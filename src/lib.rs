@@ -1,4 +1,5 @@
 mod lifecycle;
+mod migration;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::{
@@ -31,6 +32,7 @@ pub fn open_state(dir: &Path) -> Result<Connection, Box<dyn std::error::Error>> 
     tx.execute("INSERT OR IGNORE INTO metadata VALUES('host_uuid',?1)", [uuid.trim()])?;
     tx.commit()?;
     lifecycle::prepare_scratch(&dir.join("podman-tmp"))?;
+    migration::prepare(&dir.join("migrations"))?;
     Ok(db)
 }
 fn inventory() -> Result<Value, Box<dyn std::error::Error>> {
@@ -83,10 +85,20 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
     let op = request.get("operation").and_then(Value::as_str).unwrap_or("");
     let result: Result<Value, Box<dyn std::error::Error>> = (|| {
         Ok(match op {
-            "create" | "delete" | "clone" | "start" | "stop" => lifecycle::execute(db, request)?,
+            "create" | "delete" | "clone" | "start" | "stop" | "migration_preflight" | "migration_checkpoint" => {
+                lifecycle::execute(db, request)?
+            }
+            "migration_status" => migration::status(db, request)?,
             "capabilities" => json!({
                 "version":option_env!("PODMESH_PACKAGE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
                 "operations":["capabilities","identity","inventory","observations","create","delete","clone","start","stop"],
+                "experimental_operations":["migration_preflight","migration_checkpoint","migration_status"],
+                "experimental_contracts":{
+                    "migration_preflight":"read-only compatibility report bound to universe UUID, container ID, image ID, source and destination host UUIDs; no reservation, suspension or artifact",
+                    "migration_checkpoint":"source-side only: fresh checks before suspension, durable reservation, checkpoint with the packaged podmesh-vzcriu runtime in its own scope, archive/manifest/hashes under the state directory; not a transfer, restore or authorization",
+                    "migration_status":"read-only reservation, fresh observation, artifact re-hash and release preconditions; no release operation exists",
+                    "reservation":"blocks create, start, delete and clone for the universe; stop remains available"
+                },
                 "scope":"local rootful Podman; network-disabled universes created or cloned by this host's PodMesh journal; one request at a time",
                 "contracts":{
                     "ownership":"delete, start, stop and clone sources require a verified journal creation for the same universe and container ID",

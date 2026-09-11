@@ -1,4 +1,5 @@
 //! Local managed-container operations. No implicit image pulls or network access.
+use crate::migration::{self, Binding};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::{
@@ -10,7 +11,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-type Error = Box<dyn std::error::Error>;
+pub(crate) type Error = Box<dyn std::error::Error>;
 
 const UNIVERSE: &str = "io.podmesh.universe";
 const CREATION: &str = "io.podmesh.creation-operation";
@@ -18,11 +19,19 @@ const SNAPSHOT_FOR: &str = "io.podmesh.snapshot-for";
 const SNAPSHOT_OPERATION: &str = "io.podmesh.snapshot-operation";
 const SNAPSHOT_SOURCE: &str = "io.podmesh.snapshot-source-container";
 const SNAPSHOT_REPOSITORY: &str = "localhost/podmesh-clone:";
-const OPERATIONS: [&str; 5] = ["create", "delete", "clone", "start", "stop"];
+const OPERATIONS: [&str; 7] = [
+    "create",
+    "delete",
+    "clone",
+    "start",
+    "stop",
+    "migration_preflight",
+    "migration_checkpoint",
+];
 // Podman states in which no container process can write the root filesystem.
 const STOPPED: [&str; 3] = ["created", "exited", "stopped"];
 // Seconds. The service handles one request at a time, so these also bound queueing.
-const QUICK: u64 = 30;
+pub(crate) const QUICK: u64 = 30;
 const COMMIT: u64 = 300;
 const DEFAULT_OBSERVE_SECONDS: u64 = 2;
 const MAX_OBSERVE_SECONDS: u64 = 30;
@@ -43,7 +52,7 @@ impl fmt::Display for Failure {
     }
 }
 impl std::error::Error for Failure {}
-fn failure(message: impl Into<String>, details: Value) -> Error {
+pub(crate) fn failure(message: impl Into<String>, details: Value) -> Error {
     Box::new(Failure {
         message: message.into(),
         details,
@@ -57,9 +66,24 @@ enum Params<'a> {
     Delete,
     Start { observe_seconds: u64 },
     Stop { timeout: u64, on_timeout: &'a str },
+    MigrationPreflight(Binding<'a>),
+    MigrationCheckpoint(Binding<'a>),
+}
+impl Params<'_> {
+    fn name(&self) -> &'static str {
+        match self {
+            Params::Create { .. } => "create",
+            Params::Clone { .. } => "clone",
+            Params::Delete => "delete",
+            Params::Start { .. } => "start",
+            Params::Stop { .. } => "stop",
+            Params::MigrationPreflight(_) => "migration_preflight",
+            Params::MigrationCheckpoint(_) => "migration_checkpoint",
+        }
+    }
 }
 
-fn text<'a>(r: &'a Value, key: &str) -> Result<&'a str, Error> {
+pub(crate) fn text<'a>(r: &'a Value, key: &str) -> Result<&'a str, Error> {
     r.get(key)
         .and_then(Value::as_str)
         .filter(|v| !v.is_empty())
@@ -71,7 +95,7 @@ fn token(value: &str) -> Result<(), Error> {
     }
     Ok(())
 }
-fn is_uuid(v: &str) -> bool {
+pub(crate) fn is_uuid(v: &str) -> bool {
     v.len() == 36
         && v.chars().enumerate().all(|(i, c)| {
             if [8, 13, 18, 23].contains(&i) {
@@ -122,7 +146,7 @@ fn podman_error(timeout: u64, args: &[&str], out: &Output) -> String {
         _ => format!("Podman operation failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
     }
 }
-fn podman(timeout: u64, args: &[&str]) -> Result<String, Error> {
+pub(crate) fn podman(timeout: u64, args: &[&str]) -> Result<String, Error> {
     let out = run_podman(timeout, args)?;
     if !out.status.success() {
         return Err(podman_error(timeout, args, &out).into());
@@ -132,7 +156,7 @@ fn podman(timeout: u64, args: &[&str]) -> Result<String, Error> {
 fn label<'a>(c: &'a Value, key: &str) -> Option<&'a str> {
     c["Config"]["Labels"][key].as_str()
 }
-fn inspect(name: &str) -> Result<Option<Value>, Error> {
+pub(crate) fn inspect(name: &str) -> Result<Option<Value>, Error> {
     let all: Value = serde_json::from_str(&podman(QUICK, &["ps", "--all", "--format", "json"])?)?;
     let exists = all.as_array().ok_or("Invalid inventory")?.iter().any(|c| {
         c["Names"]
@@ -146,11 +170,11 @@ fn inspect(name: &str) -> Result<Option<Value>, Error> {
     let data: Value = serde_json::from_str(&podman(QUICK, &["container", "inspect", name])?)?;
     Ok(Some(data[0].clone()))
 }
-fn images() -> Result<Vec<Value>, Error> {
+pub(crate) fn images() -> Result<Vec<Value>, Error> {
     let all: Value = serde_json::from_str(&podman(QUICK, &["images", "--all", "--format", "json"])?)?;
     Ok(all.as_array().ok_or("Invalid image inventory")?.clone())
 }
-fn image_id(i: &Value) -> &str {
+pub(crate) fn image_id(i: &Value) -> &str {
     i["Id"].as_str().unwrap_or("").trim_start_matches("sha256:")
 }
 fn names(i: &Value) -> Vec<&str> {
@@ -159,7 +183,7 @@ fn names(i: &Value) -> Vec<&str> {
         .map(|n| n.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default()
 }
-fn status(c: &Value) -> &str {
+pub(crate) fn status(c: &Value) -> &str {
     c["State"]["Status"].as_str().unwrap_or("unknown")
 }
 fn stopped(c: &Value) -> Result<(), Error> {
@@ -170,7 +194,7 @@ fn stopped(c: &Value) -> Result<(), Error> {
     Ok(())
 }
 /// Seconds since the Unix epoch for Podman's UTC timestamps (`YYYY-MM-DDTHH:MM:SS[.frac]Z`).
-fn epoch(ts: &str) -> Option<i64> {
+pub(crate) fn epoch(ts: &str) -> Option<i64> {
     let b = ts.as_bytes();
     if b.len() < 20 || !ts.ends_with('Z') || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
         return None;
@@ -187,7 +211,7 @@ fn epoch(ts: &str) -> Option<i64> {
     Some((era * 146097 + doe - 719468) * 86400 + hh * 3600 + mm * 60 + ss)
 }
 /// The observed container state, without claims about anything not observed.
-fn state_view(c: &Value) -> Value {
+pub(crate) fn state_view(c: &Value) -> Value {
     let s = &c["State"];
     let running = process_active(c);
     let mut view = json!({
@@ -207,14 +231,14 @@ fn state_view(c: &Value) -> Value {
 }
 /// Podman leaves a container in `stopping`, with `Running` false, when the process running
 /// `podman stop` dies before the application exits. The recorded PID is still the application.
-fn process_active(c: &Value) -> bool {
+pub(crate) fn process_active(c: &Value) -> bool {
     match status(c) {
         "running" => true,
         "stopping" => c["State"]["Pid"].as_i64().unwrap_or(0) > 0,
         _ => false,
     }
 }
-fn observe(uuid: &str) -> Result<Value, Error> {
+pub(crate) fn observe(uuid: &str) -> Result<Value, Error> {
     Ok(match inspect(&format!("podmesh-{uuid}"))? {
         None => json!({"observed_at": crate::now(), "present": false}),
         Some(c) => {
@@ -227,7 +251,7 @@ fn observe(uuid: &str) -> Result<Value, Error> {
 }
 /// A target must be a universe this host's journal recorded as created or cloned,
 /// still carried by the same container. A matching label alone is not enough.
-fn owned(db: &Connection, c: &Value, uuid: &str, role: &str) -> Result<(), Error> {
+pub(crate) fn owned(db: &Connection, c: &Value, uuid: &str, role: &str) -> Result<(), Error> {
     let operation = label(c, CREATION).ok_or_else(|| format!("{role} has no creation operation"))?;
     let row: Option<(String, Option<String>)> = db
         .query_row(
@@ -297,6 +321,36 @@ fn parse<'a>(operation: &str, uuid: &str, request: &'a Value) -> Result<Params<'
                 .ok_or("on_timeout must be \"kill\" or \"leave_running\"")?;
             Params::Stop { timeout, on_timeout }
         }
+        "migration_preflight" | "migration_checkpoint" => {
+            // Every identity the checkpoint is bound to is explicit and immutable.
+            let container_id = text(request, "container_id")?;
+            if container_id.len() != 64 || !container_id.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
+                return Err("container_id must be a full 64-character lowercase hexadecimal container ID".into());
+            }
+            let image = text(request, "image")?;
+            if image.len() != 71 || !image.starts_with("sha256:") || !image[7..].bytes().all(|c| c.is_ascii_hexdigit()) {
+                return Err("Use a full local sha256 image ID".into());
+            }
+            let source_host = text(request, "source_host_uuid")?;
+            let destination = text(request, "destination_host_uuid")?;
+            if !is_uuid(source_host) || !is_uuid(destination) {
+                return Err("source_host_uuid and destination_host_uuid must be UUIDs".into());
+            }
+            if source_host == destination {
+                return Err("destination_host_uuid must differ from source_host_uuid".into());
+            }
+            let binding = Binding {
+                container_id,
+                image,
+                source_host,
+                destination,
+            };
+            if operation == "migration_preflight" {
+                Params::MigrationPreflight(binding)
+            } else {
+                Params::MigrationCheckpoint(binding)
+            }
+        }
         _ => Params::Delete,
     })
 }
@@ -307,6 +361,7 @@ fn ensure_schema(db: &Connection) -> Result<(), Error> {
         "CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY, request TEXT NOT NULL, status TEXT NOT NULL, result TEXT);
          CREATE TABLE IF NOT EXISTS operation_attempts(id INTEGER PRIMARY KEY, operation_id TEXT NOT NULL, started_at INTEGER NOT NULL, finished_at INTEGER, outcome TEXT, detail TEXT);",
     )?;
+    migration::ensure_schema(db)?;
     Ok(())
 }
 pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
@@ -334,7 +389,7 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
             return Err("Operation ID already belongs to a different request".into());
         }
         if status == "verified" {
-            return replay(db, id, uuid, result);
+            return replay(db, id, uuid, operation, result);
         }
         // pending (interrupted) or failed: re-evaluate from the observed state below.
     } else {
@@ -372,8 +427,18 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
 }
 /// A verified operation is never executed again. Its persisted result is returned as
 /// history, next to a fresh observation that may contradict it.
-fn replay(db: &Connection, id: &str, uuid: &str, result: Option<String>) -> Result<Value, Error> {
+fn replay(db: &Connection, id: &str, uuid: &str, operation: &str, result: Option<String>) -> Result<Value, Error> {
     let original: Value = serde_json::from_str(&result.ok_or("Missing persisted result")?)?;
+    // A replayed checkpoint never recaptures; its preserved artifacts are re-hashed instead.
+    let artifacts = if operation == "migration_checkpoint" {
+        Some(migration::verify_artifacts(
+            id,
+            original["archive"]["sha256"].as_str(),
+            original["manifest"]["sha256"].as_str(),
+        )?)
+    } else {
+        None
+    };
     let verified_at: Option<i64> = db.query_row(
         "SELECT MAX(finished_at) FROM operation_attempts WHERE operation_id=?1 AND outcome='verified'",
         [id],
@@ -385,7 +450,7 @@ fn replay(db: &Connection, id: &str, uuid: &str, result: Option<String>) -> Resu
         (Some(_), None) => json!(false),
         _ => Value::Null,
     };
-    Ok(json!({
+    let mut response = json!({
         "replayed": true,
         "historical": true,
         "notice": "original_result is the persisted result from when this operation was verified, not current state; current is a fresh Podman observation",
@@ -393,7 +458,11 @@ fn replay(db: &Connection, id: &str, uuid: &str, result: Option<String>) -> Resu
         "original_result": original,
         "current": current,
         "current_matches_recorded_container": same_container,
-    }))
+    });
+    if let Some(artifacts) = artifacts {
+        response["current_artifacts"] = artifacts;
+    }
+    Ok(response)
 }
 fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params) -> Result<Value, Error> {
     let name = format!("podmesh-{uuid}");
@@ -403,12 +472,23 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
             return Err("Target is not managed by PodMesh".into());
         }
     }
+    // A migration reservation blocks every generic operation that could run, replace or remove
+    // the universe. Stop stays available: it cannot run, replace or remove the source, although stopping a
+    // source whose checkpoint failed does end its process.
+    if !matches!(
+        params,
+        Params::Stop { .. } | Params::MigrationPreflight(_) | Params::MigrationCheckpoint(_)
+    ) {
+        migration::refuse_if_reserved(db, uuid, params.name())?;
+    }
     match params {
         Params::Create { image, command } => create(id, uuid, &name, existing, image, command),
         Params::Clone { source } => clone(db, id, uuid, source, &name, existing),
         Params::Delete => delete(db, uuid, &name, existing),
         Params::Start { observe_seconds } => start(db, attempt, id, uuid, &name, existing, *observe_seconds),
         Params::Stop { timeout, on_timeout } => stop(db, attempt, id, uuid, &name, existing, *timeout, on_timeout),
+        Params::MigrationPreflight(binding) => migration::preflight(db, uuid, binding, existing),
+        Params::MigrationCheckpoint(binding) => migration::checkpoint(db, attempt, id, uuid, &name, binding, existing),
     }
 }
 fn create(id: &str, uuid: &str, name: &str, existing: Option<Value>, image: &str, command: &[&str]) -> Result<Value, Error> {
@@ -714,6 +794,7 @@ fn clone(db: &Connection, id: &str, uuid: &str, source: &str, name: &str, existi
                 return Err("Clone source is not managed by PodMesh".into());
             }
             owned(db, &before, source, "Clone source")?;
+            migration::refuse_if_reserved(db, source, "clone from this source")?;
             stopped(&before).map_err(|e| format!("Clone source must be stopped for a coherent filesystem snapshot: {e}"))?;
             if before["Mounts"].as_array().map(|m| !m.is_empty()).unwrap_or(true) {
                 return Err("Volume and bind mount cloning is not supported yet".into());
