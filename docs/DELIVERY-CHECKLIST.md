@@ -1,6 +1,6 @@
 # PodMesh delivery plan and evidence checklist
 
-Owner: Xavier de Poorter, collaborating with OpenAI Codex.
+Owner: Xavier de Poorter, collaborating with OpenAI Codex and Claude Code.
 
 This is the central delivery tracker. Detailed contracts remain in INTENT.md, RUST-IMPLEMENTATION-PLAN.md, ACCEPTANCE-TEST-PLAN.md, BACKUP-SERVER.md and LVM-LAB-PLAN.md. A checked item records only the scope explicitly stated. Compilation, installation, runtime proof and independent review are separate gates.
 
@@ -73,7 +73,7 @@ This is the central delivery tracker. Detailed contracts remain in INTENT.md, RU
 
 ## Work allocation and completion discipline
 
-Before delegating, choose model and effort based on task difficulty, risk and cost: Luna for bounded routine tasks, Terra for ordinary implementation/testing, Sol for more involved changes, Astra for difficult architecture or recovery decisions. These are selection heuristics, not quality guarantees. Codex performs initial tests; Claude Code is preferred for independent counter-review with full context. Verify findings before applying corrections.
+Before delegating, choose model and effort based on task difficulty, risk and cost: Luna for bounded routine tasks, Terra for ordinary implementation/testing, Sol for more involved changes, Astra for difficult architecture or recovery decisions. These are selection heuristics, not quality guarantees. To preserve the operator's GPT budget, Claude Code is preferred for bounded implementation and execution of tests, with the relevant full context. Codex is used at requested review checkpoints and for difficult architecture or recovery problems. A reviewer must be independent of the implementation being reviewed; Claude reviewing its own change is not an independent counter-view. Record the actual model and effort when known, and verify findings before applying corrections.
 
 Continue authorized work without waiting for status prompts. Update this tracker as evidence is obtained. At each coherent delivery, apply governance, human/organizational and technical/adversarial review; record whether independent counter-review was actually available. Never mark the complete product proven based on an isolated test.
 

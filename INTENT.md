@@ -56,7 +56,10 @@ the declared partition policy. Exclusivity and data-loss limits remain explicit.
 
 ## Boundaries and open decisions
 
-The service, API, UUID/IP allocator and HA coordination remain to be implemented.
+The experimental service and local lifecycle API exist. Full migration, the
+UUID/IP allocator and HA coordination remain incomplete. See
+[the experimental scope](docs/EXPERIMENTAL-SCOPE.md) for the boundary between
+current SHAPER conformance and the authorized Podman research.
 Public instructions describe generic hosts. The laboratory is an example, not a
 runtime dependency. See README.md for the complete inventory, decisions, candidate
 mechanisms, deferred DNS work and qualified evidence. Existing SHAPER governing
