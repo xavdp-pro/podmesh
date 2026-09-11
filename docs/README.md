@@ -254,5 +254,21 @@ reusing existing logs and supervision. Both modes must be tested; neither is
 implemented by this decision record. See INTENT.md and the Rust plan for access
 boundaries and the required deployment matrix.
 
+## Operator clarifications, 2026-09-11 evening
+
+Recorded when Xavier handed implementation over to Claude Code to conserve GPT use.
+
+- P25 — placement agent: an agent observes measured CPU, memory, disk I/O and network
+  use per host and proposes rebalancing. Proposals become desired state only through
+  the governor's ledger; makers execute them through PodMesh operations. Requested
+  direction / OPEN; no metric collection or placement logic exists.
+- P26 — no shared cluster filesystem and no global quorum dependency: persistence moves
+  by explicit checkpoint, replication and backup (P09, P10, Backup Server). Losing a
+  host loses that host, not the ability to rebuild its universes elsewhere. DECIDED
+  direction / OPEN; host-loss recovery is untested (T01).
+- Migration transfer authority and source exclusion: see
+  [MIGRATION-PROTOCOL.md](MIGRATION-PROTOCOL.md), a provisional design taken under the
+  standing mandate.
+
 Shared supervision integration: [Shaper supervision](SHAPER-SUPERVISION.md) links
 to the common architectural definition instead of maintaining a second loop here.
