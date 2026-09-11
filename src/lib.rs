@@ -1,5 +1,7 @@
 mod lifecycle;
 mod migration;
+mod restore;
+mod transfer;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::{
@@ -33,6 +35,7 @@ pub fn open_state(dir: &Path) -> Result<Connection, Box<dyn std::error::Error>> 
     tx.commit()?;
     lifecycle::prepare_scratch(&dir.join("podman-tmp"))?;
     migration::prepare(&dir.join("migrations"))?;
+    transfer::prepare(dir)?;
     Ok(db)
 }
 fn inventory() -> Result<Value, Box<dyn std::error::Error>> {
@@ -85,23 +88,40 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
     let op = request.get("operation").and_then(Value::as_str).unwrap_or("");
     let result: Result<Value, Box<dyn std::error::Error>> = (|| {
         Ok(match op {
-            "create" | "delete" | "clone" | "start" | "stop" | "migration_preflight" | "migration_checkpoint" => {
-                lifecycle::execute(db, request)?
-            }
+            "create"
+            | "delete"
+            | "clone"
+            | "start"
+            | "stop"
+            | "migration_preflight"
+            | "migration_checkpoint"
+            | "migration_authorize_transfer"
+            | "migration_complete_transfer"
+            | "migration_retire_source"
+            | "migration_destination_preflight"
+            | "migration_restore"
+            | "migration_restore_abort" => lifecycle::execute(db, request)?,
             "migration_status" => migration::status(db, request)?,
             "capabilities" => json!({
                 "version":option_env!("PODMESH_PACKAGE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
                 "operations":["capabilities","identity","inventory","observations","create","delete","clone","start","stop"],
-                "experimental_operations":["migration_preflight","migration_checkpoint","migration_status"],
+                "experimental_operations":["migration_preflight","migration_checkpoint","migration_status","migration_authorize_transfer",
+                    "migration_complete_transfer","migration_retire_source","migration_destination_preflight","migration_restore","migration_restore_abort"],
                 "experimental_contracts":{
                     "migration_preflight":"read-only compatibility report bound to universe UUID, container ID, image ID, source and destination host UUIDs; no reservation, suspension or artifact",
-                    "migration_checkpoint":"source-side only: fresh checks before suspension, durable reservation, checkpoint with the packaged podmesh-vzcriu runtime in its own scope, archive/manifest/hashes under the state directory; not a transfer, restore or authorization",
-                    "migration_status":"read-only reservation, fresh observation, artifact re-hash and release preconditions; no release operation exists",
-                    "reservation":"blocks create, start, delete and clone for the universe; stop remains available"
+                    "migration_checkpoint":"source: fresh checks before suspension, durable reservation, checkpoint with the packaged podmesh-vzcriu runtime in its own scope, archive/manifest/hashes under the state directory; never an authorization to restore",
+                    "migration_status":"read-only reservation, fresh observation, artifact re-hash, transfer authorizations, restore claims and archived reservations; no release operation exists",
+                    "migration_authorize_transfer":"source: checkpointed -> transfer_authorized after re-hashing the artifacts and observing the checkpointed source; authorization recorded first, then archive, manifest and handoff in outbox/<authorization_id>/",
+                    "migration_complete_transfer":"source: inbox/<authorization_id>/outcome.json bound to this handoff; restored -> transferred, not_restored -> checkpointed with the authorization ended; any mismatch refused without state change",
+                    "migration_retire_source":"source: from transferred, removes only the stopped, checkpointed reserved container; reservation and evidence kept",
+                    "migration_destination_preflight":"destination, read-only: inbox handoff names this host; name, label, reservation and claims free; image, runtime, kernel, archive, manifest and space checked",
+                    "migration_restore":"destination: preflight, durable claim, restore of a private archive copy with the packaged runtime in its own scope; verified only when the universe runs restored and the CRIU restore log names the qualified runtime; records ownership and writes outbox/<authorization_id>/outcome.json",
+                    "migration_restore_abort":"destination: never removes a running or verified universe; removes only a non-running container created by a held claim, or declines an unclaimed authorization, then records not_restored and writes the outcome",
+                    "reservation":"a reservation or an unresolved restore claim blocks create, start, delete and clone for the universe; stop remains available"
                 },
                 "scope":"local rootful Podman; network-disabled universes created or cloned by this host's PodMesh journal; one request at a time",
                 "contracts":{
-                    "ownership":"delete, start, stop and clone sources require a verified journal creation for the same universe and container ID",
+                    "ownership":"delete, start, stop and clone sources require a verified create, clone or migration_restore in this host's journal for the same universe and container ID",
                     "start":"observe_seconds 0-30 (default 2); reports running or not running as observed, with exit code when not running",
                     "stop":"timeout_seconds 0-300 and on_timeout kill|leave_running are required; kill lets podman escalate to SIGKILL after the timeout, leave_running only sends the stop signal",
                     "retry":"a verified operation ID returns its historical result with a fresh observation; pending or failed operations are re-evaluated; no cancellation operation",

@@ -1,5 +1,6 @@
 //! Local managed-container operations. No implicit image pulls or network access.
 use crate::migration::{self, Binding};
+use crate::{restore, transfer};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::{
@@ -19,7 +20,7 @@ const SNAPSHOT_FOR: &str = "io.podmesh.snapshot-for";
 const SNAPSHOT_OPERATION: &str = "io.podmesh.snapshot-operation";
 const SNAPSHOT_SOURCE: &str = "io.podmesh.snapshot-source-container";
 const SNAPSHOT_REPOSITORY: &str = "localhost/podmesh-clone:";
-const OPERATIONS: [&str; 7] = [
+const OPERATIONS: [&str; 13] = [
     "create",
     "delete",
     "clone",
@@ -27,6 +28,12 @@ const OPERATIONS: [&str; 7] = [
     "stop",
     "migration_preflight",
     "migration_checkpoint",
+    "migration_authorize_transfer",
+    "migration_complete_transfer",
+    "migration_retire_source",
+    "migration_destination_preflight",
+    "migration_restore",
+    "migration_restore_abort",
 ];
 // Podman states in which no container process can write the root filesystem.
 const STOPPED: [&str; 3] = ["created", "exited", "stopped"];
@@ -61,13 +68,43 @@ pub(crate) fn failure(message: impl Into<String>, details: Value) -> Error {
 
 /// Validated request parameters. Validation happens before an operation ID is reserved.
 enum Params<'a> {
-    Create { image: &'a str, command: Vec<&'a str> },
-    Clone { source: &'a str },
+    Create {
+        image: &'a str,
+        command: Vec<&'a str>,
+    },
+    Clone {
+        source: &'a str,
+    },
     Delete,
-    Start { observe_seconds: u64 },
-    Stop { timeout: u64, on_timeout: &'a str },
+    Start {
+        observe_seconds: u64,
+    },
+    Stop {
+        timeout: u64,
+        on_timeout: &'a str,
+    },
     MigrationPreflight(Binding<'a>),
     MigrationCheckpoint(Binding<'a>),
+    MigrationAuthorize {
+        checkpoint: &'a str,
+        destination: &'a str,
+        authorization_ref: &'a str,
+    },
+    MigrationComplete {
+        authorization: &'a str,
+    },
+    MigrationRetire {
+        authorization: &'a str,
+    },
+    DestinationPreflight {
+        authorization: &'a str,
+    },
+    MigrationRestore {
+        authorization: &'a str,
+    },
+    MigrationRestoreAbort {
+        authorization: &'a str,
+    },
 }
 impl Params<'_> {
     fn name(&self) -> &'static str {
@@ -79,6 +116,12 @@ impl Params<'_> {
             Params::Stop { .. } => "stop",
             Params::MigrationPreflight(_) => "migration_preflight",
             Params::MigrationCheckpoint(_) => "migration_checkpoint",
+            Params::MigrationAuthorize { .. } => "migration_authorize_transfer",
+            Params::MigrationComplete { .. } => "migration_complete_transfer",
+            Params::MigrationRetire { .. } => "migration_retire_source",
+            Params::DestinationPreflight { .. } => "migration_destination_preflight",
+            Params::MigrationRestore { .. } => "migration_restore",
+            Params::MigrationRestoreAbort { .. } => "migration_restore_abort",
         }
     }
 }
@@ -249,9 +292,16 @@ pub(crate) fn observe(uuid: &str) -> Result<Value, Error> {
         }
     })
 }
-/// A target must be a universe this host's journal recorded as created or cloned,
-/// still carried by the same container. A matching label alone is not enough.
+/// A target must be a universe this host's journal recorded as created, cloned or restored from a verified
+/// migration handoff, still carried by the same container. A matching label alone is not enough.
 pub(crate) fn owned(db: &Connection, c: &Value, uuid: &str, role: &str) -> Result<(), Error> {
+    // A restored container keeps the source journal's creation label, which this journal does not know: its
+    // ownership is the verified migration_restore that binds this universe to this container ID.
+    if let Some(id) = c["Id"].as_str() {
+        if restore::restored_here(db, uuid, id)? {
+            return Ok(());
+        }
+    }
     let operation = label(c, CREATION).ok_or_else(|| format!("{role} has no creation operation"))?;
     let row: Option<(String, Option<String>)> = db
         .query_row(
@@ -266,6 +316,13 @@ pub(crate) fn owned(db: &Connection, c: &Value, uuid: &str, role: &str) -> Resul
     let kind = request["operation"].as_str().unwrap_or("");
     if !["create", "clone"].contains(&kind) || request["universe_uuid"].as_str() != Some(uuid) || result["container_id"] != c["Id"] {
         return Err(format!("{role} container does not match its recorded creation").into());
+    }
+    // A container this host transferred away never regains ownership through its original creation.
+    if migration::transferred_away(db, uuid, c["Id"].as_str().unwrap_or(""))? {
+        return Err(format!(
+            "{role} container was transferred to another host by a completed migration; its original creation no longer grants ownership"
+        )
+        .into());
     }
     Ok(())
 }
@@ -351,6 +408,37 @@ fn parse<'a>(operation: &str, uuid: &str, request: &'a Value) -> Result<Params<'
                 Params::MigrationCheckpoint(binding)
             }
         }
+        "migration_authorize_transfer" => {
+            let checkpoint = text(request, "checkpoint_operation_id")?;
+            token(checkpoint).map_err(|_| "checkpoint_operation_id must contain 1-80 ASCII letters, digits or hyphens")?;
+            let destination = text(request, "destination_host_uuid")?;
+            if !is_uuid(destination) {
+                return Err("destination_host_uuid must be a UUID".into());
+            }
+            Params::MigrationAuthorize {
+                checkpoint,
+                destination,
+                authorization_ref: text(request, "authorization_ref")?,
+            }
+        }
+        "migration_complete_transfer"
+        | "migration_retire_source"
+        | "migration_destination_preflight"
+        | "migration_restore"
+        | "migration_restore_abort" => {
+            // Documents are found by this service-issued identifier; requests never carry paths.
+            let authorization = text(request, "authorization_id")?;
+            if !is_uuid(authorization) {
+                return Err("authorization_id must be a UUID".into());
+            }
+            match operation {
+                "migration_complete_transfer" => Params::MigrationComplete { authorization },
+                "migration_retire_source" => Params::MigrationRetire { authorization },
+                "migration_destination_preflight" => Params::DestinationPreflight { authorization },
+                "migration_restore" => Params::MigrationRestore { authorization },
+                _ => Params::MigrationRestoreAbort { authorization },
+            }
+        }
         _ => Params::Delete,
     })
 }
@@ -429,15 +517,18 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
 /// history, next to a fresh observation that may contradict it.
 fn replay(db: &Connection, id: &str, uuid: &str, operation: &str, result: Option<String>) -> Result<Value, Error> {
     let original: Value = serde_json::from_str(&result.ok_or("Missing persisted result")?)?;
-    // A replayed checkpoint never recaptures; its preserved artifacts are re-hashed instead.
-    let artifacts = if operation == "migration_checkpoint" {
-        Some(migration::verify_artifacts(
-            id,
-            original["archive"]["sha256"].as_str(),
-            original["manifest"]["sha256"].as_str(),
-        )?)
-    } else {
-        None
+    // A replay never repeats an effect. Migration replays add a fresh re-hash or state of what the operation produced.
+    let extra = match operation {
+        "migration_checkpoint" => Some((
+            "current_artifacts",
+            migration::verify_artifacts(id, original["archive"]["sha256"].as_str(), original["manifest"]["sha256"].as_str())?,
+        )),
+        "migration_authorize_transfer" => Some(("current_artifacts", transfer::verify_outbox(&original)?)),
+        "migration_restore" | "migration_restore_abort" => Some(("current_outcome", restore::verify_outcome(&original)?)),
+        "migration_complete_transfer" | "migration_retire_source" => {
+            Some(("current_reservation", json!(migration::reservation(db, uuid)?.map(|r| r.view()))))
+        }
+        _ => None,
     };
     let verified_at: Option<i64> = db.query_row(
         "SELECT MAX(finished_at) FROM operation_attempts WHERE operation_id=?1 AND outcome='verified'",
@@ -459,25 +550,30 @@ fn replay(db: &Connection, id: &str, uuid: &str, operation: &str, result: Option
         "current": current,
         "current_matches_recorded_container": same_container,
     });
-    if let Some(artifacts) = artifacts {
-        response["current_artifacts"] = artifacts;
+    if let Some((key, value)) = extra {
+        response[key] = value;
     }
     Ok(response)
 }
 fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params) -> Result<Value, Error> {
     let name = format!("podmesh-{uuid}");
     let existing = inspect(&name)?;
+    // On a migration destination an occupied name is a reported blocker, not an early refusal.
+    let on_destination = matches!(
+        params,
+        Params::DestinationPreflight { .. } | Params::MigrationRestore { .. } | Params::MigrationRestoreAbort { .. }
+    );
     if let Some(ref c) = existing {
-        if label(c, UNIVERSE) != Some(uuid) {
+        if !on_destination && label(c, UNIVERSE) != Some(uuid) {
             return Err("Target is not managed by PodMesh".into());
         }
     }
-    // A migration reservation blocks every generic operation that could run, replace or remove
-    // the universe. Stop stays available: it cannot run, replace or remove the source, although stopping a
-    // source whose checkpoint failed does end its process.
-    if !matches!(
+    // A migration reservation or an unresolved restore claim blocks every generic operation that could run, replace
+    // or remove the universe. Stop stays available: it cannot run, replace or remove the source, although stopping
+    // a source whose checkpoint failed does end its process. Migration operations apply their own state checks.
+    if matches!(
         params,
-        Params::Stop { .. } | Params::MigrationPreflight(_) | Params::MigrationCheckpoint(_)
+        Params::Create { .. } | Params::Clone { .. } | Params::Delete | Params::Start { .. }
     ) {
         migration::refuse_if_reserved(db, uuid, params.name())?;
     }
@@ -489,6 +585,16 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
         Params::Stop { timeout, on_timeout } => stop(db, attempt, id, uuid, &name, existing, *timeout, on_timeout),
         Params::MigrationPreflight(binding) => migration::preflight(db, uuid, binding, existing),
         Params::MigrationCheckpoint(binding) => migration::checkpoint(db, attempt, id, uuid, &name, binding, existing),
+        Params::MigrationAuthorize {
+            checkpoint,
+            destination,
+            authorization_ref,
+        } => transfer::authorize(db, id, uuid, checkpoint, destination, authorization_ref, existing),
+        Params::MigrationComplete { authorization } => transfer::complete(db, id, uuid, authorization, existing),
+        Params::MigrationRetire { authorization } => transfer::retire(db, id, uuid, &name, authorization, existing),
+        Params::DestinationPreflight { authorization } => restore::preflight(db, uuid, authorization, existing),
+        Params::MigrationRestore { authorization } => restore::restore(db, attempt, id, uuid, &name, authorization, existing),
+        Params::MigrationRestoreAbort { authorization } => restore::abort(db, id, uuid, &name, authorization, existing),
     }
 }
 fn create(id: &str, uuid: &str, name: &str, existing: Option<Value>, image: &str, command: &[&str]) -> Result<Value, Error> {

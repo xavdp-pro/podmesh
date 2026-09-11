@@ -139,11 +139,64 @@ Development service on the destination host, isolated like the source milestone.
 - Refused without effect: restore without handoff, wrong destination, tampered archive,
   occupied name or UUID, absent image, runtime mismatch, release after authorization,
   completion with an outcome bound to another handoff.
-- Replays: authorize, restore and complete are historical when retried.
+- Replays: authorize and restore are historical when retried, demonstrated directly. Completion
+  rides the same generic replay path; its repeat is not separately demonstrated.
 - Interruption: service killed during `migration_restore`; the retry reconciles to one
   container and one outcome.
 - Unrelated containers untouched; every Podman event on managed universes falls inside
   an API window.
+
+## Deviations recorded by the destination implementation (lot M2)
+
+Implemented on 2026-09-11 by Claude Code (Opus 5) in the development tree and exercised on two lab hosts.
+Each entry is either a decision this protocol did not settle or a difference from what it describes. Xavier
+may amend any of them. Lot M3 (`migration_release`, `migration_abandon`, `migration_restore_local`) is not
+implemented, so a reservation still has no local way out.
+
+1. **Refusals before a claim write no outcome.** The protocol says a failure before Podman starts restoring
+   writes `not_restored`. A refusal raised by the repeated preflight happens before anything is claimed, leaves
+   no trace and stays retryable with the same operation ID, which is what a re-copied archive or a newly loaded
+   image needs. Only a claim that was persisted and whose command could not be started is closed `not_restored`.
+2. **`migration_restore_abort` also declines an authorization this host never claimed.** Otherwise a destination
+   that refuses a handoff (absent image, different kernel) leaves the source held indefinitely, since only a
+   verified destination outcome ends an authorization. The decline is recorded as a closed claim before the
+   outcome is written, so this host can never restore that authorization afterwards.
+3. **A verified restore archives an earlier `transferred` reservation** into a history table. The reservation
+   table is keyed by universe and `transferred` keeps refusing generic operations; without archiving, a returned
+   universe could neither be operated nor checkpointed again on its original host. `migration_status` reports
+   the archived rows.
+4. **Ownership is withdrawn from a container transferred away.** `owned()` accepts a verified create, clone or
+   `migration_restore` for the observed container ID, and additionally refuses a container ID this host recorded
+   as transferred, so that restoring an old archive out of band under its original ID cannot regain ownership
+   through the original creation.
+5. **The restore uses `--keep` and `--name podmesh-<uuid>`.** `--keep` preserves the CRIU restore log that the
+   verification requires: selecting the runtime through `PATH` does not prove which engine restored the
+   universe. The kept files stay in the restored container's storage until it is removed or checkpointed again,
+   and a later export from that container may carry image files left by the previous restore. `--name` gives
+   each hop a new container ID, recorded in the outcome and the journal.
+6. **`INVOCATION_ID` is removed inside the transient scope, not only around it.** `systemd-run --scope` sets it
+   for the command it runs (observed with systemd 257), and Podman then leaves conmon inside that scope, which
+   would stay active for the life of the restored universe and defeat the scope-completion check. The checkpoint
+   command strips it the same way, for consistency.
+7. **The destination restores a private copy of the archive.** The inbox bytes are hashed, copied into the
+   operation's directory and re-hashed there, and Podman reads that copy: a transport controller writing into
+   the inbox during a restore cannot change what is restored.
+8. **The handoff carries the dump-time runtime and kernel**, taken from the checkpoint manifest rather than from
+   a fresh observation at authorization, because they describe the engine that produced the archive.
+9. **Authorization IDs are service-issued UUIDs**, not caller-chosen operation IDs, and they name the delivery
+   directories.
+10. **Completion is refused while the source container is running or replaced**, rather than recording a
+    destination outcome over an unexplained local activity.
+11. **Retirement keeps the reservation in `transferred`** and records the retirement in its detail; there is no
+    `retired` state. An already absent container is a verified no-op, and a source that is no longer
+    checkpointed is refused rather than removed.
+12. **The destination preflight adds two checks the table above leaves implicit**: the manifest must agree with
+    the handoff field by field, and the archive's own `config.dump` must name the handoff's source container,
+    image and universe label.
+13. **An unresolved restore claim gates generic operations** exactly as a reservation does, because such a claim
+    may hold a container the destination created.
+14. **`migration_status` reports authorizations, restore claims and archived reservations** beside the
+    reservation, so one read-only call shows both sides of a migration on either host.
 
 ## Still open
 

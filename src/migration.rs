@@ -3,8 +3,9 @@
 //! Scope: the default rootful Podman store; network-disabled, mount-free containers owned by this
 //! host's journal whose processes are musl-based; checkpoint with the separately packaged
 //! podmesh-vzcriu runtime through its private-path shim, never the distribution CRIU.
-//! Transfer, destination restore, source exclusion and reservation release are not implemented.
-//! A checkpoint result is evidence for a later reviewed protocol, never an authorization to restore.
+//! Transfer authorization and completion live in `transfer.rs`, destination restore in `restore.rs`
+//! (docs/MIGRATION-PROTOCOL.md). Reservation release and abandonment are not implemented.
+//! A checkpoint result never authorizes a restore: only a transfer authorization issues a handoff.
 use crate::lifecycle::{self as lc, failure, Error};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -17,7 +18,7 @@ use std::{
     sync::OnceLock,
 };
 
-const RUNTIME_REAL: &str = "/usr/lib/podmesh-vzcriu/criu";
+pub(crate) const RUNTIME_REAL: &str = "/usr/lib/podmesh-vzcriu/criu";
 const RUNTIME_WRAPPER: &str = "/usr/bin/podmesh-vzcriu";
 const RUNTIME_SHIM: &str = "/opt/podmesh-vzcriu-kit/bin/criu";
 // Qualified bytes of the runtime and of the packaged scripts that select it (podmesh-vzcriu
@@ -25,22 +26,22 @@ const RUNTIME_SHIM: &str = "/opt/podmesh-vzcriu-kit/bin/criu";
 const RUNTIME_REAL_SHA256: &str = "4ecb663e7e3b019cdfa534c0d4cce4134938f87ae3b45cac35a7481c0a947cd4";
 const RUNTIME_WRAPPER_SHA256: &str = "97d0f0728c54dd340b6ec6d002e1946b3a41fdd8ceb3ded5d4d5cccfda44b28e";
 const RUNTIME_SHIM_SHA256: &str = "fcbec55d0401080d020b1a56299d007792ca8215f68c533756080ff5e86948eb";
-const RUNTIME_GIT_ID: &str = "v3.15.5.3";
+pub(crate) const RUNTIME_GIT_ID: &str = "v3.15.5.3";
 // Podman and crun look up a binary named `criu` on PATH; the private shim directory comes first.
 const RUNTIME_PATH: &str = "/opt/podmesh-vzcriu-kit/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const CHECKPOINT_SECONDS: u64 = 300;
-const ARCHIVE: &str = "checkpoint.tar.zst";
-const MANIFEST: &str = "manifest.json";
+pub(crate) const ARCHIVE: &str = "checkpoint.tar.zst";
+pub(crate) const MANIFEST: &str = "manifest.json";
 const MAX_PROCESSES: usize = 64;
 // About 513 MiB was dumped in under a second on the lab. A dump still running when the 300 s bound
 // expires is killed, which was observed to destroy the application: refuse larger sources before suspension.
 const MAX_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
-const SPACE_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const SPACE_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 // Podman keeps the uncompressed checkpoint image files (--keep) under the container storage.
-const CONTAINER_STORAGE: &str = "/var/lib/containers/storage";
-const SCOPE: &str = "experimental source-side checkpoint only: default rootful Podman store, network-disabled, mount-free, journal-owned container with musl processes, packaged podmesh-vzcriu 3.15.5.3 through its private-path shim; no transfer, no restore";
-const AUTHORITY: &str = "This checkpoint does not authorize restore on any host, does not prove source exclusion and does not release the reservation. Transfer of authority requires the later reviewed protocol.";
-const RELEASE_GAP: &str = "No release operation exists. Releasing would let the source universe run again. A safe release needs the reviewed transfer/exclusion protocol to establish that no transfer authorization or restore exists elsewhere; this version records no transfer authorizations and cannot prove their absence. Restarting the application would also start it fresh, not resume the checkpointed memory: that recovery semantic is an open design decision.";
+pub(crate) const CONTAINER_STORAGE: &str = "/var/lib/containers/storage";
+const SCOPE: &str = "experimental source-side checkpoint: default rootful Podman store, network-disabled, mount-free, journal-owned container with musl processes, packaged podmesh-vzcriu 3.15.5.3 through its private-path shim";
+const AUTHORITY: &str = "This checkpoint does not authorize restore on any host and does not release the reservation. Only migration_authorize_transfer issues a handoff, and only a verified destination outcome bound to it ends the reservation.";
+const RELEASE_GAP: &str = "No release operation exists in this version (lot M3). Releasing would let the source universe run again; the protocol permits it only when no transfer authorization was ever issued for the reservation. Restarting the application would start it fresh, not resume the checkpointed memory.";
 
 /// Identity binding carried by every migration request.
 pub(crate) struct Binding<'a> {
@@ -57,43 +58,63 @@ pub(crate) fn prepare(dir: &Path) -> Result<(), Error> {
     MIGRATIONS.get_or_init(|| dir.to_path_buf());
     Ok(())
 }
-fn base() -> Result<&'static PathBuf, Error> {
+pub(crate) fn base() -> Result<&'static PathBuf, Error> {
     MIGRATIONS
         .get()
         .ok_or_else(|| Error::from("Migration state directory not prepared"))
 }
 pub(crate) fn ensure_schema(db: &Connection) -> Result<(), Error> {
-    // A separate table: earlier package versions keep working on this journal after a rollback,
-    // but they do not enforce reservations.
+    // Separate tables: earlier package versions keep working on this journal after a rollback,
+    // but they do not enforce reservations, authorizations or restore claims.
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS migration_reservations(universe_uuid TEXT PRIMARY KEY, operation_id TEXT NOT NULL,
          container_id TEXT NOT NULL, image_id TEXT NOT NULL, source_host_uuid TEXT NOT NULL, destination_host_uuid TEXT NOT NULL,
-         container_started_at TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, detail TEXT);",
+         container_started_at TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, detail TEXT);
+         CREATE TABLE IF NOT EXISTS migration_authorizations(authorization_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE,
+         universe_uuid TEXT NOT NULL, checkpoint_operation_id TEXT NOT NULL, destination_host_uuid TEXT NOT NULL, handoff TEXT NOT NULL,
+         handoff_sha256 TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, outcome TEXT,
+         outcome_sha256 TEXT, completed_by_operation TEXT);
+         CREATE TABLE IF NOT EXISTS migration_restore_claims(authorization_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL,
+         universe_uuid TEXT NOT NULL, handoff TEXT NOT NULL, handoff_sha256 TEXT NOT NULL, source_host_uuid TEXT NOT NULL,
+         source_container_id TEXT NOT NULL, image_id TEXT NOT NULL, state TEXT NOT NULL, container_id TEXT, created_at INTEGER NOT NULL,
+         updated_at INTEGER NOT NULL, outcome TEXT, outcome_sha256 TEXT, detail TEXT);
+         CREATE TABLE IF NOT EXISTS migration_reservation_history(id INTEGER PRIMARY KEY, universe_uuid TEXT NOT NULL, operation_id TEXT NOT NULL,
+         container_id TEXT NOT NULL, image_id TEXT NOT NULL, source_host_uuid TEXT NOT NULL, destination_host_uuid TEXT NOT NULL,
+         container_started_at TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, detail TEXT,
+         archived_at INTEGER NOT NULL, archived_by_operation TEXT NOT NULL);",
     )?;
     Ok(())
 }
 
-struct Reservation {
-    operation_id: String,
-    container_id: String,
-    image_id: String,
-    source_host: String,
-    destination: String,
-    started_at: String,
-    state: String,
-    created_at: i64,
-    updated_at: i64,
-    detail: Option<String>,
+pub(crate) struct Reservation {
+    pub operation_id: String,
+    pub container_id: String,
+    pub image_id: String,
+    pub source_host: String,
+    pub destination: String,
+    pub started_at: String,
+    pub state: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub detail: Option<String>,
 }
 impl Reservation {
-    fn view(&self) -> Value {
+    pub(crate) fn view(&self) -> Value {
         json!({"operation_id": self.operation_id, "container_id": self.container_id, "image_id": self.image_id,
             "source_host_uuid": self.source_host, "destination_host_uuid": self.destination,
             "container_started_at": self.started_at, "state": self.state, "created_at": self.created_at,
             "updated_at": self.updated_at, "detail": self.detail.as_deref().and_then(|d| serde_json::from_str::<Value>(d).ok())})
     }
+    /// The recorded detail as a JSON object (empty when absent or not an object).
+    pub(crate) fn detail_value(&self) -> Value {
+        self.detail
+            .as_deref()
+            .and_then(|d| serde_json::from_str::<Value>(d).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}))
+    }
 }
-fn reservation(db: &Connection, uuid: &str) -> Result<Option<Reservation>, Error> {
+pub(crate) fn reservation(db: &Connection, uuid: &str) -> Result<Option<Reservation>, Error> {
     Ok(db
         .query_row(
             "SELECT operation_id,container_id,image_id,source_host_uuid,destination_host_uuid,container_started_at,state,created_at,updated_at,detail
@@ -116,14 +137,25 @@ fn reservation(db: &Connection, uuid: &str) -> Result<Option<Reservation>, Error
         )
         .optional()?)
 }
-fn set_state(db: &Connection, uuid: &str, state: &str, detail: &Value) -> Result<(), Error> {
+pub(crate) fn set_state(db: &Connection, uuid: &str, state: &str, detail: &Value) -> Result<(), Error> {
     db.execute(
         "UPDATE migration_reservations SET state=?2, updated_at=?3, detail=?4 WHERE universe_uuid=?1",
         params![uuid, state, crate::now() as i64, detail.to_string()],
     )?;
     Ok(())
 }
-/// Generic lifecycle operations must not bypass a migration reservation.
+/// Changes the reservation state while keeping the recorded detail fields, such as the artifact hashes.
+pub(crate) fn merge_state(db: &Connection, uuid: &str, state: &str, patch: &Value) -> Result<(), Error> {
+    let r = reservation(db, uuid)?.ok_or("Reservation not found")?;
+    let mut detail = r.detail_value();
+    if let (Some(d), Some(p)) = (detail.as_object_mut(), patch.as_object()) {
+        for (k, v) in p {
+            d.insert(k.clone(), v.clone());
+        }
+    }
+    set_state(db, uuid, state, &detail)
+}
+/// Generic lifecycle operations must not bypass a migration reservation or an unresolved restore claim.
 pub(crate) fn refuse_if_reserved(db: &Connection, uuid: &str, operation: &str) -> Result<(), Error> {
     ensure_schema(db)?;
     if let Some(r) = reservation(db, uuid)? {
@@ -135,13 +167,66 @@ pub(crate) fn refuse_if_reserved(db: &Connection, uuid: &str, operation: &str) -
             json!({"reservation": r.view()}),
         ));
     }
+    // A restore that is neither verified nor closed may have created a container for this universe.
+    if let Some(claim) = crate::restore::unresolved_claim(db, uuid)? {
+        return Err(failure(
+            format!(
+                "Universe {uuid} has an unresolved restore claim for authorization {} (state {}); {operation} is refused until migration_restore verifies it or migration_restore_abort closes it",
+                claim["authorization_id"].as_str().unwrap_or(""),
+                claim["state"].as_str().unwrap_or("")
+            ),
+            json!({"restore_claim": claim}),
+        ));
+    }
     Ok(())
 }
-fn host_uuid(db: &Connection) -> Result<String, Error> {
+/// Whether this host transferred the given container away through a completed migration, in the current or an
+/// archived reservation. Such a container never regains ownership through its original creation.
+pub(crate) fn transferred_away(db: &Connection, uuid: &str, container_id: &str) -> Result<bool, Error> {
+    ensure_schema(db)?;
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM migration_reservations WHERE universe_uuid=?1 AND container_id=?2 AND state='transferred')
+         OR EXISTS(SELECT 1 FROM migration_reservation_history WHERE universe_uuid=?1 AND container_id=?2 AND state='transferred')",
+        params![uuid, container_id],
+        |r| r.get::<_, bool>(0),
+    )?)
+}
+/// Moves a `transferred` reservation to history when a verified restore brings the universe back to this host;
+/// the caller holds the transaction. Returns whether a row was archived.
+pub(crate) fn archive_transferred(db: &Connection, uuid: &str, operation: &str) -> Result<bool, Error> {
+    let moved = db.execute(
+        "INSERT INTO migration_reservation_history(universe_uuid,operation_id,container_id,image_id,source_host_uuid,destination_host_uuid,
+         container_started_at,state,created_at,updated_at,detail,archived_at,archived_by_operation)
+         SELECT universe_uuid,operation_id,container_id,image_id,source_host_uuid,destination_host_uuid,container_started_at,state,created_at,
+         updated_at,detail,?2,?3 FROM migration_reservations WHERE universe_uuid=?1 AND state='transferred'",
+        params![uuid, crate::now() as i64, operation],
+    )?;
+    db.execute(
+        "DELETE FROM migration_reservations WHERE universe_uuid=?1 AND state='transferred'",
+        [uuid],
+    )?;
+    Ok(moved > 0)
+}
+fn history_view(db: &Connection, uuid: &str) -> Result<Vec<Value>, Error> {
+    let mut stmt = db.prepare(
+        "SELECT operation_id,container_id,state,created_at,updated_at,detail,archived_at,archived_by_operation
+         FROM migration_reservation_history WHERE universe_uuid=?1 ORDER BY id",
+    )?;
+    let rows = stmt.query_map([uuid], |r| {
+        Ok(
+            json!({"operation_id": r.get::<_, String>(0)?, "container_id": r.get::<_, String>(1)?, "state": r.get::<_, String>(2)?,
+            "created_at": r.get::<_, i64>(3)?, "updated_at": r.get::<_, i64>(4)?,
+            "detail": r.get::<_, Option<String>>(5)?.and_then(|d| serde_json::from_str::<Value>(&d).ok()),
+            "archived_at": r.get::<_, i64>(6)?, "archived_by_operation": r.get::<_, String>(7)?}),
+        )
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+pub(crate) fn host_uuid(db: &Connection) -> Result<String, Error> {
     Ok(db.query_row("SELECT value FROM metadata WHERE key='host_uuid'", [], |r| r.get(0))?)
 }
 /// SHA-256 of a service-controlled path, computed by coreutils with fixed arguments.
-fn sha256(path: &Path) -> Result<String, Error> {
+pub(crate) fn sha256(path: &Path) -> Result<String, Error> {
     let out = Command::new("/usr/bin/sha256sum").arg("--").arg(path).output()?;
     if !out.status.success() {
         return Err(format!("sha256sum failed for {}", path.display()).into());
@@ -149,7 +234,53 @@ fn sha256(path: &Path) -> Result<String, Error> {
     let text = String::from_utf8(out.stdout)?;
     Ok(text.split_whitespace().next().ok_or("Empty sha256sum output")?.to_string())
 }
-fn write_private(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+/// SHA-256 of bytes held in memory, computed by coreutils from standard input.
+pub(crate) fn sha256_bytes(bytes: &[u8]) -> Result<String, Error> {
+    let mut child = Command::new("/usr/bin/sha256sum")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    child.stdin.take().ok_or("sha256sum input unavailable")?.write_all(bytes)?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        return Err("sha256sum failed".into());
+    }
+    let text = String::from_utf8(out.stdout)?;
+    Ok(text.split_whitespace().next().ok_or("Empty sha256sum output")?.to_string())
+}
+/// Copies a file into a service-owned path through a temporary name, private and synced; callers re-hash the copy.
+pub(crate) fn copy_private(from: &Path, to: &Path) -> Result<u64, Error> {
+    let temporary = to.with_extension("partial-write");
+    let mut input = fs::File::open(from)?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+    let bytes = std::io::copy(&mut input, &mut output)?;
+    output.sync_all()?;
+    fs::rename(&temporary, to)?;
+    Ok(bytes)
+}
+/// Bytes available to root under a path, as reported by coreutils df; 0 when unreadable.
+pub(crate) fn available_bytes(path: &Path) -> u64 {
+    Command::new("/usr/bin/df")
+        .args(["-B1", "--output=avail"])
+        .arg(path)
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .last()
+                .and_then(|l| l.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(0)
+}
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     let temporary = path.with_extension("partial-write");
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -162,7 +293,20 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     fs::rename(&temporary, path)?;
     Ok(())
 }
-fn tail(bytes: &[u8]) -> String {
+// A failing runtime can write an unbounded log: a CRIU restore of a deliberately damaged archive produced a
+// multi-gigabyte restore.log on the lab, and reading it whole cost the service an out-of-memory kill. Every
+// copy of runtime output is therefore bounded, and a longer file is marked as truncated.
+pub(crate) const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) fn read_bounded(path: &Path) -> Result<Vec<u8>, Error> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?.take(MAX_LOG_BYTES).read_to_end(&mut bytes)?;
+    if fs::metadata(path)?.len() > MAX_LOG_BYTES {
+        bytes.extend_from_slice(format!("\n[truncated by PodMesh after {MAX_LOG_BYTES} bytes]\n").as_bytes());
+    }
+    Ok(bytes)
+}
+pub(crate) fn tail(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     let start = text.len().saturating_sub(2000);
     text[text.char_indices().map(|(i, _)| i).find(|i| *i >= start).unwrap_or(0)..].to_string()
@@ -189,7 +333,7 @@ struct Assessment {
     blockers: Vec<String>,
     facts: Value,
 }
-fn runtime_facts(blockers: &mut Vec<String>) -> Value {
+pub(crate) fn runtime_facts(blockers: &mut Vec<String>) -> Value {
     let mut hashes = json!({});
     for (path, expected) in [
         (RUNTIME_REAL, RUNTIME_REAL_SHA256),
@@ -414,30 +558,38 @@ pub(crate) fn preflight(db: &Connection, uuid: &str, b: &Binding, existing: Opti
 fn scope_unit(id: &str) -> String {
     format!("podmesh-checkpoint-{id}.scope")
 }
-/// Whether the checkpoint scope of this operation may still hold its command. `is-active` reports a
-/// scope that is still activating or deactivating as not active, so only a finished or absent unit
-/// counts as done; a query that cannot be answered fails closed.
-fn scope_busy(id: &str) -> bool {
+/// Whether a transient scope may still hold its command. `is-active` reports a scope that is still
+/// activating or deactivating as not active, so only a finished or absent unit counts as done; a query
+/// that cannot be answered fails closed.
+pub(crate) fn unit_busy(unit: &str) -> bool {
     match Command::new("/usr/bin/systemctl")
-        .args(["show", "--property=ActiveState", "--value", &scope_unit(id)])
+        .args(["show", "--property=ActiveState", "--value", unit])
         .output()
     {
         Ok(o) if o.status.success() => !matches!(String::from_utf8_lossy(&o.stdout).trim(), "inactive" | "failed"),
         _ => true,
     }
 }
-/// The checkpoint runs in its own transient systemd scope, outside the service cgroup: a service
-/// crash or restart must not kill CRIU mid-dump, which was observed to destroy the application
-/// without producing an archive. GNU timeout inside the scope still bounds it. Output goes to
-/// files, not to pipes held by the service, so a dead service cannot break the command's output.
-/// The command names the reserved container ID, never the universe name: a container replaced under
-/// that name after the checks cannot be captured. Its temporary directory belongs to the operation and
-/// is never the shared scratch directory that every service start empties: a restarted service must not
-/// remove files from under a dump that is still running in its scope.
-fn checkpoint_command(id: &str, container_id: &str, archive: &Path, stdout: fs::File, stderr: fs::File) -> Result<ExitStatus, Error> {
-    let export = format!("--export={}", archive.display());
-    let unit = format!("--unit={}", scope_unit(id));
-    let limit = CHECKPOINT_SECONDS.to_string();
+/// Runs one Podman command of a migration operation in its own transient systemd scope, outside the
+/// service cgroup, with the private runtime first on PATH, bounded by GNU timeout inside the scope and
+/// with output written to files, so that a service crash or restart neither interrupts it nor breaks its
+/// output. Its temporary directory belongs to the operation and is never the shared scratch directory
+/// that every service start empties.
+///
+/// systemd-run --scope sets INVOCATION_ID for the command it runs even when the caller has none (observed
+/// with systemd 257). Podman then leaves conmon inside the scope, which stays active for as long as a
+/// restored universe runs; the variable is therefore removed inside the scope as well, so that conmon moves
+/// to its own libpod-conmon scope and this scope ends with the Podman command.
+pub(crate) fn scoped_podman(
+    unit: &str,
+    id: &str,
+    seconds: u64,
+    args: &[&str],
+    stdout: fs::File,
+    stderr: fs::File,
+) -> Result<ExitStatus, Error> {
+    let unit = format!("--unit={unit}");
+    let limit = seconds.to_string();
     let temporary = base()?.join(".tmp").join(id);
     fs::create_dir_all(&temporary)?;
     fs::set_permissions(base()?.join(".tmp"), fs::Permissions::from_mode(0o700))?;
@@ -452,13 +604,32 @@ fn checkpoint_command(id: &str, container_id: &str, archive: &Path, stdout: fs::
             "--collect",
             &unit,
             "--",
+            "/usr/bin/env",
+            "-u",
+            "INVOCATION_ID",
             "/usr/bin/timeout",
             "--signal=TERM",
             "--kill-after=5",
             &limit,
-        ])
-        .args([
             "/usr/bin/podman",
+        ])
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .status()?)
+}
+/// The checkpoint runs in its own scope (see `scoped_podman`): a service crash or restart must not kill
+/// CRIU mid-dump, which was observed to destroy the application without producing an archive. The command
+/// names the reserved container ID, never the universe name: a container replaced under that name after
+/// the checks cannot be captured.
+fn checkpoint_command(id: &str, container_id: &str, archive: &Path, stdout: fs::File, stderr: fs::File) -> Result<ExitStatus, Error> {
+    let export = format!("--export={}", archive.display());
+    scoped_podman(
+        &scope_unit(id),
+        id,
+        CHECKPOINT_SECONDS,
+        &[
             "container",
             "checkpoint",
             &export,
@@ -467,11 +638,10 @@ fn checkpoint_command(id: &str, container_id: &str, archive: &Path, stdout: fs::
             "--file-locks",
             "--print-stats",
             container_id,
-        ])
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr)
-        .status()?)
+        ],
+        stdout,
+        stderr,
+    )
 }
 
 pub(crate) fn checkpoint(
@@ -550,7 +720,7 @@ fn resume(
     r: Reservation,
     dir: &Path,
 ) -> Result<Value, Error> {
-    if scope_busy(id) {
+    if unit_busy(&scope_unit(id)) {
         return Err(failure(
             "The checkpoint scope of this operation has not finished, or its state cannot be queried; retry after it finishes",
             json!({"reservation": r.view(), "scope": scope_unit(id)}),
@@ -607,7 +777,7 @@ fn capture(db: &Connection, attempt: i64, id: &str, uuid: &str, name: &str, dir:
     let stderr_path = dir.join(format!("checkpoint-attempt-{attempt}.stderr"));
     let exit = checkpoint_command(id, &r.container_id, &archive, open(&stdout_path)?, open(&stderr_path)?)?;
     if !exit.success() {
-        let stderr = fs::read(&stderr_path).unwrap_or_default();
+        let stderr = read_bounded(&stderr_path).unwrap_or_default();
         let observed = lc::inspect(name)?;
         if let Some(ref c) = observed {
             copy_dump_log(c, &dir.join(format!("dump-attempt-{attempt}.log")));
@@ -628,15 +798,19 @@ fn capture(db: &Connection, attempt: i64, id: &str, uuid: &str, name: &str, dir:
     finalize(db, id, uuid, name, dir, r, false)
 }
 
-/// Copy Podman's CRIU log, only from the container's own static directory.
-fn copy_dump_log(c: &Value, target: &Path) -> bool {
-    let expected = c["StaticDir"].as_str().map(|d| format!("{d}/dump.log"));
-    match (c["State"]["CheckpointLog"].as_str(), expected) {
-        (Some(log), Some(expected)) if log == expected && log.starts_with("/var/lib/containers/storage/") => {
-            fs::read(log).ok().and_then(|bytes| write_private(target, &bytes).ok()).is_some()
-        }
+/// Copy one of Podman's CRIU logs (`State.<state_key>`), only from the container's own static directory.
+pub(crate) fn copy_podman_log(c: &Value, state_key: &str, file: &str, target: &Path) -> bool {
+    let expected = c["StaticDir"].as_str().map(|d| format!("{d}/{file}"));
+    match (c["State"][state_key].as_str(), expected) {
+        (Some(log), Some(expected)) if log == expected && log.starts_with("/var/lib/containers/storage/") => read_bounded(Path::new(log))
+            .ok()
+            .and_then(|bytes| write_private(target, &bytes).ok())
+            .is_some(),
         _ => false,
     }
+}
+fn copy_dump_log(c: &Value, target: &Path) -> bool {
+    copy_podman_log(c, "CheckpointLog", "dump.log", target)
 }
 
 fn finalize(db: &Connection, id: &str, uuid: &str, name: &str, dir: &Path, r: &Reservation, resumed: bool) -> Result<Value, Error> {
@@ -746,7 +920,8 @@ pub(crate) fn verify_artifacts(id: &str, archive_sha256: Option<&str>, manifest_
     }))
 }
 
-/// Read-only: reservation, fresh observation, artifact verification and release preconditions.
+/// Read-only: reservation, fresh observation, artifact verification, transfer authorizations, restore claims,
+/// archived reservations and release preconditions.
 pub(crate) fn status(db: &Connection, request: &Value) -> Result<Value, Error> {
     let uuid = lc::text(request, "universe_uuid")?;
     if !lc::is_uuid(uuid) {
@@ -755,9 +930,19 @@ pub(crate) fn status(db: &Connection, request: &Value) -> Result<Value, Error> {
     ensure_schema(db)?;
     let r = reservation(db, uuid)?;
     let current = lc::observe(uuid)?;
+    let authorizations = crate::transfer::authorizations_view(db, uuid)?;
+    let claims = crate::restore::claims_view(db, uuid)?;
+    let history = history_view(db, uuid)?;
     let Some(r) = r else {
-        return Ok(json!({"universe_uuid": uuid, "reservation": null, "current": current}));
+        return Ok(
+            json!({"universe_uuid": uuid, "reservation": null, "current": current, "transfer_authorizations": authorizations,
+            "restore_claims": claims, "reservation_history": history}),
+        );
     };
+    let issued = authorizations
+        .iter()
+        .filter(|a| a["checkpoint_operation_id"].as_str() == Some(r.operation_id.as_str()))
+        .count();
     let detail: Value = r
         .detail
         .as_deref()
@@ -777,6 +962,9 @@ pub(crate) fn status(db: &Connection, request: &Value) -> Result<Value, Error> {
         "reservation": r.view(),
         "current": current,
         "artifacts": artifacts,
+        "transfer_authorizations": authorizations,
+        "restore_claims": claims,
+        "reservation_history": history,
         "release": {
             "permitted": false,
             "operation_available": false,
@@ -786,7 +974,7 @@ pub(crate) fn status(db: &Connection, request: &Value) -> Result<Value, Error> {
                 "same_reserved_container": same,
                 "source_not_running": container.as_ref().is_some_and(|c| !lc::process_active(c)),
                 "source_checkpointed": container.as_ref().is_some_and(|c| c["State"]["Checkpointed"] == true),
-                "transfer_authorization_records": "not implemented in this version; their absence cannot be established",
+                "transfer_authorizations_issued_for_reservation": issued,
             },
         },
     }))
