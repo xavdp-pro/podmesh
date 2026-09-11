@@ -18,7 +18,7 @@ PodMesh is an independent Podman project for Linux hosts, not a Proxmox extensio
 
 ## Current scope
 
-An experimental Rust service and CLI provide local inventory, persistent host identity, an observation journal, and initial managed-container creation, deletion and cloning. These operations have been exercised on three laboratory hosts. Cloning is limited to network-disabled copies of stopped, PodMesh-created containers without volumes or bind mounts, taken through a committed snapshot image. Start/stop, migration integration, networking, general volume handling and high availability remain incomplete.
+An experimental Rust service and CLI provide local inventory, persistent host identity, an observation journal, and initial managed-container creation, explicit start and stop, deletion and cloning. These operations have been exercised on three laboratory hosts. They act only on network-disabled containers whose creation is recorded in the host's PodMesh journal. Start reports the observed outcome; stop requires a declared graceful timeout and escalation behavior. Cloning is limited to stopped containers without volumes or bind mounts, taken through a committed snapshot image. Migration integration, networking, general volume handling and high availability remain incomplete.
 
 The service currently exposes a root-only Unix socket and uses the default rootful Podman store. A request's authorization reference records provenance; it is not an implemented remote authorization system. The local administrator controls access.
 

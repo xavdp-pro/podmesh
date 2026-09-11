@@ -3,7 +3,7 @@ set -euo pipefail
 # Package directories must not inherit a group-writable build umask.
 umask 022
 cd "$(dirname "$0")/.."
-version=0.1.0~experimental3
+version=0.1.0~experimental4
 # Reported by the capabilities operation, so an installed binary identifies its package.
 PODMESH_PACKAGE_VERSION=$version cargo build --release --locked -j2
 work=$(mktemp -d)
@@ -21,13 +21,15 @@ Priority: optional
 Maintainer: Xavier de Poorter <xavier@xavdp.pro>
 Depends: libc6 (>= 2.39), libgcc-s1, podman, systemd, coreutils
 Description: Experimental local Podman lifecycle service
- Local root-only API and CLI with persistent host identity and observation
- journal, operating on the default rootful Podman store. Experimental managed
- operations: create a network-disabled container from a local image ID,
- delete a stopped container, and clone a stopped PodMesh-created container
+ Local root-only API and CLI with persistent host identity, observation
+ journal and operation attempt history, operating on the default rootful
+ Podman store. Experimental managed operations on network-disabled containers
+ recorded by this host's journal: create from a local image ID; explicit start
+ with an observed outcome; stop with a declared graceful timeout and declared
+ escalation; delete of a stopped container; clone of a stopped container
  without volumes or bind mounts through a committed snapshot image.
- Start/stop, networking, volumes, migration and high availability are not
- implemented in this version.
+ Networking, volumes, migration and high availability are not implemented in
+ this version.
 CONTROL
 cat > "$work/DEBIAN/postinst" <<'SCRIPT'
 #!/bin/sh

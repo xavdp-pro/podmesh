@@ -164,6 +164,8 @@ try:
     assert ok(delete_d)['replayed'] and ok(request('delete', d))['absent']
     deleted_c = ok(request('delete', c))
     assert deleted_c['snapshot_images_removed'] == [prepared]
+    refused(request('delete', e), 'delete of a universe container replaced out of band', 'does not match')
+    out('rm', E)
     ok(request('delete', e))
     checks.append('delete removes only this universe snapshots; repeated deletion is consistent')
     for name in forged: podman('rm', name, check=False)
