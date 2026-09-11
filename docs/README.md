@@ -253,3 +253,6 @@ users without SHAPER OS, and inside a SHAPER OS universe for our integration,
 reusing existing logs and supervision. Both modes must be tested; neither is
 implemented by this decision record. See INTENT.md and the Rust plan for access
 boundaries and the required deployment matrix.
+
+Shared supervision integration: [Shaper supervision](SHAPER-SUPERVISION.md) links
+to the common architectural definition instead of maintaining a second loop here.
