@@ -1,0 +1,15 @@
+[Unit]
+Description=PodMesh local operations service
+After=network.target
+[Service]
+ExecStart=/usr/bin/podmeshd
+RuntimeDirectory=podmesh
+RuntimeDirectoryMode=0700
+StateDirectory=podmesh
+StateDirectoryMode=0700
+UMask=0077
+ExecStartPre=/usr/bin/rm -f /run/podmesh/api.sock
+Restart=on-failure
+RestartSec=3
+[Install]
+WantedBy=multi-user.target

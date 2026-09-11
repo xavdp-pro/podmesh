@@ -1,0 +1,9 @@
+PodMesh
+Copyright 2026 Xavier de Poorter
+
+Developed collaboratively with OpenAI Codex (GPT-6 Astra).
+Claude Code contributes implementation and testing under operator delegation.
+
+The separate migration experiments build on CRIU and OpenVZ/Virtuozzo vzcriu.
+Their source code retains its own upstream license and attribution; the PodMesh
+license does not relicense those projects.

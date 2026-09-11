@@ -1,0 +1,7 @@
+/target/
+/dist/
+/evidence/
+.env
+.env.*
+*.pem
+*.key

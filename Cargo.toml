@@ -1,0 +1,10 @@
+[package]
+name = "podmesh"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Local Podman operations for human-agent tandems"
+
+[dependencies]
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
