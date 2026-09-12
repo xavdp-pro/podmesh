@@ -3,7 +3,7 @@ set -euo pipefail
 # Package directories must not inherit a group-writable build umask.
 umask 022
 cd "$(dirname "$0")/.."
-version=0.1.0~experimental4
+version=0.1.0~experimental5
 # Reported by the capabilities operation, so an installed binary identifies its package.
 PODMESH_PACKAGE_VERSION=$version cargo build --release --locked -j2
 work=$(mktemp -d)
@@ -28,8 +28,14 @@ Description: Experimental local Podman lifecycle service
  with an observed outcome; stop with a declared graceful timeout and declared
  escalation; delete of a stopped container; clone of a stopped container
  without volumes or bind mounts through a committed snapshot image.
- Networking, volumes, migration and high availability are not implemented in
- this version.
+ This version also carries the experimental migration operations, qualified in
+ the laboratory for one workload shape between two identical hosts: source
+ preflight and checkpoint with a durable reservation, transfer authorization,
+ destination preflight and restore with imported ownership, completion, source
+ retirement, and the recovery of a reservation that never left its host. They
+ require the separately packaged podmesh-vzcriu runtime and its helper shim.
+ Networking, volumes and high availability are not implemented in this version,
+ and a reservation is not fencing.
 CONTROL
 cat > "$work/DEBIAN/postinst" <<'SCRIPT'
 #!/bin/sh
