@@ -57,6 +57,10 @@ The entire SHAPER corpus has NOT been audited in this sequence. No canon changed
 
 ## Manager, governor and makers
 
+Its operating contract — replication, partition behavior, reconnection, priority,
+bootstrap and build order — is [CONTROL-SERVICES-UNIVERSE.md](CONTROL-SERVICES-UNIVERSE.md),
+the operator's design direction of 2026-09-12. This section keeps the earlier record.
+
 The manager universe, more precisely the **control-services universe**, is a
 Podman-hosted universe containing the registry, existing tools and, in the latest
 proposal, DNS. The word manager is a deployment label here, never a governance role:
@@ -268,7 +272,8 @@ Recorded when Xavier handed implementation over to Claude Code to conserve GPT u
 - P25 — placement agent: an agent observes measured CPU, memory, disk I/O and network
   use per host and proposes rebalancing. Proposals become desired state only through
   the governor's ledger; makers execute them through PodMesh operations. Requested
-  direction / OPEN; no metric collection or placement logic exists.
+  direction / OPEN; no metric collection or placement logic exists. See "Placement and
+  rebalancing" below for the three automation levels and their prerequisites.
 - P26 — no shared cluster filesystem and no global quorum dependency: persistence moves
   by explicit checkpoint, replication and backup (P09, P10, Backup Server). Losing a
   host loses that host, not the ability to rebuild its universes elsewhere. DECIDED
@@ -276,6 +281,40 @@ Recorded when Xavier handed implementation over to Claude Code to conserve GPT u
 - Migration transfer authority and source exclusion: see
   [MIGRATION-PROTOCOL.md](MIGRATION-PROTOCOL.md), a provisional design taken under the
   standing mandate.
+
+### Placement and rebalancing
+
+The operator's comparison is automatic resource balancing in commercial hypervisors.
+That product balances live-migrated virtual machines under a central cluster authority
+with shared storage. PodMesh moves a workload by stopping, copying and restoring it: the
+pause is real and its duration is not yet measured, mobility is proven for one workload
+shape without networking or volumes, and there is deliberately no central authority and
+no shared filesystem. Automatic rebalancing of running universes is therefore not the
+first target; it is the last.
+
+Who organizes placement does not change: an agent measures and proposes, the governor
+writes the desired placement as ledger rows, each host's maker invokes PodMesh, and
+PodMesh reports facts. The agent never moves a universe itself, and being able to read
+every host's metrics grants it no authority over any of them.
+
+Three levels, in the order they become defensible:
+
+1. **Placement at birth.** Choose the host for a universe that does not exist yet, from
+   measured free capacity and declared constraints. No move, no pause, no data risk; it
+   captures most of the value and needs only the metric collection and a capacity record.
+2. **Advisory rebalancing.** The agent proposes a move with its reason, its measured cost
+   (archive size, expected pause, required free space on both hosts) and its rollback
+   path. A human or an authorized maker accepts. Nothing moves without that acceptance.
+3. **Bounded automatic rebalancing.** Only under a standing mandate that names what may
+   move (never an exclusive production universe), between which hosts, how often, within
+   which hours, and what stops it. It requires anti-flapping bounds in the sense of the
+   convergence guard: hysteresis, a cooldown per universe, and a fleet-wide stop when too
+   many moves fail.
+
+Prerequisites shared by levels 2 and 3, none of which exist today: per-universe measured
+resource use, a cost model of moving, network identity that survives a move, volume
+handling, and a measured downtime figure. Until they do, an automatic mover would be
+optimizing a placement while risking the workload it moves.
 
 Shared supervision integration: [Shaper supervision](SHAPER-SUPERVISION.md) links
 to the common architectural definition instead of maintaining a second loop here.
