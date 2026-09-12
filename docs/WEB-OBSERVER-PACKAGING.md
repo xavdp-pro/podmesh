@@ -15,7 +15,8 @@ created: the API is a root-only Unix socket.
 | Persistent identity and observation journal | `/var/lib/podmesh-web-observer` |
 
 The unit sets `PODMESH_READ_ONLY=1`. The corresponding Rust guard accepts only
-`identity`, `capabilities`, `inventory`, `observations`, and `container_details`.
+`identity`, `capabilities`, `inventory`, `observations`, `container_details`, and
+`host_resource_metrics`.
 This is an application guard, not a privilege sandbox. The service runs as root
 because the current explorer observes the default rootful Podman store and uses
 `podman exec` to inspect running nested stores. Queries can update observation
@@ -88,5 +89,7 @@ The checked items passed on three Debian 13 laboratory hosts for package
 was then published to the signed `trixie-experimental` APT suite. These checks
 do not establish clean-host compatibility, long-duration operation or HA.
 Container details cover the default rootful nested store only. Rootless stores,
-fractal authority, HA, available filesystem capacity, and production deployment
-are outside this package's claim.
+fractal authority, HA, per-universe persistent-volume capacity, and production
+deployment are outside this package's claim. The next package version adds bounded
+host RAM, CPU/load and filesystem-capacity observations; its upgrade and target
+results must be recorded separately before changing the checklist above.

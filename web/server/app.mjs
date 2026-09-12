@@ -14,8 +14,11 @@ export function createApp(config,{call=request,origin='http://127.0.0.1:4175'}={
  app.get('/api/snapshot',async(_req,res)=>{
   if(!cached||Date.now()-cached.receivedAt>10000){
    const captured=generation;loading??=Promise.all(hosts.map(async h=>{
-    const row={id:h.id,name:h.name,allowActions:!!h.allowActions,responses:{},errors:{},receivedAt:Date.now()};
-    for(const operation of ['identity','capabilities','inventory','observations']){try{const response=await call(h,{operation},{timeout:15000});row.responses[operation]=response;if(!response.ok)row.errors[operation]=response.error||'API refused';}catch(e){row.errors[operation]=e.message;break;}}
+    const row={id:h.id,name:h.name,allowActions:!!h.allowActions,responses:{},errors:{},optionalErrors:{},receivedAt:Date.now()};
+    for(const operation of ['identity','capabilities','inventory','observations','host_resource_metrics']){
+     if(operation==='host_resource_metrics'&&!row.responses.capabilities?.data?.operations?.includes(operation))continue;
+     try{const response=await call(h,{operation},{timeout:operation==='host_resource_metrics'?18000:15000});row.responses[operation]=response;if(!response.ok){if(operation==='host_resource_metrics')row.optionalErrors[operation]=response.error||'Metrics API refused';else row.errors[operation]=response.error||'API refused';}}catch(e){if(operation==='host_resource_metrics')row.optionalErrors[operation]=e.message;else{row.errors[operation]=e.message;break;}}
+    }
     row.receivedAt=Date.now();return row;
    })).then(rows=>{const snapshot={receivedAt:Date.now(),hosts:rows};if(captured===generation)cached=snapshot;return snapshot;}).finally(()=>loading=null);
    const snapshot=await loading;return res.json(snapshot);

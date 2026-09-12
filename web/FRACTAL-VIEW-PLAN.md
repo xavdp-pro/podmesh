@@ -26,7 +26,7 @@ Physical Podman nesting is not authoritative Shaper parentage. A nested containe
 
 Use fixtures with multiple roots, descendants on different hosts, a migrated node retaining its parent, missing/offline parents, conflicting edges and cycles. Verify filters keep ancestor context and clearing search preserves the selected fractal/node. Then qualify the same behavior against the real relationship API.
 
-Status: planned; relationship API integration is not implemented by the current container explorer.
+Status: the read-only console view and pure relationship model are implemented. The live console reports the relationship source as unavailable and lists observed, unassigned universes separately. Manager relationship API integration and live tree qualification remain open.
 
 ## Per-fractal statistics
 
@@ -37,3 +37,5 @@ Aggregation requires membership from the logical relationship registry, timestam
 Show measurement coverage, sample age and unavailable contributors beside totals. Missing or stale observations are not zero; mark incomplete totals partial. CPU percentages require normalization to CPU count and compatible sample windows. Configured limits and actual use are separate series. Fractal totals must not include unrelated workloads on the same host.
 
 Test overlapping parent/child accounting, shared disks, multi-host membership, migration overlap, stale samples and partial host loss before presenting totals as complete.
+
+The implemented aggregation counts each universe UUID once and each explicit accounting scope once. Missing, stale, future-dated, invalid or overlapping measurements make the result partial; incompatible CPU sample windows are not summed, and a wholly absent measurement is unknown rather than zero. Current fixture tests cover cross-host trees, ancestor context under filters, missing parents, conflicting records, visible cycles, shared accounting scopes, filtered totals, stale samples, incompatible CPU windows, malformed universe UUIDs, duplicate fractal names and bounded-input degradation. Live resource aggregation remains unavailable until the manager supplies relationship and per-universe accounting records.

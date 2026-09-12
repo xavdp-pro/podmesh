@@ -52,6 +52,10 @@ The historical milestone descriptions below retain their original scope. The cur
 
 ### 3. Availability and fractal operation
 
+- [x] Qualify the local append-only observation store, frozen bounded exchange pages, exact-byte replay, refusal-aware receipts, third-copy catch-up and writer contention in isolated stores. This is not authenticated network replication or HA. Evidence: `experiments/registry/README.md` and its test suites.
+- [x] Make the manager partition/reconnect rules executable in an isolated deterministic three-replica model: non-overlapping disconnected scopes, history convergence before coordination, newer facts preserved, exclusive conflicts blocked, inactive replicas silent and stale-copy catch-up. This is not a deployed manager or failover proof. Evidence: `experiments/manager-ha/README.md` and its test suite.
+- [x] Implement a read-only fractal forest model and console view from explicit manager relationship records only, with filters, conflict/cycle reporting and partial statistics. Fixture tests pass; the live manager relationship API remains unavailable.
+- [ ] Publish and qualify the host-resource observer update on all three laboratory hosts; source and browser tests currently pass, but the installed observer version predates the operation.
 - [ ] Validate periodic coherent disk/memory recovery points and quantify rollback.
 - [ ] Test host loss, partition and reconnection; distinguish unreachable from stopped.
 - [ ] Prove exclusion before activating a replacement for an exclusive universe.

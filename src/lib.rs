@@ -1,6 +1,7 @@
 mod cleanup;
 mod collector;
 mod explorer;
+mod host_metrics;
 mod lifecycle;
 mod migration;
 mod recovery;
@@ -114,6 +115,7 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
                 "identity",
                 "capabilities",
                 "inventory",
+                "host_resource_metrics",
                 "observations",
                 "container_details",
             ]
@@ -143,7 +145,7 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
             "migration_status" => migration::status(db, request)?,
             "capabilities" => json!({
                 "version":option_env!("PODMESH_PACKAGE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
-                "operations":["capabilities","identity","container_details","inventory","observations","create","delete","clone","start","stop"],
+                "operations":["capabilities","identity","container_details","host_resource_metrics","inventory","observations","create","delete","clone","start","stop"],
                 "experimental_operations":["migration_preflight","migration_checkpoint","migration_status","migration_authorize_transfer",
                     "migration_complete_transfer","migration_retire_source","migration_release","migration_abandon","migration_restore_local",
                     "migration_destination_preflight","migration_restore","migration_restore_abort",
@@ -180,6 +182,7 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
                 json!({"host_uuid":db.query_row("SELECT value FROM metadata WHERE key='host_uuid'",[],|r|r.get::<_,String>(0))?})
             }
             "container_details" => explorer::inspect(request)?,
+            "host_resource_metrics" => host_metrics::observe(),
             "inventory" => json!({"containers":inventory()?,"store":"default rootful Podman"}),
             "observations" => {
                 let mut stmt = db.prepare(
