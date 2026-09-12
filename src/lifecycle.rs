@@ -1,6 +1,6 @@
 //! Local managed-container operations. No implicit image pulls or network access.
 use crate::migration::{self, Binding};
-use crate::{restore, transfer};
+use crate::{recovery, restore, transfer};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::{
@@ -20,7 +20,7 @@ const SNAPSHOT_FOR: &str = "io.podmesh.snapshot-for";
 const SNAPSHOT_OPERATION: &str = "io.podmesh.snapshot-operation";
 const SNAPSHOT_SOURCE: &str = "io.podmesh.snapshot-source-container";
 const SNAPSHOT_REPOSITORY: &str = "localhost/podmesh-clone:";
-const OPERATIONS: [&str; 13] = [
+const OPERATIONS: [&str; 16] = [
     "create",
     "delete",
     "clone",
@@ -31,6 +31,9 @@ const OPERATIONS: [&str; 13] = [
     "migration_authorize_transfer",
     "migration_complete_transfer",
     "migration_retire_source",
+    "migration_release",
+    "migration_abandon",
+    "migration_restore_local",
     "migration_destination_preflight",
     "migration_restore",
     "migration_restore_abort",
@@ -96,6 +99,15 @@ enum Params<'a> {
     MigrationRetire {
         authorization: &'a str,
     },
+    MigrationRelease {
+        checkpoint: &'a str,
+    },
+    MigrationAbandon {
+        checkpoint: &'a str,
+    },
+    MigrationRestoreLocal {
+        checkpoint: &'a str,
+    },
     DestinationPreflight {
         authorization: &'a str,
     },
@@ -104,6 +116,8 @@ enum Params<'a> {
     },
     MigrationRestoreAbort {
         authorization: &'a str,
+        reference: &'a str,
+        reclaim_processes: bool,
     },
 }
 impl Params<'_> {
@@ -119,6 +133,9 @@ impl Params<'_> {
             Params::MigrationAuthorize { .. } => "migration_authorize_transfer",
             Params::MigrationComplete { .. } => "migration_complete_transfer",
             Params::MigrationRetire { .. } => "migration_retire_source",
+            Params::MigrationRelease { .. } => "migration_release",
+            Params::MigrationAbandon { .. } => "migration_abandon",
+            Params::MigrationRestoreLocal { .. } => "migration_restore_local",
             Params::DestinationPreflight { .. } => "migration_destination_preflight",
             Params::MigrationRestore { .. } => "migration_restore",
             Params::MigrationRestoreAbort { .. } => "migration_restore_abort",
@@ -296,9 +313,10 @@ pub(crate) fn observe(uuid: &str) -> Result<Value, Error> {
 /// migration handoff, still carried by the same container. A matching label alone is not enough.
 pub(crate) fn owned(db: &Connection, c: &Value, uuid: &str, role: &str) -> Result<(), Error> {
     // A restored container keeps the source journal's creation label, which this journal does not know: its
-    // ownership is the verified migration_restore that binds this universe to this container ID.
+    // ownership is the verified migration_restore that binds this universe to this container ID. A local
+    // restore from a preserved archive produces a new container ID the same way.
     if let Some(id) = c["Id"].as_str() {
-        if restore::restored_here(db, uuid, id)? {
+        if restore::restored_here(db, uuid, id)? || recovery::restored_locally(db, uuid, id)? {
             return Ok(());
         }
     }
@@ -421,6 +439,17 @@ fn parse<'a>(operation: &str, uuid: &str, request: &'a Value) -> Result<Params<'
                 authorization_ref: text(request, "authorization_ref")?,
             }
         }
+        // The recovery operations name the checkpoint whose reservation they act on, so that a request
+        // can never resolve to a reservation the caller did not mean.
+        "migration_release" | "migration_abandon" | "migration_restore_local" => {
+            let checkpoint = text(request, "checkpoint_operation_id")?;
+            token(checkpoint).map_err(|_| "checkpoint_operation_id must contain 1-80 ASCII letters, digits or hyphens")?;
+            match operation {
+                "migration_release" => Params::MigrationRelease { checkpoint },
+                "migration_abandon" => Params::MigrationAbandon { checkpoint },
+                _ => Params::MigrationRestoreLocal { checkpoint },
+            }
+        }
         "migration_complete_transfer"
         | "migration_retire_source"
         | "migration_destination_preflight"
@@ -436,7 +465,18 @@ fn parse<'a>(operation: &str, uuid: &str, request: &'a Value) -> Result<Params<'
                 "migration_retire_source" => Params::MigrationRetire { authorization },
                 "migration_destination_preflight" => Params::DestinationPreflight { authorization },
                 "migration_restore" => Params::MigrationRestore { authorization },
-                _ => Params::MigrationRestoreAbort { authorization },
+                _ => {
+                    // Explicit, typed and default false: ending processes is never implied by an abort.
+                    let reclaim_processes = match request.get("reclaim_processes") {
+                        None | Some(Value::Null) => false,
+                        Some(v) => v.as_bool().ok_or("reclaim_processes must be true or false")?,
+                    };
+                    Params::MigrationRestoreAbort {
+                        authorization,
+                        reference: text(request, "authorization_ref")?,
+                        reclaim_processes,
+                    }
+                }
             }
         }
         _ => Params::Delete,
@@ -592,9 +632,16 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
         } => transfer::authorize(db, id, uuid, checkpoint, destination, authorization_ref, existing),
         Params::MigrationComplete { authorization } => transfer::complete(db, id, uuid, authorization, existing),
         Params::MigrationRetire { authorization } => transfer::retire(db, id, uuid, &name, authorization, existing),
+        Params::MigrationRelease { checkpoint } => recovery::release(db, id, uuid, checkpoint, existing),
+        Params::MigrationAbandon { checkpoint } => recovery::abandon(db, id, uuid, checkpoint, existing),
+        Params::MigrationRestoreLocal { checkpoint } => recovery::restore_local(db, attempt, id, uuid, &name, checkpoint, existing),
         Params::DestinationPreflight { authorization } => restore::preflight(db, uuid, authorization, existing),
         Params::MigrationRestore { authorization } => restore::restore(db, attempt, id, uuid, &name, authorization, existing),
-        Params::MigrationRestoreAbort { authorization } => restore::abort(db, id, uuid, &name, authorization, existing),
+        Params::MigrationRestoreAbort {
+            authorization,
+            reference,
+            reclaim_processes,
+        } => restore::abort(db, id, uuid, &name, authorization, reference, *reclaim_processes, existing),
     }
 }
 fn create(id: &str, uuid: &str, name: &str, existing: Option<Value>, image: &str, command: &[&str]) -> Result<Value, Error> {
@@ -737,7 +784,17 @@ fn start(
     } else {
         "the application exited during the observation window"
     };
-    Ok(start_result(&c, uuid, "started", observe_seconds, note))
+    let mut result = start_result(&c, uuid, "started", observe_seconds, note);
+    // Starting a released universe begins its application afresh. Say so: the caller chose this over
+    // migration_restore_local, which is the operation that resumes the checkpointed memory.
+    if let Some(r) = migration::reservation(db, uuid)? {
+        result["memory_restored"] = json!(false);
+        result["memory_note"] = json!(format!(
+            "this is an ordinary start of a universe whose reservation is {}: the checkpointed memory was not restored and the application began afresh; migration_restore_local resumes it instead",
+            r.state
+        ));
+    }
+    Ok(result)
 }
 #[allow(clippy::too_many_arguments)]
 fn stop_result(

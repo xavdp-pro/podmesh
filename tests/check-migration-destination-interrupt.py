@@ -95,7 +95,7 @@ try:
     B.windows.append((interruption['first_response']['begin_ns'], interruption['first_response']['end_ns'], 'migration_restore',
                       restore_request['operation_id']))
     at_kill = interruption['at_kill']
-    assert interruption['first_response']['response'].get('interrupted') is True, interruption['first_response']
+    assert interruption['first_response']['response'].get('interrupted') is True, (at_kill, interruption['first_response'])
     assert at_kill['restore_command_pids'] and at_kill['scope_before_kill'] == 'active', at_kill
     assert at_kill['restore_command_alive_after_kill'] is True, ('the restore command did not survive the service kill', at_kill)
     checks.append('[destination] the service was killed with SIGKILL while its Podman restore command ran; the command survived in its own '

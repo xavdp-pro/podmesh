@@ -3,9 +3,11 @@
 //! Scope: the default rootful Podman store; network-disabled, mount-free containers owned by this
 //! host's journal whose processes are musl-based; checkpoint with the separately packaged
 //! podmesh-vzcriu runtime through its private-path shim, never the distribution CRIU.
-//! Transfer authorization and completion live in `transfer.rs`, destination restore in `restore.rs`
-//! (docs/MIGRATION-PROTOCOL.md). Reservation release and abandonment are not implemented.
+//! Transfer authorization and completion live in `transfer.rs`, destination restore in `restore.rs`,
+//! and the recovery paths of a reservation that never left this host — release, abandonment and local
+//! restore — in `recovery.rs` (docs/MIGRATION-PROTOCOL.md).
 //! A checkpoint result never authorizes a restore: only a transfer authorization issues a handoff.
+use crate::cleanup::{Bound, Watch};
 use crate::lifecycle::{self as lc, failure, Error};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -16,6 +18,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     sync::OnceLock,
+    thread,
+    time::{Duration, Instant},
 };
 
 pub(crate) const RUNTIME_REAL: &str = "/usr/lib/podmesh-vzcriu/criu";
@@ -41,7 +45,10 @@ pub(crate) const SPACE_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const CONTAINER_STORAGE: &str = "/var/lib/containers/storage";
 const SCOPE: &str = "experimental source-side checkpoint: default rootful Podman store, network-disabled, mount-free, journal-owned container with musl processes, packaged podmesh-vzcriu 3.15.5.3 through its private-path shim";
 const AUTHORITY: &str = "This checkpoint does not authorize restore on any host and does not release the reservation. Only migration_authorize_transfer issues a handoff, and only a verified destination outcome bound to it ends the reservation.";
-const RELEASE_GAP: &str = "No release operation exists in this version (lot M3). Releasing would let the source universe run again; the protocol permits it only when no transfer authorization was ever issued for the reservation. Restarting the application would start it fresh, not resume the checkpointed memory.";
+/// Reservation states this file and `recovery.rs` share.
+pub(crate) const RELEASED: &str = "released";
+pub(crate) const ABANDONED: &str = "abandoned";
+pub(crate) const RESTORED_LOCALLY: &str = "restored_locally";
 
 /// Identity binding carried by every migration request.
 pub(crate) struct Binding<'a> {
@@ -159,6 +166,11 @@ pub(crate) fn merge_state(db: &Connection, uuid: &str, state: &str, patch: &Valu
 pub(crate) fn refuse_if_reserved(db: &Connection, uuid: &str, operation: &str) -> Result<(), Error> {
     ensure_schema(db)?;
     if let Some(r) = reservation(db, uuid)? {
+        // A released reservation holds nothing: migration_release lifted the gate deliberately, and the
+        // row stays only so that migration_restore_local can still resume its preserved memory.
+        if r.state == RELEASED {
+            return Ok(());
+        }
         return Err(failure(
             format!(
                 "Universe {uuid} is reserved by migration operation {} (state {}); {operation} is refused while the reservation exists",
@@ -191,21 +203,25 @@ pub(crate) fn transferred_away(db: &Connection, uuid: &str, container_id: &str) 
         |r| r.get::<_, bool>(0),
     )?)
 }
-/// Moves a `transferred` reservation to history when a verified restore brings the universe back to this host;
-/// the caller holds the transaction. Returns whether a row was archived.
-pub(crate) fn archive_transferred(db: &Connection, uuid: &str, operation: &str) -> Result<bool, Error> {
+/// Moves a reservation in one given state to history; the caller holds the transaction. Returns whether a row
+/// was archived. Used when a verified restore brings a `transferred` universe back to this host, when a
+/// verified local restore ends a `released` reservation, and when a new checkpoint supersedes a released one.
+pub(crate) fn archive_reservation(db: &Connection, uuid: &str, operation: &str, state: &str) -> Result<bool, Error> {
     let moved = db.execute(
         "INSERT INTO migration_reservation_history(universe_uuid,operation_id,container_id,image_id,source_host_uuid,destination_host_uuid,
          container_started_at,state,created_at,updated_at,detail,archived_at,archived_by_operation)
          SELECT universe_uuid,operation_id,container_id,image_id,source_host_uuid,destination_host_uuid,container_started_at,state,created_at,
-         updated_at,detail,?2,?3 FROM migration_reservations WHERE universe_uuid=?1 AND state='transferred'",
-        params![uuid, crate::now() as i64, operation],
+         updated_at,detail,?3,?4 FROM migration_reservations WHERE universe_uuid=?1 AND state=?2",
+        params![uuid, state, crate::now() as i64, operation],
     )?;
     db.execute(
-        "DELETE FROM migration_reservations WHERE universe_uuid=?1 AND state='transferred'",
-        [uuid],
+        "DELETE FROM migration_reservations WHERE universe_uuid=?1 AND state=?2",
+        params![uuid, state],
     )?;
     Ok(moved > 0)
+}
+pub(crate) fn archive_transferred(db: &Connection, uuid: &str, operation: &str) -> Result<bool, Error> {
+    archive_reservation(db, uuid, operation, "transferred")
 }
 fn history_view(db: &Connection, uuid: &str) -> Result<Vec<Value>, Error> {
     let mut stmt = db.prepare(
@@ -580,6 +596,11 @@ pub(crate) fn unit_busy(unit: &str) -> bool {
 /// with systemd 257). Podman then leaves conmon inside the scope, which stays active for as long as a
 /// restored universe runs; the variable is therefore removed inside the scope as well, so that conmon moves
 /// to its own libpod-conmon scope and this scope ends with the Podman command.
+///
+/// With a `bound`, the command is watched while it runs and stopped if it consumes more of the Podman
+/// graph root than its own preflight required, or if that filesystem falls below the floor: a restore of
+/// a damaged archive was measured writing about 20 MB/s without ever returning. The returned value
+/// describes that measurement whether or not it had to act; without a bound it says `watched: false`.
 pub(crate) fn scoped_podman(
     unit: &str,
     id: &str,
@@ -587,14 +608,15 @@ pub(crate) fn scoped_podman(
     args: &[&str],
     stdout: fs::File,
     stderr: fs::File,
-) -> Result<ExitStatus, Error> {
-    let unit = format!("--unit={unit}");
+    bound: Option<&Bound>,
+) -> Result<(ExitStatus, Value), Error> {
+    let unit_argument = format!("--unit={unit}");
     let limit = seconds.to_string();
     let temporary = base()?.join(".tmp").join(id);
     fs::create_dir_all(&temporary)?;
     fs::set_permissions(base()?.join(".tmp"), fs::Permissions::from_mode(0o700))?;
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700))?;
-    Ok(Command::new("/usr/bin/systemd-run")
+    let mut child = Command::new("/usr/bin/systemd-run")
         .env("PATH", RUNTIME_PATH)
         .env("TMPDIR", &temporary)
         .env_remove("INVOCATION_ID")
@@ -602,7 +624,7 @@ pub(crate) fn scoped_podman(
             "--scope",
             "--quiet",
             "--collect",
-            &unit,
+            &unit_argument,
             "--",
             "/usr/bin/env",
             "-u",
@@ -617,7 +639,22 @@ pub(crate) fn scoped_podman(
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(stderr)
-        .status()?)
+        .spawn()?;
+    let begin = Instant::now();
+    let mut watch = bound.map(Watch::start);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let measurement = match (&watch, bound) {
+                (Some(w), Some(b)) => w.view(b),
+                _ => json!({"watched": false}),
+            };
+            return Ok((status, measurement));
+        }
+        if let (Some(w), Some(b)) = (watch.as_mut(), bound) {
+            w.step(b, begin.elapsed().as_secs_f64());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
 }
 /// The checkpoint runs in its own scope (see `scoped_podman`): a service crash or restart must not kill
 /// CRIU mid-dump, which was observed to destroy the application without producing an archive. The command
@@ -625,7 +662,9 @@ pub(crate) fn scoped_podman(
 /// the checks cannot be captured.
 fn checkpoint_command(id: &str, container_id: &str, archive: &Path, stdout: fs::File, stderr: fs::File) -> Result<ExitStatus, Error> {
     let export = format!("--export={}", archive.display());
-    scoped_podman(
+    // No space bound here: a dump writes what the preflight measured and was never observed running
+    // away, unlike a restore of a damaged archive. Adding one would need its own measurement.
+    Ok(scoped_podman(
         &scope_unit(id),
         id,
         CHECKPOINT_SECONDS,
@@ -641,7 +680,9 @@ fn checkpoint_command(id: &str, container_id: &str, archive: &Path, stdout: fs::
         ],
         stdout,
         stderr,
-    )
+        None,
+    )?
+    .0)
 }
 
 pub(crate) fn checkpoint(
@@ -654,6 +695,13 @@ pub(crate) fn checkpoint(
     existing: Option<Value>,
 ) -> Result<Value, Error> {
     let dir = base()?.join(id);
+    // A released reservation holds nothing and must not block a new checkpoint of the same universe:
+    // it is archived, with its history and its preserved artifacts, and this operation reserves afresh.
+    if let Some(r) = reservation(db, uuid)? {
+        if r.state == RELEASED && r.operation_id != id {
+            archive_reservation(db, uuid, id, RELEASED)?;
+        }
+    }
     match reservation(db, uuid)? {
         Some(r) if r.operation_id != id => Err(failure(
             format!(
@@ -920,8 +968,69 @@ pub(crate) fn verify_artifacts(id: &str, archive_sha256: Option<&str>, manifest_
     }))
 }
 
+/// Reservation states that are a finished record rather than a decision still owed to someone.
+const SETTLED: [&str; 3] = [RELEASED, ABANDONED, "transferred"];
+/// What an outside observer needs in order to report on this universe without running anything: what is
+/// unresolved and since when, what a failed restore left behind, and the room left where it would write.
+///
+/// Every fact carries the time it was observed. What cannot be established is reported as unknown, with
+/// the reason: an absent or unreadable observation must never read as a healthy one. In particular, once a
+/// container's cgroups are gone, the surviving-process question can only be answered by a command-line
+/// scan, which is a hint and not proof, and it is labelled as such.
+fn watch_view(r: Option<&Reservation>, claims: &[Value], authorizations: &[Value]) -> Result<Value, Error> {
+    let now = crate::now();
+    let unresolved: Vec<Value> = claims
+        .iter()
+        .filter(|k| matches!(k["state"].as_str(), Some("restoring") | Some("restore_failed")))
+        .map(|k| {
+            let container = k["container_id"].as_str();
+            let claimed_at = k["created_at"].as_i64().unwrap_or(0);
+            let processes = match container {
+                Some(id) => crate::cleanup::runtime_processes(id, claimed_at),
+                // A claim that never recorded a container may still have created one: nothing here can
+                // say it did not, so the honest answer is unknown, not zero.
+                None => json!({"observed_at": now, "known": false,
+                    "reason": "this claim recorded no container, so no cgroup can be read for it; a container may still exist under the universe name"}),
+            };
+            json!({"authorization_id": k["authorization_id"], "state": k["state"], "since": k["updated_at"],
+                "claimed_at": k["created_at"], "container_id": container, "runtime_processes": processes,
+                "allowance_bytes": k["detail"]["prevention"]["allowance_bytes"],
+                "prevention_stopped_the_attempt": k["detail"]["prevention"]["stopped"]})
+        })
+        .collect();
+    let open: Vec<Value> = authorizations
+        .iter()
+        .filter(|a| a["state"].as_str() == Some("issued"))
+        .map(|a| {
+            json!({"authorization_id": a["authorization_id"], "state": a["state"], "since": a["updated_at"],
+            "destination_host_uuid": a["destination_host_uuid"]})
+        })
+        .collect();
+    // Where a restore writes, and how much room is left there against what an unresolved attempt was
+    // allowed. A graph root that cannot be read is unknown, not empty.
+    let graph_root = lc::podman(lc::QUICK, &["info", "--format", "{{.Store.GraphRoot}}"])
+        .map(|g| g.trim().to_string())
+        .ok();
+    let graph = match graph_root {
+        Some(ref path) => json!({"observed_at": now, "known": true, "path": path,
+            "available_bytes": available_bytes(Path::new(path)),
+            "is_the_qualified_default_store": path == CONTAINER_STORAGE,
+            "required_bytes_for_unresolved_attempts": unresolved.iter().map(|k| k["allowance_bytes"].clone()).collect::<Vec<_>>()}),
+        None => json!({"observed_at": now, "known": false, "reason": "Podman did not report its graph root"}),
+    };
+    Ok(json!({
+        "observed_at": now,
+        "reservation": r.map(|r| json!({"state": r.state, "since": r.updated_at, "created_at": r.created_at,
+            "blocks_generic_operations": r.state != RELEASED, "awaiting_decision": !SETTLED.contains(&r.state.as_str())})),
+        "unresolved_restore_claims": unresolved,
+        "open_transfer_authorizations": open,
+        "graph_root": graph,
+        "note": "read-only facts for an observer. A count of runtime processes is authoritative only when it comes from cgroup residency (source cgroup_residency, authorizes_reclaim true); a cmdline_fallback count is a hint about a container whose cgroups are already gone, and an unknown is not a zero.",
+    }))
+}
+
 /// Read-only: reservation, fresh observation, artifact verification, transfer authorizations, restore claims,
-/// archived reservations and release preconditions.
+/// archived reservations, release preconditions and the observer summary.
 pub(crate) fn status(db: &Connection, request: &Value) -> Result<Value, Error> {
     let uuid = lc::text(request, "universe_uuid")?;
     if !lc::is_uuid(uuid) {
@@ -934,9 +1043,10 @@ pub(crate) fn status(db: &Connection, request: &Value) -> Result<Value, Error> {
     let claims = crate::restore::claims_view(db, uuid)?;
     let history = history_view(db, uuid)?;
     let Some(r) = r else {
+        let watch = watch_view(None, &claims, &authorizations)?;
         return Ok(
             json!({"universe_uuid": uuid, "reservation": null, "current": current, "transfer_authorizations": authorizations,
-            "restore_claims": claims, "reservation_history": history}),
+            "restore_claims": claims, "reservation_history": history, "watch": watch}),
         );
     };
     let issued = authorizations
@@ -957,6 +1067,15 @@ pub(crate) fn status(db: &Connection, request: &Value) -> Result<Value, Error> {
     let same = container
         .as_ref()
         .is_some_and(|c| c["Id"].as_str() == Some(r.container_id.as_str()));
+    let observed = json!({
+        "source_container_present": container.is_some(),
+        "same_reserved_container": same,
+        "source_not_running": container.as_ref().is_some_and(|c| !lc::process_active(c)),
+        "source_checkpointed": container.as_ref().is_some_and(|c| c["State"]["Checkpointed"] == true),
+        "transfer_authorizations_issued_for_reservation": issued,
+    });
+    let recovery = crate::recovery::availability(db, uuid, &r, container.as_ref(), issued, &artifacts)?;
+    let watch = watch_view(Some(&r), &claims, &authorizations)?;
     Ok(json!({
         "universe_uuid": uuid,
         "reservation": r.view(),
@@ -965,17 +1084,14 @@ pub(crate) fn status(db: &Connection, request: &Value) -> Result<Value, Error> {
         "transfer_authorizations": authorizations,
         "restore_claims": claims,
         "reservation_history": history,
+        "recovery": recovery,
+        "watch": watch,
         "release": {
-            "permitted": false,
-            "operation_available": false,
-            "reason": RELEASE_GAP,
-            "preconditions_observed": {
-                "source_container_present": container.is_some(),
-                "same_reserved_container": same,
-                "source_not_running": container.as_ref().is_some_and(|c| !lc::process_active(c)),
-                "source_checkpointed": container.as_ref().is_some_and(|c| c["State"]["Checkpointed"] == true),
-                "transfer_authorizations_issued_for_reservation": issued,
-            },
+            "permitted": recovery["release"]["permitted"],
+            "operation_available": true,
+            "reason": recovery["release"]["reason"],
+            "blockers": recovery["release"]["blockers"],
+            "preconditions_observed": observed,
         },
     }))
 }

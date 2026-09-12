@@ -198,9 +198,95 @@ implemented, so a reservation still has no local way out.
 14. **`migration_status` reports authorizations, restore claims and archived reservations** beside the
     reservation, so one read-only call shows both sides of a migration on either host.
 
+## Deviations recorded by the recovery implementation (lot M3)
+
+Implemented on 2026-09-12 by Claude Code (Opus 5) in the development tree and exercised on two lab hosts.
+Each entry is either a decision this protocol did not settle or a difference from what it describes. Xavier
+may amend any of them. The M2 entries above are unchanged.
+
+1. **The recovery operations name their reservation.** `migration_release`, `migration_abandon` and
+   `migration_restore_local` all require `checkpoint_operation_id`, matched against the reservation's own
+   operation, like `migration_authorize_transfer`. The table above names no parameters; binding them this
+   way means a request can never resolve to a reservation the caller did not mean.
+2. **`migration_abandon` also accepts `checkpointed`**, still only with the reserved container absent. The
+   table lists `reserved`, `checkpointing` and `checkpoint_failed`. A `checkpointed` reservation whose
+   container was removed out of band — which the source milestone's own test leaves behind — otherwise has
+   no way out at all: release requires a fresh observation of that container, and abandonment excluded the
+   state. Abandonment grants nothing (the universe UUID stays refused exactly as the stuck reservation
+   did); it only records the decision and stops a dead reservation from looking like a live migration. The
+   cost is explicit in the result: abandoning a `checkpointed` reservation gives up the local restore of
+   its preserved memory.
+3. **"No authorization ever issued" is applied strictly, and it leaves a real gap.** A reservation whose
+   authorization ended `not_restored` — the destination proved it did not restore — can be authorized
+   again but can never be released or abandoned, because an authorization *was* issued for it. This
+   follows the protocol as written and invariant 3, and it is what the tests demonstrate. The smallest
+   amendment, if Xavier wants one, is to permit release and abandonment when **every** authorization
+   recorded for the reservation is `ended_not_restored`, since each of those is a verified destination
+   outcome proving non-restoration. Not implemented, deliberately: it changes an authority rule.
+4. **`released` is a reservation state, not a deleted row.** The row stays so that
+   `migration_restore_local` can still find the reservation, its artifacts and its identities, but it
+   blocks no generic operation. A new `migration_checkpoint` of that universe archives the released row
+   into the history table and reserves afresh, rather than being refused as "already reserved".
+5. **A verified local restore archives its reservation** as `restored_locally`, exactly as a verified
+   destination restore archives a `transferred` one, so the universe is fully operable again. The protocol
+   asked for this shape to be decided; this is the decision.
+6. **Ownership after a local restore from the archive.** The restored container carries the original
+   creation label with a new container ID, so `owned()` accepts a verified `migration_restore_local`
+   binding the universe UUID to that ID, beside the verified create, clone and `migration_restore` it
+   already accepted. An in-place restore keeps its container ID and needs nothing new.
+7. **An ordinary `start` of a released universe states that memory was not restored** (`memory_restored:
+   false` with a note). The protocol asks the result to say so; this is the field it says it in.
+8. **A restore attempt is bounded while it runs.** The protocol says nothing about resource cost. A restore
+   of a damaged archive was measured writing about 20 MB/s without the command ever returning, from
+   processes in the container's own cgroups that stopping the transient scope does not reach. Every
+   restore now runs under a bound: when it consumes more of the graph root than its own preflight
+   required, or the graph root falls below 1 GiB, the container's cgroup is **frozen** — nothing is ended,
+   the freeze is reversible, and it is undone if the cgroup turns out not to belong to the attempt — and
+   the transient scope is stopped. Freezing was chosen over killing because prevention must not need the
+   authority that reclaim needs.
+9. **An abort refuses when processes of the attempt survive and `reclaim_processes` is absent.** M2's abort
+   removed the container and reported the leftovers; that is exactly how a failed restore filled a disk
+   with unlinked files. Refusing without effect preserves both the evidence and the space, and names the
+   field. The claim is closed only when the universe is actually absent.
+10. **Reclaim is proven per process, not per container.** Membership of `/machine.slice/libpod-<id>.scope`
+    or `libpod-conmon-<id>.scope`, plus a start time at or after the durable claim, both re-read from
+    `/proc` immediately before each signal so that a PID reused in between is skipped. A command line
+    naming the container is a diagnostic fallback once those cgroups are gone and authorizes nothing. An
+    incomplete reclaim — a surviving process, or a cgroup that does not disappear within the bounded wait
+    — is reported as incomplete and refused, never as a verified cleanup, and no recovered space is
+    claimed.
+11. **The authority to ask for a reclaim is recorded as provenance.** Following the operator's decision of
+    2026-09-12: the request carries the ordinary `authorization_ref` beside the explicit field, both are
+    recorded verbatim with the PID and cgroup facts, and no role or credential check is built on them. The
+    root-only local socket stays the access boundary; the proof still gates the act.
+12. **A failed local restore removes its own container when it can prove it is safe** — not running,
+    created after the attempt began, carrying the universe label, owned by nothing verified, and with
+    nothing of the attempt left in its cgroups. Otherwise it keeps everything and reports it. A local
+    restore has no claim table and no abort operation, so an attempt that leaves frozen processes behind
+    has no API path that ends them; that gap is named in the lot's report.
+
+13. **A frozen container is never a restored universe.** Podman keeps reporting a container as running when
+    this service froze its cgroup, because the freeze goes to the kernel and not through Podman's own
+    bookkeeping. Both restores — destination and local — therefore refuse to verify a container whose cgroup
+    is frozen, and a failed attempt reports whether it is still frozen. The freeze is not undone on that
+    path: it is what stopped a runaway from writing, and only an explicit reclaim ends those processes.
+14. **A freeze request is recorded apart from its confirmation.** The kernel confirms a freeze only once
+    every task has stopped, which a task blocked in the writing the bound exists to stop can delay past the
+    poll. An unconfirmed request is now its own state, so a freeze that caught the wrong container is still
+    undone when its confirmation is late, instead of reading as a freeze that never happened.
+15. **The local cleanup checks the universe label**, like the destination's abort, before removing a
+    container left by its own failed attempt. Without it, a container created out of band under the
+    universe name during the attempt matched the other three conditions and could have been removed.
+
+Entries 13 to 15 were added after the independent counter-review of this lot; the eleven suites were rerun
+on the corrected binary.
+
 ## Still open
 
-- Break-glass release when the destination is unreachable or its journal is lost.
+- Break-glass release when the destination is unreachable or its journal is lost, including the case where
+  a transport altered the documents so that no outcome can ever bind to the source's authorization.
+- Release or abandonment of a reservation whose only authorizations ended `not_restored` (deviation 3).
+- Ending the processes of a failed **local** restore through the API (deviation 12).
 - Moving network identity and addresses (P11–P13).
 - Transport by makers, authenticated remote operations and the manager's role.
 - Periodic replication and controlled failover (P10, P16, P17).

@@ -80,15 +80,15 @@ A dropped connection is an uncertain outcome, not proof that no action occurred.
 
 ## Experimental: source-side migration preparation (development tree, not packaged)
 
-These operations prepare and checkpoint a migration **source**. Transfer of authority to another host and the destination side are the separate operations documented in the next section; no release, abandonment or local restore of a reservation exists (lot M3). See MIGRATION-INTEGRATION.md and MIGRATION-PROTOCOL.md for the protocol and its remaining gaps.
+These operations prepare and checkpoint a migration **source**. Transfer of authority to another host and the destination side are the separate operations documented in the next section; the recovery paths of a reservation that never left this host — release, abandonment and local restore — are documented after them. See MIGRATION-INTEGRATION.md and MIGRATION-PROTOCOL.md for the protocol and its remaining gaps.
 
 Requests carry the full binding: `operation_id`, `universe_uuid`, `authorization_ref`, `container_id` (full 64-character ID), `image` (full `sha256:` image ID), `source_host_uuid` (must be this host) and `destination_host_uuid` (recorded, not contacted; must differ from the source).
 
 - `migration_preflight` reports `compatible` and `blockers` with fresh facts and has no effect: no reservation, signal, suspension or artifact. Like every operation, repeating the same operation ID returns the historical report; a fresh assessment uses a new operation ID. Blockers include: not owned by this host's journal, identity mismatch, not running, network mode other than `none`, volumes or bind mounts, privileged or TTY containers, a frozen cgroup, more than 64 processes, container memory above 1 GiB or unreadable (a dump still running at the 300 s bound is killed, which destroys the application), any process that is not musl-based (glibc registers rseq, which the qualified CRIU 3.15 predates; static binaries cannot be identified), a Podman graph root other than the default store, insufficient space in the state directory or the graph root, an existing reservation, and a private runtime whose binary, wrapper or shim differs from the pinned SHA-256 or whose `criu check` fails.
 - `migration_checkpoint` repeats every check immediately before acting and refuses before any suspension if one fails. It then persists a reservation, creates `migrations/<operation_id>/` under the service state directory (0700, files 0600), and runs `podman container checkpoint --export --compress=zstd --keep --file-locks --print-stats` on the reserved container ID (not the universe name) with `PATH` beginning at the packaged private shim `/opt/podmesh-vzcriu-kit/bin`, inside its own transient systemd scope `podmesh-checkpoint-<operation_id>.scope`, bounded to 300 s. The distribution CRIU is never used. The result is verified only if Podman reports the same container `Checkpointed` and stopped, the archive lists the expected entries, and the copied CRIU log shows a successful dump by `v3.15.5.3`. The directory keeps `checkpoint.tar.zst`, `manifest.json`, `dump.log`, `preflight.json`, per-attempt stdout/stderr and failure records; the result carries the archive and manifest SHA-256.
-- `migration_status` (read-only, `universe_uuid` only) returns the reservation, a fresh observation, a re-hash of the preserved archive and manifest, and the release preconditions it can observe, with `release.permitted: false`.
+- `migration_status` (read-only, `universe_uuid` only) returns the reservation, a fresh observation, a re-hash of the preserved archive and manifest, the transfer authorizations, restore claims and archived reservations, and a `recovery` object saying which of `migration_release`, `migration_abandon` and `migration_restore_local` the observed state permits, each with its blockers. The older `release` key keeps its `preconditions_observed` and now reports the same verdict.
 
-A reservation blocks `create`, `start`, `delete` and `clone` for that universe (as target or source); `stop` remains available: it cannot run, replace or remove the source, but stopping a source whose checkpoint failed ends its process and memory state. Earlier package versions running on the same journal after a rollback do not enforce reservations.
+A reservation blocks `create`, `start`, `delete` and `clone` for that universe (as target or source); `stop` remains available: it cannot run, replace or remove the source, but stopping a source whose checkpoint failed ends its process and memory state. A `released` reservation blocks nothing — that is what releasing means — while `abandoned` and `transferred` keep refusing all four. Earlier package versions running on the same journal after a rollback do not enforce reservations.
 
 Retries: a verified checkpoint is never captured again; its replay is historical and adds `current_artifacts` with a fresh re-hash. A pending or failed checkpoint is re-evaluated: if its scope has not finished (including activating or deactivating) or its state cannot be queried, the retry is refused; if Podman shows the reserved container checkpointed after the reservation, the existing archive is finalized without capture (`finalized_after_interruption: true`); if the same process is still running and was never checkpointed, it is checkpointed again; anything else is refused with the observed state, and nothing is restarted. Killing CRIU itself mid-dump was observed to destroy the application without an archive; the separate scope protects against a service crash, not against CRIU or host failure.
 
@@ -104,17 +104,89 @@ Documents travel through fixed directories under the service state directory: `o
 - `migration_complete_transfer` (`authorization_id`) reads `inbox/<authorization_id>/outcome.json` and applies it: `restored` makes the reservation `transferred`; `not_restored` returns it to `checkpointed` and records the authorization as ended. The state machine then allows a new authorization for the same recorded destination; that retry is not exercised by the current tests. The outcome must be a `podmesh-transfer-outcome/1` document bound to this authorization's handoff SHA-256, this universe, this source host and the recorded destination. Any mismatch is refused without a state change, as is a source container that is running or has been replaced.
 - `migration_retire_source` (`authorization_id`) removes, from a `transferred` reservation, only the stopped container that is still the reserved one and still checkpointed, together with the checkpoint files Podman kept for it. The reservation stays `transferred` and keeps refusing generic operations and `create` for that universe UUID; the evidence directory is kept. An already absent container is a verified no-op.
 
+### Recovery on the source host
+
+These three end a reservation whose migration is not going to happen. Each names the checkpoint whose
+reservation it acts on (`checkpoint_operation_id`), so a request can never resolve to a reservation the
+caller did not mean, and none of them starts an application. **None of them is possible once a transfer
+authorization has been issued for the reservation**, whatever became of it: from that moment only a
+verified destination outcome bound to it can end the reservation, and an unreachable destination leaves
+the source held. There is still no break-glass path.
+
+- `migration_release` moves a `checkpointed` or `checkpoint_failed` reservation to `released`, after
+  observing that the container under the universe name is still the reserved one and is not running. It
+  lifts the generic-operation gate — `create`, `start`, `delete` and `clone` work again for that universe
+  — and starts nothing. The preserved archive and the checkpoint files Podman kept are untouched, so the
+  caller then chooses explicitly between `migration_restore_local` and an ordinary `start`.
+- `migration_abandon` records that a reservation will never be completed, from `reserved`,
+  `checkpointing`, `checkpoint_failed` or `checkpointed`, and only when the reserved container is absent
+  (not under the universe name, not under any other name). The artifacts are kept and verifiable, and the
+  universe UUID keeps refusing `create`, `start`, `delete` and `clone` on this host: only a verified
+  restore of a handoff from another host brings that universe back. Abandoning a `checkpointed`
+  reservation therefore gives up the local restore of its preserved memory; that is the point of the
+  operation, and `migration_release` is the path for a reservation whose container is still there.
+- `migration_restore_local` resumes the checkpointed memory on this host, from `released`. It prefers the
+  checkpoint files Podman kept for the reserved container — an in-place restore, which keeps the same
+  container ID — and falls back to the preserved archive when those files are gone, which produces a new
+  container ID under the same universe name. It is verified exactly like a destination restore: Podman
+  must show the container running and `Restored`, restored after this operation began, from the recorded
+  image, network-disabled and mount-free, **and** the preserved CRIU restore log must show a successful
+  restore by the qualified runtime. Memory continuity itself is established by an observer outside the
+  universe, never by this result. A verified local restore then archives the reservation into the history
+  table, so the universe is fully operable again: it can be checkpointed, started, stopped and deleted.
+  A container restored from the archive keeps the original creation label with a new ID, so `owned()`
+  accepts the verified `migration_restore_local` that binds the universe UUID to it, as it does for an
+  imported restore.
+
+A universe whose container was started out of band after its checkpoint is refused by
+`migration_restore_local`: Podman no longer reports it as checkpointed, and restoring stale memory over a
+container that has since run would be wrong. Deleting that container makes the preserved archive
+restorable under the same name again. An ordinary `start` of a released universe says so in its result:
+`memory_restored: false`, with a note that the application began afresh. A new `migration_checkpoint` of
+a universe whose reservation is `released` supersedes it: the released row is archived with its history
+and the new checkpoint reserves afresh.
+
 ### Destination
 
 - `migration_destination_preflight` (`authorization_id`) is read-only and reports `compatible` and `blockers`: the inbox handoff names this host and another source; no container `podmesh-<uuid>`, no container carrying the universe label, no active reservation (a local `transferred` history does not block a return trip) and no other unresolved restore claim; the image is present locally (PodMesh never pulls); the runtime binary hash, the runtime git ID and the kernel release equal the handoff's; the archive and manifest hash to the handoff and agree with it field by field; the archive's own `config.dump` names the handoff's source container, image and universe label, and the archive lists the expected checkpoint entries; both the state directory and the Podman graph root have room. Repeating the operation ID returns the historical report.
-- `migration_restore` (`authorization_id`) repeats that assessment, copies the archive into its own operation directory and re-hashes the copy, persists a restore claim, then runs `podman container restore --import --name podmesh-<uuid> --keep --file-locks --print-stats` in its own transient scope with the private runtime first on `PATH`. It is verified only when Podman shows that container running and `Restored`, created and restored after the claim, carrying the handoff's universe label, from the handoff image, network-disabled and mount-free, **and** the preserved CRIU restore log shows a successful restore by the qualified runtime. The command's exit code alone proves nothing. It then records ownership, archives an earlier `transferred` reservation for that universe, and writes `outbox/<authorization_id>/outcome.json`.
-- `migration_restore_abort` (`authorization_id`) is the only way to end a claim that was not verified. It never touches a running or verified universe. For a held claim it removes only a non-running container created after that claim, labelled for the universe and owned by no verified operation, verifies its absence, then records `not_restored` and writes the outcome. An authorization this host never claimed is declined the same way, so that a destination which cannot restore lets the source end the authorization explicitly.
+- `migration_restore` (`authorization_id`) repeats that assessment, copies the archive into its own operation directory and re-hashes the copy, persists a restore claim, then runs `podman container restore --import --name podmesh-<uuid> --keep --file-locks --print-stats` in its own transient scope with the private runtime first on `PATH`. It is verified only when Podman shows that container running and `Restored`, created and restored after the claim, carrying the handoff's universe label, from the handoff image, network-disabled and mount-free, **and** the preserved CRIU restore log shows a successful restore by the qualified runtime. A container whose cgroup this service froze is refused: Podman still reports it as running, and a suspended universe is not a restored one. The command's exit code alone proves nothing. It then records ownership, archives an earlier `transferred` reservation for that universe, and writes `outbox/<authorization_id>/outcome.json`.
+- `migration_restore_abort` (`authorization_id`, optional `reclaim_processes`) is the only way to end a claim that was not verified. It never touches a running or verified universe. For a held claim it removes only a non-running container created after that claim, labelled for the universe and owned by no verified operation, verifies its absence, then records `not_restored` and writes the outcome. An authorization this host never claimed is declined the same way, so that a destination which cannot restore lets the source end the authorization explicitly.
+
+  `reclaim_processes` is an explicit boolean, false when absent, and it is the only way PodMesh ever ends a process it did not start. Without it, an abort that finds processes of the failed attempt still in the container's cgroups **refuses without effect** and reports them: removing the container then would unlink the files they are writing without freeing the space. With it, PodMesh ends only what it can prove belongs to the attempt — membership of that container's own `/machine.slice/libpod-<id>.scope` or `libpod-conmon-<id>.scope`, and a start time at or after the durable claim, both re-read from `/proc` immediately before each signal, which excludes a PID reused in between. A command line naming the container is a diagnostic fallback once those cgroups are gone; it never authorizes a signal. The abort then waits, bounded, for both cgroup directories to disappear, verifies the container's absence and measures the graph root before and after. A cgroup that does not disappear, or a process that survives, is an **incomplete** reclaim: the abort refuses, keeps the claim and preserves the evidence rather than claiming space it did not recover. Every PID, its cgroup, its start time, the decision and its result, the requester's `authorization_ref` and the field itself are recorded in the result and in `migrations/<claim operation>/reclaim-<operation>.json`.
+
+  Who may ask for it is provenance, not proof: the request is meant for the root tandem, the operator with the agent acting under his direct control, and a maker forwarding a governor's row does not by itself carry that authority — that mapping is a later product decision. The root-only local socket remains the access boundary, as it is for every operation; PodMesh records the reference it was given and still refuses to signal anything it cannot prove, whatever the requester claims.
 
 Ownership on the destination: a restored container keeps the source journal's creation label, which this journal does not know. `owned()` therefore accepts a verified `create`, `clone` **or** `migration_restore` whose recorded container ID is the observed one; a label alone stays insufficient, and a container this host recorded as transferred away never regains ownership through its original creation. Restoring with `--name` gives each hop a new container ID, which the outcome and the journal record.
 
 Retries and interruption: a verified restore is never restored again; its replay is historical and adds `current_outcome`, a fresh re-hash of the written outcome. If the service is killed while the restore command runs, the command survives in its scope; a retry of the same operation is refused while that scope is still running and then reconciles by observation to one container and one outcome (`finalized_after_interruption: true`). A restore that fails after Podman started holds its claim, writes no outcome and preserves its diagnostics until an abort. While a claim is unresolved, `create`, `start`, `delete` and `clone` for that universe are refused, exactly as under a reservation.
 
+What a restore attempt may consume: a restore of a damaged archive was measured on the laboratory writing its CRIU log at about 20 MB/s while `podman container restore` never returned, from processes living in the container's own cgroups rather than in the transient scope PodMesh created — stopping that scope does not stop them. Every restore, on a destination and locally, therefore runs under a bound. While the command runs, the free space of the Podman graph root is watched once a second, and the container the attempt created is identified from the cgroups that appear under `/machine.slice` (Podman itself does not answer during a restore). If the attempt consumes more than the space its own preflight required for it, or the graph root falls below one gibibyte, PodMesh **freezes that container's cgroup** — which stops the writing without ending anything, and is undone if the frozen cgroup turns out not to be the attempt's — and stops the transient scope. The restore then fails verification and holds its claim as usual, with the whole measurement (allowance, minimum free space, most consumed, samples) in the result. The frozen processes are left for an explicit `migration_restore_abort`, with or without `reclaim_processes`.
+
 Scope and conmon lifetime: `systemd-run --scope` sets `INVOCATION_ID` for the command it runs, and Podman then leaves conmon inside that scope, which would stay active for as long as the restored universe runs. The variable is therefore removed inside the scope as well: conmon moves to its own `libpod-conmon-<id>.scope`, the transient restore scope ends with the Podman command, and stopping or deleting the universe through the API removes the conmon scope with it. `--keep` is what preserves the CRIU restore log the verification requires; the kept checkpoint files stay in the restored container's storage until the universe is removed or checkpointed again, and a later export from that container may also carry image files left by the previous restore.
+
+## Facts for a watching agent
+
+The intended first consumer of these read-only facts is a watching agent that observes and reports: it has
+no hand on the host. `migration_status` therefore carries a `watch` object beside the detailed rows, so
+that one call answers, without running anything: whether a reservation still blocks the universe and
+whether it is still awaiting a decision, with the time it last changed; which restore claims are
+unresolved and since when; which transfer authorizations are still open; whether a failed restore left
+runtime processes, with the cgroup facts each conclusion rests on; and how much room is left on the
+Podman graph root against what an unresolved attempt was allowed to consume.
+
+Every fact carries the time it was observed, and what cannot be established is reported as unknown with
+its reason — never as a healthy zero. A surviving-process count is authoritative only when it comes from
+cgroup residency (`source: cgroup_residency`, `authorizes_reclaim: true`); once those cgroups are gone the
+command-line fallback is a hint about what may remain, and a claim that never recorded a container reports
+`known: false` rather than none. A reader that finds no `watch` object, or one older than it expects, is
+looking at a stale answer and should say so.
+
+A reclaim remains an explicit request carrying the root tandem's provenance. A watcher that concludes one
+is needed is making a proposal, not an authorization: nothing in this version verifies who asked, the
+root-only socket is the whole access boundary, and PodMesh still refuses to signal anything it cannot
+prove belongs to the failed attempt it claimed. `migration_status` is per universe: enumerating the
+universes to watch is the reader's job, from `inventory` and its own records, and a host-wide listing of
+unresolved migrations does not exist.
 
 ## Authority and scope
 

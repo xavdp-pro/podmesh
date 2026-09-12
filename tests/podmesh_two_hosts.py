@@ -194,13 +194,19 @@ def n_corrupt(path, mode='append', data='tampered'):
     return {'path': path, 'previous_bytes': size, 'bytes': os.path.getsize(path), 'sha256': _sha256(path)}
 def n_corrupt_archive(source, target, member):
     """A self-consistent archive defect: one checkpoint image truncated, the archive rebuilt in order.
-    Simulates a damaged archive that still lists the expected entries (documents are forged separately)."""
+    Simulates a damaged archive that still lists the expected entries (documents are forged separately).
+
+    `member` selects the damage: a name truncates that entry, None truncates the inventory (an immediate
+    CRIU failure), and 'largest-pages' truncates the biggest memory image, which is the hard shape that
+    makes CRIU spin and write until something stops it."""
     work = target + '.work'
     subprocess.run(['rm', '-rf', work], check=True)
     os.makedirs(work, mode=0o700)
     entries = subprocess.run(['tar', '-tf', source], check=True, capture_output=True, text=True).stdout.splitlines()
     subprocess.run(['tar', '-C', work, '-xf', source], check=True)
-    if member is None:
+    if member == 'largest-pages':
+        member = None
+    elif member is None:
         # Truncating the inventory leaves every entry and every other file intact, so the archive still passes
         # every structural check and only CRIU discovers the damage, failing early. Truncating a memory image
         # instead was observed to make CRIU spin and write a multi-gigabyte restore log.
@@ -220,6 +226,97 @@ def n_corrupt_archive(source, target, member):
     subprocess.run(['rm', '-rf', work], check=True)
     return {'target': target, 'member': member, 'member_bytes_before': before, 'member_bytes_after': before // 2,
             'bytes': os.path.getsize(target), 'sha256': _sha256(target)}
+def _libpod_cgroups(container_id):
+    return [f'/sys/fs/cgroup/machine.slice/libpod-{container_id}.scope',
+            f'/sys/fs/cgroup/machine.slice/libpod-conmon-{container_id}.scope']
+def _libpod_ids():
+    """Container IDs owning a cgroup under machine.slice, read from the kernel alone."""
+    ids = set()
+    for entry in os.listdir('/sys/fs/cgroup/machine.slice') if os.path.isdir('/sys/fs/cgroup/machine.slice') else []:
+        if entry.startswith('libpod-') and entry.endswith('.scope'):
+            candidate = entry[len('libpod-'):-len('.scope')].removeprefix('conmon-')
+            if len(candidate) == 64 and all(c in '0123456789abcdef' for c in candidate):
+                ids.add(candidate)
+    return ids
+def _cgroup_members(path):
+    found = []
+    for root, _dirs, files in os.walk(path):
+        if 'cgroup.procs' in files:
+            try:
+                found += [(int(l), root) for l in open(os.path.join(root, 'cgroup.procs')) if l.strip()]
+            except OSError:
+                pass
+    return sorted(set(found))
+def _start_epoch(pid):
+    """Start time of a process, from /proc/<pid>/stat, in seconds since the epoch."""
+    try:
+        boot = next(int(l.split()[1]) for l in open('/proc/stat') if l.startswith('btime '))
+        stat = open(f'/proc/{pid}/stat').read()
+        return boot + int(stat[stat.rindex(')') + 2:].split()[19]) // 100
+    except (OSError, ValueError, StopIteration, IndexError):
+        return None
+def n_cgroup_facts(container_id):
+    """The suite's own reading of the facts a reclaim must be proven on: the two cgroups of a container,
+    their members, and each member's start time. Independent of what PodMesh reports about them."""
+    facts = {}
+    for path in _libpod_cgroups(container_id):
+        members = _cgroup_members(path) if os.path.isdir(path) else []
+        facts[path] = {'exists': os.path.isdir(path),
+                       'processes': [{'pid': pid, 'cgroup_procs_file': root, 'start_epoch': _start_epoch(pid),
+                                      'comm': (open(f'/proc/{pid}/comm').read().strip() if os.path.exists(f'/proc/{pid}/comm') else None)}
+                                     for pid, root in members]}
+    facts['total_processes'] = sum(len(v['processes']) for v in facts.values() if isinstance(v, dict))
+    return facts
+def n_df(path):
+    """Raw `df -B1` for the evidence, exactly as the tool prints it."""
+    p = subprocess.run(['df', '-B1', path], capture_output=True, text=True, check=True)
+    return {'path': path, 'df': p.stdout, 'free': shutil.disk_usage(path).free, 'at': time.time()}
+def n_journal_text(unit=None, since=None, lines=200):
+    """Raw journal text of a unit, for a resource incident's evidence. Distinct from n_journal, which
+    reads the migration tables."""
+    argv = ['journalctl', '--no-pager', '-n', str(lines), '-u', unit or _unit()]
+    if since:
+        argv += ['--since', f'@{int(since)}']
+    p = subprocess.run(argv, capture_output=True, text=True)
+    return {'unit': unit or _unit(), 'text': p.stdout, 'exit': p.returncode}
+def n_restore_under_watchdog(request, floor_bytes, graph='/var/lib/containers/storage', timeout=900):
+    """Sends one API request while a TEST-OWNED free-space watchdog runs beside it.
+
+    The watchdog is this suite's own cleanup, not a product mechanism: if free space on the graph root
+    drops below the floor, it ends every process in the cgroups of the container that appeared during the
+    attempt and records why. The product's own bound is expected to act long before that; the watchdog
+    exists so that a failure of the product's bound cannot fill a laboratory disk."""
+    before_ids, box = _libpod_ids(), []
+    baseline = shutil.disk_usage(graph).free
+    def send():
+        box.append(n_api(request, timeout))
+    thread = threading.Thread(target=send)
+    thread.start()
+    samples, fired, killed, container_id = [], None, [], None
+    while thread.is_alive():
+        free = shutil.disk_usage(graph).free
+        samples.append([round(time.time(), 2), free])
+        if container_id is None:
+            fresh = _libpod_ids() - before_ids
+            if len(fresh) == 1:
+                container_id = fresh.pop()
+        if free < floor_bytes and fired is None:
+            fired = {'at': time.time(), 'free': free, 'container_id': container_id}
+            for path in _libpod_cgroups(container_id) if container_id else []:
+                for pid, _root in _cgroup_members(path):
+                    try:
+                        os.kill(pid, 9)
+                        killed.append(pid)
+                    except OSError:
+                        pass
+            fired['killed'] = killed
+        time.sleep(.25)
+    thread.join(60)
+    return {'response': box[0]['response'] if box else None, 'begin_ns': box[0]['begin_ns'] if box else None,
+            'end_ns': box[0]['end_ns'] if box else None, 'watchdog_fired': fired, 'floor_bytes': floor_bytes,
+            'baseline_free': baseline, 'minimum_free': min([s[1] for s in samples], default=baseline),
+            'maximum_consumed': baseline - min([s[1] for s in samples], default=baseline),
+            'attempt_container_id': container_id, 'samples': samples[-60:], 'sample_count': len(samples)}
 def n_kill_container_processes(container_id):
     """Test-owned cleanup: PodMesh reports the processes a failed restore leaves behind but never kills them,
     so the suite kills the ones that still name its own disposable container."""
@@ -232,6 +329,23 @@ def n_kill_container_processes(container_id):
         except OSError:
             pass
     return {'killed': killed}
+def n_kill_container_cgroups(container_id):
+    """Test-owned cleanup by cgroup residency, for a disposable container of this suite: used only when the
+    product deliberately left processes alone (an abort without reclaim_processes), so that the laboratory
+    host does not keep them."""
+    assert len(container_id) == 64 and all(c in '0123456789abcdef' for c in container_id), container_id
+    killed = []
+    for path in _libpod_cgroups(container_id):
+        for pid, _root in _cgroup_members(path):
+            try:
+                os.kill(pid, 9)
+                killed.append(pid)
+            except OSError:
+                pass
+    deadline = time.time() + 30
+    while time.time() < deadline and any(os.path.isdir(p) for p in _libpod_cgroups(container_id)):
+        time.sleep(.25)
+    return {'killed': killed, 'cgroups_gone': not any(os.path.isdir(p) for p in _libpod_cgroups(container_id))}
 def n_kill_service():
     subprocess.run(['systemctl', 'kill', '--signal=SIGKILL', _unit()], check=True)
     return {'killed': _unit()}
@@ -251,39 +365,54 @@ def n_processes(*needles):
 def n_interrupt_restore(request, import_path, unit):
     """Sends migration_restore and kills the service while the restore command runs in its own scope.
 
-    The kill is timed on the command's own process: it is only sent once `podman container restore`
-    of this operation is running, and the CRIU process it spawns is recorded when it is visible."""
+    The kill is timed on Podman's own process, not on the systemd-run wrapper that carries the same
+    arguments: waiting for the wrapper alone was observed to lose the race on a fast restore, because the
+    request spends its first seconds hashing and decompressing the archive before the command starts. CRIU
+    is recorded when it becomes visible, but the kill never waits for it beyond the command's own life."""
     box = []
     def send():
         box.append(n_api(request))
     thread = threading.Thread(target=send)
     thread.start()
-    deadline = time.time() + 120
-    restore_pids = []
-    while not restore_pids:
-        assert time.time() < deadline and thread.is_alive(), ('the restore command was never observed', box)
-        restore_pids = n_processes('restore', f'--import={import_path}')
-        time.sleep(.002)
-    criu_deadline = time.time() + 10
-    criu = []
+    def argv_of(pid):
+        try:
+            return open(f'/proc/{pid}/cmdline', 'rb').read().split(b'\0')
+        except OSError:
+            return []
+    def podman_pids():
+        found = []
+        for pid in filter(str.isdigit, os.listdir('/proc')):
+            argv = argv_of(pid)
+            if argv and argv[0].endswith(b'/podman') and b'restore' in argv and f'--import={import_path}'.encode() in argv:
+                found.append(int(pid))
+        return found
     def criu_pids():
         found = []
         for pid in filter(str.isdigit, os.listdir('/proc')):
-            try:
-                argv0 = open(f'/proc/{pid}/cmdline', 'rb').read().split(b'\0')[0].decode()
-            except (OSError, UnicodeDecodeError):
-                continue
+            argv = argv_of(pid)
+            argv0 = argv[0].decode(errors='replace') if argv else ''
             if argv0.endswith('/criu') or argv0 == 'criu':
                 found.append({'pid': int(pid), 'executable': argv0})
         return found
-    while time.time() < criu_deadline and not criu:
-        criu = criu_pids()
-        if criu or not thread.is_alive():
-            break
+    began = time.time()
+    deadline = began + 300
+    restore_pids = []
+    while not restore_pids:
+        assert time.time() < deadline and thread.is_alive(), ('the restore command was never observed', box)
+        restore_pids = podman_pids()
         time.sleep(.002)
-    at_kill = {'restore_command_pids': restore_pids, 'criu_processes': criu, 'scope_before_kill': n_scope(unit)['active_state']}
+    observed_at = time.time()
+    # A short look for CRIU, abandoned the moment the command itself is gone: the kill must land while the
+    # command is still running, which is what this test is about.
+    criu, criu_deadline = [], time.time() + 3
+    while time.time() < criu_deadline and not criu and thread.is_alive() and podman_pids():
+        criu = criu_pids()
+        time.sleep(.002)
+    at_kill = {'restore_command_pids': restore_pids, 'criu_processes': criu, 'scope_before_kill': n_scope(unit)['active_state'],
+               'command_seen_after_seconds': round(observed_at - began, 2), 'killed_after_seconds': round(time.time() - began, 2),
+               'command_still_running_at_kill': bool(podman_pids()), 'request_still_open_at_kill': thread.is_alive()}
     subprocess.run(['systemctl', 'kill', '--signal=SIGKILL', _unit()], check=True)
-    at_kill['restore_command_alive_after_kill'] = bool(n_processes('restore', f'--import={import_path}'))
+    at_kill['restore_command_alive_after_kill'] = bool(podman_pids())
     at_kill['criu_alive_after_kill'] = bool(criu_pids())
     at_kill['scope_after_kill'] = n_scope(unit)['active_state']
     thread.join(120)

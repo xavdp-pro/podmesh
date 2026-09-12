@@ -181,9 +181,12 @@ try:
     assert current['reservation']['state'] == 'checkpointed' and current['reservation']['operation_id'] == checkpoint['operation_id']
     assert current['artifacts']['archive_sha256_matches'] is True and current['artifacts']['manifest_sha256_matches'] is True
     release = current['release']
-    assert release['permitted'] is False and release['operation_available'] is False
+    assert release['permitted'] is True and release['operation_available'] is True and release['blockers'] == []
     assert release['preconditions_observed']['source_not_running'] is True and release['preconditions_observed']['source_checkpointed'] is True
-    checks.append('status reports the durable reservation, verified artifacts and release preconditions, and states that no release exists')
+    assert release['preconditions_observed']['transfer_authorizations_issued_for_reservation'] == 0
+    assert current['recovery']['abandon']['permitted'] is False and current['recovery']['restore_local']['permitted'] is False
+    checks.append('status reports the durable reservation, verified artifacts and the release preconditions, and that this reservation may be '
+                  'released but neither abandoned nor restored locally while its container is there')
 
     # Replay does not recapture.
     mtime, checkpointed_at = os.stat(archive).st_mtime_ns, ci['State']['CheckpointedAt']

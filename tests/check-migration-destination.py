@@ -224,9 +224,14 @@ try:
     A.refused(request('migration_complete_transfer', V, REF, authorization_id=V1),
               'completion with an outcome bound to another handoff', 'not to this authorization', checks)
 
-    completion = A.ok(request('migration_complete_transfer', U, REF, authorization_id=A1), 'transfer completed as restored', checks)
+    complete_request = request('migration_complete_transfer', U, REF, authorization_id=A1)
+    completion = A.ok(complete_request, 'transfer completed as restored', checks)
     assert completion['destination_result'] == 'restored' and completion['restored_container_id'] == restored_container['Id']
     assert A.status(U)['reservation']['state'] == 'transferred'
+    completion_replay = A.ok(complete_request)
+    assert completion_replay['replayed'] and completion_replay['historical'] and completion_replay['original_result'] == completion
+    assert completion_replay['current_reservation']['state'] == 'transferred'
+    checks.append('[source] repeating the completion with the same operation ID is historical, with a fresh reading of the reservation it left')
     A.refused(request('migration_complete_transfer', U, REF, authorization_id=A1), 'second completion of the same authorization',
               'already completed by operation', checks)
     for operation, extra, label in [('start', {}, 'start'), ('delete', {}, 'delete'), ('create', {'image': 'sha256:' + alpine, 'command': ['true']}, 'create')]:
@@ -256,6 +261,46 @@ try:
     assert ended['destination_result'] == 'not_restored' and A.status(V)['reservation']['state'] == 'checkpointed'
     assert A.status(V)['transfer_authorizations'][0]['state'] == 'ended_not_restored'
     A.refused(request('start', V, REF), 'start of a source whose authorization ended without a restore', 'reserved', checks)
+
+    # ------------------------------------------- a declined authorization, then a new one to the same destination
+    # The reservation returns to checkpointed and may be authorized again to the destination its checkpoint
+    # named; this exercises that retry through to a verified restore.
+    N = str(uuid.uuid4())
+    n_container = universe(A, N, alpine, COUNTER)
+    before_n = counter(A, N)
+    n_checkpoint = request('migration_checkpoint', N, REF, container_id=n_container['Id'], image='sha256:' + alpine,
+                           source_host_uuid=A.identity, destination_host_uuid=B.identity)
+    A.ok(n_checkpoint)
+    first = A.ok(request('migration_authorize_transfer', N, REF, checkpoint_operation_id=n_checkpoint['operation_id'],
+                         destination_host_uuid=B.identity))
+    N1 = first['authorization_id']
+    transfer(A, B, N1)
+    B.ok(request('migration_restore_abort', N, REF, authorization_id=N1), 'destination declined a deliverable authorization', checks)
+    transfer(B, A, N1, files=('outcome.json',))
+    A.ok(request('migration_complete_transfer', N, REF, authorization_id=N1))
+    assert A.status(N)['reservation']['state'] == 'checkpointed'
+    second = A.ok(request('migration_authorize_transfer', N, REF, checkpoint_operation_id=n_checkpoint['operation_id'],
+                          destination_host_uuid=B.identity),
+                  'a reservation returned to checkpointed by a not_restored outcome can be authorized again to its recorded destination', checks)
+    N2 = second['authorization_id']
+    assert N2 != N1 and second['handoff_sha256'] != first['handoff_sha256']
+    assert A.status(N)['reservation']['state'] == 'transfer_authorized'
+    transfer(A, B, N2)
+    B.refused(request('migration_restore', N, REF, authorization_id=N1), 'restore of the authorization this host declined earlier',
+              'state not_restored', checks)
+    renewed = B.ok(request('migration_restore', N, REF, authorization_id=N2), 'the re-authorized transfer runs to a verified restore', checks)
+    assert inspect(B, N)['State']['Restored'] is True and renewed['container_id'] == inspect(B, N)['Id']
+    continuity_renewed = memory_continued(before_n, counter(B, N, seconds=6))
+    checks.append('[destination] memory continuity after the re-authorization: token %s, counter %s -> %s'
+                  % (continuity_renewed['token'][:8], continuity_renewed['last_before_checkpoint'], continuity_renewed['last_after_restore']))
+    transfer(B, A, N2, files=('outcome.json',))
+    A.ok(request('migration_complete_transfer', N, REF, authorization_id=N2), 'the second authorization completed as restored', checks)
+    assert A.status(N)['reservation']['state'] == 'transferred'
+    assert [a['state'] for a in A.status(N)['transfer_authorizations']] == ['ended_not_restored', 'completed_restored']
+    A.ok(request('migration_retire_source', N, REF, authorization_id=N2))
+    B.ok(request('stop', N, REF, timeout_seconds=10, on_timeout='kill'))
+    B.ok(request('delete', N, REF))
+    assert inspect(A, N) is None and inspect(B, N) is None
 
     # ---------------------------------------------------------------- lifecycle on the destination, then the return trip
     B.ok(request('stop', U, REF, timeout_seconds=10, on_timeout='kill'), 'stop of the restored universe through the API', checks)

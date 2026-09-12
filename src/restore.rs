@@ -5,6 +5,7 @@
 //! private directory, re-hashed and restored from that copy with the packaged runtime in its own transient
 //! scope. An outcome document is written to the outbox only from a durable claim state: `restored` after
 //! verification, or `not_restored` once this host has recorded that it will never restore the authorization.
+use crate::cleanup::{self, Bound};
 use crate::lifecycle::{self as lc, failure, Error};
 use crate::migration as mg;
 use crate::transfer as tr;
@@ -148,7 +149,7 @@ pub(crate) fn restored_here(db: &Connection, uuid: &str, container_id: &str) -> 
         && result["container_id"].as_str() == Some(container_id))
 }
 /// Whether a verified create, clone or migration_restore of this host's journal owns this container ID.
-fn verified_owner(db: &Connection, container_id: &str) -> Result<bool, Error> {
+pub(crate) fn verified_owner(db: &Connection, container_id: &str) -> Result<bool, Error> {
     let claimed: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM migration_restore_claims WHERE container_id=?1 AND state='restored')",
         [container_id],
@@ -248,40 +249,12 @@ fn labelled(uuid: &str) -> Result<Vec<Value>, Error> {
         .map(|c| json!({"id": c["Id"], "names": c["Names"], "state": c["State"]}))
         .collect())
 }
-/// Processes whose command line still names this container. A restore that fails this way was observed to
-/// leave Podman's conmon and the CRIU processes of the attempt running after the container itself was removed,
-/// still writing their log. PodMesh reports them; it never kills processes it did not start.
-fn runtime_processes(container_id: &str) -> Vec<Value> {
-    let mut found = vec![];
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return found;
-    };
-    for entry in entries.flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|p| p.parse::<u32>().ok()) else {
-            continue;
-        };
-        let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) else {
-            continue;
-        };
-        if raw.len() > 64 * 1024 {
-            continue;
-        }
-        let cmdline = String::from_utf8_lossy(&raw).replace('\0', " ");
-        if cmdline.contains(container_id) {
-            found.push(json!({"pid": pid, "program": cmdline.split_whitespace().next().unwrap_or("")}));
-        }
-        if found.len() >= 32 {
-            break;
-        }
-    }
-    found
-}
 /// The destination's fresh observation recorded in an outcome.
 fn observation(uuid: &str) -> Result<Value, Error> {
     Ok(json!({"observed_at": crate::now(), "universe_container": lc::observe(uuid)?, "labelled_containers": labelled(uuid)?}))
 }
 /// Uncompressed size of the zstd archive, streamed through the distribution zstd under a bound.
-fn uncompressed_bytes(archive: &Path) -> Result<u64, Error> {
+pub(crate) fn uncompressed_bytes(archive: &Path) -> Result<u64, Error> {
     let mut child = Command::new("/usr/bin/timeout")
         .args(["--signal=KILL", "300", "/usr/bin/zstd", "-dcq", "--"])
         .arg(archive)
@@ -659,19 +632,36 @@ pub(crate) fn restore(
     )?;
     mg::write_private(&dir.join("preflight.json"), serde_json::to_string_pretty(&a.facts)?.as_bytes())?;
     let k = claim(db, authorization)?.ok_or("Restore claim not persisted")?;
-    launch(db, attempt, id, uuid, name, &k, &dir, false)
+    let graph = a.facts["space"]["graph_root"].clone();
+    launch(db, attempt, id, uuid, name, &k, &dir, false, &graph)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch(db: &Connection, attempt: i64, id: &str, uuid: &str, name: &str, k: &Claim, dir: &Path, resumed: bool) -> Result<Value, Error> {
+fn launch(
+    db: &Connection,
+    attempt: i64,
+    id: &str,
+    uuid: &str,
+    name: &str,
+    k: &Claim,
+    dir: &Path,
+    resumed: bool,
+    graph: &Value,
+) -> Result<Value, Error> {
     // Durable before the command can start: a claim without this mark never reached Podman.
     merge_claim(db, &k.authorization_id, "restoring", None, &json!({"launched_attempt": attempt}))?;
     let open = |path: &Path| fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path);
     let stdout = open(&dir.join(format!("restore-attempt-{attempt}.stdout")))?;
     let stderr = open(&dir.join(format!("restore-attempt-{attempt}.stderr")))?;
     let import = format!("--import={}", dir.join(mg::ARCHIVE).display());
+    let unit = restore_unit(id);
+    // The attempt may consume what its own preflight required of the graph root, and no more: a restore
+    // of a damaged archive was measured writing about 20 MB/s without the command ever returning.
+    let bound = graph["path"]
+        .as_str()
+        .map(|p| Bound::new(Path::new(p), graph["required_bytes"].as_u64().unwrap_or(0), &unit));
     let exit = mg::scoped_podman(
-        &restore_unit(id),
+        &unit,
         id,
         RESTORE_SECONDS,
         &[
@@ -686,6 +676,7 @@ fn launch(db: &Connection, attempt: i64, id: &str, uuid: &str, name: &str, k: &C
         ],
         stdout,
         stderr,
+        bound.as_ref(),
     );
     match exit {
         Err(e) => {
@@ -697,7 +688,7 @@ fn launch(db: &Connection, attempt: i64, id: &str, uuid: &str, name: &str, k: &C
                 detail,
             ))
         }
-        Ok(status) => finalize(db, attempt, attempt, id, uuid, name, k, dir, status.code(), resumed),
+        Ok((status, prevention)) => finalize(db, attempt, attempt, id, uuid, name, k, dir, status.code(), resumed, prevention),
     }
 }
 
@@ -711,6 +702,11 @@ fn verify(k: &Claim, observed: Option<&Value>, log: &Path, log_preserved: bool) 
     }
     if lc::status(c) != "running" || !lc::process_active(c) {
         return Err(format!("the container is not running (state {})", lc::status(c)));
+    }
+    // Podman keeps reporting a running container whose cgroup the bound froze, because the freeze goes
+    // to the kernel and not through Podman's own bookkeeping. A suspended universe is not restored.
+    if cleanup::frozen(c["Id"].as_str().unwrap_or("")) {
+        return Err("the container's cgroup is frozen: the universe is suspended, not running".into());
     }
     if c["State"]["Restored"] != true {
         return Err("Podman does not report the container as restored".into());
@@ -747,8 +743,12 @@ fn finalize(
     dir: &Path,
     exit: Option<i32>,
     resumed: bool,
+    mut prevention: Value,
 ) -> Result<Value, Error> {
     let observed = lc::inspect(name)?;
+    // A freeze the bound applied is confirmed against the container this claim actually created, and
+    // undone if it caught anything else.
+    cleanup::confirm_or_thaw(&mut prevention, observed.as_ref().and_then(|c| c["Id"].as_str()));
     let log = dir.join(format!("restore-attempt-{launched}.log"));
     let log_preserved = observed
         .as_ref()
@@ -758,13 +758,30 @@ fn finalize(
         let detail = json!({"reason": reason, "attempt": attempt, "launched_attempt": launched, "exit_code": exit,
             "observed": observed.as_ref().map(lc::state_view), "restored": observed.as_ref().map(|c| c["State"]["Restored"].clone()),
             "restore_log_preserved": log_preserved.then(|| log.display().to_string()), "stderr_tail": mg::tail(&stderr),
-            "restore_scope_finished": !mg::unit_busy(&restore_unit(id)),
-            "runtime_processes": observed.as_ref().and_then(|c| c["Id"].as_str()).map(runtime_processes)});
+            "restore_scope_finished": !mg::unit_busy(&restore_unit(id)), "prevention": prevention,
+            // A freeze the bound applied stays applied: it is what stopped a runaway from writing, and
+            // only an explicit reclaim ends those processes. It is reported, never left to be guessed.
+            "container_cgroup_frozen_now": observed.as_ref().and_then(|c| c["Id"].as_str()).map(cleanup::frozen),
+            "runtime_processes": observed.as_ref().and_then(|c| c["Id"].as_str())
+                .map(|cid| cleanup::runtime_processes(cid, k.created_at))});
         mg::write_private(
             &dir.join(format!("failure-attempt-{attempt}.json")),
             serde_json::to_string_pretty(&detail)?.as_bytes(),
         )?;
-        merge_claim(db, &k.authorization_id, "restore_failed", None, &detail)?;
+        // A failed claim records the container its own attempt created — labelled for this universe and
+        // created after the claim — so that an abort, and any observer reading the journal, can name what
+        // has to be cleaned up. Nothing else is ever recorded here.
+        let created_here = observed.as_ref().filter(|c| {
+            c["Config"]["Labels"][UNIVERSE_LABEL].as_str() == Some(k.universe_uuid.as_str())
+                && c["Created"].as_str().and_then(lc::epoch).is_some_and(|t| t >= k.created_at)
+        });
+        merge_claim(
+            db,
+            &k.authorization_id,
+            "restore_failed",
+            created_here.and_then(|c| c["Id"].as_str()),
+            &detail,
+        )?;
         return Err(failure(
             format!("The restore could not be verified: {reason}; the claim is held and no outcome was written. migration_restore_abort removes only a non-running container created by this claim."),
             detail,
@@ -782,7 +799,7 @@ fn finalize(
         "restored",
         Some(&container_id),
         &json!({"verified_at": now, "verified_attempt": attempt, "launched_attempt": launched, "exit_code": exit,
-            "reservation_history_archived": archived, "restore_log_sha256": mg::sha256(&log)?}),
+            "reservation_history_archived": archived, "restore_log_sha256": mg::sha256(&log)?, "prevention": prevention}),
     )?;
     let k = claim(&tx, &k.authorization_id)?.ok_or("Restore claim disappeared")?;
     let outcome = outcome_text(
@@ -847,6 +864,7 @@ fn restored_result(uuid: &str, k: &Claim, dir: &Path, resumed: bool) -> Result<V
         "outcome": {"result": "restored", "file": outcome_file["file"], "sha256": k.outcome_sha256},
         "restore_log": {"file": dir.join("restore.log"), "sha256": detail["restore_log_sha256"], "runtime_git_id": mg::RUNTIME_GIT_ID},
         "restore_scope": {"unit": unit, "finished": !mg::unit_busy(&unit)}, "conmon_cgroup": conmon_cgroup,
+        "prevention": detail["prevention"],
         "artifact_directory": dir, "archive": handoff["archive"],
         "reservation_history_archived": detail["reservation_history_archived"], "finalized_after_interruption": resumed,
         "ownership": "this verified migration_restore binds the universe UUID to the restored container ID in this host's journal",
@@ -914,10 +932,23 @@ fn resume(db: &Connection, attempt: i64, id: &str, uuid: &str, name: &str, k: Cl
                         json!({"restore_claim": k.view()}),
                     ));
                 }
-                launch(db, attempt, id, uuid, name, &k, &dir, true)
+                let graph = a.facts["space"]["graph_root"].clone();
+                launch(db, attempt, id, uuid, name, &k, &dir, true, &graph)
             }
             // The command may have run: only observation decides, and nothing is restored twice.
-            Some(launched) => finalize(db, attempt, launched, id, uuid, name, &k, &dir, None, true),
+            Some(launched) => finalize(
+                db,
+                attempt,
+                launched,
+                id,
+                uuid,
+                name,
+                &k,
+                &dir,
+                None,
+                true,
+                json!({"watched": false, "reason": "this attempt did not run the restore command"}),
+            ),
         },
     }
 }
@@ -926,12 +957,21 @@ fn resume(db: &Connection, attempt: i64, id: &str, uuid: &str, name: &str, k: Cl
 /// after its scope finished and a non-running container created after the claim, owned by nothing verified,
 /// has been removed and its absence verified. An authorization never claimed here is declined: the closed
 /// claim is recorded first, so that this host never restores it afterwards.
+///
+/// `reclaim` is the caller's explicit, default-false `reclaim_processes`. Without it nothing is signalled:
+/// if processes of the attempt survive in the container's cgroups, the abort refuses and reports them
+/// rather than removing a container whose writers are still holding its files. With it, only processes
+/// proven to be members of that container's own `libpod-<id>.scope` or `libpod-conmon-<id>.scope`, with a
+/// start time at or after the claim, are ended; the field is the requester's provenance, never the proof.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn abort(
     db: &Connection,
     id: &str,
     uuid: &str,
     name: &str,
     authorization: &str,
+    reference: &str,
+    reclaim: bool,
     existing: Option<Value>,
 ) -> Result<Value, Error> {
     let host = mg::host_uuid(db)?;
@@ -996,23 +1036,67 @@ pub(crate) fn abort(
                     json!({"scope": unit, "restore_claim": k.view()}),
                 ));
             }
+            let graph_root = lc::podman(lc::QUICK, &["info", "--format", "{{.Store.GraphRoot}}"])?.trim().to_string();
+            let space_before = mg::available_bytes(Path::new(&graph_root));
             let mut removed = None;
+            let mut reclaimed = Value::Null;
+            let mut before_removal = Value::Null;
             if let Some(c) = existing {
-                let refuse = |reason: &str| failure(format!("{reason}; nothing was removed"), json!({"observed": lc::state_view(&c), "restore_claim": k.view()}));
+                let refuse = |reason: &str, extra: Value| {
+                    failure(
+                        format!("{reason}; nothing was removed"),
+                        json!({"observed": lc::state_view(&c), "restore_claim": k.view(), "detail": extra}),
+                    )
+                };
                 if c["Config"]["Labels"][UNIVERSE_LABEL].as_str() != Some(uuid) {
-                    return Err(refuse("The container under the universe name is not labelled for this universe, so this claim did not create it"));
+                    return Err(refuse(
+                        "The container under the universe name is not labelled for this universe, so this claim did not create it",
+                        Value::Null,
+                    ));
                 }
                 if lc::process_active(&c) {
                     return Err(refuse(
                         "The container is running: abort never removes a running universe; retry migration_restore to verify it, or investigate it",
+                        Value::Null,
                     ));
                 }
                 if !c["Created"].as_str().and_then(lc::epoch).is_some_and(|t| t >= k.created_at) {
-                    return Err(refuse("The container predates this claim"));
+                    return Err(refuse("The container predates this claim", Value::Null));
                 }
                 let container_id = c["Id"].as_str().unwrap_or("").to_string();
                 if verified_owner(db, &container_id)? {
-                    return Err(refuse("The container is owned by a verified operation of this host"));
+                    return Err(refuse("The container is owned by a verified operation of this host", Value::Null));
+                }
+                // Every fact a reclaim is judged on, read before anything is removed or signalled.
+                let leftovers = cleanup::runtime_processes(&container_id, k.created_at);
+                before_removal = leftovers.clone();
+                let surviving = leftovers["count"].as_u64().unwrap_or(0);
+                if surviving > 0 && !reclaim {
+                    return Err(refuse(
+                        "Processes of the failed restore are still in this container's cgroups: removing it now would unlink the files they are writing without freeing the space. They are reported, not ended; retry with reclaim_processes: true to end the ones this host can prove belong to the attempt",
+                        json!({"runtime_processes": leftovers, "graph_root": graph_root, "available_bytes": space_before}),
+                    ));
+                }
+                if reclaim {
+                    // Provenance of the request, recorded verbatim beside the facts; the proof is what gates
+                    // the act, and it is re-read for every PID immediately before its signal.
+                    let mut outcome = cleanup::reclaim(&container_id, k.created_at);
+                    outcome["requested_by"] = json!({"operation_id": id, "authorization_ref": reference, "reclaim_processes": true});
+                    outcome["graph_root"] = json!(graph_root);
+                    outcome["available_bytes_before"] = json!(space_before);
+                    mg::write_private(
+                        &mg::base()?.join(&k.operation_id).join(format!("reclaim-{id}.json")),
+                        serde_json::to_string_pretty(&outcome)?.as_bytes(),
+                    )?;
+                    if outcome["complete"] != true && surviving > 0 {
+                        let reason = outcome["incomplete_reason"].as_str().unwrap_or("").to_string();
+                        reclaimed = outcome;
+                        return Err(refuse(
+                            &format!("The reclaim did not end every process of the failed restore ({reason})"),
+                            json!({"reclaim": reclaimed}),
+                        ));
+                    }
+                    reclaimed = outcome;
                 }
                 // Keep the CRIU restore log of the failed restore before its container storage is removed.
                 let _ = mg::copy_podman_log(
@@ -1032,18 +1116,28 @@ pub(crate) fn abort(
                 return Err("A universe container is present after the abort; nothing was recorded".into());
             }
             // A failed attempt can leave its conmon and CRIU processes running after its container is removed.
-            let leftover = removed.as_deref().map(runtime_processes).unwrap_or_default();
-            observed["runtime_processes_of_removed_container"] = json!(leftover);
-            let conmon_scope_absent = removed
-                .as_ref()
-                .map(|cid| !Path::new(&format!("/sys/fs/cgroup/machine.slice/libpod-conmon-{cid}.scope")).exists());
+            let leftover = removed
+                .as_deref()
+                .map(|cid| cleanup::runtime_processes(cid, k.created_at))
+                .unwrap_or(Value::Null);
+            let remaining = leftover["count"].as_u64().unwrap_or(0);
+            observed["runtime_processes_of_removed_container"] = leftover.clone();
+            let cgroups_absent = removed.as_ref().map(|cid| {
+                !cleanup::container_scope(cid).exists() && !cleanup::conmon_scope(cid).exists()
+            });
+            let space_after = mg::available_bytes(Path::new(&graph_root));
             let k = close(
                 db,
                 authorization,
                 id,
                 removed.as_deref(),
-                &json!({"reason": "migration_restore_abort", "restore_scope_finished": true, "conmon_scope_absent": conmon_scope_absent,
-                    "runtime_processes_remaining": leftover.len(), "runtime_processes": leftover}),
+                &json!({"reason": "migration_restore_abort", "restore_scope_finished": true,
+                    "conmon_scope_absent": removed.as_ref().map(|cid| !cleanup::conmon_scope(cid).exists()),
+                    "container_cgroups_absent": cgroups_absent, "runtime_processes_remaining": remaining,
+                    "runtime_processes": leftover, "runtime_processes_before_removal": before_removal,
+                    "reclaim_processes_requested": reclaim, "reclaim": reclaimed, "authorization_ref": reference,
+                    "graph_root": {"path": graph_root, "available_bytes_before": space_before, "available_bytes_after": space_after,
+                        "recovered_bytes": space_after as i64 - space_before as i64}}),
                 observed,
             )?;
             abort_result(
@@ -1065,7 +1159,11 @@ fn abort_result(uuid: &str, k: &Claim, action: &str) -> Result<Value, Error> {
         "status": "verified", "operation": "migration_restore_abort", "universe_uuid": uuid, "authorization_id": k.authorization_id,
         "action": action, "handoff_sha256": k.handoff_sha256, "claim_operation_id": k.operation_id,
         "removed_container_id": detail["removed_container_id"], "conmon_scope_absent": detail["conmon_scope_absent"],
+        "container_cgroups_absent": detail["container_cgroups_absent"],
         "runtime_processes_remaining": detail["runtime_processes_remaining"], "runtime_processes": detail["runtime_processes"],
+        "runtime_processes_before_removal": detail["runtime_processes_before_removal"],
+        "reclaim_processes_requested": detail["reclaim_processes_requested"], "reclaim": detail["reclaim"],
+        "authorization_ref": detail["authorization_ref"], "graph_root": detail["graph_root"],
         "outcome": {"result": "not_restored", "file": outcome_file["file"], "sha256": k.outcome_sha256},
         "restore_claim": k.view(),
         "note": "this host recorded that it will not restore this authorization; completing the transfer on the source with this outcome ends the authorization",

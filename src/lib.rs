@@ -1,5 +1,7 @@
+mod cleanup;
 mod lifecycle;
 mod migration;
+mod recovery;
 mod restore;
 mod transfer;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -98,6 +100,9 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
             | "migration_authorize_transfer"
             | "migration_complete_transfer"
             | "migration_retire_source"
+            | "migration_release"
+            | "migration_abandon"
+            | "migration_restore_local"
             | "migration_destination_preflight"
             | "migration_restore"
             | "migration_restore_abort" => lifecycle::execute(db, request)?,
@@ -106,18 +111,23 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
                 "version":option_env!("PODMESH_PACKAGE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
                 "operations":["capabilities","identity","inventory","observations","create","delete","clone","start","stop"],
                 "experimental_operations":["migration_preflight","migration_checkpoint","migration_status","migration_authorize_transfer",
-                    "migration_complete_transfer","migration_retire_source","migration_destination_preflight","migration_restore","migration_restore_abort"],
+                    "migration_complete_transfer","migration_retire_source","migration_release","migration_abandon","migration_restore_local",
+                    "migration_destination_preflight","migration_restore","migration_restore_abort"],
                 "experimental_contracts":{
                     "migration_preflight":"read-only compatibility report bound to universe UUID, container ID, image ID, source and destination host UUIDs; no reservation, suspension or artifact",
                     "migration_checkpoint":"source: fresh checks before suspension, durable reservation, checkpoint with the packaged podmesh-vzcriu runtime in its own scope, archive/manifest/hashes under the state directory; never an authorization to restore",
-                    "migration_status":"read-only reservation, fresh observation, artifact re-hash, transfer authorizations, restore claims and archived reservations; no release operation exists",
+                    "migration_status":"read-only reservation, fresh observation, artifact re-hash, transfer authorizations, restore claims, archived reservations and which recovery operations the observed state permits",
                     "migration_authorize_transfer":"source: checkpointed -> transfer_authorized after re-hashing the artifacts and observing the checkpointed source; authorization recorded first, then archive, manifest and handoff in outbox/<authorization_id>/",
                     "migration_complete_transfer":"source: inbox/<authorization_id>/outcome.json bound to this handoff; restored -> transferred, not_restored -> checkpointed with the authorization ended; any mismatch refused without state change",
                     "migration_retire_source":"source: from transferred, removes only the stopped, checkpointed reserved container; reservation and evidence kept",
+                    "migration_release":"source: checkpointed or checkpoint_failed -> released, only when no transfer authorization was ever issued and the same reserved container is observed stopped; lifts the generic-operation gate and starts nothing",
+                    "migration_abandon":"source: reserved, checkpointing, checkpoint_failed or checkpointed with the reserved container absent -> abandoned, only when no authorization was ever issued; artifacts kept and the universe UUID stays refused",
+                    "migration_restore_local":"source: from released, resumes the checkpointed memory here from the checkpoint files Podman kept (same container ID) or, when they are gone, from the preserved archive; verified like a destination restore, then the reservation is archived",
                     "migration_destination_preflight":"destination, read-only: inbox handoff names this host; name, label, reservation and claims free; image, runtime, kernel, archive, manifest and space checked",
                     "migration_restore":"destination: preflight, durable claim, restore of a private archive copy with the packaged runtime in its own scope; verified only when the universe runs restored and the CRIU restore log names the qualified runtime; records ownership and writes outbox/<authorization_id>/outcome.json",
-                    "migration_restore_abort":"destination: never removes a running or verified universe; removes only a non-running container created by a held claim, or declines an unclaimed authorization, then records not_restored and writes the outcome",
-                    "reservation":"a reservation or an unresolved restore claim blocks create, start, delete and clone for the universe; stop remains available"
+                    "migration_restore_abort":"destination: never removes a running or verified universe; removes only a non-running container created by a held claim, or declines an unclaimed authorization, then records not_restored and writes the outcome. With the explicit reclaim_processes: true it first ends the processes it can prove belong to the failed attempt (membership of the container's own libpod or libpod-conmon cgroup, start time at or after the claim, both re-read immediately before the signal) and verifies that both cgroups disappeared; without it, surviving processes are reported and nothing is removed or signalled",
+                    "restore_bound":"a restore attempt is watched while it runs: if it consumes more of the Podman graph root than its own preflight required, or that filesystem falls below the floor, its container cgroup is frozen (nothing is ended) and the transient scope is stopped",
+                    "reservation":"a reservation or an unresolved restore claim blocks create, start, delete and clone for the universe; stop remains available, and a released reservation blocks nothing"
                 },
                 "scope":"local rootful Podman; network-disabled universes created or cloned by this host's PodMesh journal; one request at a time",
                 "contracts":{
