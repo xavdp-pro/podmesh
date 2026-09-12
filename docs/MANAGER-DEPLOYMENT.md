@@ -1,12 +1,13 @@
 # Experimental resident manager package and deployment boundary
 
-Status: source-ready packaging and qualification contract only. No
-`podmesh-manager` binary, package publication, host installation, resident
-replication service, DNS service or HA claim exists yet.
+Status: a reviewed resident-manager source candidate and a locally exercised
+Debian assembly path exist. The final candidate must be rebuilt after the current
+documentation and qualification changes. No package has been published or installed
+on a host, and no deployed resident replication, DNS service or HA claim exists yet.
 
 ## Purpose and isolation
 
-`podmesh-manager` is the future resident process for one replica of the logical
+`podmesh-manager` is the resident process candidate for one replica of the logical
 control-services universe on one Linux host. It is intended to retain and exchange
 control facts such as replica identity, immutable history, peer progress, conflicts
 and later DNS publication evidence. It is not the PodMesh lifecycle daemon, an
@@ -21,13 +22,23 @@ partition and reconciliation model is in [CONTROL-SERVICES-UNIVERSE.md](CONTROL-
 the current executable laboratory boundaries are in
 [MANAGER-HA-ACCEPTANCE.md](MANAGER-HA-ACCEPTANCE.md).
 
+The present milestone deliberately exercises the manager as standalone local
+processes first. This isolates its persistence, replication, refusal and recovery
+behavior from an orchestration environment; it does not qualify an installed host
+service. The preferred integrated target then
+runs each host-bound replica inside a ShaperOS universe so it can reuse ShaperOS
+logging, observation and parent-supervision contracts. It remains the same single
+logical manager across those replicas. Standalone operation on a compatible Linux
+host remains required for users who do not deploy ShaperOS; neither mode is evidence
+for the other and both require their own qualification.
+
 This package deliberately coexists with the existing experimental components:
 
 | Component | Package/service | This package's relationship |
 | --- | --- | --- |
 | Local lifecycle API | `podmesh` / `podmesh.service` | Untouched: no file overlap, dependency, restart, stop or socket reuse |
 | Observation API | `podmesh-web-observer` / `podmesh-web-observer.service` | Untouched: no file overlap, dependency, restart, stop or socket reuse |
-| Future manager replica | `podmesh-manager` / `podmesh-manager.service` | Separate binary, user, configuration, state and runtime directory |
+| Manager replica candidate | `podmesh-manager` / `podmesh-manager.service` | Separate binary, user, configuration, state and runtime directory |
 
 No package maintainer script edits `/run/podmesh`, `/var/lib/podmesh`,
 `/run/podmesh-web-observer`, `/var/lib/podmesh-web-observer`, their units or their
@@ -66,18 +77,19 @@ The service runs unprivileged and uses systemd state/runtime directories, a priv
 temporary directory, a strict read-only host filesystem except for declared
 state/runtime paths, no ambient capabilities and a constrained Unix-only address
 family. `Restart=no` avoids an automatic recovery claim before actual host
-qualification. Its hardening must be requalified once a real binary's storage,
-transport and DNS behavior are known; hardening that prevents a required, reviewed
-operation is not silently relaxed.
+qualification. Its hardening must be qualified with the exact package candidate on
+disposable hosts, then requalified when its storage, transport or DNS behavior
+changes; hardening that prevents a required, reviewed operation is not silently
+relaxed.
 
 ## Build contract
 
 Packaging only assembles an explicitly supplied manager binary. It never compiles
 Rust, downloads inputs, generates keys, installs a package, starts a service,
-publishes to APT or contacts a host. There is no source-ready package until the
-future manager binary provides the documented `--config`, `--state-dir` and
-`--runtime-dir` command-line contract, validates configuration before accepting
-work, and reports a build/version identifier.
+publishes to APT or contacts a host. The current source candidate provides the
+documented `--config`, `--state-dir` and `--runtime-dir` command-line contract,
+performs pure offline configuration validation, refuses networking unless the
+reviewed mode is explicitly selected, and reports a build/version identifier.
 
 The supplied binary must be an amd64 ELF named exactly `podmesh-managerd`; its
 SHA-256 is verified before and after staging. The packager derives the highest
@@ -106,11 +118,11 @@ packaging/podmesh-manager/test-packaging.sh
 
 ## Network, firewall and WireGuard
 
-The package opens no port and makes no firewall or routing changes. A future
-packaged binary must bind no TCP or UDP listener while the
-`PODMESH_MANAGER_NETWORK_MODE=disabled` environment contract is in force. The
-current resident-laboratory schema has no `network.mode` field and still requires
-its declared TCP bind field; it cannot run under this unit. Transport configuration,
+The package opens no port and makes no firewall or routing changes. The current
+candidate refuses runtime startup before opening its database, lock or sockets while
+the `PODMESH_MANAGER_NETWORK_MODE=disabled` environment contract is in force. It
+requires an explicit `authenticated-static-peers` opt-in and a separately reviewed
+systemd network drop-in before it can run as a resident service. Transport configuration,
 known peers and current inline pair keys are supplied only through the protected
 operator-owned configuration file. Received data must never enroll a peer, choose a
 filesystem path, change a configuration path or widen a replica's scope.
@@ -123,41 +135,69 @@ tokens in public documentation, packages or evidence.
 
 ## Explicit installation and activation procedure
 
-This procedure is a future laboratory checklist, not authorization to deploy a
-manager now. Complete it independently for each of the three declared lab hosts.
-The currently built `podmesh-manager-resident-lab` is not a package candidate: it
-expects one positional configuration path, always requires TCP bind/peer endpoints,
-and does not implement the packaged `--config`, `--state-dir`, `--runtime-dir` or
-network-disabled contract. The example configuration is intentionally its exact
-current JSON schema so its limits are reviewable; it is not accepted by the future
-packaged binary until that binary formally adopts it.
+This procedure is the laboratory qualification checklist for the reviewed local
+candidate. Complete it independently for each of the three declared lab hosts.
+The current `podmesh-manager-resident-lab` source now implements the package CLI
+contract, strict declared state/runtime boundaries, offline validation and an
+explicit `authenticated-static-peers` runtime opt-in. Claude Code Opus independently
+reviewed that source boundary. A local package was assembled to exercise the build
+path before the present documentation and harness corrections; it is deliberately
+stale and is not the candidate for publication. The final candidate remains
+experimental until it is rebuilt from reviewed committed source, verified against
+signed repository metadata and qualified through the stages below. The example
+configuration is its exact current JSON schema.
 
 1. Record a pre-install inventory outside the candidate package: host identity,
    package versions, `podmesh.service` and `podmesh-web-observer.service` PIDs,
    their unit state, both Unix socket metadata, and full rootful Podman inventory.
    Hash the evidence and use stable host aliases instead of public/private addresses.
 2. Verify the signed APT metadata, package version, package SHA-256, binary
-   SHA-256, file list and source commit. Confirm package paths have no overlap
-   with either existing PodMesh package.
+   SHA-256 and file list. Confirm the reviewed candidate contract names the intended
+   source commit; this contract assertion is not an independent source-to-binary
+   reproducibility proof. Confirm package paths have no overlap with either existing
+   PodMesh package.
 3. Install the package only. Confirm that no manager service starts or enables,
    no manager configuration or inline key material exists unless the operator created it, and both
    existing services retain their pre-install PIDs and inventories.
 4. Create a unique per-host replica configuration from the example, preserving one
    declared logical manager identity but using distinct host and replica IDs. The
    current laboratory key fields stay inside the protected configuration; never copy
-   them into a public artifact. Validate configuration offline with the future
-   binary's dedicated validation command before enabling the unit.
-5. Enable and start **only** `podmesh-manager.service`. Verify its UID, directory
-   modes, state ownership, process arguments, logs and no unexpected listener. In
-   disabled network mode, verify no TCP/UDP listener and no firewall/routing change.
-   A future network qualification requires an explicit, reviewed systemd drop-in
-   that removes `IPAddressDeny=any`, widens the address-family set as needed and
-   changes the environment only after its transport contract is accepted.
-6. Run only the acceptance scenarios whose prerequisite gates in
+   them into a public artifact. Create an otherwise empty temporary runtime directory
+   owned by `podmesh-manager`, then run offline validation as that account so both
+   declared directories have the same ownership as the process:
+
+   ```sh
+   install -d -o podmesh-manager -g podmesh-manager -m 0700 /run/podmesh-manager
+   runuser -u podmesh-manager -- /usr/lib/podmesh-manager/podmesh-managerd \
+     --config /etc/podmesh-manager/config.json \
+     --state-dir /var/lib/podmesh-manager \
+     --runtime-dir /run/podmesh-manager \
+     --validate-config
+   rmdir /run/podmesh-manager
+   ```
+
+   The final command must remove only the empty directory created for validation;
+   any unexpected content is a refusal that requires investigation.
+5. Exercise the package's default-disabled gate before adding any override. Record
+   the result of `systemctl start podmesh-manager.service`, but do not use that
+   command's exit status as the verdict: a `Type=simple` start job can return before
+   the process refusal is observed. Wait for the process outcome and require
+   `systemctl show` to report `ActiveState=failed`, `Result=exit-code`,
+   and `ExecMainStatus=1`; preserve the matching journal evidence, then run
+   `systemctl reset-failed podmesh-manager.service`. A skipped condition or an
+   inactive unit is not this proof. The attempt must leave no manager database,
+   lock, control socket, TCP/UDP listener, firewall or routing change. This is a
+   negative installation proof, not a running-service qualification.
+6. To qualify resident exchange, install an explicit, separately reviewed systemd
+   drop-in that selects `authenticated-static-peers`, removes `IPAddressDeny=any`
+   and widens the address-family set only as required by the accepted transport.
+   Start **only** `podmesh-manager.service`, then verify its UID, directory modes,
+   state ownership, exact arguments, declared listeners and logs.
+7. Run only the acceptance scenarios whose prerequisite gates in
    `MANAGER-HA-ACCEPTANCE.md` are satisfied. Initial resident-service qualification
    must prove the manager's own identity/state lifecycle before replica exchange,
    effects, DNS, migration or workload activation.
-7. Record a post-test independent inventory. The lifecycle and observer PIDs,
+8. Record a post-test independent inventory. The lifecycle and observer PIDs,
    socket modes, package versions, rootful Podman inventory and unrelated
    workloads must match the pre-install record. Explain every intended manager
    artifact separately.
@@ -178,8 +218,8 @@ This makes recovery explicit and prevents a package command from erasing the
 evidence that explains an incident. Reinstallation must re-open the same local
 identity only when the operator has verified that it is the intended replica.
 
-Rollback is forbidden until the future binary provides a schema compatibility
-contract. A downgrade can remove checks that a newer state relies on. Before any
+Rollback is forbidden until the resident manager provides and qualifies a schema
+compatibility contract. A downgrade can remove checks that a newer state relies on. Before any
 rollback trial, capture the package/state/configuration hashes, verify a supported
 prior binary and schema path on a disposable copy, and prove that replayed
 operation IDs remain deterministic. Never replace a current manager database with
@@ -194,7 +234,8 @@ For each stage, preserve one evidence bundle per host and a cross-host compariso
 | Pre-install | Existing service PIDs, unit states, sockets, package versions and Podman inventory |
 | Install | Package signatures/hashes/file list; no manager process; existing PIDs/inventory unchanged |
 | Configure | Different replica ID per host; same logical manager ID; config/key ownership and mode; no secrets retained in public evidence |
-| Activation | Only manager unit changed; PID/UID/arguments; state/runtime modes; disabled-network listener check |
+| Default-disabled refusal | Failed unit with exit status 1; no manager database, lock, socket or listener; matching journal evidence |
+| Resident activation | Separately reviewed network opt-in; only manager unit changed; PID/UID/arguments; state/runtime modes; only declared listeners |
 | Restart | Same replica identity and state checksum; existing service PIDs/inventory unchanged |
 | Upgrade | Previous and new package/binary hashes; explicit restart; schema/version compatibility result |
 | Remove/purge/reinstall | Manager-only stop/disable; retained identity/state; lifecycle/observer PIDs and inventories unchanged |
@@ -205,26 +246,31 @@ Podman CLI provide evidence from outside the resident manager. The manager's own
 health endpoint or log cannot prove its effect, its exclusion guarantees, host
 death or unchanged workloads.
 
-## Open requirements before publication
+## Open requirements before publication and activation
 
-- Implement a resident manager binary with bounded authenticated peer exchange,
-  configuration validation and explicit schema evolution.
 - Establish key generation, rotation, revocation and operator recovery rules.
-- Decide and qualify the transport framing, confidentiality and endpoint policy.
+- Qualify the implemented authenticated static-peer transport on three disposable
+  hosts, including confidentiality and endpoint policy.
 - Bind replica history to a durable external effect gate before any exclusive
   activation, route or DNS publication.
-- Qualify clean installation, activation, restart, upgrade, removal, purge and
-  supported rollback on three disposable hosts.
-- Repeat the independent counter-review after a compatible binary exists, then
-  publish only the proven package scope through the signed experimental APT suite.
+- Verify the exact candidate against signed repository metadata, then qualify clean
+  installation with the service disabled and inactive on three disposable hosts.
+- Qualify explicit activation, restart, upgrade, removal, purge and supported
+  rollback separately before claiming those lifecycle phases.
+- Publish only the package scope supported by the recorded evidence through the
+  signed experimental APT suite.
 
-The package boundary is intentionally ready before the binary so that its separate
-state, privilege, network and lifecycle contract can be reviewed without
-accidentally modifying the currently qualified PodMesh daemon or observer.
+The package boundary was designed before the compatible binary so its separate
+state, privilege, network and lifecycle contract could be reviewed without
+accidentally modifying the currently qualified PodMesh daemon or observer. The
+current candidate preserves that boundary.
 
 Claude Code Opus independently counter-reviewed this source-ready boundary. Its
 findings on directory modes, Debian lifecycle ordering, network isolation,
 configuration truthfulness, licensing, GLIBC portability and maintainer-script
 regression checks were corrected. The final closure review reported no remaining
-blocker or important finding for this undeployed scope. A future real binary and
-package still require a fresh review and host qualification.
+blocker or important finding for this undeployed scope. Claude Code Opus then
+reviewed the compatible CLI, path boundary, offline validation and network refusal;
+after two port-race corrections it reported no remaining blocker or important
+finding for the local-only increment. Signed publication and host qualification
+remain open.

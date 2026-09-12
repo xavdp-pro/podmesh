@@ -2,7 +2,8 @@
 
 ## Package-candidate CLI increment
 
-Thirteen process integration tests now pass, including strict CLI errors,
+At commit `13e7051f687775125fcef10290de6a148c2643f5`, thirteen process
+integration tests pass, including strict CLI errors,
 installed-facing `--version`, explicit network opt-in, exact declared directories,
 symlink/hardlink/traversal refusals, group-readable state layout and offline
 validation. An already bound configured TCP address does not prevent offline
@@ -47,13 +48,16 @@ documented experimental scope.
 | MR-07 | Config and duplicate instance | Invalid bounds/unknown fields refused; second resident with distinct free bind/socket but same DB lock cannot start |
 | MR-08 | Error/control regressions | Extra fields on status/shutdown refused without process exit; store failure terminates and removes owned socket; partition yields null count delta after fresh local attempt |
 
-Eight integration tests passed. Tests inspect durable state through independently
+Eight integration tests passed at that increment. Tests inspect durable state through independently
 opened Store instances and the typed status interface, beyond process existence.
 Transport tests additionally exercise the accepted-connection seam and absolute
 frame deadline.
 
 The interrupted-syscall retry branches were inspected and surrounding I/O gates
-rerun; no deterministic signal/EINTR injection is claimed.
+rerun; no deterministic signal/EINTR injection is claimed. After replacing four
+release-and-rebind ephemeral-port test patterns with retained listeners, Codex
+reran the complete resident suite, strict Clippy and formatting at the commit
+above. The recorded run completed with 13 passed and no failure.
 
 ```sh
 cargo test --locked --manifest-path experiments/manager-resident/Cargo.toml

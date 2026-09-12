@@ -39,7 +39,7 @@ OpenAI Codex GPT-6 Astra at high effort.
 
 | Command | Result |
 | --- | --- |
-| `cargo test --locked --manifest-path experiments/manager-network/Cargo.toml` | 10 tests passed: nine library transport cases and one three-process integration case |
+| `cargo test --locked --manifest-path experiments/manager-network/Cargo.toml` | 11 tests passed: ten library transport cases and one three-process integration case |
 | `cargo clippy --locked --all-targets --manifest-path experiments/manager-network/Cargo.toml -- -D warnings` | Passed |
 | `cargo fmt --manifest-path experiments/manager-network/Cargo.toml -- --check` | Passed |
 
@@ -76,12 +76,18 @@ availability, HA, replication convergence under unbounded history, or safe
 exclusive activation. A separate Claude Code counter-review and Codex verification
 found and corrected an inverted diagnostic address, untyped remote status, an
 unbounded configuration read, an unignored build tree and one inaccurate bound.
-Claude Code Opus at medium effort then reran the eight tests, strict Clippy and
+Claude Code Opus at medium effort then reran the then-current eight tests, strict Clippy and
 formatting and reported no remaining blocker or important finding for this
 documented experimental scope. Codex independently reran the same gates.
 
 For the resident increment, Claude Code Opus at high effort found and prompted
 corrections for strict control request fields, error-path socket cleanup, stale
 count-delta reporting and interrupted-syscall retry. Its closure review reported
-no remaining blocker or important finding. Codex reran all ten transport tests,
-strict Clippy and formatting after those corrections.
+no remaining blocker or important finding. Codex reran all then-current ten
+transport tests, strict Clippy and formatting after those corrections. At commit
+`13e7051f687775125fcef10290de6a148c2643f5`, after replacing two additional
+release-and-rebind ephemeral-port patterns with retained listeners, Codex reran
+the complete current suite: ten library tests and one three-process test passed,
+with strict Clippy and formatting also passing. The `unused_addresses` helper and
+the three-process setup still release reservation listeners before child processes
+bind; this remaining laboratory race is not described as corrected.

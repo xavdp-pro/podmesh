@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PodMesh manager host qualification evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "stage", "host_alias", "captured_at_utc", "boot_id_commitment", "packages", "services", "sockets", "podman_rootful", "manager"],
+  "properties": {
+    "schema_version": {"const": "podmesh-manager-host-evidence/v5"},
+    "stage": {"enum": ["pre-install", "post-install"]},
+    "host_alias": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$"},
+    "captured_at_utc": {"type": "string", "format": "date-time"},
+    "boot_id_commitment": {"$ref": "#/$defs/commitment"},
+    "packages": {
+      "type": "object", "additionalProperties": false,
+      "required": ["podmesh", "podmesh-web-observer", "podmesh-manager"],
+      "properties": {
+        "podmesh": {"$ref": "#/$defs/package"},
+        "podmesh-web-observer": {"$ref": "#/$defs/package"},
+        "podmesh-manager": {"$ref": "#/$defs/package"}
+      }
+    },
+    "services": {
+      "type": "object", "additionalProperties": false,
+      "required": ["podmesh.service", "podmesh-web-observer.service", "podmesh-manager.service"],
+      "properties": {
+        "podmesh.service": {"$ref": "#/$defs/unit"},
+        "podmesh-web-observer.service": {"$ref": "#/$defs/unit"},
+        "podmesh-manager.service": {"$ref": "#/$defs/unit"}
+      }
+    },
+    "sockets": {
+      "type": "object", "additionalProperties": false,
+      "required": ["/run/podmesh/api.sock", "/run/podmesh-web-observer/api.sock"],
+      "properties": {
+        "/run/podmesh/api.sock": {"$ref": "#/$defs/socket"},
+        "/run/podmesh-web-observer/api.sock": {"$ref": "#/$defs/socket"}
+      }
+    },
+    "podman_rootful": {
+      "type": "object", "additionalProperties": false,
+      "required": ["projection_version", "commitments"],
+      "properties": {
+        "projection_version": {"const": "v2"},
+        "commitments": {
+          "type": "object", "additionalProperties": false,
+          "required": ["containers", "images", "volumes", "networks", "pods"],
+          "properties": {
+            "containers": {"$ref": "#/$defs/commitment"},
+            "images": {"$ref": "#/$defs/commitment"},
+            "volumes": {"$ref": "#/$defs/commitment"},
+            "networks": {"$ref": "#/$defs/commitment"},
+            "pods": {"$ref": "#/$defs/commitment"}
+          }
+        }
+      }
+    },
+    "manager": {
+      "type": "object", "additionalProperties": false,
+      "required": ["process_count", "account", "config_present", "state_directory", "runtime_present", "candidate_binding"],
+      "properties": {
+        "process_count": {"type": "integer", "minimum": 0},
+        "account": {"$ref": "#/$defs/account"},
+        "config_present": {"type": "boolean"},
+        "state_directory": {"$ref": "#/$defs/state_directory"},
+        "runtime_present": {"type": "boolean"},
+        "candidate_binding": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/candidate_binding"}]}
+      }
+    }
+  },
+  "$defs": {
+    "commitment": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "package": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["status", "version"], "properties": {"status": {"const": "absent"}, "version": {"type": "null"}}},
+        {"type": "object", "additionalProperties": false, "required": ["status", "version"], "properties": {"status": {"const": "installed"}, "version": {"type": "string", "minLength": 1}}}
+      ]
+    },
+    "unit": {
+      "type": "object", "additionalProperties": false,
+      "required": ["unit", "load_state", "active_state", "sub_state", "unit_file_state", "main_pid", "exec_main_pid", "invocation_id", "start_monotonic_usec", "n_restarts"],
+      "properties": {
+        "unit": {"type": "string"},
+        "load_state": {"type": "string", "not": {"const": "unknown"}},
+        "active_state": {"type": "string", "not": {"const": "unknown"}},
+        "sub_state": {"type": "string", "not": {"const": "unknown"}},
+        "unit_file_state": {"type": "string", "not": {"const": "unknown"}},
+        "main_pid": {"type": "integer", "minimum": 0},
+        "exec_main_pid": {"type": "integer", "minimum": 0},
+        "invocation_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/commitment"}]},
+        "start_monotonic_usec": {"type": "integer", "minimum": 0},
+        "n_restarts": {"type": "integer", "minimum": 0}
+      }
+    },
+    "socket": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["path", "present", "file_type", "mode", "uid", "gid", "inode", "bytes"],
+          "properties": {
+            "path": {"type": "string"}, "present": {"const": false}, "file_type": {"type": "null"}, "mode": {"type": "null"},
+            "uid": {"type": "null"}, "gid": {"type": "null"}, "inode": {"type": "null"}, "bytes": {"type": "null"}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["path", "present", "file_type", "mode", "uid", "gid", "inode", "bytes"],
+          "properties": {
+            "path": {"type": "string"}, "present": {"const": true}, "file_type": {"type": "string", "minLength": 1}, "mode": {"type": "string", "pattern": "^[0-7]{3,4}$"},
+            "uid": {"type": "integer", "minimum": 0}, "gid": {"type": "integer", "minimum": 0}, "inode": {"type": "integer", "minimum": 0}, "bytes": {"type": "integer", "minimum": 0}
+          }
+        }
+      ]
+    },
+    "account": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["name", "present", "uid", "primary_gid", "primary_group", "home", "shell"], "properties": {"name": {"const": "podmesh-manager"}, "present": {"const": false}, "uid": {"type": "null"}, "primary_gid": {"type": "null"}, "primary_group": {"type": "null"}, "home": {"type": "null"}, "shell": {"type": "null"}}},
+        {"type": "object", "additionalProperties": false, "required": ["name", "present", "uid", "primary_gid", "primary_group", "home", "shell"], "properties": {"name": {"const": "podmesh-manager"}, "present": {"const": true}, "uid": {"type": "integer", "minimum": 0}, "primary_gid": {"type": "integer", "minimum": 0}, "primary_group": {"type": "string", "minLength": 1}, "home": {"type": "string", "minLength": 1}, "shell": {"type": "string", "minLength": 1}}}
+      ]
+    },
+    "state_directory": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["path", "present", "file_type", "owner", "group", "mode", "entry_count"], "properties": {"path": {"const": "/var/lib/podmesh-manager"}, "present": {"const": false}, "file_type": {"type": "null"}, "owner": {"type": "null"}, "group": {"type": "null"}, "mode": {"type": "null"}, "entry_count": {"type": "null"}}},
+        {"type": "object", "additionalProperties": false, "required": ["path", "present", "file_type", "owner", "group", "mode", "entry_count"], "properties": {"path": {"const": "/var/lib/podmesh-manager"}, "present": {"const": true}, "file_type": {"const": "directory"}, "owner": {"type": "string", "minLength": 1}, "group": {"type": "string", "minLength": 1}, "mode": {"type": "string", "pattern": "^[0-7]{3,4}$"}, "entry_count": {"type": "integer", "minimum": 0}}},
+        {"type": "object", "additionalProperties": false, "required": ["path", "present", "file_type", "owner", "group", "mode", "entry_count"], "properties": {"path": {"const": "/var/lib/podmesh-manager"}, "present": {"const": true}, "file_type": {"type": "string", "not": {"const": "directory"}}, "owner": {"type": "string", "minLength": 1}, "group": {"type": "string", "minLength": 1}, "mode": {"type": "string", "pattern": "^[0-7]{3,4}$"}, "entry_count": {"type": "null"}}}
+      ]
+    },
+    "candidate_binding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["package", "version", "binary_sha256", "regular_payload_files_commitment", "maintainer_scripts_commitment", "dpkg_verify", "verification_commitment"],
+      "properties": {
+        "package": {"const": "podmesh-manager"},
+        "version": {"type": "string", "minLength": 1},
+        "binary_sha256": {"$ref": "#/$defs/sha256"},
+        "regular_payload_files_commitment": {"$ref": "#/$defs/commitment"},
+        "maintainer_scripts_commitment": {"$ref": "#/$defs/commitment"},
+        "dpkg_verify": {"const": "clean"},
+        "verification_commitment": {"$ref": "#/$defs/commitment"}
+      }
+    }
+  }
+}
