@@ -283,37 +283,21 @@ on the corrected binary.
 
 ## Garbage collection
 
-Operator decision, 2026-09-12, answering both dead ends at once: a reservation with no way out and a
-failed local restore with no reclaim do not each deserve their own operation. They are the work of a
-garbage collector, the shape SHAPER already uses for ephemeral universes. Age alone never justifies
-collecting anything; proof does.
-
-It may collect, each as a typed decision recorded with the evidence it rests on:
-
-- a reservation whose every authorization ended `not_restored`, whose source is still the reserved
-  container and is not running — an ended authorization can no longer produce a copy anywhere, which the
-  independent review of lot M3 verified against the destination's own refusal path;
-- a reservation whose container is gone and which never issued an authorization — today's
-  `migration_abandon`, which becomes one of the collector's cases rather than a separate act;
-- a failed restore claim together with the processes of its own attempt, under the reclaim proof already
-  implemented: cgroup membership and a start time at or after the claim, re-read before each signal;
-- a failed local restore's own container and processes, under the same proof;
-- the artifacts of finished operations, under a declared retention, never those of an unresolved one.
-
-It must never collect: anything while an authorization is open, since a destination may hold it; a claim
-that verified; a running universe; a container it cannot prove its own attempt created; or the evidence
-of an incident nobody has read yet.
-
-Two modes, both typed operations carrying an `authorization_ref`: a dry run that reports what it would
-collect and why, and a run that collects and reports what it did. Nothing runs on a timer of its own in
-this version. The watching agent proposes; the root tandem, or a standing mandate that names the scope,
-decides. What the mandate may cover for a production universe is not settled here.
+Operator decision, 2026-09-12: a reservation with no way out and a failed local restore with no reclaim
+do not each deserve their own operation. Both are cases a garbage collector sweeps, on proof and never on
+age. Its complete contract — the four kinds of act it must never confuse, the exclusions that make an
+unknown fact a blocker, the terminal classes with the proofs each requires, the `plan` and `apply` modes
+without a timer, the record every run owes and the bounded execution rules — is
+[GARBAGE-COLLECTION.md](GARBAGE-COLLECTION.md). This protocol keeps only what binds a migration: a
+collection is never a way around a migration, a restore, a retirement or an authority decision, and a
+collected reservation always leaves a tombstone so that an old container cannot regain its meaning.
 
 ## Still open
 
 - Break-glass release when the destination is unreachable or its journal is lost, including the case where
   a transport altered the documents so that no outcome can ever bind to the source's authorization.
-- The garbage collector above: its operations, its retention, and the mandate that may run it.
+- The garbage collector's implementation, and the production mandate that may ever apply it
+  automatically ([GARBAGE-COLLECTION.md](GARBAGE-COLLECTION.md)).
 - Moving network identity and addresses (P11–P13).
 - Transport by makers, authenticated remote operations and the manager's role.
 - Periodic replication and controlled failover (P10, P16, P17).
