@@ -1,5 +1,32 @@
 # Resident replication evidence
 
+## Package-candidate CLI increment
+
+Thirteen process integration tests now pass, including strict CLI errors,
+installed-facing `--version`, explicit network opt-in, exact declared directories,
+symlink/hardlink/traversal refusals, group-readable state layout and offline
+validation. An already bound configured TCP address does not prevent offline
+validation; no database, resident lock or socket appears. Existing non-SQLite
+bytes remain unchanged because validation does not open the durable store.
+Legacy runtime tests explicitly set `authenticated-static-peers`.
+
+A separate disposable local proof ran the binary as effective UID 1000 against
+a root-owned `0640` config with group 1000, state `0750`, runtime `0700`, mode
+disabled and the configured TCP address already held. Exit was 0, response was
+`configuration_valid=true`, `durable_store_checked=false`, `network_started=false`;
+both state/runtime directories remained empty. Only that temporary config's
+ownership was changed with sudo; no service or package configuration was changed.
+
+Transport static validation was extracted as pure `ConfigurationFile::validate`;
+its focused regression confirms no store/listener opening. Claude Code Opus high
+found that the integrated laboratory still invoked the legacy positional form
+without the now-required explicit network mode. That caller was corrected and the
+integrated suite rerun. Independent closure of the remaining CLI boundary is
+complete: the source review found no remaining blocker or important issue in the
+CLI, path boundary, offline validation, network refusal or legacy compatibility.
+It identified deployment-procedure defects outside this source boundary; the
+installation qualification review tracks their correction separately.
+
 Date: 2026-09-12. Scope: disposable loopback processes and SQLite stores.
 Implementation: Codex GPT-6 Astra; inherited effort not independently exposed.
 Claude Code Opus high counter-review found four important issues. All are corrected:

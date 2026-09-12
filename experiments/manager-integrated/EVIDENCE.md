@@ -30,6 +30,20 @@ fixes. Relevant SHA-256 identities from its retained manifest:
 | `integrated_lab.py` | `c330870e45c536a40d7b2c04a11f58c87674ef4059925826304384998a2a744b` |
 | `test_integration.py` | `058a81d50bc37968e28e991cb5ecb446d04c559addb211bbf0c12f0603215d9c` |
 
+The later package-candidate CLI made runtime network selection explicit. A
+compatibility rerun after updating this harness to set
+`PODMESH_MANAGER_NETWORK_MODE=authenticated-static-peers` passed the same three
+tests in 6.282 seconds. Its run ID is
+`4f34ef37-d6d1-4076-a315-bb6a197f20bd`, retained under
+`/tmp/pm-integrated-c8ead6e68775`. The manifest records the current CLI source as
+`44f82bb6d5eb0a89ebf33922d7126324d55ac3820cf94efc4e3e7e222798c5c9`,
+resident source as
+`4c34356c658a15e59375e7b6015727f1cb199eedfc8bc0d57560c7ed42aacb75`
+and network source as
+`071bef1d6c1f7086455034b56464239cdbd2c8e9baf43229c6e31d40df115afa`.
+This rerun preserves the laboratory scope; it does not turn the package candidate
+into installed-service or host evidence.
+
 ## Independently observed result
 
 | Observation | Result |

@@ -1,5 +1,15 @@
 # Network transport laboratory evidence
 
+## Offline configuration validation seam
+
+`ConfigurationFile::validate()` now performs existing topology/peer/key checks
+without a Store or listener. `open()` invokes it before opening SQLite. A focused
+regression holds the configured bind address, validates with no DB, then validates
+with unchanged non-SQLite bytes and refuses a malformed key. This seam supports
+the resident package candidate's offline validation. Claude Code Opus high later
+reviewed the seam with the complete candidate boundary and found no remaining
+blocker or important source issue.
+
 ## Resident integration seam increment
 
 The resident milestone extracts `Node::serve_connection(TcpStream)` from the

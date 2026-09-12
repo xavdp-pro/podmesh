@@ -72,13 +72,12 @@ pub fn load_configuration(path: &Path) -> Result<ConfigurationFile, Error> {
 }
 
 impl ConfigurationFile {
-    /// Opens a locally configured node after validating complete static peer identity.
+    /// Validates complete static peer identity without opening a store or socket.
     ///
     /// # Errors
     ///
-    /// Returns a refusal when the static replica topology, peer identities, keys or
-    /// locally bound durable store are invalid.
-    pub fn open(&self) -> Result<Node, Error> {
+    /// Returns a refusal when topology, peer identities or pair keys are invalid.
+    pub fn validate(&self) -> Result<(), Error> {
         let topology = self.manager.topology().map_err(Error::refused)?;
         topology
             .instantiate(&self.replica_id)
@@ -106,6 +105,15 @@ impl ConfigurationFile {
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// Opens the configured durable store after pure static validation.
+    ///
+    /// # Errors
+    /// Returns a refusal on invalid static configuration or durable-store failure.
+    pub fn open(&self) -> Result<Node, Error> {
+        self.validate()?;
         let store = Store::open(&self.database_path, self.manager.clone(), &self.replica_id)
             .map_err(Error::refused)?;
         Ok(Node {
@@ -702,6 +710,21 @@ mod tests {
     use super::*;
 
     const WRONG_KEY: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+    #[test]
+    fn pure_configuration_validation_opens_no_store_or_listener() {
+        let directory = tempfile::tempdir().unwrap();
+        let addresses = unused_addresses();
+        let mut config = configuration(&directory, "r1", &addresses);
+        let _occupied = TcpListener::bind(config.bind).unwrap();
+        config.validate().unwrap();
+        assert!(!config.database_path.exists());
+        fs::write(&config.database_path, b"not SQLite").unwrap();
+        config.validate().unwrap();
+        assert_eq!(fs::read(&config.database_path).unwrap(), b"not SQLite");
+        config.peers[0].shared_key_hex = "invalid".into();
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn accepted_connection_seam_preserves_authentication_and_one_frame_boundary() {

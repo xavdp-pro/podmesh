@@ -24,6 +24,8 @@ use std::{
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+pub mod cli;
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
@@ -36,6 +38,7 @@ pub struct Configuration {
 
 impl Configuration {
     pub fn validate(&self) -> Result<()> {
+        self.network.validate()?;
         if !(100..=60_000).contains(&self.interval_ms)
             || !(self.interval_ms..=300_000).contains(&self.max_backoff_ms)
             || !(1..=8).contains(&self.incoming_workers)
@@ -148,7 +151,8 @@ enum Control {
 }
 
 /// Runs until the private typed control interface requests graceful shutdown.
-pub fn run(config: Configuration) -> Result<()> {
+pub(crate) fn run(config: Configuration) -> Result<()> {
+    cli::require_network_mode()?;
     config.validate()?;
     // Holding the lock prevents duplicate residents on this configured database.
     let lock = OpenOptions::new()

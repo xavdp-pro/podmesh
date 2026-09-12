@@ -32,7 +32,51 @@ or a privileged actor. No history/receipt compaction or disk quota exists yet.
 
 ## Configuration and bounds
 
-Run `podmesh-manager-resident-lab CONFIG.json`. Unknown JSON fields are refused.
+The Cargo executable remains `podmesh-manager-resident-lab`; it is intended to be
+installed as `podmesh-managerd`. `--version` prints the installed-facing identity
+`podmesh-managerd 0.1.0`, independently of the filename. This is the crate version,
+not an assertion about a Debian package version or installed deployment.
+
+The package candidate accepts exactly:
+
+```text
+podmesh-managerd --config /etc/podmesh-manager/config.json --state-dir /var/lib/podmesh-manager --runtime-dir /run/podmesh-manager [--validate-config]
+podmesh-managerd --version
+```
+
+All three path flags are mandatory in flag mode and can appear in any order.
+Unknown, repeated, mixed positional, missing-value and missing-required flags
+are refused. The one positional `CONFIG.json` laboratory form remains available;
+its absolute state/runtime boundaries are derived from the configured DB/socket
+parents and undergo the same checks. All runtime forms require the explicit
+environment value `PODMESH_MANAGER_NETWORK_MODE=authenticated-static-peers`.
+Missing mode or `disabled` refuses runtime networking before DB, lock or socket
+creation. Unknown modes are refused. `--validate-config` works with disabled or
+enabled mode but never binds, opens/creates a durable database, takes a lock or
+creates a socket. It reads the config and filesystem metadata only; a successful
+offline check does not validate an existing SQLite file's identity/integrity.
+
+Paths must be absolute, at most 4096 bytes, without `.`/`..`, repeated/trailing
+separators or any symlink in their checked ancestry. The DB and socket must be
+direct children of declared state/runtime directories. State/runtime directories
+must exist and belong to the effective user: state permits group read/traverse
+(package mode `0750`), runtime permits no group/other access (`0700`). Their
+ancestors must belong to root or the effective user and disallow other-user
+writes, except root-owned sticky temporary directories. Config files must be
+regular, singly linked, root- or effective-user-owned and not group/other writable;
+root-owned group-readable `0640` config is supported. Existing DB/lock/WAL/SHM
+files must be singly linked regular files owned by the effective user and not
+group/other writable. Existing sockets must be private and owned by that user.
+Validation follows no symlink and performs no automatic directory creation.
+
+These metadata checks assume the effective account and root do not race path
+replacement after validation; descriptor-relative race hardening against those
+trusted actors is not implemented. Do not run this service under an account
+shared with untrusted software. The package networking default stays disabled;
+its systemd address-family/firewall policy needs separately reviewed changes
+before opting into real networking.
+
+Unknown JSON fields are refused.
 The configuration has `network` (the complete transport `ConfigurationFile`),
 `control_socket`, `interval_ms`, `max_backoff_ms`, and `incoming_workers`.
 `network` fixes the replica identity/topology, local DB, TCP bind and all exact

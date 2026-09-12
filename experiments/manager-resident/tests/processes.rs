@@ -161,6 +161,7 @@ impl Lab {
         fs::write(&path, serde_json::to_vec(&self.configs[i]).unwrap()).unwrap();
         self.children[i] = Some(
             Command::new(env!("CARGO_BIN_EXE_podmesh-manager-resident-lab"))
+                .env("PODMESH_MANAGER_NETWORK_MODE", "authenticated-static-peers")
                 .arg(path)
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit())
@@ -397,6 +398,7 @@ fn invalid_config_and_second_resident_are_refused() {
     let duplicate_path = lab._dir.path().join("duplicate.json");
     fs::write(&duplicate_path, serde_json::to_vec(&duplicate).unwrap()).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_podmesh-manager-resident-lab"))
+        .env("PODMESH_MANAGER_NETWORK_MODE", "authenticated-static-peers")
         .arg(duplicate_path)
         .output()
         .unwrap();
@@ -447,6 +449,281 @@ fn store_failure_exit_unlinks_owned_control_socket() {
     );
     assert!(!child.wait().unwrap().success());
     assert!(!lab.configs[0].control_socket.exists());
+}
+
+fn candidate(lab: &Lab, config: &Configuration) -> Command {
+    candidate_dirs(lab, config, lab._dir.path(), lab._dir.path())
+}
+
+fn candidate_dirs(
+    lab: &Lab,
+    config: &Configuration,
+    state: &std::path::Path,
+    runtime: &std::path::Path,
+) -> Command {
+    let path = lab._dir.path().join("candidate.json");
+    fs::write(&path, serde_json::to_vec(config).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_podmesh-manager-resident-lab"));
+    command
+        .env_remove("PODMESH_MANAGER_NETWORK_MODE")
+        .arg("--config")
+        .arg(path)
+        .arg("--state-dir")
+        .arg(state)
+        .arg("--runtime-dir")
+        .arg(runtime);
+    command
+}
+
+#[test]
+fn candidate_validates_offline_and_network_requires_explicit_opt_in() {
+    let lab = Lab::new();
+    // Holding the exact configured address makes an accidental validation bind
+    // fail; successful validation must remain fully offline.
+    let _occupied = TcpListener::bind(lab.configs[0].network.bind).unwrap();
+    for mode in [None, Some("disabled"), Some("authenticated-static-peers")] {
+        let mut command = candidate(&lab, &lab.configs[0]);
+        command.arg("--validate-config");
+        if let Some(mode) = mode {
+            command.env("PODMESH_MANAGER_NETWORK_MODE", mode);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap()["durable_store_checked"],
+            false
+        );
+        assert!(!lab.configs[0].network.database_path.exists());
+        assert!(!lab.configs[0]
+            .network
+            .database_path
+            .with_extension("resident-lock")
+            .exists());
+        assert!(!lab.configs[0].control_socket.exists());
+    }
+    for mode in [None, Some("disabled"), Some("unexpected")] {
+        let mut command = candidate(&lab, &lab.configs[0]);
+        if let Some(mode) = mode {
+            command.env("PODMESH_MANAGER_NETWORK_MODE", mode);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("NETWORK_MODE")
+                || String::from_utf8_lossy(&output.stderr).contains("networking disabled")
+        );
+        assert!(!lab.configs[0].network.database_path.exists());
+    }
+    let mut wrong_key = lab.configs[0].clone();
+    wrong_key.network.peers[0].shared_key_hex = "bad".into();
+    assert!(!candidate(&lab, &wrong_key)
+        .arg("--validate-config")
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(!lab.configs[0].network.database_path.exists());
+    // Existing arbitrary bytes are not a database-validation target: offline
+    // validation checks paths/topology only and must leave these bytes untouched.
+    fs::write(
+        &lab.configs[0].network.database_path,
+        b"not a SQLite database",
+    )
+    .unwrap();
+    assert!(candidate(&lab, &lab.configs[0])
+        .arg("--validate-config")
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert_eq!(
+        fs::read(&lab.configs[0].network.database_path).unwrap(),
+        b"not a SQLite database"
+    );
+}
+
+#[test]
+fn candidate_rejects_cli_ambiguity_and_reports_version_without_config() {
+    let lab = Lab::new();
+    let binary = env!("CARGO_BIN_EXE_podmesh-manager-resident-lab");
+    let output = Command::new(binary).arg("--version").output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("podmesh-managerd {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    for flags in [
+        vec!["--unknown"],
+        vec!["--config"],
+        vec!["--version", "--version"],
+        vec!["--validate-config"],
+        vec!["--state-dir", "--runtime-dir"],
+    ] {
+        assert!(!Command::new(binary)
+            .args(flags)
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+    for flags in [
+        vec!["--validate-config", "--validate-config"],
+        vec!["--config", "/tmp/unused"],
+        vec!["--runtime-dir", "/tmp"],
+        vec!["--version"],
+    ] {
+        assert!(!candidate(&lab, &lab.configs[0])
+            .args(flags)
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+}
+
+#[test]
+fn candidate_enforces_direct_owned_nonsymlink_path_boundaries() {
+    use std::os::unix::fs::symlink;
+    let lab = Lab::new();
+    let original = &lab.configs[0];
+    for db in [
+        std::path::PathBuf::from("relative.sqlite"),
+        lab._dir.path().join("sub/../r0.sqlite"),
+        lab._dir.path().join("./r0.sqlite"),
+        lab._dir.path().join("sub/r0.sqlite"),
+        lab._dir.path().parent().unwrap().join("outside.sqlite"),
+    ] {
+        let mut config = original.clone();
+        config.network.database_path = db;
+        assert!(!candidate(&lab, &config)
+            .arg("--validate-config")
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+    let outside = lab._dir.path().join("retained");
+    fs::write(&outside, b"keep").unwrap();
+    symlink(&outside, &original.network.database_path).unwrap();
+    assert!(!candidate(&lab, original)
+        .arg("--validate-config")
+        .output()
+        .unwrap()
+        .status
+        .success());
+    fs::remove_file(&original.network.database_path).unwrap();
+    fs::hard_link(&outside, &original.network.database_path).unwrap();
+    assert!(!candidate(&lab, original)
+        .arg("--validate-config")
+        .output()
+        .unwrap()
+        .status
+        .success());
+    fs::remove_file(&original.network.database_path).unwrap();
+    let alias = lab._dir.path().join("alias");
+    symlink(lab._dir.path(), &alias).unwrap();
+    let mut config = original.clone();
+    config.network.database_path = alias.join("r0.sqlite");
+    assert!(!candidate(&lab, &config)
+        .arg("--validate-config")
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(!candidate_dirs(&lab, &config, &alias, lab._dir.path())
+        .arg("--validate-config")
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(!candidate_dirs(
+        &lab,
+        original,
+        std::path::Path::new("relative"),
+        lab._dir.path()
+    )
+    .arg("--validate-config")
+    .output()
+    .unwrap()
+    .status
+    .success());
+    let mut socket_outside = original.clone();
+    socket_outside.control_socket = lab._dir.path().join("sub/control.sock");
+    assert!(!candidate(&lab, &socket_outside)
+        .arg("--validate-config")
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert_eq!(fs::read(&outside).unwrap(), b"keep");
+    fs::set_permissions(lab._dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(!candidate(&lab, original)
+        .arg("--validate-config")
+        .output()
+        .unwrap()
+        .status
+        .success());
+    fs::set_permissions(lab._dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn package_directory_modes_validate_without_creating_state() {
+    let lab = Lab::new();
+    let state = lab._dir.path().join("state");
+    let runtime = lab._dir.path().join("run");
+    fs::create_dir(&state).unwrap();
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o750)).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut config = lab.configs[0].clone();
+    config.network.database_path = state.join("manager.sqlite");
+    config.control_socket = runtime.join("control.sock");
+    let output = candidate_dirs(&lab, &config, &state, &runtime)
+        .arg("--validate-config")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_dir(state).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(&runtime).unwrap().count(), 0);
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o750)).unwrap();
+    assert!(!candidate_dirs(
+        &lab,
+        &config,
+        config.network.database_path.parent().unwrap(),
+        &runtime
+    )
+    .arg("--validate-config")
+    .output()
+    .unwrap()
+    .status
+    .success());
+}
+
+#[test]
+fn candidate_flag_mode_runs_and_shuts_down_with_explicit_network_mode() {
+    let mut lab = Lab::new();
+    lab.children[0] = Some(
+        candidate(&lab, &lab.configs[0])
+            .env("PODMESH_MANAGER_NETWORK_MODE", "authenticated-static-peers")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    until(
+        || lab.control(0, "status").is_some(),
+        Duration::from_secs(5),
+    );
+    lab.stop(0);
 }
 
 #[test]

@@ -255,6 +255,7 @@ dependencies = [
  "hmac",
  "podmesh-manager-ha-lab",
  "podmesh-manager-network-lab",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

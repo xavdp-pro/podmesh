@@ -418,8 +418,10 @@ class Lab:
     def start(self, i):
         log = (self.directory / f"resident{i}.log").open("ab")
         self.logs.append(log)
+        environment = dict(os.environ)
+        environment["PODMESH_MANAGER_NETWORK_MODE"] = "authenticated-static-peers"
         self.children[i] = subprocess.Popen([str(RESIDENT), str(self.directory / f"r{i}.json")],
-                                             stdout=log, stderr=log)
+                                             stdout=log, stderr=log, env=environment)
         def ready():
             try:
                 return control(self.directory / f"r{i}.sock")["activation_authority"] is False
