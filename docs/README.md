@@ -57,9 +57,11 @@ The entire SHAPER corpus has NOT been audited in this sequence. No canon changed
 
 ## Manager, governor and makers
 
-Its operating contract — replication, partition behavior, reconnection, priority,
-bootstrap and build order — is [CONTROL-SERVICES-UNIVERSE.md](CONTROL-SERVICES-UNIVERSE.md),
-the operator's design direction of 2026-09-12. This section keeps the earlier record.
+Its complete brief — identities, registry records, storage and event format,
+replication, network and DNS, partition behavior, reconnection, priority, bootstrap,
+the decisions still required and the implementation and test order — is
+[CONTROL-SERVICES-UNIVERSE.md](CONTROL-SERVICES-UNIVERSE.md), the operator's design
+direction of 2026-09-12. This section keeps the earlier record.
 
 The manager universe, more precisely the **control-services universe**, is a
 Podman-hosted universe containing the registry, existing tools and, in the latest

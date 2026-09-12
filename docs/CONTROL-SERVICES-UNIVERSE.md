@@ -1,207 +1,358 @@
-# Control-services universe: purpose, replication and operating contract
+# Control-services universe: complete implementation brief
 
-Date: 2026-09-12. Audience: the PodMesh implementation and review agents.
-Status: operator design direction. This is a design contract for later lots, not
-an implementation claim, a SHAPER canon amendment, or proof of high availability.
+Date: 2026-09-12. Audience: PodMesh implementation and review agents.
+Owner: Xavier de Poorter, collaborating with Codex and Claude Code.
+Status: design direction and implementation brief. It describes the target and
+the decisions still needed; it is not evidence that the target already works.
 
-## The problem it solves
+## 1. Why this component exists
 
-PodMesh is being built because the operator wants autonomous Linux hosts that can
-join, leave, be rebuilt, and reconnect without forcing every existing workload to
-be evacuated first. The goal is more operational freedom than a cluster that
-depends on one shared filesystem, one permanently available control node, or a
-global quorum that can leave healthy hosts unable to work after a split.
+PodMesh is intended to make a group of autonomous Linux hosts easier to use than
+a traditional tightly coupled virtualization cluster. A host must be able to join
+with existing work, leave, fail, be rebuilt, and return without making every other
+host unusable or requiring the operator to evacuate all workloads first.
 
-Traditional shared-cluster designs commonly make control information and workload
-storage depend on a shared distributed filesystem and quorum membership. They are
-valuable designs, but a damaged quorum, a lost storage dependency, or an awkward
-cluster join can turn recovery into a cluster-wide problem. PodMesh deliberately
-does not begin by reproducing that dependency chain.
+The operator's experience with clustered virtualization is that shared storage and
+global quorum are useful but can make recovery difficult. A lost quorum, a broken
+shared filesystem, or a host that cannot be cleanly rejoined may turn a local
+problem into a cluster-wide recovery operation.
 
-The replacement is not “no consistency”. It is a smaller and clearer division:
+PodMesh does not attempt to deny those engineering problems. It changes the
+dependency order:
 
-1. Every host remains able to operate its own local Podman runtime through its
-   local Maker and PodMesh API.
-2. A replicated **control-services universe** provides the shared logical services
-   needed to discover, name, observe and coordinate universes.
-3. Durable workload data, image availability, checkpoints and control records have
-   separate replication and recovery contracts. A copied runtime process or a
-   replicated database is not silently treated as a shared filesystem.
-4. During a partition, each host acts only inside rights already delegated to it.
-   Reconnection exchanges facts before coordination changes. No host infers that a
-   remote universe has stopped merely because it cannot reach it.
+- local runtime operation must remain possible on each healthy host;
+- control facts are replicated rather than stored in one shared live filesystem;
+- a host never treats loss of reachability as proof that another host stopped;
+- exclusive activation, migration and resource ownership remain explicit;
+- unresolved conflicts may keep a limited part of the system degraded rather than
+  performing a false automatic recovery.
 
-## Name and role boundary
+The target is practical freedom with evidence: connect hosts, place workloads,
+move them, rebuild a host, and recover control services without every action being
+dependent on one central cluster state.
 
-Older discussions call this component the “manager”. Do not use **manager** as an
-unqualified governance role. SHAPER already has precise names:
+## 2. The logical component
 
-| Term | Function | What it must not become |
+The older discussion name was “manager”. New technical material should call it the
+**control-services universe**. It is one logical universe replicated on every host.
+
+It is a Podman-hosted package of control services, initially intended to provide:
+
+- the universe registry;
+- naming and DNS publication;
+- host and replica discovery;
+- dated observations and evidence references;
+- synchronization of control records;
+- a later status/control interface for the human-agent tandem.
+
+It is not a universal administrator. Replication gives availability of control
+services; it does not grant host-root access, policy authority, or permission to
+activate workloads.
+
+## 3. Roles and authority
+
+| Component | Owns | Does not own |
 | --- | --- | --- |
-| Human / Steward | defines purpose, authority and major decisions | an operational bottleneck for every safe routine action |
-| Governor | holds declared desired state, routes, coordinates and escalates | a host-root executor or a hidden source of authority |
-| Maker | runs on or for one host, retrieves authorized work, invokes local operations and reports facts | an autonomous policy owner |
-| PodMesh | local runtime mechanics: Podman inventory, lifecycle, migration, evidence | another governor or global scheduler |
-| Control-services universe | a deployable package for registry, DNS, discovery, observation and related control services | the Governor, a Maker, or an authority grant by itself |
+| Human / Steward | purpose, scope, authority, exceptional decisions | routine execution of every safe operation |
+| SaaS Governor | desired state, delegation, coordination, escalation | direct host-root commands or unrestricted host keys |
+| Maker on each host | approved local work, local evidence publication | desired-state policy or cross-host takeover by assumption |
+| PodMesh on each host | Podman lifecycle, checkpoint/migration mechanics, durable operation evidence | global scheduling or a second desired-state ledger |
+| Control-services universe | registry, DNS, discovery, replication of control facts | Governor, Maker, or implicit authority |
 
-Use **control-services universe** in new architecture and implementation text.
-For transition, “manager universe (control-services universe)” is acceptable when
-linking to older documents. The SaaS remains the Governor. A replicated
-control-services universe does not itself decide what should exist or obtain the
-right to execute host actions.
+Normal flow:
 
-## What runs in the control-services universe
+```text
+Human intent
+  -> Governor records desired state and authorization reference
+  -> Maker retrieves work for its host and scope
+  -> PodMesh performs a typed local operation
+  -> Independent observation verifies the actual result
+  -> Maker publishes dated facts and evidence to control services
+  -> Registry/DNS publish only verified placement facts
+```
 
-The exact components remain selectable, but the logical function is stable:
+No participant obtains extra authority from an informal sentence, a replicated
+database row, or a successful health endpoint.
 
-- a registry of stable universe UUIDs, logical parents, assigned names, network
-  identities, instance/host records, observed status, evidence references and
-  delegated scopes;
-- DNS or DNS publication based on those registry facts, so applications and parents
-  use names rather than fixed host IP addresses;
-- discovery/bootstrap information needed to find another available replica;
-- observation and synchronization services that exchange dated facts and histories;
-- optional operator-facing status APIs later, using the same authority contracts.
+## 4. Identity model
 
-It does **not** need to be a remote root gateway to every host. It must not hold
-unrestricted host credentials merely because it contains the registry or DNS. A
-Maker keeps local execution capability; PodMesh keeps a local root-only API until
-remote authorization is explicitly designed and qualified.
+The design must distinguish logical objects from the running copies that currently
+host them.
 
-## Replication model
+| Identity | Meaning | Stability |
+| --- | --- | --- |
+| Universe UUID | logical workload identity | permanent across clone/migration/recovery where appropriate |
+| Universe instance UUID | a particular active or standby runtime copy | new for each created/restored replica |
+| Host UUID | stable host identity | preserved through ordinary restarts; replacement is explicit |
+| Control-service logical UUID | one logical replicated service | same across all replicas |
+| Control-service instance UUID | one running replica on one host | distinct per host/creation |
+| Operation ID | idempotent request identity on the acting host | immutable audit identity |
+| Authorization reference | provenance from Governor/Human | not yet a cryptographic remote credential |
 
-There is one logical control-services universe and one replica on each participating
-host. “One logical universe” means the service identity, schema, records and
-purpose are shared. It does not mean independent processes can write contradictory
-facts without a protocol.
+For a workload, logical identity, IP/name identity, current host, active/standby
+role and runtime container ID are separate fields. A restored container may have a
+new runtime ID while remaining the same logical universe. An old runtime ID must not
+regain ownership merely because its labels still exist.
 
-Each replica needs:
+## 5. Registry: what it records
 
-- a stable **logical service UUID**, shared by all replicas;
-- a distinct **instance UUID** and current host UUID, so observations identify the
-  exact process that made them;
-- durable, versioned records with operation IDs, author, observed time and evidence
-  references;
-- a replication cursor/history rather than copying mutable database files;
-- a bootstrap path that can locate a surviving replica without requiring its own DNS
-  service to be available first.
+The registry is control data, not a universal filesystem and not an application
+database for every workload. Each record needs provenance, freshness and a conflict
+state.
 
-Replicate records and explicitly defined recovery points. Do not mount the same
-live database directory or filesystem on several hosts and call that replication.
-That would reintroduce the shared-storage and recovery coupling this design is
-trying to avoid.
+Minimum proposed record classes:
 
-## Operation while connected
+| Record | Minimum contents |
+| --- | --- |
+| Host | host UUID, instance facts, reachable endpoints, capacity observations, last observer/time, supported PodMesh capabilities |
+| Universe | universe UUID, parent UUID, declared kind, desired state reference, current placement facts, image digest, lifecycle state |
+| Instance | instance UUID, universe UUID, host UUID, Podman container ID, active/standby role, created/restored operation binding |
+| Network assignment | network UUID, IP, DNS names, gateway/prefix, assigned scope, active route owner, evidence/time |
+| Delegated scope | issuer, recipient Maker/host, scope type, allocation range or workload list, validity window, revocation status |
+| Operation fact | operation ID, host, actor, authorization reference, requested effect, verified outcome, evidence reference/time |
+| Migration handoff | source/destination, logical universe, artifact hashes, claim/outcome references, source exclusion state |
+| Conflict | competing records, affected exclusive resource, detection time, automatic action allowed, required resolver |
 
-When replicas can communicate, they exchange versioned registry facts and select a
-coordinator according to the later, explicit coordination policy. Coordination does
-not replace the Governor's desired-state authority. Its purpose is to make discovery,
-DNS publication, record propagation and delegated placement observable.
+All facts must identify who observed or wrote them and when. “Unknown” and “stale”
+are real states; absence of a fresh observation is never proof of health or failure.
 
-A normal operation is:
+## 6. Storage choice: the initial direction and decision required
 
-1. The Governor records desired state and an authorization reference.
-2. The relevant Maker retrieves the approved work for its own host or scope.
-3. The Maker invokes PodMesh locally.
-4. PodMesh returns a durable operation result and independent observations verify
-   actual runtime effects.
-5. The Maker publishes dated facts and evidence references to the control-services
-   universe. DNS and registry publication follow verified facts, never a request
-   acceptance alone.
+The recommended first implementation is **SQLite per control-service replica plus
+an append-only, versioned event/history log**. The replicas exchange records or
+events, never live SQLite files.
 
-## Operation during a partition
+Why this is a sensible first step:
 
-The objective is **continued bounded local operation**, not automatic global
-authority without evidence. A partition must not make every host unusable, but it
-also must not create two active owners of the same workload, address or exclusive
-external effect.
+- the control dataset is initially small: identities, mappings, operations,
+  observations and scopes;
+- SQLite is simple, local, durable, inspectable and easy to back up;
+- each host keeps working with its own last known records during an interruption;
+- merge and conflict rules remain visible in the application instead of being
+  hidden inside an apparently shared filesystem;
+- it avoids introducing a distributed database or global quorum before the actual
+  consistency requirements have been measured.
 
-Before a partition, allocate non-overlapping scopes. Examples include a host's
-address-allocation pool, local disposable workload capacity, and explicitly
-delegated placement work. A Maker may continue only inside its current scope.
-It may not take over a remote workload replica merely because the remote host is
-unreachable.
+This is an implementation proposal, not yet an approved storage standard. Before
+coding replication, record the decision explicitly:
 
-During a partition:
+1. SQLite plus event log is accepted for the first laboratory implementation; or
+2. another engine is selected, with its partition/recovery behavior documented.
 
-- each replica records local facts and operations with its own instance identity;
-- names and DNS entries keep their established behavior; a stale record is visible
-  as stale rather than silently asserted to be current;
-- no automatic cross-host activation occurs without an explicit exclusion/fencing
-  proof for the prior active instance;
-- changes needing conflicting exclusive ownership are deferred or rejected;
-- existing local workloads remain autonomous as far as their own data and network
-  dependencies allow.
+Do not treat a Git repository, a shared directory, or copied database files as the
+replication protocol. Git can preserve design and source history; it is not the
+runtime arbiter for exclusive resource operations.
 
-## Reconnection and priority
+## 7. Replication contract
 
-When connectivity returns, replicas first exchange their histories and compare
-facts. Only then may the designated coordinator resume broader coordination. The
-operator proposes a stable priority based on creation order, with the lowest
-priority number coordinating after reconciliation.
+Each control-service replica has a local durable store and an outbound/inbound
+history cursor. When peers are reachable, they exchange missing immutable events and
+materialized facts. The protocol must preserve the original event identity and must
+not create a new operation merely because a fact is received again.
 
-Priority is a deterministic tie-breaker, not proof that one replica's data is newer
-or that a remote workload stopped. It must never overwrite newer observed facts,
-erase confirmed allocations, replay completed commands, renew revoked authority or
-activate a duplicate workload.
+Every event requires at least:
 
-Conflicting records require explicit resolution before an operation is issued. For
-exclusive resources, safe choices are pre-delegated non-overlapping ownership,
-verified handoff, fencing/exclusion, or human escalation. The system may remain
-partially degraded while a conflict is unresolved; that is safer than a false
-automatic repair.
+- globally unique event ID;
+- producing control-service instance UUID and host UUID;
+- sequence number local to that producer;
+- wall-clock observation time and receive time;
+- record type and version;
+- payload hash;
+- causal predecessor or vector/version relation sufficient to detect a conflict;
+- evidence reference when the event claims an external effect.
 
-## Relationship to migration, storage and backup
+Replication may automatically merge only facts that are demonstrably non-exclusive,
+such as independent observations, immutable operation results and non-overlapping
+allocations. It must not automatically merge contradictory active-instance claims,
+IP assignments, host scope ownership, revocations, or completed external effects.
 
-The control-services universe is not a substitute for the data required to restore
-a workload. A recoverable universe needs, according to its declared scope:
+When a conflict is found, create a conflict record, prevent the conflicting action,
+retain both histories, and escalate according to the delegated authority. A later
+coordinator may propose a resolution; it must not silently erase the losing history.
 
-- its container image by content digest;
-- configuration and logical identity;
-- persistent data or a coherent replicated recovery point;
-- optionally, a compatible memory checkpoint for memory-preserving recovery;
-- a verified decision about which instance may become active.
+## 8. Connected operation
 
-PodMesh migration transfers a stopped/checkpointed workload through a specific,
-verified handoff. Future periodic checkpoints and backup storage can improve data
-loss bounds, but neither alone implements automatic HA. DNS/name publication must
-follow verified active placement; it must not itself direct traffic to a standby
-replica before activation is authorized.
+When replicas communicate normally:
 
-## Bootstrap and host reconstruction
+1. They synchronize missing records and verify their hashes.
+2. They materialize the same logical registry view when no conflict exists.
+3. They select a coordinator according to the explicit later priority policy.
+4. The coordinator assists discovery, DNS publication and routing of requests; it
+   does not replace the Governor's desired-state authority.
+5. Makers remain the only actors that invoke the local PodMesh API for host work.
+6. DNS publication follows verified active placement, not a requested placement.
 
-A new or rebuilt host should not need a perfect existing cluster to join. It starts
-with a host identity, a minimal configured trust/discovery seed, its Maker and local
-PodMesh service. It discovers a reachable control-services replica by configured
-endpoint, LAN discovery, WireGuard peer knowledge or another explicit bootstrap
-source. It then receives only the records and scopes it is authorized to hold.
+The initial implementation must expose replication health: peers seen, last common
+event, lag, stale records, blocked conflicts and bootstrap status.
 
-If all control-services replicas are absent, host-local PodMesh operations remain
-available within their local authorization boundary. Recreating the logical service
-requires a documented recovery/bootstrap procedure, evidence of the selected
-recovery point, and an explicit decision about authority and stale allocations.
-It must not invent a new global state from whichever host responds first.
+## 9. Network model
 
-## Implementation sequence for PodMesh
+The current direction is one logical IPv4 `/16`, divided into non-overlapping `/24`
+allocation pools per host. A universe has a stable UUID and a unique assigned IP in
+its logical network. An IP assignment is distinct from the host that currently
+routes it.
 
-1. Keep the present local PodMesh API, migration contracts and durable evidence
-   boundaries intact.
-2. Define the registry schema: logical universe, instance, host, parent, name,
-   address, scope, operation, evidence, freshness and conflict state.
-3. Implement a single control-services universe locally, with explicit backup and
-   recovery export/import, before replication.
-4. Add replicas on the three laboratory hosts and prove record synchronization,
-   DNS publication and bootstrap without creating a shared live filesystem.
-5. Test host loss, partition and reconnection with pre-delegated scopes. Measure
-   what remains available, what is deliberately blocked, recovery time and any data
-   rollback.
-6. Only then evaluate automatic takeover, resource fencing and a future HA contract.
+Hosts may communicate on their existing network or through optional WireGuard.
+WireGuard can protect control traffic and transfer checkpoint/image/data artifacts,
+but PodMesh must work without making it mandatory. A transport is not an authority
+mechanism: it carries authenticated requests and records; it does not decide which
+workload may activate.
 
-## Non-claims
+Initial DNS direction:
 
-This document does not claim that replicated control services remove every need for
-consensus, fencing or a human decision. It does not claim a partition-safe global
-write protocol, instant failover, continuous memory replication, shared data
-consistency, or replacement of a full virtual-machine platform. It specifies the
-direction: simple local autonomy, explicit cross-host handoffs, replicated control
-facts and recovery that stays possible when a host or control replica disappears.
+- names resolve from verified UUID/IP/placement registry records;
+- replicated control-service instances may serve or publish DNS;
+- a moved universe keeps its logical name; the route/active placement changes below
+  it only after verified handoff;
+- stale DNS or registry knowledge is visible and bounded by a chosen TTL/refresh
+  policy, not silently assumed correct.
+
+Actual prefix, DNS zone, routing implementation, TTL policy and WireGuard identity
+mechanism remain decisions to make before network implementation.
+
+## 10. Partition model
+
+The objective is to avoid a global quorum dependency that blocks all healthy hosts.
+It is not a claim that all writes are safe everywhere during a split.
+
+Before a partition, the system assigns non-overlapping rights. Examples:
+
+- a `/24` address allocation pool owned by one host;
+- explicitly assigned disposable workload capacity;
+- a set of universes a Maker may maintain locally;
+- a migration that carries a verified transfer handoff;
+- a read-only observation/synchronization task.
+
+During a partition, a host may continue inside its known valid scope. It must not:
+
+- allocate another host's address range;
+- activate a remote standby merely because the primary is unreachable;
+- overwrite a remote ownership record;
+- issue a conflicting exclusive placement;
+- convert missing observations into a “stopped” verdict.
+
+Existing local workloads continue as far as their own dependencies permit. The
+control-services replica stores facts for later synchronization. It may be locally
+useful even when it cannot coordinate globally.
+
+## 11. Reconnection and coordinator priority
+
+When connectivity returns, the sequence is mandatory:
+
+1. Discover the replicas and authenticate their identities.
+2. Exchange histories until each peer can state what it lacks.
+3. Verify record hashes, sequence continuity and evidence references.
+4. Materialize non-conflicting records.
+5. Create conflict records for exclusive conflicts.
+6. Select the coordinator only after the preceding reconciliation.
+7. Resume broader coordination only for facts that are conflict-free and within
+   authority.
+
+The operator proposes a stable priority derived from creation order: the lowest
+priority number coordinates after reconciliation. This is a deterministic
+tie-breaker, not a truth oracle. It does not prove that the lower-number replica
+has newer records, that a remote workload stopped, or that a historic command may
+be replayed.
+
+The exact priority field, tie-break rule, failure detector and permitted coordinator
+actions remain to be specified and tested. Do not implement priority as automatic
+global takeover.
+
+## 12. Migration, backups and workload data
+
+Replicating control records is not enough to restore a workload. A recovery plan
+must independently name:
+
+- image digest and availability policy;
+- universe configuration and logical identity;
+- persistent volumes or an application-consistent data recovery point;
+- optional compatible memory checkpoint;
+- source exclusion and active-instance authorization;
+- network route/name transition;
+- expected data-loss and recovery-time bounds.
+
+The present PodMesh serial migration is a bounded, experimental two-host API
+capability for one workload shape. It is a foundation for explicit handoff, not
+proof of generic live migration, replicated memory or automatic HA.
+
+PodMesh Backup Server is a separate later service. It stores versioned recovery
+points; it must not be confused with replicated control services or a running
+workload replica. Deletion, corruption or stale state may propagate through
+replication, so backup retention and restore verification remain separate contracts.
+
+## 13. Bootstrap and host reconstruction
+
+A host must be reconstructible without demanding a perfectly healthy cluster.
+Initial bootstrap artifacts should be small, explicit and recoverable:
+
+- host UUID or explicitly documented replacement identity;
+- local Maker and PodMesh installation;
+- control-service logical identity and trusted discovery seed;
+- one or more discovery paths: configured peer endpoint, local-network discovery,
+  WireGuard peer data, or an explicit operator bootstrap source;
+- local credentials/certificates or keys according to the chosen transport design;
+- current scope allocation and a known recovery-point reference.
+
+The bootstrap seed must not be hosted only behind the DNS service it is supposed to
+recover. A rebuilt host receives records only after authentication and only for
+scopes it is allowed to use.
+
+If every control-service replica is absent, local PodMesh remains usable for its
+local operations. Recreating the control plane requires an explicit recovery
+procedure: select an evidence-qualified recovery point, establish new replica
+identities, handle stale allocations and authority, and record the human decision.
+The system must not elect a new global truth merely because one disconnected host
+answers first.
+
+## 14. Required design decisions before implementation
+
+Claude should not invent these values. Record each decision, its owner and its
+acceptance test before using it in a production-shaped implementation.
+
+| Decision | Initial recommendation | Still required |
+| --- | --- | --- |
+| Local registry store | SQLite plus append-only event history | operator acceptance and schema |
+| Event ordering/conflict detection | producer sequence plus causal/version relation | exact format and merge rules |
+| Replication transport | direct existing network, optional WireGuard | authentication, encryption and peer enrollment |
+| DNS mechanism | replicated control service publishes verified records | server choice, zone, TTL and client discovery |
+| Coordinator priority | immutable creation-order priority, lowest value after reconciliation | tie-break, failure detector and allowable actions |
+| Partition write rights | pre-delegated non-overlapping scopes | scope vocabulary, validity and revocation |
+| Exclusive conflict resolution | reject/defer, verified handoff/fencing, or human escalation | resolver procedure and evidence format |
+| Bootstrap | minimal seed outside the service DNS dependency | storage, rotation, recovery and trust policy |
+| Workload data recovery | separate image/data/checkpoint contracts | first supported volume/database and backup target |
+
+## 15. Implementation and test order
+
+1. Finish and independently review the current bounded migration/recovery work.
+2. Define and commit the registry schema and an immutable event format.
+3. Build one local control-services universe with registry read/write, explicit
+   export and import, and no replication yet.
+4. Test restart and recovery of that one instance from its own backup.
+5. Replicate it to two laboratory hosts. Prove idempotent event transfer, history
+   catch-up, stale-record visibility and conflict creation.
+6. Add the third host. Prove bootstrap from each host and control-service loss on
+   one host without losing local PodMesh operation on the others.
+7. Add DNS publication from verified registry facts and test a universe move.
+8. Test a partition, allowed local work inside pre-delegated scopes, reconnection,
+   history reconciliation and conflict handling.
+9. Only after those tests evaluate controlled takeover, fencing, automatic recovery
+   and a future HA claim.
+
+Each stage must produce raw evidence, exact versions, an independent observation,
+recovery steps and a list of limitations. A healthy endpoint alone is not proof.
+
+## 16. Explicit non-claims
+
+This direction does not claim:
+
+- that a shared filesystem is never useful;
+- that replication eliminates every consistency or consensus problem;
+- that priority alone solves split brain;
+- instant failover, zero data loss or continuous memory replication;
+- a production-ready DNS, registry, backup service or HA system;
+- generic migration for networks, volumes, arbitrary runtimes or all Linux hosts;
+- authority created by a replicated service, UUID, DNS record or model decision.
+
+The intended result is smaller, more explicit and more repairable: local autonomy,
+replicated control facts, explicit handoffs, independent recovery paths and proof at
+each stage.
