@@ -25,3 +25,4 @@ test('unknown action invalidates completed and in-flight observations',async t=>
  await fetch(url+'/api/snapshot');assert.equal(reads,1);assert.equal((await post()).status,502);await fetch(url+'/api/snapshot');assert.equal(reads,2);
  await post();hold=true;const pending=fetch(url+'/api/snapshot');while(!release)await new Promise(r=>setTimeout(r,1));await post();hold=false;release();await pending;await fetch(url+'/api/snapshot');assert.equal(reads,4);
 });
+test('details rejects command-like IDs and refuses missing API capability',async t=>{const g=await gateway(t);const session=await fetch(g.url+'/api/session').then(r=>r.json());const post=ids=>fetch(g.url+'/api/hosts/a/details',{method:'POST',headers:{Origin:g.url,'Content-Type':'application/json','X-Podmesh-Token':session.token},body:JSON.stringify({container_path:ids})});assert.equal((await post(['--latest'])).status,400);assert.equal((await post(['a'.repeat(64)])).status,409);});

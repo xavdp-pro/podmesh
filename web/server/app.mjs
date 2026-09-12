@@ -21,6 +21,15 @@ export function createApp(config,{call=request,origin='http://127.0.0.1:4175'}={
    const snapshot=await loading;return res.json(snapshot);
   }res.json(cached);
  });
+ const detailBusy=new Set();
+ app.post('/api/hosts/:id/details',async(req,res)=>{
+  if(req.headers.origin!==origin||req.headers['x-podmesh-token']!==token)return res.status(403).json({error:'Same-origin session required'});
+  const host=hosts.find(h=>h.id===req.params.id);if(!host)return res.status(404).json({error:'Unknown host'});
+  const ids=req.body?.container_path;if(!Array.isArray(ids)||ids.length<1||ids.length>4||!ids.every(id=>typeof id==='string'&&/^[a-f0-9]{64}$/.test(id)))return res.status(400).json({error:'Full lowercase container IDs required; maximum depth four'});
+  if(detailBusy.has(host.id))return res.status(429).json({error:'An observation is already in progress for this host; retry when it finishes'});detailBusy.add(host.id);
+  const observer=host.detailsSocket?{...host,remoteSocket:host.detailsSocket,socket:host.ssh?host.socket:host.detailsSocket}:host;
+  try{const caps=await call(observer,{operation:'capabilities'},{timeout:15000});if(!caps.ok||!caps.data.operations?.includes('container_details'))return res.status(409).json({error:'This host requires the container_details API update'});res.json(await call(observer,{operation:'container_details',container_path:ids},{timeout:75000}));}catch(e){res.status(502).json({error:e.message});}finally{detailBusy.delete(host.id);}
+ });
  app.post('/api/hosts/:id/actions',async(req,res)=>{
   if(req.headers.origin!==origin||req.headers['x-podmesh-token']!==token)return res.status(403).json({error:'Same-origin session required'});
   const host=hosts.find(h=>h.id===req.params.id);if(!host)return res.status(404).json({error:'Unknown host'});

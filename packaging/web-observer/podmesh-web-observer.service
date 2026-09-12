@@ -1,0 +1,24 @@
+[Unit]
+Description=PodMesh observation-only explorer API
+Documentation=file:/usr/share/doc/podmesh-web-observer/README.md
+After=local-fs.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=PODMESH_READ_ONLY=1
+Environment=PODMESH_SOCKET=/run/podmesh-web-observer/api.sock
+Environment=PODMESH_STATE_DIR=/var/lib/podmesh-web-observer
+ExecStart=/usr/lib/podmesh-web-observer/podmeshd
+RuntimeDirectory=podmesh-web-observer
+RuntimeDirectoryMode=0700
+StateDirectory=podmesh-web-observer
+StateDirectoryMode=0700
+UMask=0077
+ExecStartPre=/usr/bin/rm -f /run/podmesh-web-observer/api.sock
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

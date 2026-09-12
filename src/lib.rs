@@ -1,5 +1,6 @@
 mod cleanup;
 mod collector;
+mod explorer;
 mod lifecycle;
 mod migration;
 mod recovery;
@@ -108,6 +109,18 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("");
     let result: Result<Value, Box<dyn std::error::Error>> = (|| {
+        if std::env::var("PODMESH_READ_ONLY").as_deref() == Ok("1")
+            && ![
+                "identity",
+                "capabilities",
+                "inventory",
+                "observations",
+                "container_details",
+            ]
+            .contains(&op)
+        {
+            return Err("Observation-only API: mutations disabled".into());
+        }
         Ok(match op {
             "create"
             | "delete"
@@ -130,7 +143,7 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
             "migration_status" => migration::status(db, request)?,
             "capabilities" => json!({
                 "version":option_env!("PODMESH_PACKAGE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
-                "operations":["capabilities","identity","inventory","observations","create","delete","clone","start","stop"],
+                "operations":["capabilities","identity","container_details","inventory","observations","create","delete","clone","start","stop"],
                 "experimental_operations":["migration_preflight","migration_checkpoint","migration_status","migration_authorize_transfer",
                     "migration_complete_transfer","migration_retire_source","migration_release","migration_abandon","migration_restore_local",
                     "migration_destination_preflight","migration_restore","migration_restore_abort",
@@ -166,6 +179,7 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
             "identity" => {
                 json!({"host_uuid":db.query_row("SELECT value FROM metadata WHERE key='host_uuid'",[],|r|r.get::<_,String>(0))?})
             }
+            "container_details" => explorer::inspect(request)?,
             "inventory" => json!({"containers":inventory()?,"store":"default rootful Podman"}),
             "observations" => {
                 let mut stmt = db.prepare(

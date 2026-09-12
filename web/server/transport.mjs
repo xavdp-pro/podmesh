@@ -6,7 +6,7 @@ const MAX=8*1024*1024;
 const remote=`import socket,sys
 b=sys.stdin.buffer.readline(4097)
 if len(b)>4096 or not b.endswith(b'\\n'): raise ValueError('Invalid request')
-s=socket.socket(socket.AF_UNIX);s.settimeout(390);s.connect('/run/podmesh/api.sock');s.sendall(b)
+s=socket.socket(socket.AF_UNIX);s.settimeout(390);s.connect(SOCKET_PATH);s.sendall(b)
 n=0
 while True:
  b=s.recv(65536)
@@ -17,6 +17,7 @@ while True:
 `;
 const quote=s=>"'"+s.replaceAll("'","'\\''")+"'";
 export function request(host,payload,{timeout=395000}={}) {
+ const remoteSocket=host.remoteSocket||'/run/podmesh/api.sock';if(!/^\/[a-zA-Z0-9_./-]+$/.test(remoteSocket))return Promise.reject(new Error('Invalid configured API socket'));
  const body=JSON.stringify(payload)+'\n';if(Buffer.byteLength(body)>4096)return Promise.reject(new Error('Request exceeds PodMesh limit'));
  return new Promise((resolve,reject)=>{
   let output=[],done=false,size=0;let process;
@@ -24,7 +25,7 @@ export function request(host,payload,{timeout=395000}={}) {
   const read=b=>{size+=b.length;if(size>MAX)return finish(new Error('Response too large'));output.push(b);};
   const timer=setTimeout(()=>finish(new Error('Transport timed out; outcome may be unknown. Reconcile before retry.')),timeout);
   let socket;
-  if(host.ssh){process=spawn('ssh',['-o','BatchMode=yes','-o','ConnectTimeout=8','-o','StrictHostKeyChecking=yes','-o','UserKnownHostsFile='+(host.knownHostsFile||path.join(os.homedir(),'.ssh/known_hosts')),host.ssh,'sudo -n python3 -c '+quote(remote)],{stdio:['pipe','pipe','pipe']});process.stdout.on('data',read);process.stderr.resume();process.on('error',finish);process.on('close',code=>finish(code?new Error('SSH transport failed; verify host connection and permissions'):null));process.stdin.on('error',finish);process.stdin.end(body);}
+  if(host.ssh){process=spawn('ssh',['-o','BatchMode=yes','-o','ConnectTimeout=8','-o','StrictHostKeyChecking=yes','-o','UserKnownHostsFile='+(host.knownHostsFile||path.join(os.homedir(),'.ssh/known_hosts')),host.ssh,'sudo -n python3 -c '+quote(remote.replace('SOCKET_PATH',JSON.stringify(remoteSocket)))],{stdio:['pipe','pipe','pipe']});process.stdout.on('data',read);process.stderr.resume();process.on('error',finish);process.on('close',code=>finish(code?new Error('SSH transport failed; verify host connection and permissions'):null));process.stdin.on('error',finish);process.stdin.end(body);}
   else{socket=net.createConnection(host.socket||'/run/podmesh/api.sock',()=>socket.end(body));socket.on('data',read);socket.on('error',finish);socket.on('end',()=>finish());}
  });
 }
