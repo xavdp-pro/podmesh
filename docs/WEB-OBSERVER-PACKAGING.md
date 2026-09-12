@@ -33,12 +33,12 @@ SHA-256, the package version and a source timestamp. Packaging performs no Cargo
 build, download, host installation, service activation or APT publication.
 
 ```sh
-PODMESH_PACKAGE_VERSION=0.1.0~observer1 cargo build --release --locked --bin podmeshd
+PODMESH_PACKAGE_VERSION=0.1.0~observer2 cargo build --release --locked --bin podmeshd
 SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
   packaging/web-observer/build-deb.sh \
   target/release/podmeshd \
   "$(sha256sum target/release/podmeshd | cut -d ' ' -f 1)" \
-  '0.1.0~observer1' /tmp/podmesh-observer-packages
+  '0.1.0~observer2' /tmp/podmesh-observer-packages
 ```
 
 The script rejects checksum mismatches and non-amd64 ELF inputs, normalizes file
@@ -54,7 +54,7 @@ No CRIU dependency is needed by the enabled observations.
 ## Explicit installation and activation
 
 ```sh
-sudo apt install /path/to/podmesh-web-observer_0.1.0~observer1_amd64.deb
+sudo apt install /path/to/podmesh-web-observer_0.1.0~observer2_amd64.deb
 sudo systemctl enable --now podmesh-web-observer.service
 sudo systemctl status podmesh-web-observer.service
 ```
@@ -82,14 +82,26 @@ removes only its dedicated stale socket. No maintainer script edits or deletes
 - [x] Restart and confirm persistent observer identity and journal.
 - [x] Remove/purge and reinstall on one host; confirm state preservation.
 - [x] Recheck the lifecycle service PID and original workloads remain unchanged.
-- [ ] Qualify a later package-version upgrade; reinstalling the same version is not upgrade proof.
+- [x] Qualify a later package-version upgrade; reinstalling the same version is not upgrade proof.
 
-The checked items passed on three Debian 13 laboratory hosts for package
-`0.1.0~observer1`; purge/reinstall was exercised on the third host. The package
-was then published to the signed `trixie-experimental` APT suite. These checks
-do not establish clean-host compatibility, long-duration operation or HA.
-Container details cover the default rootful nested store only. Rootless stores,
-fractal authority, HA, per-universe persistent-volume capacity, and production
-deployment are outside this package's claim. The next package version adds bounded
-host RAM, CPU/load and filesystem-capacity observations; its upgrade and target
-results must be recorded separately before changing the checklist above.
+The original checked items passed on three Debian 13 laboratory hosts for package
+`0.1.0~observer1`; purge/reinstall was exercised on the third host. Package
+`0.1.0~observer2` was then built from commit `909fc5b`, published to the signed
+`trixie-experimental` APT suite and installed as an actual package upgrade on all
+three hosts. Its binary SHA-256 is
+`f43fcc419a85d43f71b3903b3fb08b0b25ce1297266762f50377b6e5c21b0ac5`;
+the amd64 package SHA-256 is
+`7de1314de2eabb041ca52cee26f7504d9ae2ebf3b63c482e77c026d2c7a16c68`.
+Before publication, the repository container was snapshot-backed up. Each
+observer service was then explicitly restarted to load the upgraded binary. The
+persistent observer state remained present, the lifecycle daemon PID
+and complete rootful Podman inventory matched their recorded pre-upgrade values, the
+dedicated socket remained mode `0600`, mutations were refused, and RAM, CPU/load
+and graph-root filesystem capacity returned as independently sourced observations.
+The local gateway then displayed live metrics from all three dedicated observer
+sockets without enabling actions.
+
+These checks do not establish clean-host compatibility, long-duration operation
+or HA. Container details cover the default rootful nested store only. Rootless
+stores, fractal authority, HA, per-universe persistent-volume capacity, and
+production deployment are outside this package's claim.

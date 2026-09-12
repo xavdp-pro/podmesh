@@ -35,7 +35,7 @@ A transport error can occur after execution. An unknown outcome disables retry i
 
 ## Verification and remaining work
 
-`npm test` passes 27 gateway, metrics and fractal-model tests. `npm run build` succeeds and the production dependency audit reports no known vulnerability. Browser navigation over real read-only inventories produced no page errors. The browser lifecycle returned successful API results for create, clone, start, graceful stop and both deletions. An independent Podman inventory comparison confirmed unchanged pre-existing container IDs/states and absence of disposable containers afterward. Intermediate application behavior and HA recovery are not covered.
+`npm test` passes 32 gateway, metrics and fractal-model tests. `npm run build` succeeds and the production dependency audit reports no known vulnerability. Browser navigation over real read-only inventories and live resource metrics from three dedicated observer sockets produced no page errors or mobile horizontal overflow. The browser lifecycle returned successful API results for create, clone, start, graceful stop and both deletions. An independent Podman inventory comparison confirmed unchanged pre-existing container IDs/states and absence of disposable containers afterward. Intermediate application behavior and HA recovery are not covered.
 
 Claude Code Opus completed a source-only counter-review. Corrections applied include strict action fields, explicit transport selection, cache generation invalidation, UTF-8 buffering, frame protection, explicit create target and unknown-outcome retry disabling. Findings are not a production approval. Cache-race and split-UTF-8 regression tests now pass. Restricted remote credentials and further accessibility qualification remain outside this local operator release.
 
@@ -48,16 +48,16 @@ Claude Code Opus completed a source-only counter-review. Corrections applied inc
 - [x] Complete regression coverage for cache races and split UTF-8.
 - [x] Qualify create/clone/start/stop/delete using only disposable workloads.
 - [x] Recheck the metrics and fractal changes independently with Claude Opus and apply the findings.
-- [ ] Publish and qualify the metrics-enabled observer package on the three hosts.
+- [x] Publish and qualify the metrics-enabled observer package upgrade on the three hosts.
 - [ ] Connect manager relationships and migration only when their API contracts are available.
 
 ## Three-pass closeout
 
 1. Governance: this console adds no manager authority. Each mutation carries an explicit authorization reference and operation UUID; the existing runtime remains responsible for ownership and reservations.
 2. Operator experience: host selection is explicit for creation, unknown metrics and unqualified HA remain visible, and ambiguous outcomes cannot be retried in the same dialog. Keyboard Escape and mobile navigation were exercised after the UI corrections.
-3. Runtime: 27 automated tests cover gateway boundaries, UTF-8 chunking, cache invalidation, host-metric aggregation and the fixture-only fractal model. The isolated browser lifecycle succeeded; external inventory comparison verified no change to pre-existing container identities/states. Claude provided independent source counter-views; Codex assessed the findings and the affected suites were rerun after correction.
+3. Runtime: 32 automated tests cover gateway boundaries, dedicated observer routing and exclusion, action-endpoint isolation, optional failure handling, UTF-8 chunking, cache invalidation, host-metric aggregation and the fixture-only fractal model. The isolated browser lifecycle succeeded; external inventory comparison verified no change to pre-existing container identities/states. The metrics-enabled observer package was upgraded through signed APT on all three hosts without changing lifecycle daemon PIDs or workload inventories. Claude provided independent source counter-views; Codex assessed the findings and the affected suites were rerun after correction.
 
-Verdict: coherent with corrections for a local experimental operator console. Production exposure remains OPEN pending scoped credentials and authentication. No Shaper canon was modified. WEB-01 through WEB-10 are reconciled in the feature table above. Live manager relationships, migration and manager HA remain explicit omissions; the metrics source is coded and locally tested but still needs installed-package qualification.
+Verdict: coherent with corrections for a local experimental operator console. Production exposure remains OPEN pending scoped credentials and authentication. No Shaper canon was modified. WEB-01 through WEB-10 are reconciled in the feature table above. Live manager relationships, migration and manager HA remain explicit omissions. The metrics source is installed and qualified on the three laboratory hosts.
 
 ## Nested universe explorer
 

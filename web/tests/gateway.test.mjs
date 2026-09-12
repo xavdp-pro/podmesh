@@ -36,6 +36,47 @@ test('snapshot includes advertised host metrics and skips them on older runtimes
  assert.deepEqual(calls.filter(([,operation])=>operation==='host_resource_metrics'),[['new','host_resource_metrics']]);
 });
 
+test('snapshot reads metrics from the dedicated observation socket',async t=>{
+ let app;const calls=[];const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'a',name:'A',ssh:'lab@example.test',detailsSocket:'/run/observer.sock'}]},{origin:url,call:async(h,p)=>{calls.push([h.remoteSocket||'/run/podmesh/api.sock',p.operation]);if(p.operation==='capabilities')return{ok:true,data:{operations:h.remoteSocket?['host_resource_metrics']:[]}};if(p.operation==='host_resource_metrics')return{ok:true,data:{memory:{known:true,total_bytes:20,available_bytes:10}}};if(p.operation==='inventory')return{ok:true,data:{containers:[]}};if(p.operation==='observations')return{ok:true,data:{observations:[]}};return{ok:true,data:{host_uuid:'a'}};}});
+ const host=(await fetch(url+'/api/snapshot').then(r=>r.json())).hosts[0];
+ assert.equal(host.responses.host_resource_metrics.data.memory.available_bytes,10);
+ assert.deepEqual(host.responses.host_resource_capabilities.data.operations,['host_resource_metrics']);
+ assert.deepEqual(calls.filter(([,operation])=>operation==='host_resource_metrics'),[['/run/observer.sock','host_resource_metrics']]);
+});
+
+test('dedicated observer capability state is truthful when metrics are unsupported',async t=>{
+ let app;const calls=[];const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'a',name:'A',socket:'/main.sock',detailsSocket:'/observer.sock'}]},{origin:url,call:async(h,p)=>{calls.push([h.socket,p.operation]);if(p.operation==='capabilities')return{ok:true,data:{operations:h.socket==='/observer.sock'?[]:['host_resource_metrics']}};if(p.operation==='inventory')return{ok:true,data:{containers:[]}};if(p.operation==='observations')return{ok:true,data:{observations:[]}};return{ok:true,data:{host_uuid:'a'}};}});
+ const host=(await fetch(url+'/api/snapshot').then(r=>r.json())).hosts[0];
+ assert.deepEqual(host.responses.host_resource_capabilities.data.operations,[]);
+ assert.equal(host.responses.host_resource_metrics,undefined);
+ assert.deepEqual(calls.filter(([,operation])=>operation==='host_resource_metrics'),[]);
+ assert.ok(calls.some(([socket,operation])=>socket==='/observer.sock'&&operation==='capabilities'));
+});
+
+test('details socket never redirects lifecycle actions',async t=>{
+ let app;const calls=[];const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'a',name:'A',ssh:'lab@example.test',detailsSocket:'/run/observer.sock',allowActions:true}]},{origin:url,call:async(h,p)=>{calls.push([h.remoteSocket,p.operation]);return{ok:true,data:p.operation==='capabilities'?{operations:['start']}:{}};}});
+ const session=await fetch(url+'/api/session').then(r=>r.json());const response=await fetch(url+'/api/hosts/a/actions',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Podmesh-Token':session.token},body:JSON.stringify(payload)});
+ assert.equal(response.status,200);assert.deepEqual(calls,[[undefined,'capabilities'],[undefined,'start']]);
+});
+
+test('deep inspection excludes concurrent observer polling without hiding main inventory',async t=>{
+ let app,releaseDetails,detailsStarted;const started=new Promise(resolve=>detailsStarted=resolve);const calls=[];const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'a',name:'A',socket:'/main.sock',detailsSocket:'/observer.sock'}]},{origin:url,call:async(h,p)=>{calls.push([h.socket,p.operation]);if(p.operation==='capabilities')return{ok:true,data:{operations:h.socket==='/observer.sock'?['container_details','host_resource_metrics']:[]}};if(p.operation==='container_details'){detailsStarted();await new Promise(resolve=>releaseDetails=resolve);return{ok:true,data:{}};}if(p.operation==='inventory')return{ok:true,data:{containers:[{Id:'kept'}]}};if(p.operation==='observations')return{ok:true,data:{observations:[]}};return{ok:true,data:{host_uuid:'a'}};}});
+ const session=await fetch(url+'/api/session').then(r=>r.json());const detailRequest=fetch(url+'/api/hosts/a/details',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Podmesh-Token':session.token},body:JSON.stringify({container_path:['a'.repeat(64)]})});await started;
+ const host=(await fetch(url+'/api/snapshot').then(r=>r.json())).hosts[0];
+ assert.equal(host.responses.inventory.data.containers[0].Id,'kept');assert.equal(host.metricsDeferred,true);assert.equal(calls.filter(([socket])=>socket==='/observer.sock').length,2);
+ releaseDetails();assert.equal((await detailRequest).status,200);
+});
+
+test('observer capability failure remains optional for main observations',async t=>{
+ let app;const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'a',name:'A',socket:'/main.sock',detailsSocket:'/observer.sock'}]},{origin:url,call:async(h,p)=>{if(h.socket==='/observer.sock')throw Error('observer unavailable');if(p.operation==='inventory')return{ok:true,data:{containers:[{Id:'kept'}]}};if(p.operation==='observations')return{ok:true,data:{observations:[{id:1}]}};if(p.operation==='capabilities')return{ok:true,data:{operations:[]}};return{ok:true,data:{host_uuid:'a'}};}});
+ const host=(await fetch(url+'/api/snapshot').then(r=>r.json())).hosts[0];assert.equal(host.responses.inventory.data.containers[0].Id,'kept');assert.equal(host.responses.observations.data.observations[0].id,1);assert.equal(host.optionalErrors.host_resource_metrics,'observer unavailable');assert.deepEqual(host.errors,{});
+});
+
 test('failed optional metrics cannot suppress inventory or journal observations',async t=>{
  let app;const calls=[];const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
  app=createApp({hosts:[{id:'a',name:'A',socket:'/a.sock'}]},{origin:url,call:async(_host,p)=>{calls.push(p.operation);if(p.operation==='capabilities')return{ok:true,data:{operations:['host_resource_metrics']}};if(p.operation==='host_resource_metrics')throw Error('fixture metrics timeout');if(p.operation==='inventory')return{ok:true,data:{containers:[{Id:'kept'}]}};if(p.operation==='observations')return{ok:true,data:{observations:[{id:1,operation:'create'}]}};return{ok:true,data:{host_uuid:'a'}};}});
