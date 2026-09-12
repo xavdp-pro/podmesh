@@ -716,7 +716,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let addresses = unused_addresses();
         let mut config = configuration(&directory, "r1", &addresses);
-        let _occupied = TcpListener::bind(config.bind).unwrap();
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        config.bind = occupied.local_addr().unwrap();
         config.validate().unwrap();
         assert!(!config.database_path.exists());
         fs::write(&config.database_path, b"not SQLite").unwrap();
@@ -730,13 +731,22 @@ mod tests {
     fn accepted_connection_seam_preserves_authentication_and_one_frame_boundary() {
         let directory = tempfile::tempdir().unwrap();
         let addresses = unused_addresses();
-        let destination = configuration(&directory, "r2", &addresses);
-        let listener = TcpListener::bind(destination.bind).unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let destination_address = listener.local_addr().unwrap();
+        let mut destination = configuration(&directory, "r2", &addresses);
+        destination.bind = destination_address;
         let worker = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             destination.open().unwrap().serve_connection(stream)
         });
-        let mut source = configuration(&directory, "r1", &addresses).open().unwrap();
+        let mut source_configuration = configuration(&directory, "r1", &addresses);
+        source_configuration
+            .peers
+            .iter_mut()
+            .find(|peer| peer.replica_id == "r2")
+            .unwrap()
+            .endpoint = destination_address;
+        let mut source = source_configuration.open().unwrap();
         let receipt = source
             .sync_to("r2", "accepted-stream", "accepted-nonce")
             .unwrap();

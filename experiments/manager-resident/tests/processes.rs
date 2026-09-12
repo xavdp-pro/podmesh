@@ -481,9 +481,11 @@ fn candidate_validates_offline_and_network_requires_explicit_opt_in() {
     let lab = Lab::new();
     // Holding the exact configured address makes an accidental validation bind
     // fail; successful validation must remain fully offline.
-    let _occupied = TcpListener::bind(lab.configs[0].network.bind).unwrap();
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut held_config = lab.configs[0].clone();
+    held_config.network.bind = occupied.local_addr().unwrap();
     for mode in [None, Some("disabled"), Some("authenticated-static-peers")] {
-        let mut command = candidate(&lab, &lab.configs[0]);
+        let mut command = candidate(&lab, &held_config);
         command.arg("--validate-config");
         if let Some(mode) = mode {
             command.env("PODMESH_MANAGER_NETWORK_MODE", mode);
@@ -729,13 +731,15 @@ fn candidate_flag_mode_runs_and_shuts_down_with_explicit_network_mode() {
 #[test]
 fn accepted_transport_connection_has_absolute_trickle_deadline() {
     let lab = Lab::new();
-    let config = lab.configs[1].network.clone();
-    let listener = TcpListener::bind(config.bind).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut config = lab.configs[1].network.clone();
+    config.bind = address;
     let worker = thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
         config.open().unwrap().serve_connection(stream)
     });
-    let mut socket = TcpStream::connect(lab.configs[1].network.bind).unwrap();
+    let mut socket = TcpStream::connect(address).unwrap();
     socket.write_all(&100_u32.to_be_bytes()).unwrap();
     let start = Instant::now();
     while start.elapsed() < Duration::from_millis(2300) {
