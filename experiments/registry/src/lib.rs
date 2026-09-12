@@ -288,47 +288,62 @@ impl Store {
                 )
             })
             .collect();
-        loop {
-            let mut changed = false;
-            for (id, e) in &events {
-                if states[id] != "pending" {
-                    continue;
-                }
-                let deps: Vec<_> = e
-                    .dependencies
-                    .iter()
-                    .chain(e.previous_event_id.iter())
-                    .collect();
-                if deps.iter().any(|d| {
-                    states
-                        .get(*d)
-                        .is_some_and(|s| s == "quarantined" || s == "invalid")
-                }) {
-                    states.insert(id.clone(), "quarantined".into());
-                    changed = true;
-                    continue;
-                }
-                if let Some(prev) = &e.previous_event_id {
-                    if let Some(p) = events.get(prev) {
-                        if p.producer_epoch_uuid != e.producer_epoch_uuid
-                            || p.sequence + 1 != e.sequence
-                        {
-                            states.insert(id.clone(), "invalid".into());
-                            changed = true;
-                            continue;
-                        }
+        // Build the dependency graph once instead of rescanning the whole history
+        // for every link in a reverse-arriving chain.
+        let mut consumers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut remaining: BTreeMap<String, usize> = BTreeMap::new();
+        for (id, e) in &events {
+            let deps: BTreeSet<_> = e
+                .dependencies
+                .iter()
+                .chain(e.previous_event_id.iter())
+                .cloned()
+                .collect();
+            remaining.insert(id.clone(), deps.len());
+            for dep in deps {
+                consumers.entry(dep).or_default().push(id.clone());
+            }
+            if states[id] == "pending" {
+                if let Some(p) = e.previous_event_id.as_ref().and_then(|id| events.get(id)) {
+                    if p.producer_epoch_uuid != e.producer_epoch_uuid
+                        || p.sequence + 1 != e.sequence
+                    {
+                        states.insert(id.clone(), "invalid".into());
                     }
                 }
-                if deps
-                    .iter()
-                    .all(|d| states.get(*d).is_some_and(|s| s == "admitted"))
-                {
-                    states.insert(id.clone(), "admitted".into());
-                    changed = true;
+            }
+        }
+        let mut blocked: std::collections::VecDeque<_> = states
+            .iter()
+            .filter(|(_, state)| state.as_str() != "pending")
+            .map(|(id, _)| id.clone())
+            .collect();
+        while let Some(id) = blocked.pop_front() {
+            for child in consumers.get(&id).into_iter().flatten() {
+                if states[child] == "pending" {
+                    states.insert(child.clone(), "quarantined".into());
+                    blocked.push_back(child.clone());
                 }
             }
-            if !changed {
-                break;
+        }
+        let mut ready: std::collections::VecDeque<_> = remaining
+            .iter()
+            .filter(|(id, n)| **n == 0 && states[*id] == "pending")
+            .map(|(id, _)| id.clone())
+            .collect();
+        while let Some(id) = ready.pop_front() {
+            states.insert(id.clone(), "admitted".into());
+            for child in consumers.get(&id).into_iter().flatten() {
+                if states[child] != "pending" {
+                    continue;
+                }
+                let count = remaining
+                    .get_mut(child)
+                    .expect("every event has a dependency count");
+                *count -= 1;
+                if *count == 0 {
+                    ready.push_back(child.clone());
+                }
             }
         }
         Ok(states)
@@ -534,5 +549,54 @@ mod tests {
         let states = s.states().unwrap();
         assert_eq!(states[&digest(&c)], "quarantined");
         assert_eq!(states[&digest(&b)], "admitted");
+    }
+    #[test]
+    fn repeated_predecessor_dependency_counts_once() {
+        let s = store();
+        let a = event(1, None);
+        let id = digest(&a);
+        s.ingest(&id, &a).unwrap();
+        let mut b = decode(&event(2, Some(id.clone()))).unwrap();
+        b.dependencies = vec![id];
+        let bytes = serde_json::to_vec(&b).unwrap();
+        assert_eq!(s.ingest(&digest(&bytes), &bytes).unwrap(), "admitted");
+    }
+    #[test]
+    fn malformed_predecessor_blocks_its_consumers() {
+        let s = store();
+        let a = event(1, None);
+        let b = event(3, Some(digest(&a)));
+        let c = event(4, Some(digest(&b)));
+        for bytes in [&c, &b, &a] {
+            s.ingest(&digest(bytes), bytes).unwrap();
+        }
+        let states = s.states().unwrap();
+        assert_eq!(states[&digest(&b)], "invalid");
+        assert_eq!(states[&digest(&c)], "quarantined");
+    }
+    #[test]
+    fn sqlite_full_rolls_back_then_retry_succeeds() {
+        let s = store();
+        let pages: i64 =
+            s.db.query_row("PRAGMA page_count", [], |r| r.get(0))
+                .unwrap();
+        s.db.pragma_update(None, "max_page_count", pages).unwrap();
+        let mut e = decode(&event(1, None)).unwrap();
+        e.dependencies = (0..64).map(|n| format!("{n:064x}")).collect();
+        let bytes = serde_json::to_vec(&e).unwrap();
+        let error = s.submit(Q, &bytes).unwrap_err();
+        let sql = error
+            .downcast_ref::<rusqlite::Error>()
+            .expect("SQLite allocation error");
+        assert_eq!(sql.sqlite_error_code(), Some(rusqlite::ErrorCode::DiskFull));
+        assert!(s.export().unwrap().is_empty());
+        let requests: i64 =
+            s.db.query_row("SELECT count(*) FROM requests", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(requests, 0);
+        s.db.pragma_update(None, "max_page_count", 1_000_000)
+            .unwrap();
+        assert_eq!(s.submit(Q, &bytes).unwrap(), digest(&bytes));
+        assert_eq!(s.states().unwrap()[&digest(&bytes)], "pending");
     }
 }

@@ -42,7 +42,7 @@ These are laboratory limits, not a claim of denial-of-service-resistant hosting.
 
 ## Qualification
 
-Ten tests cover exact-byte preservation, duplicate/changed requests, request quota
+The foundational tests cover exact-byte preservation, duplicate/changed requests, request quota
 and retry at quota, restart persistence, shuffled three-store exchange, missing
 predecessors, same- and cross-epoch fork quarantine, preservation of independent
 observations, strict input refusals and immutable SQL history. Formatting and
@@ -68,3 +68,44 @@ Three-pass review: governance boundaries remain explicit; operator-visible statu
 separates stored facts from authority; adversarial review found an unbounded request
 mapping, corrected with quotas and a regression test. A separate Codex agent reviewed
 the source, not Claude. Verdict: coherent with corrections for this foundation only.
+
+## Stress qualification increment
+
+The integration harness now kills an actual child writer with SIGKILL after 1,
+10 and 100 acknowledged submissions. A separate SQLite connection checks database
+integrity, acknowledged event rows, exact request mappings and absence of partial
+request/event pairs before replay. Reopening and replaying the requests must keep
+both counts unchanged. Additional unacknowledged commits are allowed. These are
+three progress-triggered kills, not deterministic injection at every transaction
+instruction or a power-loss test. ACK waits are bounded and failing tests kill/reap
+their own child.
+
+A second test exchanges 256 chained events across three separate SQLite files,
+including disjoint offline subsets, reverse order, duplicate delivery and reopening.
+It exercises persistence and catch-up, not network transport, independent allocator
+writes, physical host loss or takeover. The ignored `crash_writer` test is a child
+fixture explicitly invoked by its parent test; it is not skipped acceptance coverage.
+
+Reconstruction now uses dependency queues rather than repeated whole-history scans.
+Structural invalidity takes precedence over dependency quarantine; both prevent
+admission, and their consumers are quarantined. Unit regressions also cover a
+predecessor repeated in dependencies and invalid-predecessor propagation.
+
+A SQLite page-allocation limit now injects SQLITE_FULL: both event and request
+rows remain absent after failure, and a retry succeeds once the limit is lifted.
+This is an allocation-failure injection, not filling a physical host disk. Four
+concurrent connections submit the same request and converge to one event/mapping
+with bounded caller-side retries for SQLITE_BUSY/SQLITE_LOCKED; the library does
+not claim automatic retry.
+
+Remaining stress gates: real storage exhaustion, production concurrency/retry
+policy, stale snapshot recovery, authenticated inter-host exchanges, network
+partitions, exclusive takeover and full control-plane loss. None is satisfied by
+the local observation-store tests.
+
+Final source counter-review found no blocking false positive in these scoped tests.
+The concurrency case permits caller-side busy retries but does not assert that
+contention actually produced a busy response. The SQLite allocation fixture uses
+an in-memory database and may fail on the first insert: it does not cover every
+partial-write location or physical WAL durability. Historical reruns remain evidence
+of their own revisions, not extra independent test cases.
