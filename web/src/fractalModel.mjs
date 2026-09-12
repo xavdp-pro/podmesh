@@ -118,3 +118,31 @@ export function filterFractalModel(model,filters={}){
  });
  return {...model,fractals,unassigned:model.unassigned.filter(node=>match(node,filters))};
 }
+
+export function filterFractalOptions(fractals=[],query=''){
+ const needle=String(query).trim().toLowerCase();
+ if(!needle)return fractals;
+ return fractals.filter(fractal=>`${fractal.name||''} ${fractal.uuid||''}`.toLowerCase().includes(needle));
+}
+
+export function fractalNodePath(nodes=[],focusUuid){
+ const byUuid=new Map(nodes.map(node=>[node.uuid,node])),path=[],seen=new Set();
+ let node=byUuid.get(focusUuid);
+ while(node&&!seen.has(node.uuid)){seen.add(node.uuid);path.push(node);node=byUuid.get(node.parentUuid);}
+ return path.reverse();
+}
+
+export function projectFractalNodes(nodes=[],{focusUuid='',collapsedUuids=[]}={}){
+ const focusIndex=focusUuid?nodes.findIndex(node=>node.uuid===focusUuid):-1;
+ const start=focusIndex>=0?focusIndex:0,focusDepth=focusIndex>=0?nodes[focusIndex].depth:0,collapsed=new Set(collapsedUuids);
+ const projected=[];let collapsedDepth=null;
+ for(let index=start;index<nodes.length;index++){
+  const node=nodes[index];
+  if(focusIndex>=0&&index>start&&node.depth<=focusDepth)break;
+  if(collapsedDepth!==null&&node.depth>collapsedDepth)continue;
+  if(collapsedDepth!==null&&node.depth<=collapsedDepth)collapsedDepth=null;
+  projected.push({...node,depth:node.depth-focusDepth});
+  if(collapsed.has(node.uuid))collapsedDepth=node.depth;
+ }
+ return projected;
+}
