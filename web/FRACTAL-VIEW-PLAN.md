@@ -26,7 +26,7 @@ Physical Podman nesting is not authoritative Shaper parentage. A nested containe
 
 Use fixtures with multiple roots, descendants on different hosts, a migrated node retaining its parent, missing/offline parents, conflicting edges and cycles. Verify filters keep ancestor context and clearing search preserves the selected fractal/node. Then qualify the same behavior against the real relationship API.
 
-Status: the read-only console view and pure relationship model are implemented. The live console reports the relationship source as unavailable and lists observed, unassigned universes separately. Manager relationship API integration and live tree qualification remain open.
+Status: the read-only console view and pure relationship model are implemented. The local gateway can optionally read a bounded, loopback-only manager relationship endpoint through a same-origin session route. Missing configuration, failed reads, malformed or over-limit envelopes, stale source data and conflicting records remain explicit; observed inventories remain listed separately. Qualification against a real control-services relationship API remains open.
 
 ## Per-fractal statistics
 

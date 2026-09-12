@@ -3,10 +3,11 @@ const payload={operation:'start',universe_uuid:'00000000-0000-4000-8000-00000000
 async function gateway(t,actions=true){
  const calls=[];let app;const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
  app=createApp({hosts:[{id:'a',name:'A',socket:'/fixture.sock',allowActions:actions}]},{origin:url,call:async(_h,p)=>{calls.push(p);return {ok:true,data:p.operation==='capabilities'?{operations:['start']}:{}};}});
- const session=await fetch(url+'/api/session').then(r=>r.json());return{calls,url,post:(body=payload,extra={})=>fetch(url+'/api/hosts/a/actions',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Podmesh-Token':session.token,...extra},body:JSON.stringify(body)})};
+ const session=await fetch(url+'/api/session').then(r=>r.json());return{calls,url,session,post:(body=payload,extra={})=>fetch(url+'/api/hosts/a/actions',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Podmesh-Token':session.token,...extra},body:JSON.stringify(body)})};
 }
 test('action forwards exact identity through capability check',async t=>{const g=await gateway(t);assert.equal((await g.post()).status,200);assert.deepEqual(g.calls,[{operation:'capabilities'},payload]);});
 test('missing session, foreign origin and unknown action refused',async t=>{const g=await gateway(t);assert.equal((await g.post(payload,{'X-Podmesh-Token':''})).status,403);assert.equal((await g.post(payload,{Origin:'https://foreign.test'})).status,403);assert.equal((await g.post({...payload,operation:'garbage_collect_apply'})).status,400);assert.deepEqual(g.calls,[]);});
+test('mutating routes require an explicit same-origin header even with a valid session token',async t=>{const g=await gateway(t);const action=await fetch(g.url+'/api/hosts/a/actions',{method:'POST',headers:{'Content-Type':'application/json','X-Podmesh-Token':g.session.token},body:JSON.stringify(payload)});const details=await fetch(g.url+'/api/hosts/a/details',{method:'POST',headers:{'Content-Type':'application/json','X-Podmesh-Token':g.session.token},body:JSON.stringify({container_path:['a'.repeat(64)]})});assert.equal(action.status,403);assert.equal(details.status,403);assert.deepEqual(g.calls,[]);});
 test('read-only and unadvertised capabilities refuse writes',async t=>{const a=await gateway(t,false);assert.equal((await a.post()).status,403);assert.deepEqual(a.calls,[]);const b=await gateway(t);assert.equal((await b.post({...payload,operation:'delete'})).status,409);assert.equal(b.calls.length,1);});
 test('DNS rebinding host refused',async t=>{const g=await gateway(t);const status=await new Promise((resolve,reject)=>{http.get(g.url+'/api/session',{headers:{Host:'foreign.test'}},r=>{r.resume();resolve(r.statusCode);}).on('error',reject);});assert.equal(status,403);});
 test('Unix transport forwards newline JSON and bounds response',async t=>{const dir=await fs.mkdtemp(path.join(os.tmpdir(),'podmesh-web-'));const socket=path.join(dir,'api.sock');const server=net.createServer({allowHalfOpen:true},c=>{let b='';c.on('data',x=>{b+=x;if(b.endsWith('\n')){assert.deepEqual(JSON.parse(b),{operation:'identity'});c.end('{"ok":true,"data":{"host_uuid":"fixture"}}\n');}});});await new Promise(r=>server.listen(socket,r));t.after(async()=>{server.close();await fs.rm(dir,{recursive:true,force:true});});assert.deepEqual(await request({socket},{operation:'identity'}),{ok:true,data:{host_uuid:'fixture'}});await assert.rejects(request({socket},{operation:'x',value:'x'.repeat(4096)}),/limit/);});
@@ -82,4 +83,36 @@ test('failed optional metrics cannot suppress inventory or journal observations'
  app=createApp({hosts:[{id:'a',name:'A',socket:'/a.sock'}]},{origin:url,call:async(_host,p)=>{calls.push(p.operation);if(p.operation==='capabilities')return{ok:true,data:{operations:['host_resource_metrics']}};if(p.operation==='host_resource_metrics')throw Error('fixture metrics timeout');if(p.operation==='inventory')return{ok:true,data:{containers:[{Id:'kept'}]}};if(p.operation==='observations')return{ok:true,data:{observations:[{id:1,operation:'create'}]}};return{ok:true,data:{host_uuid:'a'}};}});
  const host=(await fetch(url+'/api/snapshot').then(r=>r.json())).hosts[0];
  assert.deepEqual(calls,['identity','capabilities','inventory','observations','host_resource_metrics']);assert.equal(host.responses.inventory.data.containers[0].Id,'kept');assert.equal(host.responses.observations.data.observations[0].operation,'create');assert.equal(host.errors.host_resource_metrics,undefined);assert.equal(host.optionalErrors.host_resource_metrics,'fixture metrics timeout');
+});
+
+async function relationshipGateway(t,relationshipFetch,now=100000){
+ let app;const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'a',name:'A',socket:'/fixture.sock'}],relationships:{endpoint:'http://127.0.0.1:8787/v1/fractals',maxAgeSeconds:60}},{origin:url,now:()=>now,relationshipFetch,call:async(_h,p)=>p.operation==='inventory'?{ok:true,data:{containers:[{Id:'kept'}]}}:{ok:true,data:p.operation==='observations'?{observations:[]}:{}}});
+ const session=await fetch(url+'/api/session').then(r=>r.json());const read=()=>fetch(url+'/api/relationships',{headers:{Origin:url,'X-Podmesh-Token':session.token}}).then(r=>r.json());return{url,session,read};
+}
+const relationship=(fractal_uuid,universe_uuid,parent_uuid=null)=>({fractal_uuid,fractal_name:'Fixture',universe_uuid,parent_uuid,name:'Fixture universe',role:'worker',revision:1,provenance:'fixture',observed_at:100});
+const relationIds={first:'00000000-0000-4000-8000-000000000010',second:'00000000-0000-4000-8000-000000000011',one:'00000000-0000-4000-8000-000000000001',two:'00000000-0000-4000-8000-000000000002'};
+
+test('relationship gateway reads multiple manager-attested fractals through the local session',async t=>{
+ const g=await relationshipGateway(t,async(url,options)=>{assert.equal(url,'http://127.0.0.1:8787/v1/fractals');assert.equal(options.method,'GET');return new Response(JSON.stringify({observed_at:100,relationships:[relationship(relationIds.first,relationIds.one),relationship(relationIds.second,relationIds.two)]}),{headers:{'content-type':'application/json'}});});
+ const body=await g.read();assert.equal(body.status,'available');assert.equal(body.relationships.length,2);assert.equal((await fetch(g.url+'/api/relationships')).status,403);assert.equal((await fetch(g.url+'/api/relationships',{headers:{'X-Podmesh-Token':g.session.token}}).then(r=>r.json())).status,'available');
+});
+
+test('missing relationship endpoint remains explicit and cannot block host inventory',async t=>{
+ let app;const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'a',name:'A',socket:'/fixture.sock'}]},{origin:url,call:async(_h,p)=>p.operation==='inventory'?{ok:true,data:{containers:[{Id:'kept'}]}}:{ok:true,data:p.operation==='observations'?{observations:[]}:{}}});const session=await fetch(url+'/api/session').then(r=>r.json());
+ const relationships=await fetch(url+'/api/relationships',{headers:{Origin:url,'X-Podmesh-Token':session.token}}).then(r=>r.json());const snapshot=await fetch(url+'/api/snapshot').then(r=>r.json());assert.equal(relationships.status,'unavailable');assert.equal(snapshot.hosts[0].responses.inventory.data.containers[0].Id,'kept');
+});
+
+test('malformed and over-limit manager responses are rejected before the view model',async t=>{
+ const malformed=await relationshipGateway(t,async()=>new Response(JSON.stringify({relationships:[]}),{headers:{'content-type':'application/json'}}));assert.equal((await malformed.read()).status,'malformed');
+ const bounded=await relationshipGateway(t,async()=>new Response(JSON.stringify({observed_at:100,relationships:Array.from({length:5001},()=>({}))}),{headers:{'content-type':'application/json'}}));const body=await bounded.read();assert.equal(body.status,'malformed');assert.match(body.error,/5000-record/);
+});
+
+test('stale relationship data remains explicit and leaves observed universes unassigned',async t=>{
+ const g=await relationshipGateway(t,async()=>new Response(JSON.stringify({observed_at:1,relationships:[relationship(relationIds.first,relationIds.one)]}),{headers:{'content-type':'application/json'}}));const body=await g.read();assert.equal(body.status,'stale');assert.equal(body.relationships,undefined);
+});
+
+test('manager relationship failure is isolated from host snapshot collection',async t=>{
+ const g=await relationshipGateway(t,async()=>{throw Error('fixture manager unavailable');});const relationships=await g.read();const snapshot=await fetch(g.url+'/api/snapshot').then(r=>r.json());assert.equal(relationships.status,'unavailable');assert.match(relationships.error,/fixture manager unavailable/);assert.equal(snapshot.hosts[0].responses.inventory.data.containers[0].Id,'kept');
 });

@@ -10,6 +10,40 @@ Each host requires a stable local identifier, display name, and exactly one tran
 
 Actions default to disabled. `allowActions` enables console actions for that target; this is a gateway restriction, not a read-only host credential. The current laboratory SSH credential has broader host authority. Production use requires a restricted remote wrapper, scoped credentials and authentication; do not publish this loopback console directly.
 
+## Optional logical relationship source
+
+The optional `relationships` configuration connects the Fractals view to a local control-services read endpoint. `endpoint` must be an explicit `http://127.0.0.1` or `http://[::1]` URL; it is read with `GET`, cannot carry credentials or fragments, and is never browser-controlled. `maxAgeSeconds` is 5–86,400 seconds and defaults to 60.
+
+```json
+"relationships": {
+  "endpoint": "http://127.0.0.1:8787/v1/fractals",
+  "maxAgeSeconds": 60
+}
+```
+
+The endpoint must return JSON with a bounded envelope:
+
+```json
+{
+  "observed_at": 1760000000,
+  "relationships": [
+    {
+      "fractal_uuid": "...",
+      "universe_uuid": "...",
+      "parent_uuid": null,
+      "fractal_name": "...",
+      "name": "...",
+      "role": "...",
+      "revision": 1,
+      "provenance": "...",
+      "observed_at": 1760000000
+    }
+  ]
+}
+```
+
+The gateway accepts at most 5,000 relationship records and 1 MiB of JSON. It exposes the result only through the same-origin, session-token-protected `/api/relationships` route. Missing configuration, failed reads, malformed envelopes, over-limit data, stale data, conflicting records and invalid records remain visible in the Fractals view. Repeated diagnostics are summarized with counts and capped before rendering. They never infer parentage from Podman nesting or host placement, and they never hide the independent host inventory.
+
 ## Feature inventory and qualification
 
 | ID | Feature | Current scope |
@@ -23,7 +57,7 @@ Actions default to disabled. `allowActions` enables console actions for that tar
 | WEB-07 | Browser presentation | Six views exercised in Chromium; desktop/mobile screenshots captured |
 | WEB-08 | Migration and restore | Not exposed by this console yet |
 | WEB-09 | Nested explorer | Ordinary and nested Podman detail, with a distinct ShaperOS presentation hint; no logical-parent inference |
-| WEB-10 | Fractal forest | Read-only model, filters, conflict/cycle handling and partial statistics tested with fixtures; live manager relationships unavailable |
+| WEB-10 | Fractal forest | Read-only model, filters, conflict/cycle handling and partial statistics tested with fixtures; optional bounded local manager relationship input available, but no live manager qualification |
 
 The landing view shows six matching inventory entries; the Universes view is currently capped at 100. Inventory labels identify candidates only: the daemon verifies ownership. Collection time is not the time of an authoritative state change.
 
@@ -35,7 +69,7 @@ A transport error can occur after execution. An unknown outcome disables retry i
 
 ## Verification and remaining work
 
-`npm test` passes 32 gateway, metrics and fractal-model tests. `npm run build` succeeds and the production dependency audit reports no known vulnerability. Browser navigation over real read-only inventories and live resource metrics from three dedicated observer sockets produced no page errors or mobile horizontal overflow. The browser lifecycle returned successful API results for create, clone, start, graceful stop and both deletions. An independent Podman inventory comparison confirmed unchanged pre-existing container IDs/states and absence of disposable containers afterward. Intermediate application behavior and HA recovery are not covered.
+`npm test` passes 42 gateway, metrics and fractal-model tests. `npm run build` succeeds and the production dependency audit reports no known vulnerability. Browser navigation over real read-only inventories and live resource metrics from three dedicated observer sockets produced no page errors or mobile horizontal overflow. The browser lifecycle returned successful API results for create, clone, start, graceful stop and both deletions. An independent Podman inventory comparison confirmed unchanged pre-existing container IDs/states and absence of disposable containers afterward. Intermediate application behavior and HA recovery are not covered.
 
 Claude Code Opus completed a source-only counter-review. Corrections applied include strict action fields, explicit transport selection, cache generation invalidation, UTF-8 buffering, frame protection, explicit create target and unknown-outcome retry disabling. Findings are not a production approval. Cache-race and split-UTF-8 regression tests now pass. Restricted remote credentials and further accessibility qualification remain outside this local operator release.
 
@@ -49,15 +83,15 @@ Claude Code Opus completed a source-only counter-review. Corrections applied inc
 - [x] Qualify create/clone/start/stop/delete using only disposable workloads.
 - [x] Recheck the metrics and fractal changes independently with Claude Opus and apply the findings.
 - [x] Publish and qualify the metrics-enabled observer package upgrade on the three hosts.
-- [ ] Connect manager relationships and migration only when their API contracts are available.
+- [ ] Qualify a real control-services relationship endpoint and connect migration when their API contracts are available.
 
 ## Three-pass closeout
 
 1. Governance: this console adds no manager authority. Each mutation carries an explicit authorization reference and operation UUID; the existing runtime remains responsible for ownership and reservations.
 2. Operator experience: host selection is explicit for creation, unknown metrics and unqualified HA remain visible, and ambiguous outcomes cannot be retried in the same dialog. Keyboard Escape and mobile navigation were exercised after the UI corrections.
-3. Runtime: 32 automated tests cover gateway boundaries, dedicated observer routing and exclusion, action-endpoint isolation, optional failure handling, UTF-8 chunking, cache invalidation, host-metric aggregation and the fixture-only fractal model. The isolated browser lifecycle succeeded; external inventory comparison verified no change to pre-existing container identities/states. The metrics-enabled observer package was upgraded through signed APT on all three hosts without changing lifecycle daemon PIDs or workload inventories. Claude provided independent source counter-views; Codex assessed the findings and the affected suites were rerun after correction.
+3. Runtime: 42 automated tests cover gateway boundaries, dedicated observer routing and exclusion, action-endpoint isolation, optional failure handling, UTF-8 chunking, cache invalidation, host-metric aggregation, bounded manager relationship reads and the fractal model. The isolated browser lifecycle succeeded; external inventory comparison verified no change to pre-existing container identities/states. The metrics-enabled observer package was upgraded through signed APT on all three hosts without changing lifecycle daemon PIDs or workload inventories. Claude provided independent source counter-views; Codex assessed the findings and the affected suites were rerun after correction.
 
-Verdict: coherent with corrections for a local experimental operator console. Production exposure remains OPEN pending scoped credentials and authentication. No Shaper canon was modified. WEB-01 through WEB-10 are reconciled in the feature table above. Live manager relationships, migration and manager HA remain explicit omissions. The metrics source is installed and qualified on the three laboratory hosts.
+Verdict: coherent with corrections for a local experimental operator console. Production exposure remains OPEN pending scoped credentials and authentication. No Shaper canon was modified. WEB-01 through WEB-10 are reconciled in the feature table above. A bounded local read adapter can display manager-attested relationships, but live manager qualification, migration and manager HA remain explicit omissions. The metrics source is installed and qualified on the three laboratory hosts.
 
 ## Nested universe explorer
 
