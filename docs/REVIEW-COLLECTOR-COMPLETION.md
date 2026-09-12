@@ -1,6 +1,6 @@
 # Collector completion review
 
-Status: source and two-host laboratory runtime qualified; package installation qualification in progress. Not production or full HA acceptance.
+Status: source, two-host collector runtime and three-host experimental package qualification completed. Not production or full HA acceptance.
 
 ## Problem and resulting behavior
 
@@ -37,4 +37,12 @@ Runtime run `1dc2993b-2529-4ad1-93cc-c7c70c49e173` exited 0 with 81 checks passe
 
 Reclaim observed ten candidates, nine pidfd signal calls successfully delivered, one process already gone, no refusals and no remaining target processes. Memory continuity kept the same token and progressed from 5 before checkpoint to observed values 7 through 13 after restore. Independently compared pre-existing containers, images and volumes were unchanged on both hosts. Test observers finished and the source-only barrier configuration was removed after the run.
 
-The built experimental6 package contains byte-identical executables. Package installation, publication and user acceptance are separate gates. This interruption test covers a committed class-2 state transition; it does not prove every crash position during delegated runtime reclaim, host power failure, or distributed HA.
+The signed experimental6 package is published and installed on all three laboratory hosts, with byte-identical executables. Each host passed eight installed-service suites (143 checks); the target source suite was rerun with its missing Debian fixture to cover two initially skipped refusals. The temporary image was removed and independent inventories restored. A clean Debian container dependency installation passed; this is not a clean full-host runtime qualification. Package removal, signed-APT reinstallation, downgrade to retained experimental5 and re-upgrade passed on one host, preserving a running witness, identity and journal. User acceptance remains separate. This interruption test covers a committed class-2 state transition; it does not prove every crash position during delegated runtime reclaim, host power failure, or distributed HA.
+
+## Three-pass closeout
+
+Verdict: **COHERENT WITH CORRECTIONS** for the bounded PodMesh runtime and experimental packaging lot.
+
+1. Governance: collection remains explicitly authorized, proof-based and fail-closed. Age, unknown observation and coordinator identity confer no deletion authority. No automatic timer or new Shaper OS law was introduced.
+2. Human operation: API results distinguish attempted and delivered effects; package documentation states supported scope and rollback limitations. Existing workloads and host identities were preserved. Product-wide acceptance remains open.
+3. Runtime: pidfd binding, actual post-commit daemon interruption, durable replay, independent inventories and package lifecycle were exercised. Separate Codex review conversations inspected source and retained evidence. This final counter-view was not a fresh Claude review. Uncovered crash windows, collector classes 4–5, replicated manager, networking and HA remain explicit follow-up work.

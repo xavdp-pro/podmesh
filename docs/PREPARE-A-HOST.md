@@ -42,3 +42,9 @@ The service records a machine identity to reject accidental state reuse on anoth
 LVM2, LVM thin, ZFS, Btrfs and WireGuard are planned optional capabilities. They are not requirements for the initial installation. Do not reformat an existing disk to install this package. The patched migration runtime and its helper shim install from the same repository, and from `0.1.0~experimental5` the service package itself carries the experimental migration operations. They are qualified for one workload shape — Alpine, musl, network-disabled, mount-free — between two hosts with identical kernel, runtime and image identity. A reservation is not fencing, and direct administration bypasses it: do not enable this pathway for ordinary workloads.
 
 For containers, Alpine is preferred where tested. That preference does not change the Debian host package target.
+
+## Experimental6 collector and upgrade boundary
+
+The current service package explicitly depends on the pinned migration runtime and node helper, plus archive tools. APT must be able to obtain those versions from this signed repository. Runtime reclaim requires the qualified Linux pidfd interface; lack of support refuses signalling rather than falling back to numeric PIDs.
+
+Keep a verified previous `.deb` and a consistent backup of the service state before an upgrade. The repository keeps one version per suite. Package removal retains identity and journal; it does not delete workloads. Downgrading can remove newer safety enforcement even when the journal is readable: do not operate held migration universes with an older binary. See [the qualification review](REVIEW-COLLECTOR-COMPLETION.md) for the measured scope. No test-barrier environment setting is needed or shipped for ordinary installation.
