@@ -281,12 +281,39 @@ may amend any of them. The M2 entries above are unchanged.
 Entries 13 to 15 were added after the independent counter-review of this lot; the eleven suites were rerun
 on the corrected binary.
 
+## Garbage collection
+
+Operator decision, 2026-09-12, answering both dead ends at once: a reservation with no way out and a
+failed local restore with no reclaim do not each deserve their own operation. They are the work of a
+garbage collector, the shape SHAPER already uses for ephemeral universes. Age alone never justifies
+collecting anything; proof does.
+
+It may collect, each as a typed decision recorded with the evidence it rests on:
+
+- a reservation whose every authorization ended `not_restored`, whose source is still the reserved
+  container and is not running — an ended authorization can no longer produce a copy anywhere, which the
+  independent review of lot M3 verified against the destination's own refusal path;
+- a reservation whose container is gone and which never issued an authorization — today's
+  `migration_abandon`, which becomes one of the collector's cases rather than a separate act;
+- a failed restore claim together with the processes of its own attempt, under the reclaim proof already
+  implemented: cgroup membership and a start time at or after the claim, re-read before each signal;
+- a failed local restore's own container and processes, under the same proof;
+- the artifacts of finished operations, under a declared retention, never those of an unresolved one.
+
+It must never collect: anything while an authorization is open, since a destination may hold it; a claim
+that verified; a running universe; a container it cannot prove its own attempt created; or the evidence
+of an incident nobody has read yet.
+
+Two modes, both typed operations carrying an `authorization_ref`: a dry run that reports what it would
+collect and why, and a run that collects and reports what it did. Nothing runs on a timer of its own in
+this version. The watching agent proposes; the root tandem, or a standing mandate that names the scope,
+decides. What the mandate may cover for a production universe is not settled here.
+
 ## Still open
 
 - Break-glass release when the destination is unreachable or its journal is lost, including the case where
   a transport altered the documents so that no outcome can ever bind to the source's authorization.
-- Release or abandonment of a reservation whose only authorizations ended `not_restored` (deviation 3).
-- Ending the processes of a failed **local** restore through the API (deviation 12).
+- The garbage collector above: its operations, its retention, and the mandate that may run it.
 - Moving network identity and addresses (P11–P13).
 - Transport by makers, authenticated remote operations and the manager's role.
 - Periodic replication and controlled failover (P10, P16, P17).
