@@ -5,6 +5,11 @@ export function formatBytes(value){
  return `${amount>=10||index===0?amount.toFixed(0):amount.toFixed(1)} ${units[index]}`;
 }
 
+export function formatCpuCores(value){
+ if(!Number.isFinite(value)||value<0)return 'Unknown';
+ return new Intl.NumberFormat('en',{maximumFractionDigits:2}).format(value);
+}
+
 export function meshMemory(hosts){
  const identities=new Set();let available=0,total=0,contributors=0;const reasons=[];
  for(const host of hosts){
