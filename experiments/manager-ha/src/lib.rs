@@ -1,25 +1,30 @@
 //! Deterministic laboratory model for a replicated logical `PodMesh` manager.
 //!
-//! This crate models merge and activation gates. It has no networking, durable
-//! storage, authentication, failure detector, fencing, DNS or Podman adapter.
+//! This crate models merge and activation gates with a local durable process API.
+//! It has no network authentication, failure detector, fencing, DNS or Podman adapter.
 
+pub mod durable;
+
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub type Result<T> = std::result::Result<T, String>;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplicaConfig {
     pub replica_id: String,
     pub host_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeGrant {
     pub scope: String,
     pub owner_replica_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Topology {
     logical_manager_id: String,
     replicas: BTreeMap<String, ReplicaConfig>,
@@ -116,7 +121,8 @@ fn scopes_overlap(left: &str, right: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Fact {
     pub event_id: String,
     pub logical_manager_id: String,
@@ -186,7 +192,11 @@ impl Replica {
         }
 
         let current = self.local_subject_head(scope, subject)?;
-        let subject_revision = current.map_or(1, |fact| fact.subject_revision + 1);
+        let subject_revision = current.map_or(Ok(1), |fact| {
+            fact.subject_revision
+                .checked_add(1)
+                .ok_or_else(|| "subject revision exhausted".to_string())
+        })?;
         let predecessor = current.map(|fact| fact.event_id.clone());
         let event_id = format!("{}:{:020}", self.replica_id(), self.next_sequence);
         let fact = Fact {
@@ -319,20 +329,23 @@ fn validate_fact(topology: &Topology, fact: &Fact) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubjectKey {
     pub scope: String,
     pub subject: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ConflictKind {
     MissingPredecessor,
     SubjectFork,
     ExclusiveResource,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Conflict {
     pub kind: ConflictKind,
     pub resource: String,
@@ -377,7 +390,7 @@ fn materialize(history: &BTreeMap<String, Fact>) -> View {
                     previous.scope == fact.scope
                         && previous.subject == fact.subject
                         && previous.origin_replica_id == fact.origin_replica_id
-                        && previous.subject_revision + 1 == fact.subject_revision
+                        && previous.subject_revision.checked_add(1) == Some(fact.subject_revision)
                 }) {
                     reason = Some(ConflictKind::MissingPredecessor);
                     break;
