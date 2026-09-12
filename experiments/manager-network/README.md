@@ -103,6 +103,12 @@ podmesh-manager-network-lab sync LOCAL-CONFIG.json PEER_ID OPERATION_ID NONCE
 
 It does not start a resident service and does not run shell commands.
 
+`Node::serve_connection(TcpStream)` handles exactly one accepted connection with
+the same authentication, framing and atomic import. Its caller owns listener
+admission/concurrency; `../manager-resident/` supplies that laboratory owner.
+Frame reads/writes use absolute two-second deadlines, so trickled bytes cannot
+renew a timeout forever.
+
 ## Evidence covered by tests
 
 - a three-replica executable test holds two destination listeners while the

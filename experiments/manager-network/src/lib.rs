@@ -138,7 +138,7 @@ impl Node {
         let listener = TcpListener::bind(self.bind).map_err(Error::unavailable)?;
         listener.set_nonblocking(true).map_err(Error::unavailable)?;
         let deadline = Instant::now() + IO_TIMEOUT;
-        let mut stream = loop {
+        let stream = loop {
             match listener.accept() {
                 Ok((stream, _)) => break stream,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -150,6 +150,15 @@ impl Node {
                 Err(error) => return Err(Error::unavailable(error)),
             }
         };
+        self.serve_connection(stream)
+    }
+
+    /// Handles exactly one bounded authenticated exchange on an accepted stream.
+    /// The caller owns listener admission and concurrency limits.
+    ///
+    /// # Errors
+    /// Returns a local I/O error when the bounded request/reply cannot complete.
+    pub fn serve_connection(&mut self, mut stream: TcpStream) -> Result<(), Error> {
         stream
             .set_read_timeout(Some(IO_TIMEOUT))
             .map_err(Error::unavailable)?;
@@ -454,25 +463,38 @@ fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, Error> {
 }
 
 fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>, Error> {
+    let deadline = Instant::now() + IO_TIMEOUT;
     let mut length = [0_u8; 4];
-    read_exact(stream, &mut length)?;
+    read_exact(stream, &mut length, deadline)?;
     let length = u32::from_be_bytes(length) as usize;
     if length == 0 || length > MAX_FRAME_BYTES {
         return Err(Error::malformed("invalid frame length"));
     }
     let mut bytes = vec![0; length];
-    read_exact(stream, &mut bytes)?;
+    read_exact(stream, &mut bytes, deadline)?;
     Ok(bytes)
 }
 
-fn read_exact(stream: &mut TcpStream, bytes: &mut [u8]) -> Result<(), Error> {
-    stream.read_exact(bytes).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::UnexpectedEof {
-            Error::malformed("truncated frame")
-        } else {
-            Error::unavailable(error)
+fn read_exact(
+    stream: &mut TcpStream,
+    mut bytes: &mut [u8],
+    deadline: Instant,
+) -> Result<(), Error> {
+    while !bytes.is_empty() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| Error::unavailable("frame read deadline exceeded"))?;
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(Error::unavailable)?;
+        match stream.read(bytes) {
+            Ok(0) => return Err(Error::malformed("truncated frame")),
+            Ok(length) => bytes = &mut bytes[length..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(Error::unavailable(error)),
         }
-    })
+    }
+    Ok(())
 }
 
 fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
@@ -480,8 +502,28 @@ fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
         .len()
         .try_into()
         .map_err(|_| std::io::Error::other("frame limit"))?;
-    stream.write_all(&length.to_be_bytes())?;
-    stream.write_all(bytes)?;
+    let deadline = Instant::now() + IO_TIMEOUT;
+    for mut part in [&length.to_be_bytes()[..], bytes] {
+        while !part.is_empty() {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "frame write deadline exceeded",
+                    )
+                })?;
+            stream.set_write_timeout(Some(remaining))?;
+            let written = match stream.write(part) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if written == 0 {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            part = &part[written..];
+        }
+    }
     stream.flush()
 }
 
@@ -660,6 +702,47 @@ mod tests {
     use super::*;
 
     const WRONG_KEY: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+    #[test]
+    fn accepted_connection_seam_preserves_authentication_and_one_frame_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let addresses = unused_addresses();
+        let destination = configuration(&directory, "r2", &addresses);
+        let listener = TcpListener::bind(destination.bind).unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            destination.open().unwrap().serve_connection(stream)
+        });
+        let mut source = configuration(&directory, "r1", &addresses).open().unwrap();
+        let receipt = source
+            .sync_to("r2", "accepted-stream", "accepted-nonce")
+            .unwrap();
+        assert_eq!(receipt.history_len, 0);
+        assert!(worker.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn frame_deadline_is_absolute_despite_trickling_bytes() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let start = Instant::now();
+            let result = read_frame(&mut stream);
+            (result, start.elapsed())
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.write_all(&100_u32.to_be_bytes()).unwrap();
+        for _ in 0..24 {
+            if stream.write_all(b" ").is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let (result, elapsed) = worker.join().unwrap();
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_secs(3));
+    }
 
     fn key_for(left: usize, right: usize) -> String {
         match (left.min(right), left.max(right)) {

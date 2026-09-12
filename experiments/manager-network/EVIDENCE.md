@@ -1,5 +1,19 @@
 # Network transport laboratory evidence
 
+## Resident integration seam increment
+
+The resident milestone extracts `Node::serve_connection(TcpStream)` from the
+one-shot listener without exposing raw handlers, keys or unbounded frames.
+Focused tests prove authenticated receipt through an already accepted stream and
+an absolute two-second frame deadline despite trickling bytes. The reader/writer
+now share one deadline across the frame prefix and payload instead of resetting
+the limit for every syscall. This increment was independently reviewed with the
+resident service after correction.
+
+The resident counter-review additionally restored interrupted-system-call retry
+in the absolute read/write loops. A retry uses the original deadline. Existing
+frame/seam tests were rerun; no deterministic signal injection is claimed.
+
 Date: 2026-09-12. Scope: `experiments/manager-network/` only.
 Source dependency: the unmodified local `experiments/manager-ha/` durable manager
 laboratory, imported as a typed path dependency. No host service, Debian package,
@@ -8,13 +22,14 @@ or network configuration was changed.
 
 Implementation model: OpenAI Codex GPT-5.6 Terra at high effort, selected by the
 coordinating agent for this bounded implementation. This is not an independent
-counter-review.
+counter-review. The resident seam and EINTR corrections were implemented by
+OpenAI Codex GPT-6 Astra at high effort.
 
 ## Executed qualification
 
 | Command | Result |
 | --- | --- |
-| `cargo test --locked --manifest-path experiments/manager-network/Cargo.toml` | 8 tests passed: seven library transport cases and one three-process integration case |
+| `cargo test --locked --manifest-path experiments/manager-network/Cargo.toml` | 10 tests passed: nine library transport cases and one three-process integration case |
 | `cargo clippy --locked --all-targets --manifest-path experiments/manager-network/Cargo.toml -- -D warnings` | Passed |
 | `cargo fmt --manifest-path experiments/manager-network/Cargo.toml -- --check` | Passed |
 
@@ -54,3 +69,9 @@ unbounded configuration read, an unignored build tree and one inaccurate bound.
 Claude Code Opus at medium effort then reran the eight tests, strict Clippy and
 formatting and reported no remaining blocker or important finding for this
 documented experimental scope. Codex independently reran the same gates.
+
+For the resident increment, Claude Code Opus at high effort found and prompted
+corrections for strict control request fields, error-path socket cleanup, stale
+count-delta reporting and interrupted-syscall retry. Its closure review reported
+no remaining blocker or important finding. Codex reran all ten transport tests,
+strict Clippy and formatting after those corrections.
