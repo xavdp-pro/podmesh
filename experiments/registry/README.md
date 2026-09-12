@@ -59,9 +59,11 @@ claim follows from these tests.
 | Durable immutable observation input and deterministic replay | Implemented/tested in this experiment |
 | Local fixture enrollment, request deduplication, bounded retention | Implemented/tested |
 | Manager/host runtime identity and writer epoch recovery | Pending |
-| Automatic producer sequence, stream cursors, bounded batch protocol | Pending |
+| Automatic producer sequence | Pending |
+| Frozen digest-snapshot cursors and bounded observation batches | Implemented/tested locally; no authenticated network endpoint |
 | Grants, exclusive IP/placement conflicts, tombstones, migration lineage | Pending |
-| Snapshot recovery and actual process-kill proof | Pending |
+| Writer SIGKILL and acknowledged-commit persistence | Implemented/tested locally; not power loss |
+| Stale snapshot recovery and control-plane rebuild | Pending |
 | Signed origins, network transport, DNS, takeover and HA | Pending |
 
 Three-pass review: governance boundaries remain explicit; operator-visible status
@@ -109,3 +111,82 @@ contention actually produced a busy response. The SQLite allocation fixture uses
 an in-memory database and may fail on the first insert: it does not cover every
 partial-write location or physical WAL durability. Historical reruns remain evidence
 of their own revisions, not extra independent test cases.
+
+## Enrollment contention qualification
+
+Enrollment already holds a SQLite IMMEDIATE transaction across the quota check
+and insertion. A regression now holds an independent write transaction containing
+the 255th binding while four connections attempt distinct enrollments. After that
+writer commits, exactly one attempt succeeds, three receive the quota refusal,
+and an independent connection reads exactly 256 rows. This validates the local
+quota under writer contention; it does not establish distributed enrollment
+consensus. See `NEXT-NETWORK-MILESTONE.md` for the next bounded exchange proposal.
+
+## Transport-neutral exchange increment
+
+`exchange::Snapshot` freezes a deterministic export and binds page offsets to its
+mesh/content digest. Reuse that snapshot throughout pagination; a new capture
+requires a new traversal. Pages contain at most 64 events and 256 KiB of original
+body bytes, with a 600 KiB wire bound. Lowercase hex preserves exact whitespace and
+UTF-8 bytes. These are laboratory limits, not a public endpoint.
+
+`exchange::import` validates the whole batch framing before writes, then imports
+individual events with existing local enrollment and quota checks. A batch can
+partially succeed: its receipt identifies each event's persisted exact bytes and
+separately its admission result. Admission is a point-in-time replay result and
+can change when later events arrive. A receipt digest binds it to the exact input
+batch; it is not a signature. Lost responses can be retried with identical bytes.
+Cursor metadata is pagination context, never a receipt or authority claim.
+
+Tests exercise bounded pages, duplicate delivery after a lost receipt, third-store
+catch-up, exact-byte preservation, stale cursors, wrong mesh, unknown enrollment,
+malformed/oversize input and per-event altered-body refusal. The exchange fixture
+runs in-process with separate stores; it does not demonstrate authenticated network
+transport or host-loss survival. Existing persistence/crash tests remain separate.
+
+External authentication remains unimplemented: an operator-owned fixed peer/store
+configuration, pinned transport identity and recipient executable must be specified
+before wiring this module to SSH or another channel. No enrollment transfer,
+manager takeover, DNS, IP allocation, collector or installed daemon is changed.
+
+
+## Exchange review corrections and caller contract
+
+Batches must carry strictly increasing, unique digest IDs and the frozen snapshot's
+bounded event count. A non-final page must carry the exact next offset; it cannot
+silently claim completion before that count. Page cursors refer to one frozen
+snapshot; ingesting more data does not change it. Capture a new snapshot
+and restart its traversal to discover later events. Compile-time body/event and
+wire-overhead bounds guarantee one valid event fits; runtime guards refuse a
+non-progressing page even if internal data violates those bounds. Tests cover
+four 64-KiB events filling the body budget and a fifth on the next page, maximum
+record metadata, and unchanged snapshot bytes after a new ingest.
+
+**Inspect every event receipt before advancing.** `Receipt::advance` binds the
+receipt to the original batch and requires every expected ID to be marked stored.
+An event without an exact storage receipt keeps the cursor in place: retry only
+transient storage contention, or reconcile a permanent validation/enrollment/quota
+refusal. A replay result may report a refusal after its exact bytes were already
+committed; advancing then acknowledges storage only, never admission. Do not silently
+skip an unstored event because another event succeeded. The reference catch-up test uses this helper.
+It checks completeness, not authenticity; transport authentication is still absent.
+
+Per-event refusals expose only categories: validation, enrollment, quota,
+retryable_storage (SQLite BUSY/LOCKED), or storage_fault (operator investigation,
+including SQLITE_FULL). No SQL text, paths or raw database errors are returned.
+A stored event can still report a replay failure; its storage receipt remains valid
+while admission stays unknown. An outer import error can also occur **after partial
+writes**, for example if the independent receipt query fails. On a missing/failed
+receipt retain the batch and retry identical bytes; never assume rollback of the
+entire batch. Only malformed framing is guaranteed refused before any writes.
+
+Enrollment uses IMMEDIATE transactions to serialize its quota check and insertion.
+Existing ingest/submit use DEFERRED transactions: competing writers can encounter
+BUSY/LOCKED while upgrading a read transaction. The library does not retry. A caller
+must bound retries of identical inputs; exclusive enrollment retries must never
+weaken quota checks. No distributed-lock semantics follow from SQLite transactions.
+
+The manifest declares Rust 1.88 because fixed-size slice `as_chunks` requires it.
+This is a source-level minimum, not evidence of a full MSRV build; qualification
+used the available toolchain. `--locked` pins dependency resolution to Cargo.lock;
+it does not pin the Rust compiler, operating system or system environment.
