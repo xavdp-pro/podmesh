@@ -1,0 +1,48 @@
+[Unit]
+Description=PodMesh experimental resident control-services manager
+Documentation=file:/usr/share/doc/podmesh-manager/MANAGER-DEPLOYMENT.md
+After=local-fs.target
+ConditionPathExists=/etc/podmesh-manager/config.json
+
+[Service]
+Type=simple
+User=podmesh-manager
+Group=podmesh-manager
+Environment=PODMESH_MANAGER_CONFIG=/etc/podmesh-manager/config.json
+Environment=PODMESH_MANAGER_STATE_DIR=/var/lib/podmesh-manager
+Environment=PODMESH_MANAGER_RUNTIME_DIR=/run/podmesh-manager
+Environment=PODMESH_MANAGER_NETWORK_MODE=disabled
+ExecStart=/usr/lib/podmesh-manager/podmesh-managerd --config ${PODMESH_MANAGER_CONFIG} --state-dir ${PODMESH_MANAGER_STATE_DIR} --runtime-dir ${PODMESH_MANAGER_RUNTIME_DIR}
+RuntimeDirectory=podmesh-manager
+RuntimeDirectoryMode=0700
+StateDirectory=podmesh-manager
+StateDirectoryMode=0750
+UMask=0077
+# Automatic restart is intentionally disabled until resident recovery behavior is
+# qualified on actual hosts.
+Restart=no
+TimeoutStartSec=30
+TimeoutStopSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+{
+  "network": {
+    "replica_id": "replace-with-this-host-replica-uuid",
+    "database_path": "/var/lib/podmesh-manager/manager.sqlite",
+    "manager": {
+      "logical_manager_id": "replace-with-a-stable-logical-manager-uuid",
+      "replicas": [
+        {
+          "replica_id": "replace-with-this-host-replica-uuid",
+          "host_id": "replace-with-this-host-uuid"
+        }
+      ],
+      "grants": []
+    },
+    "bind": "127.0.0.1:9443",
+    "peers": []
+  },
+  "control_socket": "/run/podmesh-manager/control.sock",
+  "interval_ms": 1000,
+  "max_backoff_ms": 30000,
+  "incoming_workers": 1
+}
