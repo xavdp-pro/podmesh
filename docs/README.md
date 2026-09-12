@@ -57,10 +57,17 @@ The entire SHAPER corpus has NOT been audited in this sequence. No canon changed
 
 ## Manager, governor and makers
 
-The manager is a Podman-hosted universe containing the registry, existing tools
-and, in the latest proposal, DNS. It has one logical identity replicated across
-hosts. Logical identity does not make independent running copies automatically
-consistent. Each replica requires a distinct instance identity and hosting record.
+The manager universe, more precisely the **control-services universe**, is a
+Podman-hosted universe containing the registry, existing tools and, in the latest
+proposal, DNS. The word manager is a deployment label here, never a governance role:
+SHAPER's vocabulary already has the governor for declared desired state and the maker
+for local materialization, and this universe is neither. It receives no authority by
+being replicated. New text should prefer control-services universe and state that
+mapping in the same paragraph; the older phrasing survives in this record.
+
+It has one logical identity replicated across hosts. Logical identity does not make
+independent running copies automatically consistent. Each replica requires a distinct
+instance identity and hosting record.
 
 The SaaS acts as governor. Existing definitions say it holds the desired-state
 ledger, dates observations and does not initiate broad host administration.

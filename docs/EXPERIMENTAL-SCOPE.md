@@ -60,7 +60,7 @@ permission to activate merely because a peer becomes unreachable.
 | Packaged lifecycle API | Inventory, creation, start, stop, deletion and restricted cloning have recorded laboratory tests on three hosts. This is not arbitrary-volume or network qualification. |
 | Source checkpoint API | Experimental development implementation records a reservation and checkpoint artifact in the default rootful store. This is not a complete migration. |
 | Default-store destination probe | The operator supplied a Claude report of successful direct Podman restore after an API checkpoint, using an Alpine, network-disabled, mount-free fixture. The memory marker survived and the counter progressed. This review did not rerun the probe or independently inspect the hosts. |
-| End-to-end destination API | Still requires implementation and acceptance through the verified handoff protocol, destination ownership import, recovery and placement reporting. |
+| End-to-end destination API | Implemented experimentally and qualified only for the recorded two-host fixture: one Alpine, musl, network-disabled, mount-free workload of about 0.5 GiB, matching kernel, runtime hashes and image identity, forward and return, with the handoff verified, ownership imported on the destination and memory continuity observed from outside the universe. Independently counter-reviewed. Recovery of a held reservation, packaging, a third host, networking, storage and HA remain. |
 | Networking, general storage, replicated manager and HA | Research targets; no general availability or lossless failover claim follows from the preceding rows. |
 
 The reported destination probe used a placeholder destination identity, direct
@@ -99,7 +99,15 @@ assumption and a proposed change to the SHAPER standard. Explain the smallest fi
 its evidence and remaining limitations. Never merge divergent canon branches,
 delete historical copies or edit archived releases as routine documentation hygiene.
 
-Next: qualify the destination adapter through the PodMesh API and the provisional
-handoff contract, including invalid artifacts, wrong destination identity,
-interruption, retry, imported ownership and source exclusion. A copied checkpoint
-and a stopped source alone do not prove safe automatic failover.
+The destination adapter has since been qualified through the PodMesh API and the
+provisional handoff contract, including invalid artifacts, wrong destination identity,
+interruption, retry, imported ownership and source exclusion, on two hosts. A copied
+checkpoint and a stopped source still do not prove safe automatic failover.
+
+Next: the recovery paths of a held reservation, and the cleanup of the runtime processes
+a failed restore leaves behind. A reclaim is acceptable only with proof of cgroup
+membership and a start time at or after the claim, an explicit opt-in, verification from
+outside that the cgroups disappeared and the container is absent, a declared disk-recovery
+tolerance, and an incomplete-reclaim outcome for any residual process. Who may request
+such an action remains an open product policy; a local root socket is not a delegated
+authority model.
