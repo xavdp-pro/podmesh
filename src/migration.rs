@@ -27,9 +27,12 @@ const RUNTIME_WRAPPER: &str = "/usr/bin/podmesh-vzcriu";
 const RUNTIME_SHIM: &str = "/opt/podmesh-vzcriu-kit/bin/criu";
 // Qualified bytes of the runtime and of the packaged scripts that select it (podmesh-vzcriu
 // 3.15.5.3+podmesh1~experimental1, podmesh-vzcriu-helpers-node 1.0.0+podmesh1~experimental1).
-const RUNTIME_REAL_SHA256: &str = "4ecb663e7e3b019cdfa534c0d4cce4134938f87ae3b45cac35a7481c0a947cd4";
-const RUNTIME_WRAPPER_SHA256: &str = "97d0f0728c54dd340b6ec6d002e1946b3a41fdd8ceb3ded5d4d5cccfda44b28e";
-const RUNTIME_SHIM_SHA256: &str = "fcbec55d0401080d020b1a56299d007792ca8215f68c533756080ff5e86948eb";
+const RUNTIME_REAL_SHA256: &str =
+    "4ecb663e7e3b019cdfa534c0d4cce4134938f87ae3b45cac35a7481c0a947cd4";
+const RUNTIME_WRAPPER_SHA256: &str =
+    "97d0f0728c54dd340b6ec6d002e1946b3a41fdd8ceb3ded5d4d5cccfda44b28e";
+const RUNTIME_SHIM_SHA256: &str =
+    "fcbec55d0401080d020b1a56299d007792ca8215f68c533756080ff5e86948eb";
 pub(crate) const RUNTIME_GIT_ID: &str = "v3.15.5.3";
 // Podman and crun look up a binary named `criu` on PATH; the private shim directory comes first.
 const RUNTIME_PATH: &str = "/opt/podmesh-vzcriu-kit/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -45,10 +48,14 @@ pub(crate) const SPACE_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const CONTAINER_STORAGE: &str = "/var/lib/containers/storage";
 const SCOPE: &str = "experimental source-side checkpoint: default rootful Podman store, network-disabled, mount-free, journal-owned container with musl processes, packaged podmesh-vzcriu 3.15.5.3 through its private-path shim";
 const AUTHORITY: &str = "This checkpoint does not authorize restore on any host and does not release the reservation. Only migration_authorize_transfer issues a handoff, and only a verified destination outcome bound to it ends the reservation.";
-/// Reservation states this file and `recovery.rs` share.
+/// Reservation states this file, `recovery.rs` and `collector.rs` share.
 pub(crate) const RELEASED: &str = "released";
 pub(crate) const ABANDONED: &str = "abandoned";
 pub(crate) const RESTORED_LOCALLY: &str = "restored_locally";
+/// Terminal state of a reservation the garbage collector swept on proof (docs/GARBAGE-COLLECTION.md). Like
+/// `released` it blocks no generic operation; unlike it, a tombstone keeps refusing a blind `create` of the
+/// same universe UUID for good.
+pub(crate) const COLLECTED: &str = "collected";
 
 /// Identity binding carried by every migration request.
 pub(crate) struct Binding<'a> {
@@ -88,9 +95,160 @@ pub(crate) fn ensure_schema(db: &Connection) -> Result<(), Error> {
          CREATE TABLE IF NOT EXISTS migration_reservation_history(id INTEGER PRIMARY KEY, universe_uuid TEXT NOT NULL, operation_id TEXT NOT NULL,
          container_id TEXT NOT NULL, image_id TEXT NOT NULL, source_host_uuid TEXT NOT NULL, destination_host_uuid TEXT NOT NULL,
          container_started_at TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, detail TEXT,
-         archived_at INTEGER NOT NULL, archived_by_operation TEXT NOT NULL);",
+         archived_at INTEGER NOT NULL, archived_by_operation TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS migration_universe_tombstones(universe_uuid TEXT PRIMARY KEY, class TEXT NOT NULL,
+         class_number INTEGER NOT NULL, container_id TEXT NOT NULL, container_absent_at_collection INTEGER NOT NULL,
+         checkpoint_operation_id TEXT NOT NULL, collected_by_operation TEXT NOT NULL, collected_at INTEGER NOT NULL, proof TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS migration_collection_history(id INTEGER PRIMARY KEY, universe_uuid TEXT NOT NULL,
+         class TEXT NOT NULL, class_number INTEGER NOT NULL, container_id TEXT NOT NULL,
+         container_absent_at_collection INTEGER NOT NULL, checkpoint_operation_id TEXT NOT NULL,
+         collected_by_operation TEXT NOT NULL, collected_at INTEGER NOT NULL, proof TEXT NOT NULL,
+         UNIQUE(universe_uuid,collected_by_operation));
+         CREATE UNIQUE INDEX IF NOT EXISTS migration_collection_history_by_operation
+         ON migration_collection_history(universe_uuid,collected_by_operation);
+         INSERT OR IGNORE INTO migration_collection_history(universe_uuid,class,class_number,container_id,
+         container_absent_at_collection,checkpoint_operation_id,collected_by_operation,collected_at,proof)
+         SELECT universe_uuid,class,class_number,container_id,container_absent_at_collection,checkpoint_operation_id,
+         collected_by_operation,collected_at,proof FROM migration_universe_tombstones;",
     )?;
     Ok(())
+}
+/// Every collection this universe has ever been through, oldest first. The tombstone is the permanent
+/// identity protection and keeps the first proof; this is the occurrence history, and a universe that comes
+/// back through a verified restore and is collected again adds a row rather than replacing anything.
+pub(crate) fn collection_history(db: &Connection, uuid: &str) -> Result<Vec<Value>, Error> {
+    let mut stmt = db.prepare(
+        "SELECT class,class_number,container_id,container_absent_at_collection,checkpoint_operation_id,collected_by_operation,
+         collected_at,proof FROM migration_collection_history WHERE universe_uuid=?1 ORDER BY id",
+    )?;
+    let rows = stmt.query_map([uuid], |r| {
+        Ok(json!({"class": r.get::<_, String>(0)?, "class_number": r.get::<_, i64>(1)?,
+            "container_id": r.get::<_, String>(2)?, "container_absent_at_collection": r.get::<_, i64>(3)? != 0,
+            "checkpoint_operation_id": r.get::<_, String>(4)?, "collected_by_operation": r.get::<_, String>(5)?,
+            "collected_at": r.get::<_, i64>(6)?,
+            "proof": serde_json::from_str::<Value>(&r.get::<_, String>(7)?).unwrap_or(Value::Null)}))
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+/// Records one collection: an append-only occurrence row, and the tombstone itself the first time only, so
+/// that a second collection of the same identity never overwrites the proof the first one rested on. The
+/// caller holds the transaction.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_collection(
+    db: &Connection,
+    uuid: &str,
+    class: &str,
+    class_number: i64,
+    container_id: &str,
+    absent: bool,
+    checkpoint_operation: &str,
+    operation: &str,
+    at: i64,
+    proof: &Value,
+) -> Result<bool, Error> {
+    let occurrence = db.execute(
+        "INSERT INTO migration_collection_history(universe_uuid,class,class_number,container_id,container_absent_at_collection,
+         checkpoint_operation_id,collected_by_operation,collected_at,proof) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+         ON CONFLICT(universe_uuid,collected_by_operation) DO NOTHING",
+        params![
+            uuid,
+            class,
+            class_number,
+            container_id,
+            absent as i64,
+            checkpoint_operation,
+            operation,
+            at,
+            proof.to_string()
+        ],
+    )?;
+    // OR IGNORE, never OR REPLACE: the first tombstone's proof is history and is not overwritten.
+    let first = db.execute(
+        "INSERT OR IGNORE INTO migration_universe_tombstones VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![
+            uuid,
+            class,
+            class_number,
+            container_id,
+            absent as i64,
+            checkpoint_operation,
+            operation,
+            at,
+            proof.to_string()
+        ],
+    )?;
+    debug_assert!(
+        occurrence > 0 || first == 0,
+        "a repeated operation must not rewrite a tombstone"
+    );
+    Ok(first > 0)
+}
+/// The tombstone a garbage collection left for a universe, if any. It is never removed: it is the history
+/// that keeps a collected identity from silently coming back (docs/GARBAGE-COLLECTION.md, "History retention").
+pub(crate) fn tombstone(db: &Connection, uuid: &str) -> Result<Option<Value>, Error> {
+    ensure_schema(db)?;
+    let tombstone = db
+        .query_row(
+            "SELECT class,class_number,container_id,container_absent_at_collection,checkpoint_operation_id,collected_by_operation,
+             collected_at,proof FROM migration_universe_tombstones WHERE universe_uuid=?1",
+            [uuid],
+            |r| {
+                Ok(
+                    json!({"universe_uuid": uuid, "class": r.get::<_, String>(0)?, "class_number": r.get::<_, i64>(1)?,
+                    "container_id": r.get::<_, String>(2)?, "container_absent_at_collection": r.get::<_, i64>(3)? != 0,
+                    "checkpoint_operation_id": r.get::<_, String>(4)?, "collected_by_operation": r.get::<_, String>(5)?,
+                    "collected_at": r.get::<_, i64>(6)?,
+                    "proof": serde_json::from_str::<Value>(&r.get::<_, String>(7)?).unwrap_or(Value::Null)}),
+                )
+            },
+        )
+        .optional()?;
+    let Some(mut tombstone) = tombstone else {
+        return Ok(None);
+    };
+    // The tombstone is the first collection; the occurrences are every collection of that identity. A
+    // history read failure is unknown, never an empty history, so propagate it to the caller.
+    tombstone["occurrences"] = json!(collection_history(db, uuid)?);
+    Ok(Some(tombstone))
+}
+/// A collected universe UUID is never created again blindly: only a verified handoff restore, or an explicit
+/// replacement procedure, may give that identity a meaning on this host after a collection.
+pub(crate) fn refuse_identity_reuse(
+    db: &Connection,
+    uuid: &str,
+    operation: &str,
+) -> Result<(), Error> {
+    ensure_schema(db)?;
+    if let Some(t) = tombstone(db, uuid)? {
+        return Err(failure(
+            format!(
+                "Universe {uuid} was collected on this host by garbage collection operation {} (class {}); {operation} with this universe UUID is refused, because reusing a collected identity requires a verified handoff restore or an explicit replacement procedure",
+                t["collected_by_operation"].as_str().unwrap_or(""),
+                t["class"].as_str().unwrap_or("")
+            ),
+            json!({"tombstone": {"universe_uuid": uuid, "class": t["class"], "class_number": t["class_number"],
+                "collected_by_operation": t["collected_by_operation"], "collected_at": t["collected_at"]}}),
+        ));
+    }
+    Ok(())
+}
+/// Whether any collection of this universe recorded this exact container as absent. Such a container can
+/// only have come back out of band, so its original creation never owns it again — and this holds for every
+/// container ever proved absent for that identity, not only for the one the tombstone kept.
+pub(crate) fn collected_absent(
+    db: &Connection,
+    uuid: &str,
+    container_id: &str,
+) -> Result<bool, Error> {
+    ensure_schema(db)?;
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM migration_universe_tombstones WHERE universe_uuid=?1 AND container_id=?2
+         AND container_absent_at_collection=1)
+         OR EXISTS(SELECT 1 FROM migration_collection_history WHERE universe_uuid=?1 AND container_id=?2
+         AND container_absent_at_collection=1)",
+        params![uuid, container_id],
+        |r| r.get::<_, bool>(0),
+    )?)
 }
 
 pub(crate) struct Reservation {
@@ -144,7 +302,38 @@ pub(crate) fn reservation(db: &Connection, uuid: &str) -> Result<Option<Reservat
         )
         .optional()?)
 }
-pub(crate) fn set_state(db: &Connection, uuid: &str, state: &str, detail: &Value) -> Result<(), Error> {
+/// Every reservation this host holds, oldest first. The garbage collector is the only host-wide reader:
+/// every other operation names the universe it acts on.
+pub(crate) fn reservations(db: &Connection) -> Result<Vec<(String, Reservation)>, Error> {
+    let mut stmt = db.prepare(
+        "SELECT universe_uuid,operation_id,container_id,image_id,source_host_uuid,destination_host_uuid,container_started_at,
+         state,created_at,updated_at,detail FROM migration_reservations ORDER BY created_at, universe_uuid",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            Reservation {
+                operation_id: r.get(1)?,
+                container_id: r.get(2)?,
+                image_id: r.get(3)?,
+                source_host: r.get(4)?,
+                destination: r.get(5)?,
+                started_at: r.get(6)?,
+                state: r.get(7)?,
+                created_at: r.get(8)?,
+                updated_at: r.get(9)?,
+                detail: r.get(10)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+pub(crate) fn set_state(
+    db: &Connection,
+    uuid: &str,
+    state: &str,
+    detail: &Value,
+) -> Result<(), Error> {
     db.execute(
         "UPDATE migration_reservations SET state=?2, updated_at=?3, detail=?4 WHERE universe_uuid=?1",
         params![uuid, state, crate::now() as i64, detail.to_string()],
@@ -152,7 +341,12 @@ pub(crate) fn set_state(db: &Connection, uuid: &str, state: &str, detail: &Value
     Ok(())
 }
 /// Changes the reservation state while keeping the recorded detail fields, such as the artifact hashes.
-pub(crate) fn merge_state(db: &Connection, uuid: &str, state: &str, patch: &Value) -> Result<(), Error> {
+pub(crate) fn merge_state(
+    db: &Connection,
+    uuid: &str,
+    state: &str,
+    patch: &Value,
+) -> Result<(), Error> {
     let r = reservation(db, uuid)?.ok_or("Reservation not found")?;
     let mut detail = r.detail_value();
     if let (Some(d), Some(p)) = (detail.as_object_mut(), patch.as_object()) {
@@ -163,12 +357,18 @@ pub(crate) fn merge_state(db: &Connection, uuid: &str, state: &str, patch: &Valu
     set_state(db, uuid, state, &detail)
 }
 /// Generic lifecycle operations must not bypass a migration reservation or an unresolved restore claim.
-pub(crate) fn refuse_if_reserved(db: &Connection, uuid: &str, operation: &str) -> Result<(), Error> {
+pub(crate) fn refuse_if_reserved(
+    db: &Connection,
+    uuid: &str,
+    operation: &str,
+) -> Result<(), Error> {
     ensure_schema(db)?;
     if let Some(r) = reservation(db, uuid)? {
         // A released reservation holds nothing: migration_release lifted the gate deliberately, and the
-        // row stays only so that migration_restore_local can still resume its preserved memory.
-        if r.state == RELEASED {
+        // row stays only so that migration_restore_local can still resume its preserved memory. A collected
+        // one is the same decision taken on proof by the garbage collector; its tombstone, not the
+        // reservation, is what still refuses a blind create of that universe UUID.
+        if r.state == RELEASED || r.state == COLLECTED {
             return Ok(());
         }
         return Err(failure(
@@ -194,7 +394,11 @@ pub(crate) fn refuse_if_reserved(db: &Connection, uuid: &str, operation: &str) -
 }
 /// Whether this host transferred the given container away through a completed migration, in the current or an
 /// archived reservation. Such a container never regains ownership through its original creation.
-pub(crate) fn transferred_away(db: &Connection, uuid: &str, container_id: &str) -> Result<bool, Error> {
+pub(crate) fn transferred_away(
+    db: &Connection,
+    uuid: &str,
+    container_id: &str,
+) -> Result<bool, Error> {
     ensure_schema(db)?;
     Ok(db.query_row(
         "SELECT EXISTS(SELECT 1 FROM migration_reservations WHERE universe_uuid=?1 AND container_id=?2 AND state='transferred')
@@ -206,7 +410,12 @@ pub(crate) fn transferred_away(db: &Connection, uuid: &str, container_id: &str) 
 /// Moves a reservation in one given state to history; the caller holds the transaction. Returns whether a row
 /// was archived. Used when a verified restore brings a `transferred` universe back to this host, when a
 /// verified local restore ends a `released` reservation, and when a new checkpoint supersedes a released one.
-pub(crate) fn archive_reservation(db: &Connection, uuid: &str, operation: &str, state: &str) -> Result<bool, Error> {
+pub(crate) fn archive_reservation(
+    db: &Connection,
+    uuid: &str,
+    operation: &str,
+    state: &str,
+) -> Result<bool, Error> {
     let moved = db.execute(
         "INSERT INTO migration_reservation_history(universe_uuid,operation_id,container_id,image_id,source_host_uuid,destination_host_uuid,
          container_started_at,state,created_at,updated_at,detail,archived_at,archived_by_operation)
@@ -220,7 +429,11 @@ pub(crate) fn archive_reservation(db: &Connection, uuid: &str, operation: &str, 
     )?;
     Ok(moved > 0)
 }
-pub(crate) fn archive_transferred(db: &Connection, uuid: &str, operation: &str) -> Result<bool, Error> {
+pub(crate) fn archive_transferred(
+    db: &Connection,
+    uuid: &str,
+    operation: &str,
+) -> Result<bool, Error> {
     archive_reservation(db, uuid, operation, "transferred")
 }
 fn history_view(db: &Connection, uuid: &str) -> Result<Vec<Value>, Error> {
@@ -239,16 +452,27 @@ fn history_view(db: &Connection, uuid: &str) -> Result<Vec<Value>, Error> {
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 pub(crate) fn host_uuid(db: &Connection) -> Result<String, Error> {
-    Ok(db.query_row("SELECT value FROM metadata WHERE key='host_uuid'", [], |r| r.get(0))?)
+    Ok(db.query_row(
+        "SELECT value FROM metadata WHERE key='host_uuid'",
+        [],
+        |r| r.get(0),
+    )?)
 }
 /// SHA-256 of a service-controlled path, computed by coreutils with fixed arguments.
 pub(crate) fn sha256(path: &Path) -> Result<String, Error> {
-    let out = Command::new("/usr/bin/sha256sum").arg("--").arg(path).output()?;
+    let out = Command::new("/usr/bin/sha256sum")
+        .arg("--")
+        .arg(path)
+        .output()?;
     if !out.status.success() {
         return Err(format!("sha256sum failed for {}", path.display()).into());
     }
     let text = String::from_utf8(out.stdout)?;
-    Ok(text.split_whitespace().next().ok_or("Empty sha256sum output")?.to_string())
+    Ok(text
+        .split_whitespace()
+        .next()
+        .ok_or("Empty sha256sum output")?
+        .to_string())
 }
 /// SHA-256 of bytes held in memory, computed by coreutils from standard input.
 pub(crate) fn sha256_bytes(bytes: &[u8]) -> Result<String, Error> {
@@ -257,13 +481,21 @@ pub(crate) fn sha256_bytes(bytes: &[u8]) -> Result<String, Error> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
-    child.stdin.take().ok_or("sha256sum input unavailable")?.write_all(bytes)?;
+    child
+        .stdin
+        .take()
+        .ok_or("sha256sum input unavailable")?
+        .write_all(bytes)?;
     let out = child.wait_with_output()?;
     if !out.status.success() {
         return Err("sha256sum failed".into());
     }
     let text = String::from_utf8(out.stdout)?;
-    Ok(text.split_whitespace().next().ok_or("Empty sha256sum output")?.to_string())
+    Ok(text
+        .split_whitespace()
+        .next()
+        .ok_or("Empty sha256sum output")?
+        .to_string())
 }
 /// Copies a file into a service-owned path through a temporary name, private and synced; callers re-hash the copy.
 pub(crate) fn copy_private(from: &Path, to: &Path) -> Result<u64, Error> {
@@ -281,20 +513,82 @@ pub(crate) fn copy_private(from: &Path, to: &Path) -> Result<u64, Error> {
     fs::rename(&temporary, to)?;
     Ok(bytes)
 }
-/// Bytes available to root under a path, as reported by coreutils df; 0 when unreadable.
-pub(crate) fn available_bytes(path: &Path) -> u64 {
-    Command::new("/usr/bin/df")
+/// Bytes available to root under a path, as reported by coreutils `df`. Execution, exit-status, encoding,
+/// shape and numeric failures remain errors: an unknown observation is never represented as measured zero.
+fn available_bytes_with(program: &Path, path: &Path) -> Result<u64, Error> {
+    let output = Command::new(program)
         .args(["-B1", "--output=avail"])
         .arg(path)
         .output()
-        .ok()
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .last()
-                .and_then(|l| l.trim().parse::<u64>().ok())
-        })
-        .unwrap_or(0)
+        .map_err(|e| {
+            format!(
+                "could not execute {} for {}: {e}",
+                program.display(),
+                path.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} failed for {} with status {}: {}",
+            program.display(),
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let stdout = String::from_utf8(output.stdout).map_err(|e| {
+        format!(
+            "{} returned non-UTF-8 output for {}: {e}",
+            program.display(),
+            path.display()
+        )
+    })?;
+    parse_available_bytes(program, path, &stdout)
+}
+fn parse_available_bytes(program: &Path, path: &Path, stdout: &str) -> Result<u64, Error> {
+    let mut rows = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let _header = rows.next().ok_or_else(|| {
+        Error::from(format!(
+            "{} returned no header for {}",
+            program.display(),
+            path.display()
+        ))
+    })?;
+    let value = rows.next().ok_or_else(|| {
+        Error::from(format!(
+            "{} returned no available-byte measurement for {}",
+            program.display(),
+            path.display()
+        ))
+    })?;
+    if rows.next().is_some() {
+        return Err(format!(
+            "{} returned more than one available-byte measurement for {}",
+            program.display(),
+            path.display()
+        )
+        .into());
+    }
+    value.parse::<u64>().map_err(|e| {
+        format!(
+            "{} returned an invalid available-byte measurement {:?} for {}: {e}",
+            program.display(),
+            value,
+            path.display()
+        )
+        .into()
+    })
+}
+pub(crate) fn available_bytes(path: &Path) -> Result<u64, Error> {
+    available_bytes_with(Path::new("/usr/bin/df"), path)
+}
+#[cfg(test)]
+pub(crate) fn available_bytes_for_test(program: &Path, path: &Path) -> Result<u64, Error> {
+    available_bytes_with(program, path)
 }
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     let temporary = path.with_extension("partial-write");
@@ -316,16 +610,25 @@ pub(crate) const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) fn read_bounded(path: &Path) -> Result<Vec<u8>, Error> {
     use std::io::Read;
     let mut bytes = Vec::new();
-    fs::File::open(path)?.take(MAX_LOG_BYTES).read_to_end(&mut bytes)?;
+    fs::File::open(path)?
+        .take(MAX_LOG_BYTES)
+        .read_to_end(&mut bytes)?;
     if fs::metadata(path)?.len() > MAX_LOG_BYTES {
-        bytes.extend_from_slice(format!("\n[truncated by PodMesh after {MAX_LOG_BYTES} bytes]\n").as_bytes());
+        bytes.extend_from_slice(
+            format!("\n[truncated by PodMesh after {MAX_LOG_BYTES} bytes]\n").as_bytes(),
+        );
     }
     Ok(bytes)
 }
 pub(crate) fn tail(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     let start = text.len().saturating_sub(2000);
-    text[text.char_indices().map(|(i, _)| i).find(|i| *i >= start).unwrap_or(0)..].to_string()
+    text[text
+        .char_indices()
+        .map(|(i, _)| i)
+        .find(|i| *i >= start)
+        .unwrap_or(0)..]
+        .to_string()
 }
 fn command_text(program: &str, args: &[&str]) -> (bool, String) {
     match Command::new(program)
@@ -336,9 +639,13 @@ fn command_text(program: &str, args: &[&str]) -> (bool, String) {
     {
         Ok(o) => (
             o.status.success(),
-            format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))
-                .trim()
-                .to_string(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )
+            .trim()
+            .to_string(),
         ),
         Err(e) => (false, e.to_string()),
     }
@@ -359,7 +666,9 @@ pub(crate) fn runtime_facts(blockers: &mut Vec<String>) -> Value {
         match sha256(Path::new(path)) {
             Ok(h) => {
                 if h != expected {
-                    blockers.push(format!("{path} sha256 {h} differs from the qualified {expected}"));
+                    blockers.push(format!(
+                        "{path} sha256 {h} differs from the qualified {expected}"
+                    ));
                 }
                 hashes[path] = json!(h);
             }
@@ -422,7 +731,8 @@ fn process_facts(c: &Value, blockers: &mut Vec<String>, allow_frozen: bool) -> (
             m
         }
         None => {
-            blockers.push("container memory.current is unreadable; the dump cannot be bounded".into());
+            blockers
+                .push("container memory.current is unreadable; the dump cannot be bounded".into());
             0
         }
     };
@@ -434,7 +744,10 @@ fn process_facts(c: &Value, blockers: &mut Vec<String>, allow_frozen: bool) -> (
         blockers.push("no container process observed".into());
     }
     if pids.len() > MAX_PROCESSES {
-        blockers.push(format!("{} processes exceed the qualified maximum of {MAX_PROCESSES}", pids.len()));
+        blockers.push(format!(
+            "{} processes exceed the qualified maximum of {MAX_PROCESSES}",
+            pids.len()
+        ));
     }
     let mut processes = vec![];
     for pid in pids.iter().take(MAX_PROCESSES) {
@@ -443,8 +756,10 @@ fn process_facts(c: &Value, blockers: &mut Vec<String>, allow_frozen: bool) -> (
         let glibc = maps.contains("/libc.so.6");
         let rseq_disabled = fs::read(format!("/proc/{pid}/environ"))
             .map(|e| {
-                e.split(|b| *b == 0)
-                    .any(|v| v.starts_with(b"GLIBC_TUNABLES=") && String::from_utf8_lossy(v).contains("glibc.pthread.rseq=0"))
+                e.split(|b| *b == 0).any(|v| {
+                    v.starts_with(b"GLIBC_TUNABLES=")
+                        && String::from_utf8_lossy(v).contains("glibc.pthread.rseq=0")
+                })
             })
             .unwrap_or(false);
         let libc = match (musl, glibc) {
@@ -459,15 +774,24 @@ fn process_facts(c: &Value, blockers: &mut Vec<String>, allow_frozen: bool) -> (
                 "process {pid} uses {libc} libc; the qualified runtime cannot safely checkpoint rseq-registered or unidentified processes"
             ));
         }
-        processes.push(json!({"pid": pid, "libc": libc, "glibc_rseq_disabled_by_tunable": rseq_disabled}));
+        processes.push(
+            json!({"pid": pid, "libc": libc, "glibc_rseq_disabled_by_tunable": rseq_disabled}),
+        );
     }
     (
         json!({"cgroup": cgroup, "frozen": frozen, "memory_current_bytes": memory, "processes": processes}),
         memory,
     )
 }
-fn space_facts(container_id: &str, memory: u64, blockers: &mut Vec<String>) -> Result<Value, Error> {
-    let sized: Value = serde_json::from_str(&lc::podman(lc::QUICK, &["container", "inspect", "--size", container_id])?)?;
+fn space_facts(
+    container_id: &str,
+    memory: u64,
+    blockers: &mut Vec<String>,
+) -> Result<Value, Error> {
+    let sized: Value = serde_json::from_str(&lc::podman(
+        lc::QUICK,
+        &["container", "inspect", "--size", container_id],
+    )?)?;
     let size_rw = sized[0]["SizeRw"].as_u64().unwrap_or(0);
     // The kept image files land in Podman's graph root. The qualified scope is the default rootful store,
     // so another graph root is refused rather than measured on a filesystem the dump does not use.
@@ -481,29 +805,56 @@ fn space_facts(container_id: &str, memory: u64, blockers: &mut Vec<String>) -> R
     }
     // Uncompressed upper bound: memory twice (image files and export), writable layer, margin. The kept
     // image files land in the graph root and the export in the state directory; both are checked.
-    let required = memory.saturating_mul(2).saturating_add(size_rw).saturating_add(SPACE_MARGIN_BYTES);
-    let mut available_bytes = json!({});
+    let required = memory
+        .saturating_mul(2)
+        .saturating_add(size_rw)
+        .saturating_add(SPACE_MARGIN_BYTES);
+    let mut available_by_path = json!({});
+    let mut observations = json!({});
     for path in [base()?.as_path(), Path::new(&graph_root)] {
-        let out = Command::new("/usr/bin/df").args(["-B1", "--output=avail"]).arg(path).output()?;
-        let available = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .last()
-            .and_then(|l| l.trim().parse::<u64>().ok())
-            .unwrap_or(0);
-        if available < required {
-            blockers.push(format!("{available} bytes available under {}, {required} required", path.display()));
+        let key = path.display().to_string();
+        match available_bytes(path) {
+            Ok(available) => {
+                if available < required {
+                    blockers.push(format!(
+                        "{available} bytes available under {}, {required} required",
+                        path.display()
+                    ));
+                }
+                available_by_path[key.clone()] = json!(available);
+                observations[key] = json!({"known": true, "available_bytes": available});
+            }
+            Err(error) => {
+                blockers.push(format!(
+                    "available bytes under {} could not be observed: {error}",
+                    path.display()
+                ));
+                available_by_path[key.clone()] = Value::Null;
+                observations[key] = json!({"known": false, "available_bytes": Value::Null, "error": error.to_string()});
+            }
         }
-        available_bytes[path.display().to_string()] = json!(available);
     }
-    Ok(json!({"available_bytes": available_bytes, "required_bytes": required, "writable_layer_bytes": size_rw}))
+    Ok(
+        json!({"available_bytes": available_by_path, "space_observations": observations,
+        "required_bytes": required, "writable_layer_bytes": size_rw}),
+    )
 }
-fn assess(db: &Connection, uuid: &str, b: &Binding, existing: Option<Value>, allow_frozen: bool) -> Result<Assessment, Error> {
+fn assess(
+    db: &Connection,
+    uuid: &str,
+    b: &Binding,
+    existing: Option<Value>,
+    allow_frozen: bool,
+) -> Result<Assessment, Error> {
     let c = existing.ok_or("Universe container not found")?;
     lc::owned(db, &c, uuid, "Migration source")?;
     let host = host_uuid(db)?;
     let mut blockers = vec![];
     if b.source_host != host {
-        blockers.push(format!("source_host_uuid {} is not this host", b.source_host));
+        blockers.push(format!(
+            "source_host_uuid {} is not this host",
+            b.source_host
+        ));
     }
     if b.destination == host {
         blockers.push("destination_host_uuid is this host".into());
@@ -512,7 +863,12 @@ fn assess(db: &Connection, uuid: &str, b: &Binding, existing: Option<Value>, all
         blockers.push("container_id does not match the universe container".into());
     }
     let image = b.image.trim_start_matches("sha256:");
-    if c["Image"].as_str().unwrap_or("").trim_start_matches("sha256:") != image {
+    if c["Image"]
+        .as_str()
+        .unwrap_or("")
+        .trim_start_matches("sha256:")
+        != image
+    {
         blockers.push("image does not match the universe container image".into());
     }
     if !lc::images()?.iter().any(|i| lc::image_id(i) == image) {
@@ -527,7 +883,11 @@ fn assess(db: &Connection, uuid: &str, b: &Binding, existing: Option<Value>, all
     if c["HostConfig"]["NetworkMode"].as_str() != Some("none") {
         blockers.push("network mode is not none".into());
     }
-    if c["Mounts"].as_array().map(|m| !m.is_empty()).unwrap_or(true) {
+    if c["Mounts"]
+        .as_array()
+        .map(|m| !m.is_empty())
+        .unwrap_or(true)
+    {
         blockers.push("container has volumes or bind mounts".into());
     }
     if c["HostConfig"]["Privileged"].as_bool() != Some(false) {
@@ -554,7 +914,12 @@ fn assess(db: &Connection, uuid: &str, b: &Binding, existing: Option<Value>, all
     })
 }
 
-pub(crate) fn preflight(db: &Connection, uuid: &str, b: &Binding, existing: Option<Value>) -> Result<Value, Error> {
+pub(crate) fn preflight(
+    db: &Connection,
+    uuid: &str,
+    b: &Binding,
+    existing: Option<Value>,
+) -> Result<Value, Error> {
     let mut a = assess(db, uuid, b, existing, false)?;
     let reserved = reservation(db, uuid)?;
     if let Some(ref r) = reserved {
@@ -582,7 +947,10 @@ pub(crate) fn unit_busy(unit: &str) -> bool {
         .args(["show", "--property=ActiveState", "--value", unit])
         .output()
     {
-        Ok(o) if o.status.success() => !matches!(String::from_utf8_lossy(&o.stdout).trim(), "inactive" | "failed"),
+        Ok(o) if o.status.success() => !matches!(
+            String::from_utf8_lossy(&o.stdout).trim(),
+            "inactive" | "failed"
+        ),
         _ => true,
     }
 }
@@ -610,16 +978,42 @@ pub(crate) fn scoped_podman(
     stderr: fs::File,
     bound: Option<&Bound>,
 ) -> Result<(ExitStatus, Value), Error> {
+    if let Some(bound) = bound {
+        if bound.unit != unit || bound.operation_id != id {
+            return Err(
+                "restore watchdog binding does not match the scoped Podman operation".into(),
+            );
+        }
+    }
     let unit_argument = format!("--unit={unit}");
     let limit = seconds.to_string();
     let temporary = base()?.join(".tmp").join(id);
     fs::create_dir_all(&temporary)?;
     fs::set_permissions(base()?.join(".tmp"), fs::Permissions::from_mode(0o700))?;
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700))?;
-    let mut child = Command::new("/usr/bin/systemd-run")
+    // Establish the initial graph-space observation before the external command is allowed to start.
+    let mut watch = match bound {
+        Some(bound) => Some(Watch::start(bound)?),
+        None => None,
+    };
+    let mut command = Command::new("/usr/bin/systemd-run");
+    command
         .env("PATH", RUNTIME_PATH)
         .env("TMPDIR", &temporary)
-        .env_remove("INVOCATION_ID")
+        .env_remove("INVOCATION_ID");
+    if let Some(bound) = bound {
+        command
+            .env("PODMESH_RESTORE_OPERATION_ID", &bound.operation_id)
+            .env(
+                "PODMESH_RESTORE_ATTEMPT_ID",
+                bound.operation_attempt_id.to_string(),
+            )
+            .env("PODMESH_RESTORE_AUTHORITY_ID", &bound.authority_id)
+            .env("PODMESH_RESTORE_UNIVERSE_UUID", &bound.universe_uuid)
+            .env("PODMESH_RESTORE_CONTAINER_NAME", &bound.expected_name)
+            .env("PODMESH_RESTORE_IMAGE_ID", &bound.expected_image_id);
+    }
+    let mut child = command
         .args([
             "--scope",
             "--quiet",
@@ -641,7 +1035,6 @@ pub(crate) fn scoped_podman(
         .stderr(stderr)
         .spawn()?;
     let begin = Instant::now();
-    let mut watch = bound.map(Watch::start);
     loop {
         if let Some(status) = child.try_wait()? {
             let measurement = match (&watch, bound) {
@@ -660,7 +1053,13 @@ pub(crate) fn scoped_podman(
 /// CRIU mid-dump, which was observed to destroy the application without producing an archive. The command
 /// names the reserved container ID, never the universe name: a container replaced under that name after
 /// the checks cannot be captured.
-fn checkpoint_command(id: &str, container_id: &str, archive: &Path, stdout: fs::File, stderr: fs::File) -> Result<ExitStatus, Error> {
+fn checkpoint_command(
+    id: &str,
+    container_id: &str,
+    archive: &Path,
+    stdout: fs::File,
+    stderr: fs::File,
+) -> Result<ExitStatus, Error> {
     let export = format!("--export={}", archive.display());
     // No space bound here: a dump writes what the preflight measured and was never observed running
     // away, unlike a restore of a damaged archive. Adding one would need its own measurement.
@@ -695,11 +1094,14 @@ pub(crate) fn checkpoint(
     existing: Option<Value>,
 ) -> Result<Value, Error> {
     let dir = base()?.join(id);
-    // A released reservation holds nothing and must not block a new checkpoint of the same universe:
-    // it is archived, with its history and its preserved artifacts, and this operation reserves afresh.
+    // A released or collected reservation holds nothing and must not block a new checkpoint of the same
+    // universe: it is archived, with its history and its preserved artifacts, and this operation reserves
+    // afresh. The tombstone of a collected universe is untouched by that — the identity stays protected
+    // against a blind create, while the universe itself may be checkpointed and migrated again.
     if let Some(r) = reservation(db, uuid)? {
-        if r.state == RELEASED && r.operation_id != id {
-            archive_reservation(db, uuid, id, RELEASED)?;
+        if (r.state == RELEASED || r.state == COLLECTED) && r.operation_id != id {
+            let state = r.state.clone();
+            archive_reservation(db, uuid, id, &state)?;
         }
     }
     match reservation(db, uuid)? {
@@ -734,7 +1136,10 @@ pub(crate) fn checkpoint(
             }
             fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
             let now = crate::now() as i64;
-            let started_at = a.container["State"]["StartedAt"].as_str().unwrap_or("").to_string();
+            let started_at = a.container["State"]["StartedAt"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
             // The reservation is durable before anything can suspend the source.
             db.execute(
                 "INSERT INTO migration_reservations VALUES(?1,?2,?3,?4,?5,?6,?7,'reserved',?8,?8,NULL)",
@@ -749,7 +1154,10 @@ pub(crate) fn checkpoint(
                     now
                 ],
             )?;
-            write_private(&dir.join("preflight.json"), serde_json::to_string_pretty(&a.facts)?.as_bytes())?;
+            write_private(
+                &dir.join("preflight.json"),
+                serde_json::to_string_pretty(&a.facts)?.as_bytes(),
+            )?;
             let r = reservation(db, uuid)?.ok_or("Reservation not persisted")?;
             capture(db, attempt, id, uuid, name, &dir, &r)
         }
@@ -787,7 +1195,10 @@ fn resume(
             .as_str()
             .and_then(lc::epoch)
             .is_some_and(|t| t >= r.created_at);
-    if c["Id"].as_str() == Some(r.container_id.as_str()) && checkpointed_after_reservation && !lc::process_active(&c) {
+    if c["Id"].as_str() == Some(r.container_id.as_str())
+        && checkpointed_after_reservation
+        && !lc::process_active(&c)
+    {
         // A previous attempt completed the checkpoint but was interrupted before recording it.
         return finalize(db, id, uuid, name, dir, &r, true);
     }
@@ -801,7 +1212,10 @@ fn resume(
         if !a.blockers.is_empty() {
             let detail = json!({"blockers": a.blockers, "facts": a.facts});
             set_state(db, uuid, "checkpoint_failed", &detail)?;
-            return Err(failure("Checkpoint preconditions are no longer met; nothing was suspended", detail));
+            return Err(failure(
+                "Checkpoint preconditions are no longer met; nothing was suspended",
+                detail,
+            ));
         }
         return capture(db, attempt, id, uuid, name, dir, &r);
     }
@@ -813,17 +1227,40 @@ fn resume(
     ))
 }
 
-fn capture(db: &Connection, attempt: i64, id: &str, uuid: &str, name: &str, dir: &Path, r: &Reservation) -> Result<Value, Error> {
+fn capture(
+    db: &Connection,
+    attempt: i64,
+    id: &str,
+    uuid: &str,
+    name: &str,
+    dir: &Path,
+    r: &Reservation,
+) -> Result<Value, Error> {
     set_state(db, uuid, "checkpointing", &json!({"attempt": attempt}))?;
     let archive = dir.join(ARCHIVE);
     if archive.exists() {
         // Preserve a partial archive of an earlier attempt as diagnostics; never overwrite it.
-        fs::rename(&archive, dir.join(format!("{ARCHIVE}.partial-before-attempt-{attempt}")))?;
+        fs::rename(
+            &archive,
+            dir.join(format!("{ARCHIVE}.partial-before-attempt-{attempt}")),
+        )?;
     }
-    let open = |path: &Path| fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path);
+    let open = |path: &Path| {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    };
     let stdout_path = dir.join(format!("checkpoint-attempt-{attempt}.stdout"));
     let stderr_path = dir.join(format!("checkpoint-attempt-{attempt}.stderr"));
-    let exit = checkpoint_command(id, &r.container_id, &archive, open(&stdout_path)?, open(&stderr_path)?)?;
+    let exit = checkpoint_command(
+        id,
+        &r.container_id,
+        &archive,
+        open(&stdout_path)?,
+        open(&stderr_path)?,
+    )?;
     if !exit.success() {
         let stderr = read_bounded(&stderr_path).unwrap_or_default();
         let observed = lc::inspect(name)?;
@@ -850,10 +1287,14 @@ fn capture(db: &Connection, attempt: i64, id: &str, uuid: &str, name: &str, dir:
 pub(crate) fn copy_podman_log(c: &Value, state_key: &str, file: &str, target: &Path) -> bool {
     let expected = c["StaticDir"].as_str().map(|d| format!("{d}/{file}"));
     match (c["State"][state_key].as_str(), expected) {
-        (Some(log), Some(expected)) if log == expected && log.starts_with("/var/lib/containers/storage/") => read_bounded(Path::new(log))
-            .ok()
-            .and_then(|bytes| write_private(target, &bytes).ok())
-            .is_some(),
+        (Some(log), Some(expected))
+            if log == expected && log.starts_with("/var/lib/containers/storage/") =>
+        {
+            read_bounded(Path::new(log))
+                .ok()
+                .and_then(|bytes| write_private(target, &bytes).ok())
+                .is_some()
+        }
         _ => false,
     }
 }
@@ -861,7 +1302,15 @@ fn copy_dump_log(c: &Value, target: &Path) -> bool {
     copy_podman_log(c, "CheckpointLog", "dump.log", target)
 }
 
-fn finalize(db: &Connection, id: &str, uuid: &str, name: &str, dir: &Path, r: &Reservation, resumed: bool) -> Result<Value, Error> {
+fn finalize(
+    db: &Connection,
+    id: &str,
+    uuid: &str,
+    name: &str,
+    dir: &Path,
+    r: &Reservation,
+    resumed: bool,
+) -> Result<Value, Error> {
     let fail = |db: &Connection, reason: String, observed: Value| -> Result<Value, Error> {
         let detail = json!({"reason": reason, "observed": observed});
         set_state(db, uuid, "checkpoint_failed", &detail)?;
@@ -873,7 +1322,10 @@ fn finalize(db: &Connection, id: &str, uuid: &str, name: &str, dir: &Path, r: &R
     let Some(c) = lc::inspect(name)? else {
         return fail(db, "source container disappeared".into(), Value::Null);
     };
-    if c["Id"].as_str() != Some(r.container_id.as_str()) || c["State"]["Checkpointed"] != true || lc::process_active(&c) {
+    if c["Id"].as_str() != Some(r.container_id.as_str())
+        || c["State"]["Checkpointed"] != true
+        || lc::process_active(&c)
+    {
         return fail(
             db,
             "source is not the reserved container in a checkpointed, stopped state".into(),
@@ -887,7 +1339,10 @@ fn finalize(db: &Connection, id: &str, uuid: &str, name: &str, dir: &Path, r: &R
     }
     // Podman creates the archive; its mode is set here rather than inherited from a unit's umask.
     fs::set_permissions(&archive, fs::Permissions::from_mode(0o600))?;
-    let listing = Command::new("/usr/bin/tar").arg("-tf").arg(&archive).output()?;
+    let listing = Command::new("/usr/bin/tar")
+        .arg("-tf")
+        .arg(&archive)
+        .output()?;
     let entries = String::from_utf8_lossy(&listing.stdout);
     if !listing.status.success()
         || !["config.dump", "spec.dump", "checkpoint/inventory.img"]
@@ -902,10 +1357,16 @@ fn finalize(db: &Connection, id: &str, uuid: &str, name: &str, dir: &Path, r: &R
     }
     let log = dir.join("dump.log");
     if !copy_dump_log(&c, &log) {
-        return fail(db, "CRIU dump log is unavailable".into(), lc::state_view(&c));
+        return fail(
+            db,
+            "CRIU dump log is unavailable".into(),
+            lc::state_view(&c),
+        );
     }
     let log_text = fs::read_to_string(&log).unwrap_or_default();
-    if !log_text.contains(&format!("(gitid {RUNTIME_GIT_ID})")) || !log_text.contains("Dumping finished successfully") {
+    if !log_text.contains(&format!("(gitid {RUNTIME_GIT_ID})"))
+        || !log_text.contains("Dumping finished successfully")
+    {
         return fail(
             db,
             "dump log does not show a successful dump by the qualified private runtime".into(),
@@ -926,7 +1387,10 @@ fn finalize(db: &Connection, id: &str, uuid: &str, name: &str, dir: &Path, r: &R
         "runtime": runtime, "runtime_blockers_at_finalization": blockers,
         "scope": SCOPE, "authority": AUTHORITY,
     });
-    write_private(&dir.join(MANIFEST), serde_json::to_string_pretty(&manifest)?.as_bytes())?;
+    write_private(
+        &dir.join(MANIFEST),
+        serde_json::to_string_pretty(&manifest)?.as_bytes(),
+    )?;
     let manifest_sha256 = sha256(&dir.join(MANIFEST))?;
     set_state(
         db,
@@ -953,12 +1417,24 @@ fn finalize(db: &Connection, id: &str, uuid: &str, name: &str, dir: &Path, r: &R
 }
 
 /// Fresh verification of preserved artifacts, for historical replays and status.
-pub(crate) fn verify_artifacts(id: &str, archive_sha256: Option<&str>, manifest_sha256: Option<&str>) -> Result<Value, Error> {
+pub(crate) fn verify_artifacts(
+    id: &str,
+    archive_sha256: Option<&str>,
+    manifest_sha256: Option<&str>,
+) -> Result<Value, Error> {
     let dir = base()?.join(id);
     let archive = dir.join(ARCHIVE);
     let manifest = dir.join(MANIFEST);
-    let archive_now = if archive.is_file() { Some(sha256(&archive)?) } else { None };
-    let manifest_now = if manifest.is_file() { Some(sha256(&manifest)?) } else { None };
+    let archive_now = if archive.is_file() {
+        Some(sha256(&archive)?)
+    } else {
+        None
+    };
+    let manifest_now = if manifest.is_file() {
+        Some(sha256(&manifest)?)
+    } else {
+        None
+    };
     Ok(json!({
         "observed_at": crate::now(),
         "archive_present": archive_now.is_some(),
@@ -969,7 +1445,7 @@ pub(crate) fn verify_artifacts(id: &str, archive_sha256: Option<&str>, manifest_
 }
 
 /// Reservation states that are a finished record rather than a decision still owed to someone.
-const SETTLED: [&str; 3] = [RELEASED, ABANDONED, "transferred"];
+const SETTLED: [&str; 4] = [RELEASED, ABANDONED, COLLECTED, "transferred"];
 /// What an outside observer needs in order to report on this universe without running anything: what is
 /// unresolved and since when, what a failed restore left behind, and the room left where it would write.
 ///
@@ -977,7 +1453,11 @@ const SETTLED: [&str; 3] = [RELEASED, ABANDONED, "transferred"];
 /// the reason: an absent or unreadable observation must never read as a healthy one. In particular, once a
 /// container's cgroups are gone, the surviving-process question can only be answered by a command-line
 /// scan, which is a hint and not proof, and it is labelled as such.
-fn watch_view(r: Option<&Reservation>, claims: &[Value], authorizations: &[Value]) -> Result<Value, Error> {
+fn watch_view(
+    r: Option<&Reservation>,
+    claims: &[Value],
+    authorizations: &[Value],
+) -> Result<Value, Error> {
     let now = crate::now();
     let unresolved: Vec<Value> = claims
         .iter()
@@ -1012,16 +1492,25 @@ fn watch_view(r: Option<&Reservation>, claims: &[Value], authorizations: &[Value
         .map(|g| g.trim().to_string())
         .ok();
     let graph = match graph_root {
-        Some(ref path) => json!({"observed_at": now, "known": true, "path": path,
-            "available_bytes": available_bytes(Path::new(path)),
-            "is_the_qualified_default_store": path == CONTAINER_STORAGE,
-            "required_bytes_for_unresolved_attempts": unresolved.iter().map(|k| k["allowance_bytes"].clone()).collect::<Vec<_>>()}),
-        None => json!({"observed_at": now, "known": false, "reason": "Podman did not report its graph root"}),
+        Some(ref path) => match available_bytes(Path::new(path)) {
+            Ok(available) => json!({"observed_at": now, "known": true, "path": path,
+                "available_bytes": available,
+                "is_the_qualified_default_store": path == CONTAINER_STORAGE,
+                "required_bytes_for_unresolved_attempts": unresolved.iter().map(|k| k["allowance_bytes"].clone()).collect::<Vec<_>>()}),
+            Err(error) => json!({"observed_at": now, "known": false, "path": path,
+                "available_bytes": Value::Null, "reason": error.to_string(),
+                "is_the_qualified_default_store": path == CONTAINER_STORAGE,
+                "required_bytes_for_unresolved_attempts": unresolved.iter().map(|k| k["allowance_bytes"].clone()).collect::<Vec<_>>()}),
+        },
+        None => {
+            json!({"observed_at": now, "known": false, "reason": "Podman did not report its graph root"})
+        }
     };
     Ok(json!({
         "observed_at": now,
         "reservation": r.map(|r| json!({"state": r.state, "since": r.updated_at, "created_at": r.created_at,
-            "blocks_generic_operations": r.state != RELEASED, "awaiting_decision": !SETTLED.contains(&r.state.as_str())})),
+            "blocks_generic_operations": r.state != RELEASED && r.state != COLLECTED,
+            "awaiting_decision": !SETTLED.contains(&r.state.as_str())})),
         "unresolved_restore_claims": unresolved,
         "open_transfer_authorizations": open,
         "graph_root": graph,
@@ -1042,11 +1531,13 @@ pub(crate) fn status(db: &Connection, request: &Value) -> Result<Value, Error> {
     let authorizations = crate::transfer::authorizations_view(db, uuid)?;
     let claims = crate::restore::claims_view(db, uuid)?;
     let history = history_view(db, uuid)?;
+    let collected = tombstone(db, uuid)?;
     let Some(r) = r else {
         let watch = watch_view(None, &claims, &authorizations)?;
         return Ok(
             json!({"universe_uuid": uuid, "reservation": null, "current": current, "transfer_authorizations": authorizations,
-            "restore_claims": claims, "reservation_history": history, "watch": watch}),
+            "restore_claims": claims, "reservation_history": history, "tombstone": collected,
+            "collection_history": collection_history(db, uuid)?, "watch": watch}),
         );
     };
     let issued = authorizations
@@ -1074,7 +1565,8 @@ pub(crate) fn status(db: &Connection, request: &Value) -> Result<Value, Error> {
         "source_checkpointed": container.as_ref().is_some_and(|c| c["State"]["Checkpointed"] == true),
         "transfer_authorizations_issued_for_reservation": issued,
     });
-    let recovery = crate::recovery::availability(db, uuid, &r, container.as_ref(), issued, &artifacts)?;
+    let recovery =
+        crate::recovery::availability(db, uuid, &r, container.as_ref(), issued, &artifacts)?;
     let watch = watch_view(Some(&r), &claims, &authorizations)?;
     Ok(json!({
         "universe_uuid": uuid,
@@ -1084,6 +1576,8 @@ pub(crate) fn status(db: &Connection, request: &Value) -> Result<Value, Error> {
         "transfer_authorizations": authorizations,
         "restore_claims": claims,
         "reservation_history": history,
+        "tombstone": collected,
+        "collection_history": collection_history(db, uuid)?,
         "recovery": recovery,
         "watch": watch,
         "release": {
@@ -1094,4 +1588,160 @@ pub(crate) fn status(db: &Connection, request: &Value) -> Result<Value, Error> {
             "preconditions_observed": observed,
         },
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const UUID: &str = "d1111111-1111-4111-8111-111111111111";
+
+    fn insert_reservation(db: &Connection, operation: &str, container: &str, state: &str) {
+        db.execute(
+            "INSERT INTO migration_reservations VALUES(?1,?2,?3,'image','source','destination','started',?4,10,10,'{}')",
+            params![UUID, operation, container, state],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn legacy_tombstone_backfills_one_immutable_occurrence() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE migration_universe_tombstones(universe_uuid TEXT PRIMARY KEY, class TEXT NOT NULL,
+             class_number INTEGER NOT NULL, container_id TEXT NOT NULL, container_absent_at_collection INTEGER NOT NULL,
+             checkpoint_operation_id TEXT NOT NULL, collected_by_operation TEXT NOT NULL, collected_at INTEGER NOT NULL,
+             proof TEXT NOT NULL);",
+        )
+        .unwrap();
+        let original = json!({"proof": "first and retained"});
+        db.execute(
+            "INSERT INTO migration_universe_tombstones VALUES(?1,'class-1',1,'old-container',1,'checkpoint-1','collection-1',11,?2)",
+            params![UUID, original.to_string()],
+        )
+        .unwrap();
+
+        ensure_schema(&db).unwrap();
+        let history = collection_history(&db, UUID).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["collected_by_operation"], "collection-1");
+        assert_eq!(history[0]["proof"], original);
+
+        assert!(!record_collection(
+            &db,
+            UUID,
+            "class-1",
+            1,
+            "old-container",
+            true,
+            "checkpoint-1",
+            "collection-1",
+            11,
+            &json!({"forged": true})
+        )
+        .unwrap());
+        assert_eq!(collection_history(&db, UUID).unwrap().len(), 1);
+        assert_eq!(tombstone(&db, UUID).unwrap().unwrap()["proof"], original);
+    }
+
+    #[test]
+    fn every_absent_identity_survives_successive_collections() {
+        let db = Connection::open_in_memory().unwrap();
+        ensure_schema(&db).unwrap();
+        let first_proof = json!({"cycle": 1, "container": "old-container"});
+        assert!(record_collection(
+            &db,
+            UUID,
+            "class-2",
+            2,
+            "old-container",
+            true,
+            "checkpoint-1",
+            "collection-1",
+            11,
+            &first_proof
+        )
+        .unwrap());
+
+        // A collected reservation does not block an ordinary start; a subsequent checkpoint archives that
+        // settled reservation before it records the next cycle. This is a journal-only invariant test.
+        insert_reservation(&db, "checkpoint-1", "old-container", COLLECTED);
+        assert!(refuse_if_reserved(&db, UUID, "start").is_ok());
+        assert!(refuse_identity_reuse(&db, UUID, "create").is_err());
+        assert!(archive_reservation(&db, UUID, "checkpoint-2", COLLECTED).unwrap());
+        assert!(reservation(&db, UUID).unwrap().is_none());
+        insert_reservation(&db, "checkpoint-2", "new-container", "checkpointed");
+
+        let second_proof = json!({"cycle": 2, "container": "new-container"});
+        assert!(!record_collection(
+            &db,
+            UUID,
+            "class-2",
+            2,
+            "new-container",
+            true,
+            "checkpoint-2",
+            "collection-2",
+            22,
+            &second_proof
+        )
+        .unwrap());
+        assert!(!record_collection(
+            &db,
+            UUID,
+            "class-2",
+            2,
+            "new-container",
+            true,
+            "checkpoint-2",
+            "collection-2",
+            22,
+            &json!({"replay": true})
+        )
+        .unwrap());
+
+        let history = collection_history(&db, UUID).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["collected_by_operation"], "collection-1");
+        assert_eq!(history[1]["collected_by_operation"], "collection-2");
+        assert_eq!(history[0]["proof"], first_proof);
+        assert_eq!(history[1]["proof"], second_proof);
+        assert!(collected_absent(&db, UUID, "old-container").unwrap());
+        assert!(collected_absent(&db, UUID, "new-container").unwrap());
+
+        let tombstone = tombstone(&db, UUID).unwrap().unwrap();
+        assert_eq!(tombstone["collected_by_operation"], "collection-1");
+        assert_eq!(tombstone["proof"], first_proof);
+        assert_eq!(tombstone["occurrences"], json!(history));
+    }
+
+    #[test]
+    fn disk_observation_failures_are_not_measured_zero() {
+        let path = Path::new("/");
+        let missing = available_bytes_with(Path::new("/definitely-not-a-podmesh-program"), path)
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("could not execute"));
+
+        let failed = available_bytes_with(Path::new("/bin/false"), path)
+            .unwrap_err()
+            .to_string();
+        assert!(failed.contains("failed") && failed.contains("status"));
+
+        // `echo` accepts the injected df arguments but does not emit the required header plus one numeric
+        // row. This exercises malformed successful command output through the real producer path.
+        let malformed = available_bytes_with(Path::new("/bin/echo"), path)
+            .unwrap_err()
+            .to_string();
+        assert!(malformed.contains("no available-byte measurement"));
+    }
+
+    #[test]
+    fn measured_zero_is_distinct_from_an_unknown_measurement() {
+        assert_eq!(
+            parse_available_bytes(Path::new("injected-df"), Path::new("/"), "Avail\n0\n").unwrap(),
+            0
+        );
+        assert!(available_bytes_with(Path::new("/bin/false"), Path::new("/")).is_err());
+    }
 }

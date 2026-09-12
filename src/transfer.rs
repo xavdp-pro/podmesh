@@ -36,16 +36,23 @@ pub(crate) fn prepare(state: &Path) -> Result<(), Error> {
     Ok(())
 }
 pub(crate) fn inbox(authorization: &str) -> Result<PathBuf, Error> {
-    Ok(INBOX.get().ok_or("Inbox directory not prepared")?.join(authorization))
+    Ok(INBOX
+        .get()
+        .ok_or("Inbox directory not prepared")?
+        .join(authorization))
 }
 pub(crate) fn outbox_base() -> Result<&'static PathBuf, Error> {
-    OUTBOX.get().ok_or_else(|| Error::from("Outbox directory not prepared"))
+    OUTBOX
+        .get()
+        .ok_or_else(|| Error::from("Outbox directory not prepared"))
 }
 pub(crate) fn outbox(authorization: &str) -> Result<PathBuf, Error> {
     Ok(outbox_base()?.join(authorization))
 }
 pub(crate) fn is_sha256(v: &str) -> bool {
-    v.len() == 64 && v.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    v.len() == 64
+        && v.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 pub(crate) fn is_token(v: &str) -> bool {
     !v.is_empty() && v.len() <= 80 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -87,7 +94,8 @@ pub(crate) fn read_document(dir: &Path, file: &str) -> Result<Option<(Vec<u8>, V
         return Err(format!("{} exceeds {MAX_DOCUMENT_BYTES} bytes", path.display()).into());
     }
     let bytes = fs::read(&path)?;
-    let value: Value = serde_json::from_slice(&bytes).map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?;
     if !value.is_object() {
         return Err(format!("{} is not a JSON object", path.display()).into());
     }
@@ -95,7 +103,10 @@ pub(crate) fn read_document(dir: &Path, file: &str) -> Result<Option<(Vec<u8>, V
 }
 /// Every container known to Podman, with labels, from one bounded inventory call.
 pub(crate) fn all_containers() -> Result<Vec<Value>, Error> {
-    let all: Value = serde_json::from_str(&lc::podman(lc::QUICK, &["ps", "--all", "--format", "json"])?)?;
+    let all: Value = serde_json::from_str(&lc::podman(
+        lc::QUICK,
+        &["ps", "--all", "--format", "json"],
+    )?)?;
     Ok(all.as_array().ok_or("Invalid inventory")?.clone())
 }
 
@@ -138,10 +149,16 @@ impl Authorization {
             "outcome_sha256": self.outcome_sha256, "completed_by_operation": self.completed_by})
     }
 }
-fn authorization_by(db: &Connection, column: &str, value: &str) -> Result<Option<Authorization>, Error> {
+fn authorization_by(
+    db: &Connection,
+    column: &str,
+    value: &str,
+) -> Result<Option<Authorization>, Error> {
     Ok(db
         .query_row(
-            &format!("SELECT {AUTHORIZATION_COLUMNS} FROM migration_authorizations WHERE {column}=?1"),
+            &format!(
+                "SELECT {AUTHORIZATION_COLUMNS} FROM migration_authorizations WHERE {column}=?1"
+            ),
             [value],
             authorization_row,
         )
@@ -152,21 +169,33 @@ pub(crate) fn authorizations_view(db: &Connection, uuid: &str) -> Result<Vec<Val
         "SELECT {AUTHORIZATION_COLUMNS} FROM migration_authorizations WHERE universe_uuid=?1 ORDER BY created_at, authorization_id"
     ))?;
     let rows = stmt.query_map([uuid], authorization_row)?;
-    Ok(rows.map(|a| a.map(|a| a.view())).collect::<Result<Vec<_>, _>>()?)
+    Ok(rows
+        .map(|a| a.map(|a| a.view()))
+        .collect::<Result<Vec<_>, _>>()?)
 }
 /// The verified checkpoint result recorded for a reservation.
 fn checkpoint_record(db: &Connection, checkpoint: &str, uuid: &str) -> Result<Value, Error> {
     let row: Option<(String, String, Option<String>)> = db
-        .query_row("SELECT request,status,result FROM operations WHERE id=?1", [checkpoint], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
+        .query_row(
+            "SELECT request,status,result FROM operations WHERE id=?1",
+            [checkpoint],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
         .optional()?;
-    let (request, status, result) = row.ok_or("The checkpoint operation is not recorded on this host")?;
+    let (request, status, result) =
+        row.ok_or("The checkpoint operation is not recorded on this host")?;
     let request: Value = serde_json::from_str(&request)?;
-    if request["operation"] != "migration_checkpoint" || request["universe_uuid"].as_str() != Some(uuid) || status != "verified" {
-        return Err("The checkpoint operation is not a verified checkpoint of this universe".into());
+    if request["operation"] != "migration_checkpoint"
+        || request["universe_uuid"].as_str() != Some(uuid)
+        || status != "verified"
+    {
+        return Err(
+            "The checkpoint operation is not a verified checkpoint of this universe".into(),
+        );
     }
-    Ok(serde_json::from_str(&result.ok_or("Missing persisted checkpoint result")?)?)
+    Ok(serde_json::from_str(
+        &result.ok_or("Missing persisted checkpoint result")?,
+    )?)
 }
 
 /// `checkpointed` -> `transfer_authorized`. The authorization row is durable before any artifact is placed in
@@ -216,9 +245,15 @@ pub(crate) fn authorize(
         ));
     }
     let recorded = checkpoint_record(db, checkpoint, uuid)?;
-    let archive_sha256 = recorded["archive"]["sha256"].as_str().ok_or("Missing recorded archive hash")?;
-    let manifest_sha256 = recorded["manifest"]["sha256"].as_str().ok_or("Missing recorded manifest hash")?;
-    let bytes = recorded["archive"]["bytes"].as_u64().ok_or("Missing recorded archive size")?;
+    let archive_sha256 = recorded["archive"]["sha256"]
+        .as_str()
+        .ok_or("Missing recorded archive hash")?;
+    let manifest_sha256 = recorded["manifest"]["sha256"]
+        .as_str()
+        .ok_or("Missing recorded manifest hash")?;
+    let bytes = recorded["archive"]["bytes"]
+        .as_u64()
+        .ok_or("Missing recorded archive size")?;
     let fresh = mg::verify_artifacts(checkpoint, Some(archive_sha256), Some(manifest_sha256))?;
     if fresh["archive_sha256_matches"] != true || fresh["manifest_sha256_matches"] != true {
         return Err(failure(
@@ -232,13 +267,17 @@ pub(crate) fn authorize(
             json!({"reservation": r.view()}),
         )
     })?;
-    if c["Id"].as_str() != Some(r.container_id.as_str()) || c["State"]["Checkpointed"] != true || lc::process_active(&c) {
+    if c["Id"].as_str() != Some(r.container_id.as_str())
+        || c["State"]["Checkpointed"] != true
+        || lc::process_active(&c)
+    {
         return Err(failure(
             "The source is not the reserved container in a checkpointed, stopped state; nothing was authorized",
             json!({"observed": lc::state_view(&c), "checkpointed": c["State"]["Checkpointed"], "reservation": r.view()}),
         ));
     }
-    let manifest: Value = serde_json::from_slice(&fs::read(mg::base()?.join(checkpoint).join(mg::MANIFEST))?)?;
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(mg::base()?.join(checkpoint).join(mg::MANIFEST))?)?;
     for (field, expected) in [
         ("operation_id", checkpoint),
         ("universe_uuid", uuid),
@@ -249,7 +288,9 @@ pub(crate) fn authorize(
     ] {
         if manifest[field].as_str() != Some(expected) {
             return Err(failure(
-                format!("The manifest {field} does not match the reservation; nothing was authorized"),
+                format!(
+                    "The manifest {field} does not match the reservation; nothing was authorized"
+                ),
                 json!({"reservation": r.view()}),
             ));
         }
@@ -263,7 +304,13 @@ pub(crate) fn authorize(
         .as_str()
         .filter(|k| !k.is_empty())
         .ok_or("The manifest does not record the kernel release")?;
-    let available = mg::available_bytes(outbox_base()?);
+    let outbox = outbox_base()?;
+    let available = mg::available_bytes(outbox).map_err(|error| {
+        failure(
+            format!("Available space for the outbox could not be observed: {error}; nothing was authorized"),
+            json!({"path": outbox, "space_observation": {"known": false, "error": error.to_string()}}),
+        )
+    })?;
     let required = bytes.saturating_add(mg::SPACE_MARGIN_BYTES);
     if available < required {
         return Err(failure(
@@ -271,7 +318,9 @@ pub(crate) fn authorize(
             json!({}),
         ));
     }
-    let authorization = fs::read_to_string("/proc/sys/kernel/random/uuid")?.trim().to_string();
+    let authorization = fs::read_to_string("/proc/sys/kernel/random/uuid")?
+        .trim()
+        .to_string();
     let now = crate::now() as i64;
     let handoff = json!({
         "format": HANDOFF_FORMAT, "authorization_id": authorization, "universe_uuid": uuid,
@@ -297,13 +346,20 @@ pub(crate) fn authorize(
         &json!({"authorization_id": authorization, "handoff_sha256": handoff_sha256}),
     )?;
     tx.commit()?;
-    let a = authorization_by(db, "authorization_id", &authorization)?.ok_or("Authorization not persisted")?;
+    let a = authorization_by(db, "authorization_id", &authorization)?
+        .ok_or("Authorization not persisted")?;
     publish(db, uuid, &r, &a, false)
 }
 
 /// Places the archive, manifest and handoff of a recorded authorization in its outbox, each verified against
 /// the recorded hashes. Repeating it keeps intact files and rewrites others from the preserved artifacts.
-fn publish(db: &Connection, uuid: &str, r: &Reservation, a: &Authorization, resumed: bool) -> Result<Value, Error> {
+fn publish(
+    db: &Connection,
+    uuid: &str,
+    r: &Reservation,
+    a: &Authorization,
+    resumed: bool,
+) -> Result<Value, Error> {
     let handoff: Value = serde_json::from_str(&a.handoff)?;
     let source = mg::base()?.join(&a.checkpoint_operation_id);
     let out = outbox(&a.authorization_id)?;
@@ -332,7 +388,9 @@ fn publish(db: &Connection, uuid: &str, r: &Reservation, a: &Authorization, resu
     if !(regular_file(&target)?.is_some() && mg::sha256(&target)? == a.handoff_sha256) {
         mg::write_private(&target, a.handoff.as_bytes())?;
         if mg::sha256(&target)? != a.handoff_sha256 {
-            return Err("The handoff written to the outbox does not hash to the recorded value".into());
+            return Err(
+                "The handoff written to the outbox does not hash to the recorded value".into(),
+            );
         }
     }
     files[HANDOFF] = json!({"bytes": a.handoff.len(), "sha256": a.handoff_sha256});
@@ -348,12 +406,20 @@ fn publish(db: &Connection, uuid: &str, r: &Reservation, a: &Authorization, resu
 
 /// Fresh re-hash of an authorization's outbox files, for historical replays.
 pub(crate) fn verify_outbox(original: &Value) -> Result<Value, Error> {
-    let authorization = original["authorization_id"].as_str().ok_or("Missing authorization_id")?;
+    let authorization = original["authorization_id"]
+        .as_str()
+        .ok_or("Missing authorization_id")?;
     let out = outbox(authorization)?;
     let mut files = json!({});
     for (file, expected) in [
-        (mg::ARCHIVE, original["handoff"]["archive"]["sha256"].as_str()),
-        (mg::MANIFEST, original["handoff"]["manifest"]["sha256"].as_str()),
+        (
+            mg::ARCHIVE,
+            original["handoff"]["archive"]["sha256"].as_str(),
+        ),
+        (
+            mg::MANIFEST,
+            original["handoff"]["manifest"]["sha256"].as_str(),
+        ),
         (HANDOFF, original["handoff_sha256"].as_str()),
     ] {
         let path = out.join(file);
@@ -370,7 +436,13 @@ pub(crate) fn verify_outbox(original: &Value) -> Result<Value, Error> {
 /// `transfer_authorized` -> `transferred` (outcome `restored`) or `checkpointed` (outcome `not_restored`,
 /// authorization ended). Any mismatch between the inbox outcome and this host's authorization is refused
 /// without a state change.
-pub(crate) fn complete(db: &Connection, id: &str, uuid: &str, authorization: &str, existing: Option<Value>) -> Result<Value, Error> {
+pub(crate) fn complete(
+    db: &Connection,
+    id: &str,
+    uuid: &str,
+    authorization: &str,
+    existing: Option<Value>,
+) -> Result<Value, Error> {
     let host = mg::host_uuid(db)?;
     let a = authorization_by(db, "authorization_id", authorization)?
         .filter(|a| a.universe_uuid == uuid)
@@ -394,10 +466,16 @@ pub(crate) fn complete(db: &Connection, id: &str, uuid: &str, authorization: &st
             json!({"authorization": a.view()}),
         ));
     }
-    let r = mg::reservation(db, uuid)?.ok_or("The universe has no migration reservation on this host")?;
-    if r.state != "transfer_authorized" || r.detail_value()["authorization_id"].as_str() != Some(authorization) {
+    let r = mg::reservation(db, uuid)?
+        .ok_or("The universe has no migration reservation on this host")?;
+    if r.state != "transfer_authorized"
+        || r.detail_value()["authorization_id"].as_str() != Some(authorization)
+    {
         return Err(failure(
-            format!("The reservation is in state {} and does not hold this authorization", r.state),
+            format!(
+                "The reservation is in state {} and does not hold this authorization",
+                r.state
+            ),
             json!({"reservation": r.view()}),
         ));
     }
@@ -413,7 +491,10 @@ pub(crate) fn complete(db: &Connection, id: &str, uuid: &str, authorization: &st
     let text = |k: &str| outcome[k].as_str().unwrap_or("").to_string();
     let mut mismatches: Vec<String> = vec![];
     if text("format") != OUTCOME_FORMAT {
-        mismatches.push(format!("format {:?} is not {OUTCOME_FORMAT}", text("format")));
+        mismatches.push(format!(
+            "format {:?} is not {OUTCOME_FORMAT}",
+            text("format")
+        ));
     }
     if text("authorization_id") != authorization {
         mismatches.push("the outcome names another authorization".into());
@@ -441,7 +522,10 @@ pub(crate) fn complete(db: &Connection, id: &str, uuid: &str, authorization: &st
     match result.as_str() {
         "restored" if is_sha256(&text("restored_container_id")) => {}
         "not_restored" if outcome["restored_container_id"].is_null() => {}
-        _ => mismatches.push("result must be restored with a restored container ID, or not_restored without one".into()),
+        _ => mismatches.push(
+            "result must be restored with a restored container ID, or not_restored without one"
+                .into(),
+        ),
     }
     if !mismatches.is_empty() {
         return Err(failure(
@@ -494,10 +578,17 @@ pub(crate) fn complete(db: &Connection, id: &str, uuid: &str, authorization: &st
             .join(format!("outcome-{authorization}.json")),
         &bytes,
     )?;
-    let a = authorization_by(db, "authorization_id", authorization)?.ok_or("Authorization disappeared")?;
+    let a = authorization_by(db, "authorization_id", authorization)?
+        .ok_or("Authorization disappeared")?;
     completion_result(db, uuid, &a, existing, false)
 }
-fn completion_result(db: &Connection, uuid: &str, a: &Authorization, existing: Option<Value>, resumed: bool) -> Result<Value, Error> {
+fn completion_result(
+    db: &Connection,
+    uuid: &str,
+    a: &Authorization,
+    existing: Option<Value>,
+    resumed: bool,
+) -> Result<Value, Error> {
     let outcome: Value = db
         .query_row(
             "SELECT outcome FROM migration_authorizations WHERE authorization_id=?1",
@@ -536,7 +627,12 @@ pub(crate) fn retire(
     authorization: &str,
     existing: Option<Value>,
 ) -> Result<Value, Error> {
-    let r = mg::reservation(db, uuid)?.ok_or_else(|| failure("The universe has no migration reservation on this host", json!({})))?;
+    let r = mg::reservation(db, uuid)?.ok_or_else(|| {
+        failure(
+            "The universe has no migration reservation on this host",
+            json!({}),
+        )
+    })?;
     let detail = r.detail_value();
     if r.state != "transferred" || detail["authorization_id"].as_str() != Some(authorization) {
         return Err(failure(
@@ -557,7 +653,10 @@ pub(crate) fn retire(
         })?;
     let (action, kept_checkpoint_files_removed) = match existing {
         None => {
-            if all_containers()?.iter().any(|c| c["Id"].as_str() == Some(r.container_id.as_str())) {
+            if all_containers()?
+                .iter()
+                .any(|c| c["Id"].as_str() == Some(r.container_id.as_str()))
+            {
                 return Err(failure(
                     "The reserved source container exists under another name; nothing was removed",
                     json!({"reservation": r.view()}),
@@ -581,7 +680,11 @@ pub(crate) fn retire(
             let static_dir = c["StaticDir"].as_str().map(PathBuf::from);
             // Never forced: the container is stopped.
             lc::podman(lc::QUICK, &["rm", &r.container_id])?;
-            if lc::inspect(name)?.is_some() || all_containers()?.iter().any(|c| c["Id"].as_str() == Some(r.container_id.as_str())) {
+            if lc::inspect(name)?.is_some()
+                || all_containers()?
+                    .iter()
+                    .any(|c| c["Id"].as_str() == Some(r.container_id.as_str()))
+            {
                 return Err("The source container is still present after removal".into());
             }
             ("removed", json!(static_dir.map(|d| !d.exists())))

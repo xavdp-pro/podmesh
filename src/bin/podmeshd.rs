@@ -5,8 +5,10 @@ use std::{
     time::Duration,
 };
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = PathBuf::from(std::env::var("PODMESH_STATE_DIR").unwrap_or("/var/lib/podmesh".into()));
-    let socket = PathBuf::from(std::env::var("PODMESH_SOCKET").unwrap_or("/run/podmesh/api.sock".into()));
+    let dir =
+        PathBuf::from(std::env::var("PODMESH_STATE_DIR").unwrap_or("/var/lib/podmesh".into()));
+    let socket =
+        PathBuf::from(std::env::var("PODMESH_SOCKET").unwrap_or("/run/podmesh/api.sock".into()));
     let db = podmesh::open_state(&dir)?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     std::fs::create_dir_all(socket.parent().ok_or("Invalid socket path")?)?;

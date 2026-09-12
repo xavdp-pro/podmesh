@@ -106,18 +106,23 @@ try:
     run('apt-get', 'install', '-y', '--allow-downgrades', old_deb)
     ready()
     assert package() == f'{old} installed'
-    assert api({'operation': 'capabilities'})['data']['version'] == old
+    rollback_capabilities = api({'operation': 'capabilities'})['data']
+    assert rollback_capabilities['version'] == old
     assert api({'operation': 'identity'})['data']['host_uuid'] == identity
     create_w = request('create', w, image='sha256:' + alpine, command=['true'])
     observed['rollback_create'] = api(create_w)
     observed['rollback_delete'] = api(request('delete', w))
     assert observed['rollback_create']['ok'] and observed['rollback_delete']['ok'] and not exists(W), observed
     observed['rollback_start'] = api(request('start', u))
-    assert observed['rollback_start']['ok'] is False
+    if 'start' in rollback_capabilities.get('operations', []):
+        assert observed['rollback_start']['ok'], observed['rollback_start']
+        assert observed['rollback_start']['data']['action'] == 'none_already_running', observed['rollback_start']
+    else:
+        assert observed['rollback_start']['ok'] is False
     observed['rollback_replay'] = api(create_v)
     assert observed['rollback_replay']['ok'] and observed['rollback_replay']['data']['replayed']
     still_running(U, u_started)
-    checks.append('rollback: previous version runs on the newer journal; its create/delete contract works; start honestly unsupported; identity kept')
+    checks.append('rollback: previous version runs on the newer journal; its create/delete contract works; start follows the advertised capability without restarting the workload; identity kept')
 
     # 4. Re-upgrade from the signed repository.
     run('apt-get', 'install', '-y', f'podmesh={new}')

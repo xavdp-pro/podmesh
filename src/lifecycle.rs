@@ -39,7 +39,7 @@ const OPERATIONS: [&str; 16] = [
     "migration_restore_abort",
 ];
 // Podman states in which no container process can write the root filesystem.
-const STOPPED: [&str; 3] = ["created", "exited", "stopped"];
+pub(crate) const STOPPED: [&str; 3] = ["created", "exited", "stopped"];
 // Seconds. The service handles one request at a time, so these also bound queueing.
 pub(crate) const QUICK: u64 = 30;
 const COMMIT: u64 = 300;
@@ -149,8 +149,12 @@ pub(crate) fn text<'a>(r: &'a Value, key: &str) -> Result<&'a str, Error> {
         .filter(|v| !v.is_empty())
         .ok_or_else(|| format!("Missing {key}").into())
 }
-fn token(value: &str) -> Result<(), Error> {
-    if value.len() > 80 || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+pub(crate) fn token(value: &str) -> Result<(), Error> {
+    if value.len() > 80
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
         return Err("Identifier must contain 1-80 ASCII letters, digits or hyphens".into());
     }
     Ok(())
@@ -174,7 +178,9 @@ pub fn prepare_scratch(dir: &Path) -> Result<(), Error> {
     empty_scratch()
 }
 fn empty_scratch() -> Result<(), Error> {
-    let dir = SCRATCH.get().ok_or("Podman scratch directory not prepared")?;
+    let dir = SCRATCH
+        .get()
+        .ok_or("Podman scratch directory not prepared")?;
     if dir.exists() {
         fs::remove_dir_all(dir)?;
     }
@@ -185,7 +191,9 @@ fn empty_scratch() -> Result<(), Error> {
 fn run_podman(timeout: u64, args: &[&str]) -> Result<Output, Error> {
     // GNU timeout bounds this process group; no shell evaluates caller input.
     let limit = timeout.to_string();
-    let scratch = SCRATCH.get().ok_or("Podman scratch directory not prepared")?;
+    let scratch = SCRATCH
+        .get()
+        .ok_or("Podman scratch directory not prepared")?;
     Ok(Command::new("/usr/bin/timeout")
         .env("TMPDIR", scratch)
         // systemd sets INVOCATION_ID for this service. Podman then leaves conmon in the
@@ -231,7 +239,8 @@ pub(crate) fn inspect(name: &str) -> Result<Option<Value>, Error> {
     Ok(Some(data[0].clone()))
 }
 pub(crate) fn images() -> Result<Vec<Value>, Error> {
-    let all: Value = serde_json::from_str(&podman(QUICK, &["images", "--all", "--format", "json"])?)?;
+    let all: Value =
+        serde_json::from_str(&podman(QUICK, &["images", "--all", "--format", "json"])?)?;
     Ok(all.as_array().ok_or("Invalid image inventory")?.clone())
 }
 pub(crate) fn image_id(i: &Value) -> &str {
@@ -256,7 +265,14 @@ fn stopped(c: &Value) -> Result<(), Error> {
 /// Seconds since the Unix epoch for Podman's UTC timestamps (`YYYY-MM-DDTHH:MM:SS[.frac]Z`).
 pub(crate) fn epoch(ts: &str) -> Option<i64> {
     let b = ts.as_bytes();
-    if b.len() < 20 || !ts.ends_with('Z') || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+    if b.len() < 20
+        || !ts.ends_with('Z')
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
         return None;
     }
     let num = |from: usize, to: usize| ts.get(from..to)?.parse::<i64>().ok();
@@ -320,7 +336,8 @@ pub(crate) fn owned(db: &Connection, c: &Value, uuid: &str, role: &str) -> Resul
             return Ok(());
         }
     }
-    let operation = label(c, CREATION).ok_or_else(|| format!("{role} has no creation operation"))?;
+    let operation =
+        label(c, CREATION).ok_or_else(|| format!("{role} has no creation operation"))?;
     let row: Option<(String, Option<String>)> = db
         .query_row(
             "SELECT request,result FROM operations WHERE id=?1 AND status='verified'",
@@ -328,17 +345,30 @@ pub(crate) fn owned(db: &Connection, c: &Value, uuid: &str, role: &str) -> Resul
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let (request, result) = row.ok_or_else(|| format!("{role} is not recorded as a verified PodMesh universe on this host"))?;
+    let (request, result) = row.ok_or_else(|| {
+        format!("{role} is not recorded as a verified PodMesh universe on this host")
+    })?;
     let request: Value = serde_json::from_str(&request)?;
     let result: Value = serde_json::from_str(&result.ok_or("Missing persisted result")?)?;
     let kind = request["operation"].as_str().unwrap_or("");
-    if !["create", "clone"].contains(&kind) || request["universe_uuid"].as_str() != Some(uuid) || result["container_id"] != c["Id"] {
+    if !["create", "clone"].contains(&kind)
+        || request["universe_uuid"].as_str() != Some(uuid)
+        || result["container_id"] != c["Id"]
+    {
         return Err(format!("{role} container does not match its recorded creation").into());
     }
     // A container this host transferred away never regains ownership through its original creation.
     if migration::transferred_away(db, uuid, c["Id"].as_str().unwrap_or(""))? {
         return Err(format!(
             "{role} container was transferred to another host by a completed migration; its original creation no longer grants ownership"
+        )
+        .into());
+    }
+    // Neither does a container a garbage collection proved absent when it collected the universe: it can
+    // only have come back out of band.
+    if migration::collected_absent(db, uuid, c["Id"].as_str().unwrap_or(""))? {
+        return Err(format!(
+            "{role} container was proven absent when this universe was collected; its original creation no longer grants ownership"
         )
         .into());
     }
@@ -349,10 +379,15 @@ fn parse<'a>(operation: &str, uuid: &str, request: &'a Value) -> Result<Params<'
         "create" => {
             let image = text(request, "image")?;
             // An immutable local image ID is mandatory for this first version.
-            if image.len() != 71 || !image.starts_with("sha256:") || !image[7..].bytes().all(|c| c.is_ascii_hexdigit()) {
+            if image.len() != 71
+                || !image.starts_with("sha256:")
+                || !image[7..].bytes().all(|c| c.is_ascii_hexdigit())
+            {
                 return Err("Use a full local sha256 image ID".into());
             }
-            let command = request["command"].as_array().ok_or("command must be an array")?;
+            let command = request["command"]
+                .as_array()
+                .ok_or("command must be an array")?;
             let command: Vec<&str> = command
                 .iter()
                 .map(|v| v.as_str().ok_or("command items must be strings"))
@@ -394,16 +429,29 @@ fn parse<'a>(operation: &str, uuid: &str, request: &'a Value) -> Result<Params<'
                 .and_then(Value::as_str)
                 .filter(|v| ["kill", "leave_running"].contains(v))
                 .ok_or("on_timeout must be \"kill\" or \"leave_running\"")?;
-            Params::Stop { timeout, on_timeout }
+            Params::Stop {
+                timeout,
+                on_timeout,
+            }
         }
         "migration_preflight" | "migration_checkpoint" => {
             // Every identity the checkpoint is bound to is explicit and immutable.
             let container_id = text(request, "container_id")?;
-            if container_id.len() != 64 || !container_id.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
-                return Err("container_id must be a full 64-character lowercase hexadecimal container ID".into());
+            if container_id.len() != 64
+                || !container_id
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            {
+                return Err(
+                    "container_id must be a full 64-character lowercase hexadecimal container ID"
+                        .into(),
+                );
             }
             let image = text(request, "image")?;
-            if image.len() != 71 || !image.starts_with("sha256:") || !image[7..].bytes().all(|c| c.is_ascii_hexdigit()) {
+            if image.len() != 71
+                || !image.starts_with("sha256:")
+                || !image[7..].bytes().all(|c| c.is_ascii_hexdigit())
+            {
                 return Err("Use a full local sha256 image ID".into());
             }
             let source_host = text(request, "source_host_uuid")?;
@@ -428,7 +476,9 @@ fn parse<'a>(operation: &str, uuid: &str, request: &'a Value) -> Result<Params<'
         }
         "migration_authorize_transfer" => {
             let checkpoint = text(request, "checkpoint_operation_id")?;
-            token(checkpoint).map_err(|_| "checkpoint_operation_id must contain 1-80 ASCII letters, digits or hyphens")?;
+            token(checkpoint).map_err(|_| {
+                "checkpoint_operation_id must contain 1-80 ASCII letters, digits or hyphens"
+            })?;
             let destination = text(request, "destination_host_uuid")?;
             if !is_uuid(destination) {
                 return Err("destination_host_uuid must be a UUID".into());
@@ -443,7 +493,9 @@ fn parse<'a>(operation: &str, uuid: &str, request: &'a Value) -> Result<Params<'
         // can never resolve to a reservation the caller did not mean.
         "migration_release" | "migration_abandon" | "migration_restore_local" => {
             let checkpoint = text(request, "checkpoint_operation_id")?;
-            token(checkpoint).map_err(|_| "checkpoint_operation_id must contain 1-80 ASCII letters, digits or hyphens")?;
+            token(checkpoint).map_err(|_| {
+                "checkpoint_operation_id must contain 1-80 ASCII letters, digits or hyphens"
+            })?;
             match operation {
                 "migration_release" => Params::MigrationRelease { checkpoint },
                 "migration_abandon" => Params::MigrationAbandon { checkpoint },
@@ -469,7 +521,9 @@ fn parse<'a>(operation: &str, uuid: &str, request: &'a Value) -> Result<Params<'
                     // Explicit, typed and default false: ending processes is never implied by an abort.
                     let reclaim_processes = match request.get("reclaim_processes") {
                         None | Some(Value::Null) => false,
-                        Some(v) => v.as_bool().ok_or("reclaim_processes must be true or false")?,
+                        Some(v) => v
+                            .as_bool()
+                            .ok_or("reclaim_processes must be true or false")?,
                     };
                     Params::MigrationRestoreAbort {
                         authorization,
@@ -482,7 +536,7 @@ fn parse<'a>(operation: &str, uuid: &str, request: &'a Value) -> Result<Params<'
         _ => Params::Delete,
     })
 }
-fn ensure_schema(db: &Connection) -> Result<(), Error> {
+pub(crate) fn ensure_schema(db: &Connection) -> Result<(), Error> {
     // operation_attempts is a separate table so that an experimental3 rollback, which inserts
     // four values into operations, keeps working on a journal written by this version.
     db.execute_batch(
@@ -508,9 +562,11 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
     ensure_schema(db)?;
     let canonical = request.to_string();
     let previous: Option<(String, String, Option<String>)> = db
-        .query_row("SELECT request,status,result FROM operations WHERE id=?1", [id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
+        .query_row(
+            "SELECT request,status,result FROM operations WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
         .optional()?;
     if let Some((saved, status, result)) = previous {
         if saved != canonical {
@@ -521,7 +577,10 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
         }
         // pending (interrupted) or failed: re-evaluate from the observed state below.
     } else {
-        db.execute("INSERT INTO operations VALUES(?1,?2,'pending',NULL)", params![id, canonical])?;
+        db.execute(
+            "INSERT INTO operations VALUES(?1,?2,'pending',NULL)",
+            params![id, canonical],
+        )?;
     }
     db.execute(
         "INSERT INTO operation_attempts(operation_id,started_at) VALUES(?1,?2)",
@@ -542,9 +601,15 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
             )?;
         }
         Err(e) => {
-            let details = e.downcast_ref::<Failure>().map(|f| f.details.clone()).unwrap_or(Value::Null);
+            let details = e
+                .downcast_ref::<Failure>()
+                .map(|f| f.details.clone())
+                .unwrap_or(Value::Null);
             let record = json!({"error": e.to_string(), "details": details}).to_string();
-            db.execute("UPDATE operations SET status='failed', result=?2 WHERE id=?1", params![id, record])?;
+            db.execute(
+                "UPDATE operations SET status='failed', result=?2 WHERE id=?1",
+                params![id, record],
+            )?;
             db.execute(
                 "UPDATE operation_attempts SET finished_at=?2, outcome='failed', detail=?3 WHERE id=?1",
                 params![attempt, finished, record],
@@ -555,19 +620,34 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
 }
 /// A verified operation is never executed again. Its persisted result is returned as
 /// history, next to a fresh observation that may contradict it.
-fn replay(db: &Connection, id: &str, uuid: &str, operation: &str, result: Option<String>) -> Result<Value, Error> {
+fn replay(
+    db: &Connection,
+    id: &str,
+    uuid: &str,
+    operation: &str,
+    result: Option<String>,
+) -> Result<Value, Error> {
     let original: Value = serde_json::from_str(&result.ok_or("Missing persisted result")?)?;
     // A replay never repeats an effect. Migration replays add a fresh re-hash or state of what the operation produced.
     let extra = match operation {
         "migration_checkpoint" => Some((
             "current_artifacts",
-            migration::verify_artifacts(id, original["archive"]["sha256"].as_str(), original["manifest"]["sha256"].as_str())?,
+            migration::verify_artifacts(
+                id,
+                original["archive"]["sha256"].as_str(),
+                original["manifest"]["sha256"].as_str(),
+            )?,
         )),
-        "migration_authorize_transfer" => Some(("current_artifacts", transfer::verify_outbox(&original)?)),
-        "migration_restore" | "migration_restore_abort" => Some(("current_outcome", restore::verify_outcome(&original)?)),
-        "migration_complete_transfer" | "migration_retire_source" => {
-            Some(("current_reservation", json!(migration::reservation(db, uuid)?.map(|r| r.view()))))
+        "migration_authorize_transfer" => {
+            Some(("current_artifacts", transfer::verify_outbox(&original)?))
         }
+        "migration_restore" | "migration_restore_abort" => {
+            Some(("current_outcome", restore::verify_outcome(&original)?))
+        }
+        "migration_complete_transfer" | "migration_retire_source" => Some((
+            "current_reservation",
+            json!(migration::reservation(db, uuid)?.map(|r| r.view())),
+        )),
         _ => None,
     };
     let verified_at: Option<i64> = db.query_row(
@@ -576,7 +656,10 @@ fn replay(db: &Connection, id: &str, uuid: &str, operation: &str, result: Option
         |r| r.get(0),
     )?;
     let current = observe(uuid)?;
-    let same_container = match (original["container_id"].as_str(), current["container_id"].as_str()) {
+    let same_container = match (
+        original["container_id"].as_str(),
+        current["container_id"].as_str(),
+    ) {
         (Some(recorded), Some(observed)) => json!(recorded == observed),
         (Some(_), None) => json!(false),
         _ => Value::Null,
@@ -595,13 +678,21 @@ fn replay(db: &Connection, id: &str, uuid: &str, operation: &str, result: Option
     }
     Ok(response)
 }
-fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params) -> Result<Value, Error> {
+fn perform(
+    db: &Connection,
+    attempt: i64,
+    id: &str,
+    uuid: &str,
+    params: &Params,
+) -> Result<Value, Error> {
     let name = format!("podmesh-{uuid}");
     let existing = inspect(&name)?;
     // On a migration destination an occupied name is a reported blocker, not an early refusal.
     let on_destination = matches!(
         params,
-        Params::DestinationPreflight { .. } | Params::MigrationRestore { .. } | Params::MigrationRestoreAbort { .. }
+        Params::DestinationPreflight { .. }
+            | Params::MigrationRestore { .. }
+            | Params::MigrationRestoreAbort { .. }
     );
     if let Some(ref c) = existing {
         if !on_destination && label(c, UNIVERSE) != Some(uuid) {
@@ -617,34 +708,85 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
     ) {
         migration::refuse_if_reserved(db, uuid, params.name())?;
     }
+    // A garbage collection leaves a tombstone: the identity of a collected universe is never given a new
+    // meaning by a blind create, or by a clone into it. Operating the container a collection released, and
+    // restoring a verified handoff, stay available (docs/GARBAGE-COLLECTION.md).
+    if matches!(params, Params::Create { .. } | Params::Clone { .. }) {
+        migration::refuse_identity_reuse(db, uuid, params.name())?;
+    }
     match params {
         Params::Create { image, command } => create(id, uuid, &name, existing, image, command),
         Params::Clone { source } => clone(db, id, uuid, source, &name, existing),
         Params::Delete => delete(db, uuid, &name, existing),
-        Params::Start { observe_seconds } => start(db, attempt, id, uuid, &name, existing, *observe_seconds),
-        Params::Stop { timeout, on_timeout } => stop(db, attempt, id, uuid, &name, existing, *timeout, on_timeout),
+        Params::Start { observe_seconds } => {
+            start(db, attempt, id, uuid, &name, existing, *observe_seconds)
+        }
+        Params::Stop {
+            timeout,
+            on_timeout,
+        } => stop(db, attempt, id, uuid, &name, existing, *timeout, on_timeout),
         Params::MigrationPreflight(binding) => migration::preflight(db, uuid, binding, existing),
-        Params::MigrationCheckpoint(binding) => migration::checkpoint(db, attempt, id, uuid, &name, binding, existing),
+        Params::MigrationCheckpoint(binding) => {
+            migration::checkpoint(db, attempt, id, uuid, &name, binding, existing)
+        }
         Params::MigrationAuthorize {
             checkpoint,
             destination,
             authorization_ref,
-        } => transfer::authorize(db, id, uuid, checkpoint, destination, authorization_ref, existing),
-        Params::MigrationComplete { authorization } => transfer::complete(db, id, uuid, authorization, existing),
-        Params::MigrationRetire { authorization } => transfer::retire(db, id, uuid, &name, authorization, existing),
-        Params::MigrationRelease { checkpoint } => recovery::release(db, id, uuid, checkpoint, existing),
-        Params::MigrationAbandon { checkpoint } => recovery::abandon(db, id, uuid, checkpoint, existing),
-        Params::MigrationRestoreLocal { checkpoint } => recovery::restore_local(db, attempt, id, uuid, &name, checkpoint, existing),
-        Params::DestinationPreflight { authorization } => restore::preflight(db, uuid, authorization, existing),
-        Params::MigrationRestore { authorization } => restore::restore(db, attempt, id, uuid, &name, authorization, existing),
+        } => transfer::authorize(
+            db,
+            id,
+            uuid,
+            checkpoint,
+            destination,
+            authorization_ref,
+            existing,
+        ),
+        Params::MigrationComplete { authorization } => {
+            transfer::complete(db, id, uuid, authorization, existing)
+        }
+        Params::MigrationRetire { authorization } => {
+            transfer::retire(db, id, uuid, &name, authorization, existing)
+        }
+        Params::MigrationRelease { checkpoint } => {
+            recovery::release(db, id, uuid, checkpoint, existing)
+        }
+        Params::MigrationAbandon { checkpoint } => {
+            recovery::abandon(db, id, uuid, checkpoint, existing)
+        }
+        Params::MigrationRestoreLocal { checkpoint } => {
+            recovery::restore_local(db, attempt, id, uuid, &name, checkpoint, existing)
+        }
+        Params::DestinationPreflight { authorization } => {
+            restore::preflight(db, uuid, authorization, existing)
+        }
+        Params::MigrationRestore { authorization } => {
+            restore::restore(db, attempt, id, uuid, &name, authorization, existing)
+        }
         Params::MigrationRestoreAbort {
             authorization,
             reference,
             reclaim_processes,
-        } => restore::abort(db, id, uuid, &name, authorization, reference, *reclaim_processes, existing),
+        } => restore::abort(
+            db,
+            id,
+            uuid,
+            &name,
+            authorization,
+            reference,
+            *reclaim_processes,
+            existing,
+        ),
     }
 }
-fn create(id: &str, uuid: &str, name: &str, existing: Option<Value>, image: &str, command: &[&str]) -> Result<Value, Error> {
+fn create(
+    id: &str,
+    uuid: &str,
+    name: &str,
+    existing: Option<Value>,
+    image: &str,
+    command: &[&str],
+) -> Result<Value, Error> {
     if let Some(ref c) = existing {
         if label(c, CREATION) != Some(id) {
             return Err("Universe already exists under another creation operation".into());
@@ -672,7 +814,12 @@ fn create(id: &str, uuid: &str, name: &str, existing: Option<Value>, image: &str
         json!({"status":"verified","state":c["State"]["Status"],"universe_uuid":uuid,"container_id":c["Id"],"network":"none","started":false}),
     )
 }
-fn delete(db: &Connection, uuid: &str, name: &str, existing: Option<Value>) -> Result<Value, Error> {
+fn delete(
+    db: &Connection,
+    uuid: &str,
+    name: &str,
+    existing: Option<Value>,
+) -> Result<Value, Error> {
     if let Some(c) = existing {
         owned(db, &c, uuid, "Target")?;
         stopped(&c).map_err(|e| format!("Refusing to delete: {e}; stop it explicitly first"))?;
@@ -762,7 +909,10 @@ fn start(
             view["runtime_error"] = c["State"]["Error"].clone();
             view
         });
-        return Err(failure(format!("Start failed: {e}"), json!({"observed": observed})));
+        return Err(failure(
+            format!("Start failed: {e}"),
+            json!({"observed": observed}),
+        ));
     }
     // The application may exit at once. Report only what is observed within the window.
     let deadline = Instant::now() + Duration::from_secs(observe_seconds);
@@ -818,7 +968,8 @@ fn stop_result(
     result["on_timeout"] = json!(on_timeout);
     result["forced"] = json!(forced);
     result["forced_evidence"] = json!(match (action, on_timeout, forced) {
-        ("stopped", "kill", true) => "podman reported escalation to SIGKILL after the graceful timeout",
+        ("stopped", "kill", true) =>
+            "podman reported escalation to SIGKILL after the graceful timeout",
         ("stopped", "kill", false) => "no escalation reported by podman",
         ("stopped", _, _) => "only the stop signal was sent",
         _ => "no signal was sent",
@@ -872,7 +1023,10 @@ fn stop(
             }
         }
     }
-    let signal = c["Config"]["StopSignal"].as_str().unwrap_or("SIGTERM").to_string();
+    let signal = c["Config"]["StopSignal"]
+        .as_str()
+        .unwrap_or("SIGTERM")
+        .to_string();
     let begin = Instant::now();
     let mut forced = false;
     if on_timeout == "kill" {
@@ -933,7 +1087,14 @@ fn stop(
 /// Clone a stopped, mount-free universe: commit its root filesystem into a snapshot image
 /// tagged by operation ID, then create a new network-disabled container from that image.
 /// A retry reuses a snapshot committed by an interrupted attempt of the same operation.
-fn clone(db: &Connection, id: &str, uuid: &str, source: &str, name: &str, existing: Option<Value>) -> Result<Value, Error> {
+fn clone(
+    db: &Connection,
+    id: &str,
+    uuid: &str,
+    source: &str,
+    name: &str,
+    existing: Option<Value>,
+) -> Result<Value, Error> {
     let reference = format!("{SNAPSHOT_REPOSITORY}{id}");
     let mut reused = false;
     if let Some(ref c) = existing {
@@ -941,12 +1102,19 @@ fn clone(db: &Connection, id: &str, uuid: &str, source: &str, name: &str, existi
             return Err("Clone target already belongs to another operation".into());
         }
     } else {
-        let prior = images()?.into_iter().find(|i| names(i).contains(&reference.as_str()));
+        let prior = images()?
+            .into_iter()
+            .find(|i| names(i).contains(&reference.as_str()));
         let image = if let Some(snapshot) = prior {
             let l = &snapshot["Labels"];
-            if l[SNAPSHOT_FOR].as_str() != Some(uuid) || l[SNAPSHOT_OPERATION].as_str() != Some(id) || l[UNIVERSE].as_str() != Some(source)
+            if l[SNAPSHOT_FOR].as_str() != Some(uuid)
+                || l[SNAPSHOT_OPERATION].as_str() != Some(id)
+                || l[UNIVERSE].as_str() != Some(source)
             {
-                return Err("Snapshot reference exists with different provenance; refusing to reuse it".into());
+                return Err(
+                    "Snapshot reference exists with different provenance; refusing to reuse it"
+                        .into(),
+                );
             }
             reused = true;
             image_id(&snapshot).to_string()
@@ -958,11 +1126,19 @@ fn clone(db: &Connection, id: &str, uuid: &str, source: &str, name: &str, existi
             }
             owned(db, &before, source, "Clone source")?;
             migration::refuse_if_reserved(db, source, "clone from this source")?;
-            stopped(&before).map_err(|e| format!("Clone source must be stopped for a coherent filesystem snapshot: {e}"))?;
-            if before["Mounts"].as_array().map(|m| !m.is_empty()).unwrap_or(true) {
+            stopped(&before).map_err(|e| {
+                format!("Clone source must be stopped for a coherent filesystem snapshot: {e}")
+            })?;
+            if before["Mounts"]
+                .as_array()
+                .map(|m| !m.is_empty())
+                .unwrap_or(true)
+            {
                 return Err("Volume and bind mount cloning is not supported yet".into());
             }
-            let source_id = before["Id"].as_str().ok_or("Missing source container identity")?;
+            let source_id = before["Id"]
+                .as_str()
+                .ok_or("Missing source container identity")?;
             let changes = [
                 format!("LABEL {SNAPSHOT_FOR}={uuid}"),
                 format!("LABEL {SNAPSHOT_OPERATION}={id}"),
@@ -986,12 +1162,17 @@ fn clone(db: &Connection, id: &str, uuid: &str, source: &str, name: &str, existi
                 ],
             )?;
             let after = inspect(&source_name)?;
-            let unchanged = after
-                .as_ref()
-                .is_some_and(|a| a["Id"] == before["Id"] && a["State"]["StartedAt"] == before["State"]["StartedAt"] && stopped(a).is_ok());
+            let unchanged = after.as_ref().is_some_and(|a| {
+                a["Id"] == before["Id"]
+                    && a["State"]["StartedAt"] == before["State"]["StartedAt"]
+                    && stopped(a).is_ok()
+            });
             if !unchanged {
                 let _ = podman(QUICK, &["image", "rm", &reference]);
-                return Err("Clone source was started or replaced during the snapshot; snapshot discarded".into());
+                return Err(
+                    "Clone source was started or replaced during the snapshot; snapshot discarded"
+                        .into(),
+                );
             }
             let snapshot = images()?
                 .into_iter()
@@ -1019,7 +1200,11 @@ fn clone(db: &Connection, id: &str, uuid: &str, source: &str, name: &str, existi
     }
     // Verify the observed clone, whether created now or by an interrupted attempt.
     let c = inspect(name)?.ok_or("Clone not observable")?;
-    let image = c["Image"].as_str().unwrap_or("").trim_start_matches("sha256:").to_string();
+    let image = c["Image"]
+        .as_str()
+        .unwrap_or("")
+        .trim_start_matches("sha256:")
+        .to_string();
     let snapshot = images()?
         .into_iter()
         .find(|i| image_id(i) == image)
@@ -1032,7 +1217,12 @@ fn clone(db: &Connection, id: &str, uuid: &str, source: &str, name: &str, existi
     {
         return Err("Clone provenance does not match the operation".into());
     }
-    if c["HostConfig"]["NetworkMode"].as_str() != Some("none") || c["Mounts"].as_array().map(|m| !m.is_empty()).unwrap_or(true) {
+    if c["HostConfig"]["NetworkMode"].as_str() != Some("none")
+        || c["Mounts"]
+            .as_array()
+            .map(|m| !m.is_empty())
+            .unwrap_or(true)
+    {
         return Err("Clone configuration does not match the supported scope".into());
     }
     Ok(
@@ -1050,11 +1240,15 @@ fn snapshot_recorded(db: &Connection, uuid: &str, i: &Value) -> Result<bool, Err
         return Ok(false);
     };
     let row: Option<(String, String, Option<String>)> = db
-        .query_row("SELECT request,status,result FROM operations WHERE id=?1", [operation], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
+        .query_row(
+            "SELECT request,status,result FROM operations WHERE id=?1",
+            [operation],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
         .optional()?;
-    let Some((request, status, result)) = row else { return Ok(false) };
+    let Some((request, status, result)) = row else {
+        return Ok(false);
+    };
     let request: Value = serde_json::from_str(&request)?;
     if request["operation"] != "clone"
         || request["universe_uuid"].as_str() != Some(uuid)
@@ -1067,13 +1261,17 @@ fn snapshot_recorded(db: &Connection, uuid: &str, i: &Value) -> Result<bool, Err
         return Ok(true);
     }
     let result: Value = serde_json::from_str(result.as_deref().unwrap_or("null"))?;
-    Ok(result["snapshot_image"].as_str() == Some(image_id(i)) && result["source_container_id"] == l[SNAPSHOT_SOURCE])
+    Ok(result["snapshot_image"].as_str() == Some(image_id(i))
+        && result["source_container_id"] == l[SNAPSHOT_SOURCE])
 }
 /// Remove snapshot images committed for this universe. Never forced: an image still used
 /// by a container or by a dependent image, or without journal provenance, is retained and reported.
 fn remove_snapshots(db: &Connection, uuid: &str) -> Result<(Vec<String>, Vec<Value>), Error> {
     let (mut removed, mut retained) = (vec![], vec![]);
-    for i in images()?.iter().filter(|i| i["Labels"][SNAPSHOT_FOR].as_str() == Some(uuid)) {
+    for i in images()?
+        .iter()
+        .filter(|i| i["Labels"][SNAPSHOT_FOR].as_str() == Some(uuid))
+    {
         let id = image_id(i).to_string();
         let tags = names(i);
         if tags.iter().any(|n| !n.starts_with(SNAPSHOT_REPOSITORY)) {
@@ -1084,7 +1282,11 @@ fn remove_snapshots(db: &Connection, uuid: &str) -> Result<(Vec<String>, Vec<Val
             retained.push(json!({"image":id,"reason":"snapshot provenance does not match this host's journal"}));
             continue;
         }
-        let targets = if tags.is_empty() { vec![id.as_str()] } else { tags };
+        let targets = if tags.is_empty() {
+            vec![id.as_str()]
+        } else {
+            tags
+        };
         let mut args = vec!["image", "rm"];
         args.extend(targets);
         match podman(QUICK, &args) {
