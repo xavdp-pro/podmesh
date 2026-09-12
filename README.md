@@ -30,7 +30,7 @@ See [the intent](INTENT.md), [delivery checklist](docs/DELIVERY-CHECKLIST.md), a
 
 ## Debian delivery
 
-[deb.xavdp.pro](https://deb.xavdp.pro) hosts the signed experimental APT repository. The initial PodMesh package is available for Debian 13 amd64; stable and other architectures are not yet validated.
+[deb.xavdp.pro](https://deb.xavdp.pro) hosts the signed experimental APT repository. The published package is `0.1.0~experimental5` for Debian 13 amd64. The repository keeps one version per suite, so an earlier package is reinstallable only from a host's own APT cache. Stable and other architectures are not validated.
 
 The delivery objective is an installable dependency chain for the complete supported system. Publish project-specific components and required patched runtime packages with explicit versions, dependencies, conflicts and rollback instructions. Use Debian's existing packages for ordinary dependencies rather than unnecessarily republishing them. The patched `podmesh-vzcriu` runtime and separate helper packages have been published and tested through experimental APT. A complete clean-host migration installation chain remains to qualify; the future backup service is not implemented.
 

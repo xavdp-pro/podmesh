@@ -39,6 +39,6 @@ The service records a machine identity to reject accidental state reuse on anoth
 
 ## Optional storage and transport
 
-LVM2, LVM thin, ZFS, Btrfs and WireGuard are planned optional capabilities. They are not requirements for the initial installation. Do not reformat an existing disk to install this package. Memory-preserving migration and the patched runtime installation chain remain experimental work outside the currently validated service scope.
+LVM2, LVM thin, ZFS, Btrfs and WireGuard are planned optional capabilities. They are not requirements for the initial installation. Do not reformat an existing disk to install this package. The patched migration runtime and its helper shim install from the same repository, and from `0.1.0~experimental5` the service package itself carries the experimental migration operations. They are qualified for one workload shape — Alpine, musl, network-disabled, mount-free — between two hosts with identical kernel, runtime and image identity. A reservation is not fencing, and direct administration bypasses it: do not enable this pathway for ordinary workloads.
 
 For containers, Alpine is preferred where tested. That preference does not change the Debian host package target.
