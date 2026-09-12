@@ -2,7 +2,7 @@
 
 Owner: Xavier de Poorter, collaborating with OpenAI Codex and Claude Code.
 
-This is the central delivery tracker. Detailed contracts remain in INTENT.md, RUST-IMPLEMENTATION-PLAN.md, ACCEPTANCE-TEST-PLAN.md, BACKUP-SERVER.md and LVM-LAB-PLAN.md. A checked item records only the scope explicitly stated. Compilation, installation, runtime proof and independent review are separate gates.
+This is the central delivery tracker. Detailed contracts remain in INTENT.md, RUST-IMPLEMENTATION-PLAN.md, ACCEPTANCE-TEST-PLAN.md, MANAGER-HA-ACCEPTANCE.md, BACKUP-SERVER.md and LVM-LAB-PLAN.md. A checked item records only the scope explicitly stated. Compilation, installation, runtime proof and independent review are separate gates.
 
 ## Current collector qualification update
 
@@ -57,7 +57,7 @@ The historical milestone descriptions below retain their original scope. The cur
 - [x] Implement a read-only fractal forest model and console view from explicit manager relationship records only, with filters, conflict/cycle reporting and partial statistics. The local console now has a bounded optional loopback relationship adapter and a session-protected same-origin endpoint. It never infers logical parentage from Podman placement and keeps host inventory available when the relationship source is absent, stale or malformed. Fixture and gateway tests pass; no real manager relationship endpoint is deployed or qualified.
 - [x] Publish and qualify host-resource observer `0.1.0~observer2` on all three laboratory hosts through signed APT. Persistent observer state remained present; lifecycle daemon PIDs and complete rootful Podman inventories stayed unchanged; mutations were refused; live RAM, CPU/load and graph-root filesystem capacity reached the browser through the dedicated sockets. Package and binary hashes are recorded in `docs/WEB-OBSERVER-PACKAGING.md`.
 - [ ] Validate periodic coherent disk/memory recovery points and quantify rollback.
-- [ ] Test host loss, partition and reconnection; distinguish unreachable from stopped.
+- [ ] Test host loss, partition and reconnection; distinguish unreachable from stopped. The ordered evidence contract and fault catalogue are frozen in `docs/MANAGER-HA-ACCEPTANCE.md`; prepared scenarios are not passing evidence.
 - [ ] Prove exclusion before activating a replacement for an exclusive universe.
 - [ ] Test manager recovery and DNS/bootstrap dependencies.
 - [ ] Exercise governor/makers and child supervision across all three hosts.
