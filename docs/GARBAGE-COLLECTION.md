@@ -33,8 +33,10 @@ ownership decision with a filesystem deletion.
 
 The first version has two explicit modes:
 
-- **Plan / dry run:** calculate candidates, blockers and proposed effects. It makes
-  no Podman call, signal, database mutation, file deletion, or retention change.
+- **Plan / dry run:** calculate candidates, blockers and proposed effects. Bounded
+  read-only Podman inspection and its own operation/attempt/plan audit writes are
+  permitted. It makes no Podman mutation, signal, domain-state transition, file
+  deletion, or retention change. Audit writes do not authorize a later apply.
 - **Apply:** repeat every proof immediately before each effect, perform the bounded
   action, independently verify the result, and write an immutable operation record.
 
@@ -65,6 +67,8 @@ The collector must refuse a candidate when any of the following is true:
 - an evidence hold, investigation hold, or minimum retention interval applies;
 - a process cannot be proven by cgroup membership and start time to belong to the
   failed attempt;
+- a required graph-root or state-directory free-space observation fails, returns a
+  non-success status, or cannot be parsed; measured zero is distinct from unknown;
 - the operation attempts to delete a logical-history row, ownership tombstone,
   transfer outcome, evidence manifest, or audit record needed for future safety.
 
@@ -225,7 +229,8 @@ To make an error recoverable:
 
 The implementation is not accepted until it demonstrates all of the following:
 
-- dry run has no Podman events, no signals, no deletion and no state mutation;
+- dry run has no Podman events, signals, deletion or domain-state mutation; only
+  its operation, attempt and immutable plan audit records may be written;
 - apply refuses every open authorization, verified restore, running universe,
   uncertain identity and active evidence hold;
 - each terminal collection class succeeds only with the stated fresh proofs;
@@ -233,6 +238,13 @@ The implementation is not accepted until it demonstrates all of the following:
 - abort with `reclaim_processes: false` reports but does not kill;
 - verified reclaim proves cgroup membership/start time, no remaining cgroup/PID,
   container absence and measured graph-root recovery;
+- injected cgroup, `/proc`, and `df` producer failures reach the collector verdict
+  as explicit unknown facts, leave the effect/run unverified, and stop later
+  candidates;
+- a restore watchdog freezes no cgroup unless an exact immutable container ID is
+  attested by the current durable operation-attempt, authority, universe, name and
+  image markers plus exact conmon ID/name arguments; unrelated or ambiguous global
+  cgroups cause only the attempt's own transient scope to be stopped;
 - failed/incomplete reclaim remains visible and does not falsely claim recovered
   space;
 - retention collection retains a manifest and never removes an active or referenced

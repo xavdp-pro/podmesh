@@ -16,7 +16,7 @@
 //!   archives the reservation so that the universe is fully operable again.
 use crate::cleanup::{self, Bound};
 use crate::lifecycle::{self as lc, failure, Error};
-use crate::migration::{self as mg, Reservation, ABANDONED, RELEASED, RESTORED_LOCALLY};
+use crate::migration::{self as mg, Reservation, ABANDONED, COLLECTED, RELEASED, RESTORED_LOCALLY};
 use crate::restore as ds;
 use crate::transfer as tr;
 use rusqlite::Connection;
@@ -34,21 +34,32 @@ const SCOPE: &str = "experimental local restore: default rootful Podman store, t
 const NO_RESTART: &str = "nothing was started: the application is resumed only by migration_restore_local, and an ordinary start would begin it afresh without its checkpointed memory";
 /// States a reservation can be released from, abandoned from, and locally restored from.
 const RELEASABLE: [&str; 2] = ["checkpointed", "checkpoint_failed"];
-const ABANDONABLE: [&str; 4] = ["reserved", "checkpointing", "checkpoint_failed", "checkpointed"];
+const ABANDONABLE: [&str; 4] = [
+    "reserved",
+    "checkpointing",
+    "checkpoint_failed",
+    "checkpointed",
+];
 
 fn scope_unit(id: &str) -> String {
     format!("podmesh-restore-local-{id}.scope")
 }
 /// Every transfer authorization ever recorded for this reservation's checkpoint operation, whatever its
 /// state. One is enough to refuse a release or an abandonment for good.
-fn authorizations_issued(db: &Connection, uuid: &str, checkpoint: &str) -> Result<Vec<Value>, Error> {
+fn authorizations_issued(
+    db: &Connection,
+    uuid: &str,
+    checkpoint: &str,
+) -> Result<Vec<Value>, Error> {
     let mut stmt = db.prepare(
         "SELECT authorization_id,state,destination_host_uuid FROM migration_authorizations
          WHERE universe_uuid=?1 AND checkpoint_operation_id=?2 ORDER BY created_at",
     )?;
     let rows = stmt.query_map(rusqlite::params![uuid, checkpoint], |r| {
-        Ok(json!({"authorization_id": r.get::<_, String>(0)?, "state": r.get::<_, String>(1)?,
-            "destination_host_uuid": r.get::<_, String>(2)?}))
+        Ok(
+            json!({"authorization_id": r.get::<_, String>(0)?, "state": r.get::<_, String>(1)?,
+            "destination_host_uuid": r.get::<_, String>(2)?}),
+        )
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
@@ -59,7 +70,10 @@ fn kept_checkpoint(c: &Value) -> Option<PathBuf> {
         return None;
     }
     let checkpoint = Path::new(dir).join("checkpoint");
-    checkpoint.join("inventory.img").is_file().then_some(checkpoint)
+    checkpoint
+        .join("inventory.img")
+        .is_file()
+        .then_some(checkpoint)
 }
 fn directory_bytes(dir: &Path) -> u64 {
     Command::new("/usr/bin/du")
@@ -78,9 +92,15 @@ fn directory_bytes(dir: &Path) -> u64 {
 /// Whether a verified `migration_restore_local` of this host binds this universe to this container ID.
 /// A container restored from the preserved archive carries the original creation label but a new ID, so
 /// its ownership is the verified local restore, exactly as an imported restore's is on a destination.
-pub(crate) fn restored_locally(db: &Connection, uuid: &str, container_id: &str) -> Result<bool, Error> {
+pub(crate) fn restored_locally(
+    db: &Connection,
+    uuid: &str,
+    container_id: &str,
+) -> Result<bool, Error> {
     // The ID is hexadecimal, so LIKE only narrows the scan; each candidate is then checked exactly.
-    let mut stmt = db.prepare("SELECT request,result FROM operations WHERE status='verified' AND result LIKE ?1")?;
+    let mut stmt = db.prepare(
+        "SELECT request,result FROM operations WHERE status='verified' AND result LIKE ?1",
+    )?;
     let rows = stmt.query_map([format!("%{container_id}%")], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
     })?;
@@ -146,7 +166,12 @@ fn release_blockers(r: &Reservation, o: &Observed, issued: &[Value]) -> Vec<Stri
     }
     blockers
 }
-fn abandon_blockers(r: &Reservation, o: &Observed, issued: &[Value], elsewhere: bool) -> Vec<String> {
+fn abandon_blockers(
+    r: &Reservation,
+    o: &Observed,
+    issued: &[Value],
+    elsewhere: bool,
+) -> Vec<String> {
     let mut blockers = vec![];
     if !ABANDONABLE.contains(&r.state.as_str()) {
         blockers.push(format!(
@@ -170,11 +195,18 @@ fn abandon_blockers(r: &Reservation, o: &Observed, issued: &[Value], elsewhere: 
     }
     blockers
 }
-fn restore_local_blockers(r: &Reservation, o: &Observed, artifacts: &Value, elsewhere: bool) -> Vec<String> {
+fn restore_local_blockers(
+    r: &Reservation,
+    o: &Observed,
+    artifacts: &Value,
+    elsewhere: bool,
+) -> Vec<String> {
     let mut blockers = vec![];
-    if r.state != RELEASED {
+    // A collected reservation is a released one the garbage collector settled on proof: the contract's
+    // class 1 says a later local memory restore stays a separate explicit operation, so it stays available.
+    if r.state != RELEASED && r.state != COLLECTED {
         blockers.push(format!(
-            "the reservation is in state {}; a local restore resumes a released reservation, so migration_release comes first",
+            "the reservation is in state {}; a local restore resumes a released reservation, so migration_release comes first, or a garbage collection that ends a terminal one",
             r.state
         ));
     }
@@ -268,7 +300,13 @@ fn artifacts_of(r: &Reservation) -> Result<Value, Error> {
     )
 }
 
-pub(crate) fn release(db: &Connection, id: &str, uuid: &str, checkpoint: &str, existing: Option<Value>) -> Result<Value, Error> {
+pub(crate) fn release(
+    db: &Connection,
+    id: &str,
+    uuid: &str,
+    checkpoint: &str,
+    existing: Option<Value>,
+) -> Result<Value, Error> {
     let r = reserved(db, uuid, checkpoint)?;
     let issued = authorizations_issued(db, uuid, checkpoint)?;
     let o = observe(&r, existing.as_ref());
@@ -306,7 +344,13 @@ pub(crate) fn release(db: &Connection, id: &str, uuid: &str, checkpoint: &str, e
     }))
 }
 
-pub(crate) fn abandon(db: &Connection, id: &str, uuid: &str, checkpoint: &str, existing: Option<Value>) -> Result<Value, Error> {
+pub(crate) fn abandon(
+    db: &Connection,
+    id: &str,
+    uuid: &str,
+    checkpoint: &str,
+    existing: Option<Value>,
+) -> Result<Value, Error> {
     let r = reserved(db, uuid, checkpoint)?;
     let issued = authorizations_issued(db, uuid, checkpoint)?;
     let o = observe(&r, existing.as_ref());
@@ -359,37 +403,64 @@ fn verify(
         return Err("the container does not carry the universe label".into());
     }
     if in_place && c["Id"].as_str() != Some(r.container_id.as_str()) {
-        return Err("the container is not the reserved one, which an in-place restore never replaces".into());
+        return Err(
+            "the container is not the reserved one, which an in-place restore never replaces"
+                .into(),
+        );
     }
     if lc::status(c) != "running" || !lc::process_active(c) {
-        return Err(format!("the container is not running (state {})", lc::status(c)));
+        return Err(format!(
+            "the container is not running (state {})",
+            lc::status(c)
+        ));
     }
     // Podman keeps reporting a running container whose cgroup this service froze, because the freeze
     // goes to the kernel and not through Podman's own bookkeeping. A suspended universe is not restored.
     if cleanup::frozen(c["Id"].as_str().unwrap_or("")) {
-        return Err("the container's cgroup is frozen: the universe is suspended, not running".into());
+        return Err(
+            "the container's cgroup is frozen: the universe is suspended, not running".into(),
+        );
     }
     if c["State"]["Restored"] != true {
         return Err("Podman does not report the container as restored".into());
     }
-    if !c["State"]["RestoredAt"].as_str().and_then(lc::epoch).is_some_and(|t| t >= since) {
+    if !c["State"]["RestoredAt"]
+        .as_str()
+        .and_then(lc::epoch)
+        .is_some_and(|t| t >= since)
+    {
         return Err("the container was not restored after this operation began".into());
     }
-    if !in_place && !c["Created"].as_str().and_then(lc::epoch).is_some_and(|t| t >= since) {
+    if !in_place
+        && !c["Created"]
+            .as_str()
+            .and_then(lc::epoch)
+            .is_some_and(|t| t >= since)
+    {
         return Err("the container was not created after this operation began".into());
     }
     if c["Image"].as_str().map(|i| i.trim_start_matches("sha256:")) != Some(r.image_id.as_str()) {
         return Err("the container image is not the image recorded by the reservation".into());
     }
-    if c["HostConfig"]["NetworkMode"].as_str() != Some("none") || c["Mounts"].as_array().map(|m| !m.is_empty()).unwrap_or(true) {
+    if c["HostConfig"]["NetworkMode"].as_str() != Some("none")
+        || c["Mounts"]
+            .as_array()
+            .map(|m| !m.is_empty())
+            .unwrap_or(true)
+    {
         return Err("the container is not network-disabled and mount-free".into());
     }
     if !preserved {
         return Err("the CRIU restore log is unavailable".into());
     }
     let text = fs::read_to_string(log).unwrap_or_default();
-    if !text.contains(&format!("(gitid {})", mg::RUNTIME_GIT_ID)) || !text.contains("Restore finished successfully") {
-        return Err("the restore log does not show a successful restore by the qualified private runtime".into());
+    if !text.contains(&format!("(gitid {})", mg::RUNTIME_GIT_ID))
+        || !text.contains("Restore finished successfully")
+    {
+        return Err(
+            "the restore log does not show a successful restore by the qualified private runtime"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -448,7 +519,13 @@ pub(crate) fn restore_local(
             .saturating_mul(2)
             .saturating_add(mg::SPACE_MARGIN_BYTES),
     };
-    let available = mg::available_bytes(Path::new(&graph_root));
+    let available = mg::available_bytes(Path::new(&graph_root)).map_err(|error| {
+        failure(
+            format!("Available space under {graph_root} could not be observed: {error}; nothing was restored"),
+            json!({"reservation": r.view(), "graph_root": {"path": graph_root,
+                "known": false, "available_bytes": Value::Null, "error": error.to_string()}}),
+        )
+    })?;
     if available < required {
         return Err(failure(
             format!("{available} bytes available under {graph_root}, {required} required; nothing was restored"),
@@ -456,20 +533,36 @@ pub(crate) fn restore_local(
         ));
     }
     let since = crate::now() as i64;
+    // The reservation keeps the state the restore started from: a collected reservation stays collected
+    // whatever this attempt does, and only a verified restore archives it.
+    let from = r.state.clone();
     mg::merge_state(
         db,
         uuid,
-        RELEASED,
+        &from,
         &json!({"local_restore_attempt": attempt, "local_restore_operation": id, "local_restore_started_at": since,
             "local_restore_source": if in_place { "kept_checkpoint_files" } else { "preserved_archive" }}),
     )?;
-    let open = |path: &Path| fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path);
+    let open = |path: &Path| {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    };
     let stdout = open(&dir.join(format!("restore-local-attempt-{attempt}.stdout")))?;
     let stderr = open(&dir.join(format!("restore-local-attempt-{attempt}.stderr")))?;
     let import = format!("--import={}", dir.join(mg::ARCHIVE).display());
     let arguments: Vec<&str> = if in_place {
         // In place: the same container ID resumes from the files Podman kept for it.
-        vec!["container", "restore", "--keep", "--file-locks", "--print-stats", &r.container_id]
+        vec![
+            "container",
+            "restore",
+            "--keep",
+            "--file-locks",
+            "--print-stats",
+            &r.container_id,
+        ]
     } else {
         vec![
             "container",
@@ -482,16 +575,49 @@ pub(crate) fn restore_local(
             "--print-stats",
         ]
     };
-    let bound = Bound::new(Path::new(&graph_root), required, &unit);
-    let (exit, mut prevention) = mg::scoped_podman(&unit, id, RESTORE_SECONDS, &arguments, stdout, stderr, Some(&bound))?;
+    let bound = Bound::new(
+        Path::new(&graph_root),
+        required,
+        &unit,
+        name,
+        uuid,
+        id,
+        attempt,
+        &r.operation_id,
+        &r.image_id,
+        since,
+        in_place.then_some(r.container_id.as_str()),
+    )?;
+    let (exit, mut prevention) = mg::scoped_podman(
+        &unit,
+        id,
+        RESTORE_SECONDS,
+        &arguments,
+        stdout,
+        stderr,
+        Some(&bound),
+    )?;
     let observed = lc::inspect(name)?;
-    cleanup::confirm_or_thaw(&mut prevention, observed.as_ref().and_then(|c| c["Id"].as_str()));
+    cleanup::confirm_or_thaw(
+        &mut prevention,
+        observed.as_ref().and_then(|c| c["Id"].as_str()),
+    );
     let log = dir.join(format!("restore-local-attempt-{attempt}.log"));
     let preserved = observed
         .as_ref()
         .is_some_and(|c| mg::copy_podman_log(c, "RestoreLog", "restore.log", &log));
-    if let Err(reason) = verify(&r, uuid, observed.as_ref(), &log, preserved, since, in_place) {
-        let stderr_tail = mg::read_bounded(&dir.join(format!("restore-local-attempt-{attempt}.stderr"))).unwrap_or_default();
+    if let Err(reason) = verify(
+        &r,
+        uuid,
+        observed.as_ref(),
+        &log,
+        preserved,
+        since,
+        in_place,
+    ) {
+        let stderr_tail =
+            mg::read_bounded(&dir.join(format!("restore-local-attempt-{attempt}.stderr")))
+                .unwrap_or_default();
         let leftovers = observed
             .as_ref()
             .and_then(|c| c["Id"].as_str())
@@ -500,11 +626,21 @@ pub(crate) fn restore_local(
         // attempt's own and nothing of it survives; otherwise everything is preserved and reported.
         let mut removed = Value::Null;
         if !in_place {
-            removed = remove_own_failed_container(db, uuid, name, observed.as_ref(), since, leftovers.as_ref())?;
+            removed = remove_own_failed_container(
+                db,
+                uuid,
+                name,
+                observed.as_ref(),
+                since,
+                leftovers.as_ref(),
+            )?;
         }
         // A freeze the bound applied stays applied: it is what stopped a runaway from writing, and only
         // an explicit reclaim ends those processes. It is reported so that no reader has to guess.
-        let frozen_now = observed.as_ref().and_then(|c| c["Id"].as_str()).map(cleanup::frozen);
+        let frozen_now = observed
+            .as_ref()
+            .and_then(|c| c["Id"].as_str())
+            .map(cleanup::frozen);
         let detail = json!({"container_cgroup_frozen_now": frozen_now,
             "reason": reason, "attempt": attempt, "exit_code": exit.code(), "in_place": in_place,
             "observed": observed.as_ref().map(lc::state_view), "restored": observed.as_ref().map(|c| c["State"]["Restored"].clone()),
@@ -515,9 +651,14 @@ pub(crate) fn restore_local(
             &dir.join(format!("local-restore-failure-attempt-{attempt}.json")),
             serde_json::to_string_pretty(&detail)?.as_bytes(),
         )?;
-        mg::merge_state(db, uuid, RELEASED, &json!({"local_restore_failed": detail.clone()}))?;
+        mg::merge_state(
+            db,
+            uuid,
+            &from,
+            &json!({"local_restore_failed": detail.clone()}),
+        )?;
         return Err(failure(
-            format!("The local restore could not be verified: {reason}; the reservation stays released and the diagnostics are preserved"),
+            format!("The local restore could not be verified: {reason}; the reservation stays {from} and the diagnostics are preserved"),
             detail,
         ));
     }
@@ -569,14 +710,20 @@ fn remove_own_failed_container(
         return Ok(json!({"action": "none_absent"}));
     };
     let container_id = c["Id"].as_str().unwrap_or("").to_string();
-    let refuse = |reason: &str| Ok(json!({"action": "kept", "reason": reason, "container_id": container_id}));
+    let refuse = |reason: &str| {
+        Ok(json!({"action": "kept", "reason": reason, "container_id": container_id}))
+    };
     if c["Config"]["Labels"][UNIVERSE_LABEL].as_str() != Some(uuid) {
         return refuse("the container under the universe name is not labelled for this universe, so this attempt did not create it");
     }
     if lc::process_active(c) {
         return refuse("the container is running; it is not removed");
     }
-    if !c["Created"].as_str().and_then(lc::epoch).is_some_and(|t| t >= since) {
+    if !c["Created"]
+        .as_str()
+        .and_then(lc::epoch)
+        .is_some_and(|t| t >= since)
+    {
         return refuse("the container predates this attempt");
     }
     if ds::verified_owner(db, &container_id)? {
@@ -589,7 +736,44 @@ fn remove_own_failed_container(
     }
     lc::podman(lc::QUICK, &["rm", &container_id])?;
     if lc::inspect(name)?.is_some() {
-        return Err("The container of the failed local restore is still present after removal".into());
+        return Err(
+            "The container of the failed local restore is still present after removal".into(),
+        );
     }
     Ok(json!({"action": "removed", "container_id": container_id}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collected_reservation_keeps_the_explicit_local_restore_path() {
+        let reservation = Reservation {
+            operation_id: "checkpoint-1".into(),
+            container_id: "original-container".into(),
+            image_id: "image".into(),
+            source_host: "source".into(),
+            destination: "destination".into(),
+            started_at: "started".into(),
+            state: COLLECTED.into(),
+            created_at: 1,
+            updated_at: 2,
+            detail: None,
+        };
+        let observed = Observed {
+            named: None,
+            same: false,
+            running: false,
+            checkpointed: false,
+            kept: None,
+        };
+        let blockers = restore_local_blockers(
+            &reservation,
+            &observed,
+            &json!({"archive_sha256_matches": true}),
+            false,
+        );
+        assert!(blockers.is_empty());
+    }
 }

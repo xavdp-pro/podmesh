@@ -77,7 +77,9 @@ impl Claim {
 fn claim(db: &Connection, authorization: &str) -> Result<Option<Claim>, Error> {
     Ok(db
         .query_row(
-            &format!("SELECT {CLAIM_COLUMNS} FROM migration_restore_claims WHERE authorization_id=?1"),
+            &format!(
+                "SELECT {CLAIM_COLUMNS} FROM migration_restore_claims WHERE authorization_id=?1"
+            ),
             [authorization],
             claim_row,
         )
@@ -88,7 +90,9 @@ pub(crate) fn claims_view(db: &Connection, uuid: &str) -> Result<Vec<Value>, Err
         "SELECT {CLAIM_COLUMNS} FROM migration_restore_claims WHERE universe_uuid=?1 ORDER BY created_at, authorization_id"
     ))?;
     let rows = stmt.query_map([uuid], claim_row)?;
-    Ok(rows.map(|k| k.map(|k| k.view())).collect::<Result<Vec<_>, _>>()?)
+    Ok(rows
+        .map(|k| k.map(|k| k.view()))
+        .collect::<Result<Vec<_>, _>>()?)
 }
 /// A claim that is neither verified nor closed: it may hold a container created by its restore.
 pub(crate) fn unresolved_claim(db: &Connection, uuid: &str) -> Result<Option<Value>, Error> {
@@ -103,7 +107,13 @@ pub(crate) fn unresolved_claim(db: &Connection, uuid: &str) -> Result<Option<Val
         .optional()?
         .map(|k| k.view()))
 }
-fn merge_claim(db: &Connection, authorization: &str, state: &str, container: Option<&str>, patch: &Value) -> Result<(), Error> {
+fn merge_claim(
+    db: &Connection,
+    authorization: &str,
+    state: &str,
+    container: Option<&str>,
+    patch: &Value,
+) -> Result<(), Error> {
     let k = claim(db, authorization)?.ok_or("Restore claim not found")?;
     let mut detail = k.detail_value();
     if let (Some(d), Some(p)) = (detail.as_object_mut(), patch.as_object()) {
@@ -129,7 +139,11 @@ fn restore_unit(id: &str) -> String {
 }
 
 /// Whether a verified migration_restore on this host binds this universe to this container ID.
-pub(crate) fn restored_here(db: &Connection, uuid: &str, container_id: &str) -> Result<bool, Error> {
+pub(crate) fn restored_here(
+    db: &Connection,
+    uuid: &str,
+    container_id: &str,
+) -> Result<bool, Error> {
     mg::ensure_schema(db)?;
     let row: Option<(String, Option<String>)> = db
         .query_row(
@@ -159,7 +173,9 @@ pub(crate) fn verified_owner(db: &Connection, container_id: &str) -> Result<bool
         return Ok(true);
     }
     // The ID is hexadecimal, so LIKE only narrows the scan; each candidate is checked exactly.
-    let mut stmt = db.prepare("SELECT request,result FROM operations WHERE status='verified' AND result LIKE ?1")?;
+    let mut stmt = db.prepare(
+        "SELECT request,result FROM operations WHERE status='verified' AND result LIKE ?1",
+    )?;
     let rows = stmt.query_map([format!("%{container_id}%")], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
     })?;
@@ -224,10 +240,14 @@ fn load_handoff(authorization: &str) -> Result<Handoff, Error> {
     {
         malformed.push("archive");
     }
-    if v["manifest"]["file"] != mg::MANIFEST || !tr::is_sha256(v["manifest"]["sha256"].as_str().unwrap_or("")) {
+    if v["manifest"]["file"] != mg::MANIFEST
+        || !tr::is_sha256(v["manifest"]["sha256"].as_str().unwrap_or(""))
+    {
         malformed.push("manifest");
     }
-    if v["runtime"]["git_id"].as_str().is_none() || !tr::is_sha256(v["runtime"]["binary_sha256"].as_str().unwrap_or("")) {
+    if v["runtime"]["git_id"].as_str().is_none()
+        || !tr::is_sha256(v["runtime"]["binary_sha256"].as_str().unwrap_or(""))
+    {
         malformed.push("runtime");
     }
     if s("kernel_release").is_empty() {
@@ -240,7 +260,11 @@ fn load_handoff(authorization: &str) -> Result<Handoff, Error> {
         ));
     }
     let sha256 = mg::sha256_bytes(&bytes)?;
-    Ok(Handoff { value: v, bytes, sha256 })
+    Ok(Handoff {
+        value: v,
+        bytes,
+        sha256,
+    })
 }
 fn labelled(uuid: &str) -> Result<Vec<Value>, Error> {
     Ok(tr::all_containers()?
@@ -251,7 +275,9 @@ fn labelled(uuid: &str) -> Result<Vec<Value>, Error> {
 }
 /// The destination's fresh observation recorded in an outcome.
 fn observation(uuid: &str) -> Result<Value, Error> {
-    Ok(json!({"observed_at": crate::now(), "universe_container": lc::observe(uuid)?, "labelled_containers": labelled(uuid)?}))
+    Ok(
+        json!({"observed_at": crate::now(), "universe_container": lc::observe(uuid)?, "labelled_containers": labelled(uuid)?}),
+    )
 }
 /// Uncompressed size of the zstd archive, streamed through the distribution zstd under a bound.
 pub(crate) fn uncompressed_bytes(archive: &Path) -> Result<u64, Error> {
@@ -272,7 +298,10 @@ pub(crate) fn uncompressed_bytes(archive: &Path) -> Result<u64, Error> {
 /// command that produces more than the limit is killed and reported instead of being read to the end.
 fn bounded_output(command: &mut Command, limit: u64) -> Result<(bool, Vec<u8>), Error> {
     use std::io::Read;
-    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
     let mut bytes = Vec::new();
     let mut stdout = child.stdout.take().ok_or("command output unavailable")?;
     stdout.by_ref().take(limit).read_to_end(&mut bytes)?;
@@ -307,7 +336,10 @@ fn archive_contents(archive: &Path) -> Result<(Value, Vec<String>), Error> {
     }
     Ok((
         serde_json::from_slice(&config)?,
-        String::from_utf8_lossy(&listing).lines().map(str::to_string).collect(),
+        String::from_utf8_lossy(&listing)
+            .lines()
+            .map(str::to_string)
+            .collect(),
     ))
 }
 
@@ -318,17 +350,29 @@ struct Assessment {
 }
 /// Every destination precondition, freshly observed and without effect. `own` names the operation whose claim
 /// is being re-assessed, so that its own claim is not reported as a conflict.
-fn assess(db: &Connection, uuid: &str, authorization: &str, named: Option<&Value>, own: Option<&str>) -> Result<Assessment, Error> {
+fn assess(
+    db: &Connection,
+    uuid: &str,
+    authorization: &str,
+    named: Option<&Value>,
+    own: Option<&str>,
+) -> Result<Assessment, Error> {
     let host = mg::host_uuid(db)?;
     let h = load_handoff(authorization)?;
     let v = &h.value;
     let s = |k: &str| v[k].as_str().unwrap_or("");
     let mut blockers: Vec<String> = vec![];
     if s("universe_uuid") != uuid {
-        blockers.push(format!("the handoff is for universe {}, not {uuid}", s("universe_uuid")));
+        blockers.push(format!(
+            "the handoff is for universe {}, not {uuid}",
+            s("universe_uuid")
+        ));
     }
     if s("destination_host_uuid") != host {
-        blockers.push(format!("the handoff destination {} is not this host", s("destination_host_uuid")));
+        blockers.push(format!(
+            "the handoff destination {} is not this host",
+            s("destination_host_uuid")
+        ));
     }
     if s("source_host_uuid") == host {
         blockers.push("the handoff source is this host".into());
@@ -343,7 +387,10 @@ fn assess(db: &Connection, uuid: &str, authorization: &str, named: Option<&Value
     let labelled = labelled(uuid)?;
     let named_id = named.and_then(|c| c["Id"].as_str());
     for c in labelled.iter().filter(|c| c["id"].as_str() != named_id) {
-        blockers.push(format!("container {} carries this universe label", c["id"].as_str().unwrap_or("")));
+        blockers.push(format!(
+            "container {} carries this universe label",
+            c["id"].as_str().unwrap_or("")
+        ));
     }
     let reservation = mg::reservation(db, uuid)?;
     if let Some(ref r) = reservation {
@@ -384,7 +431,10 @@ fn assess(db: &Connection, uuid: &str, authorization: &str, named: Option<&Value
         ));
     }
     let runtime = mg::runtime_facts(&mut blockers);
-    let local_binary = runtime["sha256"][mg::RUNTIME_REAL].as_str().unwrap_or("").to_string();
+    let local_binary = runtime["sha256"][mg::RUNTIME_REAL]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
     if v["runtime"]["binary_sha256"].as_str() != Some(local_binary.as_str()) {
         blockers.push(format!(
             "the local runtime binary {local_binary} differs from the source runtime {}",
@@ -412,8 +462,10 @@ fn assess(db: &Connection, uuid: &str, authorization: &str, named: Option<&Value
     match tr::regular_file(&archive) {
         Ok(Some(size)) => {
             let sha = mg::sha256(&archive)?;
-            let intact = Some(sha.as_str()) == v["archive"]["sha256"].as_str() && Some(size) == v["archive"]["bytes"].as_u64();
-            archive_facts = json!({"present": true, "bytes": size, "sha256": sha, "matches_handoff": intact});
+            let intact = Some(sha.as_str()) == v["archive"]["sha256"].as_str()
+                && Some(size) == v["archive"]["bytes"].as_u64();
+            archive_facts =
+                json!({"present": true, "bytes": size, "sha256": sha, "matches_handoff": intact});
             if !intact {
                 blockers.push(format!(
                     "the archive in the inbox ({size} bytes, sha256 {sha}) does not match the handoff"
@@ -431,12 +483,16 @@ fn assess(db: &Connection, uuid: &str, authorization: &str, named: Option<&Value
                                 "the archive configuration does not name the handoff's source container, image and universe label".into(),
                             );
                         }
-                        let missing: Vec<&str> = ["config.dump", "spec.dump", "checkpoint/inventory.img"]
-                            .into_iter()
-                            .filter(|e| !entries.iter().any(|l| l == e))
-                            .collect();
+                        let missing: Vec<&str> =
+                            ["config.dump", "spec.dump", "checkpoint/inventory.img"]
+                                .into_iter()
+                                .filter(|e| !entries.iter().any(|l| l == e))
+                                .collect();
                         if !missing.is_empty() {
-                            blockers.push(format!("the archive lacks expected entries: {}", missing.join(", ")));
+                            blockers.push(format!(
+                                "the archive lacks expected entries: {}",
+                                missing.join(", ")
+                            ));
                         }
                         archive_facts["config"] = json!({"container_id": config["id"], "image_id": config["rootfsImageID"],
                             "universe_label": label, "create_network_namespace": config["createNetNS"], "entries": entries.len()});
@@ -463,28 +519,48 @@ fn assess(db: &Connection, uuid: &str, authorization: &str, named: Option<&Value
             let intact = Some(sha.as_str()) == v["manifest"]["sha256"].as_str();
             manifest_facts = json!({"present": true, "sha256": sha, "matches_handoff": intact});
             if !intact {
-                blockers.push(format!("the manifest in the inbox (sha256 {sha}) does not match the handoff"));
+                blockers.push(format!(
+                    "the manifest in the inbox (sha256 {sha}) does not match the handoff"
+                ));
             } else {
                 let m: Value = serde_json::from_slice(&fs::read(&manifest)?).unwrap_or(Value::Null);
                 for (field, agrees) in [
-                    ("operation_id", m["operation_id"].as_str() == Some(s("checkpoint_operation_id"))),
-                    ("universe_uuid", m["universe_uuid"].as_str() == Some(s("universe_uuid"))),
-                    ("container_id", m["container_id"].as_str() == Some(s("source_container_id"))),
+                    (
+                        "operation_id",
+                        m["operation_id"].as_str() == Some(s("checkpoint_operation_id")),
+                    ),
+                    (
+                        "universe_uuid",
+                        m["universe_uuid"].as_str() == Some(s("universe_uuid")),
+                    ),
+                    (
+                        "container_id",
+                        m["container_id"].as_str() == Some(s("source_container_id")),
+                    ),
                     ("image_id", m["image_id"].as_str() == Some(image)),
-                    ("source_host_uuid", m["source_host_uuid"].as_str() == Some(s("source_host_uuid"))),
+                    (
+                        "source_host_uuid",
+                        m["source_host_uuid"].as_str() == Some(s("source_host_uuid")),
+                    ),
                     (
                         "destination_host_uuid",
                         m["destination_host_uuid"].as_str() == Some(s("destination_host_uuid")),
                     ),
                     (
                         "archive",
-                        m["archive"]["sha256"] == v["archive"]["sha256"] && m["archive"]["bytes"] == v["archive"]["bytes"],
+                        m["archive"]["sha256"] == v["archive"]["sha256"]
+                            && m["archive"]["bytes"] == v["archive"]["bytes"],
                     ),
-                    ("runtime", m["runtime"]["sha256"][mg::RUNTIME_REAL] == v["runtime"]["binary_sha256"]),
+                    (
+                        "runtime",
+                        m["runtime"]["sha256"][mg::RUNTIME_REAL] == v["runtime"]["binary_sha256"],
+                    ),
                     ("kernel", m["runtime"]["kernel"] == v["kernel_release"]),
                 ] {
                     if !agrees {
-                        blockers.push(format!("the manifest disagrees with the handoff on {field}"));
+                        blockers.push(format!(
+                            "the manifest disagrees with the handoff on {field}"
+                        ));
                     }
                 }
             }
@@ -492,13 +568,33 @@ fn assess(db: &Connection, uuid: &str, authorization: &str, named: Option<&Value
         Ok(None) => blockers.push("the manifest is missing from the inbox".into()),
         Err(e) => blockers.push(format!("the manifest in the inbox is unusable: {e}")),
     }
-    let state_required = v["archive"]["bytes"].as_u64().unwrap_or(0).saturating_add(mg::SPACE_MARGIN_BYTES);
-    let state_available = mg::available_bytes(mg::base()?);
-    if state_available < state_required {
-        blockers.push(format!(
-            "{state_available} bytes available under the state directory, {state_required} required"
-        ));
-    }
+    let state_required = v["archive"]["bytes"]
+        .as_u64()
+        .unwrap_or(0)
+        .saturating_add(mg::SPACE_MARGIN_BYTES);
+    let state_path = mg::base()?;
+    let (state_available, state_observation) = match mg::available_bytes(state_path) {
+        Ok(available) => {
+            if available < state_required {
+                blockers.push(format!(
+                    "{available} bytes available under the state directory, {state_required} required"
+                ));
+            }
+            (
+                json!(available),
+                json!({"known": true, "available_bytes": available}),
+            )
+        }
+        Err(error) => {
+            blockers.push(format!(
+                "available bytes under the state directory could not be observed: {error}"
+            ));
+            (
+                Value::Null,
+                json!({"known": false, "available_bytes": Value::Null, "error": error.to_string()}),
+            )
+        }
+    };
     let graph_root = lc::podman(lc::QUICK, &["info", "--format", "{{.Store.GraphRoot}}"])?
         .trim()
         .to_string();
@@ -509,20 +605,41 @@ fn assess(db: &Connection, uuid: &str, authorization: &str, named: Option<&Value
         ));
     }
     // Podman extracts the archive into the new container's storage and keeps the restore files (--keep).
-    let graph_required = uncompressed.unwrap_or(0).saturating_mul(2).saturating_add(mg::SPACE_MARGIN_BYTES);
-    let graph_available = mg::available_bytes(Path::new(&graph_root));
-    if graph_available < graph_required {
-        blockers.push(format!(
-            "{graph_available} bytes available under {graph_root}, {graph_required} required"
-        ));
-    }
+    let graph_required = uncompressed
+        .unwrap_or(0)
+        .saturating_mul(2)
+        .saturating_add(mg::SPACE_MARGIN_BYTES);
+    let (graph_available, graph_observation) = match mg::available_bytes(Path::new(&graph_root)) {
+        Ok(available) => {
+            if available < graph_required {
+                blockers.push(format!(
+                    "{available} bytes available under {graph_root}, {graph_required} required"
+                ));
+            }
+            (
+                json!(available),
+                json!({"known": true, "available_bytes": available}),
+            )
+        }
+        Err(error) => {
+            blockers.push(format!(
+                "available bytes under {graph_root} could not be observed: {error}"
+            ));
+            (
+                Value::Null,
+                json!({"known": false, "available_bytes": Value::Null, "error": error.to_string()}),
+            )
+        }
+    };
     let facts = json!({
         "observed_at": crate::now(), "host_uuid": host, "authorization_id": authorization, "handoff_sha256": h.sha256,
         "handoff": v, "name_occupied_by": named.map(lc::state_view), "labelled_containers": labelled,
         "reservation": reservation.as_ref().map(|r| r.view()), "image_present": image_present, "runtime": runtime,
         "archive": archive_facts, "manifest": manifest_facts,
-        "space": {"state_directory": {"available_bytes": state_available, "required_bytes": state_required},
-                  "graph_root": {"path": graph_root, "available_bytes": graph_available, "required_bytes": graph_required}},
+        "space": {"state_directory": {"available_bytes": state_available, "required_bytes": state_required,
+                      "observation": state_observation},
+                  "graph_root": {"path": graph_root, "available_bytes": graph_available,
+                      "required_bytes": graph_required, "observation": graph_observation}},
     });
     Ok(Assessment {
         handoff: h,
@@ -531,7 +648,12 @@ fn assess(db: &Connection, uuid: &str, authorization: &str, named: Option<&Value
     })
 }
 
-pub(crate) fn preflight(db: &Connection, uuid: &str, authorization: &str, existing: Option<Value>) -> Result<Value, Error> {
+pub(crate) fn preflight(
+    db: &Connection,
+    uuid: &str,
+    authorization: &str,
+    existing: Option<Value>,
+) -> Result<Value, Error> {
     let a = assess(db, uuid, authorization, existing.as_ref(), None)?;
     Ok(json!({
         "status": "verified", "operation": "migration_destination_preflight", "universe_uuid": uuid, "authorization_id": authorization,
@@ -630,7 +752,10 @@ pub(crate) fn restore(
             now
         ],
     )?;
-    mg::write_private(&dir.join("preflight.json"), serde_json::to_string_pretty(&a.facts)?.as_bytes())?;
+    mg::write_private(
+        &dir.join("preflight.json"),
+        serde_json::to_string_pretty(&a.facts)?.as_bytes(),
+    )?;
     let k = claim(db, authorization)?.ok_or("Restore claim not persisted")?;
     let graph = a.facts["space"]["graph_root"].clone();
     launch(db, attempt, id, uuid, name, &k, &dir, false, &graph)
@@ -649,17 +774,42 @@ fn launch(
     graph: &Value,
 ) -> Result<Value, Error> {
     // Durable before the command can start: a claim without this mark never reached Podman.
-    merge_claim(db, &k.authorization_id, "restoring", None, &json!({"launched_attempt": attempt}))?;
-    let open = |path: &Path| fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path);
+    merge_claim(
+        db,
+        &k.authorization_id,
+        "restoring",
+        None,
+        &json!({"launched_attempt": attempt}),
+    )?;
+    let open = |path: &Path| {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    };
     let stdout = open(&dir.join(format!("restore-attempt-{attempt}.stdout")))?;
     let stderr = open(&dir.join(format!("restore-attempt-{attempt}.stderr")))?;
     let import = format!("--import={}", dir.join(mg::ARCHIVE).display());
     let unit = restore_unit(id);
     // The attempt may consume what its own preflight required of the graph root, and no more: a restore
     // of a damaged archive was measured writing about 20 MB/s without the command ever returning.
-    let bound = graph["path"]
-        .as_str()
-        .map(|p| Bound::new(Path::new(p), graph["required_bytes"].as_u64().unwrap_or(0), &unit));
+    let bound = match graph["path"].as_str() {
+        Some(path) => Some(Bound::new(
+            Path::new(path),
+            graph["required_bytes"].as_u64().unwrap_or(0),
+            &unit,
+            name,
+            uuid,
+            id,
+            attempt,
+            &k.authorization_id,
+            &k.image_id,
+            k.created_at,
+            None,
+        )?),
+        None => None,
+    };
     let exit = mg::scoped_podman(
         &unit,
         id,
@@ -682,51 +832,94 @@ fn launch(
         Err(e) => {
             // The command was never started: Podman did not begin restoring.
             let detail = json!({"reason": format!("the restore command could not be started: {e}"), "attempt": attempt});
-            close(db, &k.authorization_id, id, None, &detail, observation(uuid)?)?;
+            close(
+                db,
+                &k.authorization_id,
+                id,
+                None,
+                &detail,
+                observation(uuid)?,
+            )?;
             Err(failure(
                 "The restore command could not be started; this host recorded not_restored and wrote the outcome",
                 detail,
             ))
         }
-        Ok((status, prevention)) => finalize(db, attempt, attempt, id, uuid, name, k, dir, status.code(), resumed, prevention),
+        Ok((status, prevention)) => finalize(
+            db,
+            attempt,
+            attempt,
+            id,
+            uuid,
+            name,
+            k,
+            dir,
+            status.code(),
+            resumed,
+            prevention,
+        ),
     }
 }
 
 /// Verified only when Podman shows the universe container created after this claim, running, restored,
 /// network-disabled and mount-free, from the handoff image, and its preserved CRIU restore log shows a successful
 /// restore by the qualified private runtime. The command's exit code alone proves nothing.
-fn verify(k: &Claim, observed: Option<&Value>, log: &Path, log_preserved: bool) -> Result<(), String> {
+fn verify(
+    k: &Claim,
+    observed: Option<&Value>,
+    log: &Path,
+    log_preserved: bool,
+) -> Result<(), String> {
     let c = observed.ok_or("the universe container is absent")?;
     if c["Config"]["Labels"][UNIVERSE_LABEL].as_str() != Some(k.universe_uuid.as_str()) {
         return Err("the container does not carry the handoff's universe label".into());
     }
     if lc::status(c) != "running" || !lc::process_active(c) {
-        return Err(format!("the container is not running (state {})", lc::status(c)));
+        return Err(format!(
+            "the container is not running (state {})",
+            lc::status(c)
+        ));
     }
     // Podman keeps reporting a running container whose cgroup the bound froze, because the freeze goes
     // to the kernel and not through Podman's own bookkeeping. A suspended universe is not restored.
     if cleanup::frozen(c["Id"].as_str().unwrap_or("")) {
-        return Err("the container's cgroup is frozen: the universe is suspended, not running".into());
+        return Err(
+            "the container's cgroup is frozen: the universe is suspended, not running".into(),
+        );
     }
     if c["State"]["Restored"] != true {
         return Err("Podman does not report the container as restored".into());
     }
-    let after_claim = |v: &Value| v.as_str().and_then(lc::epoch).is_some_and(|t| t >= k.created_at);
+    let after_claim = |v: &Value| {
+        v.as_str()
+            .and_then(lc::epoch)
+            .is_some_and(|t| t >= k.created_at)
+    };
     if !after_claim(&c["Created"]) || !after_claim(&c["State"]["RestoredAt"]) {
         return Err("the container was not created and restored after this claim".into());
     }
     if c["Image"].as_str().map(|i| i.trim_start_matches("sha256:")) != Some(k.image_id.as_str()) {
         return Err("the container image is not the handoff image".into());
     }
-    if c["HostConfig"]["NetworkMode"].as_str() != Some("none") || c["Mounts"].as_array().map(|m| !m.is_empty()).unwrap_or(true) {
+    if c["HostConfig"]["NetworkMode"].as_str() != Some("none")
+        || c["Mounts"]
+            .as_array()
+            .map(|m| !m.is_empty())
+            .unwrap_or(true)
+    {
         return Err("the container is not network-disabled and mount-free".into());
     }
     if !log_preserved {
         return Err("the CRIU restore log is unavailable".into());
     }
     let text = fs::read_to_string(log).unwrap_or_default();
-    if !text.contains(&format!("(gitid {})", mg::RUNTIME_GIT_ID)) || !text.contains("Restore finished successfully") {
-        return Err("the restore log does not show a successful restore by the qualified private runtime".into());
+    if !text.contains(&format!("(gitid {})", mg::RUNTIME_GIT_ID))
+        || !text.contains("Restore finished successfully")
+    {
+        return Err(
+            "the restore log does not show a successful restore by the qualified private runtime"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -748,13 +941,24 @@ fn finalize(
     let observed = lc::inspect(name)?;
     // A freeze the bound applied is confirmed against the container this claim actually created, and
     // undone if it caught anything else.
-    cleanup::confirm_or_thaw(&mut prevention, observed.as_ref().and_then(|c| c["Id"].as_str()));
+    cleanup::confirm_or_thaw(
+        &mut prevention,
+        observed.as_ref().and_then(|c| c["Id"].as_str()),
+    );
     let log = dir.join(format!("restore-attempt-{launched}.log"));
     let log_preserved = observed
         .as_ref()
         .is_some_and(|c| mg::copy_podman_log(c, "RestoreLog", "restore.log", &log));
-    if let Err(reason) = verify(k, observed.as_ref(), &log, log_preserved) {
-        let stderr = mg::read_bounded(&dir.join(format!("restore-attempt-{launched}.stderr"))).unwrap_or_default();
+    let verification = verify(k, observed.as_ref(), &log, log_preserved).and_then(|_| {
+        if prevention["watched"] == true && prevention["measurement_known"] != true {
+            Err("the graph-root prevention measurement became unknown; restore success cannot be verified".into())
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(reason) = verification {
+        let stderr = mg::read_bounded(&dir.join(format!("restore-attempt-{launched}.stderr")))
+            .unwrap_or_default();
         let detail = json!({"reason": reason, "attempt": attempt, "launched_attempt": launched, "exit_code": exit,
             "observed": observed.as_ref().map(lc::state_view), "restored": observed.as_ref().map(|c| c["State"]["Restored"].clone()),
             "restore_log_preserved": log_preserved.then(|| log.display().to_string()), "stderr_tail": mg::tail(&stderr),
@@ -773,7 +977,10 @@ fn finalize(
         // has to be cleaned up. Nothing else is ever recorded here.
         let created_here = observed.as_ref().filter(|c| {
             c["Config"]["Labels"][UNIVERSE_LABEL].as_str() == Some(k.universe_uuid.as_str())
-                && c["Created"].as_str().and_then(lc::epoch).is_some_and(|t| t >= k.created_at)
+                && c["Created"]
+                    .as_str()
+                    .and_then(lc::epoch)
+                    .is_some_and(|t| t >= k.created_at)
         });
         merge_claim(
             db,
@@ -818,7 +1025,14 @@ fn finalize(
     restored_result(uuid, &k, dir, resumed)
 }
 
-fn outcome_text(k: &Claim, operation: &str, result: &str, container: Option<&str>, observation: Value, now: i64) -> Result<String, Error> {
+fn outcome_text(
+    k: &Claim,
+    operation: &str,
+    result: &str,
+    container: Option<&str>,
+    observation: Value,
+    now: i64,
+) -> Result<String, Error> {
     let handoff: Value = serde_json::from_str(&k.handoff)?;
     let outcome = json!({
         "format": tr::OUTCOME_FORMAT, "authorization_id": k.authorization_id, "handoff_sha256": k.handoff_sha256,
@@ -831,14 +1045,19 @@ fn outcome_text(k: &Claim, operation: &str, result: &str, container: Option<&str
 /// Writes the claim's recorded outcome to the outbox unless an identical file is already there.
 fn publish_outcome(k: &Claim) -> Result<Value, Error> {
     let text = k.outcome.as_deref().ok_or("No recorded outcome")?;
-    let sha = k.outcome_sha256.as_deref().ok_or("No recorded outcome hash")?;
+    let sha = k
+        .outcome_sha256
+        .as_deref()
+        .ok_or("No recorded outcome hash")?;
     let out = tr::outbox(&k.authorization_id)?;
     tr::private_dir(&out)?;
     let target = out.join(tr::OUTCOME);
     if !(tr::regular_file(&target)?.is_some() && mg::sha256(&target)? == sha) {
         mg::write_private(&target, text.as_bytes())?;
         if mg::sha256(&target)? != sha {
-            return Err("The outcome written to the outbox does not hash to the recorded value".into());
+            return Err(
+                "The outcome written to the outbox does not hash to the recorded value".into(),
+            );
         }
     }
     Ok(json!({"file": target, "sha256": sha, "bytes": text.len()}))
@@ -900,7 +1119,15 @@ fn close(
     Ok(k)
 }
 
-fn resume(db: &Connection, attempt: i64, id: &str, uuid: &str, name: &str, k: Claim, existing: Option<Value>) -> Result<Value, Error> {
+fn resume(
+    db: &Connection,
+    attempt: i64,
+    id: &str,
+    uuid: &str,
+    name: &str,
+    k: Claim,
+    existing: Option<Value>,
+) -> Result<Value, Error> {
     let unit = restore_unit(id);
     if mg::unit_busy(&unit) {
         return Err(failure(
@@ -978,7 +1205,9 @@ pub(crate) fn abort(
     let Some(k) = claim(db, authorization)? else {
         let h = load_handoff(authorization)?;
         let v = &h.value;
-        if v["universe_uuid"].as_str() != Some(uuid) || v["destination_host_uuid"].as_str() != Some(host.as_str()) {
+        if v["universe_uuid"].as_str() != Some(uuid)
+            || v["destination_host_uuid"].as_str() != Some(host.as_str())
+        {
             return Err(failure(
                 "The inbox handoff does not name this universe and this destination host; nothing was recorded",
                 json!({"handoff_sha256": h.sha256}),
@@ -1037,7 +1266,15 @@ pub(crate) fn abort(
                 ));
             }
             let graph_root = lc::podman(lc::QUICK, &["info", "--format", "{{.Store.GraphRoot}}"])?.trim().to_string();
-            let space_before = mg::available_bytes(Path::new(&graph_root));
+            let space_before = mg::available_bytes(Path::new(&graph_root)).map_err(|error| {
+                failure(
+                    format!(
+                        "Available space under {graph_root} could not be observed before the abort: {error}; nothing was removed"
+                    ),
+                    json!({"restore_claim": k.view(), "graph_root": {"path": graph_root,
+                        "known": false, "available_bytes": Value::Null, "error": error.to_string()}}),
+                )
+            })?;
             let mut removed = None;
             let mut reclaimed = Value::Null;
             let mut before_removal = Value::Null;
@@ -1046,6 +1283,23 @@ pub(crate) fn abort(
                     failure(
                         format!("{reason}; nothing was removed"),
                         json!({"observed": lc::state_view(&c), "restore_claim": k.view(), "detail": extra}),
+                    )
+                };
+                let after_reclaim = |reason: String, reclaim_outcome: &Value, removal_attempted: bool| {
+                    let prior_effect = if reclaim {
+                        "the reclaim path may already have sent signals"
+                    } else if removal_attempted {
+                        "the container removal path may already have acted"
+                    } else {
+                        "no external effect is proven"
+                    };
+                    failure(
+                        format!(
+                            "{reason}; {prior_effect}, so no no-effect claim is made. The restore claim remains open and the effect is uncertain"
+                        ),
+                        json!({"observed": lc::state_view(&c), "restore_claim": k.view(),
+                            "reclaim": reclaim_outcome, "container_removal_attempted": removal_attempted,
+                            "effect_state": "uncertain"}),
                     )
                 };
                 if c["Config"]["Labels"][UNIVERSE_LABEL].as_str() != Some(uuid) {
@@ -1069,6 +1323,12 @@ pub(crate) fn abort(
                 }
                 // Every fact a reclaim is judged on, read before anything is removed or signalled.
                 let leftovers = cleanup::runtime_processes(&container_id, k.created_at);
+                if leftovers["known"] != true {
+                    return Err(refuse(
+                        "The failed restore's cgroup membership is unknown; an unreadable cgroup is not empty",
+                        json!({"runtime_processes": leftovers}),
+                    ));
+                }
                 before_removal = leftovers.clone();
                 let surviving = leftovers["count"].as_u64().unwrap_or(0);
                 if surviving > 0 && !reclaim {
@@ -1084,16 +1344,26 @@ pub(crate) fn abort(
                     outcome["requested_by"] = json!({"operation_id": id, "authorization_ref": reference, "reclaim_processes": true});
                     outcome["graph_root"] = json!(graph_root);
                     outcome["available_bytes_before"] = json!(space_before);
+                    let proof = serde_json::to_string_pretty(&outcome)
+                        .map_err(|error| after_reclaim(format!("the reclaim proof could not be encoded: {error}"), &outcome, false))?;
                     mg::write_private(
                         &mg::base()?.join(&k.operation_id).join(format!("reclaim-{id}.json")),
-                        serde_json::to_string_pretty(&outcome)?.as_bytes(),
-                    )?;
+                        proof.as_bytes(),
+                    )
+                    .map_err(|error| {
+                        after_reclaim(
+                            format!("the reclaim proof could not be durably written: {error}"),
+                            &outcome,
+                            false,
+                        )
+                    })?;
                     if outcome["complete"] != true && surviving > 0 {
                         let reason = outcome["incomplete_reason"].as_str().unwrap_or("").to_string();
                         reclaimed = outcome;
-                        return Err(refuse(
-                            &format!("The reclaim did not end every process of the failed restore ({reason})"),
-                            json!({"reclaim": reclaimed}),
+                        return Err(after_reclaim(
+                            format!("the reclaim did not end every process of the failed restore ({reason})"),
+                            &reclaimed,
+                            false,
                         ));
                     }
                     reclaimed = outcome;
@@ -1105,15 +1375,51 @@ pub(crate) fn abort(
                     "restore.log",
                     &mg::base()?.join(&k.operation_id).join(format!("abort-{id}-restore.log")),
                 );
-                lc::podman(lc::QUICK, &["rm", &container_id])?;
-                if lc::inspect(name)?.is_some() || tr::all_containers()?.iter().any(|x| x["Id"].as_str() == Some(container_id.as_str())) {
-                    return Err("The container is still present after removal".into());
+                lc::podman(lc::QUICK, &["rm", &container_id]).map_err(|error| {
+                    after_reclaim(
+                        format!("container removal returned an error: {error}"),
+                        &reclaimed,
+                        true,
+                    )
+                })?;
+                let named = lc::inspect(name).map_err(|error| {
+                    after_reclaim(
+                        format!("container absence by name could not be observed after removal: {error}"),
+                        &reclaimed,
+                        true,
+                    )
+                })?;
+                let all = tr::all_containers().map_err(|error| {
+                    after_reclaim(
+                        format!("container absence by immutable ID could not be observed after removal: {error}"),
+                        &reclaimed,
+                        true,
+                    )
+                })?;
+                if named.is_some() || all.iter().any(|x| x["Id"].as_str() == Some(container_id.as_str())) {
+                    return Err(after_reclaim(
+                        "the container is still present after the removal request".into(),
+                        &reclaimed,
+                        true,
+                    ));
                 }
                 removed = Some(container_id);
             }
-            let mut observed = observation(uuid)?;
+            let mut observed = observation(uuid).map_err(|error| {
+                failure(
+                    format!(
+                        "The abort may have reclaimed processes or removed its container, but the universe could not be observed afterwards: {error}; the claim remains open"
+                    ),
+                    json!({"removed_container_id": removed, "reclaim": reclaimed,
+                        "effect_state": "uncertain"}),
+                )
+            })?;
             if observed["universe_container"]["present"] == true {
-                return Err("A universe container is present after the abort; nothing was recorded".into());
+                return Err(failure(
+                    "A universe container is present after the abort; earlier reclaim or removal effects may already have occurred, the claim remains open",
+                    json!({"removed_container_id": removed, "reclaim": reclaimed,
+                        "observed": observed, "effect_state": "uncertain"}),
+                ));
             }
             // A failed attempt can leave its conmon and CRIU processes running after its container is removed.
             let leftover = removed
@@ -1121,23 +1427,51 @@ pub(crate) fn abort(
                 .map(|cid| cleanup::runtime_processes(cid, k.created_at))
                 .unwrap_or(Value::Null);
             let remaining = leftover["count"].as_u64().unwrap_or(0);
+            if removed.is_some() && (leftover["known"] != true || leftover["cgroups_known_absent"] != true) {
+                return Err(failure(
+                    "The container was removed, but disappearance of its cgroups could not be verified; the claim remains open",
+                    json!({"removed_container_id": removed, "runtime_processes": leftover, "effect_state": "uncertain"}),
+                ));
+            }
             observed["runtime_processes_of_removed_container"] = leftover.clone();
-            let cgroups_absent = removed.as_ref().map(|cid| {
-                !cleanup::container_scope(cid).exists() && !cleanup::conmon_scope(cid).exists()
-            });
-            let space_after = mg::available_bytes(Path::new(&graph_root));
+            // `runtime_processes` just established both scopes as known absent. Do not perform another
+            // lossy metadata read and turn an error into `false` or absence.
+            let cgroups_absent = removed.as_ref().map(|_| leftover["cgroups_known_absent"] == true);
+            let space_after = mg::available_bytes(Path::new(&graph_root)).map_err(|error| {
+                failure(
+                    format!(
+                        "The abort may have removed or reclaimed runtime state, but available space under {graph_root} could not be observed afterwards: {error}; the claim remains open"
+                    ),
+                    json!({"removed_container_id": removed, "runtime_processes": leftover,
+                        "graph_root": {"path": graph_root, "known": false,
+                            "available_bytes_before": space_before, "available_bytes_after": Value::Null,
+                            "error": error.to_string()}, "effect_state": "uncertain"}),
+                )
+            })?;
+            let recovered_bytes = i64::try_from(i128::from(space_after) - i128::from(space_before)).map_err(|error| {
+                failure(
+                    format!(
+                        "The abort may have changed runtime state, but the graph-root byte delta cannot be represented: {error}; the claim remains open"
+                    ),
+                    json!({"removed_container_id": removed, "runtime_processes": leftover,
+                        "graph_root": {"path": graph_root, "known": false,
+                            "available_bytes_before": space_before, "available_bytes_after": space_after,
+                            "error": error.to_string()}, "effect_state": "uncertain"}),
+                )
+            })?;
             let k = close(
                 db,
                 authorization,
                 id,
                 removed.as_deref(),
                 &json!({"reason": "migration_restore_abort", "restore_scope_finished": true,
-                    "conmon_scope_absent": removed.as_ref().map(|cid| !cleanup::conmon_scope(cid).exists()),
+                    "conmon_scope_absent": removed.as_ref().map(|_| true),
                     "container_cgroups_absent": cgroups_absent, "runtime_processes_remaining": remaining,
                     "runtime_processes": leftover, "runtime_processes_before_removal": before_removal,
                     "reclaim_processes_requested": reclaim, "reclaim": reclaimed, "authorization_ref": reference,
-                    "graph_root": {"path": graph_root, "available_bytes_before": space_before, "available_bytes_after": space_after,
-                        "recovered_bytes": space_after as i64 - space_before as i64}}),
+                    "graph_root": {"path": graph_root, "known": true,
+                        "available_bytes_before": space_before, "available_bytes_after": space_after,
+                        "recovered_bytes": recovered_bytes}}),
                 observed,
             )?;
             abort_result(
@@ -1171,7 +1505,9 @@ fn abort_result(uuid: &str, k: &Claim, action: &str) -> Result<Value, Error> {
 }
 /// Fresh re-hash of a restore or abort outcome in the outbox, for historical replays.
 pub(crate) fn verify_outcome(original: &Value) -> Result<Value, Error> {
-    let authorization = original["authorization_id"].as_str().ok_or("Missing authorization_id")?;
+    let authorization = original["authorization_id"]
+        .as_str()
+        .ok_or("Missing authorization_id")?;
     let expected = original["outcome"]["sha256"].as_str();
     let path = tr::outbox(authorization)?.join(tr::OUTCOME);
     let now = if tr::regular_file(&path).ok().flatten().is_some() {

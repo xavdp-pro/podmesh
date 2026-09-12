@@ -281,6 +281,133 @@ may amend any of them. The M2 entries above are unchanged.
 Entries 13 to 15 were added after the independent counter-review of this lot; the eleven suites were rerun
 on the corrected binary.
 
+## Deviations recorded by the collector (lot M4)
+
+Implemented on 2026-09-12 by Claude Code (Opus 5) in the development tree and exercised on two lab hosts.
+The binding document for this lot is [GARBAGE-COLLECTION.md](GARBAGE-COLLECTION.md), which the lot does not
+edit: anything it should say differently is a finding in the lot's report. Each entry below is either a
+decision that document left open or a difference from what it or this protocol describes. Xavier may amend
+any of them. The M2 and M3 entries above are unchanged. Class 4 (a failed local restore) and class 5
+(operation artifacts after declared retention, with evidence holds) are **not** implemented, and nothing in
+this lot assumes they exist.
+
+1. **The operations are `garbage_collect_plan` and `garbage_collect_apply`.** The contract's recommended
+   order names `garbage_collect_plan`; the lot's brief called them `migration_gc_plan` and
+   `migration_gc_apply`. The contract wins, and the apply is named after its plan. They are the only
+   operations that do not name a universe: the collector is host-wide by design, which incidentally gives
+   the host-wide listing of unresolved migrations that lot M3 reported missing.
+2. **A collected reservation becomes `collected` and keeps its row, beside a tombstone.** The contract asks
+   for "a terminal archived/tombstoned reservation state". The row stays in `migration_reservations` so that
+   `migration_status`, the artifacts and `migration_restore_local` remain reachable; the new
+   `migration_universe_tombstones` row is what protects the identity. Both are written in one transaction.
+3. **What a tombstone refuses is exactly identity reuse.** `create` with that universe UUID, and a `clone`
+   into it, are refused for good. `start`, `stop`, `delete`, a clone *from* it and `migration_restore_local`
+   are not: the contract's class 1 says the collection lifts the generic gate and that a later local memory
+   restore or ordinary start remains a separate explicit operation with its own result. A verified handoff
+   restore is likewise never blocked by a tombstone — it is the way back the contract names.
+4. **A tombstone is never lifted, not even by a verified local restore.** After
+   `migration_restore_local` brings a collected universe back, its reservation is archived as usual and the
+   universe is fully operable, but `create` with that UUID stays refused. That is the point of the
+   tombstone: an identity comes back through a verified restore, never through a blind creation.
+5. **A collected reservation blocks no generic operation**, exactly as a released one does not.
+6. **An apply names the plan it applies and the candidates it may act on.** The contract requires "a named
+   operator decision or a named mandate with explicit collection scope"; this is that scope, and it also
+   gives an audit chain. A candidate is acted on only if a recorded plan **of this host** examined it, gave
+   it the same class and found it collectable, *and* the proofs still hold when the apply repeats them.
+   Nothing is ever discovered by an apply.
+7. **The bounds.** `max_candidates` (default 20, maximum 100) bounds both modes; `max_effects` (default 1,
+   maximum 10) and `max_runtime_reclaims` (default 0, maximum 5) bound an apply. A runtime reclaim therefore
+   needs two explicit fields, `reclaim_processes: true` and a raised `max_runtime_reclaims`. There is no byte
+   or file bound because this version collects no artifact.
+8. **A refusal before the first effect refuses the whole request; anything after it stops the run.** The
+   contract says to stop at the first mismatch. When nothing has been applied yet, the request fails and
+   writes no run record, so a refused collection is indistinguishable from one that never happened. Once an
+   effect exists, the run returns what it did, names the candidate it stopped at and why, and keeps the
+   record. A verification from outside that does not hold after a committed effect also stops the run and is
+   reported as such — never as a refusal, which would claim that nothing happened. Nothing after a commit
+   may fail the call: an observation that cannot be made at all is recorded as an unknown and counts as a
+   failed verification, and an error a candidate raises before its effect is that candidate's refusal, never
+   an error that discards what earlier candidates already achieved.
+9. **A plan writes one immutable run record, and that is the only state it changes.** The contract says a
+   plan makes "no database mutation" and, later, that every dry run creates a durable, queryable record.
+   They are read together: no reservation, claim, authorization or artifact changes, and the run itself is
+   appended to `garbage_collection_runs`. The acceptance test is worded on effects — no Podman events, no
+   signal, no deletion, no state mutation — and that is what the suite measures.
+10. **A plan makes read-only Podman calls.** "No Podman call" cannot be read literally without giving up the
+    fresh observation every class requires. A plan makes exactly two: one `podman ps --all` and one batched
+    `container inspect` of the candidate names that exist. The suite proves that its window contains no
+    Podman event at all, on either host.
+11. **A plan examines only what still owes someone a decision**: reservations in `reserved`,
+    `checkpointing`, `checkpointed`, `checkpoint_failed` or `transfer_authorized`, and restore claims in
+    `restoring` or `restore_failed`. Settled rows (`released`, `abandoned`, `transferred`, `collected`) are
+    counted and reported, never examined; a verified restore claim is never enumerated at all.
+12. **Class 1 is proven on the documents, not on the state columns.** For every authorization the reservation
+    ever emitted, the recorded handoff and outcome are re-hashed against the values recorded when they were
+    issued and completed, the outcome is re-parsed, and its format, authorization, handoff hash, universe,
+    source host, destination host and `not_restored` result are re-checked. A journal row that merely says
+    `ended_not_restored` proves nothing.
+13. **Class 2 differs from `migration_abandon` in what it leaves behind.** Both keep every artifact and both
+    refuse a blind `create`. An abandoned reservation refuses every generic operation for ever; a collected
+    one refuses only identity reuse. `migration_abandon` stays the explicit decision for a reservation whose
+    container is gone; the collector's class 2 is the swept version of it, with the proofs and the record.
+14. **Class 3 is delegated, not reimplemented.** The plan proposes; the apply calls
+    `migration_restore_abort` with the run's own operation ID and the explicit `reclaim_processes` the
+    request carried, and reports its result verbatim beside a fresh observation. Its refusals — a running
+    universe, a container this claim did not create, surviving processes without the field — are the
+    collector's refusals. No process is enumerated, signalled or waited for anywhere in the collector.
+15. **A paused or frozen universe is excluded explicitly.** `process_active()` reads a paused container as
+    not running, so a collectable source must be observed in `created`, `exited` or `stopped`, and a
+    container whose cgroup this service froze is refused as not reliably observable.
+16. **A candidate that matches no class is reported with the decision it actually needs.** A reservation
+    whose container is still there and which never issued an authorization is named as a `migration_release`
+    or `migration_abandon` decision, not widened into a collection class.
+17. **A gap the classes leave, reported and not widened.** A reservation whose authorizations all ended
+    `not_restored` **and** whose container is gone matches neither class 1, which requires a fresh
+    observation of the stopped, checkpointed source it releases, nor class 2, which requires that no
+    authorization was ever issued. The collector reports it as blocked. The smallest amendment, if Xavier
+    wants one, is to let class 2 require that **no authorization is live** rather than that none was ever
+    issued, since a verified `not_restored` outcome is exactly the proof class 1 already accepts. Not
+    implemented: it widens a class the contract wrote deliberately.
+18. **`migration_restore_local` keeps the state it started from.** It used to write `released` while it ran;
+    it now writes back the reservation's own state, so a collected reservation stays collected through a
+    failed local restore and only a verified one archives it.
+
+Entries 19 to 24 were added after the independent counter-review of this lot (OpenAI Codex,
+`evidence/garbage-collection/independent-review-codex.md`), whose four findings they answer. Every suite was
+rerun on the corrected binary.
+
+19. **A run records each effect as it commits it, and a retry recovers rather than repeats.** The effect and
+    a progress row for it are written in one transaction, so a service that dies between an effect and the
+    report describing it comes back to what it actually did: a retry of the same operation ID recovers the
+    committed effect from the journal, re-reads its verification, and never applies it again. The domain
+    tables are the second witness — the collection history names the operation that collected, and a closed
+    restore claim names the operation that closed it — so a lost progress row costs a re-verification, never
+    a repeated effect. A run is `verified` only when every effect it carries verified from outside; when one
+    did not, the record says `completed_with_unverified_effects` and names the blockers.
+20. **A tombstone is written once; every collection is an occurrence.** The tombstone keeps the proof of the
+    first collection of an identity and is never replaced. Each collection, including a later one of the
+    same universe, appends to `migration_collection_history`, and the ownership refusal covers every
+    container ID any collection ever proved absent, not only the one the tombstone kept.
+21. **A new checkpoint supersedes a collected reservation** exactly as it supersedes a released one: the row
+    is archived with its history and the universe reserves afresh. Collection ends a decision, not a
+    universe — a collected universe can be started, checkpointed, authorized and migrated again — while its
+    tombstone goes on refusing a blind `create` of that identity for good.
+22. **A runtime reclaim's budget is reserved before the delegated call, not counted after it.** The abort
+    observes the processes itself, so what the collector's classification predicted cannot bound what the
+    abort may do. Every delegated abort a run authorizes to signal costs one unit of `max_runtime_reclaims`
+    before it is called, whether it ends up signalling or not, and the run reports the reservations, the
+    reclaims actually performed and the processes actually signalled as three separate numbers.
+23. **Every class returns its own verdict.** A delegated abort's facts are not a verdict: the collector
+    decides, from the claim, the container and the cgroup residency it re-reads afterwards, whether the
+    effect held, and an observation it could not make is an unknown that fails the verification rather than
+    a silence that passes it. The same verdict functions are unit-tested for the branches a laboratory
+    cannot stage.
+24. **A plan may be scoped to named universes.** Without a scope a plan is host-wide and its bound decides
+    what it reaches; with `universe_uuids` it answers about exactly what the caller named. Only the number
+    of candidates is bounded: the count of settled reservations a host-wide plan reports, and the size of
+    one candidate's proofs, are not, which is a scalability limit to bound or paginate before a journal
+    grows far beyond a laboratory's.
+
 ## Garbage collection
 
 Operator decision, 2026-09-12: a reservation with no way out and a failed local restore with no reclaim

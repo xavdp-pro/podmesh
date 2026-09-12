@@ -3,7 +3,11 @@ set -euo pipefail
 # Package directories must not inherit a group-writable build umask.
 umask 022
 cd "$(dirname "$0")/.."
-version=0.1.0~experimental5
+version=0.1.0~experimental6
+if [ "$(dpkg --print-architecture)" != amd64 ]; then
+ echo "This experimental package is qualified for Debian amd64 only." >&2
+ exit 1
+fi
 # Reported by the capabilities operation, so an installed binary identifies its package.
 PODMESH_PACKAGE_VERSION=$version cargo build --release --locked -j2
 work=$(mktemp -d)
@@ -19,7 +23,7 @@ Architecture: amd64
 Section: admin
 Priority: optional
 Maintainer: Xavier de Poorter <xavier@xavdp.pro>
-Depends: libc6 (>= 2.39), libgcc-s1, podman, systemd, coreutils
+Depends: libc6 (>= 2.39), libgcc-s1, podman, systemd, coreutils, tar, zstd, podmesh-vzcriu (= 3.15.5.3+podmesh1~experimental1), podmesh-vzcriu-helpers-node (= 1.0.0+podmesh1~experimental1)
 Description: Experimental local Podman lifecycle service
  Local root-only API and CLI with persistent host identity, observation
  journal and operation attempt history, operating on the default rootful
@@ -34,6 +38,10 @@ Description: Experimental local Podman lifecycle service
  destination preflight and restore with imported ownership, completion, source
  retirement, and the recovery of a reservation that never left its host. They
  require the separately packaged podmesh-vzcriu runtime and its helper shim.
+ The collector plans bounded terminal reservation and failed-restore cleanup,
+ requires a separate apply authorization, preserves logical history, and
+ verifies outcomes. Runtime reclaim requires explicit opt-in and process
+ identity proof. There is no autonomous cleanup scheduler.
  Networking, volumes and high availability are not implemented in this version,
  and a reservation is not fencing.
 CONTROL
