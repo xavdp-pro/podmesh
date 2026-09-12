@@ -231,6 +231,7 @@ fi
 bash -n "$root/collect-host.sh" "$root/verify-candidate.sh"
 "$root/tests/collector-stub-tests.sh"
 "$root/tests/verifier-tests.sh"
+"$root/refusal/tests/run-tests.sh"
 printf '%s\n' '[{"name":"podman","id":"2f259bab93aa","driver":"bridge","network_interface":"podman0"}]' |
   jq -e -cS 'if type != "array" then error("invalid network inventory") else map({id:(.id//.Id//.ID//error("missing network id")),driver:(.driver//.Driver//"")})|sort_by(.id) end' |
   jq -e '.[0] == {"id":"2f259bab93aa","driver":"bridge"}' >/dev/null

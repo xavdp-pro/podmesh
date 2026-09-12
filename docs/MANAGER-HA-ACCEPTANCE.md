@@ -83,7 +83,7 @@ Missing data is `unknown`; it is never recorded as zero or stopped.
 | G1 Durable process | Crash/restart, concurrent writers, checked facts and receipts | Qualified locally; no host deployment |
 | G2 Authenticated exchange | Three real processes, bounded mutual peer authentication and durable imports | Not yet qualified |
 | G3 Effect exclusion | Current epoch enforced outside manager memory and old epoch refused | Not yet qualified |
-| G4 Host deployment | Signed package, preserved identity, upgrade/rollback and clean install on three hosts | Package-only signed installation passes on three existing hosts; identity, lifecycle and clean-host requirements remain open |
+| G4 Host deployment | Signed package, preserved identity, upgrade/rollback and clean install on three hosts | Signed installation, protected three-replica configuration, offline validation and default-disabled refusal pass on three existing hosts; durable identity restart, lifecycle, upgrade/rollback and clean-host requirements remain open |
 | G5 Manager service recovery | Real process/host loss, restart and stale return under external observation | Not yet qualified |
 | G6 DNS/bootstrap recovery | Resolver and manager recover without circular dependency | Not yet qualified |
 | G7 Human-agent operation | Governor/Maker intent, effect and evidence correlate end to end | Not yet qualified |

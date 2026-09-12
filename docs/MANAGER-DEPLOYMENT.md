@@ -2,8 +2,10 @@
 
 Status: the reviewed resident-manager candidate from commit `5319ab1` was built,
 published through signed experimental APT and installed with its service disabled
-and inactive on three existing laboratory hosts. The package-only comparisons
-passed. No configured resident replication, DNS service or HA claim exists yet.
+and inactive on three existing laboratory hosts. Package installation, protected
+three-replica configuration, pure offline validation and the default-disabled
+failed-start gate passed. No authenticated resident exchange, DNS service or HA
+claim exists yet.
 
 ## Purpose and isolation
 
@@ -145,8 +147,12 @@ from reviewed committed source, verified against signed repository metadata,
 published to the experimental suite and installed with the service disabled and
 inactive on three existing laboratory hosts. The package-only evidence is recorded
 in [REVIEW-MANAGER-PACKAGE-QUALIFICATION.md](REVIEW-MANAGER-PACKAGE-QUALIFICATION.md).
-The example configuration is its exact current JSON schema. Later configuration,
-activation and recovery stages remain open.
+The example configuration is its exact current JSON schema. Protected configurations
+for one logical identity and three distinct replicas now pass offline validation,
+and the unchanged default unit refuses runtime startup on all three hosts without
+leaving state, sockets or listeners. See
+[REVIEW-MANAGER-DEFAULT-REFUSAL.md](REVIEW-MANAGER-DEFAULT-REFUSAL.md). Explicit
+network activation, resident exchange and recovery stages remain open.
 
 1. Record a pre-install inventory outside the candidate package: host identity,
    package versions, `podmesh.service` and `podmesh-web-observer.service` PIDs,
@@ -190,8 +196,12 @@ activation and recovery stages remain open.
    lock, control socket, TCP/UDP listener, firewall or routing change. This is a
    negative installation proof, not a running-service qualification.
 6. To qualify resident exchange, install an explicit, separately reviewed systemd
-   drop-in that selects `authenticated-static-peers`, removes `IPAddressDeny=any`
-   and widens the address-family set only as required by the accepted transport.
+   drop-in that selects `authenticated-static-peers`, resets the inherited
+   `AF_UNIX`-only address-family list to `AF_UNIX AF_INET`, retains
+   `IPAddressDeny=any` and adds exact `/32` `IPAddressAllow` entries for the three
+   protected static peer addresses. IPv6, DNS, routing changes and capabilities
+   remain unavailable; the manager configures no UDP service. The live addresses
+   stay in the private host drop-in and do not enter public evidence.
    Start **only** `podmesh-manager.service`, then verify its UID, directory modes,
    state ownership, exact arguments, declared listeners and logs.
 7. Run only the acceptance scenarios whose prerequisite gates in
@@ -235,7 +245,7 @@ For each stage, preserve one evidence bundle per host and a cross-host compariso
 | Pre-install | Existing service PIDs, unit states, sockets, package versions and Podman inventory |
 | Install | Package signatures/hashes/file list; no manager process; existing PIDs/inventory unchanged |
 | Configure | Different replica ID per host; same logical manager ID; config/key ownership and mode; no secrets retained in public evidence |
-| Default-disabled refusal | Failed unit with exit status 1; no manager database, lock, socket or listener; matching journal evidence |
+| Default-disabled refusal | Failed unit with `ExecMainStatus=1`; no manager database, lock, socket or listener; matching journal evidence |
 | Resident activation | Separately reviewed network opt-in; only manager unit changed; PID/UID/arguments; state/runtime modes; only declared listeners |
 | Restart | Same replica identity and state checksum; existing service PIDs/inventory unchanged |
 | Upgrade | Previous and new package/binary hashes; explicit restart; schema/version compatibility result |

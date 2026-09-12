@@ -1,15 +1,69 @@
 # Three-host manager package qualification harness
 
 This directory prepares evidence for an exact `podmesh-manager` package candidate.
-It does not connect to a host, install a package, create configuration,
-enable or start a unit, or activate manager networking. An operator runs the
-read-only collectors separately on each declared disposable host.
+The package-only collector does not connect to a host, install a package, create
+configuration, enable or start a unit, or activate manager networking. An operator
+runs it separately on each declared disposable host. The bounded
+`refusal/run-default-refusal.sh` harness is a later, explicit phase: it validates
+an already protected configuration, attempts one start with the packaged network
+gate still disabled, records the expected refusal and does not reset or mutate
+any other service.
 
 The harness covers the package-only, disabled-service slice of G4. It does not by
 itself qualify the full G4 gate, preserved manager identity, or G2,
 G3, G5, DNS, replication, routing, WireGuard, workload activation, restart,
 upgrade, removal, purge, or rollback. Those phases require their own approved
 procedure and evidence under `docs/MANAGER-HA-ACCEPTANCE.md`.
+
+## Configured default-refusal stage
+
+After package-only qualification and protected configuration, use one common
+private root-owned `0600` salt of at least 32 random bytes on the three hosts.
+Keep it outside every evidence bundle. With the manager inactive, disabled and
+without any systemd drop-in, run as root:
+
+```sh
+refusal/run-default-refusal.sh \
+  --host-alias lab-a \
+  --salt-file /private/path/refusal-salt \
+  --output /private/evidence/lab-a.json
+```
+
+Repeat independently for the other two aliases. The harness:
+
+- commits the complete configuration, topology, local identities, peer identities,
+  endpoints and pair keys with the private salt, without emitting their values;
+- proves the validation command's effective service-account UID and the private
+  runtime directory's create, empty, validate, empty and remove lifecycle;
+- binds the failed start to its exact systemd InvocationID and unit fragment;
+- requires a disabled unit with no drop-in, `ExecMainStatus=1`, no restart and
+  the expected default-network refusal; the `systemctl start` client status is
+  recorded but is not the process outcome for this `Type=simple` unit;
+- compares lifecycle and observer process identity, stable rootful Podman
+  container identity/state/start/PID/restart fields, routes and firewall state;
+- records firewall or route collection failures as `unknown` and never turns them
+  into an empty-input success hash;
+- refuses a detected IPv4 route or nftables ruleset change; `unknown` remains
+  explicit and cannot support an unchanged-infrastructure claim;
+- refuses any retained manager process, state entry, control socket or configured
+  TCP/UDP listener.
+
+Recompute the cross-host result with the checked-in comparator and the campaign
+summary that binds the expected package, source and aliases:
+
+```sh
+refusal/compare-three-hosts.sh \
+  --summary /private/evidence/campaign-summary.json \
+  /private/evidence/lab-a.json \
+  /private/evidence/lab-b.json \
+  /private/evidence/lab-c.json
+```
+
+The cross-host comparison requires one logical identity and topology, three
+distinct local replica and host commitments, two reciprocal peers per host,
+matching endpoint-to-bind commitments and three symmetric distinct pair-key
+commitments. Passing this stage does not activate networking or qualify exchange,
+replication, takeover, DNS or HA.
 
 ## Evidence stages
 

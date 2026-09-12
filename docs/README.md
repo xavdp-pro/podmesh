@@ -40,7 +40,7 @@ The entire SHAPER corpus has NOT been audited in this sequence. No canon changed
 | P04 | Whole-universe migration including nested Podman processes and memory | VERIFIED only for disposable network-free lab workload; general qualification OPEN |
 | P05 | Preflight, checksum, explicit handoff, source stopped before destination active, durable operation report | Partially VERIFIED in serial migration kit; concurrent controllers OPEN |
 | P06 | Intent-driven human/agent management through common API/CLI; UI optional later | DECIDED / OPEN |
-| P07 | Rust core service, Debian packages, reproducible installation/update/removal | Lifecycle service VERIFIED in its bounded experimental scope; manager package-only signed installation VERIFIED on three existing hosts; complete lifecycle remains OPEN |
+| P07 | Rust core service, Debian packages, reproducible installation/update/removal | Lifecycle service VERIFIED in its bounded experimental scope; manager signed installation, protected configuration, offline validation and default-disabled refusal VERIFIED on three existing hosts; authenticated manager runtime and complete lifecycle remain OPEN |
 | P08 | Image availability across hosts using content digests; pre-stage before migration | DECIDED direction; redundancy count/policy OPEN; full registry per host not required |
 | P09 | Persistent data replication and coherent recovery points | Requested; general volume/database implementation OPEN |
 | P10 | Periodic memory checkpoints copied to another host | Bounded experiment VERIFIED; incremental continuous replication and HA OPEN |
