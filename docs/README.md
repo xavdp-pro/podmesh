@@ -40,7 +40,7 @@ The entire SHAPER corpus has NOT been audited in this sequence. No canon changed
 | P04 | Whole-universe migration including nested Podman processes and memory | VERIFIED only for disposable network-free lab workload; general qualification OPEN |
 | P05 | Preflight, checksum, explicit handoff, source stopped before destination active, durable operation report | Partially VERIFIED in serial migration kit; concurrent controllers OPEN |
 | P06 | Intent-driven human/agent management through common API/CLI; UI optional later | DECIDED / OPEN |
-| P07 | Rust core service, Debian packages, reproducible installation/update/removal | DECIDED; Rust installed, core service OPEN |
+| P07 | Rust core service, Debian packages, reproducible installation/update/removal | Lifecycle service VERIFIED in its bounded experimental scope; manager package-only signed installation VERIFIED on three existing hosts; complete lifecycle remains OPEN |
 | P08 | Image availability across hosts using content digests; pre-stage before migration | DECIDED direction; redundancy count/policy OPEN; full registry per host not required |
 | P09 | Persistent data replication and coherent recovery points | Requested; general volume/database implementation OPEN |
 | P10 | Periodic memory checkpoints copied to another host | Bounded experiment VERIFIED; incremental continuous replication and HA OPEN |
@@ -52,7 +52,7 @@ The entire SHAPER corpus has NOT been audited in this sequence. No canon changed
 | P16 | Same logical manager replicated onto every host; local bootstrap independent of failed manager/DNS | Requested / OPEN; no manager HA implementation yet |
 | P17 | Continue bounded local management during partitions; merge on reconnect | Latest operator model / OPEN; safety conditions below |
 | P18 | Rebuild a host quickly with preserved or deliberately replaced identity | DECIDED / OPEN; installation and restore rehearsal needed |
-| P19 | Public APT repository and branded landing page | VERIFIED separately at deb.xavdp.pro; only validation package released |
+| P19 | Public APT repository and branded landing page | VERIFIED separately at deb.xavdp.pro; bounded lifecycle, observer, migration-helper and disabled manager package scopes released experimentally |
 | P20 | Public product presentation, docs, sources and contribution path | DECIDED; podmesh.xavdp.pro proposed, not provisioned |
 
 ## Manager, governor and makers
@@ -167,7 +167,7 @@ https://github.com/xavdp-pro/vzcriu/tree/experiment/debian13-nested-podman
   then27; same UUID. Restore/reconciliation/proof6.575s. Not network outage time.
 - Only latest checkpoint restored. No mounted volumes, database, external
   networking, full host power loss or network partition in that test.
-- Private evidence: migration-lab-evidence/replication/replication-bfd1d29ac0db.
+- Private evidence is retained outside the public repository.
 - Earlier simple-container timings (~0.8s; 256MiB pre-copy ~2.53s) do not establish
   nested manager failover latency and must not be advertised as such.
 

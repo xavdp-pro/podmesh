@@ -1,9 +1,9 @@
 # Experimental resident manager package and deployment boundary
 
-Status: a reviewed resident-manager source candidate and a locally exercised
-Debian assembly path exist. The final candidate must be rebuilt after the current
-documentation and qualification changes. No package has been published or installed
-on a host, and no deployed resident replication, DNS service or HA claim exists yet.
+Status: the reviewed resident-manager candidate from commit `5319ab1` was built,
+published through signed experimental APT and installed with its service disabled
+and inactive on three existing laboratory hosts. The package-only comparisons
+passed. No configured resident replication, DNS service or HA claim exists yet.
 
 ## Purpose and isolation
 
@@ -22,10 +22,10 @@ partition and reconciliation model is in [CONTROL-SERVICES-UNIVERSE.md](CONTROL-
 the current executable laboratory boundaries are in
 [MANAGER-HA-ACCEPTANCE.md](MANAGER-HA-ACCEPTANCE.md).
 
-The present milestone deliberately exercises the manager as standalone local
-processes first. This isolates its persistence, replication, refusal and recovery
-behavior from an orchestration environment; it does not qualify an installed host
-service. The preferred integrated target then
+The first executable milestone exercised the manager as standalone local
+processes. This isolated its persistence, replication, refusal and recovery
+behavior from an orchestration environment. The package is now installed but the
+resident service has deliberately not been configured or activated. The preferred integrated target then
 runs each host-bound replica inside a ShaperOS universe so it can reuse ShaperOS
 logging, observation and parent-supervision contracts. It remains the same single
 logical manager across those replicas. Standalone operation on a compatible Linux
@@ -140,12 +140,13 @@ candidate. Complete it independently for each of the three declared lab hosts.
 The current `podmesh-manager-resident-lab` source now implements the package CLI
 contract, strict declared state/runtime boundaries, offline validation and an
 explicit `authenticated-static-peers` runtime opt-in. Claude Code Opus independently
-reviewed that source boundary. A local package was assembled to exercise the build
-path before the present documentation and harness corrections; it is deliberately
-stale and is not the candidate for publication. The final candidate remains
-experimental until it is rebuilt from reviewed committed source, verified against
-signed repository metadata and qualified through the stages below. The example
-configuration is its exact current JSON schema.
+reviewed that source boundary. Candidate `0.1.0~manager1+g5319ab150fc3` was rebuilt
+from reviewed committed source, verified against signed repository metadata,
+published to the experimental suite and installed with the service disabled and
+inactive on three existing laboratory hosts. The package-only evidence is recorded
+in [REVIEW-MANAGER-PACKAGE-QUALIFICATION.md](REVIEW-MANAGER-PACKAGE-QUALIFICATION.md).
+The example configuration is its exact current JSON schema. Later configuration,
+activation and recovery stages remain open.
 
 1. Record a pre-install inventory outside the candidate package: host identity,
    package versions, `podmesh.service` and `podmesh-web-observer.service` PIDs,
@@ -246,15 +247,15 @@ Podman CLI provide evidence from outside the resident manager. The manager's own
 health endpoint or log cannot prove its effect, its exclusion guarantees, host
 death or unchanged workloads.
 
-## Open requirements before publication and activation
+## Open requirements after package-only publication
 
 - Establish key generation, rotation, revocation and operator recovery rules.
 - Qualify the implemented authenticated static-peer transport on three disposable
   hosts, including confidentiality and endpoint policy.
 - Bind replica history to a durable external effect gate before any exclusive
   activation, route or DNS publication.
-- Verify the exact candidate against signed repository metadata, then qualify clean
-  installation with the service disabled and inactive on three disposable hosts.
+- Repeat clean full-host installation when suitable disposable clean hosts are
+  available; the current three-host result covers existing laboratory hosts.
 - Qualify explicit activation, restart, upgrade, removal, purge and supported
   rollback separately before claiming those lifecycle phases.
 - Publish only the package scope supported by the recorded evidence through the
@@ -272,5 +273,6 @@ regression checks were corrected. The final closure review reported no remaining
 blocker or important finding for this undeployed scope. Claude Code Opus then
 reviewed the compatible CLI, path boundary, offline validation and network refusal;
 after two port-race corrections it reported no remaining blocker or important
-finding for the local-only increment. Signed publication and host qualification
-remain open.
+finding for the local-only increment. Signed publication and disabled-service
+installation now pass on three existing hosts. Configuration, activation, service
+recovery and HA qualification remain open.
