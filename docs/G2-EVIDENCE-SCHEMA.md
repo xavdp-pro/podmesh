@@ -83,6 +83,73 @@ independently committing the same nonce produce the **same commitment**. A compa
 can therefore perform that join on commitments and **never see a nonce**. The mechanism
 is proven; only its publication is missing. Everything below is an application of it.
 
+## Correction: an exchange is not an audit row, and the join rule as written refuses everything
+
+Measured on the preserved store copy at
+`/tmp/podmesh-manager-inspect-54aca614a913501bb5dd4585/store.sqlite` — **one host, 67
+nonces, 165 audit rows**. The other preserved copy holds zero audit events, which is
+itself the fresh-store case work item 3 exists to capture. So this is a real sample, not
+all three hosts, and it is stated that way.
+
+**Every nonce in that store carries one of exactly three phase sets:**
+
+| Phase set | Nonces | What it is |
+| --- | --- | --- |
+| `outbound_request_prepared` | 17 | a stranded sender attempt — the case this lot is about |
+| `outbound_request_prepared`, `outbound_exchange_completed` | 26 | a completed sender attempt |
+| `inbound_request_observed`, `inbound_import_committed`, `inbound_reply_prepared`, `inbound_reply_write_observed` | 24 | a served receiver exchange |
+
+So a receiver exchange is **four audit rows sharing one nonce**, not one. The comparator
+rule stated below — *refuse on more than one receiver row for a nonce commitment* — would
+therefore have refused **every genuine inbound exchange in the measured campaign**. The
+join is sound; the row model under it was wrong. `exchanges` publishes **one folded row
+per nonce**, and the fold is over the audit rows that share it.
+
+### The fold rule, measured rather than assumed
+
+Within one nonce the rows disagree on some fields, because `inbound_request_observed`
+happens before the request is decoded. Counting naively, 24 of the 67 nonces have rows
+that "disagree" on peer, operation or request digest. Counting only **non-null** values,
+the number of disagreements is **zero**.
+
+That gives the rule, and it is fail-closed rather than lenient:
+
+- each folded field takes the single non-null value found among the nonce's rows;
+- a field with no non-null value anywhere folds to null and is reported as absent;
+- **two different non-null values for one field refuse the campaign.** That never occurred
+  in the measured store, which is exactly why it must be a negative fixture: a rule whose
+  violation has never been seen is a rule nobody has tested.
+
+The folded row also carries the **set of phases reached**, not a single `terminal_phase`
+as drafted below. The terminal phase is derived from the set, and a set missing a phase is
+a visible fact rather than a silently absent one.
+
+### Pre-authentication nonces cannot be joined, and must be published as such
+
+`wire_nonce` is not always a peer protocol nonce. Before decoding reaches one, the
+receiver labels the attempt `preauth:<sha256>`, built locally from the process id, an
+atomic counter and a nanosecond timestamp (`manager-network/src/lib.rs:1666-1675`). The
+store's own validator confines such a nonce to **inbound direction and three phases only**
+— `inbound_request_observed`, `inbound_diagnostic_reply_written`, `inbound_connection_closed`
+— and forbids it from carrying an authenticated peer (`durable.rs:1292-1315`).
+
+Two consequences the draft below missed:
+
+- **A preauth nonce can never join.** It is minted locally, so two hosts never commit the
+  same value for one exchange. Under a fail-closed comparator, "no receiver row for this
+  nonce commitment" is a refusal — so a campaign containing any preauth observation would
+  be refused for a reason that is not a defect.
+- **The sender side is safe.** Preauth is inbound-only and enforced, so an outbound
+  stranded attempt — the only kind condition 2 joins from — always carries a real peer
+  nonce. The measured store contains **zero** preauth rows, so this was not observed; it
+  is permitted by the contract, which is enough.
+
+Each folded row therefore carries `nonce_authority`: `peer-validated` or
+`pre-authentication`. The join is defined **only** over peer-validated nonces.
+Pre-authentication rows are published as observations that are explicitly not joinable,
+are never counted as a duplicate, and never cause a refusal by their absence from the
+other side.
+
 ## Constraints the schema must satisfy
 
 - **Never publish keys, endpoints, raw UUIDs or request bodies** (Decision 1). Every
@@ -157,8 +224,11 @@ scoped to the campaign window by the baseline watermark:
   "rows": [
     {
       "nonce_commitment": "sha256:…",       // the join key
+      "nonce_authority": "peer-validated",  // or "pre-authentication": published, never joined
       "direction": "inbound",
-      "terminal_phase": "inbound_reply_write_observed",
+      "phases_reached": ["inbound_request_observed","inbound_import_committed",
+                         "inbound_reply_prepared","inbound_reply_write_observed"],
+      "terminal_phase": "inbound_reply_write_observed",   // derived from the set above
       "outcome": "accepted",
       "peer_commitment": "sha256:…",
       "operation_commitment": "sha256:…",
@@ -194,8 +264,11 @@ plus a guessed body is a confirmation oracle.
 
 ## What the comparator must gain
 
-A fail-closed join, refusing on: no receiver row for a nonce commitment; **more than
-one** receiver row for it; any binding field that disagrees; a receiver row that never
+A fail-closed join over **folded** rows, one per nonce, and over peer-validated nonces
+only. It refuses on: no receiver row for a peer-validated nonce commitment; **more than
+one folded** row for it — the pre-fold rule would have refused every real inbound
+exchange, see the correction above; two different non-null values for one field inside a
+fold; any binding field that disagrees across hosts; a receiver row that never
 reached a terminal phase; a non-zero unaudited-receipt count; an attempt that appears in
 the post set, is claimed accounted, and is absent from `incomplete_attempts` at
 post-cleanup; and any attempt outside the declared window.
@@ -211,8 +284,8 @@ write.
 
 ## Size, and what it costs
 
-Per host in the measured campaign: about 33 incomplete-attempt records and about 125
-exchange rows. On the order of tens of kilobytes per stage file, against 13 KB today.
+Per host in the measured campaign: about 33 incomplete-attempt records, and one folded
+exchange row per nonce — 67 in the preserved store measured, folded from 165 audit rows. On the order of tens of kilobytes per stage file, against 13 KB today.
 The audit history itself is never published — only a window of summaries and two set
 digests over it.
 
