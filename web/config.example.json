@@ -1,0 +1,1 @@
+{"hosts":[{"id":"local","name":"Local host","socket":"/run/podmesh/api.sock","allowActions":false}]}

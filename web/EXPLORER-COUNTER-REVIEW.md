@@ -1,0 +1,46 @@
+Source-only review, no execution. Three files, scoped to the explorer path. Anything depending on `lifecycle::podman`, `crate::now()`, or the `/details` route handler I flag as unverified rather than asserted.
+
+## Blockers
+
+**1. `podman exec` runs as the container's configured user, not root — the documented scope may be false.**
+`query()` builds `exec -- <id> podman …` with no `--user root`. `podman exec` defaults to `Config.User` of the target container. If a parent runs as non-root (a very common hardening choice, and `Config.User` is itself displayed in the panel right next to the claim), the nested `podman ps` reads that user's **rootless** store. The response then ships `"scope":"Default rootful Podman store inside each running parent; rootless stores are not enumerated"` — a positive claim the code does not enforce. Either add `--user root` to every exec hop, or compute the scope string from the observed `Config.User` instead of hardcoding it. This is the one I'd fix first: a wrong provenance label on security-relevant output is worse than no output.
+
+**2. The only non-degradable call is the most expensive one.**
+`inspect()` uses `?` on `query(parents,&["container","inspect","--size",id])`, while metrics and children are wrapped in `observed()` and degrade gracefully. But `--size` forces computation of the writable-layer diff (a directory walk), which is exactly the call most likely to exceed the 12 s budget on a large layer — and at depth ≥ 2 it runs through two or three serialized exec hops. Result: the whole panel fails with a bare error string, losing configuration, state, and the nested inventory, because a cosmetic disk figure was slow. Split it: `inspect` without `--size` for the fatal path, `--size` as a second, `observed()`-wrapped query, or make the size fields optional on timeout.
+
+**3. Timeout budgets are mismatched by an order of magnitude, and the client has no deadline.**
+Server-side worst case for one `inspect()` is 3 × 12 s ≈ 36 s. `transport.mjs` defaults to `timeout=395000` with `settimeout(390)` in the remote reader. A stuck explorer request therefore pins a browser `fetch` for **6.5 minutes** — `Explorer.jsx` passes `abort.signal` but sets no timer, so `AbortController` only fires on path change or unmount. The UI sits on `Reading configuration, metrics and nested containers…` with no way out. Pass a per-endpoint timeout (~45–60 s for reads) and add an `AbortSignal.timeout()` in the effect. Related: `settimeout(390)` is a per-`recv` timeout, not a total-duration bound, so a trickling peer is only caught by the outer `setTimeout`.
+
+**4. Client aborts do not propagate; work accumulates on the host.**
+Aborting the fetch does nothing to the in-flight `request()` — the `ssh` process and the root `podman exec` chain behind it run to completion. Navigating three levels deep and back leaves several concurrent root `podman inspect --size` walks on the host, with no concurrency cap or rate limit anywhere in these three files. On timeout, `process?.kill()` SIGTERMs the local `ssh` only; the remote `sudo python3` and its open connection to `/run/podmesh/api.sock` may survive until its own 390 s expires. Retrying stacks. Needs a server-side cancel path (kill on client disconnect) and a per-host in-flight limit.
+
+**5. Metrics can report `status:"observed"` while every tile reads "Unavailable", with no reason shown.**
+`Explorer.jsx` reads `stats.CPU||stats.CPUPerc`, `stats.MemUsage`, `stats.NetIO`, `stats.BlockIO`. The `CPU||CPUPerc` fallback is itself an admission that the schema of `podman stats --no-stream --format json` isn't pinned; those key names have varied across Podman versions, and at depth ≥ 1 the version is whatever is installed *inside the parent*, which this gateway does not control or record. Nothing server-side validates or normalizes the shape. The failure is silent: `data.metrics?.status!=='observed'` is false, so the explanatory `reason` line is not rendered, and the operator sees four dead tiles with no cause. Normalize in `explorer.rs` to fixed keys and return `unavailable` with a reason when the expected fields are absent. Separately, `stats.CPU||…` treats a numeric `0` as missing — if any version emits a number rather than `"0.00%"`, an idle container renders "Unavailable".
+
+## Identity validation
+
+- Full 64-hex enforcement is the right call and does block the `--latest`/prefix-ambiguity class; the test covers it. Two gaps:
+- `is_ascii_hexdigit()` accepts uppercase, but Podman IDs are lowercase. An uppercase ID passes `path()`, then fails to resolve — surfacing as a raw podman error or as "Observed container identity mismatch" instead of a clean validation message. Lowercase-normalize (or reject non-lowercase) in `path()`.
+- The `c["Id"] == id` check applies only to the leaf. Parent IDs are never verified against anything, and — more fundamentally — at depth ≥ 2 the `podman` binary producing `inspect`, `stats` and `ps` output lives inside a container the operator is investigating, i.e. it is attacker-controlled in exactly the scenario where you'd be looking. A compromised parent can return an `inspect` echoing the requested `Id` with fabricated `Privileged`, `NetworkMode`, and mount counts; the identity check passes and the UI labels it `observed`. That's inherent to exec-based introspection and I don't think it's fixable here, but the response should carry a trust marker (e.g. `attested_by: "host"` vs `"nested"`) and the UI should visually distinguish depth ≥ 2 rather than presenting both with the same badge.
+
+## Data exposure
+
+- The configuration allowlist is sound — Env, Cmd, labels and mount details are genuinely excluded, and the UI states so. `mount_count` as a bare integer is a good compromise.
+- **The main leak is error text, not fields.** `observed()` embeds `e.to_string()` verbatim, and `inspect()`'s `Err` reaches `r.error` in the browser. Errors from root-privileged podman invocations routinely carry storage paths, socket paths, the full command line, and `serde_json` parse errors quote the offending output — which at depth ≥ 2 is attacker-controlled content reflected back into the operator's page. Map to a stable set of reasons and log the detail server-side.
+- Nested `Names` and `Image` are attacker-controlled strings rendered in chips and rows. React escapes them, so this is not XSS, but a hostile name can impersonate another container in the breadcrumb after you click through. Truncate and render names in a distinct style from operator-supplied values.
+- `transport.mjs` does `process.stderr.resume()` — all remote diagnostics are discarded, and every remote failure (including the oversize-request `ValueError`) collapses to `SSH transport failed; verify host connection and permissions`. That's the inverse problem of the above: too much detail to the browser, none to the operator's logs. Capture stderr (bounded) to the server log.
+
+## Smaller items
+
+- `text.len()>4*1024*1024` is checked *after* `podman()` returns, so the cap depends entirely on whether `podman()` bounds its own buffering — unverified from these files. If it doesn't, a nested `podman` shim emitting unbounded output is a memory-exhaustion path. Also note the asymmetry with `MAX=8MiB` in the transport.
+- `let process` shadows the Node global inside the executor, and `finish` closes over `socket` declared after it. Neither triggers today (all call sites are async), but both are one refactor away from a TDZ throw inside the error path.
+- The timeout message `outcome may be unknown. Reconcile before retry.` is written for mutating operations. The explorer is read-only; showing it here will send an operator hunting for damage that cannot exist.
+- Socket-path regex `^\/[a-zA-Z0-9_./-]+$` permits `..` segments. Operator-configured, so low severity, but trivially tightened.
+- `Explorer.jsx` calls `.then(r=>r.json())` without checking HTTP status — a proxy 502 returning HTML produces `Unexpected token <` as the user-facing error.
+- `new Date(data.observed_at*1000)` assumes `crate::now()` returns seconds. Worth confirming; if it returns millis the timestamp is off by 1000×.
+- Metrics are a single sample at mount with no refresh control, yet the server calls them "live metrics" and the UI prints an `Observed <time>` that silently goes stale. Add a refresh button rather than polling.
+- The `Disk space available: Unknown` tile is honestly labeled and consistent with `available_bytes:null`, but it is a permanently dead cell. Either drop it or source it from the parent's `podman system df`.
+- `memory_limit_bytes===0` renders "No explicit limit" in the grid, while the same `0` appears raw for `memory_swap_limit_bytes` in the Configuration list.
+- No check that a parent is running before `exec`; that path fails fatally via `?` (see blocker 2) rather than degrading with the clear "no start was requested" message used elsewhere — which is the right message for that case too.
+
+The stop-ship set is 1–5. Of those, 1 and 5 are correctness-of-claim issues (the panel asserts things it hasn't established), and 2–4 are all facets of one design gap: no coherent end-to-end deadline or cancellation for a read that fans out into serialized root commands.

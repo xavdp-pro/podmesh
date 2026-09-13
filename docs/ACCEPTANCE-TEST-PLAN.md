@@ -25,6 +25,19 @@ Current qualified status (standalone Linux mode). Gates 1–5 are partially exer
 
 The final byte-identical daemon also passed an 81-check two-host collector suite, including memory continuity, pidfd reclaim and actual daemon death after a committed class-2 effect followed by exactly-once recovery. Transfer and destination recovery qualification remains restricted to the documented Alpine musl, network-disabled, volume-free workload. See REVIEW-COLLECTOR-COMPLETION.md for scope and hashes.
 
+The package and default-refusal manager slices are VERIFIED for
+`0.1.0~manager1+g5319ab150fc3`: the exact candidate was published through signed
+APT and installed on three existing laboratory hosts. One logical identity was
+then represented by three protected, distinct host-bound replica configurations.
+All three passed pure offline validation; the unchanged network-disabled unit
+failed closed on an attempted start and left no process, database, lock, socket
+or listener; IPv4 routes and the nftables ruleset stayed unchanged. Existing
+lifecycle and observer service-state commitments were preserved. This does not
+qualify authenticated exchange, convergence, takeover,
+DNS recovery, fencing, clean full-host installation or HA. See
+REVIEW-MANAGER-PACKAGE-QUALIFICATION.md and
+REVIEW-MANAGER-DEFAULT-REFUSAL.md.
+
 Networking (including unique clone IPs), volumes, purge, clean-host installation, gate 7 and gate 8 are not validated through PodMesh. A reservation is not fencing. See DELIVERY-CHECKLIST.md for the exact scope and evidence. Earlier standalone migration-kit experiments do not satisfy these service acceptance gates.
 
 The same contracts must ultimately be checked in standalone Linux mode and ShaperOS-integrated mode. Passing one mode does not validate the other.

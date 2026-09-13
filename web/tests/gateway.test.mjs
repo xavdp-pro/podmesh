@@ -1,0 +1,118 @@
+import http from 'node:http';import test from 'node:test';import assert from 'node:assert/strict';import {createApp} from '../server/app.mjs';import {request}from'../server/transport.mjs';import net from'node:net';import fs from'node:fs/promises';import os from'node:os';import path from'node:path';
+const payload={operation:'start',universe_uuid:'00000000-0000-4000-8000-000000000001',operation_id:'00000000-0000-4000-8000-000000000002',authorization_ref:'fixture'};
+async function gateway(t,actions=true){
+ const calls=[];let app;const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'a',name:'A',socket:'/fixture.sock',allowActions:actions}]},{origin:url,call:async(_h,p)=>{calls.push(p);return {ok:true,data:p.operation==='capabilities'?{operations:['start']}:{}};}});
+ const session=await fetch(url+'/api/session').then(r=>r.json());return{calls,url,session,post:(body=payload,extra={})=>fetch(url+'/api/hosts/a/actions',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Podmesh-Token':session.token,...extra},body:JSON.stringify(body)})};
+}
+test('action forwards exact identity through capability check',async t=>{const g=await gateway(t);assert.equal((await g.post()).status,200);assert.deepEqual(g.calls,[{operation:'capabilities'},payload]);});
+test('missing session, foreign origin and unknown action refused',async t=>{const g=await gateway(t);assert.equal((await g.post(payload,{'X-Podmesh-Token':''})).status,403);assert.equal((await g.post(payload,{Origin:'https://foreign.test'})).status,403);assert.equal((await g.post({...payload,operation:'garbage_collect_apply'})).status,400);assert.deepEqual(g.calls,[]);});
+test('mutating routes require an explicit same-origin header even with a valid session token',async t=>{const g=await gateway(t);const action=await fetch(g.url+'/api/hosts/a/actions',{method:'POST',headers:{'Content-Type':'application/json','X-Podmesh-Token':g.session.token},body:JSON.stringify(payload)});const details=await fetch(g.url+'/api/hosts/a/details',{method:'POST',headers:{'Content-Type':'application/json','X-Podmesh-Token':g.session.token},body:JSON.stringify({container_path:['a'.repeat(64)]})});assert.equal(action.status,403);assert.equal(details.status,403);assert.deepEqual(g.calls,[]);});
+test('read-only and unadvertised capabilities refuse writes',async t=>{const a=await gateway(t,false);assert.equal((await a.post()).status,403);assert.deepEqual(a.calls,[]);const b=await gateway(t);assert.equal((await b.post({...payload,operation:'delete'})).status,409);assert.equal(b.calls.length,1);});
+test('DNS rebinding host refused',async t=>{const g=await gateway(t);const status=await new Promise((resolve,reject)=>{http.get(g.url+'/api/session',{headers:{Host:'foreign.test'}},r=>{r.resume();resolve(r.statusCode);}).on('error',reject);});assert.equal(status,403);});
+test('Unix transport forwards newline JSON and bounds response',async t=>{const dir=await fs.mkdtemp(path.join(os.tmpdir(),'podmesh-web-'));const socket=path.join(dir,'api.sock');const server=net.createServer({allowHalfOpen:true},c=>{let b='';c.on('data',x=>{b+=x;if(b.endsWith('\n')){assert.deepEqual(JSON.parse(b),{operation:'identity'});c.end('{"ok":true,"data":{"host_uuid":"fixture"}}\n');}});});await new Promise(r=>server.listen(socket,r));t.after(async()=>{server.close();await fs.rm(dir,{recursive:true,force:true});});assert.deepEqual(await request({socket},{operation:'identity'}),{ok:true,data:{host_uuid:'fixture'}});await assert.rejects(request({socket},{operation:'x',value:'x'.repeat(4096)}),/limit/);});
+
+test('unexpected action fields refused',async t=>{const g=await gateway(t);assert.equal((await g.post({...payload,on_timeout:'kill'})).status,400);assert.deepEqual(g.calls,[]);});
+test('missing host transport refused',()=>assert.throws(()=>createApp({hosts:[{id:'a',name:'A'}]}),/transport/));
+test('UTF-8 survives split socket chunks',async t=>{
+ const dir=await fs.mkdtemp(path.join(os.tmpdir(),'podmesh-utf8-'));const socket=path.join(dir,'api.sock');const expected={ok:true,data:'électricité'};const bytes=Buffer.from(JSON.stringify(expected));const at=bytes.indexOf(0xc3)+1;
+ const server=net.createServer({allowHalfOpen:true},c=>c.once('data',()=>{c.write(bytes.subarray(0,at));setTimeout(()=>c.end(bytes.subarray(at)),20);}));await new Promise(r=>server.listen(socket,r));t.after(async()=>{server.close();await fs.rm(dir,{recursive:true,force:true});});assert.deepEqual(await request({socket},{operation:'identity'}),expected);
+});
+test('unknown action invalidates completed and in-flight observations',async t=>{
+ let app,release;let reads=0,hold=false;
+ const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'a',name:'A',socket:'/fixture.sock',allowActions:true}]},{origin:url,call:async(_h,p)=>{if(p.operation==='start')throw Error('lost response');if(p.operation==='identity'){reads++;if(hold)await new Promise(r=>release=r);}return{ok:true,data:{operations:['start']}};}});
+ const session=await fetch(url+'/api/session').then(r=>r.json());const post=()=>fetch(url+'/api/hosts/a/actions',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Podmesh-Token':session.token},body:JSON.stringify(payload)});
+ await fetch(url+'/api/snapshot');assert.equal(reads,1);assert.equal((await post()).status,502);await fetch(url+'/api/snapshot');assert.equal(reads,2);
+ await post();hold=true;const pending=fetch(url+'/api/snapshot');while(!release)await new Promise(r=>setTimeout(r,1));await post();hold=false;release();await pending;await fetch(url+'/api/snapshot');assert.equal(reads,4);
+});
+test('details rejects command-like IDs and refuses missing API capability',async t=>{const g=await gateway(t);const session=await fetch(g.url+'/api/session').then(r=>r.json());const post=ids=>fetch(g.url+'/api/hosts/a/details',{method:'POST',headers:{Origin:g.url,'Content-Type':'application/json','X-Podmesh-Token':session.token},body:JSON.stringify({container_path:ids})});assert.equal((await post(['--latest'])).status,400);assert.equal((await post(['a'.repeat(64)])).status,409);});
+
+test('snapshot includes advertised host metrics and skips them on older runtimes',async t=>{
+ let app;const calls=[];const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'new',name:'New',socket:'/new.sock'},{id:'old',name:'Old',socket:'/old.sock'}]},{origin:url,call:async(h,p)=>{calls.push([h.id,p.operation]);if(p.operation==='capabilities')return{ok:true,data:{operations:h.id==='new'?['host_resource_metrics']:[]}};if(p.operation==='host_resource_metrics')return{ok:true,data:{observed_at:1,memory:{known:true,total_bytes:20,available_bytes:10}}};if(p.operation==='inventory')return{ok:true,data:{containers:[]}};if(p.operation==='observations')return{ok:true,data:{observations:[]}};return{ok:true,data:{host_uuid:h.id}};}});
+ const snapshot=await fetch(url+'/api/snapshot').then(r=>r.json());
+ assert.equal(snapshot.hosts[0].responses.host_resource_metrics.data.memory.available_bytes,10);
+ assert.equal(snapshot.hosts[1].responses.host_resource_metrics,undefined);
+ assert.deepEqual(calls.filter(([,operation])=>operation==='host_resource_metrics'),[['new','host_resource_metrics']]);
+});
+
+test('snapshot reads metrics from the dedicated observation socket',async t=>{
+ let app;const calls=[];const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'a',name:'A',ssh:'lab@example.test',detailsSocket:'/run/observer.sock'}]},{origin:url,call:async(h,p)=>{calls.push([h.remoteSocket||'/run/podmesh/api.sock',p.operation]);if(p.operation==='capabilities')return{ok:true,data:{operations:h.remoteSocket?['host_resource_metrics']:[]}};if(p.operation==='host_resource_metrics')return{ok:true,data:{memory:{known:true,total_bytes:20,available_bytes:10}}};if(p.operation==='inventory')return{ok:true,data:{containers:[]}};if(p.operation==='observations')return{ok:true,data:{observations:[]}};return{ok:true,data:{host_uuid:'a'}};}});
+ const host=(await fetch(url+'/api/snapshot').then(r=>r.json())).hosts[0];
+ assert.equal(host.responses.host_resource_metrics.data.memory.available_bytes,10);
+ assert.deepEqual(host.responses.host_resource_capabilities.data.operations,['host_resource_metrics']);
+ assert.deepEqual(calls.filter(([,operation])=>operation==='host_resource_metrics'),[['/run/observer.sock','host_resource_metrics']]);
+});
+
+test('dedicated observer capability state is truthful when metrics are unsupported',async t=>{
+ let app;const calls=[];const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'a',name:'A',socket:'/main.sock',detailsSocket:'/observer.sock'}]},{origin:url,call:async(h,p)=>{calls.push([h.socket,p.operation]);if(p.operation==='capabilities')return{ok:true,data:{operations:h.socket==='/observer.sock'?[]:['host_resource_metrics']}};if(p.operation==='inventory')return{ok:true,data:{containers:[]}};if(p.operation==='observations')return{ok:true,data:{observations:[]}};return{ok:true,data:{host_uuid:'a'}};}});
+ const host=(await fetch(url+'/api/snapshot').then(r=>r.json())).hosts[0];
+ assert.deepEqual(host.responses.host_resource_capabilities.data.operations,[]);
+ assert.equal(host.responses.host_resource_metrics,undefined);
+ assert.deepEqual(calls.filter(([,operation])=>operation==='host_resource_metrics'),[]);
+ assert.ok(calls.some(([socket,operation])=>socket==='/observer.sock'&&operation==='capabilities'));
+});
+
+test('details socket never redirects lifecycle actions',async t=>{
+ let app;const calls=[];const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'a',name:'A',ssh:'lab@example.test',detailsSocket:'/run/observer.sock',allowActions:true}]},{origin:url,call:async(h,p)=>{calls.push([h.remoteSocket,p.operation]);return{ok:true,data:p.operation==='capabilities'?{operations:['start']}:{}};}});
+ const session=await fetch(url+'/api/session').then(r=>r.json());const response=await fetch(url+'/api/hosts/a/actions',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Podmesh-Token':session.token},body:JSON.stringify(payload)});
+ assert.equal(response.status,200);assert.deepEqual(calls,[[undefined,'capabilities'],[undefined,'start']]);
+});
+
+test('deep inspection excludes concurrent observer polling without hiding main inventory',async t=>{
+ let app,releaseDetails,detailsStarted;const started=new Promise(resolve=>detailsStarted=resolve);const calls=[];const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'a',name:'A',socket:'/main.sock',detailsSocket:'/observer.sock'}]},{origin:url,call:async(h,p)=>{calls.push([h.socket,p.operation]);if(p.operation==='capabilities')return{ok:true,data:{operations:h.socket==='/observer.sock'?['container_details','host_resource_metrics']:[]}};if(p.operation==='container_details'){detailsStarted();await new Promise(resolve=>releaseDetails=resolve);return{ok:true,data:{}};}if(p.operation==='inventory')return{ok:true,data:{containers:[{Id:'kept'}]}};if(p.operation==='observations')return{ok:true,data:{observations:[]}};return{ok:true,data:{host_uuid:'a'}};}});
+ const session=await fetch(url+'/api/session').then(r=>r.json());const detailRequest=fetch(url+'/api/hosts/a/details',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Podmesh-Token':session.token},body:JSON.stringify({container_path:['a'.repeat(64)]})});await started;
+ const host=(await fetch(url+'/api/snapshot').then(r=>r.json())).hosts[0];
+ assert.equal(host.responses.inventory.data.containers[0].Id,'kept');assert.equal(host.metricsDeferred,true);assert.equal(calls.filter(([socket])=>socket==='/observer.sock').length,2);
+ releaseDetails();assert.equal((await detailRequest).status,200);
+});
+
+test('observer capability failure remains optional for main observations',async t=>{
+ let app;const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'a',name:'A',socket:'/main.sock',detailsSocket:'/observer.sock'}]},{origin:url,call:async(h,p)=>{if(h.socket==='/observer.sock')throw Error('observer unavailable');if(p.operation==='inventory')return{ok:true,data:{containers:[{Id:'kept'}]}};if(p.operation==='observations')return{ok:true,data:{observations:[{id:1}]}};if(p.operation==='capabilities')return{ok:true,data:{operations:[]}};return{ok:true,data:{host_uuid:'a'}};}});
+ const host=(await fetch(url+'/api/snapshot').then(r=>r.json())).hosts[0];assert.equal(host.responses.inventory.data.containers[0].Id,'kept');assert.equal(host.responses.observations.data.observations[0].id,1);assert.equal(host.optionalErrors.host_resource_metrics,'observer unavailable');assert.deepEqual(host.errors,{});
+});
+
+test('failed optional metrics cannot suppress inventory or journal observations',async t=>{
+ let app;const calls=[];const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'a',name:'A',socket:'/a.sock'}]},{origin:url,call:async(_host,p)=>{calls.push(p.operation);if(p.operation==='capabilities')return{ok:true,data:{operations:['host_resource_metrics']}};if(p.operation==='host_resource_metrics')throw Error('fixture metrics timeout');if(p.operation==='inventory')return{ok:true,data:{containers:[{Id:'kept'}]}};if(p.operation==='observations')return{ok:true,data:{observations:[{id:1,operation:'create'}]}};return{ok:true,data:{host_uuid:'a'}};}});
+ const host=(await fetch(url+'/api/snapshot').then(r=>r.json())).hosts[0];
+ assert.deepEqual(calls,['identity','capabilities','inventory','observations','host_resource_metrics']);assert.equal(host.responses.inventory.data.containers[0].Id,'kept');assert.equal(host.responses.observations.data.observations[0].operation,'create');assert.equal(host.errors.host_resource_metrics,undefined);assert.equal(host.optionalErrors.host_resource_metrics,'fixture metrics timeout');
+});
+
+async function relationshipGateway(t,relationshipFetch,now=100000){
+ let app;const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'a',name:'A',socket:'/fixture.sock'}],relationships:{endpoint:'http://127.0.0.1:8787/v1/fractals',maxAgeSeconds:60}},{origin:url,now:()=>now,relationshipFetch,call:async(_h,p)=>p.operation==='inventory'?{ok:true,data:{containers:[{Id:'kept'}]}}:{ok:true,data:p.operation==='observations'?{observations:[]}:{}}});
+ const session=await fetch(url+'/api/session').then(r=>r.json());const read=()=>fetch(url+'/api/relationships',{headers:{Origin:url,'X-Podmesh-Token':session.token}}).then(r=>r.json());return{url,session,read};
+}
+const relationship=(fractal_uuid,universe_uuid,parent_uuid=null)=>({fractal_uuid,fractal_name:'Fixture',universe_uuid,parent_uuid,name:'Fixture universe',role:'worker',revision:1,provenance:'fixture',observed_at:100});
+const relationIds={first:'00000000-0000-4000-8000-000000000010',second:'00000000-0000-4000-8000-000000000011',one:'00000000-0000-4000-8000-000000000001',two:'00000000-0000-4000-8000-000000000002'};
+
+test('relationship gateway reads multiple manager-attested fractals through the local session',async t=>{
+ const g=await relationshipGateway(t,async(url,options)=>{assert.equal(url,'http://127.0.0.1:8787/v1/fractals');assert.equal(options.method,'GET');return new Response(JSON.stringify({observed_at:100,relationships:[relationship(relationIds.first,relationIds.one),relationship(relationIds.second,relationIds.two)]}),{headers:{'content-type':'application/json'}});});
+ const body=await g.read();assert.equal(body.status,'available');assert.equal(body.relationships.length,2);assert.equal((await fetch(g.url+'/api/relationships')).status,403);assert.equal((await fetch(g.url+'/api/relationships',{headers:{'X-Podmesh-Token':g.session.token}}).then(r=>r.json())).status,'available');
+});
+
+test('missing relationship endpoint remains explicit and cannot block host inventory',async t=>{
+ let app;const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'a',name:'A',socket:'/fixture.sock'}]},{origin:url,call:async(_h,p)=>p.operation==='inventory'?{ok:true,data:{containers:[{Id:'kept'}]}}:{ok:true,data:p.operation==='observations'?{observations:[]}:{}}});const session=await fetch(url+'/api/session').then(r=>r.json());
+ const relationships=await fetch(url+'/api/relationships',{headers:{Origin:url,'X-Podmesh-Token':session.token}}).then(r=>r.json());const snapshot=await fetch(url+'/api/snapshot').then(r=>r.json());assert.equal(relationships.status,'unavailable');assert.equal(snapshot.hosts[0].responses.inventory.data.containers[0].Id,'kept');
+});
+
+test('malformed and over-limit manager responses are rejected before the view model',async t=>{
+ const malformed=await relationshipGateway(t,async()=>new Response(JSON.stringify({relationships:[]}),{headers:{'content-type':'application/json'}}));assert.equal((await malformed.read()).status,'malformed');
+ const bounded=await relationshipGateway(t,async()=>new Response(JSON.stringify({observed_at:100,relationships:Array.from({length:5001},()=>({}))}),{headers:{'content-type':'application/json'}}));const body=await bounded.read();assert.equal(body.status,'malformed');assert.match(body.error,/5000-record/);
+});
+
+test('stale relationship data remains explicit and leaves observed universes unassigned',async t=>{
+ const g=await relationshipGateway(t,async()=>new Response(JSON.stringify({observed_at:1,relationships:[relationship(relationIds.first,relationIds.one)]}),{headers:{'content-type':'application/json'}}));const body=await g.read();assert.equal(body.status,'stale');assert.equal(body.relationships,undefined);
+});
+
+test('manager relationship failure is isolated from host snapshot collection',async t=>{
+ const g=await relationshipGateway(t,async()=>{throw Error('fixture manager unavailable');});const relationships=await g.read();const snapshot=await fetch(g.url+'/api/snapshot').then(r=>r.json());assert.equal(relationships.status,'unavailable');assert.match(relationships.error,/fixture manager unavailable/);assert.equal(snapshot.hosts[0].responses.inventory.data.containers[0].Id,'kept');
+});

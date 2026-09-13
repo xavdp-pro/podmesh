@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PodMesh manager inactive-upgrade evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "stage", "host_evidence", "config_commitment", "state_commitment"],
+  "properties": {
+    "schema_version": {"const": "podmesh-manager-inactive-upgrade-evidence/v1"},
+    "stage": {"enum": ["pre-upgrade", "post-upgrade"]},
+    "host_evidence": {
+      "type": "object",
+      "description": "A deeply validated podmesh-manager-host-evidence/v5 post-install capture."
+    },
+    "config_commitment": {"$ref": "#/$defs/commitment"},
+    "state_commitment": {"$ref": "#/$defs/commitment"}
+  },
+  "$defs": {
+    "commitment": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
+  }
+}

@@ -45,6 +45,15 @@ It is a Podman-hosted package of control services, initially intended to provide
 - synchronization of control records;
 - a later status/control interface for the human-agent tandem.
 
+The current executable experiments run the replica as standalone local processes
+to exercise the manager mechanics in isolation; they do not qualify an installed
+Linux service. The preferred PodMesh deployment
+then places one replica inside a ShaperOS universe on every host, reusing ShaperOS
+Logger, observation and parent-supervision contracts. These are two deployment
+modes of the same logical manager. Standalone operation remains mandatory for
+compatible Linux hosts without ShaperOS, and passing either mode does not qualify
+the other.
+
 It is not a universal administrator. Replication gives availability of control
 services; it does not grant host-root access, policy authority, or permission to
 activate workloads.

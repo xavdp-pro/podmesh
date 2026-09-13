@@ -1,0 +1,76 @@
+{
+  "action": "applied",
+  "candidate": {
+    "binary_sha256": "cbd5020a37d2b6b2ab94ee41a7ea9d2f50d0da36c6fb972f795c8a1fe3660128",
+    "dpkg_verify": "clean",
+    "package": "podmesh-manager",
+    "report_commitment": "sha256:195a518760ff6e12a0cd2e69e0dbfee78177ca7b6f0de268a303341e1af682ca",
+    "version": "0.1.0~manager2+gff77b1f946e8"
+  },
+  "claims_not_made": [
+    "activation",
+    "availability",
+    "convergence",
+    "DNS",
+    "fencing",
+    "high availability",
+    "replication",
+    "takeover"
+  ],
+  "host_alias": "lab-b",
+  "offline_validation": {
+    "candidate_valid": true,
+    "durable_store_checked": false,
+    "final_path_valid": true,
+    "network_started": false
+  },
+  "preconditions": {
+    "activation_marker_present": true,
+    "durable_state_present": true,
+    "manager_disabled": true,
+    "manager_inactive": true,
+    "no_configured_port_listener": true,
+    "no_control_socket": true,
+    "no_manager_process": true,
+    "state_directory_listing_unchanged": true
+  },
+  "private_values": "absent",
+  "result": "PASS",
+  "rollback_permitted_only_while": {
+    "activation_markers_unchanged": true
+  },
+  "schema_version": "podmesh-manager-config-transition-evidence/v2",
+  "transition": {
+    "activation_markers_commitment": "sha256:822f959eb8b5e51d3f2d3dcfd592fa99d77b72b686147e3eeda0994903062da6",
+    "all_other_values_preserved": true,
+    "applied_config_commitment": "sha256:708d70d00533749c91b6b0f02f429397708a8e65cd487393a31606753d731ead",
+    "changed_keys": [
+      "incoming_workers"
+    ],
+    "grant_count": 3,
+    "grants": [
+      {
+        "owner_replica_commitment": "sha256:7ef49ef0d3469e83f96faa01acb351e18ec73aa3ee3794b18faac15a6a0e853e",
+        "scope": "g2/lab-a/observations"
+      },
+      {
+        "owner_replica_commitment": "sha256:02b5307e89a1f6930dfc476603d287258e5ab286533e09898fb8e39f036b242d",
+        "scope": "g2/lab-b/observations"
+      },
+      {
+        "owner_replica_commitment": "sha256:7b74ae56fcf4082ea42f8b6c6b160afdda64c413c057970089fb3977d9d08714",
+        "scope": "g2/lab-c/observations"
+      }
+    ],
+    "incoming_workers": {
+      "from": 1,
+      "to": 2
+    },
+    "local_replica_matches_mapping": true,
+    "mapping_commitment": "sha256:7c859d062795b499b3f3d1eef90ac320be0221fba8f04d84ac46206fe29eae0e",
+    "protected_backup_commitment": "sha256:538b59f29fd238e87f7954cd11e76e8cb7a2f2a046b4fc8414de1935b2f2339f",
+    "source_config_commitment": "sha256:a31fa60723b3743a0b765aca682846d4894e523fb256513d6e74fe25ec58f9c1",
+    "state_listing_commitment": "sha256:27a662c4e974d655db9ef87d260b173057c40b8203ea50d9a504efe298274733"
+  },
+  "transition_kind": "incoming-workers"
+}

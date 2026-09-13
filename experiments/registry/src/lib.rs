@@ -1,4 +1,5 @@
 //! Offline, explicitly enrolled observation journal. No runtime or network authority.
+pub mod exchange;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

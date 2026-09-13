@@ -248,3 +248,75 @@ fn concurrent_duplicate_requests_converge_with_explicit_busy_retry() {
     drop(external);
     std::fs::remove_dir_all(p).unwrap();
 }
+
+#[test]
+fn enrollment_quota_is_atomic_under_write_contention() {
+    let p = dir();
+    let db = p.join("enrollment.sqlite");
+    let setup = Store::open(&db, M).unwrap();
+    for n in 0..254 {
+        setup
+            .enroll(&format!("20000000-0000-4000-8000-{n:012x}"), R, "host:a:")
+            .unwrap();
+    }
+    drop(setup);
+    // Open all connections before the independent writer holds SQLite's write lock.
+    let stores: Vec<_> = (0..4).map(|_| Store::open(&db, M).unwrap()).collect();
+    let external = rusqlite::Connection::open(&db).unwrap();
+    external.execute_batch("BEGIN IMMEDIATE").unwrap();
+    external
+        .execute(
+            "INSERT INTO enrollments VALUES(?1,?2,?3)",
+            rusqlite::params!["20000000-0000-4000-8000-0000000000fe", R, "host:a:"],
+        )
+        .unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
+    let (send, receive) = std::sync::mpsc::channel();
+    let workers: Vec<_> = stores
+        .into_iter()
+        .enumerate()
+        .map(|(n, store)| {
+            let barrier = barrier.clone();
+            let send = send.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let result = store
+                    .enroll(&format!("30000000-0000-4000-8000-{n:012x}"), R, "host:a:")
+                    .map_err(|e| e.to_string());
+                send.send(result).unwrap();
+            })
+        })
+        .collect();
+    drop(send);
+    barrier.wait();
+    // The uncommitted 255th enrollment must not allow a competing write through.
+    assert!(matches!(
+        receive.recv_timeout(std::time::Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    external.execute_batch("COMMIT").unwrap();
+    let mut accepted = 0;
+    let mut refused = 0;
+    for _ in 0..4 {
+        match receive
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+        {
+            Ok(()) => accepted += 1,
+            Err(error) => {
+                assert_eq!(error, "lab enrollment quota exhausted");
+                refused += 1;
+            }
+        }
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!((accepted, refused), (1, 3));
+    let count: i64 = external
+        .query_row("SELECT count(*) FROM enrollments", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 256);
+    drop(external);
+    std::fs::remove_dir_all(p).unwrap();
+}
