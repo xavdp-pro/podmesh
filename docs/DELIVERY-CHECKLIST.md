@@ -67,6 +67,8 @@ This is the central delivery tracker. Detailed contracts remain in INTENT.md, RU
 
 ### 5. Backup Server and public delivery
 
+Section 4 is the Backup Server's lot B0 and its snapshot adapters are a prerequisite for **B2 onward**. Its first lot, **B1**, uses the portable archive fallback with a stopped fixture and therefore needs no snapshot backend: sections 4 and 5 may start in parallel, and B1 closes on the fallback path alone. Where B0 has already qualified an adapter, B1 repeats the same round trip from its frozen local capture. See `docs/BACKUP-SERVER.md`.
+
 - [ ] Make installation preflight classify storage as qualified snapshot-backed or portable archive fallback, and show the expected interruption before scheduling backups.
 - [ ] Recommend dedicated Btrfs, ZFS or LVM2 thin storage while preserving ordinary-filesystem support and refusing automatic disk reformatting; promote a default only after equivalent lab evidence.
 - [ ] Build separately deployable PodMesh Backup Server: versioned configuration/images/volumes/optional memory, retention, encryption, integrity checks and verified restore.
