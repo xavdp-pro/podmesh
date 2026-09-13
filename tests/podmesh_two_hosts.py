@@ -15,7 +15,8 @@ product mutation goes through the PodMesh API. The controller never holds author
 """
 import base64, hashlib, json, os, shutil, socket, sqlite3, subprocess, sys, threading, time, uuid
 
-MIGRATION_TABLES = ('migration_reservations', 'migration_authorizations', 'migration_restore_claims', 'migration_reservation_history')
+MIGRATION_TABLES = ('migration_reservations', 'migration_authorizations', 'migration_restore_claims', 'migration_reservation_history',
+                    'migration_universe_tombstones', 'migration_collection_history')
 
 
 # ---------------------------------------------------------------- node side
@@ -105,6 +106,44 @@ def n_boxes():
             entries[authorization]['_mode'] = oct(os.stat(directory).st_mode & 0o777)
         listing[box] = entries
     return listing
+def n_gc_runs():
+    """The garbage collector's own run records, without the record bodies: one row per plan or apply run.
+    Kept out of n_journal so that a refused request can be compared against the migration tables alone."""
+    db = sqlite3.connect(f'file:{_state()}/state.sqlite?mode=ro', uri=True)
+    try:
+        rows = [dict(zip(('operation_id', 'mode', 'authorization_ref', 'collector_version', 'started_at', 'finished_at'), r))
+                for r in db.execute('SELECT operation_id,mode,authorization_ref,collector_version,started_at,finished_at '
+                                    'FROM garbage_collection_runs ORDER BY started_at, operation_id')]
+    except sqlite3.OperationalError:
+        rows = []
+    db.close()
+    return {'runs': rows, 'count': len(rows)}
+def n_journal_row(table, key_column, key):
+    db = sqlite3.connect(f'file:{_state()}/state.sqlite?mode=ro', uri=True)
+    cursor = db.execute(f'SELECT * FROM {table} WHERE {key_column}=?', (key,))
+    names = [d[0] for d in cursor.description]
+    rows = [dict(zip(names, r)) for r in cursor.fetchall()]
+    db.close()
+    return {'rows': rows}
+def n_journal_write(table, key_column, key, values):
+    """Deliberate, test-owned journal forgery, used only on rows this suite created, to exercise the
+    collector's refusal of a malformed or wrongly bound record. The suite restores the original values and
+    asserts that it did. This is not a product mechanism: root can always forge a journal, which is why the
+    collector re-hashes and re-binds every document it relies on instead of trusting a state column."""
+    db = sqlite3.connect(f'{_state()}/state.sqlite', timeout=30)
+    with db:
+        assignments = ', '.join(f'{c}=?' for c in values)
+        db.execute(f'UPDATE {table} SET {assignments} WHERE {key_column}=?', [*values.values(), key])
+    db.close()
+    return n_journal_row(table, key_column, key)
+def n_journal_delete(table, key_column, key):
+    """Deliberate, test-owned removal of a row this suite's own operation wrote, to simulate a service that
+    died between an effect and the record describing it. Same caveat as n_journal_write."""
+    db = sqlite3.connect(f'{_state()}/state.sqlite', timeout=30)
+    with db:
+        db.execute(f'DELETE FROM {table} WHERE {key_column}=?', (key,))
+    db.close()
+    return n_journal_row(table, key_column, key)
 def n_snapshot():
     return {'podman': n_podman_state(), 'journal': n_journal(), 'boxes': n_boxes()}
 def n_inspect(name):

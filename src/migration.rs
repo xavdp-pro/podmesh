@@ -45,10 +45,14 @@ pub(crate) const SPACE_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const CONTAINER_STORAGE: &str = "/var/lib/containers/storage";
 const SCOPE: &str = "experimental source-side checkpoint: default rootful Podman store, network-disabled, mount-free, journal-owned container with musl processes, packaged podmesh-vzcriu 3.15.5.3 through its private-path shim";
 const AUTHORITY: &str = "This checkpoint does not authorize restore on any host and does not release the reservation. Only migration_authorize_transfer issues a handoff, and only a verified destination outcome bound to it ends the reservation.";
-/// Reservation states this file and `recovery.rs` share.
+/// Reservation states this file, `recovery.rs` and `collector.rs` share.
 pub(crate) const RELEASED: &str = "released";
 pub(crate) const ABANDONED: &str = "abandoned";
 pub(crate) const RESTORED_LOCALLY: &str = "restored_locally";
+/// Terminal state of a reservation the garbage collector swept on proof (docs/GARBAGE-COLLECTION.md). Like
+/// `released` it blocks no generic operation; unlike it, a tombstone keeps refusing a blind `create` of the
+/// same universe UUID for good.
+pub(crate) const COLLECTED: &str = "collected";
 
 /// Identity binding carried by every migration request.
 pub(crate) struct Binding<'a> {
@@ -88,9 +92,128 @@ pub(crate) fn ensure_schema(db: &Connection) -> Result<(), Error> {
          CREATE TABLE IF NOT EXISTS migration_reservation_history(id INTEGER PRIMARY KEY, universe_uuid TEXT NOT NULL, operation_id TEXT NOT NULL,
          container_id TEXT NOT NULL, image_id TEXT NOT NULL, source_host_uuid TEXT NOT NULL, destination_host_uuid TEXT NOT NULL,
          container_started_at TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, detail TEXT,
-         archived_at INTEGER NOT NULL, archived_by_operation TEXT NOT NULL);",
+         archived_at INTEGER NOT NULL, archived_by_operation TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS migration_universe_tombstones(universe_uuid TEXT PRIMARY KEY, class TEXT NOT NULL,
+         class_number INTEGER NOT NULL, container_id TEXT NOT NULL, container_absent_at_collection INTEGER NOT NULL,
+         checkpoint_operation_id TEXT NOT NULL, collected_by_operation TEXT NOT NULL, collected_at INTEGER NOT NULL, proof TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS migration_collection_history(id INTEGER PRIMARY KEY, universe_uuid TEXT NOT NULL,
+         class TEXT NOT NULL, class_number INTEGER NOT NULL, container_id TEXT NOT NULL,
+         container_absent_at_collection INTEGER NOT NULL, checkpoint_operation_id TEXT NOT NULL,
+         collected_by_operation TEXT NOT NULL, collected_at INTEGER NOT NULL, proof TEXT NOT NULL);",
     )?;
     Ok(())
+}
+/// Every collection this universe has ever been through, oldest first. The tombstone is the permanent
+/// identity protection and keeps the first proof; this is the occurrence history, and a universe that comes
+/// back through a verified restore and is collected again adds a row rather than replacing anything.
+pub(crate) fn collection_history(db: &Connection, uuid: &str) -> Result<Vec<Value>, Error> {
+    let mut stmt = db.prepare(
+        "SELECT class,class_number,container_id,container_absent_at_collection,checkpoint_operation_id,collected_by_operation,
+         collected_at FROM migration_collection_history WHERE universe_uuid=?1 ORDER BY id",
+    )?;
+    let rows = stmt.query_map([uuid], |r| {
+        Ok(json!({"class": r.get::<_, String>(0)?, "class_number": r.get::<_, i64>(1)?,
+            "container_id": r.get::<_, String>(2)?, "container_absent_at_collection": r.get::<_, i64>(3)? != 0,
+            "checkpoint_operation_id": r.get::<_, String>(4)?, "collected_by_operation": r.get::<_, String>(5)?,
+            "collected_at": r.get::<_, i64>(6)?}))
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+/// Records one collection: an append-only occurrence row, and the tombstone itself the first time only, so
+/// that a second collection of the same identity never overwrites the proof the first one rested on. The
+/// caller holds the transaction.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_collection(
+    db: &Connection,
+    uuid: &str,
+    class: &str,
+    class_number: i64,
+    container_id: &str,
+    absent: bool,
+    checkpoint_operation: &str,
+    operation: &str,
+    at: i64,
+    proof: &Value,
+) -> Result<bool, Error> {
+    let values = params![
+        uuid,
+        class,
+        class_number,
+        container_id,
+        absent as i64,
+        checkpoint_operation,
+        operation,
+        at,
+        proof.to_string()
+    ];
+    db.execute(
+        "INSERT INTO migration_collection_history(universe_uuid,class,class_number,container_id,container_absent_at_collection,
+         checkpoint_operation_id,collected_by_operation,collected_at,proof) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        values,
+    )?;
+    // OR IGNORE, never OR REPLACE: the first tombstone's proof is history and is not overwritten.
+    let first = db.execute(
+        "INSERT OR IGNORE INTO migration_universe_tombstones VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        values,
+    )?;
+    Ok(first > 0)
+}
+/// The tombstone a garbage collection left for a universe, if any. It is never removed: it is the history
+/// that keeps a collected identity from silently coming back (docs/GARBAGE-COLLECTION.md, "History retention").
+pub(crate) fn tombstone(db: &Connection, uuid: &str) -> Result<Option<Value>, Error> {
+    ensure_schema(db)?;
+    Ok(db
+        .query_row(
+            "SELECT class,class_number,container_id,container_absent_at_collection,checkpoint_operation_id,collected_by_operation,
+             collected_at,proof FROM migration_universe_tombstones WHERE universe_uuid=?1",
+            [uuid],
+            |r| {
+                Ok(
+                    json!({"universe_uuid": uuid, "class": r.get::<_, String>(0)?, "class_number": r.get::<_, i64>(1)?,
+                    "container_id": r.get::<_, String>(2)?, "container_absent_at_collection": r.get::<_, i64>(3)? != 0,
+                    "checkpoint_operation_id": r.get::<_, String>(4)?, "collected_by_operation": r.get::<_, String>(5)?,
+                    "collected_at": r.get::<_, i64>(6)?,
+                    "proof": serde_json::from_str::<Value>(&r.get::<_, String>(7)?).unwrap_or(Value::Null)}),
+                )
+            },
+        )
+        .optional()?
+        .map(|mut t| {
+            // The tombstone is the first collection; the occurrences are every collection of that identity.
+            t["occurrences"] = json!(collection_history(db, uuid).unwrap_or_default());
+            t
+        }))
+}
+/// A collected universe UUID is never created again blindly: only a verified handoff restore, or an explicit
+/// replacement procedure, may give that identity a meaning on this host after a collection.
+pub(crate) fn refuse_identity_reuse(db: &Connection, uuid: &str, operation: &str) -> Result<(), Error> {
+    ensure_schema(db)?;
+    if let Some(t) = tombstone(db, uuid)? {
+        return Err(failure(
+            format!(
+                "Universe {uuid} was collected on this host by garbage collection operation {} (class {}); {operation} with this universe UUID is refused, because reusing a collected identity requires a verified handoff restore or an explicit replacement procedure",
+                t["collected_by_operation"].as_str().unwrap_or(""),
+                t["class"].as_str().unwrap_or("")
+            ),
+            json!({"tombstone": {"universe_uuid": uuid, "class": t["class"], "class_number": t["class_number"],
+                "collected_by_operation": t["collected_by_operation"], "collected_at": t["collected_at"]}}),
+        ));
+    }
+    Ok(())
+}
+/// Whether any collection of this universe recorded this exact container as absent. Such a container can
+/// only have come back out of band, so its original creation never owns it again — and this holds for every
+/// container ever proved absent for that identity, not only for the one the tombstone kept.
+pub(crate) fn collected_absent(db: &Connection, uuid: &str, container_id: &str) -> Result<bool, Error> {
+    ensure_schema(db)?;
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM migration_universe_tombstones WHERE universe_uuid=?1 AND container_id=?2
+         AND container_absent_at_collection=1)
+         OR EXISTS(SELECT 1 FROM migration_collection_history WHERE universe_uuid=?1 AND container_id=?2
+         AND container_absent_at_collection=1)",
+        params![uuid, container_id],
+        |r| r.get::<_, bool>(0),
+    )?)
 }
 
 pub(crate) struct Reservation {
@@ -144,6 +267,32 @@ pub(crate) fn reservation(db: &Connection, uuid: &str) -> Result<Option<Reservat
         )
         .optional()?)
 }
+/// Every reservation this host holds, oldest first. The garbage collector is the only host-wide reader:
+/// every other operation names the universe it acts on.
+pub(crate) fn reservations(db: &Connection) -> Result<Vec<(String, Reservation)>, Error> {
+    let mut stmt = db.prepare(
+        "SELECT universe_uuid,operation_id,container_id,image_id,source_host_uuid,destination_host_uuid,container_started_at,
+         state,created_at,updated_at,detail FROM migration_reservations ORDER BY created_at, universe_uuid",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            Reservation {
+                operation_id: r.get(1)?,
+                container_id: r.get(2)?,
+                image_id: r.get(3)?,
+                source_host: r.get(4)?,
+                destination: r.get(5)?,
+                started_at: r.get(6)?,
+                state: r.get(7)?,
+                created_at: r.get(8)?,
+                updated_at: r.get(9)?,
+                detail: r.get(10)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
 pub(crate) fn set_state(db: &Connection, uuid: &str, state: &str, detail: &Value) -> Result<(), Error> {
     db.execute(
         "UPDATE migration_reservations SET state=?2, updated_at=?3, detail=?4 WHERE universe_uuid=?1",
@@ -167,8 +316,10 @@ pub(crate) fn refuse_if_reserved(db: &Connection, uuid: &str, operation: &str) -
     ensure_schema(db)?;
     if let Some(r) = reservation(db, uuid)? {
         // A released reservation holds nothing: migration_release lifted the gate deliberately, and the
-        // row stays only so that migration_restore_local can still resume its preserved memory.
-        if r.state == RELEASED {
+        // row stays only so that migration_restore_local can still resume its preserved memory. A collected
+        // one is the same decision taken on proof by the garbage collector; its tombstone, not the
+        // reservation, is what still refuses a blind create of that universe UUID.
+        if r.state == RELEASED || r.state == COLLECTED {
             return Ok(());
         }
         return Err(failure(
@@ -695,11 +846,14 @@ pub(crate) fn checkpoint(
     existing: Option<Value>,
 ) -> Result<Value, Error> {
     let dir = base()?.join(id);
-    // A released reservation holds nothing and must not block a new checkpoint of the same universe:
-    // it is archived, with its history and its preserved artifacts, and this operation reserves afresh.
+    // A released or collected reservation holds nothing and must not block a new checkpoint of the same
+    // universe: it is archived, with its history and its preserved artifacts, and this operation reserves
+    // afresh. The tombstone of a collected universe is untouched by that — the identity stays protected
+    // against a blind create, while the universe itself may be checkpointed and migrated again.
     if let Some(r) = reservation(db, uuid)? {
-        if r.state == RELEASED && r.operation_id != id {
-            archive_reservation(db, uuid, id, RELEASED)?;
+        if (r.state == RELEASED || r.state == COLLECTED) && r.operation_id != id {
+            let state = r.state.clone();
+            archive_reservation(db, uuid, id, &state)?;
         }
     }
     match reservation(db, uuid)? {
@@ -969,7 +1123,7 @@ pub(crate) fn verify_artifacts(id: &str, archive_sha256: Option<&str>, manifest_
 }
 
 /// Reservation states that are a finished record rather than a decision still owed to someone.
-const SETTLED: [&str; 3] = [RELEASED, ABANDONED, "transferred"];
+const SETTLED: [&str; 4] = [RELEASED, ABANDONED, COLLECTED, "transferred"];
 /// What an outside observer needs in order to report on this universe without running anything: what is
 /// unresolved and since when, what a failed restore left behind, and the room left where it would write.
 ///
@@ -1021,7 +1175,8 @@ fn watch_view(r: Option<&Reservation>, claims: &[Value], authorizations: &[Value
     Ok(json!({
         "observed_at": now,
         "reservation": r.map(|r| json!({"state": r.state, "since": r.updated_at, "created_at": r.created_at,
-            "blocks_generic_operations": r.state != RELEASED, "awaiting_decision": !SETTLED.contains(&r.state.as_str())})),
+            "blocks_generic_operations": r.state != RELEASED && r.state != COLLECTED,
+            "awaiting_decision": !SETTLED.contains(&r.state.as_str())})),
         "unresolved_restore_claims": unresolved,
         "open_transfer_authorizations": open,
         "graph_root": graph,
@@ -1042,11 +1197,12 @@ pub(crate) fn status(db: &Connection, request: &Value) -> Result<Value, Error> {
     let authorizations = crate::transfer::authorizations_view(db, uuid)?;
     let claims = crate::restore::claims_view(db, uuid)?;
     let history = history_view(db, uuid)?;
+    let collected = tombstone(db, uuid)?;
     let Some(r) = r else {
         let watch = watch_view(None, &claims, &authorizations)?;
         return Ok(
             json!({"universe_uuid": uuid, "reservation": null, "current": current, "transfer_authorizations": authorizations,
-            "restore_claims": claims, "reservation_history": history, "watch": watch}),
+            "restore_claims": claims, "reservation_history": history, "tombstone": collected, "watch": watch}),
         );
     };
     let issued = authorizations
@@ -1084,6 +1240,8 @@ pub(crate) fn status(db: &Connection, request: &Value) -> Result<Value, Error> {
         "transfer_authorizations": authorizations,
         "restore_claims": claims,
         "reservation_history": history,
+        "tombstone": collected,
+        "collection_history": collection_history(db, uuid)?,
         "recovery": recovery,
         "watch": watch,
         "release": {

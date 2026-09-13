@@ -1,4 +1,5 @@
 mod cleanup;
+mod collector;
 mod lifecycle;
 mod migration;
 mod recovery;
@@ -106,13 +107,16 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
             | "migration_destination_preflight"
             | "migration_restore"
             | "migration_restore_abort" => lifecycle::execute(db, request)?,
+            // Host-wide by design: the collector is the only operation that does not name one universe.
+            "garbage_collect_plan" | "garbage_collect_apply" => collector::execute(db, request)?,
             "migration_status" => migration::status(db, request)?,
             "capabilities" => json!({
                 "version":option_env!("PODMESH_PACKAGE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
                 "operations":["capabilities","identity","inventory","observations","create","delete","clone","start","stop"],
                 "experimental_operations":["migration_preflight","migration_checkpoint","migration_status","migration_authorize_transfer",
                     "migration_complete_transfer","migration_retire_source","migration_release","migration_abandon","migration_restore_local",
-                    "migration_destination_preflight","migration_restore","migration_restore_abort"],
+                    "migration_destination_preflight","migration_restore","migration_restore_abort",
+                    "garbage_collect_plan","garbage_collect_apply"],
                 "experimental_contracts":{
                     "migration_preflight":"read-only compatibility report bound to universe UUID, container ID, image ID, source and destination host UUIDs; no reservation, suspension or artifact",
                     "migration_checkpoint":"source: fresh checks before suspension, durable reservation, checkpoint with the packaged podmesh-vzcriu runtime in its own scope, archive/manifest/hashes under the state directory; never an authorization to restore",
@@ -127,7 +131,10 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
                     "migration_restore":"destination: preflight, durable claim, restore of a private archive copy with the packaged runtime in its own scope; verified only when the universe runs restored and the CRIU restore log names the qualified runtime; records ownership and writes outbox/<authorization_id>/outcome.json",
                     "migration_restore_abort":"destination: never removes a running or verified universe; removes only a non-running container created by a held claim, or declines an unclaimed authorization, then records not_restored and writes the outcome. With the explicit reclaim_processes: true it first ends the processes it can prove belong to the failed attempt (membership of the container's own libpod or libpod-conmon cgroup, start time at or after the claim, both re-read immediately before the signal) and verifies that both cgroups disappeared; without it, surviving processes are reported and nothing is removed or signalled",
                     "restore_bound":"a restore attempt is watched while it runs: if it consumes more of the Podman graph root than its own preflight required, or that filesystem falls below the floor, its container cgroup is frozen (nothing is ended) and the transient scope is stopped",
-                    "reservation":"a reservation or an unresolved restore claim blocks create, start, delete and clone for the universe; stop remains available, and a released reservation blocks nothing"
+                    "garbage_collect_plan":"host-wide and read-only: enumerates a bounded set of reservations and unresolved restore claims, their class, every proof fact observed and every blocker, and proposes an effect for each. No Podman mutation, no signal, no deletion, no state change beyond its own immutable run record. Age never justifies collection: proof does",
+                    "garbage_collect_apply":"separately authorized: names the plan it applies, the candidates it may act on, and its own bounds (max_effects, max_runtime_reclaims, reclaim_processes). It repeats every proof immediately before each effect, stops at the first mismatch, and verifies each result from outside. Terminal reservation classes 1 and 2 become a collected reservation with a tombstone; a failed restore claim is delegated to migration_restore_abort. There is no timer and no artifact collection in this version",
+                    "tombstone":"a collected universe UUID keeps refusing create and clone into that identity for good; a container proven absent at collection never regains ownership through its original creation. Only a verified handoff restore, or an explicit replacement procedure, gives that identity a meaning again",
+                    "reservation":"a reservation or an unresolved restore claim blocks create, start, delete and clone for the universe; stop remains available, and a released or collected reservation blocks nothing"
                 },
                 "scope":"local rootful Podman; network-disabled universes created or cloned by this host's PodMesh journal; one request at a time",
                 "contracts":{

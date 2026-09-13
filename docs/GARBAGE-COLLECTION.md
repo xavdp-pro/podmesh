@@ -1,9 +1,16 @@
 # Garbage collection contract: proof before age
 
-Date: 2026-09-12. Audience: PodMesh implementation and review agents.
-Status: operator design direction for a later bounded implementation lot.
+Date: 2026-09-12, amended 2026-09-13. Audience: PodMesh implementation and review
+agents. Status: operator design direction for a later bounded implementation lot.
 This document does not authorize a scheduler, destructive action, or production
 collection by itself.
+
+The 2026-09-13 amendment applies four wording decisions taken by OpenAI Codex
+coordinating with the operator, after the first implementation lot exposed places
+where this contract forbade something it also required, or left a scope unstated:
+the plan's own audit writes, class 2's eligibility, the exact gate class 1 lifts,
+and the two hold scopes. They are marked **(amended 2026-09-13)** where they appear.
+No other clause changed, and no amendment widens what an implementation may claim.
 
 ## Core rule
 
@@ -33,8 +40,14 @@ ownership decision with a filesystem deletion.
 
 The first version has two explicit modes:
 
-- **Plan / dry run:** calculate candidates, blockers and proposed effects. It makes
-  no Podman call, signal, database mutation, file deletion, or retention change.
+- **Plan / dry run (amended 2026-09-13):** calculate candidates, blockers and
+  proposed effects. It may make **read-only** Podman observations, because every
+  class requires a fresh observation to classify anything at all, and it may write
+  **only its own** bounded operation, attempt and collection-plan audit records,
+  because a dry run that leaves no durable trace cannot be audited. It must mutate
+  **no** domain record: no reservation, claim, authorization, artifact, container,
+  process, route, retention state or evidence. It sends no signal, deletes no file
+  and changes no retention.
 - **Apply:** repeat every proof immediately before each effect, perform the bounded
   action, independently verify the result, and write an immutable operation record.
 
@@ -62,7 +75,8 @@ The collector must refuse a candidate when any of the following is true:
   to a different handoff;
 - the artifact belongs to an active operation, active claim, active reservation or
   active transfer outbox/inbox;
-- an evidence hold, investigation hold, or minimum retention interval applies;
+- an evidence hold, investigation hold, or minimum retention interval applies, each
+  in the scope defined under "Hold scopes" below;
 - a process cannot be proven by cgroup membership and start time to belong to the
   failed attempt;
 - the operation attempts to delete a logical-history row, ownership tombstone,
@@ -93,18 +107,33 @@ authorization through the API. It does **not** prove that an out-of-band root ac
 cannot bypass PodMesh. The collector must state this boundary, never promise that a
 host is physically unable to make another copy.
 
-The safe effect is a terminal archived/tombstoned reservation state that lifts only
-the specified generic gate. It must not silently start the source. A later local
-memory restore or ordinary start remains a separate explicit operation with its own
-result and evidence.
+The safe effect **(amended 2026-09-13)** is a terminal archived/tombstoned
+reservation state, and the two gates it touches must be named separately.
+
+It **lifts** the generic-operation gate the reservation held over the existing
+stopped container: start, stop, delete, clone from it and a local memory restore
+become available again as ordinary explicit operations.
+
+It **never lifts** the universe-identity protection: `create` of that universe UUID,
+and a clone into it, stay refused permanently.
+
+It must not start the container. A later local memory restore or ordinary start
+remains a separate explicit operation with its own result and evidence.
 
 ### 2. Reservation whose container disappeared before any authorization
 
 This is the existing abandonment shape. It is eligible only when:
 
 1. Fresh inspection proves the reserved container is absent by both expected name
-   and recorded container ID.
-2. No authorization was ever issued for the reservation.
+   and recorded container ID. This condition stays mandatory: a reservation whose
+   container is still present is not this class, whatever its authorizations say.
+2. **(amended 2026-09-13)** No authorization for the reservation is live: either
+   none was ever issued, or every recorded authorization is terminal with a verified
+   `not_restored` outcome bound to that authorization, handoff, universe, source and
+   destination. Any missing, malformed, mismatched, pending or unverified outcome
+   blocks collection. *Before this amendment a reservation whose authorizations had
+   all ended `not_restored` and whose container was also gone matched no class at
+   all, and every declined migration whose source was later removed left one.*
 3. There is no active restore claim for its universe on this host.
 4. The original reservation, failed checkpoint records and artifacts remain
    referenceable from history.
@@ -173,6 +202,26 @@ machine-verifiable lifecycle. Instead, an incident record is held by default unt
 an explicit review acknowledgment or retention release is recorded. The collector
 must not attempt to infer human reading from access timestamps.
 
+## Hold scopes (amended 2026-09-13)
+
+A hold was previously named as a global exclusion without saying what it stops.
+Deferring artifact collection does not by itself settle whether a hold also
+prevents releasing a reservation or removing the runtime a failed restore left, so
+there are two scopes and an implementation states which it honours.
+
+1. **`evidence_hold`** blocks **artifact deletion** and **runtime reclaim**, because
+   either can destroy incident evidence. It does **not**, by default, block a
+   history-preserving terminal reservation transition, which deletes no artifact and
+   signals no process.
+2. **`investigation_hold`** blocks **every** collector apply effect: the terminal
+   reservation transition, the runtime reclaim and artifact deletion alike.
+
+If a hold record is missing, unreadable, expired without a verified expiry decision,
+or ambiguous, the effect it would govern is **blocked**. An unknown hold is a hold.
+
+An implementation that does not implement holds must say so and must claim neither
+behaviour. It may not treat the absence of a hold record as an absence of a hold.
+
 ## Required collector record
 
 Every dry run and apply run creates a durable, queryable record with:
@@ -225,9 +274,11 @@ To make an error recoverable:
 
 The implementation is not accepted until it demonstrates all of the following:
 
-- dry run has no Podman events, no signals, no deletion and no state mutation;
-- apply refuses every open authorization, verified restore, running universe,
-  uncertain identity and active evidence hold;
+- dry run produces no Podman event, no signal, no deletion and no mutation of any
+  domain record, its own audit records excepted;
+- apply refuses every open authorization, verified restore, running universe and
+  uncertain identity; and, in the lot that implements holds, refuses every effect a
+  hold governs in the scope defined above;
 - each terminal collection class succeeds only with the stated fresh proofs;
 - a stale/replayed apply operation ID does not repeat its destructive effect;
 - abort with `reclaim_processes: false` reports but does not kill;

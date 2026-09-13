@@ -78,7 +78,7 @@ Check both CLI exit status and JSON `ok`. Keep the same operation ID and byte-eq
 
 A dropped connection is an uncertain outcome, not proof that no action occurred. Preserve the request and inspect or retry it according to the operation contract. Do not generate a new operation ID blindly after a timeout.
 
-## Experimental: source-side migration preparation (development tree, not packaged)
+## Experimental: source-side migration preparation (packaged since 0.1.0~experimental5)
 
 These operations prepare and checkpoint a migration **source**. Transfer of authority to another host and the destination side are the separate operations documented in the next section; the recovery paths of a reservation that never left this host — release, abandonment and local restore — are documented after them. See MIGRATION-INTEGRATION.md and MIGRATION-PROTOCOL.md for the protocol and its remaining gaps.
 
@@ -92,7 +92,7 @@ A reservation blocks `create`, `start`, `delete` and `clone` for that universe (
 
 Retries: a verified checkpoint is never captured again; its replay is historical and adds `current_artifacts` with a fresh re-hash. A pending or failed checkpoint is re-evaluated: if its scope has not finished (including activating or deactivating) or its state cannot be queried, the retry is refused; if Podman shows the reserved container checkpointed after the reservation, the existing archive is finalized without capture (`finalized_after_interruption: true`); if the same process is still running and was never checkpointed, it is checkpointed again; anything else is refused with the observed state, and nothing is restarted. Killing CRIU itself mid-dump was observed to destroy the application without an archive; the separate scope protects against a service crash, not against CRIU or host failure.
 
-## Experimental: serial migration between two hosts (development tree, not packaged)
+## Experimental: serial migration between two hosts (packaged since 0.1.0~experimental5)
 
 The operations above prepare and checkpoint a universe. The ones below move the authority over that universe to one named destination host, and back. The protocol and the deviations this implementation recorded are in MIGRATION-PROTOCOL.md. Nothing here is packaged or qualified for ordinary workloads: a reservation is not fencing, and direct administration bypasses it.
 
@@ -164,6 +164,98 @@ What a restore attempt may consume: a restore of a damaged archive was measured 
 
 Scope and conmon lifetime: `systemd-run --scope` sets `INVOCATION_ID` for the command it runs, and Podman then leaves conmon inside that scope, which would stay active for as long as the restored universe runs. The variable is therefore removed inside the scope as well: conmon moves to its own `libpod-conmon-<id>.scope`, the transient restore scope ends with the Podman command, and stopping or deleting the universe through the API removes the conmon scope with it. `--keep` is what preserves the CRIU restore log the verification requires; the kept checkpoint files stay in the restored container's storage until the universe is removed or checkpointed again, and a later export from that container may also carry image files left by the previous restore.
 
+## Experimental: garbage collection on proof (development tree, not packaged)
+
+Age never justifies collection; proof does. The complete contract is [GARBAGE-COLLECTION.md](GARBAGE-COLLECTION.md):
+the four kinds of act a collector must never confuse, the exclusions that make an unknown fact a blocker, the
+terminal classes with the proofs each requires, the two modes, the record every run owes and the bounded
+execution rules. This section describes what the development tree implements of it. There is **no timer**:
+nothing here ever runs on its own, and no monitoring agent exists.
+
+Both operations are host-wide — they are the only ones that name no universe — and both carry
+`operation_id` and `authorization_ref` like every other operation, with the same replay contract.
+
+- `garbage_collect_plan` (read-only; optional `max_candidates`, default 20, maximum 100, and optional
+  `universe_uuids` to scope it to exactly the universes the caller is deciding about) enumerates a bounded
+  set of reservations that still owe someone a decision and of unresolved restore claims, gives each a class
+  or none, and records every proof fact it observed and every blocker it found, with the effect it would
+  propose. It changes no reservation, claim, authorization or artifact, sends no signal, deletes nothing and
+  makes two read-only Podman calls (one inventory and one batched inspection, and more only if that batch
+  loses a race to a disappearing container); the only things it writes are the operation and attempt rows
+  every operation writes, and its own immutable run record. That is exactly what the contract permits a dry
+  run to do since its 2026-09-13 amendment: read-only Podman observation, and no durable write but its own
+  audit trail. Settled reservations are counted, never
+  examined, and a verified restore claim is never a candidate. A repeated operation ID returns the recorded
+  plan as history with a fresh observation. Only the *number* of candidates is bounded: the count of settled
+  reservations a host-wide plan reports, and the size of one candidate's proofs, are not.
+- `garbage_collect_apply` (`plan_operation_id`, `candidates`, optional `max_effects` — default 1, maximum 10
+  — `max_runtime_reclaims` — default 0, maximum 5 — and `reclaim_processes`) acts only on candidates a
+  recorded plan of this host examined, classified the same way and found collectable. Immediately before
+  each effect it repeats that candidate's whole classification from fresh facts and refuses on any mismatch;
+  afterwards it verifies the result from outside, and an observation it cannot make is an unknown that fails
+  that verification rather than a silence that passes it. It stops at the first mismatch: when nothing has
+  been applied the request is refused and no run record is written, and once an effect exists the run
+  reports what it did and where it stopped, never that nothing happened. A run is `verified` only when every
+  effect it carries verified; otherwise its record says `completed_with_unverified_effects` and names the
+  blockers. Each effect is recorded durably in the same transaction as the effect itself, so a retry of the
+  same operation ID after an interruption **recovers** what was already committed instead of repeating it,
+  and a replayed operation ID returns its historical record and repeats nothing.
+
+Three classes are implemented. Class 4 (a failed local restore) and class 5 (operation artifacts after a
+declared retention, with evidence holds and retained manifests) are **not**, so no artifact is ever deleted
+by this version and no retention interval exists in it.
+
+- **Class 1, `terminal_reservation_all_authorizations_not_restored`.** A `checkpointed` reservation whose
+  every authorization ended `not_restored` — the dead end lot M3 named, where no release and no abandonment
+  are possible. The proofs: the recorded handoff and outcome of each authorization re-hashed against the
+  values recorded when they were issued and completed; each outcome re-parsed and re-bound field by field
+  (format, authorization, handoff hash, universe, source host, destination host, `not_restored`, no restored
+  container); no authorization open for the universe; no unresolved restore claim; and a fresh observation
+  showing the recorded container under the universe name, carrying its label, in `created`, `exited` or
+  `stopped`, still `Checkpointed`, and not frozen.
+- **Class 2, `terminal_reservation_container_absent`.** A reservation whose container is absent both under
+  the universe name and under its recorded ID anywhere on the host, for which no authorization was ever
+  issued and which has no unresolved restore claim. This is the abandonment shape, swept with its proofs.
+- **Class 3, `failed_restore_claim`.** An unresolved restore claim. The plan proposes it and reports the
+  container, the restore scope and the cgroup facts it rests on; the effect is `migration_restore_abort`
+  itself, called with the run's operation ID and the request's explicit `reclaim_processes`, whose refusals
+  are the collector's refusals. The collector enumerates, signals and waits for no process of its own: a
+  runtime reclaim needs `reclaim_processes: true` **and** a `max_runtime_reclaims` of at least 1.
+
+The effect of a collected reservation is a terminal `collected` state and a **tombstone**. `collected`
+blocks no generic operation, exactly as `released` does not: the stopped, checkpointed source of a class 1
+collection can then be started, stopped, deleted or resumed by `migration_restore_local`, which is a
+separate explicit operation with its own result — a collection starts, stops and removes nothing. A new
+`migration_checkpoint` supersedes a collected reservation exactly as it supersedes a released one, archiving
+it with its history, so a collected universe can be checkpointed, authorized and migrated again. The
+tombstone is what stays: `create` with that universe UUID, and a `clone` into it, are refused for good, even
+after a verified local restore or a new migration has brought the universe back, and a container any
+collection proved absent never regains ownership through its original creation. Reusing a collected identity
+needs a verified handoff restore or an explicit replacement procedure. A tombstone is never removed and
+never rewritten: it keeps the proof of the first collection, while `migration_collection_history` records
+every collection of that identity, and `migration_status` reports both beside the reservation.
+
+Every run is recorded in `garbage_collection_runs` with its operation ID, requester reference, collector and
+policy version, mode, bounds, start and end, every candidate with its class, proofs and blockers, and, for
+an apply, what was attempted, what each effect achieved and the verification that followed it, plus the
+runtime reclaims it reserved, the ones it performed and the processes it signalled. Each individual effect
+is also recorded in `garbage_collection_effects` inside the effect's own transaction, which is what lets an
+interrupted run recover. A tombstone carries a copy of the proofs its collection rested on.
+
+**Neither hold scope is implemented in this version, and nothing here deletes evidence.** The open question
+this lot raised — whether a hold should also prevent *releasing a reservation* or *removing the runtime a
+failed restore left* — was decided on 2026-09-13, and the contract now defines two scopes: an
+`evidence_hold` blocks artifact deletion and runtime reclaim but not, by default, a history-preserving
+terminal reservation transition; an `investigation_hold` blocks every apply effect; and a hold record that
+is missing, unreadable, ambiguous or expired without a verified decision blocks the effect it governs. This
+version implements **neither** and claims neither behaviour. It collects no artifact, removes no incident
+record and keeps every archive, manifest, log and reclaim record a lot ever wrote, so nothing here is
+protected by a hold and nothing here needs to be.
+
+Who may apply is provenance, not proof, exactly as for a reclaim: the request records its
+`authorization_ref`, the root-only socket remains the access boundary, and the collector still refuses
+anything it cannot prove. A plan authorizes nothing.
+
 ## Facts for a watching agent
 
 The intended first consumer of these read-only facts is a watching agent that observes and reports: it has
@@ -185,8 +277,10 @@ A reclaim remains an explicit request carrying the root tandem's provenance. A w
 is needed is making a proposal, not an authorization: nothing in this version verifies who asked, the
 root-only socket is the whole access boundary, and PodMesh still refuses to signal anything it cannot
 prove belongs to the failed attempt it claimed. `migration_status` is per universe: enumerating the
-universes to watch is the reader's job, from `inventory` and its own records, and a host-wide listing of
-unresolved migrations does not exist.
+universes to watch is the reader's job, from `inventory` and its own records. The one host-wide read-only
+listing that does exist is `garbage_collect_plan`, which enumerates the reservations that still owe a
+decision and the unresolved restore claims, with their proofs and blockers; it is a plan, and a plan
+authorizes nothing.
 
 ## Authority and scope
 

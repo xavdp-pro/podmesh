@@ -39,7 +39,7 @@ const OPERATIONS: [&str; 16] = [
     "migration_restore_abort",
 ];
 // Podman states in which no container process can write the root filesystem.
-const STOPPED: [&str; 3] = ["created", "exited", "stopped"];
+pub(crate) const STOPPED: [&str; 3] = ["created", "exited", "stopped"];
 // Seconds. The service handles one request at a time, so these also bound queueing.
 pub(crate) const QUICK: u64 = 30;
 const COMMIT: u64 = 300;
@@ -149,7 +149,7 @@ pub(crate) fn text<'a>(r: &'a Value, key: &str) -> Result<&'a str, Error> {
         .filter(|v| !v.is_empty())
         .ok_or_else(|| format!("Missing {key}").into())
 }
-fn token(value: &str) -> Result<(), Error> {
+pub(crate) fn token(value: &str) -> Result<(), Error> {
     if value.len() > 80 || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
         return Err("Identifier must contain 1-80 ASCII letters, digits or hyphens".into());
     }
@@ -342,6 +342,14 @@ pub(crate) fn owned(db: &Connection, c: &Value, uuid: &str, role: &str) -> Resul
         )
         .into());
     }
+    // Neither does a container a garbage collection proved absent when it collected the universe: it can
+    // only have come back out of band.
+    if migration::collected_absent(db, uuid, c["Id"].as_str().unwrap_or(""))? {
+        return Err(format!(
+            "{role} container was proven absent when this universe was collected; its original creation no longer grants ownership"
+        )
+        .into());
+    }
     Ok(())
 }
 fn parse<'a>(operation: &str, uuid: &str, request: &'a Value) -> Result<Params<'a>, Error> {
@@ -482,7 +490,7 @@ fn parse<'a>(operation: &str, uuid: &str, request: &'a Value) -> Result<Params<'
         _ => Params::Delete,
     })
 }
-fn ensure_schema(db: &Connection) -> Result<(), Error> {
+pub(crate) fn ensure_schema(db: &Connection) -> Result<(), Error> {
     // operation_attempts is a separate table so that an experimental3 rollback, which inserts
     // four values into operations, keeps working on a journal written by this version.
     db.execute_batch(
@@ -616,6 +624,12 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
         Params::Create { .. } | Params::Clone { .. } | Params::Delete | Params::Start { .. }
     ) {
         migration::refuse_if_reserved(db, uuid, params.name())?;
+    }
+    // A garbage collection leaves a tombstone: the identity of a collected universe is never given a new
+    // meaning by a blind create, or by a clone into it. Operating the container a collection released, and
+    // restoring a verified handoff, stay available (docs/GARBAGE-COLLECTION.md).
+    if matches!(params, Params::Create { .. } | Params::Clone { .. }) {
+        migration::refuse_identity_reuse(db, uuid, params.name())?;
     }
     match params {
         Params::Create { image, command } => create(id, uuid, &name, existing, image, command),

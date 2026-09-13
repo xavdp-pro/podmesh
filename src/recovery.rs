@@ -16,7 +16,7 @@
 //!   archives the reservation so that the universe is fully operable again.
 use crate::cleanup::{self, Bound};
 use crate::lifecycle::{self as lc, failure, Error};
-use crate::migration::{self as mg, Reservation, ABANDONED, RELEASED, RESTORED_LOCALLY};
+use crate::migration::{self as mg, Reservation, ABANDONED, COLLECTED, RELEASED, RESTORED_LOCALLY};
 use crate::restore as ds;
 use crate::transfer as tr;
 use rusqlite::Connection;
@@ -172,9 +172,11 @@ fn abandon_blockers(r: &Reservation, o: &Observed, issued: &[Value], elsewhere: 
 }
 fn restore_local_blockers(r: &Reservation, o: &Observed, artifacts: &Value, elsewhere: bool) -> Vec<String> {
     let mut blockers = vec![];
-    if r.state != RELEASED {
+    // A collected reservation is a released one the garbage collector settled on proof: the contract's
+    // class 1 says a later local memory restore stays a separate explicit operation, so it stays available.
+    if r.state != RELEASED && r.state != COLLECTED {
         blockers.push(format!(
-            "the reservation is in state {}; a local restore resumes a released reservation, so migration_release comes first",
+            "the reservation is in state {}; a local restore resumes a released reservation, so migration_release comes first, or a garbage collection that ends a terminal one",
             r.state
         ));
     }
@@ -456,10 +458,13 @@ pub(crate) fn restore_local(
         ));
     }
     let since = crate::now() as i64;
+    // The reservation keeps the state the restore started from: a collected reservation stays collected
+    // whatever this attempt does, and only a verified restore archives it.
+    let from = r.state.clone();
     mg::merge_state(
         db,
         uuid,
-        RELEASED,
+        &from,
         &json!({"local_restore_attempt": attempt, "local_restore_operation": id, "local_restore_started_at": since,
             "local_restore_source": if in_place { "kept_checkpoint_files" } else { "preserved_archive" }}),
     )?;
@@ -515,9 +520,9 @@ pub(crate) fn restore_local(
             &dir.join(format!("local-restore-failure-attempt-{attempt}.json")),
             serde_json::to_string_pretty(&detail)?.as_bytes(),
         )?;
-        mg::merge_state(db, uuid, RELEASED, &json!({"local_restore_failed": detail.clone()}))?;
+        mg::merge_state(db, uuid, &from, &json!({"local_restore_failed": detail.clone()}))?;
         return Err(failure(
-            format!("The local restore could not be verified: {reason}; the reservation stays released and the diagnostics are preserved"),
+            format!("The local restore could not be verified: {reason}; the reservation stays {from} and the diagnostics are preserved"),
             detail,
         ));
     }
