@@ -61,10 +61,14 @@ This is the central delivery tracker. Detailed contracts remain in INTENT.md, RU
 - [ ] Test LVM2 conventional volumes and thin pools, snapshots, clone independence, restoration and bounded saturation behavior.
 - [ ] Preserve evidence, remove only disposable LVM test storage, reuse the same disks for ZFS and repeat comparable tests including incremental send/receive.
 - [ ] Preserve evidence, remove only disposable ZFS test storage, reuse disks for Btrfs and repeat; explicitly test nested subvolume coverage.
+- [ ] For each backend, prove application quiesce, local snapshot, immediate live-service release, transfer from the snapshot, cross-host restore and external data verification; measure interruption separately from upload time.
+- [ ] Prove the ordinary-filesystem fallback: stopped-universe archive, cross-host restore and external verification; demonstrate that process pause alone is refused as generic consistency proof.
 - [ ] Compare practicality, installation, capacity consumption, transfer cost, reliability and recovery. Select based on measurements; keep backends optional.
 
 ### 5. Backup Server and public delivery
 
+- [ ] Make installation preflight classify storage as qualified snapshot-backed or portable archive fallback, and show the expected interruption before scheduling backups.
+- [ ] Recommend dedicated Btrfs, ZFS or LVM2 thin storage while preserving ordinary-filesystem support and refusing automatic disk reformatting; promote a default only after equivalent lab evidence.
 - [ ] Build separately deployable PodMesh Backup Server: versioned configuration/images/volumes/optional memory, retention, encryption, integrity checks and verified restore.
 - [ ] Prefer ShaperOS internally; validate standalone and container/VM/VPS deployment without mandatory ShaperOS or hypervisor dependency.
 - [ ] Publish generic host preparation guide; laboratory description is a separate example.

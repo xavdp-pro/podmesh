@@ -166,11 +166,20 @@ that the migration work has not solved either.
 Each lot ends with evidence read from outside and an honest statement of what it does
 not cover.
 
+0. **B0 — qualify local capture backends.** Run the authorized sequential 60 GB lab
+   comparison in `LVM-LAB-PLAN.md`: LVM2/thin, ZFS, then Btrfs. For each backend,
+   prove quiesce, snapshot, immediate release of the live universe, transfer from the
+   snapshot, restore on another host, failure handling, and capacity behavior. Also
+   prove the ordinary-filesystem fallback with a stopped universe. This establishes
+   the capture adapters used by the later Backup Server lots; it does not make a local
+   snapshot an independent backup.
 1. **B1 — datastore and one round trip.** Chunk store, manifest, the pull surface, and
    a verified restore of a stopped, mount-free universe's configuration and filesystem
-   to a *different* host. Rule 12's hygiene guards implemented and proven with the
-   recorder. Key generation, escrow and recovery. This is the lot that makes
-   everything else meaningful.
+   to a *different* host. B1 must work through the portable archive fallback; where B0
+   qualified a snapshot adapter, the same round trip is repeated from its frozen local
+   capture. Rule 12's hygiene guards are implemented and proven with the recorder. Key
+   generation, escrow and recovery are included. This is the lot that makes everything
+   else meaningful.
 2. **B2 — volumes.** Rule 16 level 2 with the `nosav/` exclusion and the `.env*`
    exclusion in every spelling.
 3. **B3 — databases.** Level 3 under Rule 12's dump laws: the right client name, the
@@ -185,6 +194,27 @@ not cover.
    limits.
 7. **Later.** Scheduling policy, the human interface, and the container/VM level 1
    snapshot integration where a hypervisor provides it.
+
+## Capture adapters and consistency
+
+PodMesh Backup Server selects a capture adapter from observed storage capabilities; it
+does not require LVM2, ZFS or Btrfs to install or operate.
+
+- **LVM thin:** quiesce, take the logical-volume snapshot, release the live universe,
+  and read the snapshot for transfer.
+- **ZFS:** quiesce, take a dataset snapshot, release the universe, and use the immutable
+  snapshot as the source for full or qualified incremental send.
+- **Btrfs:** quiesce, take read-only subvolume snapshots, release the universe, and use
+  them for full or qualified incremental send. Nested subvolumes require explicit
+  enumeration because the parent snapshot is not recursively complete.
+- **Ordinary filesystem:** stop the generic universe for the duration of the archive.
+  A shorter freeze is allowed only under a declared application-specific quiesce or
+  database-dump contract. Podman process pause alone is not evidence of a coherent
+  application and volume recovery point.
+
+In all cases, the local snapshot or archive staging area is disposable capture material.
+Only a transferred, authenticated, catalogued and independently restorable recovery
+point is a backup.
 
 ## What must be proven, not claimed
 
@@ -207,6 +237,24 @@ Unchanged from the original direction and still binding. Standalone operation wi
 ShaperOS is mandatory across supported host types; ShaperOS deployment is the
 operator's preference for internal use and must not become a hard dependency. The
 same backup and restore contracts apply in both modes.
+
+For PodMesh Backup Server deployments, prefer dedicated snapshot-capable storage
+qualified by PodMesh. Btrfs is the provisional default candidate for general PodMesh
+hosts because it is part of Linux and combines subvolumes, snapshots, reflink clones and
+incremental send/receive. ZFS is the provisional candidate for a dedicated backup
+datastore when end-to-end checksums, scrubs, hierarchy replication and raw encrypted
+send are more important than minimal host integration. LVM2 thin remains an important
+compatibility backend. These preferences are hypotheses until the sequential lab
+comparison records equivalent restore evidence.
+
+With a qualified snapshot backend, PodMesh quiesces the protected universe, creates an
+immutable local capture and releases the universe before the longer transfer begins.
+Installation on an ordinary root filesystem remains supported, but the generic capture
+keeps the protected universe stopped while its filesystem archive is created. A
+declared application-specific consistency adapter may shorten that interruption. A
+process freeze alone does not prove that buffered application data, databases and
+external volumes form one coherent recovery point. Installation preflight must report
+the selected capture class and expected interruption before enabling a backup schedule.
 
 Separate the storage server from host-side capture: receiving and retaining backups
 does not require Podman or CRIU locally. Host-side capture of filesystem, application
