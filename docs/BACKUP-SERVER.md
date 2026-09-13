@@ -17,6 +17,26 @@ deleted R2 by accident); R4 = `2aea3bc` (restoring R2 and crossing the design ag
 PodMesh's own artifacts); R5 = this. Where the text below says "revision 3", it means
 `1cd1736`, and "revision 4" means `2aea3bc`.
 
+**Revision 8**, 2026-09-14. A propagation review of revision 7 found three more stranded
+edits and one command that could not run:
+
+- **The step 0 marker command was invalid JSON.** A backslash and a newline inside a JSON
+  string is not a valid escape, so the creation request would have been rejected before
+  the daemon parsed it — and the obvious one-line repair leaves an escaped space that
+  becomes a command word, killing the TERM handler and restoring the exact `forced: true`
+  failure the paragraph exists to prevent. Three fixture defects in three revisions, each
+  introduced while fixing the last, all in one command. It is now one line, and the
+  marker value is pinned to hexadecimal because it is interpolated into a shell word and
+  a path.
+- **B1 produced no catalogue checkpoint** while revision 7 required step 8 to rebuild
+  from one. Step 3 now produces it.
+- **Step 5's normative sentence still said `verified`** while a note three lines below
+  said the gate is `restore_verified`. An acknowledgement is not a correction.
+- **The two-signer rule left four things unstated**: the datastore has no `host_uuid` to
+  be keyed by, "one key per host" is false when one host holds two signers, the "Backup
+  Server package" does not exist, and the restore target verifies signatures with no
+  stated copy of `producers.json`. All four are answered.
+
 **Revision 7**, 2026-09-14. A regression review of revision 6 found that three of its nine
 edits were not carried into the sections that quote them — this document's own recurring
 failure mode, committed again in the revision that named it — and that one new mechanism
@@ -297,10 +317,8 @@ B1's fixture is `quiescent`. The intent is a ceiling, not a floor.*
 **They form a partial order, not a chain.** Revision 5 printed a single chain with a `≤`
 in it and then said in the next paragraph that two of the classes are not ordered against
 each other. Both cannot be true, and a chain is the one an implementer would encode. The
-order is:
-
-It is given as an edge list rather than a drawing, because a picture added to remove
-ambiguity is worth nothing if the reader has to decode the box characters:
+order is given below as an edge list rather than a drawing, because a picture added to
+remove ambiguity is worth nothing if the reader has to decode the box characters:
 
 ```
 incoherent              <  crash-consistent
@@ -670,6 +688,17 @@ same defect as anchoring it in nothing.* In PodMesh's own terms:
   only host identity PodMesh has. The manifest carries it as the **producer identity
   commitment**, and `producers.json` is keyed by it.
 
+  **The datastore is a producer too, and it has no `host_uuid`.** It signs catalogue
+  checkpoints and proofs, and this document requires it to appear in `producers.json`
+  like any other producer — while also saying the Backup Server need not be a PodMesh
+  host, in which case there is no journal, no metadata table and no `host_uuid` to be
+  keyed by. Revision 7 sharpened that from a latent ambiguity into a flat contradiction
+  and did not notice. So: **a producer identity is a UUID**, and where PodMesh is present
+  it is PodMesh's `host_uuid`, reused rather than duplicated. Where it is not, the Backup
+  Server mints its own **once, on first use, into its own state directory**, by the same
+  rule PodMesh applies — generated once, never regenerated, never transmitted. One
+  identity per signer, whatever produced it.
+
   **`authorization_ref` is not that key and must never be used as one.** PodMesh states
   it plainly: *"`authorization_ref` is audit provenance, not a remotely verified
   credential"* (`PREPARE-A-HOST.md:38`). Revision 4 made it the signer's identity, which
@@ -682,19 +711,32 @@ same defect as anchoring it in nothing.* In PodMesh's own terms:
   is mandatory.
 - **The key** is an Ed25519 signing key at `backup/signing.ed25519` **inside the signer's
   own state directory**, mode 0600 root, generated on first use and never transmitted.
-  One key per host, which is what "never leaves its level" means when the level is a
-  host.
+  **One key per signer** — revision 7 wrote "one key per host", which its own two-signer
+  rule makes false: in B1 the Backup Server is one of the three lab hosts, so that host
+  carries two signing keys in two directories, PodMesh's and the datastore's. The level
+  Rule 36 protects is the signer, and a host may hold more than one.
 
   **There are two signers and therefore two state directories, and revision 6 collapsed
   them.** On a **source host** the signer is PodMesh, and its state directory is
   `PODMESH_STATE_DIR` when set and `/var/lib/podmesh` otherwise
   (`src/bin/podmeshd.rs:8`). On the **Backup Server** the signer is the datastore, which
-  signs catalogue checkpoints and proofs, and its state directory is the one the Backup
-  Server package creates — **not** `/var/lib/podmesh`, which no package creates on a host
-  that is not a PodMesh host, and this document elsewhere says the Backup Server needs
-  neither Podman nor CRIU. A literal path was wrong in the first place: PodMesh's own
-  test hosts relocate the state directory, and a hard-coded path puts the signing key
-  outside the tree an operator backs up, snapshots and destroys.
+  signs catalogue checkpoints and proofs, and whose directory is **not** `/var/lib/podmesh`
+  — no package creates that on a host that is not a PodMesh host, and this document
+  elsewhere says the Backup Server needs neither Podman nor CRIU.
+
+  **Where that directory is, said plainly, because revision 7 named a package that does
+  not exist.** It said "the one the Backup Server package creates". There is no Backup
+  Server package: nothing in this repository ships one, and the only package this document
+  names is `podmesh-recovery`, which is the bootstrap for a clean host and not the
+  datastore. Naming a configuration root that no lot ships is exactly the defect that
+  `/etc/podmesh/` was, and revision 7 deleted the sentence saying so and then did it. So
+  the datastore's state directory is **an explicit parameter of the service, with no
+  default** — supplied at startup, created and owned by the service, and **the service
+  halts and names it when it is absent or unwritable**, per Rule 0J. The lot that packages
+  the Backup Server chooses a default; until that lot exists, B1 passes the path. A
+  literal path was wrong in the first place: PodMesh's own test hosts relocate the state
+  directory, and a hard-coded path puts the signing key outside the tree an operator backs
+  up, snapshots and destroys.
 - **The algorithm is pure Ed25519 (RFC 8032 §5.1), over the canonical serialization
   itself — not Ed25519ph, and not over a digest.** Revision 4 said "Ed25519 over the
   SHA-256 of a canonical serialization", which names neither of the two real schemes:
@@ -711,11 +753,20 @@ same defect as anchoring it in nothing.* In PodMesh's own terms:
   independent implementations diverge. Numbers are additionally constrained to integers
   representable in 64 bits, and no floating-point value appears anywhere in a manifest.
 - **The map from producer to public key** is a pinned local file at
-  `backup/producers.json`, listing each producer's `host_uuid` and its Ed25519 public
-  key. It lives **in the state directory of whichever component is verifying**, by the
-  same two-role rule as the signing key above — and in practice that is the **Backup
-  Server**, because the datastore is what verifies a manifest it did not produce. Its
-  bootstrap restores the file with the rest of that directory.
+  `backup/producers.json`, listing each producer's identity UUID and its Ed25519 public
+  key. It lives **in the state directory of every component that verifies**, by the same
+  per-signer rule as the key above.
+
+  **There are two such components, not one, and revision 7 named only the first.** The
+  **Backup Server** verifies manifests it did not produce, and its bootstrap restores the
+  file with the rest of its directory. But a **restore target** verifies too: this
+  document makes it the only party that checks **plaintext** digests, which it reads out
+  of a manifest whose signature it must therefore check first. Under revision 7's
+  role-relative rule that host had no stated copy at all — a gap revision 6's single fixed
+  path had accidentally covered. So **B1 installs `producers.json` on all three lab
+  hosts**, with all three producers in it, rather than only on the datastore; "B1
+  populates it by hand for three hosts" below means three installations, not three
+  entries in one file.
 
   *Two wrong homes preceded this one, and the second was the first moved sideways.*
   Revision 4 put it under `/etc/podmesh/`, **a directory that does not exist**: PodMesh
@@ -1021,15 +1072,31 @@ Deliberately small, and shaped by the reviewer:
    already inside:
 
    ```
-   ["sh","-c","printf %s '<run-value>' > /marker-<run-value>; \
-     trap 'exit 0' TERM; sleep 3600 & wait"]
+   ["sh","-c","printf %s '<run-value>' > /marker-<run-value>; trap 'exit 0' TERM; sleep 3600 & wait"]
    ```
 
-   The value appears in **both the file name and the contents**, and the run also records
-   the create timestamp, which is what the marker specification above asks for. The sleep
-   bound must outlast the capture: if PID 1 exits on its own before the stop is issued,
-   the container is already gone and the stop reports nothing useful. The run records the
-   `forced` flag either way; it does not assume any of this worked;
+   **On one line, and that is not formatting.** Revision 7 wrapped this with a backslash
+   and a newline. JSON strings may not contain a raw newline and `\` followed by a newline
+   is not a valid escape, so the request would have been rejected before the daemon ever
+   parsed a `command` array. The obvious repair is worse: joining the lines while keeping
+   the backslash makes `\ ` a literal escaped space, the next command word becomes
+   `" trap"`, the shell reports it cannot run that, and PID 1 is left with **no TERM
+   handler** — straight back into the `forced: true` failure these two paragraphs exist to
+   prevent. Three fixture defects in three revisions, each introduced while fixing the
+   last, all in this one command.
+
+   **`<run-value>` is hexadecimal, and that is a constraint, not a suggestion.** It is
+   interpolated raw into a single-quoted shell word and into a filesystem path, so a value
+   containing a quote or a slash breaks the command or redirects the write. The run
+   generates it from a hex-encoded random value and nothing else.
+
+   The value appears in **both the file name and the contents**, and the run records the
+   create timestamp alongside it in the evidence, which is what the marker specification
+   above asks for. The sleep bound must outlast **create through stop** — step 1 stops the
+   container before capturing, so the capture itself runs against a stopped universe — and
+   if PID 1 exits on its own before the stop is issued the container is already gone and
+   the stop reports nothing useful. The run records the `forced` flag either way; it does
+   not assume any of this worked;
 1. one **PodMesh universe** — a Podman container with its UUID, on a Debian 13 lab host —
    marked as in step 0, mount-free and network-disabled, then **stopped with an unforced
    stop** and captured through the **ordinary-filesystem adapter** while stopped for the
@@ -1053,10 +1120,17 @@ Deliberately small, and shaped by the reviewer:
    signing section of the same document had already established that the Maker is a
    ShaperOS organ above PodMesh, is recorded as not implemented, and cannot be a B1
    dependency. B1 cannot require an operation no component can perform;*
-3. one versioned signed manifest and a content-addressed encrypted chunk set;
+3. one versioned signed manifest, a content-addressed encrypted chunk set, **and one
+   signed catalogue checkpoint** on the datastore. *The checkpoint was missing from this
+   step while revision 7 added it to step 8's rebuild and to the rebuild contract — so
+   step 8 would have rebuilt from an object class B1 never produced, and either could not
+   run or would have run vacuously and still reported a pass. The same failure mode, one
+   section over, in the revision written to fix it.* The checkpoint is what carries
+   verification history and hold state, which left the manifest because a producer cannot
+   sign facts that arise after it signs;
 4. the Backup Server **pulls from the source host's outbox**, outbound only, exactly as
    D1 describes: the source writes the sealed point to its outbox, under **the identifier
-   the sealing operation issued** and never under a `authorization_id`, which only
+   the sealing operation issued** and never under an `authorization_id`, which only
    `migration_authorize_transfer` mints and which a backup cannot obtain; the
    transport controller moves it under **its own** authorization, and the manifest
    signature is checked after arrival to prove the bytes, not to admit the reader. Over
@@ -1064,9 +1138,12 @@ Deliberately small, and shaped by the reviewer:
    use it.** No `tar.bz2` leaves a host in B1, so Rule 12's transport clause is not
    engaged; which other clauses are is stated below rather than claimed wholesale (X3
    records the amendment still owed, with its owner);
-5. the source universe is removed only after its recovery point reaches **`verified`**
-   on the datastore — not `stored_unverified`, which would make deleting the only
-   source a data-loss path.
+5. the source universe is removed only after its recovery point reaches
+   **`restore_verified`** — not `stored_unverified`, and not `verified` either, for the
+   reason below. *This step said `verified` through revision 7, which named the defect
+   three lines further down and left the normative sentence alone. An acknowledgement is
+   not a correction, and this line is the one an implementer reads before destroying the
+   only remaining copy of the source.*
 
    **`verified` on the datastore is weaker than it sounds, and the gate is strengthened
    accordingly.** The datastore verifies **ciphertext** digests, because that is all it
