@@ -114,11 +114,34 @@ the number of disagreements is **zero**.
 
 That gives the rule, and it is fail-closed rather than lenient:
 
-- each folded field takes the single non-null value found among the nonce's rows;
-- a field with no non-null value anywhere folds to null and is reported as absent;
-- **two different non-null values for one field refuse the campaign.** That never occurred
-  in the measured store, which is exactly why it must be a negative fixture: a rule whose
-  violation has never been seen is a rule nobody has tested.
+- each folded field takes the single **set** value found among the nonce's rows;
+- a field set nowhere folds to null and is reported as absent;
+- **two different set values for one field refuse the campaign.**
+
+**"Set" is not the same as "non-null", and getting that wrong silently loses every byte
+count.** A first version of this rule said non-null throughout. Measured, that is right
+for the identity and digest fields and wrong for the counters: `request_frame_bytes` and
+`reply_frame_bytes` are not nullable, so a phase that does not carry them writes **zero**,
+and a non-null fold over four rows would have found `{0, 0, 0, 2735}` — four set values,
+three of them false. So:
+
+| Field kind | Fields | "Set" means |
+| --- | --- | --- |
+| identity and digest | peer, operation, request and reply digests, local and remote receipt | non-null |
+| byte counters | request and reply frame bytes, announced body bytes | non-zero |
+| flag | `replayed` | carried by the rows after the request phase |
+
+Which phase carries which is itself measured rather than assumed, and it differs by
+direction: inbound, the request bytes and digest are on `inbound_request_observed`, the
+reply bytes on `inbound_reply_write_observed`, the local receipt from
+`inbound_import_committed` onward; outbound, the announced body size is on
+`outbound_request_prepared` — **including on all 17 stranded attempts**, which is why
+condition 2 has a binding field to join on at all — and the frame bytes, reply digest and
+remote receipt on `outbound_exchange_completed`.
+
+Across all seven folded fields, over 67 nonces, **the number of nonces carrying two
+different set values is zero**. That is why the refusal must be a negative fixture: a rule
+whose violation has never been observed is a rule nobody has tested.
 
 The folded row also carries the **set of phases reached**, not a single `terminal_phase`
 as drafted below. The terminal phase is derived from the set, and a set missing a phase is
