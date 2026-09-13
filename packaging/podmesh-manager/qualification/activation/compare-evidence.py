@@ -28,8 +28,9 @@ def read(path):
     path = Path(path)
     raw = path.read_bytes()
     sidecar = Path(f"{path}.sha256")
-    fields = sidecar.read_text(encoding="ascii").strip().split()
-    if len(fields) != 2 or not SHA.fullmatch(fields[0]) or fields[1] not in {str(path), path.name}:
+    fields = sidecar.read_text(encoding="ascii").strip().split(None, 1)
+    # The sidecar was written on the producing host, so its directory is that host's; the digest binds the file name.
+    if len(fields) != 2 or not SHA.fullmatch(fields[0]) or Path(fields[1]).name != path.name:
         raise ValueError(f"{path}: invalid evidence checksum sidecar")
     if hashlib.sha256(raw).hexdigest() != fields[0]:
         raise ValueError(f"{path}: evidence checksum mismatch")
@@ -64,13 +65,19 @@ def validate(v,label):
     if len(ids)!=2: raise ValueError(f"{label}.configuration: duplicate peer")
     d=obj(v["dropin"],f"{label}.dropin",("present","sha256","semantic_limits","packaged_fragment_sha256","inherited_deny_all","effective_policy_configured","effective_policy_commitment"))
     boolean(d["present"],f"{label}.dropin.present"); boolean(d["inherited_deny_all"],f"{label}.dropin.inherited_deny_all"); boolean(d["effective_policy_configured"],f"{label}.dropin.effective_policy_configured"); sha(d["packaged_fragment_sha256"],f"{label}.dropin.packaged_fragment_sha256")
-    limits=obj(d["semantic_limits"],f"{label}.dropin.semantic_limits",("network_mode","address_families","peer_allow_count","peer_allow_prefix_length"))
+    semantic=("network_mode","address_families","peer_allow_count","peer_allow_prefix_length")
     active={"network_mode":"authenticated-static-peers","address_families":["AF_UNIX","AF_INET"],"peer_allow_count":2,"peer_allow_prefix_length":32}
     absent={"network_mode":None,"address_families":[],"peer_allow_count":0,"peer_allow_prefix_length":None}
     if d["present"]:
         sha(d["sha256"],f"{label}.dropin.sha256"); commit(d["effective_policy_commitment"],f"{label}.dropin.effective_policy_commitment")
-        if limits != active or not d["inherited_deny_all"] or not d["effective_policy_configured"]: raise ValueError(f"{label}.dropin: effective policy differs from contract")
-    elif d["sha256"] is not None or limits != absent or d["effective_policy_configured"] or d["effective_policy_commitment"] is not None: raise ValueError(f"{label}.dropin: absent drop-in carries effective semantics")
+        # validate-dropin.py hashes the bytes it parsed; capture-host.sh hashes the installed file. Both must name one drop-in.
+        limits=obj(d["semantic_limits"],f"{label}.dropin.semantic_limits",semantic+("sha256",))
+        sha(limits["sha256"],f"{label}.dropin.semantic_limits.sha256")
+        if limits["sha256"] != d["sha256"]: raise ValueError(f"{label}.dropin.semantic_limits.sha256: validated drop-in hash is not the installed drop-in hash")
+        if {f:limits[f] for f in semantic} != active or not d["inherited_deny_all"] or not d["effective_policy_configured"]: raise ValueError(f"{label}.dropin: effective policy differs from contract")
+    else:
+        limits=obj(d["semantic_limits"],f"{label}.dropin.semantic_limits",semantic)
+        if d["sha256"] is not None or limits != absent or d["effective_policy_configured"] or d["effective_policy_commitment"] is not None: raise ValueError(f"{label}.dropin: absent drop-in carries effective semantics")
     s=obj(v["service"],f"{label}.service",("load_state","active_state","sub_state","unit_file_state","main_pid","invocation_commitment","n_restarts","result","exec_main_code","exec_main_status"))
     for f in ("load_state","active_state","sub_state","unit_file_state","result","exec_main_code"): string(s[f],f"{label}.service.{f}")
     for f in ("main_pid","n_restarts","exec_main_status"): integer(s[f],f"{label}.service.{f}")

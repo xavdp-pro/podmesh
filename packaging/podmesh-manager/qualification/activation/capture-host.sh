@@ -21,6 +21,9 @@ case "$stage" in pre-activation|active-baseline|converged|post-cleanup) ;; *) us
 for command in jq systemctl dpkg-query dpkg sha256sum stat find sort sed podman ip nft ss getent awk readlink tr runuser python3; do command -v "$command" >/dev/null || { echo "$command is required" >&2; exit 2; }; done
 work=$(mktemp -d); trap 'rm -rf -- "$work"' EXIT
 
+# A label names the kind of value, never the place it was observed: the comparator joins a replica ID, a logical
+# manager ID or an endpoint across configuration, peers, listeners and inspection, and two labels for one value
+# would make its commitments unrelated.
 commit_stdin() { { cat -- "$salt"; printf '\000%s\000' "$1"; cat; } | sha256sum | awk '{print "sha256:" $1}'; }
 commit_file() { { cat -- "$salt"; printf '\000%s\000' "$1"; cat -- "$2"; } | sha256sum | awk '{print "sha256:" $1}'; }
 commit_text() { printf '%s' "$2" | commit_stdin "$1"; }
@@ -85,10 +88,10 @@ configuration() {
     {logical:$network.manager.logical_manager_id,replica:$network.replica_id,host:$host,topology:{replicas:$replicas,grants:$grants},peers:($network.peers|sort_by(.replica_id)|map({replica_id,endpoint,shared_key_hex}))}' "$path") || return 1
   peers='[]'
   while IFS=$'\t' read -r replica endpoint key; do
-    peers=$(jq -c --arg replica "$(commit_text peer-replica "$replica")" --arg endpoint "$(commit_text peer-endpoint "$endpoint")" --arg key "$(commit_text peer-key "$key")" '.+[{replica_id_commitment:$replica,endpoint_commitment:$endpoint,shared_key_commitment:$key}]' <<<"$peers")
+    peers=$(jq -c --arg replica "$(commit_text replica-id "$replica")" --arg endpoint "$(commit_text endpoint "$endpoint")" --arg key "$(commit_text peer-key "$key")" '.+[{replica_id_commitment:$replica,endpoint_commitment:$endpoint,shared_key_commitment:$key}]' <<<"$peers")
   done < <(jq -r '.peers[]|[.replica_id,.endpoint,.shared_key_hex]|@tsv' <<<"$normalized")
   topology=$(jq -cS .topology <<<"$normalized")
-  jq -cn --arg document "$(commit_file config-document "$path")" --arg logical "$(commit_text logical-manager "$(jq -r .logical <<<"$normalized")")" --arg replica "$(commit_text local-replica "$(jq -r .replica <<<"$normalized")")" --arg host "$(commit_text local-host "$(jq -r .host <<<"$normalized")")" --arg topology "$(printf '%s' "$topology" | commit_stdin topology)" --argjson peers "$peers" '{document_commitment:$document,logical_manager_commitment:$logical,local_replica_commitment:$replica,local_host_commitment:$host,topology_commitment:$topology,peer_count:($peers|length),peers:$peers}'
+  jq -cn --arg document "$(commit_file config-document "$path")" --arg logical "$(commit_text logical-manager-id "$(jq -r .logical <<<"$normalized")")" --arg replica "$(commit_text replica-id "$(jq -r .replica <<<"$normalized")")" --arg host "$(commit_text local-host "$(jq -r .host <<<"$normalized")")" --arg topology "$(printf '%s' "$topology" | commit_stdin topology)" --argjson peers "$peers" '{document_commitment:$document,logical_manager_commitment:$logical,local_replica_commitment:$replica,local_host_commitment:$host,topology_commitment:$topology,peer_count:($peers|length),peers:$peers}'
 }
 dropin() {
   local installed=/etc/systemd/system/podmesh-manager.service.d/90-g2-network.conf packaged=/usr/lib/systemd/system/podmesh-manager.service paths
@@ -126,12 +129,12 @@ listeners() {
   udp_raw=$(ss -H -lunp "sport = :$port") || return 1
   tcp=$(awk -v endpoint="$endpoint" -v pid="$pid" '$4==endpoint && index($0,"pid=" pid ",") {n++} END{print n+0}' <<<"$tcp_raw")
   udp=$(awk 'NF {n++} END{print n+0}' <<<"$udp_raw")
-  jq -cn --arg endpoint "$(commit_text bind-endpoint "$endpoint")" --argjson tcp "$tcp" --argjson udp "$udp" '{status:"available-successful",endpoint_commitment:$endpoint,tcp_listener_count:$tcp,udp_listener_count:$udp}'
+  jq -cn --arg endpoint "$(commit_text endpoint "$endpoint")" --argjson tcp "$tcp" --argjson udp "$udp" '{status:"available-successful",endpoint_commitment:$endpoint,tcp_listener_count:$tcp,udp_listener_count:$udp}'
 }
 inspection() {
   [ "$with_inspection" -eq 1 ] || { printf '%s\n' null; return; }
   local raw; raw=$(runuser -u podmesh-manager -- /usr/lib/podmesh-manager/podmesh-managerd --inspect-store --config /etc/podmesh-manager/config.json --state-dir /var/lib/podmesh-manager) || { echo 'Read-only canonical inspection failed' >&2; return 1; }
-  jq -ce --arg logical "$(commit_text inspection-logical "$(jq -r .logical_manager_id <<<"$raw")")" --arg replica "$(commit_text inspection-replica "$(jq -r .replica_id <<<"$raw")")" '{schema_version,logical_manager_commitment:$logical,replica_commitment:$replica,logical_history_sha256,sqlite_integrity_result,history_count,receipt_count,audit_event_count,incomplete_attempt_count:(.incomplete_attempts|length)}' <<<"$raw"
+  jq -ce --arg logical "$(commit_text logical-manager-id "$(jq -r .logical_manager_id <<<"$raw")")" --arg replica "$(commit_text replica-id "$(jq -r .replica_id <<<"$raw")")" '{schema_version,logical_manager_commitment:$logical,replica_commitment:$replica,logical_history_sha256,sqlite_integrity_result,history_count,receipt_count,audit_event_count,incomplete_attempt_count:(.incomplete_attempts|length)}' <<<"$raw"
 }
 
 jq -e '.schema_version=="podmesh-manager-candidate-verification/v2" and .package=="podmesh-manager" and (.version|type=="string") and (.binary_sha256|test("^[a-f0-9]{64}$"))' "$report" >/dev/null || { echo 'Candidate verification report is invalid' >&2; exit 2; }

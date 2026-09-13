@@ -10,7 +10,12 @@ Every command runs locally on one disposable laboratory host. The operator
 orchestrates the three hosts through an external, reviewed campaign. Private
 addresses, peer keys, complete configurations and the campaign salt remain
 outside Git. Published evidence contains only stable aliases and salted
-commitments.
+commitments. The label of an identity the comparator joins names the kind of
+value — `replica-id`, `logical-manager-id`, `endpoint` — never the place it was
+observed, so that one identity can be joined across configuration, peers,
+listeners and inspection without ever seeing the value. That join also requires
+each replica to bind exactly the endpoint its peers advertise for it: a loopback
+or wildcard bind fails the comparison.
 
 ## Boundaries
 
@@ -194,4 +199,7 @@ The result always carries ha_claim: "absent". Run
 activation/tests/run-tests.sh before transferring the harness. Its tests are
 offline and synthetic; successful real-host evidence remains mandatory.
 The comparator verifies the SHA-256 sidecar beside every evidence input before
-parsing it.
+parsing it. For an active stage it also requires the drop-in hash that
+validate-dropin.py computed over the bytes it parsed to equal the hash
+capture-host.sh took of the installed file: the validated grammar and the
+installed policy must be one file, and an absent drop-in carries no such hash.

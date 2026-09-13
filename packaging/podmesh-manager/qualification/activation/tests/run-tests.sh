@@ -13,6 +13,29 @@ rg -q 'write_ledger start-failed' "$root/activate-host.sh"
 rg -q 'RECOVERED_NOT_QUALIFIED' "$root/activate-host.sh"
 rg -q 'cleanup_restart:true' "$root/activate-host.sh"
 python3 -m py_compile "$root/compare-evidence.py" "$root/validate-dropin.py" "$root/graceful-shutdown.py" "$root/wait-ready.py" "$root/append-observation.py"
+# The comparator joins replica IDs, the logical manager ID and endpoints across observation sites. A value the
+# collector commits under a site-specific label, or a right label over the wrong value, can never join, and the
+# synthetic fixtures below cannot notice: they commit every identity under one label by construction. So the
+# check is made at each site that must carry the call, inside the shell function that observes it.
+python3 - "$root/capture-host.sh" <<'PY'
+import re, sys, pathlib
+text = pathlib.Path(sys.argv[1]).read_text()
+def code(s): return "\n".join(l for l in s.splitlines() if not l.lstrip().startswith("#"))
+# One slice per shell function, bounded by its own closing brace at column 0: the last function's slice must
+# not run on into the main body, where a literal could satisfy a check meant for one observing site.
+bodies = {m.group(1): code(m.group(2)) for m in re.finditer(r'^([a-z_]+)\(\) \{\n(.*?)^\}$', text, re.M | re.S)}
+required = {
+    "configuration": ['commit_text logical-manager-id ', 'commit_text replica-id "$(jq -r .replica ', 'commit_text replica-id "$replica"', 'commit_text endpoint "$endpoint"', 'commit_text peer-key "$key"'],
+    "listeners": ['commit_text endpoint "$endpoint"'],
+    "inspection": ['commit_text logical-manager-id ', 'commit_text replica-id "$(jq -r .replica_id '],
+}
+for fn, calls in required.items():
+    if fn not in bodies: raise SystemExit(f"{fn}() is no longer a brace-delimited function of capture-host.sh; the label check cannot see its site")
+    for call in calls:
+        if call not in bodies[fn]: raise SystemExit(f"{fn}() no longer commits {call!r}; the comparator joins that value across sites")
+stale = {"local-replica", "peer-replica", "inspection-replica", "logical-manager", "inspection-logical", "peer-endpoint", "bind-endpoint"} & set(re.findall(r'commit_text (\S+) ', code(text)))
+if stale: raise SystemExit(f"site-specific commitment labels break the comparator join: {sorted(stale)}")
+PY
 python3 "$root/tests/test_helpers.py" -q
 rg -q '/run/podmesh-manager-qualification' "$root/activate-host.sh"
 rg -q '/etc/podmesh-manager/.manager2-activation-started' "$root/activate-host.sh"
@@ -43,7 +66,7 @@ shutdown={"schema_version":"podmesh-manager-graceful-shutdown/v1","typed_request
 def evidence(i,stage):
     running=stage in ("active-baseline","converged"); cleanup=stage=="post-cleanup"
     peers=[{"replica_id_commitment":replicas[j],"endpoint_commitment":c(f"endpoint-{j}"),"shared_key_commitment":keys[tuple(sorted((i,j)))]} for j in range(3) if j!=i]
-    limits={"network_mode":"authenticated-static-peers","address_families":["AF_UNIX","AF_INET"],"peer_allow_count":2,"peer_allow_prefix_length":32} if running else {"network_mode":None,"address_families":[],"peer_allow_count":0,"peer_allow_prefix_length":None}
+    limits={"network_mode":"authenticated-static-peers","address_families":["AF_UNIX","AF_INET"],"peer_allow_count":2,"peer_allow_prefix_length":32,"sha256":h("dropin")} if running else {"network_mode":None,"address_families":[],"peer_allow_count":0,"peer_allow_prefix_length":None}
     inspection=None
     if stage=="active-baseline": inspection={"schema_version":3,"logical_manager_commitment":c("logical"),"replica_commitment":replicas[i],"logical_history_sha256":h(f"baseline-{i}"),"sqlite_integrity_result":"ok","history_count":0,"receipt_count":0,"audit_event_count":0,"incomplete_attempt_count":0}
     if stage in ("converged","post-cleanup"): inspection={"schema_version":3,"logical_manager_commitment":c("logical"),"replica_commitment":replicas[i],"logical_history_sha256":h("history"),"sqlite_integrity_result":"ok","history_count":3,"receipt_count":3,"audit_event_count":9,"incomplete_attempt_count":0}
@@ -72,6 +95,9 @@ three_args=(--phase three-host --pre "$work"/*-pre-activation.json --active-base
 jq -e '.status=="PASS" and (.canonical_convergence_evidenced|not) and .ha_claim=="absent"' "$work/host.json" >/dev/null
 "$root/compare-evidence.py" "${three_args[@]}" > "$work/three.json"
 jq -e '.status=="PASS" and .canonical_convergence_evidenced and .ha_claim=="absent" and .schema_version=="podmesh-manager-live-activation-comparison/v2"' "$work/three.json" >/dev/null
+# The passing fixtures must exercise the bound hash rather than bypass it: five fields with the inner hash equal to the outer one while active, four fields while absent.
+jq -e '(.dropin.semantic_limits|length)==5 and .dropin.semantic_limits.sha256==.dropin.sha256' "$work/lab-a-active-baseline.json" >/dev/null
+jq -e '(.dropin.semantic_limits|length)==4 and (.dropin.semantic_limits|has("sha256")|not)' "$work/lab-a-pre-activation.json" >/dev/null
 
 reject_host() { local label=$1 filter=$2; jq "$filter" "$work/lab-a-${3:-post-cleanup}.json" > "$work/bad.json"; sidecar "$work/bad.json"; local args=("${host_args[@]}"); case ${3:-post-cleanup} in pre-activation) args[3]="$work/bad.json";; active-baseline) args[5]="$work/bad.json";; converged) args[7]="$work/bad.json";; post-cleanup) args[9]="$work/bad.json";; esac; if "$root/compare-evidence.py" "${args[@]}" >/dev/null; then echo "accepted $label" >&2; exit 1; fi; }
 reject_three() { local label=$1 filter=$2 stage=$3; jq "$filter" "$work/lab-a-$stage.json" > "$work/bad.json"; sidecar "$work/bad.json"; local args=("${three_args[@]}"); case $stage in active-baseline) args=(--phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work/bad.json" "$work/lab-b-active-baseline.json" "$work/lab-c-active-baseline.json" --converged "$work"/*-converged.json --cleanup "$work"/*-post-cleanup.json);; converged) args=(--phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work/bad.json" "$work/lab-b-converged.json" "$work/lab-c-converged.json" --cleanup "$work"/*-post-cleanup.json);; esac; if "$root/compare-evidence.py" "${args[@]}" >/dev/null; then echo "accepted $label" >&2; exit 1; fi; }
@@ -86,6 +112,11 @@ reject_host 'socket wrong owner' '.paths.control_socket.uid=996' converged
 reject_host 'state owner changed' '.paths.state.uid=996' converged
 reject_host 'cleanup inspection regression' '.inspection.history_count=2'
 reject_host 'cleanup history mutation without count growth' '.inspection.logical_history_sha256="0000000000000000000000000000000000000000000000000000000000000000"'
+reject_error() { local label=$1 filter=$2 stage=$3 expected=$4; jq "$filter" "$work/lab-a-$stage.json" > "$work/bad.json"; sidecar "$work/bad.json"; local args=("${host_args[@]}"); case $stage in pre-activation) args[3]="$work/bad.json";; active-baseline) args[5]="$work/bad.json";; converged) args[7]="$work/bad.json";; post-cleanup) args[9]="$work/bad.json";; esac; if "$root/compare-evidence.py" "${args[@]}" > "$work/bad-report.json"; then echo "accepted $label" >&2; exit 1; fi; jq -e --arg e "$expected" '.status=="FAIL" and (.error|contains($e))' "$work/bad-report.json" >/dev/null || { echo "$label was refused for another reason: $(cat "$work/bad-report.json")" >&2; exit 1; }; }
+reject_error 'active drop-in without validated hash' 'del(.dropin.semantic_limits.sha256)' active-baseline 'dropin.semantic_limits: unsafe shape'
+reject_error 'malformed validated drop-in hash' '.dropin.semantic_limits.sha256="not-a-sha256"' active-baseline 'dropin.semantic_limits.sha256: invalid SHA-256'
+reject_error 'validated drop-in hash unbound from installed drop-in' '.dropin.semantic_limits.sha256="0000000000000000000000000000000000000000000000000000000000000000"' active-baseline 'validated drop-in hash is not the installed drop-in hash'
+reject_error 'absent drop-in carrying a validated hash' '.dropin.semantic_limits.sha256=null' pre-activation 'dropin.semantic_limits: unsafe shape'
 reject_host 'widened effective policy' '.dropin.semantic_limits.peer_allow_count=3' active-baseline
 reject_host 'missing effective policy observation' '.dropin.effective_policy_configured=false' active-baseline
 reject_host 'infrastructure mutation during convergence' '.stability.firewall.commitment="sha256:0000000000000000000000000000000000000000000000000000000000000000"' converged
@@ -98,6 +129,23 @@ reject_three 'divergent converged history' '.inspection.logical_history_sha256="
 reject_three 'too-short converged history' '.inspection.history_count=2' converged
 reject_three 'incomplete converged attempt' '.inspection.incomplete_attempt_count=1' converged
 reject_three 'non-reciprocal topology' '.configuration.peers[0].shared_key_commitment="sha256:0000000000000000000000000000000000000000000000000000000000000000"' active-baseline
+# A replica that binds an address other than the one its peers advertise for it (a loopback or wildcard bind) must
+# fail the endpoint join, and the passing fixtures cannot show that because they hard-code the agreement.
+jq '.listeners.endpoint_commitment="sha256:0000000000000000000000000000000000000000000000000000000000000000"' "$work/lab-a-active-baseline.json" > "$work/elsewhere-bound.json"
+sidecar "$work/elsewhere-bound.json"
+if "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work/elsewhere-bound.json" "$work/lab-b-active-baseline.json" "$work/lab-c-active-baseline.json" --converged "$work"/*-converged.json --cleanup "$work"/*-post-cleanup.json > "$work/elsewhere-bound-report.json"; then echo 'accepted a listener bound elsewhere than its advertised endpoint' >&2; exit 1; fi
+jq -e '.failures | index("peer endpoint does not bind the remote listener") != null' "$work/elsewhere-bound-report.json" >/dev/null
+# A sidecar binds a digest to a file name: the directory it was written in is the producing host's, and the
+# evidence must stay verifiable byte-for-byte once copied beside its comparator, so a foreign directory with the
+# same file name is accepted and a different file name is refused.
+mkdir -p "$work/elsewhere" && cp "$work/lab-a-post-cleanup.json" "$work/elsewhere/lab-a-post-cleanup.json"
+printf '%s  %s\n' "$(sha256sum "$work/elsewhere/lab-a-post-cleanup.json" | awk '{print $1}')" "/another/host/directory/lab-a-post-cleanup.json" > "$work/elsewhere/lab-a-post-cleanup.json.sha256"
+args=("${host_args[@]}"); args[9]="$work/elsewhere/lab-a-post-cleanup.json"
+"$root/compare-evidence.py" "${args[@]}" > "$work/relocated.json"
+jq -e '.status=="PASS"' "$work/relocated.json" >/dev/null
+printf '%s  %s\n' "$(sha256sum "$work/elsewhere/lab-a-post-cleanup.json" | awk '{print $1}')" "/another/host/directory/lab-b-post-cleanup.json" > "$work/elsewhere/lab-a-post-cleanup.json.sha256"
+if "$root/compare-evidence.py" "${args[@]}" > "$work/misnamed-sidecar.json"; then echo 'accepted a sidecar naming another file' >&2; exit 1; fi
+jq -e '.status=="FAIL" and (.error|contains("invalid evidence checksum sidecar"))' "$work/misnamed-sidecar.json" >/dev/null
 jq '.inspection.logical_history_sha256="0000000000000000000000000000000000000000000000000000000000000000" | .inspection.history_count=4' "$work/lab-a-post-cleanup.json" > "$work/bad-cleanup.json"
 sidecar "$work/bad-cleanup.json"
 if "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work"/*-converged.json --cleanup "$work/bad-cleanup.json" "$work/lab-b-post-cleanup.json" "$work/lab-c-post-cleanup.json" >/dev/null; then echo 'accepted divergent post-cleanup history' >&2; exit 1; fi

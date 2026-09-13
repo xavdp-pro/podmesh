@@ -4,7 +4,10 @@ Status: manager2 candidate `0.1.0~manager2+gff77b1f946e8` from commit `ff77b1f`
 passed deterministic package assembly, signed experimental APT binding, inactive
 upgrade from manager1 on three existing laboratory hosts, a separate protected
 configuration transition, pure offline validation and the default-disabled
-failed-start gate. Network activation, replication convergence, takeover, DNS,
+failed-start gate. Two live three-host activation campaigns then converged and
+cleaned up through the reviewed harness, but the checked-in comparator does not
+PASS them (see [REVIEW-MANAGER2-G2-LIVE-ACTIVATION.md](REVIEW-MANAGER2-G2-LIVE-ACTIVATION.md)).
+Network activation as gated, replication convergence as gated, takeover, DNS,
 fencing, restart, rollback, schema-compatible activation and HA remain unqualified.
 
 ## Purpose and isolation
@@ -170,7 +173,13 @@ assembly from its exact release binary, signed APT binding, inactive upgrade on
 all three hosts, a separate protected configuration transition and the same
 default refusal. See
 [REVIEW-MANAGER2-PACKAGE-QUALIFICATION.md](REVIEW-MANAGER2-PACKAGE-QUALIFICATION.md).
-Explicit network activation, resident exchange and recovery stages remain open.
+Explicit network activation was then run twice on the three hosts through the
+reviewed harness: three authenticated replicas, one owned observation each, one
+canonical digest on all three at convergence and after typed cleanup. The gate
+is not passed, because the candidate keeps as uncertain every outbound exchange a
+peer dropped at its one-connection incoming limit, and the comparator requires
+zero; see [REVIEW-MANAGER2-G2-LIVE-ACTIVATION.md](REVIEW-MANAGER2-G2-LIVE-ACTIVATION.md).
+Recovery stages remain open.
 
 1. Record a pre-install inventory outside the candidate package: host identity,
    package versions, `podmesh.service` and `podmesh-web-observer.service` PIDs,
@@ -364,6 +373,8 @@ after two port-race corrections it reported no remaining blocker or important
 finding for the local-only increment. Signed manager1 publication and
 disabled-service installation first passed on three existing hosts. Manager2
 Stage P now also passes signed candidate binding, inactive upgrade, the separate
-configuration transition and default refusal on those hosts. Network activation,
-convergence, takeover, DNS, fencing, restart, rollback, schema-compatible
-activation and HA qualification remain open.
+configuration transition and default refusal on those hosts. Two live activation
+campaigns converged on those hosts and were cleaned up through the typed path,
+without passing the checked-in gate. Network activation and convergence as
+gated, takeover, DNS, fencing, restart, rollback, schema-compatible activation
+and HA qualification remain open.

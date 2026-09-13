@@ -1,0 +1,101 @@
+{
+  "schema_version": "podmesh-manager-live-activation-public-summary/v1",
+  "campaign": "manager2-g2-live-2",
+  "date_utc": "2026-09-13",
+  "result": "FAIL",
+  "comparator": {
+    "phase": "three-host",
+    "status": "FAIL",
+    "canonical_convergence_evidenced": false,
+    "ha_claim": "absent",
+    "failure_count": 5,
+    "only_failing_condition": "inspection.incomplete_attempt_count must be 0 at the converged and post-cleanup stages",
+    "every_other_check": "PASS",
+    "reproduce_from_this_directory": "packaging/podmesh-manager/qualification/activation/compare-evidence.py --phase three-host --pre lab-*/pre-activation.json --active-baseline lab-*/active-baseline.json --converged lab-*/converged.json --cleanup lab-*/post-cleanup.json",
+    "output": "comparison.json"
+  },
+  "candidate": {
+    "package": "podmesh-manager",
+    "version": "0.1.0~manager2+gff77b1f946e8",
+    "source_commit": "ff77b1f946e82af421de2ccdbe06d8cd45b70c33",
+    "binary_sha256": "cbd5020a37d2b6b2ab94ee41a7ea9d2f50d0da36c6fb972f795c8a1fe3660128",
+    "deb_sha256": "4e475a2421302b5a3c1c6583853f9e04515076cbd00f430e805ecb9a3ecefc8d",
+    "dpkg_verify": "clean on all three hosts at every stage"
+  },
+  "host_aliases": ["lab-a", "lab-b", "lab-c"],
+  "host_count": 3,
+  "stages_per_host": ["pre-activation", "active-baseline", "converged", "post-cleanup"],
+  "observed": {
+    "note": "every value here is readable from the twelve stage files in this directory or from the comparator run on them",
+    "replicas_started_through_reviewed_harness": 3,
+    "logical_history_sha256_at_converged": "652145a63a80b109000f848aee90f9c22a8d31c3ed2906c6066a279588230e3e",
+    "logical_history_sha256_equal_on_all_replicas_at_converged": true,
+    "logical_history_sha256_retained_by_all_replicas_after_cleanup": true,
+    "history_count_at_active_baseline": 3,
+    "history_count_at_converged": 6,
+    "history_count_after_cleanup": 6,
+    "sqlite_integrity_result": "ok",
+    "one_manager_invocation_per_host_for_the_whole_active_campaign": true,
+    "typed_graceful_shutdowns": 3,
+    "forced_signals_used": 0,
+    "unrelated_services_containers_routes_firewall_unchanged": true,
+    "final_state": "manager inactive and disabled on all three hosts, no drop-in, no runtime directory, no control socket, durable state retained"
+  },
+  "reported_not_in_this_evidence": {
+    "note": "read from the campaign driver's log and from live read-only inspections while the residents ran; these facts are not carried by the twelve stage files and cannot be reproduced from this directory",
+    "owned_non_exclusive_observations_accepted": 3,
+    "observation_first_attempt_accepted_on_every_host": true,
+    "conflicts_at_live_inspection": 0,
+    "blocked_exclusive_resources_at_live_inspection": 0,
+    "cleanup_only_restarts": 0
+  },
+  "not_passed": {
+    "inspection_incomplete_attempt_count": {
+      "lab-a": {"active-baseline": 1, "converged": 51, "post-cleanup": 50},
+      "lab-b": {"active-baseline": 1, "converged": 40, "post-cleanup": 46},
+      "lab-c": {"active-baseline": 3, "converged": 23, "post-cleanup": 27}
+    },
+    "cause": "Every incomplete attempt is an outbound exchange left at outbound_request_prepared. The candidate deliberately records an outbound attempt as uncertain, without a terminal audit phase, when its request was fully sent and no reply byte came back. A resident at its incoming_workers limit of 1 accepts and drops a second concurrent connection without replying, and three replicas synchronizing with each peer every second collide continually. Audit events are immutable, so the count never returns to zero.",
+    "evidence_or_gate_altered": false
+  },
+  "harness": {
+    "collector_scripts_that_produced_this_evidence_sha256": {
+      "capture-host.sh": "248b4a433dcb3ba731901d88eef4dba260d6878665e141ca9c600330c4851c9f",
+      "activate-host.sh": "54d107e079292996cd381c796839d2460996e9bdd61b69bd047c07b15d90acec",
+      "validate-dropin.py": "e844995d9fbbe9a8e24807f31e9313ac2f0d050ae1a0b4a4eeee27bf39e487d7",
+      "graceful-shutdown.py": "a462c753be7d2288230110cffb9f494ea1b46b7540bf7024cbf4171973b921ed",
+      "wait-ready.py": "8fdbb7e04faaf96f3b2b3e0ef0b1deb028ef50e8b46177ed2256b2a37ef8bc6c",
+      "append-observation.py": "2e2382e6a0f1c1456b477c7397a0bdb429a4443288a381b653eadb1b81f0e389"
+    },
+    "comparator_that_produced_comparison_json_sha256": {
+      "compare-evidence.py": "d63dcb03e62cec032028cffffa96aa4bdb3e2278f30eb45d027232d8bc0f4f3b"
+    },
+    "sidecars": "as written by the producing hosts; the comparator binds a sidecar to its file name, so this directory is verifiable in place"
+  },
+  "prior_campaign": {
+    "campaign": "manager2-g2-live-1",
+    "result": "not comparable",
+    "reason": "its collector committed one identity under a different label at each observation site, so no cross-host join could hold, and its comparator refused the five-field semantic_limits the collector emits; both defects are fixed in the same commit as this evidence",
+    "logical_history_sha256_at_converged_and_after_cleanup": "6244a8daad86df04b15200d01513b3f7d4ff0af63721f92cf0309e37f6178f72",
+    "inspection_incomplete_attempt_count": {
+      "lab-a": {"converged": 1, "post-cleanup": 0},
+      "lab-b": {"converged": 0, "post-cleanup": 0},
+      "lab-c": {"converged": 1, "post-cleanup": 2}
+    },
+    "cleanup_only_restart": {"lab-a": true, "lab-b": false, "lab-c": false},
+    "evidence": "retained privately; file digests recorded in REVIEW-MANAGER2-G2-LIVE-ACTIVATION.md"
+  },
+  "claims_not_made": [
+    "G2 as gated by the checked-in comparator",
+    "HA-01",
+    "activation authority",
+    "takeover",
+    "fencing",
+    "DNS",
+    "exclusive activation",
+    "host-loss recovery",
+    "high availability",
+    "production readiness"
+  ],
+  "private_values": "absent"
+}
