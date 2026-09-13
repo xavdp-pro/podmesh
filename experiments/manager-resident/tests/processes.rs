@@ -1,5 +1,5 @@
 use podmesh_manager_ha_lab::{
-    durable::{Configuration as Manager, Request, Response, Store},
+    durable::{Configuration as Manager, RefusalReason, Request, Response, Store},
     ReplicaConfig, ScopeGrant,
 };
 use podmesh_manager_network_lab::{ConfigurationFile, Peer};
@@ -756,6 +756,7 @@ fn accepted_transport_connection_has_absolute_trickle_deadline() {
 #[test]
 fn authenticated_invalid_batch_commits_no_partial_import() {
     use hmac::{Hmac, Mac};
+    use sha2::Digest;
     let mut lab = Lab::new();
     lab.observe(0, "valid-first", None);
     lab.observe(0, "invalid-second", None);
@@ -769,7 +770,7 @@ fn authenticated_invalid_batch_commits_no_partial_import() {
     let nonce = "atomic-nonce";
     let bytes = serde_json::to_vec(&(protocol, "r0", "r1", op, nonce, &snapshot)).unwrap();
     let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&[2_u8; 32]).unwrap();
-    mac.update(b"podmesh-manager-network-lab/1\\0");
+    mac.update(b"podmesh-manager-network-lab/1\0");
     mac.update(&bytes);
     let mac_hex: String = mac
         .finalize()
@@ -777,7 +778,17 @@ fn authenticated_invalid_batch_commits_no_partial_import() {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    let body=serde_json::to_vec(&json!({"protocol":protocol,"source_replica_id":"r0","destination_replica_id":"r1","operation_id":op,"nonce":nonce,"snapshot":snapshot,"mac_hex":mac_hex})).unwrap();
+    let body = serde_json::to_vec(&json!({
+        "protocol": protocol,
+        "source_replica_id": "r0",
+        "destination_replica_id": "r1",
+        "operation_id": op,
+        "nonce": nonce,
+        "snapshot": snapshot,
+        "mac_hex": mac_hex,
+    }))
+    .unwrap();
+    let request_sha256 = format!("{:x}", sha2::Sha256::digest(&body));
     lab.start(1);
     let mut stream = TcpStream::connect(lab.configs[1].network.bind).unwrap();
     stream
@@ -792,11 +803,36 @@ fn authenticated_invalid_batch_commits_no_partial_import() {
     let mut reply = vec![0; u32::from_be_bytes(length) as usize];
     stream.read_exact(&mut reply).unwrap();
     let reply: Value = serde_json::from_slice(&reply).unwrap();
-    assert_eq!(reply["result"], "diagnostic");
-    assert!(
-        !reply["detail"].as_str().unwrap().contains("authentication"),
-        "the invalid batch must reach the authenticated durable validator"
+    assert_eq!(reply["result"], "refused");
+    assert_eq!(reply["source_replica_id"], "r1");
+    assert_eq!(reply["destination_replica_id"], "r0");
+    assert_eq!(reply["operation_id"], op);
+    assert_eq!(reply["nonce"], nonce);
+    assert_eq!(reply["request_sha256"], request_sha256);
+    assert_eq!(
+        serde_json::from_value::<RefusalReason>(reply["reason"].clone()).unwrap(),
+        RefusalReason::PolicyViolation
     );
+    let signed = serde_json::to_vec(&(
+        "refused",
+        "r1",
+        "r0",
+        op,
+        nonce,
+        request_sha256.as_str(),
+        RefusalReason::PolicyViolation,
+    ))
+    .unwrap();
+    let mut expected = Hmac::<sha2::Sha256>::new_from_slice(&[2_u8; 32]).unwrap();
+    expected.update(b"podmesh-manager-network-lab/1\0");
+    expected.update(&signed);
+    let expected_mac: String = expected
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(reply["mac_hex"], expected_mac);
     assert_eq!(lab.count(1), 0);
     lab.stop(1);
 }

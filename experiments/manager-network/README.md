@@ -1,136 +1,174 @@
-# Authenticated manager replica transport laboratory
+# Durable authenticated manager exchange laboratory
 
-Status: isolated local-TCP transport experiment. It maps an authenticated replica
-snapshot into the existing `experiments/manager-ha` durable `Import` request.
-It is not deployed, packaged, enrolled dynamically, a manager failover service,
-or evidence of high availability.
+Status: Stage N is coded and locally tested against the Stage D durable API. It
+is an isolated plaintext-TCP laboratory, not Stage R, a complete G2 delivery, a
+package, an installed-host result, or manager high availability.
 
-## Purpose
+## Boundary
 
-The control-services universe is one logical manager with one replica per host.
-The durable manager experiment already binds immutable facts to a configured
-topology and imports them atomically. This increment adds a real process and TCP
-boundary without changing that experiment:
+One locally configured replica exports its typed immutable snapshot and sends it
+to one exact configured peer. Network input cannot select a database, topology,
+peer, key, route, service, or effect. The transport does not enroll peers,
+publish DNS, activate an address, run Podman, perform takeover, or fence another
+replica. `activation_authority` remains outside this crate and false in the
+resident laboratory.
 
-1. the local replica exports its typed durable snapshot;
-2. it signs a bounded exchange request for one preconfigured peer;
-3. the receiving process verifies its configured peer identity and shared key;
-4. it maps the request to `durable::Request::Import` with a namespaced durable
-   operation ID; and
-5. it sends a peer-authenticated receipt only after the durable import commits.
+Each configuration contains the local replica identity and SQLite path, the
+complete durable manager topology, one bind address, and exactly one entry for
+every other replica. Pair keys are distinct 32-byte lowercase hexadecimal values.
+The same application HMAC is required whether the endpoint is direct or routed
+through WireGuard. Plain TCP provides no payload confidentiality.
 
-The connection can use a direct LAN endpoint or an endpoint carried through
-WireGuard. WireGuard is optional: it can protect routing and transport paths, but
-the application-level request/reply MAC remains required. Incoming network data
-never names a SQLite path, changes topology, adds a peer, or creates enrollment.
+## Frame contract
 
-## Static configuration
+Each JSON body has one four-byte big-endian length prefix. The maximum body is
+512 KiB. Reads and writes use one absolute two-second deadline across prefix and
+body and retry `Interrupted` without renewing that deadline.
 
-Each local JSON configuration includes its replica ID, local SQLite path,
-durable-manager topology, local bind address, and one exact peer record for every
-other configured manager replica. A peer record has the peer replica ID, endpoint
-and a distinct 32-byte hexadecimal pair key. A production key lifecycle is intentionally
-outside this laboratory; test keys must never be reused.
+Transfer evidence records actual bytes, including the prefix, and records the
+announced body length once all four prefix bytes arrive. A body SHA-256 exists
+only after a complete read. A write records the digest of its complete intended
+body even when the peer accepts only a prefix. An oversized announcement stops
+after four bytes and never allocates the announced body. There is no transport
+flush after a complete frame, so a completed write cannot later be reclassified
+as unavailable by an ambiguous flush result.
 
-The peer IDs must be complete, distinct, in the durable topology and different
-from the local replica. The snapshot's replica ID and topology must both match
-the authenticated peer and the recipient's pre-existing local configuration.
-There is no discovery, enrollment, configuration replication, implicit bootstrap
-or trust-on-first-use.
+Tests cover exact 0, 1, 3, 4, total-minus-one, and total byte boundaries for reads
+and writes, oversized prefixes, interrupted calls, and a trickled absolute read
+deadline.
 
-## Wire protocol and replay boundary
+## Identity and authentication
 
-`podmesh-manager-network-lab/1` is a length-framed JSON request. The HMAC-SHA-256
-input is domain-separated and binds the protocol, source and destination replica
-IDs, operation ID, nonce, and complete typed snapshot. The successful reply binds
-the same request identity plus the exact durable import result. This proves only
-that a configured peer with the pair key accepted the request and committed its
-local durable result.
+The HMAC domain ends in an actual NUL byte, separates this protocol, and binds
+every request field:
 
-The caller supplies an opaque operation ID and nonce. Both are one to 128 ASCII
-letters, digits, hyphens or underscores. The recipient transforms an accepted
-operation ID to `network/<source-replica-id>/<operation-id>` before calling the
-durable store. The durable store's immutable operation receipt gives replay safety
-across a clean process restart: an identical retry returns the original import
-result; reuse with a different snapshot fails. The durable replay key deliberately
-binds the authenticated source replica and operation ID plus the mapped snapshot;
-the nonce is authenticated on the wire and bound to a successful reply, but is not
-part of the durable receipt. A repeated operation ID with a new nonce therefore
-replays only when its snapshot is identical. Callers must allocate fresh IDs
-and cryptographically unpredictable nonces in any non-laboratory deployment.
+- protocol, source replica, destination replica, wire operation, nonce; and
+- the complete typed snapshot.
 
-Error replies are deliberately unauthenticated diagnostic status only; no caller
-may treat them as peer authority or a management decision. The public error type
-marks them as `UnauthenticatedRemoteDiagnostic`; locally derived errors are marked
-`Local`. A successful import reply is mutually authenticated. An on-path actor
-can still prevent delivery; availability and peer liveness are not proven.
+An accepted reply binds source, destination, wire operation, nonce, the exact
+sent request-body SHA-256, inserted and history counts, destination receipt
+operation ID, receipt checksum, replay flag, and its MAC. The source also verifies
+the deterministic Stage D receipt mapping, checksum shape, count bounds, and
+exact request digest.
 
-## Bounds and outcome classes
+After request-MAC verification, the destination may sign only
+`invalid_request`, `policy_violation`, or `operation_id_reused`. A signed refusal
+also binds the complete received request-body digest. A wrong key, unknown peer,
+malformed message, or other pre-authentication failure receives at most an
+unsigned diagnostic. The public error source distinguishes `Local`,
+`AuthenticatedRemoteRefusal`, and `UnauthenticatedRemoteDiagnostic`.
 
-| Boundary | Fixed value |
-| --- | --- |
-| One-shot listener connections | 1 per `serve-once` process |
-| Request or reply JSON frame | 512 KiB maximum, excluding four-byte length |
-| Listener accept, connect, read and write timeout | 2 seconds each |
-| Initial connection retry window | 2 seconds, 100 ms attempts and 20 ms pause |
-| Operation ID and nonce | 1–128 ASCII token characters |
-| Local configuration JSON | 1 MiB maximum, read before parsing or opening SQLite |
-| Imported snapshot | 512 KiB effective limit from this network frame |
-| Durable manager core | No independent snapshot-byte limit; this experiment always applies its 512 KiB outer frame |
-| Imported history | Existing manager-ha semantics; full snapshot only |
+The caller keeps one stable wire operation for an identical logical retry and
+uses a fresh nonce for every transport attempt. `sync_to` validates nonce shape
+but does not persist a nonce-reuse registry. Security does not depend on nonce
+uniqueness: both signed reply variants bind the exact request digest, so a
+captured success cannot authenticate a changed request even if operation and
+nonce are reused. Stage D creates a fresh local
+`attempt:<sha256>` for each attempt. The destination derives its own bounded
+`network:<sha256>` receipt through `execute_authenticated_import`; wire operation,
+attempt, nonce, and receipt identities remain separate. Reusing a wire operation
+with changed snapshot content returns an authenticated `operation_id_reused`
+refusal with no partial import.
 
-`unavailable` means a local listener or bounded I/O path could not be reached.
-`refused` means a configured identity, MAC, topology, replay binding or durable
-import was rejected. `malformed` means a frame, token or JSON request cannot be
-interpreted within bounds. A malformed frame is refused before the durable import.
-An import failure leaves no partial durable import because the mapped durable
-request is one SQLite transaction.
+## Durable sequence
 
-## Run
+Outbound order is fixed:
+
+1. export, sign, and encode one bounded request;
+2. append `outbound_request_prepared` before connect or write;
+3. meter connect, request write, and reply read;
+4. verify every signed reply field; and
+5. append exactly one `outbound_exchange_completed` before returning, except
+   when a complete request has total reply loss.
+
+Connect, partial write, partial or malformed reply, bad MAC, binding failure,
+unsigned diagnostic, authenticated refusal, and accepted reply receive terminal
+classification with actual phase byte counts. Any unavailable reply read with
+zero transferred bytes, including EOF, timeout, or reset, is uncertainty rather
+than malformed input; Stage D deliberately retains the source
+`outbound_request_prepared` attempt without a terminal event. If a signed success
+arrives but the source cannot append its terminal audit, `sync_to` returns local
+uncertainty.
+
+Inbound order is fixed:
+
+1. allocate a local pre-authentication nonce and meter one frame;
+2. decode a validated wire nonce into a fresh local attempt when possible;
+3. append `inbound_request_observed`;
+4. atomically import facts, receipt, and `inbound_import_committed`, or append one
+   allowed `inbound_refusal_recorded` decision;
+5. append `inbound_reply_prepared` before a signed reply; and
+6. append exact full, partial, or zero-write terminal evidence.
+
+A pre-authentication attempt never changes nonce and carries no authenticated
+peer, operation, receipt, or replay authority. Unsigned diagnostics cannot follow
+a durable accepted/refused decision. A non-signable durable error before a
+decision records a zero-byte authenticated close when the store remains writable.
+Stage D requires that terminal to use `transport_unavailable`; the returned local
+error retains the actual durable cause. An unwritable store leaves the attempt
+incomplete and the original error is never masked. Missing receipts and signing,
+encoding, or preparation failures after a durable decision remain incomplete
+because Stage D does not permit a close before a matching signed-reply
+preparation. No signed reply is sent in any of these cases. The deliberate
+process-test reply-loss seam stops after the atomic
+decision, leaving visible incomplete destination evidence for retry qualification.
+
+`serve-once` checks one absolute admission deadline before every accept and stops
+after at most eight connections. A connection queued before the cutoff is not
+accepted after it. This deadline bounds admission only: each connection accepted
+before the cutoff receives its own bounded frame read/write deadline and may
+finish after the admission cutoff. An unauthenticated connection receives at most
+an unsigned diagnostic. Fast-failing bad connections do not consume the service,
+but one stalled connection can exhaust its I/O budget and the admission deadline;
+the listener then intentionally rejects any queued connection. The cap also ends
+admission after eight connections.
+
+`DurableError` is matched by variant. `Refused` retains its typed reason;
+`Corrupt`, `Storage`, and `InvalidAudit` remain distinct local classes. Store
+safety, schema, identity, corruption, audit, and transport failures never become
+signed peer-request refusals.
+
+## Commands
 
 ```sh
 cargo test --locked --manifest-path experiments/manager-network/Cargo.toml
-cargo clippy --locked --all-targets --manifest-path experiments/manager-network/Cargo.toml -- -D warnings
-cargo fmt --manifest-path experiments/manager-network/Cargo.toml -- --check
+cargo clippy --locked --manifest-path experiments/manager-network/Cargo.toml --all-targets --all-features -- -D warnings
+cargo fmt --all --manifest-path experiments/manager-network/Cargo.toml -- --check
 ```
 
-The one-shot executable is intentionally explicit:
+The executable accepts:
 
-```sh
-podmesh-manager-network-lab serve-once LOCAL-CONFIG.json
-podmesh-manager-network-lab sync LOCAL-CONFIG.json PEER_ID OPERATION_ID NONCE
+```text
+podmesh-manager-network-lab serve-once CONFIG
+podmesh-manager-network-lab sync CONFIG PEER OPERATION_ID NONCE
 ```
 
-It does not start a resident service and does not run shell commands.
+`serve-once-ready` binds the configured address, prints the still-owned actual
+address, then begins bounded admission. Tests use it with port zero so there is
+no bind-drop-rebind reservation race. `serve-once-drop-reply-ready` is a
+laboratory-only fault seam for reply loss after a durable decision. It refuses to
+run unless `PODMESH_MANAGER_NETWORK_LAB_ENABLE_REPLY_LOSS=1` is explicitly set.
+The public library method remains an intentional laboratory-only fault API because
+the process proof must invoke it from a normal binary build; it is not exposed by
+an installed package or service.
 
-`Node::serve_connection(TcpStream)` handles exactly one accepted connection with
-the same authentication, framing and atomic import. Its caller owns listener
-admission/concurrency; `../manager-resident/` supplies that laboratory owner.
-Frame reads/writes use absolute two-second deadlines, so trickled bytes cannot
-renew a timeout forever.
+The listener itself is nonblocking. The qualified Linux runtime does not pass
+that mode to an accepted socket, so per-connection blocking reads use their
+configured deadlines. Portability to systems where accepted sockets inherit
+nonblocking mode, including BSD-family behavior, is not qualified by this
+evidence.
 
-## Evidence covered by tests
+## Evidence and limits
 
-- a three-replica executable test holds two destination listeners while the
-  third replica process catches both copies up from a prior offline state;
-- exact configured identity and HMAC success, then identical replay receipt;
-- unavailable peer reported separately from an unsigned remote refusal diagnostic;
-- wrong-key peer refusal, truncated/frame-length refusal and oversize frame refusal
-  with no durable mutation;
-- a correctly authenticated snapshot containing a later invalid fact is refused
-  with zero facts committed on the recipient; and
-- reconnect/catch-up of a stale replica from a full snapshot.
+The process proof uses real child processes, retained state, reply loss, exact
+replay with a fresh nonce, catch-up to a third replica, and the external
+`podmesh-manager-ha-lab --inspect-store` interface. It verifies SQLite integrity,
+no unaudited authenticated imports, expected terminal and incomplete attempts,
+and one common logical-history digest.
 
-## Explicit gaps
-
-This experiment has no certificates or per-host key storage/rotation/revocation,
-no encrypted application payload, no signed original facts, no peer discovery,
-no TLS, no endpoint allowlist by network address, no incremental pagination,
-no rate limiting, no long-running listener, no listener concurrency policy, no
-clock-based replay window, no recovery for lost local durable receipts, no backup
-or installation path, and no host deployment.
-
-It does not perform a takeover, coordinator action, fencing, DNS/IP publication,
-Podman operation, migration, service advertisement or failure detection. A
-reachable authenticated replica is not evidence that another replica stopped.
-This is a transport prerequisite for later HA qualification, not HA itself.
+Stage N retains full snapshots and pairwise HMAC keys in protected local
+configuration. It has no encryption, production key rotation/revocation, dynamic
+membership, incremental cursor, paging, quota, rate limiting, long-running
+listener, installed service, three-host deployment, takeover, fencing,
+split-brain prevention, DNS, or effect authority. See `EVIDENCE.md` for the exact
+local qualification results.
