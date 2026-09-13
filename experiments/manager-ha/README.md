@@ -61,6 +61,11 @@ The model follows these rules:
 | MH-13 | Persisted stale-copy catch-up | Offline old database backup catches up from retained peer facts before new sequence allocation | Tested locally; lost receipt recovery remains open |
 | MH-14 | Process API reconciliation and conflict gating | Three independent stores exchange JSON facts, block divergence/conflicts, and report at most one eligible replica for one reconciled history | Tested locally; not activation/fencing |
 | MH-15 | Typed bounded local process interface | Unknown fields and input larger than 1 MiB fail before database creation | Tested locally |
+| MH-16 | Append-only exchange audit | Typed phase rows, predecessor rules, checksums and immutable triggers fail closed | Tested locally |
+| MH-17 | Authenticated-import receipt separation | Source plus wire operation map to a bounded destination-local `network:<sha256>` receipt ID; laboratory imports remain visible as unaudited | Tested locally; network wiring pending |
+| MH-18 | Non-mutating preflight and inspection | v2 WAL files and mismatched stores retain their bytes; symlinks and unexpected schema objects refuse | Tested locally |
+| MH-19 | Typed incomplete attempts | Locally allocated attempts remain distinct when a peer reuses a wire nonce; inbound and outbound unfinished phases are ordered and typed | Tested locally |
+| MH-20 | Durable inbound decisions | Accepted imports and authenticated refusals follow separate checked signed chains; unsigned diagnostic writes and no-reply closes are distinct terminals and cannot become authenticated outcomes | Tested locally; network wiring pending |
 
 Run:
 
@@ -78,37 +83,103 @@ production storage standard or change the installed PodMesh service. The existin
 reducer and reconciliation rules remain the contract; `durable::Store` invokes
 them after reloading all stored events inside each SQLite IMMEDIATE transaction.
 
-Schema v2 stores a canonical topology/replica binding, immutable serialized facts
-with SHA-256 checksums, and immutable checksummed local operation receipts. WAL plus synchronous
-FULL is requested on every open. Facts and receipts commit atomically before a
-mutation response is returned. Reloading under the write transaction prevents
-concurrent processes from overwriting stale in-memory state. Invalid imports roll
-back as a batch. SQL triggers refuse updates/deletions; they do not protect against
-an administrator who can replace the database or schema. Hashes detect accidental
-byte changes; they are not signatures.
+Schema v3 stores a canonical topology/replica binding, immutable serialized
+facts, typed mutation receipts and append-only typed exchange-audit events. WAL
+plus synchronous FULL is requested only after a private-copy preflight has
+accepted an existing schema and identity. Facts and receipts commit atomically;
+an authenticated import also commits its accepted audit row in that same SQLite
+IMMEDIATE transaction. Every insert must affect exactly one row. The exact
+`sqlite_master` shape is verified before replay or mutation, and immutable tables
+have no-update and no-delete triggers.
 
-Every request verifies all receipt checksums inside the same transaction before
-reading state, replaying a response or writing another event. Each checksum is
-SHA-256 over the UTF-8 serialization of this JSON string array:
-`["podmesh-manager-ha-receipt/1", operation_id, request_json, response_json]`.
-JSON escaping and fixed array positions make the framing unambiguous, including
-embedded quotes, delimiters, newlines and NULs. The stored request/response JSON
-strings are bound exactly. A bad checksum blocks the API without a false replay.
-An administrator able to alter both content and checksum can fabricate a matching
-row: this is integrity detection, not a MAC, signature or authentication mechanism.
+Receipt checksums bind the logical manager, destination-local receipt identity,
+receipt kind, source replica, wire operation, stored request and stored response
+using the domain `podmesh-manager-ha-receipt/2`. Authenticated peer imports use a
+bounded local identity `network:<sha256>` derived from a domain-separated tuple of
+logical manager, source replica and wire operation. The wire operation remains in
+separate receipt and audit fields. Local observations, laboratory imports and
+authenticated imports therefore have explicit kinds. Canonical inspection lists
+any import receipt that lacks a committed inbound-import audit.
 
-Schema v1 lacked receipt integrity data and is refused without mutation. There is
-no automatic migration that could bless already corrupted receipts with newly
-computed checksums. This unreleased laboratory increment uses fresh v2 fixtures;
-recovery or migration of older files requires a separately reviewed procedure.
-Revision successor arithmetic is checked both for local writes and imported causal
-relations. Malformed `u64::MAX` predecessors are quarantined rather than overflowing;
-restarting the process preserves the quarantine.
+Audit rows distinguish the locally generated `attempt_id`, wire nonce,
+wire `operation_id`, local receipt ID and remote receipt ID. Attempt IDs use the
+local `attempt:<sha256>` form. A wire nonce is either a validated decoded peer
+nonce or, before decoding reaches one, a locally generated
+`preauth:<64 lowercase hexadecimal SHA-256>` connection nonce. A pre-authentication
+nonce remains stable within its local attempt and carries no peer, operation,
+receipt, replay or effect authority. One shared sequence validator is used before
+insertion, after loading, and while deriving incomplete attempts. An authenticated
+accepted observation may lead either to an atomic accepted import or to a durable
+typed refusal. The chosen decision must precede signed reply preparation, and a
+completed signed reply write must reproduce its outcome, reason and receipt. A
+complete or partially written unsigned diagnostic has its own exact-byte terminal
+phase and cannot follow a durable decision or prepared signed reply. Partial
+diagnostics retain their intended digest and announced body size, but use only
+`unavailable` outcome/category; complete diagnostics retain the observed diagnostic
+outcome. A no-reply close is a separate zero-byte terminal. None can become an
+accepted result or authenticated refusal.
+If storage prevents the terminal record, the network must close without a signed
+response and no durable close is claimed.
+
+Byte counts are per-phase actual transfer counts rather than cumulative attempt
+totals. Request observation and signed or diagnostic reply-write phases carry
+their respective actual bytes. Import, refusal-decision and close phases carry none. Prepared phases carry
+zero actual bytes but retain bounded digest and announced-size intent. The schema
+stores announced body sizes for both request and reply, so complete transfer
+evidence requires exact framed-byte accounting. A transfer phase must retain
+the digest and announced size of its corresponding prepared intent. Accepted
+outbound completions also require the deterministic receipt ID that the
+destination derives from the manager, source replica and wire operation;
+non-accepted completions cannot assert a remote receipt.
+
+An unavailable signed reply write records only a nonzero partial frame. Zero
+bytes use `inbound_connection_closed`; a full signed frame uses only its accepted
+or authenticated-refusal outcome. Signed refusal evidence is limited to peer
+request reasons. Local configuration and preflight path-race failures are not
+represented as signable request refusals.
+Unavailable transport, reply-write and close audit rows use the stable
+`transport_unavailable` reason. `unsafe_store` remains reserved for an actual
+unsafe database or sidecar path. Neither is a signable authenticated
+peer-request refusal.
+Malformed and unauthenticated diagnostic audit rows use only the malformed
+category with `invalid_request`; local store, identity, policy and transport
+reasons are rejected both on insertion and when loading stored evidence.
+
+The durable API returns typed `DurableError` values that distinguish `refused`,
+`corrupt`, `storage` and `invalid_audit`; refusal reasons are a closed enum. These
+classes are required by the future network layer so a local storage failure cannot
+be signed as a durable peer refusal.
+
+Existing v1 and v2 stores are refused without migration. On the first successful
+open for a file-metadata/topology identity, preflight captures a stable private
+copy of the database, WAL and SHM, opens only private files, and checks schema and
+identity before opening the source read-write. If a copied WAL snapshot needs
+materialization, SQLite opens and rewrites only a second private copy. A
+process-local cache includes device, inode, size, modification time, change time,
+replica and topology; in-place replacement and different identities do not match
+the cache. The later source open uses SQLite `NOFOLLOW` and rechecks the path
+metadata identity. Tests preserve a killed-child v2 store with live
+uncheckpointed WAL frames and a mismatched live v3 WAL store byte for byte.
+Inspection and preflight reject symlinked or non-regular database and sidecar
+paths through `lstat` before opening them. The subsequent regular-file open uses
+Linux `O_NOFOLLOW|O_NONBLOCK` as defense against replacement races, and sidecar
+names are constructed without lossy path conversion. Checksums detect corruption; they are not
+signatures and do not protect against an administrator able to replace both rows
+and checksums.
 
 The executable is a one-request process boundary: database path, local
 configuration path and replica ID are operator-supplied arguments; one JSON request
 is read from stdin through EOF, and one JSON response is written to stdout. Exit
-code 0 means success; exit code 1 accompanies an `error` object. There is no shell
+code 0 means success; exit code 1 accompanies an `error` object. A separate
+external read-only form is available:
+
+```sh
+experiments/manager-ha/target/debug/podmesh-manager-ha-lab --inspect-store \
+  DATABASE CONFIGURATION_JSON_FILE REPLICA_ID
+```
+
+It opens a stable private copy and never creates or changes the canonical store.
+There is no shell
 execution, daemon, network listener, or implicit remote connection.
 
 Example using a disposable operator-owned directory:
@@ -148,11 +219,13 @@ printf '%s\n' '{"operation":"export"}' |
 | `check_service` | `snapshots` from every other declared replica, `exclusive_service` | Coordinator ID and `eligible_in_supplied_history` |
 
 Configuration and request inputs each have a 1 MiB limit. Exchange uses complete
-snapshots; durable incremental cursors, paging, retention quotas and large-history
+snapshots. Verification is intentionally linear in retained facts, receipts and
+audit rows, and full-snapshot import receipts can grow quadratically in this
+bounded laboratory; durable incremental cursors, paging, retention quotas and large-history
 performance remain open. The API reserializes typed facts canonically; it does not
 preserve original wire whitespace or claim compatibility with the registry
 experiment's distinct observation envelope. Schema version is local SQLite
-`user_version=2`; there is no negotiated remote protocol version.
+`user_version=3`; there is no negotiated remote protocol version.
 
 An `import` cannot change the local topology or identity. The supplied configuration
 must match the already declared topology; it is comparison data, never enrollment.
@@ -174,12 +247,17 @@ explicit stale-backup fixtures.
 
 ## What this proves
 
-The ten original model tests retain the MH-01–MH-08 contract. The seventeen process
+The ten original model tests retain the MH-01–MH-08 contract. The 69 executed process
 acceptance tests exercise real compiled child processes and separate temporary
 SQLite stores: restart, retry, sequence allocation, concurrent writers, disjoint
 local writes, explicit JSON exchange, stale-copy return, conflict persistence,
 reconciled eligibility, corrupt/fabricated receipt refusal, maximum imported revisions,
-legacy schema refusal and bounded protocol input. The crash
+legacy WAL-schema refusal, typed exchange-audit corruption, namespaced receipts,
+accepted/refused/complete-and-partial-diagnostic inbound chains, diagnostic peer
+binding and partial-write boundaries, pre-authentication nonce authority limits,
+transport-unavailable refusal separation, diagnostic reason/category closure,
+per-phase frame accounting, read-only
+external inspection, symlink refusal and bounded protocol input. The crash
 acceptance test invokes its otherwise ignored child helper twice; that helper is
 not omitted acceptance coverage.
 
@@ -192,7 +270,8 @@ instruction in the CLI transaction or a physical power-loss test. See
 
 ## What remains unproven
 
-No authenticated origin or network transport, WireGuard integration, discovery,
+The authenticated-import API is implemented but not yet wired into the network crate.
+No complete authenticated origin or network transport, WireGuard integration, discovery,
 DNS, Podman control, real service IP, leases, clocks, failure detector, fencing,
 physical power-loss survival, installed host deployment, Logger integration or
 end-to-end HA is implemented or proven. Grants are static fixtures; observation

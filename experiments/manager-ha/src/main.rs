@@ -5,7 +5,7 @@ use std::{
     process::ExitCode,
 };
 
-use podmesh_manager_ha_lab::durable::{Configuration, Request, Store};
+use podmesh_manager_ha_lab::durable::{inspect_read_only, Configuration, Request, Store};
 
 fn main() -> ExitCode {
     match run() {
@@ -22,8 +22,22 @@ fn main() -> ExitCode {
 
 fn run() -> Result<String, String> {
     let args: Vec<_> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--inspect-store") {
+        if args.len() != 5 {
+            return Err("usage: podmesh-manager-ha-lab --inspect-store DATABASE CONFIGURATION_JSON_FILE REPLICA_ID".into());
+        }
+        let configuration: Configuration =
+            serde_json::from_slice(&bounded(std::fs::File::open(&args[3]).map_err(error)?)?)
+                .map_err(error)?;
+        return serde_json::to_string(&inspect_read_only(
+            Path::new(&args[2]),
+            &configuration,
+            &args[4],
+        )?)
+        .map_err(error);
+    }
     if args.len() != 4 {
-        return Err("usage: podmesh-manager-ha-lab DATABASE CONFIGURATION_JSON_FILE REPLICA_ID; one JSON request on stdin".into());
+        return Err("usage: podmesh-manager-ha-lab DATABASE CONFIGURATION_JSON_FILE REPLICA_ID; one JSON request on stdin; or --inspect-store DATABASE CONFIGURATION_JSON_FILE REPLICA_ID".into());
     }
     let configuration: Configuration =
         serde_json::from_slice(&bounded(std::fs::File::open(&args[2]).map_err(error)?)?)
