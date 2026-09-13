@@ -81,7 +81,7 @@ Missing data is `unknown`; it is never recorded as zero or stopped.
 | --- | --- | --- |
 | G0 Local reducer | Deterministic three-copy reconciliation and conflict quarantine | Qualified in the isolated model |
 | G1 Durable process | Crash/restart, concurrent writers, checked facts and receipts | Qualified locally; no host deployment |
-| G2 Authenticated exchange | Three real processes, bounded mutual peer authentication and durable imports | Not yet qualified. Two live three-host campaigns of candidate `0.1.0~manager2+gff77b1f946e8` each converged to one canonical digest on all three replicas, at the converged stage and again after typed cleanup, with unchanged unrelated services, containers, routes and firewall. The checked-in comparator still does not PASS: every store retains outbound exchange attempts the candidate deliberately leaves uncertain when a peer at its one-connection incoming limit drops the connection, and the gate requires zero. A reviewed transition then raised `incoming_workers` to 2 on all three hosts and a measurement run showed the accept-and-drop eliminated (`rejected_connections: 0`) with nine strands still appearing, every one of them received, imported and replied to by its peer. The gate's `incomplete_attempt_count == 0` therefore requires that a failure mode the frozen Stage D contract explicitly specifies (`MANAGER-G2-DURABLE-EXCHANGE.md:470`, invariant G2-I07) never occurs during a campaign. Whether that is the right predicate is a specification question for this document's author; separately, the receiver's pre-reply path is O(audit table) and unbounded, which is a real defect. See [FINDING-MANAGER2-LATE-REPLY-STRANDS.md](FINDING-MANAGER2-LATE-REPLY-STRANDS.md) |
+| G2 Authenticated exchange | Three real processes, bounded mutual peer authentication and durable imports, with **every incomplete attempt individually accounted for** — see "The G2 acceptance predicate" below | Not yet qualified. Two live three-host campaigns of candidate `0.1.0~manager2+gff77b1f946e8` each converged to one canonical digest on all three replicas, at the converged stage and again after typed cleanup, with unchanged unrelated services, containers, routes and firewall. The checked-in comparator still does not PASS: every store retains outbound exchange attempts the candidate deliberately leaves uncertain when a peer at its one-connection incoming limit drops the connection, and the gate requires zero. A reviewed transition then raised `incoming_workers` to 2 on all three hosts and a measurement run showed the accept-and-drop eliminated (`rejected_connections: 0`) with nine strands still appearing, every one of them received, imported and replied to by its peer. The gate's `incomplete_attempt_count == 0` therefore requires that a failure mode the frozen Stage D contract explicitly specifies (`MANAGER-G2-DURABLE-EXCHANGE.md:470`, invariant G2-I07) never occurs during a campaign. Whether that is the right predicate is a specification question for this document's author; separately, the receiver's pre-reply path is O(audit table) and unbounded, which is a real defect. See [FINDING-MANAGER2-LATE-REPLY-STRANDS.md](FINDING-MANAGER2-LATE-REPLY-STRANDS.md) |
 | G3 Effect exclusion | Current epoch enforced outside manager memory and old epoch refused | Not yet qualified |
 | G4 Host deployment | Signed package, preserved identity, upgrade/rollback and clean install on three hosts | Signed installation, protected three-replica configuration, offline validation and default-disabled refusal pass on three existing hosts; durable identity restart, lifecycle, upgrade/rollback and clean-host requirements remain open |
 | G5 Manager service recovery | Real process/host loss, restart and stale return under external observation | Not yet qualified |
@@ -90,6 +90,97 @@ Missing data is `unknown`; it is never recorded as zero or stopped.
 
 Scenarios may run only when their prerequisite gate is qualified. A scenario that
 needs missing mechanics is prepared, not passed.
+
+## The G2 acceptance predicate: accounted, not absent
+
+Amended 2026-09-13 by decision of OpenAI Codex coordinating with the operator
+(`/tmp/podmesh-claude/DECISIONS-CODEX-2026-09-13.md`, Decision 1). The predicate is
+amended; **no evidence is modified, erased or refused retroactively.**
+
+### Why the old predicate was wrong
+
+The gate required `inspection.incomplete_attempt_count == 0` at the converged and
+post-cleanup stages. The frozen Stage D contract
+(`MANAGER-G2-DURABLE-EXCHANGE.md`) requires the opposite in a case it anticipates. Its
+failure-semantics table is normative — its columns are *Failure* and **Required
+result** — and at `:470` it reads:
+
+> | Reply is lost after destination commit | Destination retains import receipt and
+> audit; **source retains a prepared/incomplete attempt.** Identical operation retry
+> with a fresh nonce receives a replayed signed receipt. |
+
+Invariant `G2-I07` at `:80` says the same: *"a prepared attempt with no terminal event
+remains explicitly incomplete."*
+
+So a demand for zero made a contractually required representation fail the gate. Worse,
+it turned a correctness gate into a **reliability bar**: a campaign passed only if a
+specified failure mode did not happen to occur during it, on a receiver path whose
+latency is unbounded in the size of a table that only grows. That is not what G2 is for.
+
+### What the gate requires now
+
+**G2 passes when `unaccounted_incomplete_attempts == 0`**, every attempt created inside
+the campaign window is terminal or accounted for, canonical histories converge, and
+every other G2 invariant holds. The output continues to carry `ha_claim: "absent"`.
+
+The gate must **never** erase, rewrite or fabricate a terminal audit event in order to
+reach that number.
+
+### When an incomplete outbound attempt is accounted for
+
+Only when a deterministic join proves **all** of the following. Each is a separate
+refusal; there is no aggregate that can compensate for a missing one.
+
+1. the attempt belongs to the qualified campaign window and the exact candidate;
+2. its declared peer, operation ID, wire nonce, request digest, announced size and
+   transferred request bytes bind to **one** authenticated receiver-side request;
+3. the receiver recorded the complete request, authenticated it, and atomically
+   committed either the expected import receipt or a typed refusal;
+4. no partial import and no unaudited import receipt exists;
+5. the receiver prepared and completely wrote the correctly bound signed reply, while
+   the sender honestly retained the absence of a confirmed reply as incomplete;
+6. an identical retry returned the durable replayed receipt, **or** the exact imported
+   facts and receipt are independently present in the converged canonical history on
+   every replica;
+7. every store passes integrity and immutable-chain verification;
+8. the incomplete record remains visible in evidence and in operational diagnostics.
+
+An attempt with **no receiver-side authenticated join is unaccounted** and fails the
+campaign. A timeout, a missing heartbeat, a matching total, or eventual history
+convergence **alone** is insufficient — each of those is a story about the whole, and
+this predicate is about one attempt at a time.
+
+### Attempt identities, never count deltas
+
+The gate is scoped to attempt identities. **Count subtraction is forbidden**: cleanup
+legitimately adds terminal rows and changes the folded count, so a difference between
+two totals describes nothing. The capture must therefore carry attempt commitments for
+a **baseline set** and a **post-campaign set**, and the comparator works on set
+difference by identity.
+
+Pre-existing incomplete attempts are **retained and reported as baseline debt**. They
+do not fail a new bounded campaign merely by existing, and they may never be silently
+folded into a success claim. Every new attempt is classified individually.
+
+### Result vocabulary
+
+`terminal_attempts` · `accounted_incomplete_attempts` ·
+`unaccounted_incomplete_attempts` · `preexisting_incomplete_attempts` ·
+`new_incomplete_attempts`.
+
+### What this amendment does not do
+
+It does not qualify anything. The nine late-reply attempts recorded by the 2026-09-13
+measurement run are **eligible for re-evaluation** under this predicate; they are not
+retroactively qualified by it. Qualification still requires a reviewed evidence schema,
+a fail-closed comparator, synthetic negative tests, and reproducible derivation from the
+preserved stores. The 123 older attempts remain declared historical debt unless
+separately accounted for.
+
+And a passing G2 under this predicate still says nothing about long-running operational
+viability: the receiver's unbounded pre-reply verification is a separate defect, with
+its own lot, and it must not be hidden by raising a timeout or by deleting retained
+history.
 
 ## Scenario catalogue
 
