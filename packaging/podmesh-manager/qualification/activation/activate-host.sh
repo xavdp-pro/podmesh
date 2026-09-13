@@ -5,12 +5,12 @@ export LC_ALL=C
 umask 077
 
 root=$(cd -- "$(dirname -- "$0")" && pwd)
-usage() { echo "Usage: $0 [--mode activate|seal-converged|rollback] --host-alias <stable-alias> --salt-file <private-salt> --candidate-verification <report.json> --evidence-directory <directory> [--dropin-source <file>]" >&2; exit 2; }
+usage() { echo "Usage: $0 [--mode activate|seal-converged|resume-cleanup|rollback] --host-alias <stable-alias> --salt-file <private-salt> --candidate-verification <report.json> --evidence-directory <directory> [--dropin-source <file>]" >&2; exit 2; }
 mode=activate alias_name= salt= report= evidence= source=
 while [ "$#" -gt 0 ]; do case "$1" in
   --mode) mode=${2-}; shift 2;; --host-alias) alias_name=${2-}; shift 2;; --salt-file) salt=${2-}; shift 2;;
   --candidate-verification) report=${2-}; shift 2;; --evidence-directory) evidence=${2-}; shift 2;; --dropin-source) source=${2-}; shift 2;; *) usage;; esac; done
-case "$mode" in activate|seal-converged|rollback) ;; *) usage;; esac
+case "$mode" in activate|seal-converged|resume-cleanup|rollback) ;; *) usage;; esac
 [ "$(id -u)" -eq 0 ] && [[ "$alias_name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$ ]] && [ -f "$salt" ] && [ -f "$report" ] && [ -n "$evidence" ] || usage
 [ "$mode" != activate ] || [ -f "$source" ] || usage
 for command in systemctl sha256sum jq install rm mkdir mv rmdir find grep python3 flock stat mktemp chmod chown readlink; do command -v "$command" >/dev/null || { echo "$command is required" >&2; exit 2; }; done
@@ -112,6 +112,20 @@ fi
 read_ledger
 state=$(jq -r .state "$ledger")
 case "$state" in prepared|dropin-installed|start-failed|active|converged|stopped|dropin-removed|complete|failed-start-cleaned) ;; *) echo 'Activation ledger state is invalid' >&2; exit 2;; esac
+if [ "$mode" = resume-cleanup ]; then
+  case "$state" in active|converged) ;; *) echo 'Cleanup restart requires an active or converged ledger' >&2; exit 2;; esac
+  [ "$(systemctl show podmesh-manager.service -p ActiveState --value)" = inactive ] && [ "$(systemctl show podmesh-manager.service -p SubState --value)" = dead ] && [ "$(systemctl show podmesh-manager.service -p MainPID --value)" = 0 ] || { echo 'Cleanup restart requires a fully inactive manager' >&2; exit 1; }
+  expected=$(jq -r '.dropin_sha256' "$ledger")
+  [ -f "$dropin" ] && [ ! -L "$dropin" ] && [ "$(sha256sum -- "$dropin"|awk '{print $1}')" = "$expected" ] || { echo 'Cleanup restart requires the exact activation drop-in' >&2; exit 1; }
+  mark_activation_started
+  systemctl start podmesh-manager.service || { echo 'Cleanup-only restart failed; retaining evidence and drop-in' >&2; exit 1; }
+  "$root/wait-ready.py" > "$evidence/cleanup-restart-readiness.json" || { echo 'Cleanup-only restart readiness failed; retaining the live manager' >&2; exit 1; }
+  shutdown_report=$evidence/graceful-shutdown.json
+  "$root/graceful-shutdown.py" > "$shutdown_report" || { echo 'Cleanup-only typed shutdown failed; retaining evidence and drop-in' >&2; exit 1; }
+  write_ledger stopped "$(jq -n --arg dropin "$expected" --arg shutdown "$(sha256sum "$shutdown_report"|awk '{print $1}')" --arg readiness "$(sha256sum "$evidence/cleanup-restart-readiness.json"|awk '{print $1}')" '{dropin_sha256:$dropin,graceful_shutdown_sha256:$shutdown,cleanup_restart_readiness_sha256:$readiness,cleanup_restart:true}')"
+  state=stopped
+  mode=rollback
+fi
 if [ "$mode" = seal-converged ]; then
   [ "$state" = active ] || { echo 'Converged capture can only seal an active ledger' >&2; exit 2; }
   converged=$evidence/converged.json

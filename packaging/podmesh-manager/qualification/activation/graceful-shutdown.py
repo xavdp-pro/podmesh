@@ -50,8 +50,10 @@ def main():
             state = unit_state()
             clean = (
                 state.get("ActiveState"), state.get("SubState"), state.get("MainPID"),
-                state.get("Result"), state.get("ExecMainCode"), state.get("ExecMainStatus"),
-            ) == ("inactive", "dead", "0", "success", "exited", "0")
+                state.get("Result"), state.get("ExecMainStatus"),
+            ) == ("inactive", "dead", "0", "success", "0") and state.get("ExecMainCode") in {
+                "exited", "0", "1",
+            }
             if clean and not os.path.lexists(SOCKET_PATH):
                 print(json.dumps({
                     "schema_version": "podmesh-manager-graceful-shutdown/v1",

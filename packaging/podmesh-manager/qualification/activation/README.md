@@ -47,8 +47,11 @@ harness and its shared lock is outside the qualification model.
 
 Rollback sends the private typed request {"operation":"shutdown"}. It requires
 the exact acknowledgement, successful natural process exit, removal of the
-control socket and systemd Result=success, ExecMainCode=exited,
-ExecMainStatus=0. It then removes only the regular fragment whose SHA-256 is
+control socket and systemd `Result=success` plus `ExecMainStatus=0`. Depending
+on the systemd version and inactive-unit metadata retention, `ExecMainCode` may
+be reported as `exited`, `1` or `0`; the typed acknowledgement, PID
+disappearance and successful unit result remain mandatory. It then removes
+only the regular fragment whose SHA-256 is
 bound in the ledger. Failure to prove graceful shutdown leaves the fragment and
 evidence in place; it never converts a forced signal into a clean result.
 
@@ -168,6 +171,14 @@ A hash-owned temporary drop-in left before its rename is removed by the
 prepared-state rollback. The persistent activation marker is bound to the host
 alias, package version and exact binary hash. Use a fresh evidence directory
 for another campaign with the same candidate.
+
+`resume-cleanup` is an explicit laboratory recovery for a resident that already
+stopped while a cleanup verifier refused to certify the exit. It requires an
+active or converged ledger, a fully inactive unit and the exact retained
+drop-in. Under the shared lock it starts the same candidate, proves typed
+readiness, immediately requests typed shutdown, records the extra cleanup-only
+invocation and resumes hash-bound removal. This recovery must be disclosed in
+the campaign result and never strengthens the activation or convergence claim.
 
 ## Comparison
 

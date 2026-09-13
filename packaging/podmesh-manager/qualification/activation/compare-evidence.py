@@ -130,7 +130,7 @@ def host_failures(pre,base,conv,cleanup):
             base["service"]["n_restarts"] != 0 or conv["service"]["n_restarts"] != 0):
         failures.append("manager restarted or changed invocation during the active campaign")
     s=cleanup["service"]
-    if (s["active_state"],s["sub_state"],s["unit_file_state"],s["result"],s["exec_main_code"],s["exec_main_status"],cleanup["manager_process"]["count"],cleanup["listeners"]["tcp_listener_count"],cleanup["listeners"]["udp_listener_count"]) != ("inactive","dead","disabled","success","exited",0,0,0,0): failures.append("cleanup did not prove a successful manager exit with no listeners")
+    if (s["active_state"],s["sub_state"],s["unit_file_state"],s["result"],s["exec_main_status"],cleanup["manager_process"]["count"],cleanup["listeners"]["tcp_listener_count"],cleanup["listeners"]["udp_listener_count"]) != ("inactive","dead","disabled","success",0,0,0,0) or s["exec_main_code"] not in {"exited","0","1"}: failures.append("cleanup did not prove a successful manager exit with no listeners")
     if cleanup["paths"]["runtime"]["present"] or cleanup["paths"]["control_socket"]["present"]: failures.append("cleanup retained runtime or control socket")
     if [x["graceful_shutdown"] for x in captures[:3]] != [None,None,None] or cleanup["graceful_shutdown"] != SHUTDOWN: failures.append("typed graceful-shutdown proof is absent, misplaced or invalid")
     if any(not same_state_metadata(pre["paths"]["state"],x["paths"]["state"]) for x in captures[1:]): failures.append("retained state ownership or mode changed")

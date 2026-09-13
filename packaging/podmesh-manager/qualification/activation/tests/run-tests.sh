@@ -11,12 +11,13 @@ rg -q 'Prepared ledger found an unowned temporary drop-in' "$root/activate-host.
 rg -q 'ledger_sum.recovered' "$root/activate-host.sh"
 rg -q 'write_ledger start-failed' "$root/activate-host.sh"
 rg -q 'RECOVERED_NOT_QUALIFIED' "$root/activate-host.sh"
+rg -q 'cleanup_restart:true' "$root/activate-host.sh"
 python3 -m py_compile "$root/compare-evidence.py" "$root/validate-dropin.py" "$root/graceful-shutdown.py" "$root/wait-ready.py" "$root/append-observation.py"
 python3 "$root/tests/test_helpers.py" -q
 rg -q '/run/podmesh-manager-qualification' "$root/activate-host.sh"
 rg -q '/etc/podmesh-manager/.manager2-activation-started' "$root/activate-host.sh"
-marker_line=$(rg -n '^  mark_activation_started$' "$root/activate-host.sh" | cut -d: -f1)
-start_line=$(rg -n '^  if ! systemctl start podmesh-manager.service' "$root/activate-host.sh" | cut -d: -f1)
+marker_line=$(rg -n '^  mark_activation_started$' "$root/activate-host.sh" | head -1 | cut -d: -f1)
+start_line=$(rg -n '^  if ! systemctl start podmesh-manager.service' "$root/activate-host.sh" | head -1 | cut -d: -f1)
 [ "$marker_line" -lt "$start_line" ] || { echo 'activation marker is not written before systemctl start' >&2; exit 1; }
 
 cat > "$work/good.conf" <<'EOF'
@@ -50,7 +51,7 @@ def evidence(i,stage):
       "package":{"name":"podmesh-manager","version":"0.1.0~manager2","binary_sha256":h("binary"),"dpkg_verify":"clean"},
       "configuration":{"document_commitment":c(f"config-{i}"),"logical_manager_commitment":c("logical"),"local_replica_commitment":replicas[i],"local_host_commitment":hosts[i],"topology_commitment":c("topology"),"peer_count":2,"peers":peers},
       "dropin":{"present":running,"sha256":h("dropin") if running else None,"semantic_limits":limits,"packaged_fragment_sha256":h("fragment"),"inherited_deny_all":True,"effective_policy_configured":running,"effective_policy_commitment":c("effective-policy") if running else None},
-      "service":{"load_state":"loaded","active_state":"active" if running else "inactive","sub_state":"running" if running else "dead","unit_file_state":"disabled","main_pid":101+i if running else 0,"invocation_commitment":c(f"invocation-{i}") if running or cleanup else None,"n_restarts":0,"result":"success" if cleanup else "success" if running else "","exec_main_code":"exited" if cleanup else "" if not running else "exited","exec_main_status":0},
+      "service":{"load_state":"loaded","active_state":"active" if running else "inactive","sub_state":"running" if running else "dead","unit_file_state":"disabled","main_pid":101+i if running else 0,"invocation_commitment":c(f"invocation-{i}") if running or cleanup else None,"n_restarts":0,"result":"success" if cleanup else "success" if running else "","exec_main_code":"0" if cleanup else "" if not running else "exited","exec_main_status":0},
       "manager_process":{"count":1 if running else 0,"pid":101+i if running else None,"uid":995 if running else None,"argv_commitment":c(f"argv-{i}") if running else None,"argv_count":7 if running else 0},
       "paths":{"state":{"present":True,"uid":995,"gid":995,"mode":"750","content_commitment":c(f"state-{i}-{stage}")},"runtime":{"present":running,"uid":995 if running else None,"gid":995 if running else None,"mode":"700" if running else None,"content_commitment":c(f"runtime-{i}") if running else None},"control_socket":{"present":running,"uid":995 if running else None,"gid":995 if running else None,"mode":"600" if running else None}},
       "listeners":{"status":"available-successful","endpoint_commitment":c(f"endpoint-{i}"),"tcp_listener_count":1 if running else 0,"udp_listener_count":0},
