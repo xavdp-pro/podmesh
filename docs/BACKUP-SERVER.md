@@ -1,7 +1,9 @@
 # PodMesh Backup Server
 
-> **Intent Classification**: GENERIC INTENT (Rule 0B — a reusable service blueprint, not
-> one client's universe)
+> **Intent Classification**: GENERIC INTENT (Universal / Parameterized Blueprint)
+>
+> Rule 0B mandates that exact string (`RULES.md:98`); revisions 1 to 5 paraphrased it.
+> This service is a reusable blueprint, not one client's universe.
 > **Perimeter**: P1 (Rule 0A — it holds encryption keys, signing authority and every
 > universe's data, so it is classified before design, not after)
 
@@ -15,7 +17,30 @@ deleted R2 by accident); R4 = `2aea3bc` (restoring R2 and crossing the design ag
 PodMesh's own artifacts); R5 = this. Where the text below says "revision 3", it means
 `1cd1736`, and "revision 4" means `2aea3bc`.
 
-**What revision 5 changes**, from a fourth review that returned NO-GO narrowly with four
+**Revision 6**, 2026-09-14, is `ca5293d` plus the fifth review's corrections. That review
+returned **GO** — the first — and verified about fifty-five citations without finding a
+wrong line number. It also found that revision 5's own new text violated B1's
+forbidden-claims list, which is why revision 6 exists before anyone starts B1:
+
+- **A forced stop had no honest class.** Revision 5 said such a capture is
+  "`crash-consistent` at best", which the adapter section forbids and forbidden claim 4
+  forbids outright. A forced stop is now a **failed run**, not a weaker label.
+- **The puller's credential could not work as described.** The outbox and the state
+  directory are both mode 0700 and root-owned, so "an account restricted to the outbox
+  tree" was unimplementable; the restriction is now enforced by a forced command on the
+  channel. And "adds no new mechanism" was false: the two mechanisms it does add are now
+  named, including who issues the sealed point's identifier.
+- **The manifest bound fields its producer cannot know**, verification history and hold
+  state, while claiming immutability. Both move to the catalogue. The **image ID** it
+  needed and did not carry is added.
+- **The consistency classes were printed as a chain and described as a lattice.** They
+  are a partial order, drawn, with the rule D4 needs for the incomparable pair.
+- Step 0's marker had no write mechanism and would have forced every stop; D5 still
+  required the Maker; step 5 destroyed the last source on a ciphertext-only check; the
+  Rule 12 clause accounting omitted one clause and counted another twice. All corrected,
+  with the two `/tmp` citations moved into the repository.
+
+**What revision 5 changed**, from a fourth review that returned NO-GO narrowly with four
 blocking findings:
 
 - **The fixture could return a false pass**, which is the one failure this lot must not
@@ -37,7 +62,7 @@ blocking findings:
   closed list rather than prose, and two shifted citations are corrected.
 
 Revision 1 was counter-reviewed by OpenAI Codex
-(`/tmp/podmesh-claude/REVIEW-BACKUP-SERVER-CODEX-2026-09-13.md`, verdict OPEN with six
+([docs/reference/review-backup-server-codex-2026-09-13.md](reference/review-backup-server-codex-2026-09-13.md), verdict OPEN with six
 blocking findings). This revision answers BBS-R1 to BBS-R6 and folds BBS-R7 to BBS-R12
 into the manifest, state and test contract. Three of the blocking findings were errors
 of mine and are named as such where they are corrected. A second, fresh review then
@@ -204,7 +229,7 @@ from an immutable image, and is not a backup unit.
 **The word means two things, and this document must not equivocate.** In the Shaper OS
 canon a *universe* is the **LXC system container** — its own init, its own package set,
 its own nftables. In PodMesh today a *universe* is a **Podman container** with a UUID
-(`DELIVERY-CHECKLIST.md:40-44`). Read naively, the sentence above would say PodMesh has
+(`DELIVERY-CHECKLIST.md:42`, `:44` — no single line states it; the two together do). Read naively, the sentence above would say PodMesh has
 no backup units at all, which is not what Rule 11 means and not what this service is for.
 
 The reconciliation: **Rule 11's unit is the unit of a *complete* recovery point.** A
@@ -243,17 +268,35 @@ over minutes may never have existed together at any instant, and a manifest asse
 crash consistency for such a set would be a false guarantee written into evidence.
 
 **Five classes** — revision 4 added `quiescent` and left the count at four, which is the
-kind of stale number an implementer builds an enum from. They are listed here in
-increasing strength, and **a capture claims the weakest class it can prove**, never the
-strongest it hopes for:
+kind of stale number an implementer builds an enum from. The rule is that **a capture
+never claims more than it can prove.** *Revision 5 wrote that as "claims the weakest
+class it can prove", which an implementer can satisfy by always returning `incoherent`
+— provable for every capture, and flatly contradicting this document's statement that
+B1's fixture is `quiescent`. The intent is a ceiling, not a floor.*
 
-`incoherent` < `crash-consistent` < `application-consistent` ≤ `quiescent` <
-`memory-coherent`.
+**They form a partial order, not a chain.** Revision 5 printed a single chain with a `≤`
+in it and then said in the next paragraph that two of the classes are not ordered against
+each other. Both cannot be true, and a chain is the one an implementer would encode. The
+order is:
 
-`application-consistent` and `quiescent` are not ordered against each other by a single
-scale: a stopped source has no in-flight state to lose, while a running application that
-executes its own protocol keeps serving. Where both are available the application's own
-protocol is preferred, because it does not cost the stop. The classes:
+```
+                    ┌─ application-consistent ─┐
+incoherent < crash-consistent                  ├─< memory-coherent
+                    └─ quiescent ──────────────┘
+```
+
+`application-consistent` and `quiescent` are **incomparable**: a stopped source has no
+in-flight state to lose, while a running application that executes its own protocol keeps
+serving. Neither dominates. Where both are available the application's own protocol is
+preferred, because it does not cost the stop — that is a preference, not a rank.
+
+**What incomparability means for D4's retention rule**, which requires a candidate to be
+covered "with the same or stronger declared consistency". Stronger means *strictly above
+in this partial order*. So `quiescent` does not satisfy a requirement for
+`application-consistent`, and `application-consistent` does not satisfy one for
+`quiescent`; only the identical class, or `memory-coherent`, satisfies either. A rule
+phrased on a total order would have silently accepted each in place of the other. The
+classes:
 
 - **`incoherent`** — pieces gathered from a running universe with no coordination.
   This is what a naive live capture produces. It is stored and it may be useful, but it
@@ -275,12 +318,23 @@ protocol is preferred, because it does not cost the stop. The classes:
   **The stop must be unforced, and this is a precondition, not a detail.** PodMesh's stop
   sends the container's stop signal and then **SIGKILL** if it is still running after the
   timeout, reporting the escalation as `forced: true` (`LOCAL-API.md:62`). A SIGKILLed
-  process never ran its shutdown path, so its on-disk state is exactly the power-loss
-  state `crash-consistent` describes — the stop bought nothing. A capture may therefore
-  claim `quiescent` only when the stop operation reported **`forced: false`**; where it
-  reported `forced: true` the capture is `crash-consistent` at best, and the adapter
-  records the escalation in the quiesce evidence rather than silently keeping the
-  stronger label. A capture must never *upgrade* a class because a stop was requested.
+  process never ran its shutdown path, so the application's own files may be mid-write —
+  the stop bought coherence across pieces but not a settled application. A capture may
+  therefore claim `quiescent` only when the stop operation reported **`forced: false`**.
+
+  **Where it reported `forced: true`, the run has failed its precondition and is
+  reported as a failed run.** It does not fall back to a weaker label. *Revision 5 said
+  "the capture is `crash-consistent` at best", and that was wrong twice over in one
+  clause: the adapter section below states that only the three snapshot adapters can
+  yield `crash-consistent` and that the ordinary-filesystem adapter never does, and B1's
+  own forbidden-claims list forbids the label outright. `incoherent` does not fit either
+  — it is defined for pieces gathered from a **running** universe. There is no class for
+  this branch because there should not be one: a forced stop means the fixture was not
+  in the state the run assumes, and inventing a label for it would be exactly the silent
+  downgrade this section exists to prevent.* The adapter records the escalation in the
+  quiesce evidence, and the operator restarts the run with a longer timeout or a
+  container that handles its stop signal. A capture must never *upgrade* a class because
+  a stop was requested, and must never invent one because a stop went badly.
 - **`memory-coherent`** — a memory checkpoint bound to the exact disk state it was
   taken against.
 
@@ -351,15 +405,45 @@ documents it does not want inside a 4 KiB request: the service writes them into
 `outbox/<authorization_id>/` under its state directory, which **only the service writes**,
 and an **external transport controller running as root** moves them; the reverse
 direction lands in `inbox/<authorization_id>/` (`LOCAL-API.md:99`). The Backup Server
-uses that pattern unchanged and adds no new mechanism:
+reuses that pattern rather than inventing a transport. *Revision 5 said it "adds no new
+mechanism", which was false and worth correcting because it discourages an implementer
+from noticing the two things that genuinely have to be built.* It adds exactly two, both
+named here:
+
+- **A sealing operation on the local socket.** No such typed operation exists today. It
+  is new work on the daemon, and B1 step 2 depends on it.
+- **An identifier for the sealed point.** The existing `outbox/<authorization_id>/`
+  identifier is issued **only** by `migration_authorize_transfer`, against a
+  `checkpointed` reservation and a named destination host (`src/transfer.rs:172-183`).
+  A backup has neither. The sealing operation therefore issues its own identifier, of the
+  same shape and from the same durable-before-any-artifact discipline, and the outbox
+  directory is keyed by it. Leaving this unsaid would have been the same defect as
+  naming key material that no decision produces, one level down.
+
+With those two built, the flow is:
 
 - **The source host** seals a recovery point and writes it to its outbox. It opens no
   connection and needs no knowledge of the Backup Server.
-- **The transport controller** is the puller. Its authorization is **its own**, and it is
-  the ordinary root credential of the channel it uses — in B1, an SSH key held by the
-  Backup Server, authorized on each source host for a single account whose access is
-  restricted to the outbox tree. That key is the thing that must be protected. It is not
-  derived from, checked against, or in any way related to the manifest signature.
+- **The transport controller** is the puller, and its authorization is **its own**,
+  unrelated to the manifest signature.
+
+  **What that credential has to be, given PodMesh's real permissions.** Both the state
+  directory and the outbox are created mode **0700 and owned by root**
+  (`src/bin/podmeshd.rs:11`, `src/transfer.rs:29-37`). No unprivileged account can even
+  traverse them, so revision 5's "a single account whose access is restricted to the
+  outbox tree" was not implementable as written: any account that can read the outbox is
+  root, and calling it restricted would have been a safeguard that does not exist.
+
+  The restriction has to be enforced by the channel, not by the filesystem. In B1 the
+  Backup Server's public key is installed on each source host under a **forced command**
+  with `restrict`, so the key can invoke exactly one root-run program that streams a
+  named outbox directory and can do nothing else — no shell, no port forwarding, no
+  arbitrary path. Without that clause the obvious reading of this design is unrestricted
+  root SSH from the Backup Server onto every source host, which would make D6's own
+  property false: a compromised Backup Server credential must be provably unable to
+  command an arbitrary host operation, and B1 lists proving that among its exit
+  conditions. A design whose plainest implementation contradicts one of its decisions
+  has to say so in the decision.
 - **The manifest signature** does one job downstream of that: it proves the bytes that
   arrived are the bytes the producer sealed. A verifier checks it after transport, and it
   would still be checked if the bytes had arrived on a USB stick.
@@ -367,7 +451,7 @@ uses that pattern unchanged and adds no new mechanism:
 **The mesh is not required for B1, and B1 does not use it.** Rule 13's WireGuard mesh is
 optional by PodMesh's own contract, its authentication is an open design question
 elsewhere (`CONTROL-SERVICES-UNIVERSE.md`), and it has never been run end to end
-(`README.md:49` records both transports as owing tests). B1 therefore pulls over ordinary
+(`docs/README.md:49` records both transports as owing tests). B1 therefore pulls over ordinary
 existing IP connectivity, which is the same transport the three lab hosts already use.
 Where a deployment does put the Backup Server on the mesh, it is a peer like any other:
 an interface exists and is addressable, **nothing behind it answers**, and Rule 13's
@@ -433,8 +517,11 @@ operational observations under Rule 10's exception, never as figures in this doc
 
 **Who triggers a capture** is the same question and has the same answer: not the Backup
 Server, which holds no authority on a host. A scheduler on the protected side requests a
-typed capture-preparation operation, the host's Maker executes or refuses it, and the
-Backup Server discovers a new sealed point when it next pulls. The scheduler's placement
+typed capture-preparation operation, **the host's authorized caller of that operation —
+its Maker where ShaperOS is present, and an operator or the scheduler itself where it is
+not** — executes or refuses it, and the Backup Server discovers a new sealed point when
+it next pulls. *The unqualified "the host's Maker" stood here through revision 5 while
+three other sections said the Maker is not implemented and cannot be a dependency.* The scheduler's placement
 and authority are part of the lot that introduces scheduling, not B1 — B1's captures are
 requested by hand.
 
@@ -498,7 +585,7 @@ derives from it.
 **Three different things are called a manifest in this ecosystem** and they must not be
 confused: the canon's universe `manifest.json` (Rule 11's restorable identity, and where
 Rule 31's `dataLifecycle` lives); PodMesh's existing **migration checkpoint manifest**,
-hashed into a transfer handoff (`LOCAL-API.md:88`); and this service's **recovery-point
+hashed into a transfer handoff (`LOCAL-API.md:88`, re-hashed at `:103`); and this service's **recovery-point
 manifest**, described here. Where this document says "the manifest" unqualified, it
 means the third. It is immutable, versioned and authenticated, and it binds:
 
@@ -507,14 +594,31 @@ the producer's `host_uuid`; the `authorization_ref` recorded as provenance only;
 universe's declared **`data_lifecycle`** — copied from its `manifest.json` at capture
 time, because Rule 31 binds retention and erasure to that declaration and a recovery
 point that does not carry it cannot be swept, held or erased correctly later, and the
-erasure section below is unenforceable without it; the capture operation ID; the stop
-outcome including whether it was `forced`; each piece with its chunk order, sizes and
-offsets; the
-plaintext digest and the ciphertext digest of every chunk; encryption algorithm, format
-version, nonce, DEK envelope identifier, KEK identifier and any compression parameters;
-the consistency class with its quiesce evidence and boundary times; per-level
-completeness states; the producing software versions and the minimum restore-tool
-version; declared exclusions; verification history; and hold state.
+erasure section below is unenforceable without it; **the local image ID the universe was
+created from**, recorded as a string so a restore can refuse to proceed against a
+different one — the image's bytes are never captured, per Rule 11, and step 6's restore
+has nothing to refuse against if this field is missing; the capture operation ID; the
+stop outcome including whether it was `forced`; each piece with its chunk order, sizes
+and offsets; the plaintext digest and the ciphertext digest of every chunk; encryption
+algorithm, format version, nonce, DEK envelope identifier, KEK identifier and any
+compression parameters; the consistency class with its quiesce evidence and boundary
+times; per-level completeness states; the producing software versions and the minimum
+restore-tool version; and declared exclusions.
+
+**What the manifest does *not* carry, and why the previous list was self-contradictory.**
+Revisions 4 and 5 ended that list with "verification history; and hold state". Neither
+can be in a signed immutable manifest. The next section binds a signature over the
+canonical serialization of every other field, and this one forbids overwriting a manifest
+in place. But verification happens on the **datastore, after transfer**, and a hold is
+applied later still. A producer cannot sign a fact that does not exist when it signs.
+Carrying those two fields would have meant either a mutable manifest or a signature over
+fields nobody can fill, and an implementer would have discovered that only when writing
+the signer.
+
+So **verification history and hold state live in the catalogue**, as separate signed
+objects referenced from a later catalogue checkpoint, exactly as the last paragraph of
+this section already requires for proofs. The manifest stays immutable and signable at
+the instant it is produced.
 
 ### Who signs it, and what a verifier checks
 
@@ -573,9 +677,20 @@ same defect as anchoring it in nothing.* In PodMesh's own terms:
   representable in 64 bits, and no floating-point value appears anywhere in a manifest.
 - **The map from producer to public key** is a pinned local file at
   `$PODMESH_STATE_DIR/backup/producers.json`, listing each producer's `host_uuid` and its
-  Ed25519 public key. Revision 4 put it under `/etc/podmesh/`, **a directory that does
-  not exist**: PodMesh has no `/etc/podmesh`, no packaging creates one, and no other
-  document mentions one. Naming a configuration root that no lot ships is how a
+  Ed25519 public key — **on a source host**. Revision 4 put it under `/etc/podmesh/`,
+  **a directory that does not exist**: PodMesh has no `/etc/podmesh`, no packaging creates
+  one, and no other document mentions one.
+
+  **On the Backup Server the path is its own, because the Backup Server need not be a
+  PodMesh host at all.** Revision 5 moved the file to `$PODMESH_STATE_DIR` and did not
+  notice that the verifier which reads it runs on the datastore, which this document
+  elsewhere says does not require Podman or CRIU locally. Where the Backup Server is not
+  a PodMesh host, that variable is unset and `/var/lib/podmesh` is created by no package
+  — the same defect as `/etc/podmesh/`, moved one role sideways. So the service reads
+  `producers.json` and its own signing key from **its own state directory**, which the
+  Backup Server package creates and owns, and which its bootstrap restores. In B1 the
+  Backup Server happens to be one of the three lab hosts, which is why this would not
+  have been caught by running B1. Naming a configuration root that no lot ships is how a
   verification step becomes unimplementable, so the file goes into the state directory
   the daemon already owns and creates. A verifier resolves against that file and
   **never** against a key learned from the manifest. **If it is absent or unreadable, a
@@ -701,7 +816,7 @@ together, and before B5 puts anything off-site under a lock.
 ## Off-site (Rule 16 level 5)
 
 Codex's environment inspection
-(`/tmp/podmesh-claude/R2-ENCRYPTED-KEY-BACKUP-2026-09-13.md`) establishes both the shape
+([docs/reference/r2-encrypted-key-backup-2026-09-13.md](reference/r2-encrypted-key-backup-2026-09-13.md)) establishes both the shape
 and the current blocker. Cloudflare R2 through its S3-compatible API is a suitable
 off-site target. **It is not provisionable today**: the general Cloudflare token
 verifies and lists zones and tunnels, but R2 bucket listing returns HTTP 403 and no R2
@@ -831,7 +946,25 @@ Deliberately small, and shaped by the reviewer:
    **no** other host, and in no adapter's default output. Step 7 verifies it on the
    restored copy by reading its contents and comparing them to the recorded value. If the
    marker is absent or differs, the run failed, whatever else succeeded. This is what
-   makes the round trip a measurement rather than a tautology;
+   makes the round trip a measurement rather than a tautology.
+
+   **How the marker is written, since PodMesh has no `exec`.** Its local API offers
+   create, start, stop, delete, clone and the migration operations, and nothing that runs
+   a command in a running universe. Two routes work and both are in this project's
+   existing practice: fold the write into the container's own `command` at create time,
+   which the API already accepts (`LOCAL-API.md:31-32`), or write it with direct Podman,
+   which is this project's declared convention for fixtures as opposed to the operations
+   under test (`REVIEW-EXPERIMENTAL3.md:7`). B1 uses the first, so the marker is part of
+   the universe PodMesh created rather than something reached around it.
+
+   **And the command must handle its stop signal, or step 0 breaks step 1.** These two
+   steps were written together and still nearly collided. A container's PID 1 receives no
+   default signal action from the kernel: a plain `sleep` or a bare `sh -c` as PID 1
+   **ignores SIGTERM**, `podman stop` escalates to SIGKILL, `forced` comes back `true`,
+   and step 1's precondition fails — so the fixture designed to make the run meaningful
+   would have made every run fail. The command therefore installs an explicit handler,
+   for example `sh -c 'printf %s "$MARKER" > /marker; trap "exit 0" TERM; sleep 300 &
+   wait'`. The run records the `forced` flag either way; it does not assume this worked;
 1. one **PodMesh universe** — a Podman container with its UUID, on a Debian 13 lab host —
    marked as in step 0, mount-free and network-disabled, then **stopped with an unforced
    stop** and captured through the **ordinary-filesystem adapter** while stopped for the
@@ -862,7 +995,17 @@ Deliberately small, and shaped by the reviewer:
    records the amendment still owed, with its owner);
 5. the source universe is removed only after its recovery point reaches **`verified`**
    on the datastore — not `stored_unverified`, which would make deleting the only
-   source a data-loss path;
+   source a data-loss path.
+
+   **`verified` on the datastore is weaker than it sounds, and the gate is strengthened
+   accordingly.** The datastore verifies **ciphertext** digests, because that is all it
+   can see; only an authorized restore target verifies **plaintext** digests. Removing
+   the last source on a ciphertext-only check would destroy it without anyone having
+   confirmed the bytes decrypt to what was captured — the same class of gap this step's
+   own parenthetical exists to close. So in B1 the source is removed only after **step 7
+   has passed on the restored copy, marker included**, which is the first moment any
+   plaintext has been verified. B2 inherits this ordering rather than the weaker one,
+   because B1's fixture is the template;
 6. restore creates a **quarantined new-identity** copy on another host;
 7. external observation verifies files, configuration and application behaviour —
    **including step 0's marker, read from the restored copy and compared byte for byte
@@ -892,24 +1035,33 @@ put the **archive-failure clause** among the clauses with "no subject yet" and t
 listed that same clause, in its own words, among the ones B1 exercises. A document
 cannot both test a clause and have no subject for it.*
 
-**What B1 has no subject for**, because they need objects B1 does not create: the dump
-laws (no database), the `.env` globs (no `.env`), and the volume exclusions (no volume).
-These become testable in B2 and B3, with the recorder standing in for the dump client
-there.
+*Revision 5's list was the third loose attempt in three revisions: it omitted clause 4
+entirely, counted clause 5 twice as though it were two, filed volume exclusions under
+Rule 12 when they are Rule 16 level 2, and claimed a clause whose testable half has no
+subject in PodMesh. Rule 20 makes coverage limits a recorded obligation, so the
+accounting is done clause by clause against the canon's own order.* The eight clauses of
+"what a backup archive never contains, and what it never lies about" (`RULES.md:759-803`):
 
-**What B1 does exercise:** the key never travelling with the coffer; the backup key being
-its own key and reaching its tool through the environment, never on a command line; a
-failure after the archive is complete keeping the archive; a housekeeping step that
-cannot run being reported as a failure over a surviving archive; and partial output being
-renamed to its final name only once it has a size. The last three are exercised against
-B1's own archive by step 10's four interrupted operations.
+| # | Clause | B1 |
+| --- | --- | --- |
+| 1 | The key that opens the coffer does not travel with the coffer (`:760`) | **exercised** — the KEK's two copies live outside the source host and outside the datastore, per the X2 interim |
+| 2 | The backup's encryption key is its own key (`:765`) | **partly** — the half that says the key reaches its tool through the environment and never a command line is exercised; the half that refuses a key equal to `VAULT_MASTER_KEY` has **no subject**, because PodMesh has no vault and no such key exists to compare against |
+| 3 | A dump that was not taken is announced, never written empty (`:772`) | **no subject** — no database |
+| 4 | The archive command's failure is the backup's failure (`:779`) | **exercised** — B1's mandatory path produces an archive, and the status line is printed only after that archive exists, has a size and has a checksum. Step 10's interrupted capture is this clause's test |
+| 5 | A failure after the archive is complete keeps the archive, and a housekeeping step that cannot run is a reported failure over a surviving archive (`:783`) | **exercised** — one clause, tested by step 10's interrupted transfer and publication |
+| 6 | A dump that failed leaves nothing behind, written `.part` and renamed only once it has a size (`:788`) | **no subject** — it is written about dumps and B1 has none. The archive analogue is clause 4 and is not double-counted here |
+| 7 | `.env` in every spelling (`:793`) | **no subject** — no `.env`, including `deploy/env` |
+| 8 | How the script calls the client is proven with a recorder (`:796`) | **no subject** — no dump client to call. B2 and B3 introduce both the client and the recorder |
 
-**What B1 does not engage:** the transport clause, which is scoped to `tar.bz2` leaving a
-host (X3). B1's archive is chunked and encrypted before it moves and no `tar.bz2` leaves
-anything.
+**Not engaged at all:** Rule 12's transport requirements (`:753-758`), scoped by their own
+opening line to `tar.bz2` archive transfers. B1's archive is chunked and encrypted before
+it moves and no `tar.bz2` leaves anything — see X3, and its owner.
 
-B1 states, in its evidence record, which clauses it tested, which had no subject, and
-which were out of scope — rather than claiming all eight.
+**Also not Rule 12:** volume exclusions, which revision 5 filed here. They are Rule 16
+level 2 and arrive with B2.
+
+B1's evidence record reproduces this table with its observed results, rather than claiming
+all eight.
 
 **B1 explicitly does not prove:** persistent volumes, databases, original-identity
 activation, DNS, memory continuity, off-site recovery, retention, arbitrary Linux
@@ -1165,7 +1317,7 @@ shape. They belong in the B1 checklist, not in a later hardening pass.
 - **A repair loop that can give up** (Rule 27, `LAW.md:24`): B1 step 10 retries four
   interrupted operations, so each needs a declared bound, a backoff and a resting
   terminal state. A retry that never stops is not recovery.
-- **The parent repairs the child, never itself** (Rules 23 and 24, `LAW.md:17`): the
+- **The parent repairs the child, never itself** (Rule 23, `LAW.md:17`; Rule 24's SSH authority is the next row, `:18`): the
   recovery agent described below sits **outside** the service it restores. A Backup
   Server that repairs its own running instance breaks the external-healing law, which
   is exactly why the bootstrap is a separate `podmesh-recovery` package on a clean host
