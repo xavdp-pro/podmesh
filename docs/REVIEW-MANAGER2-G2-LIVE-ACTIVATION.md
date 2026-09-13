@@ -1,9 +1,12 @@
 # Manager2 G2 live activation review
 
-Status: **not passed; coordination decision pending.** Two live three-host
-campaigns of the frozen manager2 candidate converged and cleaned up through the
-reviewed harness. The checked-in four-stage comparator does not return PASS,
-and neither the evidence nor the gate was altered to make it.
+Status: **not passed; an operator decision on durable state is required before
+any further campaign.** Two live three-host campaigns of the frozen manager2
+candidate converged and cleaned up through the reviewed harness. The checked-in
+four-stage comparator does not return PASS, and neither the evidence nor the gate
+was altered to make it. The gated quantity is inherited by every future campaign
+run on the same stores, so no configuration change alone can reach it — see the
+correction in "Open decision".
 
 Date: 2026-09-13. Implementer and author of this review: Claude Code (Fable 5.1),
 under the standing automation mandate. Independent review of the harness fix
@@ -24,8 +27,11 @@ happened twice today. The comparator refuses both campaigns. The first cannot be
 compared at all because of two harness defects, now fixed and proven on the
 second. The second fails exactly one condition: every store retains outbound
 exchange attempts that the candidate deliberately records as uncertain, and the
-gate requires zero. Why that happens, what it does and does not mean, and the
-two ways to resolve it are below.
+gate requires zero. Those attempts are frozen — the audit table is append-only by
+trigger and the identifiers that could retire them died with the processes that
+minted them — so they are now a permanent floor of these three stores, which a
+third campaign would inherit before doing any work. Why that happens, what it
+does and does not mean, and what it takes to reach a passing campaign are below.
 
 ## Candidate binding
 
@@ -197,26 +203,122 @@ and no host needed a cleanup-only restart.
 
 ## Open decision
 
-Two paths keep every principle above; one is recommended.
+> **Correction, same day.** The recommendation first published in this section —
+> raise `incoming_workers`, then run a third campaign — was wrong, and is
+> withdrawn. It never stated that a third campaign would begin at 50 / 46 / 27
+> inherited incomplete attempts and would therefore fail the same five lines
+> before a single packet was sent. What follows replaces it. The finding was
+> established by an adversarial review of six independent lines of inquiry, each
+> claim put to refuters under distinct lenses, and confirmed against the running
+> hosts. Nothing above this section changes: the two campaigns and their evidence
+> are as recorded.
 
-1. **Raise `incoming_workers` through a reviewed configuration transition, then
-   run a third campaign.** Each replica has one outgoing worker and two peers,
-   so a limit of 2 removes collision drops entirely; the candidate's honest
-   uncertainty bookkeeping and the gate stay exactly as they are. The
-   `config-transition/` harness exists for this kind of change, the
-   `configuration.document_commitment` must stay constant across a campaign, and
-   the transition is an operator-reviewed protected-configuration change, so it
-   is a separate lot with its own evidence. **Recommended**: it fixes the cause
-   and changes no proof.
-2. **Redefine the gate.** Extend the evidence schema so the inspection reports
-   incomplete attempts by direction and last phase, require zero *inbound*
-   incomplete attempts (no partial import, HA-I09) and disclose the outbound
-   uncertain count as a number the report must state. This keeps candidate and
-   configuration but weakens the contract the harness author wrote, so it is
-   theirs to accept, and it would still leave a store full of unresolved
-   questions.
+**Raising `incoming_workers` cannot make a third campaign pass, and neither can
+emptying the stores. Both are necessary; neither alone is sufficient; and even
+together they do not guarantee it.**
 
-Not options: rewriting captured evidence, or changing the candidate binary.
+**Why the transition alone cannot work.** `incomplete_attempt_count` is folded
+from every row ever written to `exchange_audit_events`, over an unfiltered
+whole-table load with no time, session, campaign or process window
+(`experiments/manager-ha/src/durable.rs:2557`). The table is delete-proof and
+update-proof by SQLite trigger (`durable.rs:2953-2954`). An attempt leaves the
+set only when a later row bearing the same `attempt_id` reaches a terminal
+phase — and an attempt id is minted from the replica, the wire nonce, the
+**process id**, a process-local counter, a timestamp and sixteen random bytes
+(`durable.rs:349`), so it exists only in the memory of the process that minted
+it. All three residents have exited. The 50 / 46 / 27 attempts stranded at
+`outbound_request_prepared` are a permanent floor of the stores, and the gate
+tests an absolute zero twice: at post-cleanup
+(`activation/compare-evidence.py:154`) and at both convergence stages (`:176-177`).
+
+That inheritance is measured, not inferred: campaign 2's active-baseline opened
+on campaign 1's history, receipts, audit rows and incomplete attempts before
+campaign 2 had done any work of its own.
+
+**Why emptying the stores alone cannot work either.** Campaign 1 began from empty
+stores at `incoming_workers: 1` and still ended post-cleanup at 0 / 0 / 2. It
+would have failed this same line.
+
+**Two ways a clean campaign can still report a nonzero count.**
+
+1. *The converged capture is a live snapshot.* The gate requires the converged
+   stage to show the service active with one running process
+   (`compare-evidence.py:129`), and the prepared audit row is committed before
+   the socket is even connected, so an exchange merely **in flight** at the
+   instant of capture counts. Both campaigns show it (lab-a 51 → 50 between
+   converged and post-cleanup). A re-capture is inside the contract — the
+   collector is read-only and `--mode seal-converged` binds whatever
+   `converged.json` is on disk (`activate-host.sh:129-137`) — but re-capturing
+   until the gated number reads zero is **selection on the gated quantity**, so
+   the number of captures taken per host must be published or it is dice-rolling.
+2. *The post-cleanup count is at rest and is not retryable.* A resident drops its
+   listener before joining its workers (`manager-resident/src/lib.rs:519`) while
+   peers may still be sending, so each shutdown exposes at most one attempt per
+   still-running peer — three exposures per campaign under the frozen sequential
+   order, six if the three residents are stopped at once. **Keep the shutdowns
+   sequential.**
+
+**A second, silent producer of the same evidence.** When a worker cannot open the
+store, `manager-resident/src/lib.rs:414-419` drops the accepted connection with no
+reply, no audit row and **no `rejected_connections` increment**. It produces an
+identical stranded attempt on the peer, invisibly. `rejected_connections: 0`
+therefore proves nothing; the only sound live indicator is
+`incomplete_attempt_count` itself.
+
+**The corrected order, and who authorises each step.**
+
+| # | Step | Kind | Authority |
+| --- | --- | --- | --- |
+| 1 | Verify each host's live configuration carries the three grants and `incoming_workers` as exactly the integer `1` | mechanical | implementer |
+| 2 | Review, commit and apply `--transition incoming-workers` on all three hosts | mechanical | reviewing agent, then implementer |
+| 3 | Run a **measurement** campaign on the current stores, published and labelled as *not a qualification campaign*, and read `converged − active-baseline` per host: that is the number of new uncertain attempts at `incoming_workers: 2` | mechanical | implementer |
+| 4 | Only if that delta is zero on all three: archive the three stores aside, out of the harness, and disclose it in the campaign report | **destructive** | **operator** |
+| 5 | Campaign 3, with sequential shutdowns and a published re-capture count | mechanical | implementer |
+
+Step 3 is the point of the sequence. The premise that a limit of 2 drives new
+uncertain attempts to zero has never been measured — it is a code-shape argument
+(one serial outgoing thread × two peers can never present three concurrent
+inbound connections), and the silent path above is a standing counter-example to
+its completeness. Measuring costs one run on stores that are already doomed;
+skipping it risks spending the only clean start on all three hosts and learning
+nothing that could not have been learned first.
+
+**On step 4.** Archive, never delete: those files are the only carrier of the
+canonical digest `652145a63a80b109…`, of the six facts, and of the attempt
+identifiers this whole diagnosis rests on. The state **directory** must survive
+at mode `750` owned by `podmesh-manager`: only a missing or symlinked directory
+fails early (`capture-host.sh:147`), while one recreated as root or at another
+mode passes every capture and fails at `compare-evidence.py:132`/`:143` — after
+the whole three-host campaign is spent. This is out-of-harness by construction:
+`config-transition/README.md` states that the durable store is never removed.
+It also restores what `activation/README.md` already defines as stage 1, "an
+empty first-use state directory", a precondition campaign 2 breached undetected.
+
+**Explicitly not options.**
+
+- *Fabricating a terminal audit row for a stranded attempt.* `record_exchange_audit`
+  is public and the sequence validator would accept a synthetic
+  `OutboundExchangeCompleted`. It is named here so nobody rediscovers it as a
+  shortcut: it asserts an outcome the candidate deliberately declines to assert,
+  and it is evidence forgery.
+- *Lengthening `interval_ms`.* That tunes the laboratory until the defect stops
+  showing.
+- *Shipping the correct code fix inside campaign 3.* Replying with the existing
+  diagnostic frame instead of dropping the connection is the right repair, but a
+  new binary changes the package version and binary hash that the retained
+  activation marker hard-refuses on all three hosts, and it clears nothing
+  inherited. Its own candidate, its own lot, after G2 settles.
+- *Rewriting captured evidence.* Never.
+
+**If the gate is refined instead** — reserved to the agent who wrote it, decided
+in writing before any run, and never applied to campaign 2's captured files — the
+axis first proposed in this document was wrong. Inbound attempts also legitimately
+remain non-terminal after a durably committed import, so "zero inbound" is not
+HA-I09 enforcement; the field that bears on HA-I09 is `unaudited_import_receipt_ids`,
+which the collector does not publish at all. Refine by `last_phase`, and start
+publishing that field along with `direction` and the attempt ids, which
+`capture-host.sh:137` currently reduces to a bare count. That change alters no
+threshold and would make a campaign diagnosable rather than merely judged.
 
 ## Verification of this lot
 

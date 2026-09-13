@@ -55,7 +55,9 @@
       "lab-b": {"active-baseline": 1, "converged": 40, "post-cleanup": 46},
       "lab-c": {"active-baseline": 3, "converged": 23, "post-cleanup": 27}
     },
-    "cause": "Every incomplete attempt is an outbound exchange left at outbound_request_prepared. The candidate deliberately records an outbound attempt as uncertain, without a terminal audit phase, when its request was fully sent and no reply byte came back. A resident at its incoming_workers limit of 1 accepts and drops a second concurrent connection without replying, and three replicas synchronizing with each peer every second collide continually. Audit events are immutable, so the count never returns to zero.",
+    "cause": "Every incomplete attempt is an outbound exchange left at outbound_request_prepared. The candidate deliberately records an outbound attempt as uncertain, without a terminal audit phase, when its request was fully sent and no reply byte came back. A resident at its incoming_workers limit of 1 accepts and drops a second concurrent connection without replying, and three replicas synchronizing with each peer every second collide continually. A worker that cannot open the store drops an accepted connection the same way, with no reply, no audit row and no rejected-connection increment. Audit events are immutable, so the count never returns to zero.",
+    "inherited_by_any_later_campaign_on_these_stores": true,
+    "inheritance_note": "incomplete_attempt_count is folded from every row ever written to exchange_audit_events, which is delete-proof and update-proof by SQLite trigger. An attempt is retired only by a later row carrying the same attempt identifier, and those identifiers are minted per process and exist only in its memory. The three residents have exited, so these counts are a permanent floor of these stores: a later campaign run against them starts here. Campaign 2's own active-baseline shows the same inheritance from campaign 1.",
     "evidence_or_gate_altered": false
   },
   "harness": {
