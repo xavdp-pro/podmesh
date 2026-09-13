@@ -131,10 +131,30 @@ listeners() {
   udp=$(awk 'NF {n++} END{print n+0}' <<<"$udp_raw")
   jq -cn --arg endpoint "$(commit_text endpoint "$endpoint")" --argjson tcp "$tcp" --argjson udp "$udp" '{status:"available-successful",endpoint_commitment:$endpoint,tcp_listener_count:$tcp,udp_listener_count:$udp}'
 }
+# Three states, not two. `null` means this capture did not inspect at all;
+# store_present:false means it inspected and there is no canonical store yet;
+# store_present:true means it inspected one. A fresh host is the ordinary starting
+# condition of a campaign, so its baseline must be sealable rather than fatal.
+#
+# Absence is PROVEN by looking for the file, never inferred from a failed inspection.
+# That distinction is the whole safety of this function: a corrupt store, an unreadable
+# one, a refused schema version, or a symlink where a database belongs must all stay
+# fatal. If absence were inferred from failure, any of those would be laundered into
+# "this host is fresh" and the baseline set would silently become empty — which is
+# exactly the fail-open the accounting predicate cannot survive.
 inspection() {
   [ "$with_inspection" -eq 1 ] || { printf '%s\n' null; return; }
-  local raw; raw=$(runuser -u podmesh-manager -- /usr/lib/podmesh-manager/podmesh-managerd --inspect-store --config /etc/podmesh-manager/config.json --state-dir /var/lib/podmesh-manager) || { echo 'Read-only canonical inspection failed' >&2; return 1; }
-  jq -ce --arg logical "$(commit_text logical-manager-id "$(jq -r .logical_manager_id <<<"$raw")")" --arg replica "$(commit_text replica-id "$(jq -r .replica_id <<<"$raw")")" '{schema_version,logical_manager_commitment:$logical,replica_commitment:$replica,logical_history_sha256,sqlite_integrity_result,history_count,receipt_count,audit_event_count,incomplete_attempt_count:(.incomplete_attempts|length)}' <<<"$raw"
+  local store=/var/lib/podmesh-manager/store.sqlite raw
+  if [ ! -e "$store" ] && [ ! -L "$store" ]; then
+    # The installed package creates the state directory; only the store itself is
+    # created on first run. A missing directory is therefore not a fresh host, it is a
+    # host that is not in the state this capture assumes, and it stays fatal.
+    [ -d /var/lib/podmesh-manager ] && [ ! -L /var/lib/podmesh-manager ] || { echo 'Manager state directory is absent or is not a directory' >&2; return 1; }
+    jq -cn '{store_present:false,schema_version:null,logical_manager_commitment:null,replica_commitment:null,logical_history_sha256:null,sqlite_integrity_result:null,history_count:null,receipt_count:null,audit_event_count:null,incomplete_attempt_count:null}'
+    return
+  fi
+  raw=$(runuser -u podmesh-manager -- /usr/lib/podmesh-manager/podmesh-managerd --inspect-store --config /etc/podmesh-manager/config.json --state-dir /var/lib/podmesh-manager) || { echo 'Read-only canonical inspection failed' >&2; return 1; }
+  jq -ce --arg logical "$(commit_text logical-manager-id "$(jq -r .logical_manager_id <<<"$raw")")" --arg replica "$(commit_text replica-id "$(jq -r .replica_id <<<"$raw")")" '{store_present:true,schema_version,logical_manager_commitment:$logical,replica_commitment:$replica,logical_history_sha256,sqlite_integrity_result,history_count,receipt_count,audit_event_count,incomplete_attempt_count:(.incomplete_attempts|length)}' <<<"$raw"
 }
 
 jq -e '.schema_version=="podmesh-manager-candidate-verification/v2" and .package=="podmesh-manager" and (.version|type=="string") and (.binary_sha256|test("^[a-f0-9]{64}$"))' "$report" >/dev/null || { echo 'Candidate verification report is invalid' >&2; exit 2; }

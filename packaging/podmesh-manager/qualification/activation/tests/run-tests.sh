@@ -68,8 +68,8 @@ def evidence(i,stage):
     peers=[{"replica_id_commitment":replicas[j],"endpoint_commitment":c(f"endpoint-{j}"),"shared_key_commitment":keys[tuple(sorted((i,j)))]} for j in range(3) if j!=i]
     limits={"network_mode":"authenticated-static-peers","address_families":["AF_UNIX","AF_INET"],"peer_allow_count":2,"peer_allow_prefix_length":32,"sha256":h("dropin")} if running else {"network_mode":None,"address_families":[],"peer_allow_count":0,"peer_allow_prefix_length":None}
     inspection=None
-    if stage=="active-baseline": inspection={"schema_version":3,"logical_manager_commitment":c("logical"),"replica_commitment":replicas[i],"logical_history_sha256":h(f"baseline-{i}"),"sqlite_integrity_result":"ok","history_count":0,"receipt_count":0,"audit_event_count":0,"incomplete_attempt_count":0}
-    if stage in ("converged","post-cleanup"): inspection={"schema_version":3,"logical_manager_commitment":c("logical"),"replica_commitment":replicas[i],"logical_history_sha256":h("history"),"sqlite_integrity_result":"ok","history_count":3,"receipt_count":3,"audit_event_count":9,"incomplete_attempt_count":0}
+    if stage=="active-baseline": inspection={"store_present":True,"schema_version":3,"logical_manager_commitment":c("logical"),"replica_commitment":replicas[i],"logical_history_sha256":h(f"baseline-{i}"),"sqlite_integrity_result":"ok","history_count":0,"receipt_count":0,"audit_event_count":0,"incomplete_attempt_count":0}
+    if stage in ("converged","post-cleanup"): inspection={"store_present":True,"schema_version":3,"logical_manager_commitment":c("logical"),"replica_commitment":replicas[i],"logical_history_sha256":h("history"),"sqlite_integrity_result":"ok","history_count":3,"receipt_count":3,"audit_event_count":9,"incomplete_attempt_count":0}
     return {"schema_version":"podmesh-manager-live-activation-evidence/v2","host_alias":aliases[i],"stage":stage,
       "package":{"name":"podmesh-manager","version":"0.1.0~manager2","binary_sha256":h("binary"),"dpkg_verify":"clean"},
       "configuration":{"document_commitment":c(f"config-{i}"),"logical_manager_commitment":c("logical"),"local_replica_commitment":replicas[i],"local_host_commitment":hosts[i],"topology_commitment":c("topology"),"peer_count":2,"peers":peers},
@@ -88,6 +88,11 @@ for i in range(3):
 PY
 
 sidecar() { sha256sum -- "$1" > "$1.sha256"; }
+# `jq -e` on an EMPTY file exits 0 without ever evaluating its filter. So an assertion made
+# against a report the comparator never wrote — because it crashed rather than refusing —
+# passes silently, and the suite reports success for a comparator that cannot produce a
+# verdict. Every assertion about a refusal report goes through this instead.
+report_says() { local path=$1 filter=$2 message=$3; [ -s "$path" ] || { echo "$message: the comparator produced no report at all, which is a crash and not a refusal" >&2; exit 1; }; jq -e "$filter" "$path" >/dev/null || { echo "$message" >&2; exit 1; }; }
 
 host_args=(--phase host --pre "$work/lab-a-pre-activation.json" --active-baseline "$work/lab-a-active-baseline.json" --converged "$work/lab-a-converged.json" --cleanup "$work/lab-a-post-cleanup.json")
 three_args=(--phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work"/*-converged.json --cleanup "$work"/*-post-cleanup.json)
@@ -112,7 +117,7 @@ reject_host 'socket wrong owner' '.paths.control_socket.uid=996' converged
 reject_host 'state owner changed' '.paths.state.uid=996' converged
 reject_host 'cleanup inspection regression' '.inspection.history_count=2'
 reject_host 'cleanup history mutation without count growth' '.inspection.logical_history_sha256="0000000000000000000000000000000000000000000000000000000000000000"'
-reject_error() { local label=$1 filter=$2 stage=$3 expected=$4; jq "$filter" "$work/lab-a-$stage.json" > "$work/bad.json"; sidecar "$work/bad.json"; local args=("${host_args[@]}"); case $stage in pre-activation) args[3]="$work/bad.json";; active-baseline) args[5]="$work/bad.json";; converged) args[7]="$work/bad.json";; post-cleanup) args[9]="$work/bad.json";; esac; if "$root/compare-evidence.py" "${args[@]}" > "$work/bad-report.json"; then echo "accepted $label" >&2; exit 1; fi; jq -e --arg e "$expected" '.status=="FAIL" and (.error|contains($e))' "$work/bad-report.json" >/dev/null || { echo "$label was refused for another reason: $(cat "$work/bad-report.json")" >&2; exit 1; }; }
+reject_error() { local label=$1 filter=$2 stage=$3 expected=$4; jq "$filter" "$work/lab-a-$stage.json" > "$work/bad.json"; sidecar "$work/bad.json"; local args=("${host_args[@]}"); case $stage in pre-activation) args[3]="$work/bad.json";; active-baseline) args[5]="$work/bad.json";; converged) args[7]="$work/bad.json";; post-cleanup) args[9]="$work/bad.json";; esac; if "$root/compare-evidence.py" "${args[@]}" > "$work/bad-report.json"; then echo "accepted $label" >&2; exit 1; fi; [ -s "$work/bad-report.json" ] || { echo "$label: the comparator produced no report at all, which is a crash and not a refusal" >&2; exit 1; }; jq -e --arg e "$expected" '.status=="FAIL" and (.error|contains($e))' "$work/bad-report.json" >/dev/null || { echo "$label was refused for another reason: $(cat "$work/bad-report.json")" >&2; exit 1; }; }
 reject_error 'active drop-in without validated hash' 'del(.dropin.semantic_limits.sha256)' active-baseline 'dropin.semantic_limits: unsafe shape'
 reject_error 'malformed validated drop-in hash' '.dropin.semantic_limits.sha256="not-a-sha256"' active-baseline 'dropin.semantic_limits.sha256: invalid SHA-256'
 reject_error 'validated drop-in hash unbound from installed drop-in' '.dropin.semantic_limits.sha256="0000000000000000000000000000000000000000000000000000000000000000"' active-baseline 'validated drop-in hash is not the installed drop-in hash'
@@ -134,7 +139,7 @@ reject_three 'non-reciprocal topology' '.configuration.peers[0].shared_key_commi
 jq '.listeners.endpoint_commitment="sha256:0000000000000000000000000000000000000000000000000000000000000000"' "$work/lab-a-active-baseline.json" > "$work/elsewhere-bound.json"
 sidecar "$work/elsewhere-bound.json"
 if "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work/elsewhere-bound.json" "$work/lab-b-active-baseline.json" "$work/lab-c-active-baseline.json" --converged "$work"/*-converged.json --cleanup "$work"/*-post-cleanup.json > "$work/elsewhere-bound-report.json"; then echo 'accepted a listener bound elsewhere than its advertised endpoint' >&2; exit 1; fi
-jq -e '.failures | index("peer endpoint does not bind the remote listener") != null' "$work/elsewhere-bound-report.json" >/dev/null
+report_says "$work/elsewhere-bound-report.json" '.status=="FAIL" and (.failures | index("peer endpoint does not bind the remote listener") != null)' 'a listener bound elsewhere did not produce a typed verdict'
 # A sidecar binds a digest to a file name: the directory it was written in is the producing host's, and the
 # evidence must stay verifiable byte-for-byte once copied beside its comparator, so a foreign directory with the
 # same file name is accepted and a different file name is refused.
@@ -145,9 +150,40 @@ args=("${host_args[@]}"); args[9]="$work/elsewhere/lab-a-post-cleanup.json"
 jq -e '.status=="PASS"' "$work/relocated.json" >/dev/null
 printf '%s  %s\n' "$(sha256sum "$work/elsewhere/lab-a-post-cleanup.json" | awk '{print $1}')" "/another/host/directory/lab-b-post-cleanup.json" > "$work/elsewhere/lab-a-post-cleanup.json.sha256"
 if "$root/compare-evidence.py" "${args[@]}" > "$work/misnamed-sidecar.json"; then echo 'accepted a sidecar naming another file' >&2; exit 1; fi
-jq -e '.status=="FAIL" and (.error|contains("invalid evidence checksum sidecar"))' "$work/misnamed-sidecar.json" >/dev/null
+report_says "$work/misnamed-sidecar.json" '.status=="FAIL" and (.error|contains("invalid evidence checksum sidecar"))' 'a misnamed sidecar did not produce a typed verdict'
 jq '.inspection.logical_history_sha256="0000000000000000000000000000000000000000000000000000000000000000" | .inspection.history_count=4' "$work/lab-a-post-cleanup.json" > "$work/bad-cleanup.json"
 sidecar "$work/bad-cleanup.json"
 if "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work"/*-converged.json --cleanup "$work/bad-cleanup.json" "$work/lab-b-post-cleanup.json" "$work/lab-c-post-cleanup.json" >/dev/null; then echo 'accepted divergent post-cleanup history' >&2; exit 1; fi
 
-printf '%s\n' 'PASS: four-stage activation evidence, effective policy, ownership, graceful cleanup, infrastructure stability and converged history boundaries.'
+# A fresh host has no canonical store, and a baseline capture must be able to SEAL that
+# fact rather than die on it — otherwise the fresh-store campaign this evidence exists to
+# serve cannot produce a baseline at all. Three states are typed and all three are tested:
+# not inspected (null), inspected and absent, inspected and present. The negatives below
+# exist because "absent" must not become a way to smuggle a capture past validation.
+absent='{"store_present":false,"schema_version":null,"logical_manager_commitment":null,"replica_commitment":null,"logical_history_sha256":null,"sqlite_integrity_result":null,"history_count":null,"receipt_count":null,"audit_event_count":null,"incomplete_attempt_count":null}'
+zero='0000000000000000000000000000000000000000000000000000000000000000'
+jq ".inspection=$absent" "$work/lab-a-pre-activation.json" > "$work/fresh-pre.json"
+sidecar "$work/fresh-pre.json"
+args=("${host_args[@]}"); args[3]="$work/fresh-pre.json"
+"$root/compare-evidence.py" "${args[@]}" > "$work/fresh-baseline.json"
+jq -e '.status=="PASS"' "$work/fresh-baseline.json" >/dev/null || { echo 'refused a legitimate fresh-host baseline' >&2; exit 1; }
+reject_error 'absent store carrying a history digest' ".inspection=$absent | .inspection.logical_history_sha256=\"$zero\"" pre-activation 'absent store carries derived inspection fields'
+reject_error 'absent store carrying a count' ".inspection=$absent | .inspection.incomplete_attempt_count=0" pre-activation 'absent store carries derived inspection fields'
+reject_error 'present store missing a derived field' '.inspection.history_count=null' active-baseline 'present store is missing derived inspection fields'
+reject_error 'inspection without the store_present discriminator' 'del(.inspection.store_present)' active-baseline 'unsafe shape'
+reject_error 'non-boolean store_present' '.inspection.store_present="false"' active-baseline 'store_present: must be a boolean'
+# The regression this one guards: with the old evaluation order, a converged capture
+# reporting an absent store reached `None >= 3` and raised a TypeError. A crash is not a
+# refusal — it produces no verdict and no failure list.
+#
+# ALL THREE converged captures must report absence for this to bite, and that is not a
+# detail. With only one absent, the three history digests are {None, h, h}, the set has
+# two members, the chain short-circuits on divergence and never reaches the comparison —
+# so a one-host version of this test passes against the crashing comparator and proves
+# nothing. It was written that way first. With all three absent the set is {None}, size
+# one, and evaluation walks straight into the null comparison.
+for hostname in lab-a lab-b lab-c; do jq ".inspection=$absent" "$work/$hostname-converged.json" > "$work/$hostname-nostore.json"; sidecar "$work/$hostname-nostore.json"; done
+if "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work"/*-nostore.json --cleanup "$work"/*-post-cleanup.json > "$work/nostore-report.json"; then echo 'accepted converged captures reporting no canonical store' >&2; exit 1; fi
+report_says "$work/nostore-report.json" '.status=="FAIL" and (.failures | index("converged captures do not prove one complete logical history of at least three events") != null)' 'absent converged stores did not produce a typed verdict'
+
+printf '%s\n' 'PASS: four-stage activation evidence, effective policy, ownership, graceful cleanup, infrastructure stability, converged history boundaries and typed fresh-store absence.'

@@ -1,7 +1,19 @@
 # G2 evidence schema v3 — publishing what the accounting predicate needs
 
-Status: **design, not implemented.** Nothing here changes a collector, a comparator or
-a captured file. Lot `codex/g2-accounted-attempts`, work item 2.
+Status: **design, landing incrementally.** Lot `codex/g2-accounted-attempts`, work item 2
+(this document) and work item 3 (typed fresh-store absence, now in the collector, the
+comparator and the tests). The rest — the `incomplete_attempts` list, the `exchanges`
+object and the fail-closed join — is still design and changes no captured file.
+
+**On the version numbers, which are deliberately not bumped yet.** The constraint below
+is that collector, comparator, fixtures and schema version move together and are re-sealed
+together. They are, but the seal happens **once, when the lot closes**, not on each
+intermediate commit: bumping the public evidence string to `/v3` now would advertise a v3
+that lacks `exchanges` and would need a v4 a week later for the same lot. So the wire
+strings stay at their current values while the lot is open, and the inspection object
+grows on the branch under matched collector-and-comparator commits. Nothing sealed by a
+past campaign is read by this comparator; preserved evidence is re-derived by re-running
+the collector against preserved store copies, which is work item 6.
 
 Date: 2026-09-13. Authority: `/tmp/podmesh-claude/DECISIONS-CODEX-2026-09-13.md`,
 Decision 1. Predicate: [MANAGER-HA-ACCEPTANCE.md](MANAGER-HA-ACCEPTANCE.md), "The G2
@@ -28,6 +40,37 @@ keys. In doing so it folds `incomplete_attempts` — a vector of structs each ca
 The amended predicate is therefore not merely unmet — it cannot be computed from what a
 campaign seals. This is a collector and schema change first, and a comparator change
 second.
+
+## The frozen candidate already emits everything this needs
+
+**No new candidate binary is required, and that was not obvious.** The campaign's whole
+evidence chain is pinned to candidate source `ff77b1f`, its binary digest and its package
+digest, and `capture-host.sh` refuses to run against anything else. If v4 had needed a
+field the candidate does not produce, the lot would have meant a new build, a new
+verification and a reinstall on three hosts — a requalification rather than a work item.
+
+It does not. `CanonicalStoreInspection` (`durable.rs:302-321`) already declares
+`ordered_receipts`, `receipt_set_sha256`, `ordered_audit_events`, `audit_set_sha256`,
+`incomplete_attempts` and `unaudited_import_receipt_ids` as public fields; it derives
+plain `Serialize` with no `skip` attribute anywhere; and `--inspect-store` serializes the
+whole struct (`main.rs:32`). Every field the amended predicate needs is on the frozen
+candidate's stdout today and is thrown away by one projection in the collector
+(`capture-host.sh:137`). **v4 is a collector and comparator change, start to finish.**
+
+### Correction: `immutable_schema_verified` cannot be published
+
+The schema below listed `"immutable_schema_verified": true` as a new field, annotated
+*"`durable.rs:2628` runs it, nothing published it"*. That was the right observation and
+the wrong conclusion. The candidate runs `verify_immutable_schema` at that line and
+returns an error when it fails — it never exposes the result as a value. A collector
+emitting a hard-coded `true` would not be publishing an observation; it would be
+publishing an assertion dressed as one, which is the same defect as a signature anchored
+in nothing.
+
+What is actually true is weaker and sufficient: **a successful inspection entails that
+the check passed**, because a failed check makes the inspection fail. So the field is
+dropped. The comparator relies on inspection success, which it already requires, and the
+evidence claims nothing it did not observe.
 
 ## The one mechanism that already works
 
@@ -80,7 +123,7 @@ Inspection `schema_version` moves 3 → **4**; evidence
   "receipt_set_sha256": "…",                // new — durable.rs:314, already a digest
   "audit_set_sha256": "…",                  // new — durable.rs:317, already a digest
   "sqlite_integrity_result": "ok",
-  "immutable_schema_verified": true,        // new — durable.rs:2628 runs it, nothing published it
+  // immutable_schema_verified was here and is dropped; see the correction above.
   "history_count": 9,
   "receipt_count": 15,
   "audit_event_count": 3303,
@@ -146,7 +189,7 @@ plus a guessed body is a confirmation oracle.
 | 4 | `unaudited_import_receipt_count == 0` on every host, with the commitments published so a non-zero case names which |
 | 5 | the receiver's row reaches `inbound_reply_write_observed` with `reply_frame_bytes > 0`, **and** the sender's attempt is still `outbound_request_prepared` — the honest retention the contract requires |
 | 6 | a later `exchanges` row with the same `operation_commitment` and `replayed: true`, **or** the imported fact present in the converged history on all three replicas |
-| 7 | `sqlite_integrity_result`, `immutable_schema_verified`, and the two set digests agreeing across replicas |
+| 7 | `sqlite_integrity_result`, the inspection having succeeded at all — which is what entails the immutable-schema check — and the two set digests agreeing across replicas |
 | 8 | the attempt is still in `incomplete_attempts` at post-cleanup — visible, not silently retired |
 
 ## What the comparator must gain

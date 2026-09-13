@@ -41,10 +41,24 @@ def read(path):
     string(value["host_alias"], f"{path}.host_alias")
     return value
 
+DERIVED=("schema_version","logical_manager_commitment","replica_commitment","logical_history_sha256","sqlite_integrity_result","history_count","receipt_count","audit_event_count","incomplete_attempt_count")
+
 def validate_inspection(v, label):
+    # Three states the collector can seal, and each is checked in full:
+    #   None                  this capture did not inspect
+    #   store_present false   it inspected and found no canonical store (a fresh host)
+    #   store_present true    it inspected one
+    # The absent case is not a shortcut past validation. Every derived field must be
+    # exactly null: a capture claiming a fresh host while carrying a history digest, a
+    # count or a commitment is refused, because that combination cannot be produced by
+    # an honest collector and is precisely how an absent baseline would be forged.
     if v is None: return
-    fields=("schema_version","logical_manager_commitment","replica_commitment","logical_history_sha256","sqlite_integrity_result","history_count","receipt_count","audit_event_count","incomplete_attempt_count")
-    obj(v,label,fields)
+    obj(v,label,("store_present",)+DERIVED)
+    if not isinstance(v["store_present"], bool): raise ValueError(f"{label}.store_present: must be a boolean")
+    if not v["store_present"]:
+        if any(v[f] is not None for f in DERIVED): raise ValueError(f"{label}: absent store carries derived inspection fields")
+        return
+    if any(v[f] is None for f in DERIVED): raise ValueError(f"{label}: present store is missing derived inspection fields")
     if v["schema_version"] != 3 or v["sqlite_integrity_result"] != "ok": raise ValueError(f"{label}: invalid read-only inspection")
     commit(v["logical_manager_commitment"],label); commit(v["replica_commitment"],label); sha(v["logical_history_sha256"],label)
     for f in ("history_count","receipt_count","audit_event_count","incomplete_attempt_count"): integer(v[f],f"{label}.{f}")
@@ -110,8 +124,12 @@ def validate(v,label):
     if v["graceful_shutdown"] is not None and v["graceful_shutdown"] != SHUTDOWN: raise ValueError(f"{label}.graceful_shutdown: invalid exact typed-shutdown proof")
 
 def inspection_bound(v):
+    # store_present is checked here rather than left to fall out of a None comparison,
+    # because every caller uses this as the gate before reading a derived field. An
+    # absent store is a legitimate baseline but it is never a bound inspection: there
+    # is no store for a commitment to bind to.
     i=v["inspection"]; c=v["configuration"]
-    return i is not None and i["logical_manager_commitment"]==c["logical_manager_commitment"] and i["replica_commitment"]==c["local_replica_commitment"]
+    return i is not None and i["store_present"] and i["logical_manager_commitment"]==c["logical_manager_commitment"] and i["replica_commitment"]==c["local_replica_commitment"]
 def same_state_metadata(a,b): return all(a[f]==b[f] for f in ("present","uid","gid","mode"))
 
 def host_failures(pre,base,conv,cleanup):
@@ -173,8 +191,14 @@ def three_host_failures(pres,bases,convs,cleanups):
             elif peer["endpoint_commitment"]!=remote["listeners"]["endpoint_commitment"]: failures.append("peer endpoint does not bind the remote listener")
     inspections=[x["inspection"] for x in convs]
     final_inspections=[x["inspection"] for x in cleanups]
-    live_convergence=all(i is not None for i in inspections) and len({i["logical_history_sha256"] for i in inspections})==1 and all(i["history_count"]>=3 and i["incomplete_attempt_count"]==0 for i in inspections) and all(inspection_bound(x) for x in convs)
-    final_convergence=all(i is not None for i in final_inspections) and len({i["logical_history_sha256"] for i in final_inspections})==1 and all(i["history_count"]>=3 and i["incomplete_attempt_count"]==0 for i in final_inspections) and all(inspection_bound(x) for x in cleanups)
+    # inspection_bound comes FIRST in each chain, and the order is load-bearing rather
+    # than stylistic. It subsumes "not None" and "store_present", so nothing downstream
+    # can compare a null history digest or a null count. With the old ordering, a
+    # converged capture reporting an absent store would have reached `None >= 3` and
+    # raised a TypeError — a crash instead of a verdict, which is not fail-closed. An
+    # absent store at converged or post-cleanup is simply a failure, and is reported.
+    live_convergence=all(inspection_bound(x) for x in convs) and len({i["logical_history_sha256"] for i in inspections})==1 and all(i["history_count"]>=3 and i["incomplete_attempt_count"]==0 for i in inspections)
+    final_convergence=all(inspection_bound(x) for x in cleanups) and len({i["logical_history_sha256"] for i in final_inspections})==1 and all(i["history_count"]>=3 and i["incomplete_attempt_count"]==0 for i in final_inspections)
     convergence=live_convergence and final_convergence
     if not live_convergence: failures.append("converged captures do not prove one complete logical history of at least three events")
     if not final_convergence: failures.append("post-cleanup captures do not retain one complete logical history")
