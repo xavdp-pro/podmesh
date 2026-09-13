@@ -1,15 +1,22 @@
 # PodMesh Backup Server
 
-Status: design direction, revised after independent counter-review; not implemented,
-not validated. Nothing here is qualified.
+> **Intent Classification**: GENERIC INTENT (Rule 0B — a reusable service blueprint, not
+> one client's universe)
+> **Perimeter**: P1 (Rule 0A — it holds encryption keys, signing authority and every
+> universe's data, so it is classified before design, not after)
 
-Revision 2, 2026-09-13. The first revision was counter-reviewed by OpenAI Codex
+Status: design direction, revised twice after independent counter-review; not
+implemented, not validated. Nothing here is qualified.
+
+Revision 3, 2026-09-14. Revision 1 was counter-reviewed by OpenAI Codex
 (`/tmp/podmesh-claude/REVIEW-BACKUP-SERVER-CODEX-2026-09-13.md`, verdict OPEN with six
 blocking findings). This revision answers BBS-R1 to BBS-R6 and folds BBS-R7 to BBS-R12
 into the manifest, state and test contract. Three of the blocking findings were errors
-of mine and are named as such where they are corrected. **Four decisions remain the
-operator's and are listed at the end; B1's public contract must not be frozen until
-they are taken.**
+of mine and are named as such where they are corrected. A second, fresh review then
+returned NO-GO on that revision with six more; those are answered here too, and one of
+them was serious enough to be recorded at the end of this document rather than quietly
+fixed. **Five decisions remain the operator's and are listed at the end. None of them
+blocks B1: the interim it uses meanwhile is stated with them.**
 
 ## Purpose
 
@@ -26,18 +33,27 @@ the reviewer's, and it is the one this revision is built around.
 
 ## What the canon already decides
 
-Two rules of `SHAPER-OS-V1.14/software/RULES.md` bind this service. They are not
-re-decided here; several were written after real incidents.
+Seven rules of `SHAPER-OS-V1.14/software/RULES.md` bind this service — 16, 12, 20, 10,
+11, 31 and 30 — besides the classification rules in the header. They are not re-decided
+here; several were written after real incidents.
 
 **Rule 16 — the five levels.** Container, volumes, database, git, off-site. "This set
 is enough. Missing a level is a hole."
 
 - Level 2 is the **volumes, not the overlay**. `nosav/`, caches, image layers and
   `node_modules` are excluded. `app/` is code in git and is *not* a substitute for a
-  volume backup.
-- Level 3 is a **real dump**, not a live volume tar.
+  volume backup (that clause is Rule 4, `RULES.md:399`, not Rule 16).
+- Level 3 is a **real dump**, not a live volume tar — and it is the relational dump
+  **plus the Qdrant snapshot** (`RULES.md:842`). Omitting the vector collection is a
+  hole by this rule's own words, and it also breaks erasure: a service that never
+  captures the collection cannot honour an erasure over it.
 - Level 4 is git, and **git is never treated as a data backup**.
 - Level 5 is the off-site copy of levels 2 and 3, and optionally 1.
+- Level 1 is a **host snapshot of the enclosing LXC**, and it therefore necessarily
+  contains the Podman image store. That does not contradict "images are never backed
+  up": level 1 is a machine-recovery net taken by the hypervisor or the host's storage,
+  not a universe recovery point produced by this service. This service never places an
+  image layer in a recovery point it builds.
 
 **Rule 12 — archive hygiene.** Every clause is a failure mode this service must make
 impossible rather than merely avoid: the key never travels with the coffer; the
@@ -48,8 +64,12 @@ failure; a failure after the archive completes keeps the archive; a failed dump 
 nothing behind (`.part` then rename); `.env` is excluded in every spelling; and how the
 tool is called is proven with a recorder on a PATH built from scratch.
 
-Rule 12 **also governs transport**, and that is where this design collided with the
-canon — see D6 and Decision X3.
+Rule 12 **also governs transport**, but only within a scope this service mostly falls
+outside: `RULES.md:753` binds "all archive transfers (`PROJECT.tar.bz2`,
+`REMOTE.tar.bz2`)" and `RULES.md:848` widens that to "any `tar.bz2` that leaves the
+host". A content-addressed chunk pull is neither. Where a `tar.bz2` does leave a host —
+B2's volume archives — the clause applies in full. See Decision X3, which revision 3
+mis-read as a collision when it is a gap.
 
 Rule 20's closed-loop quality gate applies: the delivered interaction is exercised, not
 simulated.
@@ -71,8 +91,8 @@ message or anything a client reads. We promise the method, never the stopwatch.
 **Rule 11 — images are never backed up**, and the universe is the backup unit. See the
 pieces table below; this one changed the design.
 
-**Rule 31 — the universe declares its own data lifecycle**, and erasure is fractal. See
-its own section; this one is missing from the design entirely and is Decision X5.
+**Rule 31 — the universe declares its own data lifecycle**, and erasure is fractal. It
+was absent from revisions 1 and 2 entirely; see its own section, and Decision X5.
 
 **Rule 30 — the Backup Server has a named caller.** Before any data-bearing change, a
 **full snapshot taken immediately before it**, never a nightly backup "close enough";
@@ -109,8 +129,8 @@ pieces that are only meaningful together:
 | --- | --- | --- |
 | Universe identity and its PodMesh journal facts | — | UUID, creation operation, ownership |
 | Container configuration | — | command, labels, network, mounts, resources |
-| Persistent volumes | 2 | volumes only, `nosav/` and `.env*` excluded |
-| Database dumps | 3 | per Rule 12's dump laws |
+| Persistent volumes | 2 | volumes only; `nosav/` excluded, and `.env` in **every** spelling — `.env*`, `*.env`, **and `deploy/env`**, whose basename matches neither glob |
+| Database dumps **and the Qdrant snapshot** | 3 | per Rule 12's dump laws; the vector collection is part of level 3 |
 | Memory checkpoint | — | optional, only where the runtime permits |
 | Image **identity** — the digest and the lock, never the layers | **none** | a *recovery dependency*; the canon forbids carrying the content — see below |
 
@@ -136,8 +156,29 @@ commit or pulled by its locked digest is a **reproducibility defect that must su
 and the manifest's job is to make it visible — not to paper over it with a copy.
 
 The same rule fixes the unit: the **universe** is what can be snapshotted, exported and
-restored as one thing (`RULES.md:569-571`). A brick is an application container built
+restored as one thing (`RULES.md:568-570`). A brick is an application container built
 from an immutable image, and is not a backup unit.
+
+**The word means two things, and this document must not equivocate.** In the Shaper OS
+canon a *universe* is the **LXC system container** — its own init, its own package set,
+its own nftables. In PodMesh today a *universe* is a **Podman container** with a UUID
+(`DELIVERY-CHECKLIST.md:40-44`). Read naively, the sentence above would say PodMesh has
+no backup units at all, which is not what Rule 11 means and not what this service is for.
+
+The reconciliation: **Rule 11's unit is the unit of a *complete* recovery point.** A
+PodMesh universe is a *piece* — the largest piece PodMesh itself can currently produce,
+and the right subject for B1's transport fixture, but not a whole machine. Rule 16's
+level 1 exists precisely to cover the LXC that PodMesh cannot. So:
+
+- **B1 captures a PodMesh universe**, i.e. a Podman container: its configuration, its
+  image lock, and its filesystem export. It is a transport fixture and is explicitly not
+  Rule 16 coverage.
+- **A complete recovery point in the canon's sense** additionally requires the level 1
+  snapshot of the enclosing LXC, which is a hypervisor or host-storage operation and is
+  scheduled last for that reason.
+
+Wherever this document says "universe" without qualification below, it means the PodMesh
+one.
 
 And restoration is not finished when the bytes are back: Rule 11 ends it with the
 universe's own `deploy/proof.sh` — *"a restore nobody proved is a claim"*.
@@ -172,6 +213,41 @@ to one recovery-point UUID, one capture generation, its own start and end time, 
 source identity and the snapshot boundary. **A piece that changed during capture makes
 the recovery point a failure, not a recovery point of a lower class.** A restore never
 silently upgrades a class.
+
+## Capture adapters and consistency
+
+*Restored from commit `0cc7dd5`, which revision 3 deleted by accident — see the note at
+the end of this document. This section is what actually produces the classes above: the
+class a capture may claim is a property of the adapter that took it.*
+
+PodMesh Backup Server selects a capture adapter from observed storage capabilities; it
+does not require LVM2, ZFS or Btrfs to install or operate.
+
+- **LVM thin:** quiesce, take the logical-volume snapshot, release the live universe,
+  and read the snapshot for transfer.
+- **ZFS:** quiesce, take a dataset snapshot, release the universe, and use the immutable
+  snapshot as the source for full or qualified incremental send.
+- **Btrfs:** quiesce, take read-only subvolume snapshots, release the universe, and use
+  them for full or qualified incremental send. Nested subvolumes require explicit
+  enumeration because the parent snapshot is not recursively complete.
+- **Ordinary filesystem:** stop the generic universe for the duration of the archive.
+  A shorter freeze is allowed only under a declared application-specific quiesce or
+  database-dump contract. **Podman process pause alone is not evidence of a coherent
+  application and volume recovery point.**
+
+In all cases, the local snapshot or archive staging area is **disposable capture
+material**. Only a transferred, authenticated, catalogued and independently restorable
+recovery point is a backup.
+
+The three snapshot adapters are the mechanisms that can yield `crash-consistent`; the
+ordinary-filesystem adapter with a stopped universe yields it too, at the cost of the
+stop. Nothing else in this design produces that class, which is why B0 comes first.
+
+**The price of the pull model, stated.** Every host materialises a complete sealed local
+recovery point on every capture — storage for the staging area, and a full re-read of
+the source, since content addressing gives incrementality only in what is *transferred*,
+never in what is read. That cost is why the adapter matters and why B0 measures capacity
+behaviour rather than only correctness.
 
 ## Decisions
 
@@ -211,17 +287,35 @@ class, a broken key, a different namespace or only a shallow test. A replacement
 authorise removal only when it **covers every protected level of the candidate with the
 same or stronger declared consistency and policy class**, and has passed ciphertext
 verification, key-recovery proof and its declared restore verification. Policy minimum
-counts and time buckets survive replacement proof. `evidence_hold` and
-`investigation_hold` apply with exactly the scopes already decided for the migration
-collector. A **generation and lease barrier** prevents mark-and-sweep from removing a
+counts and time buckets survive replacement proof. `evidence_hold` and `investigation_hold` are
+adopted **by name and by principle** from the migration collector, and their scopes are
+re-derived here rather than transposed: the collector's scopes are defined over its own
+three effects, and there is no backup analogue of its history-preserving reservation
+transition — which is precisely the effect `evidence_hold` does *not* block. B4 states
+the mapping over this service's effects: chunk sweep, manifest retirement and off-site
+deletion. Two of the collector's clauses carry over unchanged: **an unknown hold is a
+hold**, and an implementation that does not implement holds says so and claims neither
+behaviour. A **generation and lease barrier** prevents mark-and-sweep from removing a
 chunk referenced by an in-flight upload, verification, restore or concurrently
 published manifest. The removal decision, the manifest and the chunk-set digest are
 retained permanently. Age selects; proof removes.
 
 **D5 — a restore is proven periodically, from outside.** A backup job that reported
-success is not evidence. The service restores to a scratch target on a schedule and
-verifies from outside the restorer. Measured recovery time and measured data-loss
-bounds are outputs of that test, not estimates.
+success is not evidence. *Corrected: revision 3 said "the service restores", which D6
+and the portability section forbid — the Backup Server has neither the runtime nor the
+authority to restore anything on a host.* What actually happens: the Backup Server
+**requests** a restore verification through the same typed Maker operation that performs
+any restore, on a scratch target, and then **verifies the evidence from outside the
+restorer**. It commands nothing and it trusts nothing it did not check. Measured
+recovery time and measured data-loss bounds are outputs of that test, recorded as
+operational observations under Rule 10's exception, never as figures in this document.
+
+**Who triggers a capture** is the same question and has the same answer: not the Backup
+Server, which holds no authority on a host. A scheduler on the protected side requests a
+typed capture-preparation operation, the host's Maker executes or refuses it, and the
+Backup Server discovers a new sealed point when it next pulls. The scheduler's placement
+and authority are part of the lot that introduces scheduling, not B1 — B1's captures are
+requested by hand.
 
 **D6 — the host surface is a sealed local recovery point, not a read-only peephole.**
 *Corrected (BBS-R3).* Revision 1 said the server "reads through a narrow read-only
@@ -286,6 +380,28 @@ the consistency class with its quiesce evidence and boundary times; per-level
 completeness states; the producing software versions and the minimum restore-tool
 version; declared exclusions; verification history; and hold state.
 
+### Who signs it, and what a verifier checks
+
+*Missing from revision 3, which called the manifest "authenticated" and "signed" without
+ever naming a signer — a root of trust anchored in nothing.*
+
+The manifest is signed by the **Maker that sealed it**, on the host that produced it,
+with a signing key held in that host's own vault. Rule 36 (`RULES.md:1117`, `:1126`)
+forbids the convenient alternative: a private key never leaves its level, so there is no
+fleet-wide signing key and the Backup Server does not sign what it did not produce. The
+manifest therefore binds a **producer identity commitment** and the signature over the
+canonical serialization of every other field.
+
+A verifier — the Backup Server on receipt, and the recovery tool on restore — checks the
+signature against the **public** key of that producer as declared in the topology it was
+given, never against a key learned from the manifest itself. Public keys of retired
+producers are retained, because a manifest signed years ago must stay verifiable after
+its signer is gone. Rotation publishes a new public key and re-signs nothing:
+re-signing a manifest would rewrite history, and the immutability rule forbids it.
+
+Key generation, custody, rotation and revocation for **signing** join key escrow for
+**encryption** under Decision X2.
+
 Two consequences that are requirements, not remarks:
 
 - **The datastore must rebuild its index from manifests and chunks alone.** Losing its
@@ -303,13 +419,27 @@ reference it from a later catalogue checkpoint.
 *(BBS-R12.)* Per piece and for the recovery point as a whole:
 
 `preparing` → `sealed` → `transfer_incomplete` → `stored_unverified` → `verified` →
-`restore_verified`, with `held` and `retired` as orthogonal terminal conditions.
+`restore_verified`, plus **`failed`** as a terminal outcome reachable from any of them,
+and `held` and `retired` as orthogonal conditions.
 
-A recovery point becomes eligible for an ordinary restore only once its required pieces
-are `sealed` and its manifest is committed. **A partial set is never promoted because
-some chunks survived.** Rule 12's clause applies in full: a failure after the archive is
-complete keeps the archive, and a housekeeping step that cannot run is a reported
-failure over a surviving archive.
+*Two corrections to revision 3, which copied this list from the counter-review and
+inherited its errors.* There was **no failure state at all**, although the consistency
+section requires that a piece changing during capture makes the point *a failure*, the
+capture contract requires an abort-and-thaw path *whose failure is recorded*, and B1
+step 10 tests four interrupted operations. A contract that types outcomes must be able
+to name the bad one. And `held` was called terminal; a hold is by definition lifted, so
+it is orthogonal, like `retired` is not.
+
+**A recovery point becomes eligible for an ordinary restore only once it is `verified`
+on the datastore** — not once it is `sealed`. Revision 3 said `sealed`, which is the
+pre-transfer state: the point exists only on the source host, the Backup Server has
+never seen it, and calling it restorable contradicts the pull model, D5, and this
+document's own first principle that only a transferred, authenticated, catalogued and
+independently restorable point is a backup. A `sealed` point is capture material.
+
+**A partial set is never promoted because some chunks survived.** Rule 12's clause
+applies in full: a failure after the archive is complete keeps the archive, and a
+housekeeping step that cannot run is a reported failure over a surviving archive.
 
 ## Data lifecycle and erasure — and the conflict it creates
 
@@ -444,6 +574,28 @@ ShaperOS deployment is the operator's preference for internal use and must never
 a hard dependency. The same backup and restore contracts apply in every mode, and each
 mode is validated separately: host installation does not prove container operation.
 
+### Storage preferences, as hypotheses
+
+*Also restored from commit `0cc7dd5`.* For PodMesh Backup Server deployments, prefer
+dedicated snapshot-capable storage qualified by PodMesh. **Btrfs** is the provisional
+default candidate for general PodMesh hosts, because it is part of Linux and combines
+subvolumes, snapshots, reflink clones and incremental send/receive. **ZFS** is the
+provisional candidate for a dedicated backup datastore, where end-to-end checksums,
+scrubs, hierarchy replication and raw encrypted send matter more than minimal host
+integration. **LVM2 thin** remains an important compatibility backend. These preferences
+are **hypotheses until the sequential lab comparison of B0 records equivalent restore
+evidence**, and nothing may be built as though they were settled.
+
+With a qualified snapshot backend, PodMesh quiesces the protected universe, creates an
+immutable local capture and **releases the universe before the longer transfer begins**.
+Installation on an ordinary root filesystem remains supported, but the generic capture
+keeps the protected universe stopped while its filesystem archive is created. A declared
+application-specific consistency adapter may shorten that interruption. A process freeze
+alone does not prove that buffered application data, databases and external volumes form
+one coherent recovery point. **Installation preflight must report the selected capture
+class and the expected interruption before a backup schedule may be enabled** — and
+"expected interruption" is a class, not a number (Rule 10).
+
 Targets: a physical server, a virtual machine or VPS, a container, a ShaperOS universe,
 and a PodMesh node. **The storage server does not require Podman or CRIU locally** —
 receiving and retaining sealed chunks needs neither. Host-side capture preparation does
@@ -456,10 +608,18 @@ The normal standalone version is built first. Everything else is an integration 
 
 Deliberately small, and shaped by the reviewer:
 
-1. one stopped, mount-free, network-disabled Alpine universe;
+1. one stopped, mount-free, network-disabled Alpine **PodMesh universe** — a Podman
+   container with its UUID, on a Debian 13 lab host, captured through the
+   **ordinary-filesystem adapter** with the universe stopped for the duration. No
+   snapshot backend is required, which is why B1 does not wait for B0. **B1 must work
+   through the portable archive fallback; where B0 has qualified a snapshot adapter, the
+   same round trip is repeated from its frozen local capture** — one lot, two sources,
+   the same proof;
 2. one authorized Maker operation seals its configuration and filesystem fixture;
 3. one versioned signed manifest and a content-addressed encrypted chunk set;
-4. the Backup Server pulls through the transport chosen in Decision X3;
+4. the Backup Server pulls, outbound only, over an authenticated Rule 13 private-mesh
+   connection — no `tar.bz2` leaves a host in B1, so Rule 12's transport clause is not
+   engaged and every other clause of Rule 12 is (X3 records the amendment still owed);
 5. the source universe is removed only after the backup is safely stored;
 6. restore creates a **quarantined new-identity** copy on another host;
 7. external observation verifies files, configuration and application behaviour;
@@ -478,9 +638,22 @@ distributions, ShaperOS integration, or Backup Server high availability. A stopp
 mount-free filesystem export is a **transport fixture**; it is not Rule 16 level 2 and
 must not be counted as Rule 16 coverage.
 
-## Delivery order after B1
+## Delivery order: B0 before B1, then B2 onward
 
-B2 volumes (level 2, with the `nosav/` and `.env*` exclusions). B3 databases (level 3
+**B0 — qualify local capture backends.** *(Restored from `0cc7dd5`.)* Run the authorized
+sequential 60 GB lab comparison in [LVM-LAB-PLAN.md](LVM-LAB-PLAN.md): LVM2/thin, ZFS,
+then Btrfs. For each backend, prove quiesce, snapshot, immediate release of the live
+universe, transfer from the snapshot, restore on another host, failure handling and
+capacity behaviour. Also prove the ordinary-filesystem fallback with a stopped universe.
+This establishes the capture adapters the later lots use; **it does not make a local
+snapshot an independent backup.**
+
+B0 is `DELIVERY-CHECKLIST.md` §4 and it comes before §5. B1 does not depend on it — a
+stopped, mount-free fixture needs no snapshot backend — so the two may proceed in
+parallel, but B2 onward do depend on it.
+
+Then B2 volumes (level 2, with the `nosav/` exclusion and the `.env` exclusion in every
+spelling, including `deploy/env`). B3 databases **and the Qdrant snapshot** (level 3
 under Rule 12's dump laws). B4 retention, holds and sweep with the lease barrier. B5
 off-site (level 5), once Decision X4's credentials exist. B6 memory-coherent points,
 where the runtime permits, reusing the migration chain's checkpoint machinery and its
@@ -489,47 +662,103 @@ container/VM snapshot where a hypervisor provides it.
 
 ## Decisions that remain the operator's
 
-B1's public contract must not be frozen until these four are taken. Each is stated with
-what it costs, because none of them has a free answer.
+**None of these blocks B1** — see the interim below. Each is stated with what it costs,
+because none has a free answer.
 
-**X1 — the deduplication and encryption domain.** Three shapes:
+**X1 — the deduplication and encryption domain.** Four shapes, not three:
 
-| Shape | Dedup reach | Leakage | Blast radius of one compromised host |
-| --- | --- | --- | --- |
-| Randomized AEAD, one key per universe | none across universes | none | that universe only |
-| Randomized AEAD, one key per declared domain | full within the domain | index reveals which universes share a chunk | the whole domain |
-| Convergent encryption within a domain | full within the domain | plaintext **equality** leaks; confirmation-of-content attacks become possible for anyone holding the index and a candidate file | the whole domain |
+| Shape | Dedup reach | Leakage | Per-universe crypto-erasure | Blast radius of one compromised host |
+| --- | --- | --- | --- | --- |
+| Randomized AEAD, one key per universe | none across universes | none | yes | that universe only |
+| Randomized AEAD, one key per declared domain | full within the domain | the index reveals which universes share a chunk | no | the whole domain |
+| Convergent encryption, one key domain | full within the domain | plaintext **equality**; confirmation-of-content for anyone holding the index and a candidate file | no | the whole domain |
+| **Convergent chunks, per-universe wrapped chunk keys** | **full** | same equality cost as the row above, nothing new | **yes** | that universe's key only |
 
-Storage economics push toward the second or third; confidentiality pushes toward the
-first. I will not choose this on your behalf, and revision 1 was wrong to.
+The fourth shape was missing from revision 3 and it is probably the answer. A chunk is
+encrypted under a key derived from its own plaintext and stored once; each universe's
+manifest carries that chunk key **wrapped under that universe's own KEK**. Destroying a
+universe's KEK crypto-erases it — manifest and every chunk key with it — while its
+neighbours keep reading. Revision 3 claimed dedup and per-universe erasability were
+mutually exclusive; that conflated the *chunk-encryption* domain with the *wrapping*
+domain, and only the second must match the erasure unit. The residue is that a
+co-tenant still holds byte-identical content — but a chunk deduplicates only when two
+universes genuinely hold the same bytes, which is shared data rather than a failed
+erasure.
 
-**X1 also decides X5.** A key domain wider than one universe forfeits crypto-erasure at
-universe granularity, which is the only erasure mechanism that survives immutable
-chunks and bucket locks. Answer them together.
+What is still missing before this can be decided: **a cost figure for the dedup reach**.
+PodMesh has no chunk store, so the saving is asserted and not measured. B1 produces the
+first real number.
+
+**And the canon may already have answered it.** `RULES.md:1214` says R2 buckets are
+*"derivable (`r2://<instance-id>`), never enumerated"*, while this design proposes one
+bucket with universes enumerated inside it. A per-instance bucket makes cross-universe
+deduplication impossible at the storage layer — which would settle X1 as shape 1 by
+canon rather than by preference. This document cites Rule 37 as binding for `lastBackup`
+and cannot ignore its bucket clause without saying why. **Before X1 reaches Xavier,
+somebody must establish whether Rule 37's fleet map reaches PodMesh universes at all**
+(defensible either way: a PodMesh universe may not be a ledger instance). If it does,
+there is no decision to take.
+
+Storage economics push toward the second, third or fourth; confidentiality pushes toward
+the first. I will not choose this on your behalf, and revision 1 was wrong to.
+
+**X1 and X5 are related, not identical.** Revision 3 said X1 decided X5; that was wrong,
+and the fourth shape is why. X1 determines whether crypto-erasure at universe
+granularity is *available*; it does not determine whether erasure is honoured, and it
+has no bearing at all on the declared-exemption route. Answer them together, because the
+wrapping domain must match the erasure unit — but they are two questions.
 
 **X2 — who owns and can recover each domain key**, and where the two independent copies
 of the root recovery material live. One of them must be outside the provider that holds
 the ciphertext, and neither may depend on PodMesh being restored.
 
-**X3 — Rule 12's transport clause.** Rule 12 currently requires archive transfers to use
-HTTP Basic Auth and end-to-end TLS through a Cloudflare Tunnel. This design proposes an
-authenticated private pull over the Rule 13 WireGuard mesh. **Rule 13 does not silently
-replace Rule 12.** Either the design complies with Rule 12 wherever it applies, or the
-canon is amended explicitly to accept authenticated encrypted private-mesh transfer as
-a valid archive transport, with the Cloudflare Tunnel retained for its intended
-distribution case. Once chosen, this document must state which rule governs host
-capture, which governs datastore sync, and which governs an operator download. Nothing
-is implemented around this contradiction.
+**X3 — extending Rule 12's transport clause, which is a gap and not a collision.**
+Revision 3 called this a canon conflict and escalated it without reading the scope
+first. It is narrower than that. Rule 12's transport requirements are scoped by their
+own opening line to *"All archive transfers (`PROJECT.tar.bz2`, `REMOTE.tar.bz2`)"*
+(`RULES.md:753`), and Rule 16 widens them to *"any `tar.bz2` that leaves the host"*
+(`RULES.md:848`). This service transfers **content-addressed encrypted chunks**, which
+are not `tar.bz2` leaving a host. The literal canon therefore does not govern this
+transport: it is **silent**.
+
+Silence is not permission, so an amendment is still owed — the canon should say what
+governs a chunk pull, a datastore sync and an operator download, and the Cloudflare
+Tunnel remains right for the distribution case it was written for. But **B1 is not
+blocked on it**: B1 names its own transport, below, and the amendment follows the
+measurement rather than preceding it.
+
+Where a `tar.bz2` *does* leave a host — B2's volume archives are exactly that — Rule 12
+applies in full and unamended.
 
 **X4 — the off-site credentials.** Provision the three bucket-scoped R2 credentials, or
 name a different off-site target. Until then level 5 is unreachable and B5 cannot start.
 
-**X5 — erasure granularity, which X1 decides.** Whether a client erasure request can be
-honoured on backups, and by what mechanism: crypto-erasure at a key domain no wider
-than the erasure unit, per-universe keys without cross-universe deduplication, or a
-declared exemption written into `onTermination` before any capture. See the data
-lifecycle section. This must be settled before B5 places anything under a bucket lock,
-because a lock cannot be lifted for a mistake.
+**X5 — erasure granularity.** Whether a client erasure request can be honoured on
+backups, and by what mechanism: crypto-erasure at a wrapping domain no wider than the
+erasure unit, per-universe keys without cross-universe deduplication, or a declared
+exemption written into `onTermination` **before** any capture. See the data lifecycle
+section. This must be settled before B5 places anything under a bucket lock, because a
+lock cannot be lifted for a mistake.
+
+## What B1 uses in the meantime, so that none of the above blocks it
+
+B1 captures **one** universe. Under every shape in the X1 table, one universe is one key
+domain, and nothing in B1 depends on cross-universe deduplication — there is no second
+universe to deduplicate against.
+
+- **Encryption:** per-universe randomized AEAD with a per-backup DEK wrapped by a
+  per-universe KEK. This is the interim, chosen because it is the shape every option in
+  X1 degenerates to at n = 1, and it therefore pre-empts nothing.
+- **Erasure:** crypto-erasure by destroying that universe's KEK, which the interim makes
+  available for free.
+- **Transport:** an authenticated pull over the Rule 13 private mesh, with the scope
+  finding in X3 recorded and the amendment owed. No `tar.bz2` leaves a host in B1, so
+  Rule 12's transport clause is not engaged; every other clause of Rule 12 is.
+- **Manifest signing:** see below.
+
+When X1 is answered, B1's chunk store is re-keyed or re-chunked as that answer requires.
+That is a known and bounded cost of starting, and it is smaller than the cost of not
+starting.
 
 ## Smaller canon obligations, recorded so they are not rediscovered
 
@@ -542,10 +771,12 @@ shape. They belong in the B1 checklist, not in a later hardening pass.
 - **`lastBackup` in `status.json` is canonical** (Rule 37, `:1174-1176`): every board or
   cockpit tile is a rendering of it, never a rival. This service writes it, and
   maintains no competing authoritative state file.
-- **The test universe is destroyed after it passes** (Rule 10, `:542`; LAW.md `:13`,
-  `:19`): a validation run rebuilds from empty and destroys the vehicle, which is what
+- **The test universe is destroyed after it passes** (Rule 10, `:542`;
+  `SHAPER-OS-V1.14/LAW.md:13` and `:19` — the root file, not the eight-line pointer at
+  `software/LAW.md`): a validation run rebuilds from empty and destroys the vehicle, which is what
   makes it a cold-recovery proof rather than a warm one.
-- **Never wipe what you did not provision** (BOOT-CONTRACT §2, `:27-30`): no volume, no
+- **Never wipe what you did not provision** (`SHAPER-OS-V1.14/docs/agent/BOOT-CONTRACT.md`
+  §2, `:27-30`): no volume, no
   database, no universe. If it is unclear whether a machine carries production, it does.
 - **Halt on a missing secret** (Rule 0J, `:232-233`; BOOT-CONTRACT §12, `:173`): a
   required key that is absent, empty or still a placeholder stops the run before
@@ -555,9 +786,34 @@ shape. They belong in the B1 checklist, not in a later hardening pass.
 - **Namespace isolation on restore** (Rule 22, `:948-949`): a universe's vector
   collection is its own, and a restore never cross-mounts one into another.
 - **Multi-threaded compression** for archive creation (Rule 12, `:754`).
-- **Proof is read from outside the producer** (BOOT-CONTRACT §9, `:102-106`): a
+- **Proof is read from outside the producer** (BOOT-CONTRACT §9, `:102-106`; the
+  doctrinal parent is Rule 0G, `RULES.md:164-176`, "no fake, no fallback"): a
   `COMPLETED` status is not proof that a file is correct, and a health endpoint
   answering 200 is not proof that a job ran.
+
+## A deletion this document has to own
+
+Revision 3 of this file silently reverted commit `0cc7dd5` — "Qualify snapshot backends
+before Backup Server capture", authored by Xavier with Codex at 22:21 on 2026-09-13,
+one hour and forty-three minutes before it. That commit had added lot B0, the "Capture
+adapters and consistency" section and the storage recommendation: 54 lines, three
+operative clauses, and the only named source of a `crash-consistent` capture in the
+whole design. It was deleted because revision 3 was written as a whole-file rewrite by
+an agent that had not re-read the file first, and the tooling's warning that the file
+had changed was misread.
+
+Three sibling documents kept pointing at the contract this one had dropped:
+`PREPARE-A-HOST.md:47-48`, `LVM-LAB-PLAN.md:11`, and `DELIVERY-CHECKLIST.md:64-65`
+and `:70-71`. An implementer starting B1 in that window would have found no named
+capture source and would plausibly have invented `podman pause` plus a copy — which is
+precisely what the restored section forbids, and precisely the error the first
+counter-review's BBS-R1 was written to prevent.
+
+The content is restored above, merged rather than pasted back: the adapters now sit
+beside the consistency classes they produce, because that is the relationship the two
+sections always had. It is recorded here rather than fixed quietly because a design
+document that quietly loses an operator's decision is worth less than one that says
+where it has been wrong.
 
 ## What must be proven, not claimed
 
