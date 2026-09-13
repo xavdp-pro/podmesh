@@ -1,0 +1,51 @@
+{
+  "activation_marker_present": {
+    "lab-a": true,
+    "lab-b": true,
+    "lab-c": true
+  },
+  "all_hosts_inactive_before_transition": true,
+  "all_other_values_preserved": true,
+  "changed_keys": [
+    "incoming_workers"
+  ],
+  "claims_not_made": [
+    "activation",
+    "availability",
+    "convergence",
+    "DNS",
+    "fencing",
+    "high availability",
+    "replication",
+    "takeover"
+  ],
+  "durable_state_present": {
+    "lab-a": true,
+    "lab-b": true,
+    "lab-c": true
+  },
+  "grant_count": 3,
+  "grant_scopes": [
+    "g2/lab-a/observations",
+    "g2/lab-b/observations",
+    "g2/lab-c/observations"
+  ],
+  "host_aliases": [
+    "lab-a",
+    "lab-b",
+    "lab-c"
+  ],
+  "host_count": 3,
+  "incoming_workers": {
+    "from": 1,
+    "to": 2
+  },
+  "offline_validation_only": true,
+  "private_values": "absent",
+  "result": "PASS",
+  "same_private_mapping_committed": true,
+  "same_qualified_candidate": true,
+  "same_scope_owner_bindings_committed": true,
+  "schema_version": "podmesh-manager-config-transition-comparison/v2",
+  "transition_kind": "incoming-workers"
+}

@@ -1,0 +1,106 @@
+{
+  "configuration": {
+    "document_commitment": "sha256:6c7bc0d50a26c44a24ab7ab4cc45ecaf91b56efc2fba66e712011c93c2f3a06b",
+    "local_host_commitment": "sha256:127a79eb0cb336fad2e09d54505b7cc5edce23bc0b0b844390447ad1466eaa52",
+    "local_replica_commitment": "sha256:402ff5dff5e58ab5d8751959d3f845f384ef300ef938f4db6fd8b3230efda083",
+    "logical_manager_commitment": "sha256:5f0bed2d5c669bda9c7d7945deea981ecbd4df67352a13cdae6d6ac196118ec4",
+    "peer_count": 2,
+    "peers": [
+      {
+        "endpoint_commitment": "sha256:3300d7ce46620bada31f7370ee675a2ac03d5511e2fa91b6b4825bc7577811fb",
+        "replica_id_commitment": "sha256:b8838baacb576585c79d6bef59a4e95cd9e6cfc38739667e55f918f16525aefc",
+        "shared_key_commitment": "sha256:776a6566ff27f1745193d209cf0884cc93b6f75f7f3e546724cda63dba8815f5"
+      },
+      {
+        "endpoint_commitment": "sha256:01b602d98ed17ef44871279ef81e1ff2074e2af261a207b9002e422010e0fff1",
+        "replica_id_commitment": "sha256:15720f1a68f31241df7e773be622ec1d46d0ec0454c358a444bc98681a2011eb",
+        "shared_key_commitment": "sha256:33c6d2487d2e0df00a933146195df9218e7de3b69c0ff7afe14c1648d394305d"
+      }
+    ],
+    "topology_commitment": "sha256:671498fa1810f929f0cb0acfaf9ae6aa4aa70765a5e352d069d576157c253bf7"
+  },
+  "dropin": {
+    "effective_policy_commitment": null,
+    "effective_policy_configured": false,
+    "inherited_deny_all": true,
+    "packaged_fragment_sha256": "8046eb20bf7e42d45cd4cc1f12fc3723357cfcfef3e827a9680ab84d8f81a706",
+    "present": false,
+    "semantic_limits": {
+      "address_families": [],
+      "network_mode": null,
+      "peer_allow_count": 0,
+      "peer_allow_prefix_length": null
+    },
+    "sha256": null
+  },
+  "graceful_shutdown": null,
+  "host_alias": "lab-c",
+  "inspection": null,
+  "listeners": {
+    "endpoint_commitment": "sha256:3a99eb4992b0beed5d27444a6c633fa4f1952bfab733606b93d36564186ddc1f",
+    "status": "available-successful",
+    "tcp_listener_count": 0,
+    "udp_listener_count": 0
+  },
+  "manager_process": {
+    "argv_commitment": null,
+    "argv_count": 0,
+    "count": 0,
+    "pid": null,
+    "uid": null
+  },
+  "package": {
+    "binary_sha256": "cbd5020a37d2b6b2ab94ee41a7ea9d2f50d0da36c6fb972f795c8a1fe3660128",
+    "dpkg_verify": "clean",
+    "name": "podmesh-manager",
+    "version": "0.1.0~manager2+gff77b1f946e8"
+  },
+  "paths": {
+    "control_socket": {
+      "gid": null,
+      "mode": null,
+      "present": false,
+      "uid": null
+    },
+    "runtime": {
+      "content_commitment": null,
+      "gid": null,
+      "mode": null,
+      "present": false,
+      "uid": null
+    },
+    "state": {
+      "content_commitment": "sha256:d8327d9918c7e9cd98a6a81b5a57e3796213310760f4d9a10baea3ebcb9aaa9c",
+      "gid": 104,
+      "mode": "750",
+      "present": true,
+      "uid": 103
+    }
+  },
+  "schema_version": "podmesh-manager-live-activation-evidence/v2",
+  "service": {
+    "active_state": "inactive",
+    "exec_main_code": "0",
+    "exec_main_status": 0,
+    "invocation_commitment": null,
+    "load_state": "loaded",
+    "main_pid": 0,
+    "n_restarts": 0,
+    "result": "success",
+    "sub_state": "dead",
+    "unit_file_state": "disabled"
+  },
+  "stability": {
+    "existing_services_commitment": "sha256:65ab59f30efda9da489d0b5b3a24dcb93acc17aa2cbdbfa2a97f566dd812db10",
+    "firewall": {
+      "commitment": "sha256:5998384627842997d87ca553f950c81f6032aad1bc43c0981dec38bd79979a96",
+      "status": "available-successful"
+    },
+    "podman_containers_commitment": "sha256:4a956f78aecb2ba9c8e58c38ea1840bfa4112ae144f5126d214720f00bdecebd",
+    "routes": {
+      "commitment": "sha256:8d256523803ae7987aaca5587894a454c66d2068b0a0a99bd9c5789c4c6dbb7b",
+      "status": "available-successful"
+    }
+  },
+  "stage": "pre-activation"
+}

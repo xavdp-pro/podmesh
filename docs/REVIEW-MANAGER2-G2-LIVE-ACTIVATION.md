@@ -1,12 +1,20 @@
 # Manager2 G2 live activation review
 
-Status: **not passed; an operator decision on durable state is required before
-any further campaign.** Two live three-host campaigns of the frozen manager2
-candidate converged and cleaned up through the reviewed harness. The checked-in
-four-stage comparator does not return PASS, and neither the evidence nor the gate
-was altered to make it. The gated quantity is inherited by every future campaign
-run on the same stores, so no configuration change alone can reach it — see the
-correction in "Open decision".
+Status: **not passed, and superseded in its diagnosis.** Two live three-host
+campaigns of the frozen manager2 candidate converged and cleaned up through the
+reviewed harness. The checked-in four-stage comparator does not return PASS, and
+neither the evidence nor the gate was altered to make it.
+
+> **Superseded, same day.** This document twice named a cause for the failure and
+> was twice wrong. The transition it recommended was applied and a measurement run
+> then showed that the blamed mechanism had been eliminated entirely
+> (`rejected_connections: 0`) while strands continued. The measured diagnosis, its
+> adversarial verification and the resulting reading of the frozen Stage D contract
+> are in
+> [FINDING-MANAGER2-LATE-REPLY-STRANDS.md](FINDING-MANAGER2-LATE-REPLY-STRANDS.md),
+> which supersedes everything below about *why* attempts strand. What this document
+> records and what remains correct is the two campaigns themselves, their evidence,
+> and the harness defects found and fixed. Read the finding first.
 
 Date: 2026-09-13. Implementer and author of this review: Claude Code (Fable 5.1),
 under the standing automation mandate. Independent review of the harness fix
