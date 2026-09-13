@@ -285,8 +285,8 @@ consistent transaction on that private copy. If raw copied WAL state cannot be
 opened, it captures another private snapshot and runs `VACUUM INTO` from that
 private copy into a second private file; the fallback never opens the canonical
 source through SQLite. After one successful preflight, a process cache bound to
-device, inode, size, modification time, change time, topology and replica prevents
-resident status traffic from repeatedly copying an unchanged store. In-place
+device, inode, size, modification time, change time, topology and replica can
+avoid repeating unchanged source preflight work within one process. In-place
 replacement and different identities cannot reuse that entry. The later canonical
 read-write open uses SQLite `NOFOLLOW` and rechecks path metadata identity. It
 never opens a refused old or mismatched canonical store read-write. It requires an
@@ -421,14 +421,32 @@ The resident constructs the durable request itself with
 the control schema; attempts to supply them are refused as unknown fields. The
 durable topology independently verifies that the local replica owns the scope.
 
-Increase the local request limit from 256 to 4096 bytes while retaining the
-absolute 250 ms read deadline. Operation ID, scope, subject and value receive
-explicit length and character/UTF-8 bounds before store access. The successful
-response returns the typed fact, receipt evidence and replay flag.
+Increase the raw local request limit from 256 to 32768 bytes while retaining the
+absolute 250 ms read deadline. The larger envelope is required so a value of up
+to 4096 UTF-8 bytes fits after JSON escaping and protocol fields. The response
+ceiling is 32768 bytes. Resident validation also bounds the logical manager,
+replica, host and grant identities used in an append receipt to the same 128-byte
+safe grammars; without those bounds the response ceiling would not be sound.
+Operation ID and subject use the durable safe-token grammar, are at most 128
+bytes and cannot use the reserved `network:` operation namespace. Scope is a
+bounded hierarchical path of safe-token segments separated by `/`, with no
+empty, current-directory or parent-directory segment. Value is nonempty UTF-8
+of at most 4096 bytes. Every bound is checked before store access. The
+successful response returns the typed fact, receipt evidence and replay flag.
 
-`status` and `shutdown` retain their existing behavior. Peer status counters
-remain diagnostic and reset on restart; canonical durable evidence comes from
-the store inspection interface.
+Live `status` is a bounded diagnostic response: it reports the replica identity,
+peer counters, worker bounds and `activation_authority: false`, but never embeds
+facts, receipts or audit history. Peer counters reset on restart. Canonical
+durable evidence is obtained separately through the read-only `--inspect-store`
+interface, so retained history cannot make live status unbounded or couple it to
+network I/O. `shutdown` retains its existing behavior.
+
+The 250 ms control budget is absolute across request read, append-result wait and
+response write. SQLite work runs in one bounded-admission worker. If it has not
+finished before the response reserve, the resident returns an uncertain outcome,
+keeps the worker for shutdown drain and relies on the durable operation ID for a
+safe identical retry. It never reports an unobserved late commit as a refusal or
+success.
 
 ## Failure semantics
 
@@ -437,7 +455,9 @@ the store inspection interface.
 | Unauthorized Unix UID | Refuse before store access; no fact or receipt. |
 | Unowned scope | Durable request refuses; no fact or receipt. |
 | Exclusive fields in local request | Typed JSON refusal; no store access. |
-| Storage failure during local append | No partial fact/receipt and no success response. |
+| Storage failure during local append | No partial fact/receipt and no success response; report uncertain unless the durable layer proves a policy refusal. |
+| Append worker already occupied | Report busy immediately; admit no new worker and make no claim about a prior uncertain operation. |
+| Local append exceeds the control response budget | Return uncertain, keep the resident responsive, drain the admitted worker on shutdown and resolve by identical operation-ID retry. |
 | Client disconnect after local commit | Outcome is uncertain; identical retry returns the original receipt and does not append again. |
 | Operation ID reused with different request | Refuse with zero mutation. |
 | Authenticated inbound import succeeds | Facts, receipt and accepted audit commit atomically before reply preparation. |

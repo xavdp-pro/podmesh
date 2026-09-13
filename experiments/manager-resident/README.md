@@ -41,12 +41,15 @@ The package candidate accepts exactly:
 
 ```text
 podmesh-managerd --config /etc/podmesh-manager/config.json --state-dir /var/lib/podmesh-manager --runtime-dir /run/podmesh-manager [--validate-config]
+podmesh-managerd --inspect-store --config /etc/podmesh-manager/config.json --state-dir /var/lib/podmesh-manager
 podmesh-managerd --version
 ```
 
-All three path flags are mandatory in flag mode and can appear in any order.
-Unknown, repeated, mixed positional, missing-value and missing-required flags
-are refused. The one positional `CONFIG.json` laboratory form remains available;
+The runtime and validation forms require all three path flags; `--inspect-store`
+requires only `--config` and `--state-dir`, and rejects `--runtime-dir` and
+`--validate-config`. Flags can appear in any order. Unknown, repeated, mixed
+positional, missing-value and missing-required flags are refused. The one
+positional `CONFIG.json` laboratory form remains available;
 its absolute state/runtime boundaries are derived from the configured DB/socket
 parents and undergo the same checks. All runtime forms require the explicit
 environment value `PODMESH_MANAGER_NETWORK_MODE=authenticated-static-peers`.
@@ -76,9 +79,13 @@ shared with untrusted software. The package networking default stays disabled;
 its systemd address-family/firewall policy needs separately reviewed changes
 before opting into real networking.
 
-Unknown JSON fields are refused.
-The configuration has `network` (the complete transport `ConfigurationFile`),
-`control_socket`, `interval_ms`, `max_backoff_ms`, and `incoming_workers`.
+Unknown JSON fields are refused. The required configuration has `network` (the
+complete transport `ConfigurationFile`), `control_socket`,
+`observation_writer_uid`, `interval_ms`, `max_backoff_ms`, and
+`incoming_workers`. `observation_writer_uid` fails closed when absent. The
+private socket is `0600`, so the current package-facing boundary normally makes
+UID 0 or the service account its only reachable writer. Shared group/ACL writer
+admission is deferred to Stage P; this service does not weaken the socket mode.
 `network` fixes the replica identity/topology, local DB, TCP bind and all exact
 peer endpoints with distinct pair keys. Requests cannot select paths, keys,
 endpoints, commands or topology. Protect local config/DB; never commit secrets.
@@ -95,18 +102,21 @@ endpoints, commands or topology. Protect local config/DB; never commit secrets.
 | Connection retry | 2 seconds |
 | Periodic interval | 100–60,000 ms |
 | Maximum backoff | At least interval, at most 300,000 ms |
-| Control request | 256 bytes, absolute 250 ms read deadline |
-| Control response | 512 KiB, absolute 250 ms write deadline |
+| Control request frame | 32,768 bytes within the shared 250 ms control deadline |
+| Observation value | Nonempty UTF-8, at most 4,096 bytes |
+| Control response | 32,768 bytes within the shared 250 ms control deadline |
 | Socket path | Absolute, at most 100 bytes, private parent directory |
 
 SQLite uses a five-second busy timeout. These are not hard real-time guarantees:
-serialization/verification scale with local history and storage/OS can stall.
+serialization/verification and each append Store open scale with local history,
+so growing stores can increasingly produce busy or uncertain replies until an
+incremental design replaces the full verification path. Storage/OS can stall.
 Oversize snapshots fail to exchange; history is never truncated into a success.
 
 ## Private control and observation
 
 The Unix socket is mode `0600` in a directory without group/other permissions.
-Send one JSON object and close the write half. Only two requests exist:
+Send one JSON object and close the write half. Three requests exist:
 
 ```json
 {"operation":"status"}
@@ -116,21 +126,76 @@ Send one JSON object and close the write half. Only two requests exist:
 {"operation":"shutdown"}
 ```
 
-Status includes durable inspection/conflicts, peer counters, last authenticated
-success age, next retry delay, acknowledged history count, local history count
-observed before attempt, and `history_count_delta`. This is not exact causal lag
+```json
+{"operation":"append_observation","operation_id":"op-1","scope":"team/service","subject":"subject-1","value":"observed text"}
+```
+
+`append_observation` admits no other fields. Before any Store access it reads
+Unix peer credentials and requires the configured UID. It accepts operation IDs
+and subjects made of ASCII letters/digits plus `-_.:`, 1–128 bytes; scopes use
+that alphabet in nonempty `/`-separated segments, also 1–128 bytes, with no
+leading/trailing slash or `.`/`..` segments. `network:` operation IDs are
+reserved. It constructs only `Request::Observe` with no exclusive resource and
+`active_claim=false`, then returns the durable `execute_with_receipt` result.
+Malformed JSON, wrong types and unknown fields return `invalid typed control request`;
+an oversized frame returns `control request bound exceeded`. Invalid append values,
+UID or policy failures, and durable policy refusals return
+`append_observation_refused`. An occupied worker returns
+`append_observation_busy`; it admits no new work and makes no claim about whether
+a prior request with that operation ID will commit. `status_unavailable` is a
+bounded diagnostic failure.
+
+A missing reply, a partial JSON reply or `append_observation_uncertain` leaves the
+client outcome uncertain; retry only the identical operation ID and content.
+
+The resident admits one append worker. The original server accept-to-response
+budget is an absolute 250 ms deadline, shared by read, worker wait and write. If
+SQLite work has not finished before the reserved response window, or a storage
+outcome cannot be classified as a durable refusal, the request returns
+`append_observation_uncertain`. The worker remains joined during shutdown
+and can still commit; retry the identical operation ID to obtain its original
+receipt/replay. A changed request under that ID is refused. SQLite work itself is
+not cancellable, so a shutdown response can be prompt while final process drain
+waits for an admitted append worker.
+
+Live `status` is a bounded resident diagnostic: replica identity, peer diagnostics,
+admission counters and `activation_authority=false`. It never opens, copies or
+serializes the durable store, and returns
+`canonical_inspection_available_via: "--inspect-store"`. Full canonical facts,
+receipts, audits, integrity verification and source-copy behavior are exclusively
+provided by `--inspect-store`; status remains bounded as audit retention grows.
+`--inspect-store` performs this read-only inspection without network mode,
+listener, socket, worker, interval or peer-key validation. It validates only
+config parsing, bounded manager/topology identities, local replica membership and
+the declared existing state-store path; it never creates, migrates, repairs or opens the store
+read-write. The durable inspector writes a private full source copy below
+`$TMPDIR`, and its current path ownership policy requires the caller to own the
+state directory. A root operator cannot use it directly on a service-account
+state directory without an explicit, separately reviewed access arrangement.
+
+`status` and `shutdown` rely on the private `0600` socket rather than a separate
+peer-UID check. If Stage P later broadens socket access for writers, those writers
+would also be able to request shutdown; Stage P must define separate admission if
+that is unacceptable.
+
+Status includes peer counters, last authenticated success age, next retry delay,
+acknowledged history count, local history count observed before attempt, and
+`history_count_delta`. This is not exact causal lag
 or convergence proof: equal counts can differ, and replayed receipts describe a
 historical committed result. Unknown values remain null. Unsigned diagnostics
 and failed exchanges clear `history_count_delta` to null; the previous acknowledged
 count is retained only as historical data with its last-success age. A new local
 count is never compared with an unreachable peer's old count as a current lag.
-Unsigned diagnostics remain explicitly `unauthenticated_remote_diagnostic`; no authenticated authority
-is inferred. `activation_authority` is always false. Peer status restarts unknown.
+Unsigned diagnostics remain explicitly `unauthenticated_remote_diagnostic` and
+verified remote refusals explicitly `authenticated_remote_refusal`; no text
+inference or authenticated authority is derived from either. `activation_authority`
+is always false. Peer status restarts unknown.
 
 Shutdown stops scheduling/admission and removes the owned private socket before
-fallible worker joins, then drains and joins workers. Store errors, status errors
-and outgoing worker failure terminate the resident through this same cleanup path.
-Every started worker is joined even when another worker fails. Abrupt death leaves a stale
+fallible worker joins, then drains and joins workers. Control status failures, append storage failures, append-worker panics, and
+transient outgoing Store/open failures become bounded replies, a bounded failure
+counter, or per-peer backoff rather than terminating the resident. Every started worker is
+joined even when another worker fails. Abrupt death leaves a stale
 socket: restart refuses it until the operator verifies process death and removes
 that exact private path. Tests do so only after collecting the killed child's exit.
 There is no automatic stale-file cleanup or lost-identity recovery procedure.
@@ -142,10 +207,11 @@ surrounding I/O paths.
 
 ## Validation and gaps
 
-[EVIDENCE.md](EVIDENCE.md) covers three simultaneous compiled processes, live TCP
-partition/reconnect, SIGKILL/restart, conflicts, wrong keys, authenticated invalid
-batches, framing/admission limits and shutdown. The partition test uses six TCP
-proxies to cut both directions around one still-running resident.
+[EVIDENCE.md](EVIDENCE.md) covers three simultaneous compiled processes, UID-bound
+nonexclusive observations, live TCP partition/reconnect, SIGKILL/restart,
+conflicts, wrong keys, authenticated invalid batches, raw-frame/value bounds,
+read-only inspection, framing/admission limits and shutdown. The partition test
+uses six TCP proxies to cut both directions around one still-running resident.
 
 Remaining: key rotation/revocation, signed original provenance, encryption,
 WireGuard/real-host qualification, bounded incremental history, retention/quota,

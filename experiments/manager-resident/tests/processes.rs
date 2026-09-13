@@ -1,5 +1,7 @@
 use podmesh_manager_ha_lab::{
-    durable::{Configuration as Manager, RefusalReason, Request, Response, Store},
+    durable::{
+        inspect_read_only, Configuration as Manager, RefusalReason, Request, Response, Store,
+    },
     ReplicaConfig, ScopeGrant,
 };
 use podmesh_manager_network_lab::{ConfigurationFile, Peer};
@@ -91,10 +93,21 @@ impl Lab {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        // Reserve the exact endpoint tuples that each child will bind, rather
+        // than selecting a port on another loopback address and reusing it.
         let listeners: Vec<_> = (0..3)
-            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+            .map(|i| {
+                TcpListener::bind((
+                    std::net::Ipv4Addr::new(127, 0, 0, u8::try_from(i + 10).unwrap()),
+                    0,
+                ))
+                .unwrap()
+            })
             .collect();
-        let addresses: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+        let addresses: Vec<_> = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap())
+            .collect();
         let manager = Manager {
             logical_manager_id: "resident-test".into(),
             replicas: (0..3)
@@ -128,6 +141,7 @@ impl Lab {
                         .collect(),
                 },
                 control_socket: dir.path().join(format!("r{i}.sock")),
+                observation_writer_uid: rustix::process::geteuid().as_raw(),
                 interval_ms: 100,
                 max_backoff_ms: 400,
                 incoming_workers: 2,
@@ -173,22 +187,101 @@ impl Lab {
             Duration::from_secs(5),
         );
     }
+    fn status(&self, i: usize) -> Value {
+        let start = Instant::now();
+        loop {
+            if let Some(reply) = self.control(i, "status") {
+                if reply["kind"] == "resident_observation" {
+                    return reply;
+                }
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "status did not become available"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+    fn status_once_within(&self, i: usize, bound: Duration) -> Value {
+        let started = Instant::now();
+        let reply = self
+            .control(i, "status")
+            .expect("single status request returned no typed response");
+        assert!(
+            started.elapsed() < bound,
+            "single status request exceeded {bound:?}: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(reply["kind"], "resident_observation");
+        reply
+    }
     fn control(&self, i: usize, operation: &str) -> Option<Value> {
         self.control_value(i, json!({"operation":operation}))
     }
     fn control_value(&self, i: usize, request: Value) -> Option<Value> {
+        self.control_raw(i, &serde_json::to_vec(&request).unwrap())
+    }
+    fn control_raw(&self, i: usize, request: &[u8]) -> Option<Value> {
+        serde_json::from_slice(&self.control_bytes(i, request)?).ok()
+    }
+    fn control_bytes(&self, i: usize, request: &[u8]) -> Option<Vec<u8>> {
         let mut s = UnixStream::connect(&self.configs[i].control_socket).ok()?;
         s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-        s.write_all(&serde_json::to_vec(&request).unwrap()).ok()?;
+        s.write_all(request).ok()?;
         s.shutdown(Shutdown::Write).ok()?;
         let mut bytes = Vec::new();
         s.read_to_end(&mut bytes).ok()?;
-        serde_json::from_slice(&bytes).ok()
+        Some(bytes)
+    }
+    fn append(
+        &self,
+        i: usize,
+        operation_id: &str,
+        scope: &str,
+        subject: &str,
+        value: &str,
+    ) -> Value {
+        let request = json!({
+            "operation": "append_observation",
+            "operation_id": operation_id,
+            "scope": scope,
+            "subject": subject,
+            "value": value,
+        });
+        let start = Instant::now();
+        loop {
+            let reply = self.control_value(i, request.clone()).unwrap();
+            if reply["response"]["result"] == "observed" {
+                return reply;
+            }
+            assert!(
+                matches!(
+                    reply["error"].as_str(),
+                    Some("append_observation_busy" | "append_observation_uncertain")
+                ),
+                "unexpected append reply: {reply}"
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "append remained unavailable"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
     }
     fn count(&self, i: usize) -> usize {
-        match self.store(i).execute(&Request::Inspect {}).unwrap() {
-            Response::Inspection { history_len, .. } => history_len,
-            _ => panic!("unexpected inspect"),
+        let c = &self.configs[i].network;
+        let start = Instant::now();
+        loop {
+            match inspect_read_only(&c.database_path, &c.manager, &c.replica_id) {
+                Ok(inspection) => return inspection.history_count,
+                Err(_) => {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(5),
+                        "inspection remained unavailable"
+                    );
+                    thread::sleep(Duration::from_millis(25));
+                }
+            }
         }
     }
     fn stop(&mut self, i: usize) {
@@ -234,15 +327,22 @@ fn three_residents_converge_partition_reconnect_restart_and_preserve_conflicts()
         }
     }
     for i in 0..3 {
-        lab.observe(i, "initial", None);
         lab.start(i);
+        let reply = lab.append(
+            i,
+            "initial",
+            &format!("s{i}"),
+            "initial",
+            "test-observation",
+        );
+        assert_eq!(reply["response"]["result"], "observed");
     }
     until(
         || (0..3).all(|i| lab.count(i) == 3),
         Duration::from_secs(15),
     );
     for i in 0..3 {
-        let status = lab.control(i, "status").unwrap();
+        let status = lab.status(i);
         assert_eq!(status["activation_authority"], false);
     }
     // Isolate the still-running r2 with accepting-but-dropping TCP proxies.
@@ -253,8 +353,26 @@ fn three_residents_converge_partition_reconnect_restart_and_preserve_conflicts()
         }
     }
     thread::sleep(Duration::from_millis(500));
-    lab.observe(0, "during-partition", None);
-    lab.observe(1, "during-partition", None);
+    assert_eq!(
+        lab.append(
+            0,
+            "during-partition-r0",
+            "s0",
+            "partition",
+            "test-observation"
+        )["response"]["result"],
+        "observed"
+    );
+    assert_eq!(
+        lab.append(
+            1,
+            "during-partition-r1",
+            "s1",
+            "partition",
+            "test-observation"
+        )["response"]["result"],
+        "observed"
+    );
     until(
         || lab.count(0) == 5 && lab.count(1) == 5,
         Duration::from_secs(10),
@@ -262,14 +380,14 @@ fn three_residents_converge_partition_reconnect_restart_and_preserve_conflicts()
     assert_eq!(lab.count(2), 3);
     until(
         || {
-            let status = lab.control(0, "status").unwrap();
+            let status = lab.status(0);
             let peer = &status["peers"]["r2"];
             peer["local_history_len_at_attempt"] == 5
                 && peer["outcome"] != "authenticated_import_receipt"
         },
         Duration::from_secs(10),
     );
-    assert!(lab.control(0, "status").unwrap()["peers"]["r2"]["history_count_delta"].is_null());
+    assert!(lab.status(0)["peers"]["r2"]["history_count_delta"].is_null());
     assert!(lab.children[2]
         .as_mut()
         .unwrap()
@@ -293,12 +411,14 @@ fn three_residents_converge_partition_reconnect_restart_and_preserve_conflicts()
         Duration::from_secs(15),
     );
     for i in 0..3 {
-        assert!(
-            lab.control(i, "status").unwrap()["inspection"]["blocked_exclusive_resources"]
-                .as_array()
-                .unwrap()
-                .contains(&json!("ip:test"))
-        );
+        assert!(inspect_read_only(
+            &lab.configs[i].network.database_path,
+            &lab.configs[i].network.manager,
+            &lab.configs[i].network.replica_id,
+        )
+        .unwrap()
+        .blocked_exclusive_resources
+        .contains(&"ip:test".into()));
     }
     for i in 0..3 {
         lab.stop(i);
@@ -321,21 +441,15 @@ fn wrong_key_and_oversized_frames_do_not_import() {
     }
     until(
         || {
-            lab.control(0, "status").unwrap()["peers"]["r1"]["failures"]
-                .as_u64()
-                .unwrap()
-                > 0
+            let status = lab.status(0);
+            status["peers"]["r1"]["failures"].as_u64().unwrap() > 0
+                && status["peers"]["r1"]["outcome"] == "unauthenticated_remote_diagnostic"
         },
         Duration::from_secs(10),
     );
     assert_eq!(lab.count(1), 0);
     assert_eq!(lab.count(2), 0);
-    let status = lab.control(0, "status").unwrap();
-    assert_eq!(status["peers"]["r1"]["authenticated_successes"], 0);
-    assert_eq!(
-        status["peers"]["r1"]["outcome"],
-        "unauthenticated_remote_diagnostic"
-    );
+    assert_eq!(lab.status(0)["peers"]["r1"]["authenticated_successes"], 0);
     let mut stream = TcpStream::connect(lab.configs[1].network.bind).unwrap();
     stream.write_all(&524_289_u32.to_be_bytes()).unwrap();
     stream
@@ -357,15 +471,10 @@ fn flood_has_fixed_worker_bound_and_shutdown_drains() {
         .filter_map(|_| TcpStream::connect(lab.configs[0].network.bind).ok())
         .collect();
     until(
-        || {
-            lab.control(0, "status").unwrap()["rejected_connections"]
-                .as_u64()
-                .unwrap()
-                > 0
-        },
+        || lab.status(0)["rejected_connections"].as_u64().unwrap() > 0,
         Duration::from_secs(4),
     );
-    let status = lab.control(0, "status").unwrap();
+    let status = lab.status(0);
     assert!(status["peak_incoming"].as_u64().unwrap() <= 2);
     assert_eq!(status["incoming_limit"], 2);
     assert_eq!(status["outgoing_limit"], 1);
@@ -384,8 +493,23 @@ fn invalid_config_and_second_resident_are_refused() {
     invalid = lab.configs[0].clone();
     invalid.interval_ms = 0;
     assert!(invalid.validate().is_err());
+    invalid = lab.configs[0].clone();
+    invalid.network.bind.set_port(0);
+    assert!(invalid.validate().is_err());
+    invalid = lab.configs[0].clone();
+    invalid.network.manager.logical_manager_id = "x".repeat(129);
+    assert!(invalid.validate().is_err());
+    invalid = lab.configs[0].clone();
+    invalid.network.manager.replicas[0].host_id = "\u{1}".repeat(128);
+    assert!(invalid.validate().is_err());
     let mut value = serde_json::to_value(&lab.configs[0]).unwrap();
     value["arbitrary_command"] = json!("false");
+    assert!(serde_json::from_value::<Configuration>(value).is_err());
+    let mut value = serde_json::to_value(&lab.configs[0]).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("observation_writer_uid");
     assert!(serde_json::from_value::<Configuration>(value).is_err());
     lab.start(0);
     // Give the second process distinct free bind/socket paths so refusal cannot
@@ -423,32 +547,332 @@ fn unknown_control_fields_are_refused_without_shutdown() {
             .unwrap()
             .is_none());
     }
-    assert_eq!(
-        lab.control(0, "status").unwrap()["kind"],
-        "resident_observation"
-    );
+    assert_eq!(lab.status(0)["kind"], "resident_observation");
     lab.stop(0);
 }
 
 #[test]
-fn store_failure_exit_unlinks_owned_control_socket() {
+fn append_observation_is_uid_bound_nonexclusive_and_idempotent() {
     let mut lab = Lab::new();
     lab.start(0);
-    // Replace the configured path with a directory in this disposable fixture.
-    // The next Store open deterministically fails, independently of permissions.
-    let path = &lab.configs[0].network.database_path;
-    fs::rename(path, path.with_extension("retained.sqlite")).unwrap();
-    fs::create_dir(path).unwrap();
-    // A status request may observe the store failure first; either this path or
-    // the outgoing worker must stop admission and unlink its owned socket.
-    let _ = lab.control(0, "status");
+    let first = lab.append(0, "append.1:local", "s0", "subject-1", "value");
+    assert_eq!(first["response"]["result"], "observed");
+    assert_eq!(first["response"]["fact"]["exclusive_resource"], Value::Null);
+    assert_eq!(first["response"]["fact"]["active_claim"], false);
+    assert_eq!(first["receipt"]["kind"], "observe");
+    assert_eq!(first["replayed"], false);
+    let replay = lab.append(0, "append.1:local", "s0", "subject-1", "value");
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["receipt"], first["receipt"]);
+    assert_eq!(lab.count(0), 1);
+
+    for request in [
+        json!({"operation":"append_observation","operation_id":"append.1:local","scope":"s0","subject":"subject-1","value":"different"}),
+        json!({"operation":"append_observation","operation_id":"other","scope":"s1","subject":"subject-1","value":"value"}),
+        json!({"operation":"append_observation","operation_id":"network:reserved","scope":"s0","subject":"subject-1","value":"value"}),
+        json!({"operation":"append_observation","operation_id":"bad/slash","scope":"s0","subject":"subject-1","value":"value"}),
+        json!({"operation":"append_observation","operation_id":"other","scope":"s0//child","subject":"subject-1","value":"value"}),
+        json!({"operation":"append_observation","operation_id":"other","scope":"s0","subject":"subject/invalid","value":"value"}),
+        json!({"operation":"append_observation","operation_id":"other","scope":"s0","subject":"subject-1","value":""}),
+        json!({"operation":"append_observation","operation_id":"other","scope":"s0","subject":"subject-1","value":"value","exclusive_resource":"ip:test"}),
+        json!({"operation":"append_observation","operation_id":"other","scope":"s0","subject":"subject-1","value":"value","active_claim":true}),
+    ] {
+        let reply = lab.control_value(0, request).unwrap();
+        assert!(matches!(
+            reply["error"].as_str(),
+            Some("append_observation_refused" | "invalid typed control request")
+        ));
+        assert_eq!(lab.count(0), 1);
+    }
+    assert!(lab.children[0]
+        .as_mut()
+        .unwrap()
+        .try_wait()
+        .unwrap()
+        .is_none());
+    lab.stop(0);
+}
+
+#[test]
+fn append_observation_refuses_another_uid_before_store_access_and_stays_live() {
+    let mut lab = Lab::new();
+    let current = rustix::process::geteuid().as_raw();
+    lab.configs[0].observation_writer_uid = if current == u32::MAX {
+        current - 1
+    } else {
+        current + 1
+    };
+    lab.start(0);
+    let reply = lab
+        .control_value(
+            0,
+            json!({"operation":"append_observation","operation_id":"uid-refusal","scope":"s0","subject":"subject","value":"value"}),
+        )
+        .unwrap();
+    assert_eq!(reply["error"], "append_observation_refused");
+    assert_eq!(lab.count(0), 0);
+    assert_eq!(lab.status(0)["kind"], "resident_observation");
+    assert!(lab.children[0]
+        .as_mut()
+        .unwrap()
+        .try_wait()
+        .unwrap()
+        .is_none());
+    lab.stop(0);
+}
+
+#[test]
+fn append_observation_accepts_any_4096_byte_utf8_value_and_bounds_raw_frames() {
+    let mut lab = Lab::new();
+    lab.start(0);
+    let escaped = "\\".repeat(4096);
+    let reply = lab.append(0, "escaped-value", "s0", "subject", &escaped);
+    assert_eq!(reply["response"]["result"], "observed");
+    assert_eq!(lab.count(0), 1);
+    let controls = "\u{1}".repeat(4096);
+    let reply = lab.append(0, "control-value", "s0", "subject", &controls);
+    assert_eq!(reply["response"]["result"], "observed");
+    assert_eq!(reply["response"]["fact"]["value"], controls);
+    assert_eq!(lab.count(0), 2);
+    for (size, expected) in [
+        (32_768, "invalid typed control request"),
+        (32_769, "control request bound exceeded"),
+    ] {
+        let reply = lab.control_raw(0, &vec![b' '; size]).unwrap();
+        assert_eq!(reply["error"], expected);
+        assert_eq!(lab.count(0), 2);
+    }
+    assert!(lab.children[0]
+        .as_mut()
+        .unwrap()
+        .try_wait()
+        .unwrap()
+        .is_none());
+    lab.stop(0);
+}
+
+#[test]
+fn append_observation_disconnect_replays_after_restart() {
+    let mut lab = Lab::new();
+    lab.start(0);
+    let request = json!({
+        "operation":"append_observation",
+        "operation_id":"disconnect-replay",
+        "scope":"s0",
+        "subject":"subject",
+        "value":"value",
+    });
+    let mut stream = UnixStream::connect(&lab.configs[0].control_socket).unwrap();
+    stream
+        .write_all(&serde_json::to_vec(&request).unwrap())
+        .unwrap();
+    stream.shutdown(Shutdown::Write).unwrap();
+    drop(stream);
+    until(|| lab.count(0) == 1, Duration::from_secs(5));
+    lab.children[0].as_mut().unwrap().kill().unwrap();
+    lab.children[0].take().unwrap().wait().unwrap();
+    fs::remove_file(&lab.configs[0].control_socket).unwrap();
+    lab.start(0);
+    let replay = lab.append(0, "disconnect-replay", "s0", "subject", "value");
+    assert_eq!(replay["replayed"], true);
+    let changed = lab
+        .control_value(
+            0,
+            json!({"operation":"append_observation","operation_id":"disconnect-replay","scope":"s0","subject":"subject","value":"changed"}),
+        )
+        .unwrap();
+    assert_eq!(changed["error"], "append_observation_refused");
+    assert_eq!(lab.count(0), 1);
+    lab.stop(0);
+}
+
+#[test]
+fn status_stays_compact_after_more_than_600_audit_events() {
+    let mut lab = Lab::new();
+    lab.configs[1].interval_ms = 60_000;
+    lab.configs[1].max_backoff_ms = 60_000;
+    lab.start(1);
+    until(
+        || {
+            let status = lab.status(1);
+            status["peers"]["r0"]["failures"].as_u64().unwrap() > 0
+                && status["peers"]["r2"]["failures"].as_u64().unwrap() > 0
+        },
+        Duration::from_secs(8),
+    );
+    // Status deliberately has no canonical Store read. Inflate the audit table
+    // after its initial network attempts to prove response size does not track
+    // retained audit history; --inspect-store remains the canonical verifier.
+    let script = r#"
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1], timeout=1)
+connection.executemany(
+  'INSERT INTO exchange_audit_events VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL, ?, NULL, NULL, NULL, NULL, NULL, NULL, 0, ?, ?)',
+  [(f'audit-{n:04}', f'attempt:{n:064x}', f'nonce-{n}', 'outbound', 'outbound_request_prepared', 'incomplete', '{}', '0' * 64) for n in range(600)])
+connection.commit()
+print(connection.execute('SELECT count(*) FROM exchange_audit_events').fetchone()[0])
+"#;
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(&lab.configs[1].network.database_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse::<usize>()
+            .unwrap()
+            >= 600
+    );
+    let bytes = lab.control_bytes(1, br#"{"operation":"status"}"#).unwrap();
+    assert!(bytes.len() <= 16_384);
+    let status: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(status["kind"], "resident_observation");
+    assert_eq!(
+        status["canonical_inspection_available_via"],
+        "--inspect-store"
+    );
+    assert!(status.get("inspection").is_none());
+    lab.children[1].as_mut().unwrap().kill().unwrap();
+    lab.children[1].take().unwrap().wait().unwrap();
+    let _ = fs::remove_file(&lab.configs[1].control_socket);
+}
+
+#[test]
+fn append_busy_deadline_keeps_shutdown_responsive_and_retry_recovers_commit() {
+    let mut lab = Lab::new();
+    lab.configs[0].interval_ms = 60_000;
+    lab.configs[0].max_backoff_ms = 60_000;
+    lab.start(0);
+    let ready = lab._dir.path().join("sqlite-lock-ready");
+    let mut holder = Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('BEGIN IMMEDIATE'); open(sys.argv[2], 'w').close(); sys.stdin.read(); c.rollback()",
+        )
+        .arg(&lab.configs[0].network.database_path)
+        .arg(&ready)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    until(|| ready.exists(), Duration::from_secs(3));
+    let request = json!({
+        "operation":"append_observation",
+        "operation_id":"busy-deadline",
+        "scope":"s0",
+        "subject":"subject",
+        "value":"value",
+    });
+    let started = Instant::now();
+    let reply = lab.control_value(0, request.clone()).unwrap();
+    assert_eq!(reply["error"], "append_observation_uncertain");
+    assert!(started.elapsed() < Duration::from_millis(300));
+    let started = Instant::now();
+    let retry = lab.control_value(0, request.clone()).unwrap();
+    assert_eq!(retry["error"], "append_observation_busy");
+    assert!(started.elapsed() < Duration::from_millis(300));
+    let second = json!({
+        "operation":"append_observation",
+        "operation_id":"busy-second-operation",
+        "scope":"s0",
+        "subject":"subject",
+        "value":"second",
+    });
+    assert_eq!(
+        lab.control_value(0, second.clone()).unwrap()["error"],
+        "append_observation_busy"
+    );
+    let started = Instant::now();
+    assert_eq!(
+        lab.control(0, "shutdown").unwrap()["shutdown_requested"],
+        true
+    );
+    assert!(started.elapsed() < Duration::from_millis(300));
+    holder.stdin.take().unwrap().write_all(b"release").unwrap();
+    assert!(holder.wait().unwrap().success());
     let mut child = lab.children[0].take().unwrap();
     until(
         || child.try_wait().unwrap().is_some(),
         Duration::from_secs(15),
     );
-    assert!(!child.wait().unwrap().success());
-    assert!(!lab.configs[0].control_socket.exists());
+    assert!(child.wait().unwrap().success());
+    assert_eq!(lab.count(0), 1);
+    lab.start(0);
+    let replay = lab.control_value(0, request).unwrap();
+    assert_eq!(replay["replayed"], true);
+    let observed = lab.control_value(0, second).unwrap();
+    assert_eq!(observed["response"]["result"], "observed");
+    assert_eq!(lab.count(0), 2);
+    lab.stop(0);
+}
+
+#[test]
+fn status_remains_available_during_stalled_inbound_and_down_peer_attempts() {
+    let mut lab = Lab::new();
+    let passive = TcpListener::bind(lab.configs[0].network.peers[0].endpoint).unwrap();
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::sync_channel(1);
+    let passive_worker = thread::spawn(move || {
+        let (_stream, _) = passive.accept().unwrap();
+        accepted_tx.send(()).unwrap();
+        thread::sleep(Duration::from_secs(3));
+    });
+    lab.start(0);
+    accepted_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let mut stream = TcpStream::connect(lab.configs[0].network.bind).unwrap();
+    stream.write_all(&100_u32.to_be_bytes()).unwrap();
+    until(
+        || lab.status(0)["active_incoming"].as_u64().unwrap() > 0,
+        Duration::from_secs(2),
+    );
+    // The outgoing peer withholds its reply while the incoming partial frame
+    // holds another network worker. Every single status call must prove that
+    // both stalls are still active and remain independently bounded.
+    for _ in 0..4 {
+        let status = lab.status_once_within(0, Duration::from_millis(300));
+        assert_eq!(status["peers"]["r1"]["failures"], 0);
+        assert!(status["active_incoming"].as_u64().unwrap() > 0);
+        thread::sleep(Duration::from_millis(100));
+    }
+    drop(stream);
+    assert!(lab.children[0]
+        .as_mut()
+        .unwrap()
+        .try_wait()
+        .unwrap()
+        .is_none());
+    lab.stop(0);
+    passive_worker.join().unwrap();
+}
+
+#[test]
+fn status_is_diagnostic_when_external_inspection_source_is_unavailable() {
+    let mut lab = Lab::new();
+    lab.configs[0].interval_ms = 60_000;
+    lab.configs[0].max_backoff_ms = 60_000;
+    lab.start(0);
+    let path = &lab.configs[0].network.database_path;
+    fs::rename(path, path.with_extension("retained.sqlite")).unwrap();
+    fs::create_dir(path).unwrap();
+    // Live status deliberately has no Store inspection work; recovery is via the
+    // external --inspect-store command once the source is restored.
+    assert_eq!(lab.status(0)["kind"], "resident_observation");
+    fs::remove_dir(path).unwrap();
+    fs::rename(path.with_extension("retained.sqlite"), path).unwrap();
+    assert!(lab.children[0]
+        .as_mut()
+        .unwrap()
+        .try_wait()
+        .unwrap()
+        .is_none());
+    assert_eq!(lab.status(0)["kind"], "resident_observation");
+    lab.stop(0);
 }
 
 fn candidate(lab: &Lab, config: &Configuration) -> Command {
@@ -474,6 +898,82 @@ fn candidate_dirs(
         .arg("--runtime-dir")
         .arg(runtime);
     command
+}
+
+fn inspect_candidate(lab: &Lab, config: &Configuration) -> Command {
+    let path = lab._dir.path().join("inspect.json");
+    fs::write(&path, serde_json::to_vec(config).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_podmesh-manager-resident-lab"));
+    command
+        .env_remove("PODMESH_MANAGER_NETWORK_MODE")
+        .arg("--inspect-store")
+        .arg("--config")
+        .arg(path)
+        .arg("--state-dir")
+        .arg(lab._dir.path());
+    command
+}
+
+fn store_source_bytes(path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    ["", "-wal", "-shm"]
+        .into_iter()
+        .filter_map(|suffix| {
+            let mut candidate = path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            let candidate = std::path::PathBuf::from(candidate);
+            candidate
+                .exists()
+                .then(|| (suffix.into(), fs::read(candidate).unwrap()))
+        })
+        .collect()
+}
+
+#[test]
+fn inspect_store_is_network_independent_and_does_not_mutate_source() {
+    let lab = Lab::new();
+    lab.observe(0, "inspection-source", None);
+    let before = store_source_bytes(&lab.configs[0].network.database_path);
+    let mut inspection_config = lab.configs[0].clone();
+    inspection_config.network.bind = "127.0.0.1:0".parse().unwrap();
+    inspection_config.network.peers[0].shared_key_hex = "not-a-key".into();
+    inspection_config.interval_ms = 0;
+    inspection_config.max_backoff_ms = 0;
+    inspection_config.incoming_workers = 0;
+    let output = inspect_candidate(&lab, &inspection_config)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let inspection: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(inspection["schema_version"], 3);
+    assert_eq!(inspection["history_count"], 1);
+    assert_eq!(inspection["sqlite_integrity_result"], "ok");
+    assert_eq!(
+        before,
+        store_source_bytes(&lab.configs[0].network.database_path)
+    );
+
+    let missing = Lab::new();
+    let output = inspect_candidate(&missing, &missing.configs[0])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!missing.configs[0].network.database_path.exists());
+}
+
+#[test]
+fn hierarchical_owned_scope_uses_the_control_api() {
+    let mut lab = Lab::new();
+    lab.configs[0].network.manager.grants[0].scope = "s0/local".into();
+    lab.start(0);
+    let reply = lab.append(0, "hierarchical-scope", "s0/local", "subject", "value");
+    assert_eq!(reply["response"]["result"], "observed");
+    assert_eq!(lab.count(0), 1);
+    lab.stop(0);
 }
 
 #[test]

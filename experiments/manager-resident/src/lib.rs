@@ -1,6 +1,6 @@
 //! Bounded resident replication laboratory. No executable control authority.
 use fs2::FileExt;
-use podmesh_manager_ha_lab::durable::{Request, Response, Store};
+use podmesh_manager_ha_lab::durable::{DurableError, Request, Response, Store};
 use podmesh_manager_network_lab::{ConfigurationFile, ErrorSource};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,13 +16,24 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+enum AppendCompletion {
+    Observed(Vec<u8>),
+    Refused,
+    Uncertain,
+}
+type AppendJob = (mpsc::Receiver<AppendCompletion>, thread::JoinHandle<()>);
+
+enum AppendStartError {
+    Refused,
+    Busy,
+}
 
 pub mod cli;
 
@@ -31,6 +42,7 @@ pub mod cli;
 pub struct Configuration {
     pub network: ConfigurationFile,
     pub control_socket: PathBuf,
+    pub observation_writer_uid: u32,
     pub interval_ms: u64,
     pub max_backoff_ms: u64,
     pub incoming_workers: usize,
@@ -38,6 +50,7 @@ pub struct Configuration {
 
 impl Configuration {
     pub fn validate(&self) -> Result<()> {
+        self.validate_inspection()?;
         self.network.validate()?;
         if !(100..=60_000).contains(&self.interval_ms)
             || !(self.interval_ms..=300_000).contains(&self.max_backoff_ms)
@@ -46,22 +59,41 @@ impl Configuration {
         {
             return Err("invalid interval, backoff, workers or peer count".into());
         }
-        if !self.network.database_path.is_absolute()
-            || !self.control_socket.is_absolute()
-            || self.control_socket.as_os_str().len() > 100
+        if !self.network.database_path.is_absolute() {
+            return Err("database requires a bounded absolute local path".into());
+        }
+        if !self.control_socket.is_absolute() || self.control_socket.as_os_str().len() > 100 {
+            return Err("control socket requires a bounded absolute local path".into());
+        }
+        if self.network.bind.port() == 0
+            || self
+                .network
+                .peers
+                .iter()
+                .any(|peer| peer.endpoint.port() == 0)
         {
-            return Err("database and socket require bounded absolute local paths".into());
+            return Err("static endpoints require nonzero ports".into());
         }
         let parent = self.control_socket.parent().ok_or("socket has no parent")?;
         let metadata = fs::symlink_metadata(parent)?;
         if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
             return Err("control socket parent must be a private directory".into());
         }
-        if self.network.bind.port() == 0
-            || self.network.peers.iter().any(|p| p.endpoint.port() == 0)
-        {
-            return Err("static endpoints require nonzero ports".into());
+        Ok(())
+    }
+
+    pub(crate) fn validate_inspection(&self) -> Result<()> {
+        validate_control_token(&self.network.manager.logical_manager_id)?;
+        for replica in &self.network.manager.replicas {
+            validate_control_token(&replica.replica_id)?;
+            validate_control_token(&replica.host_id)?;
         }
+        for grant in &self.network.manager.grants {
+            validate_control_scope(&grant.scope)?;
+            validate_control_token(&grant.owner_replica_id)?;
+        }
+        let topology = self.network.manager.topology()?;
+        topology.instantiate(&self.network.replica_id)?;
         Ok(())
     }
 }
@@ -82,11 +114,12 @@ pub struct PeerStatus {
 struct Status {
     kind: &'static str,
     replica_id: String,
-    inspection: Response,
+    canonical_inspection_available_via: &'static str,
     peers: BTreeMap<String, PeerStatus>,
     active_incoming: usize,
     peak_incoming: usize,
     rejected_connections: usize,
+    append_worker_failures: usize,
     incoming_limit: usize,
     outgoing_limit: usize,
     activation_authority: bool,
@@ -100,6 +133,16 @@ struct Shared {
     peak: AtomicUsize,
     rejected: AtomicUsize,
     peers: Mutex<PeerStates>,
+    append_job_active: AtomicBool,
+    append_worker_failures: AtomicUsize,
+}
+
+struct AppendJobGuard(Arc<Shared>);
+
+impl Drop for AppendJobGuard {
+    fn drop(&mut self) {
+        self.0.append_job_active.store(false, Ordering::SeqCst);
+    }
 }
 
 fn store(config: &Configuration) -> Result<Store> {
@@ -128,11 +171,12 @@ fn status(config: &Configuration, shared: &Shared) -> Result<Status> {
     Ok(Status {
         kind: "resident_observation",
         replica_id: config.network.replica_id.clone(),
-        inspection: store(config)?.execute(&Request::Inspect {})?,
+        canonical_inspection_available_via: "--inspect-store",
         peers,
         active_incoming: shared.active.load(Ordering::SeqCst),
         peak_incoming: shared.peak.load(Ordering::SeqCst),
         rejected_connections: shared.rejected.load(Ordering::SeqCst),
+        append_worker_failures: shared.append_worker_failures.load(Ordering::SeqCst),
         incoming_limit: config.incoming_workers,
         outgoing_limit: 1,
         activation_authority: false,
@@ -148,6 +192,134 @@ fn millis(duration: Duration) -> u64 {
 enum Control {
     Status {},
     Shutdown {},
+    AppendObservation {
+        operation_id: String,
+        scope: String,
+        subject: String,
+        value: String,
+    },
+}
+
+fn validate_control_token(value: &str) -> Result<()> {
+    if (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        Ok(())
+    } else {
+        Err("control token must be 1-128 safe ASCII characters".into())
+    }
+}
+
+fn validate_control_scope(value: &str) -> Result<()> {
+    if !(1..=128).contains(&value.len())
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.split('/').any(|segment| {
+            segment.is_empty()
+                || matches!(segment, "." | "..")
+                || !segment.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+                })
+        })
+    {
+        return Err("control scope must be a bounded safe hierarchical token".into());
+    }
+    Ok(())
+}
+
+fn validate_control_value(value: &str) -> Result<()> {
+    if !value.is_empty() && value.len() <= 4096 {
+        Ok(())
+    } else {
+        Err("control value must be nonempty UTF-8 and at most 4096 bytes".into())
+    }
+}
+
+fn authorize_append_observation(
+    config: &Configuration,
+    stream: &UnixStream,
+    operation_id: &str,
+    scope: &str,
+    subject: &str,
+    value: &str,
+) -> Result<()> {
+    validate_control_token(operation_id)?;
+    if operation_id.starts_with("network:") {
+        return Err("network operation IDs are reserved".into());
+    }
+    validate_control_scope(scope)?;
+    validate_control_token(subject)?;
+    validate_control_value(value)?;
+    let peer = rustix::net::sockopt::socket_peercred(stream)?;
+    if peer.uid.as_raw() != config.observation_writer_uid {
+        return Err("observation writer UID refused".into());
+    }
+    Ok(())
+}
+
+fn append_observation_store(
+    config: &Configuration,
+    operation_id: String,
+    scope: String,
+    subject: String,
+    value: String,
+) -> AppendCompletion {
+    let mut store = match store(config) {
+        Ok(store) => store,
+        Err(_) => return AppendCompletion::Uncertain,
+    };
+    let executed = match store.execute_with_receipt(&Request::Observe {
+        operation_id,
+        scope,
+        subject,
+        exclusive_resource: None,
+        active_claim: false,
+        value,
+    }) {
+        Ok(executed) => executed,
+        Err(DurableError::Refused(_)) => return AppendCompletion::Refused,
+        Err(
+            DurableError::Corrupt(_) | DurableError::Storage(_) | DurableError::InvalidAudit(_),
+        ) => return AppendCompletion::Uncertain,
+    };
+    match serde_json::to_vec(&executed) {
+        Ok(response) => AppendCompletion::Observed(response),
+        Err(_) => AppendCompletion::Uncertain,
+    }
+}
+
+fn start_append_observation(
+    config: &Configuration,
+    shared: &Arc<Shared>,
+    stream: &UnixStream,
+    operation_id: String,
+    scope: String,
+    subject: String,
+    value: String,
+) -> std::result::Result<AppendJob, AppendStartError> {
+    // This authorization and validation completes before the worker can call
+    // Store::open. A concurrent request receives a typed busy result rather than being queued
+    // behind a slow SQLite transaction, so the control loop remains responsive.
+    authorize_append_observation(config, stream, &operation_id, &scope, &subject, &value)
+        .map_err(|_| AppendStartError::Refused)?;
+    if shared
+        .append_job_active
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err(AppendStartError::Busy);
+    }
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let config = config.clone();
+    let state = Arc::clone(shared);
+    let worker = thread::spawn(move || {
+        let _active = AppendJobGuard(state);
+        let completion = append_observation_store(&config, operation_id, scope, subject, value);
+        let _ = sender.send(completion);
+    });
+    Ok((receiver, worker))
 }
 
 /// Runs until the private typed control interface requests graceful shutdown.
@@ -174,6 +346,8 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
         active: AtomicUsize::new(0),
         peak: AtomicUsize::new(0),
         rejected: AtomicUsize::new(0),
+        append_job_active: AtomicBool::new(false),
+        append_worker_failures: AtomicUsize::new(0),
         peers: Mutex::new(
             config
                 .network
@@ -199,6 +373,7 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
     let outgoing_shared = Arc::clone(&shared);
     let outgoing = thread::spawn(move || synchronize(&outgoing_config, &outgoing_shared));
     let mut workers = Vec::new();
+    let mut append_workers = Vec::new();
     let result = (|| -> Result<()> {
         while !shared.stopping.load(Ordering::SeqCst) {
             if outgoing.is_finished() {
@@ -213,6 +388,17 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
                         .map_err(|_| "incoming worker panicked")?;
                 } else {
                     index += 1;
+                }
+            }
+            let mut append_index = 0;
+            while append_index < append_workers.len() {
+                if thread::JoinHandle::is_finished(&append_workers[append_index]) {
+                    let worker = append_workers.swap_remove(append_index);
+                    if worker.join().is_err() {
+                        shared.append_worker_failures.fetch_add(1, Ordering::SeqCst);
+                    }
+                } else {
+                    append_index += 1;
                 }
             }
             match listener.accept() {
@@ -238,27 +424,84 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
             }
             match control.accept() {
                 Ok((mut stream, _)) => {
-                    stream.set_read_timeout(Some(Duration::from_millis(250)))?;
-                    stream.set_write_timeout(Some(Duration::from_millis(250)))?;
-                    let response = match read_control(&mut stream) {
+                    let deadline = Instant::now() + CONTROL_DEADLINE;
+                    stream.set_read_timeout(Some(CONTROL_DEADLINE))?;
+                    stream.set_write_timeout(Some(CONTROL_DEADLINE))?;
+                    let response = match read_control(&mut stream, deadline) {
                         Ok(bytes) => match serde_json::from_slice::<Control>(&bytes) {
-                            Ok(Control::Status {}) => {
-                                serde_json::to_vec(&status(&config, &shared)?)?
-                            }
+                            Ok(Control::Status {}) => match status(&config, &shared) {
+                                Ok(status) => serde_json::to_vec(&status).unwrap_or_else(|_| {
+                                    b"{\"error\":\"status_unavailable\"}".to_vec()
+                                }),
+                                Err(_) => b"{\"error\":\"status_unavailable\"}".to_vec(),
+                            },
                             Ok(Control::Shutdown {}) => {
                                 shared.stopping.store(true, Ordering::SeqCst);
                                 b"{\"shutdown_requested\":true}".to_vec()
                             }
+                            Ok(Control::AppendObservation {
+                                operation_id,
+                                scope,
+                                subject,
+                                value,
+                            }) => match start_append_observation(
+                                &config,
+                                &shared,
+                                &stream,
+                                operation_id,
+                                scope,
+                                subject,
+                                value,
+                            ) {
+                                Ok((receiver, worker)) => {
+                                    let wait = deadline
+                                        .saturating_duration_since(Instant::now())
+                                        .saturating_sub(CONTROL_WRITE_RESERVE);
+                                    match receiver.recv_timeout(wait) {
+                                        Ok(AppendCompletion::Observed(response)) => {
+                                            let _ = worker.join();
+                                            response
+                                        }
+                                        Ok(AppendCompletion::Refused) => {
+                                            let _ = worker.join();
+                                            b"{\"error\":\"append_observation_refused\"}".to_vec()
+                                        }
+                                        Ok(AppendCompletion::Uncertain) => {
+                                            let _ = worker.join();
+                                            b"{\"error\":\"append_observation_uncertain\"}".to_vec()
+                                        }
+                                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                            if worker.join().is_err() {
+                                                shared
+                                                    .append_worker_failures
+                                                    .fetch_add(1, Ordering::SeqCst);
+                                            }
+                                            b"{\"error\":\"append_observation_uncertain\"}".to_vec()
+                                        }
+                                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                                            append_workers.push(worker);
+                                            b"{\"error\":\"append_observation_uncertain\"}".to_vec()
+                                        }
+                                    }
+                                }
+                                Err(AppendStartError::Busy) => {
+                                    b"{\"error\":\"append_observation_busy\"}".to_vec()
+                                }
+                                Err(AppendStartError::Refused) => {
+                                    b"{\"error\":\"append_observation_refused\"}".to_vec()
+                                }
+                            },
                             Err(_) => b"{\"error\":\"invalid typed control request\"}".to_vec(),
                         },
                         _ => b"{\"error\":\"control request bound exceeded\"}".to_vec(),
                     };
-                    if response.len() <= 524_288 {
-                        let _ = write_control(&mut stream, &response);
+                    if response.len() <= CONTROL_RESPONSE_MAX {
+                        let _ = write_control(&mut stream, &response, deadline);
                     } else {
                         let _ = write_control(
                             &mut stream,
-                            b"{\"error\":\"status exceeds response limit\"}",
+                            b"{\"error\":\"control response exceeds bound\"}",
+                            deadline,
                         );
                     }
                 }
@@ -279,6 +522,11 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
     for worker in workers {
         join_failed |= worker.join().is_err();
     }
+    for worker in append_workers {
+        if worker.join().is_err() {
+            shared.append_worker_failures.fetch_add(1, Ordering::SeqCst);
+        }
+    }
     let outgoing_result = outgoing.join();
     cleanup?;
     if join_failed {
@@ -288,8 +536,11 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
     result
 }
 
-fn read_control(stream: &mut UnixStream) -> Result<Vec<u8>> {
-    let deadline = Instant::now() + Duration::from_millis(250);
+const CONTROL_DEADLINE: Duration = Duration::from_millis(250);
+const CONTROL_WRITE_RESERVE: Duration = Duration::from_millis(25);
+const CONTROL_RESPONSE_MAX: usize = 32_768;
+
+fn read_control(stream: &mut UnixStream, deadline: Instant) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 257];
     loop {
@@ -305,14 +556,13 @@ fn read_control(stream: &mut UnixStream) -> Result<Vec<u8>> {
             return Ok(bytes);
         }
         bytes.extend_from_slice(&chunk[..read]);
-        if bytes.len() > 256 {
+        if bytes.len() > 32_768 {
             return Err("control size exceeded".into());
         }
     }
 }
 
-fn write_control(stream: &mut UnixStream, mut bytes: &[u8]) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_millis(250);
+fn write_control(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> Result<()> {
     while !bytes.is_empty() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -330,6 +580,25 @@ fn write_control(stream: &mut UnixStream, mut bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn record_local_failure(
+    config: &Configuration,
+    shared: &Shared,
+    backoffs: &mut BTreeMap<String, u64>,
+    peer_id: &str,
+    local_history_len: Option<usize>,
+) -> Result<()> {
+    let mut peers = shared.peers.lock().map_err(|_| "status lock poisoned")?;
+    let (state, _, next) = peers.get_mut(peer_id).ok_or("unknown peer")?;
+    state.local_history_len_at_attempt = local_history_len;
+    state.history_count_delta = None;
+    state.failures = state.failures.saturating_add(1);
+    state.outcome = "local_exchange_failure".into();
+    let backoff = backoffs.entry(peer_id.into()).or_insert(config.interval_ms);
+    *backoff = backoff.saturating_mul(2).min(config.max_backoff_ms);
+    *next = Instant::now() + Duration::from_millis(*backoff);
+    Ok(())
+}
+
 fn synchronize(config: &Configuration, shared: &Shared) -> Result<()> {
     let mut backoffs = BTreeMap::new();
     // Reuse one operation ID for an unchanged observed snapshot. Fresh IDs after
@@ -344,25 +613,42 @@ fn synchronize(config: &Configuration, shared: &Shared) -> Result<()> {
             if Instant::now() < due {
                 continue;
             }
-            let local = store(config)?.execute(&Request::Export {})?;
-            let Response::Snapshot { snapshot } = &local else {
-                return Err("invalid store export".into());
+            // A live SQLite snapshot can transiently refuse an open while another
+            // bounded operation is committing. That is a peer-attempt failure, not
+            // a resident-fatal condition: leave the control service available and
+            // retry it through the existing bounded backoff.
+            let local = match store(config)
+                .and_then(|mut store| Ok(store.execute(&Request::Export {})?))
+            {
+                Ok(Response::Snapshot { snapshot }) => snapshot,
+                Ok(_) | Err(_) => {
+                    record_local_failure(config, shared, &mut backoffs, &peer.replica_id, None)?;
+                    continue;
+                }
             };
-            let digest = Sha256::digest(serde_json::to_vec(snapshot)?).to_vec();
+            let digest = Sha256::digest(serde_json::to_vec(&local)?).to_vec();
             let operation = operations
                 .entry(peer.replica_id.clone())
                 .or_insert_with(|| (Vec::new(), String::new()));
             if operation.0 != digest {
                 *operation = (digest, random_token()?);
             }
-            let outcome =
-                config
-                    .network
-                    .open()?
-                    .sync_to(&peer.replica_id, &operation.1, &random_token()?);
+            let outcome = match config.network.open() {
+                Ok(mut node) => node.sync_to(&peer.replica_id, &operation.1, &random_token()?),
+                Err(_) => {
+                    record_local_failure(
+                        config,
+                        shared,
+                        &mut backoffs,
+                        &peer.replica_id,
+                        Some(local.facts.len()),
+                    )?;
+                    continue;
+                }
+            };
             let mut peers = shared.peers.lock().map_err(|_| "status lock poisoned")?;
             let (state, success, next) = peers.get_mut(&peer.replica_id).ok_or("unknown peer")?;
-            state.local_history_len_at_attempt = Some(snapshot.facts.len());
+            state.local_history_len_at_attempt = Some(local.facts.len());
             let backoff = backoffs
                 .entry(peer.replica_id.clone())
                 .or_insert(config.interval_ms);
@@ -371,7 +657,7 @@ fn synchronize(config: &Configuration, shared: &Shared) -> Result<()> {
                     state.authenticated_successes = state.authenticated_successes.saturating_add(1);
                     state.acknowledged_history_len = Some(receipt.history_len);
                     state.history_count_delta =
-                        Some(receipt.history_len as i128 - snapshot.facts.len() as i128);
+                        Some(receipt.history_len as i128 - local.facts.len() as i128);
                     state.outcome = "authenticated_import_receipt".into();
                     *success = Some(Instant::now());
                     *backoff = config.interval_ms;
@@ -381,13 +667,14 @@ fn synchronize(config: &Configuration, shared: &Shared) -> Result<()> {
                     // it to a fresh local count as if the failed peer were current.
                     state.history_count_delta = None;
                     state.failures = state.failures.saturating_add(1);
-                    state.outcome =
-                        if error.source() == ErrorSource::UnauthenticatedRemoteDiagnostic {
+                    state.outcome = match error.source() {
+                        ErrorSource::UnauthenticatedRemoteDiagnostic => {
                             "unauthenticated_remote_diagnostic"
-                        } else {
-                            "local_exchange_failure"
                         }
-                        .into();
+                        ErrorSource::AuthenticatedRemoteRefusal => "authenticated_remote_refusal",
+                        ErrorSource::Local => "local_exchange_failure",
+                    }
+                    .into();
                     *backoff = backoff.saturating_mul(2).min(config.max_backoff_ms);
                 }
             }

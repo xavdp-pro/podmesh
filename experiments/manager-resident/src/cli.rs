@@ -1,5 +1,6 @@
 //! Strict offline validation and explicit network opt-in for the package candidate.
 use crate::{Configuration, Result};
+use podmesh_manager_ha_lab::durable::inspect_read_only;
 use std::{
     ffi::{OsStr, OsString},
     fs,
@@ -17,6 +18,7 @@ struct Options {
     state: Option<PathBuf>,
     runtime: Option<PathBuf>,
     validate: bool,
+    inspect_store: bool,
 }
 
 pub fn require_network_mode() -> Result<()> {
@@ -49,6 +51,19 @@ pub fn execute(arguments: impl Iterator<Item = OsString>) -> Result<()> {
         .as_deref()
         .or_else(|| config.network.database_path.parent())
         .ok_or("state directory missing")?;
+    if options.inspect_store {
+        validate_inspection_paths(&config, state)?;
+        config.validate_inspection()?;
+        println!(
+            "{}",
+            serde_json::to_string(&inspect_read_only(
+                &config.network.database_path,
+                &config.network.manager,
+                &config.network.replica_id,
+            )?)?
+        );
+        return Ok(());
+    }
     let runtime = options
         .runtime
         .as_deref()
@@ -74,12 +89,14 @@ fn parse(args: &[OsString]) -> Result<Options> {
             state: None,
             runtime: None,
             validate: false,
+            inspect_store: false,
         });
     }
     let mut config = None;
     let mut state = None;
     let mut runtime = None;
     let mut validate = false;
+    let mut inspect_store = false;
     let mut index = 0;
     while index < args.len() {
         let name = args[index].to_str().ok_or("invalid flag")?;
@@ -88,6 +105,14 @@ fn parse(args: &[OsString]) -> Result<Options> {
                 return Err("duplicate --validate-config".into());
             }
             validate = true;
+            index += 1;
+            continue;
+        }
+        if name == "--inspect-store" {
+            if inspect_store {
+                return Err("duplicate --inspect-store".into());
+            }
+            inspect_store = true;
             index += 1;
             continue;
         }
@@ -108,11 +133,22 @@ fn parse(args: &[OsString]) -> Result<Options> {
         *target = Some(PathBuf::from(value));
         index += 1;
     }
+    if inspect_store && validate {
+        return Err("--inspect-store cannot be combined with --validate-config".into());
+    }
+    if inspect_store && runtime.is_some() {
+        return Err("--inspect-store does not accept --runtime-dir".into());
+    }
     Ok(Options {
         config: config.ok_or("--config required")?,
         state: Some(state.ok_or("--state-dir required")?),
-        runtime: Some(runtime.ok_or("--runtime-dir required")?),
+        runtime: if inspect_store {
+            None
+        } else {
+            Some(runtime.ok_or("--runtime-dir required")?)
+        },
         validate,
+        inspect_store,
     })
 }
 
@@ -189,21 +225,12 @@ fn trusted_file(path: &Path, missing_allowed: bool) -> Result<()> {
 }
 
 fn validate_paths(config: &Configuration, state: &Path, runtime: &Path) -> Result<()> {
-    directory(state, false)?;
+    validate_state_paths(config, state, true)?;
     directory(runtime, true)?;
-    let db = &config.network.database_path;
     let socket = &config.control_socket;
-    lexical(db)?;
     lexical(socket)?;
-    if db.parent() != Some(state) || socket.parent() != Some(runtime) {
+    if socket.parent() != Some(runtime) {
         return Err("database/socket must be direct children of declared directories".into());
-    }
-    trusted_file(db, true)?;
-    trusted_file(&db.with_extension("resident-lock"), true)?;
-    for suffix in ["-wal", "-shm"] {
-        let mut path = db.as_os_str().to_os_string();
-        path.push(suffix);
-        trusted_file(Path::new(&path), true)?;
     }
     match fs::symlink_metadata(socket) {
         Ok(metadata)
@@ -213,6 +240,33 @@ fn validate_paths(config: &Configuration, state: &Path, runtime: &Path) -> Resul
         Ok(_) => return Err("existing control path must be an owned private Unix socket".into()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn validate_inspection_paths(config: &Configuration, state: &Path) -> Result<()> {
+    validate_state_paths(config, state, false)
+}
+
+fn validate_state_paths(
+    config: &Configuration,
+    state: &Path,
+    database_missing_allowed: bool,
+) -> Result<()> {
+    directory(state, false)?;
+    let db = &config.network.database_path;
+    lexical(db)?;
+    if db.parent() != Some(state) {
+        return Err("database must be a direct child of the declared state directory".into());
+    }
+    trusted_file(db, database_missing_allowed)?;
+    if database_missing_allowed {
+        trusted_file(&db.with_extension("resident-lock"), true)?;
+    }
+    for suffix in ["-wal", "-shm"] {
+        let mut path = db.as_os_str().to_os_string();
+        path.push(suffix);
+        trusted_file(Path::new(&path), true)?;
     }
     Ok(())
 }

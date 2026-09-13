@@ -46,7 +46,7 @@ documented experimental scope.
 | MR-05 | Authentication/atomicity | Wrong key yields no authenticated successes/imports; correctly signed valid-then-invalid batch reaches durable validator and commits zero facts |
 | MR-06 | Admission/frame/shutdown | Thirty connections remain at two workers; excess counted; shutdown drains; oversize/trickle cannot mutate history |
 | MR-07 | Config and duplicate instance | Invalid bounds/unknown fields refused; second resident with distinct free bind/socket but same DB lock cannot start |
-| MR-08 | Error/control regressions | Extra fields on status/shutdown refused without process exit; store failure terminates and removes owned socket; partition yields null count delta after fresh local attempt |
+| MR-08 | Earlier error/control regressions | At the recorded package-candidate increment, extra fields on status/shutdown were refused, a status Store failure terminated and cleaned the socket, and partition reset the count delta. The Stage R increment below supersedes the status/store behavior. |
 
 Eight integration tests passed at that increment. Tests inspect durable state through independently
 opened Store instances and the typed status interface, beyond process existence.
@@ -72,3 +72,66 @@ No installed hosts, customer services, power failures, encrypted tunnels, DNS,
 Podman activation or fencing were tested. Flood shutdown passes a 15-second test
 deadline; that is not a guarantee under arbitrary storage/OS stalls. Exact causal
 lag, retention, lost receipts, admission fairness and HA remain unproven.
+
+## Stage R observation and read-only inspection increment
+
+Date: 2026-09-13. Scope: resident source, disposable loopback processes and
+SQLite stores. No package, service, host, network-policy or deployed-system
+change was made.
+
+The resident requires `observation_writer_uid`. A Unix `append_observation`
+request is credential-checked before a worker can call Store and has no authority
+fields: it creates only a nonexclusive, inactive `Observe` request. The regression
+covers successful UID-bound append, replay and conflicting operation-ID reuse;
+unauthorized UID with no observation committed; rejected authority fields,
+reserved `network:` operations and invalid token/scope/value input; disconnect
+after durable commit followed by restart/replay; and changed operation content
+after restart refusal.
+
+One append worker is admitted at a time. Read, worker wait and response share an
+absolute 250 ms connection deadline. The SQLite `BEGIN IMMEDIATE` proof holds an
+external write transaction, receives `append_observation_uncertain` before that
+budget, then an immediate identical retry receives `append_observation_busy`
+without admitting another worker. It receives shutdown promptly, releases the
+lock, drains the child, and
+retries the same request to recover its committed receipt. This proves bounded
+control response and idempotent recovery, not cancellation of SQLite work.
+
+The raw control frame limit is 32,768 bytes, while decoded nonempty UTF-8 values
+remain limited to 4,096 bytes. Process tests exercise backslash-heavy and maximally JSON-escaped control-character
+4,096-byte values
+and exact 32,768/32,769-byte raw frames. Scope tests cover hierarchical owned
+scopes and reject empty, traversal, leading/trailing or malformed segments.
+
+Live status is intentionally a compact diagnostic, with no Store call and no
+canonical durable output. A regression inflates the durable audit table beyond
+600 rows after initial attempts, then proves `resident_observation` remains within the 32,768-byte response bound and points canonical verification to `--inspect-store`.
+A one-shot sub-300 ms regression proves status remains available while one
+outgoing peer has accepted a request but withholds its reply and an incoming peer
+simultaneously stalls a partial frame. Canonical inspection
+remains external/offline through `--inspect-store`.
+
+`--inspect-store` requires only config and state directory. Its process proof uses
+unusable bind, peer key, interval, backoff and worker settings and still obtains a
+canonical read-only inspection; it compares the main DB source bytes before and
+after and verifies a missing store is refused without creation. This run does not
+claim preservation of live WAL/SHM sidecars, independent privileged-writer
+concurrency, or a root inspection path for service-account-owned state. The
+durable inspector copies its source below `$TMPDIR`.
+
+The status/shutdown controls rely on the private `0600` socket; they have no
+separate peer-UID authorization. Stage P must define their policy before any
+socket ACL/group broadening.
+
+The 2026-09-13 recorded checks passed: resident process suite 22/22, strict
+resident Clippy and formatting, and `git diff --check`; manager-network
+regressions 28 plus one three-process test; manager-ha regressions 10 plus 69,
+with one documented helper test ignored. The three-process test routes normal
+observations through the Unix append API; direct Store observations remain only
+for the explicit lower-layer exclusive-conflict setup.
+
+No UID/group ACL deployment design, package account, external writer admission,
+real host permission proof, system service, HA/failover, activation or fencing
+claim follows from these tests. The package-facing private `0600` socket currently
+makes UID 0 or the service account the practical writer boundary; Stage P owns any
+group/ACL design.
