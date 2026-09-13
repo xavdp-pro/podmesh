@@ -28,6 +28,14 @@ grep -q '^Restart=no$' "$work/extracted/usr/lib/systemd/system/podmesh-manager.s
 grep -q '^IPAddressDeny=any$' "$work/extracted/usr/lib/systemd/system/podmesh-manager.service"
 grep -q '^RestrictAddressFamilies=AF_UNIX$' "$work/extracted/usr/lib/systemd/system/podmesh-manager.service"
 grep -q '^Package: podmesh-manager$' "$work/control/control"
+python3 - "$work/extracted/usr/share/podmesh-manager/config.example.json" <<'PY'
+import json, sys
+config = json.load(open(sys.argv[1], encoding="utf-8"))
+writer_uid = config["observation_writer_uid"]
+assert type(writer_uid) is int and writer_uid == 0
+assert config["control_socket"] == "/run/podmesh-manager/control.sock"
+assert config["network"]["manager"]["grants"] == []
+PY
 test ! -e "$work/control/preinst"
 cat > "$work/expected-postinst" <<'SCRIPT'
 #!/bin/sh

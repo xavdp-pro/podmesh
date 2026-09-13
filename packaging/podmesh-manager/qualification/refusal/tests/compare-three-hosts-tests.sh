@@ -58,6 +58,7 @@ def host(index):
                 "logical_manager_commitment": logical,
                 "local_replica_commitment": replicas[index],
                 "local_host_commitment": hosts[index],
+                "observation_writer_uid": 0,
                 "topology_commitment": topology,
                 "peer_count": 2,
                 "peers": sorted(peers, key=lambda peer: peer["replica_id_commitment"]),
@@ -162,7 +163,7 @@ PY
 
 args=(--summary "$work/summary.json" "$work/lab-0.json" "$work/lab-1.json" "$work/lab-2.json")
 "$compare" "${args[@]}" > "$work/pass.json"
-jq -e '.result=="PASS" and .host_aliases==["lab-a","lab-b","lab-c"] and .topology.peer_endpoint_bindings_match and .topology.symmetric_distinct_pair_keys and .private_values=="absent"' "$work/pass.json" >/dev/null
+jq -e '.result=="PASS" and .host_aliases==["lab-a","lab-b","lab-c"] and .observation_writer_uid==0 and .topology.one_observation_writer_uid and .topology.peer_endpoint_bindings_match and .topology.symmetric_distinct_pair_keys and .private_values=="absent"' "$work/pass.json" >/dev/null
 cp "$work/lab-0.json" "$work/lab-0-pristine.json"
 
 expect_failure() {
@@ -203,6 +204,14 @@ elif sys.argv[2] == "invalid-config-owner":
     data["configuration"]["metadata"]["uid"] = 103
 elif sys.argv[2] == "invalid-runtime-owner":
     data["offline_validation"]["runtime"]["metadata"]["uid"] = 999
+elif sys.argv[2] == "missing-observation-writer-uid":
+    del data["configuration"]["commitments"]["observation_writer_uid"]
+elif sys.argv[2] == "nonzero-observation-writer-uid":
+    data["configuration"]["commitments"]["observation_writer_uid"] = 1000
+elif sys.argv[2] == "tampered-observation-writer-uid":
+    data["configuration"]["commitments"]["observation_writer_uid"] = "0"
+elif sys.argv[2] == "one-host-grant-drift":
+    data["configuration"]["commitments"]["topology_commitment"] = "sha256:" + "1" * 64
 else:
     raise SystemExit("unknown mutation")
 path.write_text(json.dumps(data), encoding="utf-8")
@@ -231,5 +240,13 @@ mutate invalid-config-owner
 expect_failure
 mutate invalid-runtime-owner
 expect_failure
+mutate missing-observation-writer-uid
+expect_failure
+mutate nonzero-observation-writer-uid
+expect_failure
+mutate tampered-observation-writer-uid
+expect_failure
+mutate one-host-grant-drift
+expect_failure
 
-printf '%s\n' 'PASS: three-host refusal comparison recomputes identity, topology, reciprocal endpoints, symmetric pair keys, privacy and fail-closed observations.'
+printf '%s\n' 'PASS: three-host refusal comparison recomputes identity, canonical topology, writer UID, reciprocal endpoints, symmetric pair keys, privacy and fail-closed observations.'

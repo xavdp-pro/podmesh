@@ -137,8 +137,7 @@ def validate_socket(path, socket_path, value):
         raise ValueError(f"{path}: socket absence is not explicit for {socket_path}")
 
 
-def load(path):
-    value = read_json(path)
+def validate_host_value(path, value):
     required = {"schema_version", "stage", "host_alias", "captured_at_utc", "boot_id_commitment", "packages", "services", "sockets", "podman_rootful", "manager"}
     if not isinstance(value, dict) or set(value) != required or value.get("schema_version") != SCHEMA:
         raise ValueError(f"{path}: invalid evidence schema")
@@ -175,6 +174,10 @@ def load(path):
     for socket_path in EXISTING_SOCKETS:
         validate_socket(path, socket_path, value["sockets"][socket_path])
     return value
+
+
+def load(path):
+    return validate_host_value(path, read_json(path))
 
 
 def load_candidate(report_path, contract_path):

@@ -93,15 +93,26 @@ EOF
 cat > "$work/bin/systemctl" <<'EOF'
 #!/bin/sh
 unit=${2-}
+if [ -n "${PODMESH_SYSTEMCTL_COUNTER:-}" ]; then
+  count=0
+  [ ! -f "$PODMESH_SYSTEMCTL_COUNTER" ] || count=$(cat -- "$PODMESH_SYSTEMCTL_COUNTER")
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$PODMESH_SYSTEMCTL_COUNTER"
+else
+  count=0
+fi
 case "$unit" in
   podmesh.service)
+    main_pid=101
+    if [ "${PODMESH_MUTATE_HOST_EVIDENCE:-0}" = 1 ] && [ "$count" -gt 3 ]; then main_pid=303; fi
     cat <<'OUT'
 LoadState=loaded
 ActiveState=active
 SubState=running
 UnitFileState=enabled
-MainPID=101
-ExecMainPID=101
+OUT
+    printf 'MainPID=%s\nExecMainPID=%s\n' "$main_pid" "$main_pid"
+    cat <<'OUT'
 InvocationID=11111111111111111111111111111111
 ExecMainStartTimestampMonotonic=1000000
 NRestarts=0
@@ -150,7 +161,24 @@ OUT
   *) exit 74 ;;
 esac
 EOF
-chmod +x "$work/bin/id" "$work/bin/stat" "$work/bin/getent" "$work/bin/readlink" "$work/bin/dpkg-query" "$work/bin/dpkg" "$work/bin/systemctl"
+cat > "$work/bin/sha256sum" <<'EOF'
+#!/bin/sh
+if [ "$#" -gt 0 ]; then exec /usr/bin/sha256sum "$@"; fi
+material=$(mktemp)
+trap 'rm -f -- "$material"' EXIT
+cat > "$material"
+/usr/bin/sha256sum -- "$material" | awk '{print $1 "  -"}'
+if [ -n "${PODMESH_COMMIT_COUNTER:-}" ] && grep -aFq -- "${PODMESH_COMMIT_LABEL:-unused}" "$material"; then
+  count=0
+  [ ! -f "$PODMESH_COMMIT_COUNTER" ] || count=$(cat -- "$PODMESH_COMMIT_COUNTER")
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$PODMESH_COMMIT_COUNTER"
+  if [ "$count" -eq 1 ] && [ -n "${PODMESH_MUTATION_TARGET:-}" ]; then
+    printf '%s\n' 'concurrent mutation' >> "$PODMESH_MUTATION_TARGET"
+  fi
+fi
+EOF
+chmod +x "$work/bin/id" "$work/bin/stat" "$work/bin/getent" "$work/bin/readlink" "$work/bin/dpkg-query" "$work/bin/dpkg" "$work/bin/systemctl" "$work/bin/sha256sum"
 
 printf '%s' weak > "$work/weak-salt"
 chmod 600 "$work/weak-salt"
@@ -304,6 +332,74 @@ if run_post_install_collector "$work/changed-postinst.json" >"$work/changed-post
 fi
 test ! -e "$work/changed-postinst.json"
 grep -Fq 'Installed package content differs from candidate verification' "$work/changed-postinst.err"
+printf '%s\n' '#!/bin/sh' 'set -e' > "$control_root/postinst"
+chmod 755 "$control_root/postinst"
+
+mkdir -p "$installed_root/etc/podmesh-manager" "$installed_root/var/lib/podmesh-manager"
+printf '%s\n' '{"network_enabled":false}' > "$installed_root/etc/podmesh-manager/config.json"
+printf '%s\n' 'durable manager state' > "$installed_root/var/lib/podmesh-manager/state.db"
+run_upgrade_collector() {
+  local stage=$1 output=$2
+  shift 2
+  env PATH="$work/bin:$PATH" PODMESH_STUB_MODE=success PODMESH_MANAGER_INSTALLED=1 \
+    PODMESH_TEST_CONTROL_ROOT="$control_root" PODMESH_PROC_ROOT="$work/proc" \
+    PODMESH_PATH_ROOT="$installed_root" "$@" "$root/upgrade/collect-host.sh" \
+    --host-alias lab-a --stage "$stage" --salt-file "$work/salt" \
+    --candidate-verification "$work/candidate-verification.json" --output "$output"
+}
+
+expect_upgrade_collector_failure() {
+  local description=$1 expected=$2
+  shift 2
+  if run_upgrade_collector pre-upgrade "$work/rejected-upgrade.json" "$@" >"$work/rejected-upgrade.out" 2>"$work/rejected-upgrade.err"; then
+    echo "upgrade collector accepted $description" >&2
+    exit 1
+  fi
+  test ! -e "$work/rejected-upgrade.json"
+  grep -Fq "$expected" "$work/rejected-upgrade.err"
+}
+
+run_upgrade_collector pre-upgrade "$work/pre-upgrade.json"
+jq -e '
+  .schema_version=="podmesh-manager-inactive-upgrade-evidence/v1" and
+  .stage=="pre-upgrade" and
+  .host_evidence.stage=="post-install" and
+  .host_evidence.manager.process_count==0 and
+  (.config_commitment|test("^sha256:[a-f0-9]{64}$")) and
+  (.state_commitment|test("^sha256:[a-f0-9]{64}$"))
+' "$work/pre-upgrade.json" >/dev/null
+
+run_upgrade_collector post-upgrade "$work/post-upgrade.json"
+jq -e '.stage=="post-upgrade" and .host_evidence.stage=="post-install"' "$work/post-upgrade.json" >/dev/null
+
+mv -- "$installed_root/etc/podmesh-manager/config.json" "$work/config.json"
+ln -s -- "$work/config.json" "$installed_root/etc/podmesh-manager/config.json"
+expect_upgrade_collector_failure "a symlinked configuration" "Protected manager configuration must be a regular non-symlink file"
+rm -- "$installed_root/etc/podmesh-manager/config.json"
+mv -- "$work/config.json" "$installed_root/etc/podmesh-manager/config.json"
+
+mv -- "$installed_root/var/lib/podmesh-manager" "$work/state-directory"
+expect_upgrade_collector_failure "a missing state directory" "Manager state path must be a non-symlink directory"
+ln -s -- "$work/state-directory" "$installed_root/var/lib/podmesh-manager"
+expect_upgrade_collector_failure "a symlinked state directory" "Manager state path must be a non-symlink directory"
+rm -- "$installed_root/var/lib/podmesh-manager"
+mv -- "$work/state-directory" "$installed_root/var/lib/podmesh-manager"
+
+expect_upgrade_collector_failure "a configuration mutation between commitment passes" \
+  "Protected manager configuration or state changed while commitments were collected" \
+  PODMESH_COMMIT_COUNTER="$work/config-counter" PODMESH_COMMIT_LABEL=manager-config-v1 \
+  PODMESH_MUTATION_TARGET="$installed_root/etc/podmesh-manager/config.json"
+printf '%s\n' '{"network_enabled":false}' > "$installed_root/etc/podmesh-manager/config.json"
+
+expect_upgrade_collector_failure "a state mutation between commitment passes" \
+  "Protected manager configuration or state changed while commitments were collected" \
+  PODMESH_COMMIT_COUNTER="$work/state-counter" PODMESH_COMMIT_LABEL=manager-state-v1 \
+  PODMESH_MUTATION_TARGET="$installed_root/var/lib/podmesh-manager/state.db"
+printf '%s\n' 'durable manager state' > "$installed_root/var/lib/podmesh-manager/state.db"
+
+expect_upgrade_collector_failure "a host-evidence mutation between base captures" \
+  "Host evidence changed while protected-path commitments were collected" \
+  PODMESH_SYSTEMCTL_COUNTER="$work/systemctl-counter" PODMESH_MUTATE_HOST_EVIDENCE=1
 
 for mode in failure empty non-array; do
   if PATH="$work/bin:$PATH" PODMESH_STUB_MODE="$mode" PODMESH_PROC_ROOT="$work/proc" "$root/collect-host.sh" --host-alias lab-a --stage pre-install --salt-file "$work/salt" --output "$work/$mode.json" >"$work/$mode.out" 2>"$work/$mode.err"; then
@@ -314,4 +410,4 @@ for mode in failure empty non-array; do
   grep -Fq 'Evidence acquisition failed: podman_commitment' "$work/$mode.err"
 done
 
-printf '%s\n' 'PASS: collector capture plus installed payload/script binding, tamper, weak-salt, process, account and Podman negative coverage.'
+printf '%s\n' 'PASS: collector capture plus installed payload/script binding, tamper, weak-salt, process, account, Podman and inactive-upgrade negative coverage.'

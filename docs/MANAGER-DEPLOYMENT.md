@@ -75,6 +75,20 @@ operator-owned configuration file is the private key boundary and must remain
 `0640` or stricter. A future migration to separate key files requires a reviewed
 schema change, key lifecycle and a package update before this layout changes.
 
+The example sets `observation_writer_uid` to `0`. The next candidate service remains
+unprivileged, but a normal host root process can traverse the private runtime directory
+and submit bounded non-exclusive observations. The resident checks the kernel
+reported Unix peer UID before opening its Store. This increment does not create a
+shared writer group or ACL: changing the writer UID to an arbitrary account does
+not grant that account access through the service-owned `0700` directory and
+`0600` socket. A broader writer policy requires a separately reviewed package and
+control-access design. A root process stripped of discretionary-access-control
+override cannot be assumed to traverse that directory. `status` and `shutdown`
+share the same private socket, so reachable root can also request shutdown and the
+package must not broaden filesystem access as a shortcut. The example has no
+grants and is therefore a safe no-write-authority default: even UID 0 observations
+are refused until exact, reviewed scope grants are configured for the local replica.
+
 The service runs unprivileged and uses systemd state/runtime directories, a private
 temporary directory, a strict read-only host filesystem except for declared
 state/runtime paths, no ambient capabilities and a constrained Unix-only address
@@ -220,6 +234,57 @@ restart the manager. The unit never retries or restarts automatically. The opera
 snapshots the manager state and preserves a verified previous package before an
 explicit restart. A restart after upgrade is a new qualification step, not evidence
 from the old process.
+
+The manager1 configurations installed in the three-host laboratory predate the
+required `observation_writer_uid` field. Qualify the package-only upgrade first and
+prove that the package left each protected configuration byte-for-byte unchanged.
+Then, as a separate operator-owned configuration step, atomically add
+`"observation_writer_uid": 0` to each protected file. The package must never rewrite
+private configuration in a maintainer script. Use a temporary file in the same
+protected directory, validate it before replacement, and then validate the final
+path:
+
+```sh
+set -eu
+config=/etc/podmesh-manager/config.json
+runtime=/run/podmesh-manager
+test -f "$config" && test ! -L "$config"
+test "$(stat -c '%F %a %U %G %h' -- "$config")" = \
+  'regular file 640 root podmesh-manager 1'
+candidate=$(mktemp --tmpdir=/etc/podmesh-manager .config.json.XXXXXX)
+trap 'rm -f -- "$candidate"' EXIT HUP INT TERM
+jq 'if has("observation_writer_uid") then
+      error("observation_writer_uid already exists")
+    else
+      . + {observation_writer_uid: 0}
+    end' "$config" > "$candidate"
+chown root:podmesh-manager "$candidate"
+chmod 0640 "$candidate"
+install -d -o podmesh-manager -g podmesh-manager -m 0700 "$runtime"
+runuser -u podmesh-manager -- /usr/lib/podmesh-manager/podmesh-managerd \
+  --config "$candidate" \
+  --state-dir /var/lib/podmesh-manager \
+  --runtime-dir "$runtime" \
+  --validate-config
+mv -fT -- "$candidate" "$config"
+trap - EXIT HUP INT TERM
+test "$(stat -c '%F %a %U %G %h' -- "$config")" = \
+  'regular file 640 root podmesh-manager 1'
+runuser -u podmesh-manager -- /usr/lib/podmesh-manager/podmesh-managerd \
+  --config "$config" \
+  --state-dir /var/lib/podmesh-manager \
+  --runtime-dir "$runtime" \
+  --validate-config
+test -z "$(find "$runtime" -mindepth 1 -print -quit)"
+rmdir "$runtime"
+```
+
+Any metadata mismatch, validation failure or unexpected runtime content is a
+refusal that requires investigation. The operator must retain the protected
+pre-upgrade snapshot until the new configuration and later activation stage are
+qualified. Until this explicit update validates, the old configuration is
+intentionally incompatible with manager2 and the manager must remain disabled and
+inactive.
 
 `apt remove podmesh-manager` stops and disables only `podmesh-manager.service`.
 `apt purge podmesh-manager` follows the same policy: identity, state,

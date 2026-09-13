@@ -12,7 +12,7 @@ printf '%032d' 0 > "$work/salt"
 chmod 600 "$work/salt"
 printf '%s\n' '[Unit]' > "$work/fs/usr/lib/systemd/system/podmesh-manager.service"
 cat > "$work/fs/etc/podmesh-manager/config.json" <<'JSON'
-{"network":{"replica_id":"00000000-0000-4000-8000-000000000001","database_path":"/var/lib/podmesh-manager/manager.sqlite","manager":{"logical_manager_id":"00000000-0000-4000-8000-000000000010","replicas":[{"replica_id":"00000000-0000-4000-8000-000000000001","host_id":"00000000-0000-4000-8000-000000000101"},{"replica_id":"00000000-0000-4000-8000-000000000002","host_id":"00000000-0000-4000-8000-000000000102"}],"grants":[]},"bind":"127.0.0.1:9443","peers":[{"replica_id":"00000000-0000-4000-8000-000000000002","endpoint":"10.0.0.2:9443","shared_key_hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]},"control_socket":"/run/podmesh-manager/control.sock","interval_ms":1000,"max_backoff_ms":30000,"incoming_workers":1}
+{"network":{"replica_id":"00000000-0000-4000-8000-000000000001","database_path":"/var/lib/podmesh-manager/manager.sqlite","manager":{"logical_manager_id":"00000000-0000-4000-8000-000000000010","replicas":[{"replica_id":"00000000-0000-4000-8000-000000000001","host_id":"00000000-0000-4000-8000-000000000101"},{"replica_id":"00000000-0000-4000-8000-000000000002","host_id":"00000000-0000-4000-8000-000000000102"}],"grants":[{"scope":"scope-b","owner_replica_id":"00000000-0000-4000-8000-000000000002"},{"scope":"scope-a","owner_replica_id":"00000000-0000-4000-8000-000000000001"}]},"bind":"127.0.0.1:9443","peers":[{"replica_id":"00000000-0000-4000-8000-000000000002","endpoint":"10.0.0.2:9443","shared_key_hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]},"control_socket":"/run/podmesh-manager/control.sock","observation_writer_uid":0,"interval_ms":1000,"max_backoff_ms":30000,"incoming_workers":1}
 JSON
 chmod 640 "$work/fs/etc/podmesh-manager/config.json"
 
@@ -203,6 +203,24 @@ fi
 endpoint_commitment=$(jq -r '.configuration.commitments.peers[0].endpoint_commitment' "$work/evidence.json")
 unsalted="sha256:$(printf %s '10.0.0.2:9443' | sha256sum | awk '{print $1}')"
 [ "$endpoint_commitment" != "$unsalted" ] || { echo 'endpoint commitment is unsalted' >&2; exit 1; }
+jq -e '.configuration.commitments.observation_writer_uid==0' "$work/evidence.json" >/dev/null
+
+# Replica and grant ordering is presentation-only.  The topology commitment is
+# canonical, while a changed grant remains visible as a changed commitment.
+config_fixture="$work/fs/etc/podmesh-manager/config.json"
+cp -- "$config_fixture" "$work/config-pristine.json"
+base_topology=$(jq -r '.configuration.commitments.topology_commitment' "$work/evidence.json")
+jq '.network.manager.replicas |= reverse | .network.manager.grants |= reverse' "$work/config-pristine.json" > "$work/config-reordered.json"
+cp -- "$work/config-reordered.json" "$config_fixture"
+rm -f "$work/systemctl-state"
+PATH="$work/bin:$PATH" PODMESH_PATH_ROOT="$work/fs" PODMESH_PROC_ROOT="$work/proc" PODMESH_RUNUSER_BIN="$work/bin/runuser" PODMESH_MANAGER_BINARY=/manager-stub "$script" --host-alias lab-a --salt-file "$work/salt" --output "$work/reordered-evidence.json"
+[ "$(jq -r '.configuration.commitments.topology_commitment' "$work/reordered-evidence.json")" = "$base_topology" ] || { echo 'topology commitment depends on replica or grant ordering' >&2; exit 1; }
+jq '.network.manager.grants[0].owner_replica_id = "00000000-0000-4000-8000-000000000001"' "$work/config-pristine.json" > "$work/config-grant-drift.json"
+cp -- "$work/config-grant-drift.json" "$config_fixture"
+rm -f "$work/systemctl-state"
+PATH="$work/bin:$PATH" PODMESH_PATH_ROOT="$work/fs" PODMESH_PROC_ROOT="$work/proc" PODMESH_RUNUSER_BIN="$work/bin/runuser" PODMESH_MANAGER_BINARY=/manager-stub "$script" --host-alias lab-a --salt-file "$work/salt" --output "$work/grant-drift-evidence.json"
+[ "$(jq -r '.configuration.commitments.topology_commitment' "$work/grant-drift-evidence.json")" != "$base_topology" ] || { echo 'topology commitment does not cover scope grants' >&2; exit 1; }
+cp -- "$work/config-pristine.json" "$config_fixture"
 
 # A successful-but-empty firewall command is still observable as success.  A
 # command failure becomes explicit unknown rather than an empty-input hash.
@@ -221,6 +239,14 @@ expect_harness_failure() {
     exit 1
   fi
 }
+
+# The writer identity is mandatory evidence, even though the three-host
+# comparator is responsible for enforcing the deployment policy value zero.
+jq 'del(.observation_writer_uid)' "$work/config-pristine.json" > "$work/config-no-writer.json"
+cp -- "$work/config-no-writer.json" "$config_fixture"
+rm -f "$work/systemctl-state"
+expect_harness_failure env PATH="$work/bin:$PATH" PODMESH_PATH_ROOT="$work/fs" PODMESH_PROC_ROOT="$work/proc" PODMESH_RUNUSER_BIN="$work/bin/runuser" PODMESH_MANAGER_BINARY=/manager-stub "$script" --host-alias lab-a --salt-file "$work/salt" --output "$work/no-writer.json"
+cp -- "$work/config-pristine.json" "$config_fixture"
 
 # A systemd drop-in invalidates the default-unit claim before the start attempt.
 mkdir -p "$work/fs/usr/lib/systemd/system/podmesh-manager.service.d"

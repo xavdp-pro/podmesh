@@ -16,6 +16,7 @@
     "peers": []
   },
   "control_socket": "/run/podmesh-manager/control.sock",
+  "observation_writer_uid": 0,
   "interval_ms": 1000,
   "max_backoff_ms": 30000,
   "incoming_workers": 1

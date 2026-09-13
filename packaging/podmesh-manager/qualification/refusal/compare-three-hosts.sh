@@ -60,6 +60,12 @@ def boolean(value, path):
         fail(f"{path} is not proven true")
 
 
+def uid(value, path):
+    if type(value) is not int or value < 0:
+        fail(f"{path} is not a non-negative integer UID")
+    return value
+
+
 def walk_public_shape(value, path="evidence"):
     if isinstance(value, dict):
         for key, child in value.items():
@@ -125,6 +131,10 @@ def required_host(host, path):
         "local_replica_commitment", "local_host_commitment", "topology_commitment",
     ):
         commitment(get(config, field), f"{path}: configuration.commitments.{field}")
+    observation_writer_uid = uid(
+        get(config, "observation_writer_uid"),
+        f"{path}: configuration.commitments.observation_writer_uid",
+    )
     if get(config, "peer_count") != 2:
         fail(f"{path}: peer count is not exactly two")
     peers = get(config, "peers")
@@ -223,7 +233,7 @@ def required_host(host, path):
     commitment(get(listeners, "endpoint_commitment"), f"{path}: listener endpoint")
     commitment(get(host, "before.podman_containers_commitment"), f"{path}: before Podman")
     commitment(get(host, "after.podman_containers_commitment"), f"{path}: after Podman")
-    return alias, config, peers, post_unit, listeners
+    return alias, config, peers, post_unit, listeners, observation_writer_uid
 
 
 records = [required_host(host, path) for host, path in zip(hosts, HOSTS)]
@@ -233,12 +243,17 @@ if len(set(aliases)) != 3 or set(aliases) != set(summary_aliases):
 logical = [record[1]["logical_manager_commitment"] for record in records]
 topologies = [record[1]["topology_commitment"] for record in records]
 fragments = [record[3]["fragment_sha256"] for record in records]
+observation_writer_uids = [record[5] for record in records]
 if len(set(logical)) != 1:
     fail("logical manager commitments differ")
 if len(set(topologies)) != 1:
     fail("topology commitments differ")
 if len(set(fragments)) != 1:
     fail("unit fragment commitments differ")
+if len(set(observation_writer_uids)) != 1:
+    fail("observation writer UIDs differ")
+if observation_writer_uids[0] != 0:
+    fail("observation writer UID is not exactly zero")
 if len({record[1]["local_replica_commitment"] for record in records}) != 3:
     fail("local replica commitments are not distinct")
 if len({record[1]["local_host_commitment"] for record in records}) != 3:
@@ -248,7 +263,7 @@ by_replica = {record[1]["local_replica_commitment"]: record for record in record
 if len(by_replica) != 3:
     fail("local replica commitment map is incomplete")
 directed_keys = {}
-for _, config, peers, _, _ in records:
+for _, config, peers, _, _, _ in records:
     local_id = config["local_replica_commitment"]
     for peer in peers:
         remote_id = peer["replica_id_commitment"]
@@ -285,7 +300,9 @@ print(json.dumps({
         "two_peers_per_host": True,
         "peer_endpoint_bindings_match": True,
         "symmetric_distinct_pair_keys": True,
+        "one_observation_writer_uid": True,
     },
+    "observation_writer_uid": observation_writer_uids[0],
     "private_values": "absent",
 }, sort_keys=True))
 PY

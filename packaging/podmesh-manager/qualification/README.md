@@ -12,8 +12,79 @@ any other service.
 The harness covers the package-only, disabled-service slice of G4. It does not by
 itself qualify the full G4 gate, preserved manager identity, or G2,
 G3, G5, DNS, replication, routing, WireGuard, workload activation, restart,
-upgrade, removal, purge, or rollback. Those phases require their own approved
+full upgrade including restart and schema compatibility, removal, purge, or
+rollback. Those phases require their own approved
 procedure and evidence under `docs/MANAGER-HA-ACCEPTANCE.md`.
+
+## Inactive package-upgrade stage
+
+`upgrade/` provides a separate read-only evidence path for replacing an already
+installed manager candidate while the manager remains disabled and inactive. It
+does not install the package. Collect `pre-upgrade` evidence with the old
+candidate verification report, perform the separately authorized package
+upgrade, then collect `post-upgrade` evidence with the new report. The same
+private per-host salt must be used for both captures:
+
+Hosts that completed the configured default-refusal stage must first have the
+documented `systemctl reset-failed podmesh-manager.service` cleanup applied.
+That cleanup removes the retained failed-state and invocation record. Therefore,
+this upgrade evidence can prove only that no invocation record is retained at
+capture time; it cannot distinguish a never-started unit from a previously
+started unit whose failed state was reset. The historical refusal proof remains
+in `docs/REVIEW-MANAGER-DEFAULT-REFUSAL.md`.
+
+```sh
+upgrade/collect-host.sh \
+  --host-alias lab-a \
+  --stage pre-upgrade \
+  --salt-file /private/path/lab-a-salt \
+  --candidate-verification /private/evidence/manager1-verification.json \
+  --output /private/evidence/lab-a-pre-upgrade.json
+
+# The operator performs the verified package upgrade outside this harness.
+
+upgrade/collect-host.sh \
+  --host-alias lab-a \
+  --stage post-upgrade \
+  --salt-file /private/path/lab-a-salt \
+  --candidate-verification /private/evidence/manager2-verification.json \
+  --output /private/evidence/lab-a-post-upgrade.json
+```
+
+Compare one host with both reviewed candidate contracts and reports:
+
+```sh
+upgrade/compare-evidence.py \
+  --phase upgrade \
+  --pre /private/evidence/lab-a-pre-upgrade.json \
+  --post /private/evidence/lab-a-post-upgrade.json \
+  --old-candidate-verification /private/evidence/manager1-verification.json \
+  --old-contract /private/evidence/manager1-contract.json \
+  --new-candidate-verification /private/evidence/manager2-verification.json \
+  --new-contract /private/evidence/manager2-contract.json
+```
+
+Use `--phase three-host-upgrade` with exactly three `--pre` files and three
+`--post` files to qualify the declared lab set. The comparison binds both the
+old and new installed package payloads to their signed candidate reports and
+reviewed contracts. It requires one unchanged boot; a disabled and inactive
+manager unit carrying no retained invocation, start-timestamp or restart record;
+no manager process or runtime directory; identical manager account, protected
+configuration and state; and unchanged lifecycle and observer package versions,
+unit state, PIDs, invocation IDs, restart counters, sockets and rootful Podman
+commitments. Configuration and state content are represented only by
+private-salt commitments. The configuration commitment covers the
+`/etc/podmesh-manager` directory metadata, the `config.json` metadata and the
+file content. The collector brackets those
+commitments with two complete host captures and aborts if the observable host
+state changes while they are made. It also computes both protected-path
+commitments twice and rejects an unstable configuration or state tree.
+
+This stage proves a package replacement did not activate or disturb the declared
+host state. It does not prove that the new configuration schema is valid, that a
+later start will be refused or accepted, or that manager networking, exchange,
+replication, takeover, DNS or HA works. Protected configuration migration and
+default-refusal validation remain separate explicit stages.
 
 ## Configured default-refusal stage
 
