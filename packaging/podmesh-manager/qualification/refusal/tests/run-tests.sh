@@ -191,7 +191,8 @@ jq -e '
   .default_refusal.journal.network_disabled_refusal_observed and
   (.before.podman_containers_commitment|test("^sha256:")) and
   .after.manager.process_count==0 and .assertions.podman_containers_unchanged and
-  .after.firewall.status=="available-successful" and .assertions.firewall_unchanged==true
+  .after.firewall.status=="available-successful" and .assertions.firewall_unchanged==true and
+  .configuration.commitments.grant_count==2
 ' "$work/evidence.json" >/dev/null
 
 # Low-entropy endpoints must not appear in clear text, and their commitments

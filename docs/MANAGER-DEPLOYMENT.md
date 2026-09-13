@@ -1,11 +1,11 @@
 # Experimental resident manager package and deployment boundary
 
-Status: the reviewed resident-manager candidate from commit `5319ab1` was built,
-published through signed experimental APT and installed with its service disabled
-and inactive on three existing laboratory hosts. Package installation, protected
-three-replica configuration, pure offline validation and the default-disabled
-failed-start gate passed. No authenticated resident exchange, DNS service or HA
-claim exists yet.
+Status: manager2 candidate `0.1.0~manager2+gff77b1f946e8` from commit `ff77b1f`
+passed deterministic package assembly, signed experimental APT binding, inactive
+upgrade from manager1 on three existing laboratory hosts, a separate protected
+configuration transition, pure offline validation and the default-disabled
+failed-start gate. Network activation, replication convergence, takeover, DNS,
+fencing, restart, rollback, schema-compatible activation and HA remain unqualified.
 
 ## Purpose and isolation
 
@@ -26,8 +26,9 @@ the current executable laboratory boundaries are in
 
 The first executable milestone exercised the manager as standalone local
 processes. This isolated its persistence, replication, refusal and recovery
-behavior from an orchestration environment. The package is now installed but the
-resident service has deliberately not been configured or activated. The preferred integrated target then
+behavior from an orchestration environment. Manager2 is now installed with a
+protected configuration on three existing laboratory hosts, but the resident
+service remains disabled and has not been activated. The preferred integrated target then
 runs each host-bound replica inside a ShaperOS universe so it can reuse ShaperOS
 logging, observation and parent-supervision contracts. It remains the same single
 logical manager across those replicas. Standalone operation on a compatible Linux
@@ -119,7 +120,7 @@ SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
   packaging/podmesh-manager/build-deb.sh \
   /trusted/output/podmesh-managerd \
   "$(sha256sum /trusted/output/podmesh-managerd | cut -d ' ' -f 1)" \
-  '0.1.0~manager1' /tmp/podmesh-manager-packages
+  '0.1.0~manager2' /tmp/podmesh-manager-packages
 ```
 
 Identical binary, version, source timestamp and packaging tools should produce a
@@ -161,12 +162,15 @@ from reviewed committed source, verified against signed repository metadata,
 published to the experimental suite and installed with the service disabled and
 inactive on three existing laboratory hosts. The package-only evidence is recorded
 in [REVIEW-MANAGER-PACKAGE-QUALIFICATION.md](REVIEW-MANAGER-PACKAGE-QUALIFICATION.md).
-The example configuration is its exact current JSON schema. Protected configurations
-for one logical identity and three distinct replicas now pass offline validation,
-and the unchanged default unit refuses runtime startup on all three hosts without
-leaving state, sockets or listeners. See
-[REVIEW-MANAGER-DEFAULT-REFUSAL.md](REVIEW-MANAGER-DEFAULT-REFUSAL.md). Explicit
-network activation, resident exchange and recovery stages remain open.
+That historical manager1 qualification remains evidence for its exact candidate;
+its protected three-replica configuration and default refusal are recorded in
+[REVIEW-MANAGER-DEFAULT-REFUSAL.md](REVIEW-MANAGER-DEFAULT-REFUSAL.md).
+Manager2 candidate `0.1.0~manager2+gff77b1f946e8` then passed deterministic
+assembly from its exact release binary, signed APT binding, inactive upgrade on
+all three hosts, a separate protected configuration transition and the same
+default refusal. See
+[REVIEW-MANAGER2-PACKAGE-QUALIFICATION.md](REVIEW-MANAGER2-PACKAGE-QUALIFICATION.md).
+Explicit network activation, resident exchange and recovery stages remain open.
 
 1. Record a pre-install inventory outside the candidate package: host identity,
    package versions, `podmesh.service` and `podmesh-web-observer.service` PIDs,
@@ -286,6 +290,15 @@ qualified. Until this explicit update validates, the old configuration is
 intentionally incompatible with manager2 and the manager must remain disabled and
 inactive.
 
+Stage P executed this as a separate operator-owned step after all three inactive
+package upgrades passed. The public records report only the addition of
+`observation_writer_uid: 0`, no removed or changed key, empty grants, preserved
+protected-file metadata, a retained protected backup and successful offline
+validation before and after replacement. The manager unit on each of the three
+hosts remained disabled and inactive. This result is documented in
+[REVIEW-MANAGER2-PACKAGE-QUALIFICATION.md](REVIEW-MANAGER2-PACKAGE-QUALIFICATION.md);
+it does not qualify activation or schema-compatible rollback.
+
 `apt remove podmesh-manager` stops and disables only `podmesh-manager.service`.
 `apt purge podmesh-manager` follows the same policy: identity, state,
 configuration (including current inline pair key material) and the system account
@@ -331,8 +344,8 @@ death or unchanged workloads.
   activation, route or DNS publication.
 - Repeat clean full-host installation when suitable disposable clean hosts are
   available; the current three-host result covers existing laboratory hosts.
-- Qualify explicit activation, restart, upgrade, removal, purge and supported
-  rollback separately before claiming those lifecycle phases.
+- Qualify explicit activation, restart, active-service upgrade, removal, purge
+  and supported rollback separately before claiming those lifecycle phases.
 - Publish only the package scope supported by the recorded evidence through the
   signed experimental APT suite.
 
@@ -348,6 +361,9 @@ regression checks were corrected. The final closure review reported no remaining
 blocker or important finding for this undeployed scope. Claude Code Opus then
 reviewed the compatible CLI, path boundary, offline validation and network refusal;
 after two port-race corrections it reported no remaining blocker or important
-finding for the local-only increment. Signed publication and disabled-service
-installation now pass on three existing hosts. Configuration, activation, service
-recovery and HA qualification remain open.
+finding for the local-only increment. Signed manager1 publication and
+disabled-service installation first passed on three existing hosts. Manager2
+Stage P now also passes signed candidate binding, inactive upgrade, the separate
+configuration transition and default refusal on those hosts. Network activation,
+convergence, takeover, DNS, fencing, restart, rollback, schema-compatible
+activation and HA qualification remain open.

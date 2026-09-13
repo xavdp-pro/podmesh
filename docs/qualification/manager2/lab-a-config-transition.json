@@ -1,0 +1,60 @@
+{
+  "binary_sha256": "cbd5020a37d2b6b2ab94ee41a7ea9d2f50d0da36c6fb972f795c8a1fe3660128",
+  "captured_after_transition": true,
+  "claims_not_made": [
+    "DNS recovery",
+    "fencing",
+    "high availability",
+    "network activation",
+    "replication convergence",
+    "restart",
+    "rollback",
+    "schema-compatible activation",
+    "takeover"
+  ],
+  "final_config_metadata": {
+    "file_type": "regular file",
+    "gid": 104,
+    "link_count": 1,
+    "mode": "640",
+    "temporary_candidate_count": 0,
+    "uid": 0
+  },
+  "host_alias": "lab-a",
+  "package_version": "0.1.0~manager2+gff77b1f946e8",
+  "private_values": "absent",
+  "procedure": {
+    "archived_path": "docs/qualification/manager2/config-transition-executed.sh",
+    "offline_validation_after_replacement": true,
+    "offline_validation_before_replacement": true,
+    "operator_execution_result": "PASS",
+    "sha256": "5766017862bd5c09b2140b4c43b2e4a2dd6025831b5048c356294888ecf71669"
+  },
+  "protected_backup_metadata": {
+    "file_type": "regular file",
+    "gid": 0,
+    "link_count": 1,
+    "mode": "600",
+    "present": true,
+    "uid": 0
+  },
+  "result": "PASS",
+  "schema_version": "podmesh-manager-config-transition-public-evidence/v1",
+  "service": {
+    "active_state": "inactive",
+    "unit_file_state": "disabled"
+  },
+  "source_commit": "ff77b1f946e82af421de2ccdbe06d8cd45b70c33",
+  "transition": {
+    "added_keys": [
+      "observation_writer_uid"
+    ],
+    "changed_keys": [],
+    "exact_additive_transition_verified_against_private_snapshots": true,
+    "grant_count": 0,
+    "observation_writer_uid": 0,
+    "post_document_commitment": "sha256:ba3426758c75a5e477a8348d4a60829cc50e61299520aaa2a4c59f5360805338",
+    "pre_config_commitment": "sha256:1e4dd7c585095448c3e86c8a262ccaa623ce2cc7e749bc124c1de833aea45fbd",
+    "removed_keys": []
+  }
+}

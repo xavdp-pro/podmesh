@@ -229,7 +229,7 @@ listener_json() {
 }
 
 manager_configuration_json() {
-  local actual=$1 normalized logical replica host topology peers config_commitment observation_writer_uid
+  local actual=$1 normalized logical replica host topology peers config_commitment observation_writer_uid grant_count
   normalized=$(jq -e -cS '
     . as $root | .network as $network |
     ($network.manager.replicas | sort_by(.replica_id, .host_id)) as $replicas |
@@ -245,6 +245,7 @@ manager_configuration_json() {
   host=$(jq -r .local_host_id <<<"$normalized")
   observation_writer_uid=$(jq -r .observation_writer_uid <<<"$normalized")
   topology=$(jq -cS .topology <<<"$normalized")
+  grant_count=$(jq -r '.topology.grants | length' <<<"$normalized")
   peers=$(jq -cS '[.peers[] | {replica_id_commitment:null,endpoint_commitment:null,shared_key_commitment:null}]' <<<"$normalized")
   # Replace each placeholder from the original ordered entries.  All values,
   # including UUIDs and pair keys, remain salted commitments in the evidence.
@@ -252,7 +253,7 @@ manager_configuration_json() {
     peers=$(jq -c --argjson position "$position" --arg replica "$(commit_text "$peer_id")" --arg endpoint "$(commit_text "$endpoint")" --arg key "$(commit_text "$shared_key")" '.[$position]={replica_id_commitment:$replica,endpoint_commitment:$endpoint,shared_key_commitment:$key}' <<<"$peers") || return 1
   done < <(jq -r '.peers | to_entries[] | [.key,.value.replica_id,.value.endpoint,.value.shared_key_hex] | @tsv' <<<"$normalized")
   config_commitment=$(cat -- "$actual" | commit_stdin)
-  jq -cn --arg document_commitment "$config_commitment" --arg logical_manager_commitment "$(commit_text "$logical")" --arg local_replica_commitment "$(commit_text "$replica")" --arg local_host_commitment "$(commit_text "$host")" --argjson observation_writer_uid "$observation_writer_uid" --arg topology_commitment "$(printf '%s' "$topology"|commit_stdin)" --argjson peers "$peers" '{document_commitment:$document_commitment,logical_manager_commitment:$logical_manager_commitment,local_replica_commitment:$local_replica_commitment,local_host_commitment:$local_host_commitment,observation_writer_uid:$observation_writer_uid,topology_commitment:$topology_commitment,peer_count:($peers|length),peers:$peers}'
+  jq -cn --arg document_commitment "$config_commitment" --arg logical_manager_commitment "$(commit_text "$logical")" --arg local_replica_commitment "$(commit_text "$replica")" --arg local_host_commitment "$(commit_text "$host")" --argjson observation_writer_uid "$observation_writer_uid" --argjson grant_count "$grant_count" --arg topology_commitment "$(printf '%s' "$topology"|commit_stdin)" --argjson peers "$peers" '{document_commitment:$document_commitment,logical_manager_commitment:$logical_manager_commitment,local_replica_commitment:$local_replica_commitment,local_host_commitment:$local_host_commitment,observation_writer_uid:$observation_writer_uid,grant_count:$grant_count,topology_commitment:$topology_commitment,peer_count:($peers|length),peers:$peers}'
 }
 
 actual_config=$(actual_path "$config_path")

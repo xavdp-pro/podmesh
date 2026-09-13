@@ -133,8 +133,11 @@ refusal/compare-three-hosts.sh \
 The cross-host comparison requires one logical identity and topology, three
 distinct local replica and host commitments, two reciprocal peers per host,
 matching endpoint-to-bind commitments and three symmetric distinct pair-key
-commitments. Passing this stage does not activate networking or qualify exchange,
-replication, takeover, DNS or HA.
+commitments. Current campaigns must also emit `grant_count: 0` for every host and
+declare `topology.zero_grants: true` in the summary. The checked-in comparator
+rejects older evidence without these fields; historical results must be replayed
+with their source-bound frozen qualification bundle. Passing this stage does not
+activate networking or qualify exchange, replication, takeover, DNS or HA.
 
 ## Evidence stages
 

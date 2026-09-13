@@ -59,6 +59,7 @@ def host(index):
                 "local_replica_commitment": replicas[index],
                 "local_host_commitment": hosts[index],
                 "observation_writer_uid": 0,
+                "grant_count": 0,
                 "topology_commitment": topology,
                 "peer_count": 2,
                 "peers": sorted(peers, key=lambda peer: peer["replica_id_commitment"]),
@@ -155,6 +156,7 @@ summary = {
         "peer_endpoint_bindings_match": True,
         "symmetric_distinct_pair_keys": True,
         "two_peers_per_host": True,
+        "zero_grants": True,
     },
     "unit_fragment_equal": True,
 }
@@ -163,7 +165,7 @@ PY
 
 args=(--summary "$work/summary.json" "$work/lab-0.json" "$work/lab-1.json" "$work/lab-2.json")
 "$compare" "${args[@]}" > "$work/pass.json"
-jq -e '.result=="PASS" and .host_aliases==["lab-a","lab-b","lab-c"] and .observation_writer_uid==0 and .topology.one_observation_writer_uid and .topology.peer_endpoint_bindings_match and .topology.symmetric_distinct_pair_keys and .private_values=="absent"' "$work/pass.json" >/dev/null
+jq -e '.result=="PASS" and .host_aliases==["lab-a","lab-b","lab-c"] and .observation_writer_uid==0 and .grant_count==0 and .topology.one_observation_writer_uid and .topology.zero_grants and .topology.peer_endpoint_bindings_match and .topology.symmetric_distinct_pair_keys and .private_values=="absent"' "$work/pass.json" >/dev/null
 cp "$work/lab-0.json" "$work/lab-0-pristine.json"
 
 expect_failure() {
@@ -172,6 +174,11 @@ expect_failure() {
     exit 1
   fi
 }
+
+cp "$work/summary.json" "$work/summary-pristine.json"
+jq '.topology.zero_grants = false' "$work/summary-pristine.json" > "$work/summary.json"
+expect_failure
+cp "$work/summary-pristine.json" "$work/summary.json"
 
 mutate() {
   cp "$work/lab-0-pristine.json" "$work/lab-0.json"
@@ -210,6 +217,8 @@ elif sys.argv[2] == "nonzero-observation-writer-uid":
     data["configuration"]["commitments"]["observation_writer_uid"] = 1000
 elif sys.argv[2] == "tampered-observation-writer-uid":
     data["configuration"]["commitments"]["observation_writer_uid"] = "0"
+elif sys.argv[2] == "nonzero-grant-count":
+    data["configuration"]["commitments"]["grant_count"] = 1
 elif sys.argv[2] == "one-host-grant-drift":
     data["configuration"]["commitments"]["topology_commitment"] = "sha256:" + "1" * 64
 else:
@@ -245,6 +254,8 @@ expect_failure
 mutate nonzero-observation-writer-uid
 expect_failure
 mutate tampered-observation-writer-uid
+expect_failure
+mutate nonzero-grant-count
 expect_failure
 mutate one-host-grant-drift
 expect_failure

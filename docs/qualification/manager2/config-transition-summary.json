@@ -1,0 +1,38 @@
+{
+  "claims_not_made": [
+    "DNS recovery",
+    "fencing",
+    "high availability",
+    "network activation",
+    "replication convergence",
+    "restart",
+    "rollback",
+    "schema-compatible activation",
+    "takeover"
+  ],
+  "distinct_local_replicas_retained": true,
+  "grant_count": 0,
+  "host_count": 3,
+  "host_results": [
+    {
+      "host_alias": "lab-a",
+      "result": "PASS"
+    },
+    {
+      "host_alias": "lab-b",
+      "result": "PASS"
+    },
+    {
+      "host_alias": "lab-c",
+      "result": "PASS"
+    }
+  ],
+  "observation_writer_uid": 0,
+  "one_observation_writer_uid": true,
+  "package_version": "0.1.0~manager2+gff77b1f946e8",
+  "private_values": "absent",
+  "result": "PASS",
+  "same_logical_manager_retained": true,
+  "schema_version": "podmesh-manager-config-transition-public-summary/v1",
+  "source_commit": "ff77b1f946e82af421de2ccdbe06d8cd45b70c33"
+}
