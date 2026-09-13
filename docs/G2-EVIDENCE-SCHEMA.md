@@ -23,7 +23,7 @@ keys. In doing so it folds `incomplete_attempts` — a vector of structs each ca
 | `ordered_audit_events` | `durable.rs:316` | every per-attempt fact the join needs: peer, operation, nonce, phase, outcome, request digest, announced size, transferred bytes, reply bytes and digest, local and remote receipts, `replayed` |
 | `ordered_receipts`, `receipt_set_sha256` | `durable.rs:313-314` | per-receipt identity and set completeness |
 | `audit_set_sha256` | `durable.rs:317` | audit-set completeness across replicas |
-| `unaudited_import_receipt_ids` | `durable.rs:319`, computed `:2662-2676` | **the** field condition 4 is about |
+| `unaudited_import_receipt_ids` | `durable.rs:319`, computed `:2662-2676` (the diff itself at `:2667`) | **the** field condition 4 is about |
 
 The amended predicate is therefore not merely unmet — it cannot be computed from what a
 campaign seals. This is a collector and schema change first, and a comparator change
