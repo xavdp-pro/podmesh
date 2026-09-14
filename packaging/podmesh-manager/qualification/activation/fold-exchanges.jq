@@ -15,6 +15,21 @@
 # writes zero, and a non-null fold would read those zeros as values and refuse every
 # four-row exchange. Zero means "this phase did not carry it".
 
+# Labels name the KIND of value, never the place it was observed, and two kinds must never
+# share one. Established by reading the candidate's own assignments and comparisons:
+#   receipt-digest      ReceiptEvidence.sha256 = local_receipt_sha256 = remote_receipt_sha256
+#                       (durable.rs:583 assigns one from the other)
+#   receipt-operation-id  ReceiptEvidence.operation_id = local/remote_receipt_operation_id,
+#                       and that is what unaudited_import_receipt_ids holds (durable.rs:582,
+#                       :2670-2676)
+#   wire-operation-id   ExchangeAuditEvent.operation_id = ReceiptEvidence.wire_operation_id
+#                       = IncompleteAttempt.wire_operation_id (durable.rs:1873, :2584)
+#   replica-id          authenticated_peer_id = peer_claim = the store's own replica_id
+#                       (durable.rs:536)
+# The receipt fields were briefly labelled `receipt-id` here. That is the name of the
+# operation id, not the digest, so the two kinds would have collided under one label and the
+# join would have failed silently — the failure this discipline exists to prevent.
+#
 # `label` is a jq keyword, so the parameter cannot be named $label.
 def commitment($kind; $value):
   if $value == null then null
@@ -80,8 +95,8 @@ def fold($field; $zero_is_unset; $nonce_index):
         operation_commitment: commitment("wire-operation-id"; $operation),
         request_sha256_commitment: commitment("request-digest"; $request_digest),
         reply_sha256_commitment: commitment("reply-digest"; $reply_digest),
-        local_receipt_commitment: commitment("receipt-id"; $local_receipt),
-        remote_receipt_commitment: commitment("receipt-id"; $remote_receipt),
+        local_receipt_commitment: commitment("receipt-digest"; $local_receipt),
+        remote_receipt_commitment: commitment("receipt-digest"; $remote_receipt),
         request_frame_bytes: ($request_frame // 0),
         reply_frame_bytes: ($reply_frame // 0),
         request_announced_body_bytes: $announced,

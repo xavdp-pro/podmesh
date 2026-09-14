@@ -22,8 +22,8 @@ keys() {
   jq -r '[.ordered_audit_events[].event
           | [["wire-nonce",.wire_nonce],["replica-id",.authenticated_peer_id],
              ["wire-operation-id",.operation_id],["request-digest",.request_sha256],
-             ["reply-digest",.reply_sha256],["receipt-id",.local_receipt_sha256],
-             ["receipt-id",.remote_receipt_sha256]]]
+             ["reply-digest",.reply_sha256],["receipt-digest",.local_receipt_sha256],
+             ["receipt-digest",.remote_receipt_sha256]]]
          | add | map(select(.[1] != null)) | map(.[0] + "\t" + .[1]) | unique | .[]' "$1"
 }
 keys "$fixture" | jq -Rn '[inputs | {key:., value:("sha256:stub-" + (.|@base64))}] | from_entries' > "$work/commitments.json"

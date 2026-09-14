@@ -67,9 +67,29 @@ def evidence(i,stage):
     running=stage in ("active-baseline","converged"); cleanup=stage=="post-cleanup"
     peers=[{"replica_id_commitment":replicas[j],"endpoint_commitment":c(f"endpoint-{j}"),"shared_key_commitment":keys[tuple(sorted((i,j)))]} for j in range(3) if j!=i]
     limits={"network_mode":"authenticated-static-peers","address_families":["AF_UNIX","AF_INET"],"peer_allow_count":2,"peer_allow_prefix_length":32,"sha256":h("dropin")} if running else {"network_mode":None,"address_families":[],"peer_allow_count":0,"peer_allow_prefix_length":None}
-    inspection=None
-    if stage=="active-baseline": inspection={"store_present":True,"schema_version":3,"logical_manager_commitment":c("logical"),"replica_commitment":replicas[i],"logical_history_sha256":h(f"baseline-{i}"),"sqlite_integrity_result":"ok","history_count":0,"receipt_count":0,"audit_event_count":0,"incomplete_attempt_count":0}
-    if stage in ("converged","post-cleanup"): inspection={"store_present":True,"schema_version":3,"logical_manager_commitment":c("logical"),"replica_commitment":replicas[i],"logical_history_sha256":h("history"),"sqlite_integrity_result":"ok","history_count":3,"receipt_count":3,"audit_event_count":9,"incomplete_attempt_count":0}
+    def inspect(history, hc, rc, ac, attempts, exchanges):
+        return {"store_present":True,"schema_version":3,"logical_manager_commitment":c("logical"),
+                "replica_commitment":replicas[i],"logical_history_sha256":history,
+                "receipt_set_sha256":h(f"receipts-{i}-{stage}"),"audit_set_sha256":h(f"audits-{i}-{stage}"),
+                "sqlite_integrity_result":"ok","history_count":hc,"receipt_count":rc,"audit_event_count":ac,
+                "incomplete_attempt_count":len(attempts),"incomplete_attempts":attempts,
+                "unaudited_import_receipt_count":0,"unaudited_import_receipt_commitments":[]}
+    # One folded exchange per nonce: an inbound exchange collapses four audit rows, a
+    # completed outbound attempt two. The shapes are the ones measured on a preserved store.
+    def served(k):
+        return {"nonce_commitment":c(f"nonce-{i}-{k}"),"nonce_authority":"peer-validated","joinable":True,
+                "direction":"inbound","phases_reached":["inbound_request_observed","inbound_import_committed",
+                "inbound_reply_prepared","inbound_reply_write_observed"],"row_count":4,
+                "peer_commitment":replicas[(i+1)%3],"operation_commitment":c(f"op-{i}-{k}"),
+                "request_sha256_commitment":c(f"rq-{i}-{k}"),"reply_sha256_commitment":c(f"rp-{i}-{k}"),
+                "local_receipt_commitment":c(f"rcpt-{i}-{k}"),"remote_receipt_commitment":None,
+                "request_frame_bytes":2735,"reply_frame_bytes":625,"request_announced_body_bytes":2731,
+                "outcomes":["accepted"],"replayed":False}
+    inspection=None; exchanges=None
+    if stage=="active-baseline":
+        inspection=inspect(h(f"baseline-{i}"),0,0,0,[],None); exchanges=[]
+    if stage in ("converged","post-cleanup"):
+        inspection=inspect(h("history"),3,3,9,[],None); exchanges=[served(0),served(1)]
     return {"schema_version":"podmesh-manager-live-activation-evidence/v2","host_alias":aliases[i],"stage":stage,
       "package":{"name":"podmesh-manager","version":"0.1.0~manager2","binary_sha256":h("binary"),"dpkg_verify":"clean"},
       "configuration":{"document_commitment":c(f"config-{i}"),"logical_manager_commitment":c("logical"),"local_replica_commitment":replicas[i],"local_host_commitment":hosts[i],"topology_commitment":c("topology"),"peer_count":2,"peers":peers},
@@ -79,7 +99,7 @@ def evidence(i,stage):
       "paths":{"state":{"present":True,"uid":995,"gid":995,"mode":"750","content_commitment":c(f"state-{i}-{stage}")},"runtime":{"present":running,"uid":995 if running else None,"gid":995 if running else None,"mode":"700" if running else None,"content_commitment":c(f"runtime-{i}") if running else None},"control_socket":{"present":running,"uid":995 if running else None,"gid":995 if running else None,"mode":"600" if running else None}},
       "listeners":{"status":"available-successful","endpoint_commitment":c(f"endpoint-{i}"),"tcp_listener_count":1 if running else 0,"udp_listener_count":0},
       "stability":{"existing_services_commitment":c("existing"),"podman_containers_commitment":c("containers"),"routes":{"status":"available-successful","commitment":c("routes")},"firewall":{"status":"available-successful","commitment":c("firewall")}},
-      "inspection":inspection,"graceful_shutdown":shutdown if cleanup else None}
+      "inspection":inspection,"exchanges":exchanges,"graceful_shutdown":shutdown if cleanup else None}
 for i in range(3):
     for stage in ("pre-activation","active-baseline","converged","post-cleanup"):
         path=r/f"{aliases[i]}-{stage}.json"
@@ -160,7 +180,7 @@ if "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation
 # serve cannot produce a baseline at all. Three states are typed and all three are tested:
 # not inspected (null), inspected and absent, inspected and present. The negatives below
 # exist because "absent" must not become a way to smuggle a capture past validation.
-absent='{"store_present":false,"schema_version":null,"logical_manager_commitment":null,"replica_commitment":null,"logical_history_sha256":null,"sqlite_integrity_result":null,"history_count":null,"receipt_count":null,"audit_event_count":null,"incomplete_attempt_count":null}'
+absent='{"store_present":false,"schema_version":null,"logical_manager_commitment":null,"replica_commitment":null,"logical_history_sha256":null,"receipt_set_sha256":null,"audit_set_sha256":null,"sqlite_integrity_result":null,"history_count":null,"receipt_count":null,"audit_event_count":null,"incomplete_attempt_count":null,"incomplete_attempts":null,"unaudited_import_receipt_count":null,"unaudited_import_receipt_commitments":null}'
 zero='0000000000000000000000000000000000000000000000000000000000000000'
 jq ".inspection=$absent" "$work/lab-a-pre-activation.json" > "$work/fresh-pre.json"
 sidecar "$work/fresh-pre.json"
@@ -182,8 +202,27 @@ reject_error 'non-boolean store_present' '.inspection.store_present="false"' act
 # so a one-host version of this test passes against the crashing comparator and proves
 # nothing. It was written that way first. With all three absent the set is {None}, size
 # one, and evaluation walks straight into the null comparison.
-for hostname in lab-a lab-b lab-c; do jq ".inspection=$absent" "$work/$hostname-converged.json" > "$work/$hostname-nostore.json"; sidecar "$work/$hostname-nostore.json"; done
+# The exchanges must go with the store. A capture claiming no canonical store while still
+# publishing folded exchanges is refused earlier, as a shape error rather than a verdict —
+# correctly, but it is not the case under test here.
+for hostname in lab-a lab-b lab-c; do jq ".inspection=$absent | .exchanges=null" "$work/$hostname-converged.json" > "$work/$hostname-nostore.json"; sidecar "$work/$hostname-nostore.json"; done
 if "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work"/*-nostore.json --cleanup "$work"/*-post-cleanup.json > "$work/nostore-report.json"; then echo 'accepted converged captures reporting no canonical store' >&2; exit 1; fi
 report_says "$work/nostore-report.json" '.status=="FAIL" and (.failures | index("converged captures do not prove one complete logical history of at least three events") != null)' 'absent converged stores did not produce a typed verdict'
 
-printf '%s\n' 'PASS: four-stage activation evidence, effective policy, ownership, graceful cleanup, infrastructure stability, converged history boundaries and typed fresh-store absence.'
+# The published incomplete-attempt records and folded exchanges. These are what make the
+# accounting conditions evaluable at all, so every self-consistency rule over them is
+# exercised: a validation nothing tests is a validation nobody has.
+attempt='{"attempt_commitment":"sha256:1111111111111111111111111111111111111111111111111111111111111111","nonce_commitment":"sha256:2222222222222222222222222222222222222222222222222222222222222222","nonce_authority":"peer-validated","operation_commitment":null,"direction":"outbound","last_phase":"outbound_request_prepared"}'
+reject_error 'attempt count disagreeing with the published list' ".inspection.incomplete_attempts=[$attempt]" converged 'incomplete_attempt_count does not match the published list'
+reject_error 'a repeated attempt identity' ".inspection.incomplete_attempts=[$attempt,$attempt] | .inspection.incomplete_attempt_count=2" converged 'repeats an attempt identity'
+reject_error 'an outbound attempt with a locally minted nonce' ".inspection.incomplete_attempts=[$attempt | .nonce_authority=\"pre-authentication\"] | .inspection.incomplete_attempt_count=1" converged 'outbound attempt cannot carry a pre-authentication nonce'
+reject_error 'unaudited receipt count disagreeing with its list' '.inspection.unaudited_import_receipt_count=1' converged 'unaudited_import_receipt_count does not match'
+reject_error 'two folded rows for one nonce' '.exchanges=[.exchanges[0],.exchanges[0]]' converged 'two folded rows for one nonce'
+reject_error 'joinable asserted rather than derived' '.exchanges[0].nonce_authority="pre-authentication" | .exchanges[0].joinable=true' converged 'joinable does not follow from nonce_authority'
+reject_error 'an outbound exchange with a locally minted nonce' '.exchanges[0].nonce_authority="pre-authentication" | .exchanges[0].joinable=false | .exchanges[0].direction="outbound"' converged 'outbound exchange cannot carry a pre-authentication nonce'
+reject_error 'more phases than rows collapsed' '.exchanges[0].row_count=2' converged 'more phases than collapsed rows'
+reject_error 'a phase repeated in one folded row' '.exchanges[0].phases_reached=["inbound_request_observed","inbound_request_observed","inbound_import_committed","inbound_reply_prepared"]' converged 'repeats a phase'
+reject_error 'exchanges published with no store inspected' '.exchanges=[]' pre-activation 'exchanges published without an inspected present store'
+reject_error 'a present store publishing no exchanges' '.exchanges=null' converged 'no exchanges were published'
+
+printf '%s\n' 'PASS: four-stage activation evidence, effective policy, ownership, graceful cleanup, infrastructure stability, converged history boundaries, typed fresh-store absence, published incomplete attempts and folded exchanges.'

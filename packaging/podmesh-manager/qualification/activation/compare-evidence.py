@@ -35,13 +35,35 @@ def read(path):
     if hashlib.sha256(raw).hexdigest() != fields[0]:
         raise ValueError(f"{path}: evidence checksum mismatch")
     value=json.loads(raw)
-    fields=("schema_version","host_alias","stage","package","configuration","dropin","service","manager_process","paths","listeners","stability","inspection","graceful_shutdown")
+    fields=("schema_version","host_alias","stage","package","configuration","dropin","service","manager_process","paths","listeners","stability","inspection","exchanges","graceful_shutdown")
     obj(value, str(path), fields)
     if value["schema_version"] != SCHEMA or value["stage"] not in STAGES: raise ValueError(f"{path}: unsupported evidence schema or stage")
     string(value["host_alias"], f"{path}.host_alias")
     return value
 
-DERIVED=("schema_version","logical_manager_commitment","replica_commitment","logical_history_sha256","sqlite_integrity_result","history_count","receipt_count","audit_event_count","incomplete_attempt_count")
+DERIVED=("schema_version","logical_manager_commitment","replica_commitment","logical_history_sha256",
+         "receipt_set_sha256","audit_set_sha256","sqlite_integrity_result","history_count","receipt_count",
+         "audit_event_count","incomplete_attempt_count","incomplete_attempts",
+         "unaudited_import_receipt_count","unaudited_import_receipt_commitments")
+COUNTS=("history_count","receipt_count","audit_event_count","incomplete_attempt_count","unaudited_import_receipt_count")
+DIRECTIONS=("inbound","outbound")
+AUTHORITIES=("peer-validated","pre-authentication")
+
+def validate_attempt(v, label):
+    # An incomplete attempt is published as a record, not as a tally. The count alone is
+    # what made six of the eight accounting conditions impossible to evaluate: a difference
+    # of totals describes nothing, because cleanup legitimately adds terminal rows.
+    obj(v,label,("attempt_commitment","nonce_commitment","nonce_authority","operation_commitment","direction","last_phase"))
+    commit(v["attempt_commitment"],f"{label}.attempt_commitment"); commit(v["nonce_commitment"],f"{label}.nonce_commitment")
+    if v["operation_commitment"] is not None: commit(v["operation_commitment"],f"{label}.operation_commitment")
+    if v["nonce_authority"] not in AUTHORITIES: raise ValueError(f"{label}.nonce_authority: unknown authority")
+    if v["direction"] not in DIRECTIONS: raise ValueError(f"{label}.direction: unknown direction")
+    string(v["last_phase"],f"{label}.last_phase")
+    # A pre-authentication nonce is minted locally and can never be joined across hosts. The
+    # candidate confines it to inbound observation, so an outbound attempt claiming one is
+    # not a value this collector could have observed.
+    if v["nonce_authority"]=="pre-authentication" and v["direction"]!="inbound":
+        raise ValueError(f"{label}: an outbound attempt cannot carry a pre-authentication nonce")
 
 def validate_inspection(v, label):
     # Three states the collector can seal, and each is checked in full:
@@ -60,8 +82,23 @@ def validate_inspection(v, label):
         return
     if any(v[f] is None for f in DERIVED): raise ValueError(f"{label}: present store is missing derived inspection fields")
     if v["schema_version"] != 3 or v["sqlite_integrity_result"] != "ok": raise ValueError(f"{label}: invalid read-only inspection")
-    commit(v["logical_manager_commitment"],label); commit(v["replica_commitment"],label); sha(v["logical_history_sha256"],label)
-    for f in ("history_count","receipt_count","audit_event_count","incomplete_attempt_count"): integer(v[f],f"{label}.{f}")
+    commit(v["logical_manager_commitment"],label); commit(v["replica_commitment"],label)
+    for f in ("logical_history_sha256","receipt_set_sha256","audit_set_sha256"): sha(v[f],f"{label}.{f}")
+    for f in COUNTS: integer(v[f],f"{label}.{f}")
+    if not isinstance(v["incomplete_attempts"],list): raise ValueError(f"{label}.incomplete_attempts: must be a list")
+    for i,a in enumerate(v["incomplete_attempts"]): validate_attempt(a,f"{label}.incomplete_attempts[{i}]")
+    # The count and the list are two statements of one fact, and a capture that disagrees
+    # with itself is refused rather than reconciled in the comparator's favour.
+    if len(v["incomplete_attempts"]) != v["incomplete_attempt_count"]:
+        raise ValueError(f"{label}: incomplete_attempt_count does not match the published list")
+    if not isinstance(v["unaudited_import_receipt_commitments"],list): raise ValueError(f"{label}.unaudited_import_receipt_commitments: must be a list")
+    for i,c in enumerate(v["unaudited_import_receipt_commitments"]): commit(c,f"{label}.unaudited_import_receipt_commitments[{i}]")
+    if len(v["unaudited_import_receipt_commitments"]) != v["unaudited_import_receipt_count"]:
+        raise ValueError(f"{label}: unaudited_import_receipt_count does not match the published list")
+    # Attempt identities must be distinct: a duplicate would let one strand be counted as
+    # two, or two as one, and the predicate works on identities rather than on totals.
+    ids=[a["attempt_commitment"] for a in v["incomplete_attempts"]]
+    if len(set(ids)) != len(ids): raise ValueError(f"{label}: incomplete_attempts repeats an attempt identity")
 
 def validate(v,label):
     p=obj(v["package"],f"{label}.package",("name","version","binary_sha256","dpkg_verify"))
@@ -121,7 +158,57 @@ def validate(v,label):
         if x["status"]!="available-successful": raise ValueError(f"{label}.stability.{f}: unavailable observation")
         commit(x["commitment"],label)
     validate_inspection(v["inspection"],f"{label}.inspection")
+    validate_exchanges(v["exchanges"],f"{label}.exchanges")
+    # A capture that inspected a present store publishes exchanges; one that inspected an
+    # absent store, or did not inspect at all, publishes none. An empty list and "no list"
+    # are different claims and stay distinguishable.
+    if v["inspection"] is not None and v["inspection"]["store_present"] and v["exchanges"] is None:
+        raise ValueError(f"{label}: a present store was inspected but no exchanges were published")
+    if (v["inspection"] is None or not v["inspection"]["store_present"]) and v["exchanges"] is not None:
+        raise ValueError(f"{label}: exchanges published without an inspected present store")
     if v["graceful_shutdown"] is not None and v["graceful_shutdown"] != SHUTDOWN: raise ValueError(f"{label}.graceful_shutdown: invalid exact typed-shutdown proof")
+
+EXCHANGE=("nonce_commitment","nonce_authority","joinable","direction","phases_reached","row_count",
+          "peer_commitment","operation_commitment","request_sha256_commitment","reply_sha256_commitment",
+          "local_receipt_commitment","remote_receipt_commitment","request_frame_bytes","reply_frame_bytes",
+          "request_announced_body_bytes","outcomes","replayed")
+
+def validate_exchanges(v, label):
+    # One folded row per wire nonce, never one per audit row. An exchange is one to four
+    # audit rows sharing a nonce, so a rule of one row per nonce applied to raw audit rows
+    # would refuse every genuine inbound exchange.
+    if v is None: return
+    if not isinstance(v,list): raise ValueError(f"{label}: must be a list or null")
+    seen=set()
+    for i,r in enumerate(v):
+        where=f"{label}[{i}]"
+        obj(r,where,EXCHANGE)
+        commit(r["nonce_commitment"],f"{where}.nonce_commitment")
+        if r["nonce_commitment"] in seen: raise ValueError(f"{where}: two folded rows for one nonce, which the fold must have collapsed")
+        seen.add(r["nonce_commitment"])
+        if r["nonce_authority"] not in AUTHORITIES: raise ValueError(f"{where}.nonce_authority: unknown authority")
+        if not isinstance(r["joinable"],bool): raise ValueError(f"{where}.joinable: must be a boolean")
+        # joinable is derived, never asserted: a capture claiming a locally minted nonce is
+        # joinable would send the comparator looking for a peer row that cannot exist.
+        if r["joinable"] != (r["nonce_authority"]=="peer-validated"):
+            raise ValueError(f"{where}.joinable does not follow from nonce_authority")
+        if r["direction"] not in DIRECTIONS: raise ValueError(f"{where}.direction: unknown direction")
+        if r["nonce_authority"]=="pre-authentication" and r["direction"]!="inbound":
+            raise ValueError(f"{where}: an outbound exchange cannot carry a pre-authentication nonce")
+        if not isinstance(r["phases_reached"],list) or not r["phases_reached"]: raise ValueError(f"{where}.phases_reached: must be a non-empty list")
+        for p in r["phases_reached"]: string(p,f"{where}.phases_reached")
+        if sorted(set(r["phases_reached"])) != sorted(r["phases_reached"]): raise ValueError(f"{where}.phases_reached repeats a phase")
+        integer(r["row_count"],f"{where}.row_count")
+        # The fold collapses rows; row_count says how many it collapsed, and a row claiming
+        # more phases than rows collapsed did not come from this fold.
+        if r["row_count"] < len(r["phases_reached"]): raise ValueError(f"{where}: more phases than collapsed rows")
+        for f in ("peer_commitment","operation_commitment","request_sha256_commitment","reply_sha256_commitment","local_receipt_commitment","remote_receipt_commitment"):
+            if r[f] is not None: commit(r[f],f"{where}.{f}")
+        for f in ("request_frame_bytes","reply_frame_bytes"): integer(r[f],f"{where}.{f}")
+        if r["request_announced_body_bytes"] is not None: integer(r["request_announced_body_bytes"],f"{where}.request_announced_body_bytes")
+        if not isinstance(r["outcomes"],list) or not r["outcomes"]: raise ValueError(f"{where}.outcomes: must be a non-empty list")
+        for o in r["outcomes"]: string(o,f"{where}.outcomes")
+        if r["replayed"] is not None and not isinstance(r["replayed"],bool): raise ValueError(f"{where}.replayed: must be a boolean or null")
 
 def inspection_bound(v):
     # store_present is checked here rather than left to fall out of a None comparison,
