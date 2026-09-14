@@ -4,7 +4,7 @@
 >
 > **Perimeter**: P1 — it decides which host may run a workload, so a mistake runs two.
 
-Status: **lots H1 to H3 built and checked; levels 1 to 3 designed, not built.** Written 2026-09-14
+Status: **lots H1 to H4 built and checked; level 1 complete; levels 2 and 3 designed, not built.** Written 2026-09-14
 against what PodMesh actually has, not against what an HA product usually has. Every
 capability named as missing was verified in the source, and the citations are below.
 
@@ -235,6 +235,33 @@ as a computed figure.
 
 It is provenance and never a checked credential, exactly as `PREPARE-A-HOST.md:38` says of
 every `authorization_ref` in PodMesh.
+
+**Lot H4, the lease follows the migration chain.** Level 1's stated missing work was to wire
+the exclusive claim into the handoff so a second destination cannot be authorised while the
+first holds it. Doing that exposed a gap in H1 itself: the gate only knew about `start` and
+`clone`, and **two migration operations leave a running universe behind without ever being a
+`start`** — a destination restore and a local recovery restore. Either could produce a writer
+on a host holding no entitlement.
+
+The gate now covers both, and `migration_authorize_transfer` requires a live lease on the
+source: only the host entitled to run a universe may originate its handoff, or a fenced host
+could begin the very handoff the fence exists to prevent. On `migration_complete_transfer` the
+source surrenders its lease under its own history event, `released_by_handoff`, so a reader
+can tell a handoff from an operator's release.
+
+**That release is cleanup, not the safety mechanism.** A completed reservation already refuses
+`start` on the source in every state but released or collected, so a release lost to a crash
+between the two writes blocks and never permits. It is still done because a lease that
+outlives the universe it was for is a lie in the journal — and it is the one rule here the
+single-host check cannot reach, since it runs only after a completed two-host handoff. That
+is written in the code beside it.
+
+The three new refusals are each verified by removing the rule and watching the check go red
+at the case named for it. Every migration-path refusal is asserted to be the **gate's own**,
+named as such — a request well-formed enough to pass parsing and no further, so that a later
+check's refusal cannot be mistaken for this one.
+
+Level 1 is now complete as designed: a planned handoff that cannot be raced.
 
 ## What PodMesh still has to gain
 

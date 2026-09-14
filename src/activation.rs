@@ -194,6 +194,30 @@ pub fn refuse_if_not_activated(db: &Connection, uuid: &str, operation: &str) -> 
     }
 }
 
+/// Surrender this host's lease because the universe was handed off and now runs elsewhere.
+///
+/// NOT REACHED BY THE CHECKS BESIDE THIS FILE, and said so rather than left to look tested:
+/// it runs only after `migration_complete_transfer` succeeds, which needs a real checkpoint,
+/// an authorized transfer, a destination that restored, and an outcome document back in the
+/// inbox -- a completed two-host handoff. The single-host check cannot produce one. The
+/// safety of a completed handoff does not rest on this line: the reservation already refuses
+/// `start` here in every state but released or collected. What this line keeps true is the
+/// journal, so a lease never outlives the universe it was for.
+///
+/// Idempotent and quiet when there is nothing to surrender: a universe under no policy, or one
+/// whose lease this host does not hold, is left exactly as it was. The history records the
+/// release under its own event so a reader can tell a handoff from an operator's release.
+pub fn release_by_handoff(db: &Connection, uuid: &str, id: &str) -> Result<(), Error> {
+    ensure_schema(db)?;
+    let Some(l) = lease(db, uuid)? else { return Ok(()) };
+    if l.holder_host_uuid != host_uuid(db)? {
+        return Ok(());
+    }
+    db.execute("DELETE FROM activation_leases WHERE universe_uuid=?1", [uuid])?;
+    record(db, uuid, &l.holder_host_uuid, l.generation, "released_by_handoff", id)?;
+    Ok(())
+}
+
 fn record(db: &Connection, uuid: &str, holder: &str, generation: i64, event: &str, id: &str) -> Result<(), Error> {
     db.execute(
         "INSERT INTO activation_lease_history(universe_uuid,holder_host_uuid,generation,event,at,operation_id)

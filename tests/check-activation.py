@@ -131,6 +131,30 @@ assert res['cpu_count'] and res['cpu_count'] >= 1, res
 assert res['state_directory_available_bytes'] is not None, res
 assert 'PodMesh knows' in res['note'], res
 
+# The migration chain must respect the lease, because two of its operations leave a RUNNING
+# universe behind without ever being a `start`, and a third originates the handoff. Each is
+# reached with a request that is well-formed enough to get past parsing and no further: the
+# refusal has to be the activation gate's, named as such, and not some later check's.
+m = str(uuid.uuid4())
+assert op('activation_require', m, lease_seconds=60, takeover_margin_seconds=10)['ok']
+refused(op('migration_restore', m, authorization_id=str(uuid.uuid4())),
+        'requires an activation lease and none is held', 'destination restore without a lease')
+refused(op('migration_restore_local', m, checkpoint_operation_id=str(uuid.uuid4())),
+        'requires an activation lease and none is held', 'local recovery restore without a lease')
+refused(op('migration_authorize_transfer', m, checkpoint_operation_id=str(uuid.uuid4()),
+           destination_host_uuid=str(uuid.uuid4())),
+        'requires an activation lease and none is held', 'handoff originated without a lease')
+# With a live lease the gate steps aside and each fails for its own, later reason.
+assert op('activation_acquire', m)['ok']
+for name, answer in (
+    ('restore', op('migration_restore', m, authorization_id=str(uuid.uuid4()))),
+    ('restore_local', op('migration_restore_local', m, checkpoint_operation_id=str(uuid.uuid4()))),
+    ('authorize', op('migration_authorize_transfer', m, checkpoint_operation_id=str(uuid.uuid4()),
+                     destination_host_uuid=str(uuid.uuid4()))),
+):
+    assert not answer['ok'], (name, answer)
+    assert 'activation lease' not in json.dumps(answer), f'gate still refusing {name} with a live lease: {answer}'
+
 # The takeover margin, which is the rule that actually keeps two honest hosts apart. It
 # cannot be reached through the API from one host -- every lease the API grants is held by
 # this host -- so the foreign holder is written straight into the journal as a fixture. The

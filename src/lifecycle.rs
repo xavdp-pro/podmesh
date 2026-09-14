@@ -629,7 +629,23 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
     // a self-restraint on THIS host, not exclusion across hosts: it stops an agent that names
     // the wrong host, and it does not stop a host that never asks. `stop` stays available for
     // the same reason it survives a reservation -- stopping can never produce a second writer.
-    if matches!(params, Params::Start { .. } | Params::Clone { .. }) {
+    // The gate covers every operation that leaves a RUNNING universe behind, and two of them
+    // are not `start`: a destination restore and a local recovery restore both end with a
+    // process serving requests. A gate that only knew about `start` let the migration chain
+    // produce a writer on a host that held no entitlement to run it.
+    if matches!(
+        params,
+        Params::Start { .. }
+            | Params::Clone { .. }
+            | Params::MigrationRestore { .. }
+            | Params::MigrationRestoreLocal { .. }
+    ) {
+        crate::activation::refuse_if_not_activated(db, uuid, params.name())?;
+    }
+    // Only the host entitled to run a universe may hand it off. Authorizing a transfer from a
+    // host whose lease has lapsed, or that never held one, would let a fenced host originate
+    // the very handoff the fence exists to prevent.
+    if matches!(params, Params::MigrationAuthorize { .. }) {
         crate::activation::refuse_if_not_activated(db, uuid, params.name())?;
     }
     // A garbage collection leaves a tombstone: the identity of a collected universe is never given a new
@@ -651,7 +667,16 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
             destination,
             authorization_ref,
         } => transfer::authorize(db, id, uuid, checkpoint, destination, authorization_ref, existing),
-        Params::MigrationComplete { authorization } => transfer::complete(db, id, uuid, authorization, existing),
+        Params::MigrationComplete { authorization } => {
+            let result = transfer::complete(db, id, uuid, authorization, existing)?;
+            // The universe now runs elsewhere, so this host's entitlement is surrendered. This is
+            // cleanup rather than the safety mechanism: a completed reservation already refuses
+            // `start` here in every state but released or collected, so a release lost to a
+            // crash between the two writes blocks and never permits. It is still done, because
+            // a lease that outlives the universe it was for is a lie in the journal.
+            crate::activation::release_by_handoff(db, uuid, id)?;
+            Ok(result)
+        }
         Params::MigrationRetire { authorization } => transfer::retire(db, id, uuid, &name, authorization, existing),
         Params::MigrationRelease { checkpoint } => recovery::release(db, id, uuid, checkpoint, existing),
         Params::MigrationAbandon { checkpoint } => recovery::abandon(db, id, uuid, checkpoint, existing),
