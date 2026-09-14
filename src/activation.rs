@@ -104,7 +104,7 @@ fn permit(request: &serde_json::Value) -> Result<Permit, Error> {
         Ok(v.to_string())
     };
     let epoch = object["epoch"].as_i64().ok_or("permit.epoch must be an integer")?;
-    if epoch < 1 || epoch > MAX_EPOCH {
+    if !(1..=MAX_EPOCH).contains(&epoch) {
         return Err(format!("permit.epoch must be from 1 to {MAX_EPOCH}").into());
     }
     Ok(Permit {
@@ -160,7 +160,7 @@ fn host_resources() -> serde_json::Value {
         "cpu_count": std::thread::available_parallelism().map(std::num::NonZeroUsize::get).ok(),
         "load_average_1m": std::fs::read_to_string("/proc/loadavg").ok()
             .and_then(|l| l.split_whitespace().next().and_then(|v| v.parse::<f64>().ok())),
-        "state_directory_available_bytes": crate::migration::base().ok().map(|b| crate::migration::available_bytes(&b)),
+        "state_directory_available_bytes": crate::migration::base().ok().map(|b| crate::migration::available_bytes(b)),
         "note": "facts only; whether a standby fits depends on what the universe needs and on its allowance, neither of which PodMesh knows",
     })
 }
