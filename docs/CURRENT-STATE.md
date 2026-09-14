@@ -215,8 +215,16 @@ that is not acknowledged makes the stop an honest failure (exit 3, no escalation
 capture cycle refuses to capture after; the configuration is labelled a single-replica
 portability fixture; and Alpine was tried first, with the failed proof and the exact
 dependency recorded beside the Debian image (see the web tree's
-`packaging/podmesh-manager/universe/ALPINE-PROOF.md`). Still a universe contract decision: a
-network (no replication inside universes without one) and a reachable control socket.
+`packaging/podmesh-manager/universe/ALPINE-PROOF.md`). The operator's image policy
+(`/tmp/podmesh-claude/IMAGE-POLICY-UNIVERSES-2026-09-14.md`: Alpine root by default, Debian only
+as a local documented exception) was then applied the same night: the resident was built for
+musl from the frozen source commit in an Alpine Rust container on lab-a, and an Alpine root
+image (60 MB) passed the identical three-host proof with that binary (`4111e487…`) attested as
+both resident and inspector. Alpine is the default manager-universe image from here; Debian
+is the compatibility branch for the frozen glibc candidate `cbd5020a…`. The musl binary is a
+new build, not a frozen candidate: Codex freezes it or not. Still a universe contract
+decision: a network (no replication inside universes without one) and a reachable control
+socket.
 On the operator's "go" (2026-09-14 evening) the HA recommendations became the tool's
 defaults by hypothesis (`64892c4`): retention declared from every cycle (keep 3, one hour),
 three quarantined copies, 20/5 lease and margin, the laboratory's gate, no timer.
