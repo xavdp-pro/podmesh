@@ -510,6 +510,12 @@ fn promote(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error>
     // The takeover contract, in the order it is refused: a policy must exist here, because a
     // promotion without lease semantics would be a start on nobody's authority; then the lease
     // gate itself, whose three refusals say why.
+    //
+    // The activation schema is prepared here and not assumed: a standby that has never run
+    // an activation operation has no such tables, and the first two-host run of this sequence
+    // (2026-09-14) answered "no such table" where it should have said "no activation policy".
+    // The single-host check cannot reach that state, since it starts the source first.
+    crate::activation::ensure_schema(db)?;
     if crate::activation::policy(db, uuid)?.is_none() {
         return Err("recovery_point_promote refused: this universe is under no activation policy on this host; declare one with activation_require and acquire its lease first".into());
     }

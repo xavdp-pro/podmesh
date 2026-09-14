@@ -69,6 +69,16 @@ def n_ready(seconds=60):
     raise RuntimeError('Service did not become ready')
 def n_time():
     return {'time': time.time(), 'time_ns': time.time_ns()}
+def n_marker(name, marker):
+    """Whether a container's filesystem carries the marker file a running universe wrote: a fresh
+    `podman export` of the container, searched for `/marker-<marker>` holding exactly the marker bytes.
+    Taken on a container that has never been started here, it can only be satisfied by restored bytes."""
+    import io, tarfile
+    p = _podman('export', name)
+    with tarfile.open(fileobj=io.BytesIO(p.stdout)) as t:
+        hit = next((n for n in t.getnames() if n.strip('./') == f'marker-{marker}'), None)
+        present = bool(hit) and t.extractfile(hit).read() == marker.encode()
+        return {'present': present, 'entries': len(t.getnames())}
 def n_podman_state():
     """Independent view of every container, image and volume on this host."""
     containers = {c['Id']: [tuple(c.get('Names') or []), c.get('State'), c.get('StartedAt'), c.get('ExitedAt'), c.get('ExitCode'), c.get('ImageID')]

@@ -318,7 +318,11 @@ What it does not do, stated in every answer: the lease proves this host's restra
 mutual exclusion — it is not replicated; no failure detector exists; no transport moves the
 point (the two-host suite's controller can carry it); no signing crate exists in this build
 and adding one is the operator's supply-chain decision; the manifest's origin is never
-verified. None of this has run on two lab hosts yet.
+verified. On 2026-09-14 the whole level 2 sequence ran between two lab hosts on a transient
+development service (`tests/check-recovery-point-two-hosts.py`, 28 checks passed, report in the
+gitignored `evidence/ha/`), after a first run found that a standby with no activation history
+had no activation tables — fixed, rebuilt, rerun. The transient units are stopped; their state
+directories and the installed binaries under `/opt/podmesh-dev-ha/` were left in place.
 
 ## Next actions, in order
 
@@ -370,8 +374,7 @@ verified. None of this has run on two lab hosts yet.
    are specified in the same document and should be built in the same lot.
 6. Continue the central checklist: networking/volumes, partitions and HA, fractal
    demonstration, sequential storage tests, Backup Server and product documentation.
-7. HA, in order: run level 2's sequence across two lab hosts with the transient dev
-   service and the two-host controller as transport; replicate the lease as a manager
+7. HA, in order: done — level 2's sequence across two lab hosts; next, replicate the lease as a manager
    fact so the takeover margin is measured against the previous holder (new candidate,
    requalification); a failure detector on the agent's side that only decides when the
    standby's wait begins; the signing dependency once the operator decides it; then level

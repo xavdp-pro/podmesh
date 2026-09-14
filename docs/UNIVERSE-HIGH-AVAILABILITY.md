@@ -4,7 +4,7 @@
 >
 > **Perimeter**: P1 — it decides which host may run a workload, so a mistake runs two.
 
-Status: **lots H1 to H7 built and checked; level 1 complete; level 2's capture, restore and takeover built on one host, unsigned, with no transport and no failure detector; level 3 designed, not built.** Written 2026-09-14
+Status: **lots H1 to H7 built and checked; level 1 complete; level 2's sequence run end to end across two lab hosts on 2026-09-14, unsigned, with the suite as transport and as failure detector; level 3 designed, not built.** Written 2026-09-14
 against what PodMesh actually has, not against what an HA product usually has. Every
 capability named as missing was verified in the source, and the citations are below.
 
@@ -357,6 +357,45 @@ dependency decision), a datastore that verifies and catalogues, a failure detect
 decides *when* the standby begins its wait, and the lease replicated as a fact so that the
 margin is measured against the previous holder's clock rather than a fixture. Until then the
 standby's wait is measured against its own journal, and the design says so.
+
+## Level 2 across two hosts, measured on 2026-09-14
+
+`tests/check-recovery-point-two-hosts.py` ran the whole sequence between two lab hosts, on a
+transient development service carrying the same release binary on both (sha256
+`aee5d980…8af9a0f`), with every product mutation through the API and the suite in the two roles
+the design leaves outside PodMesh: transport controller and agent. Twenty-eight checks, all
+passed, in this order:
+
+1. The active host creates the universe, declares a policy of one standby among the two
+   hosts, is refused a start before any lease, acquires, starts. The container writes the
+   marker while running.
+2. It captures: stop (not forced), `recovery_point_prepare` (8.6 MB, `signed: false`), renews
+   the lease, starts again. Capture costs the universe a stop; that is level 2's price and it
+   is stated.
+3. The suite carries the manifest and the archive from the outbox to the standby's inbox over
+   SSH and compares digests on both sides.
+4. The standby is refused a restore into the source identity, restores into quarantine, and
+   **the marker is found in the quarantined copy before anything has started on the standby**.
+   A promotion before any policy exists there is refused without effect.
+5. The active host "fails": it stops renewing. The suite waits for the lapse **on the active
+   host's own clock**, a renewal is refused, the self-fence stops the universe without
+   escalation, and a start there is refused.
+6. The suite waits the takeover margin, again on the active host's clock. The standby
+   declares the policy, is refused a promotion before the lease, acquires, promotes, and **the
+   marker is found in the promoted universe before its first start**; then it starts and runs.
+
+**What the run found.** A standby that has never run an activation operation had no
+activation tables, and the promotion answered "no such table" where it should have said "no
+activation policy". The single-host check cannot reach that state, because it starts the
+source before anything else; the two-host run reached it on its first attempt. The promotion
+now prepares that schema itself, and the run was repeated on the fixed binary.
+
+**What the run does not prove, recorded in its own report under `not_proven`:** mutual
+exclusion (the standby's lease is in the standby's journal; the active host could re-acquire
+in its own), failure detection (the suite decided when the wait began; no host did), the
+manifest's origin (unsigned), and transport (bytes were carried by the suite, not by PodMesh).
+The lease generations were 1 on both hosts, which is itself the point: two journals, each
+counting alone.
 
 ## What PodMesh still has to gain
 
