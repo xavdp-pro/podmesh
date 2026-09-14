@@ -1,0 +1,213 @@
+{
+  "campaign": "manager2-g2-live-6",
+  "comparator": {
+    "accounted_incomplete_attempts": 103,
+    "canonical_convergence_evidenced": true,
+    "failures": 0,
+    "ha_claim": "absent",
+    "new_incomplete_attempts": 103,
+    "preexisting_incomplete_attempts": 211,
+    "status": "PASS",
+    "terminal_attempts": 237,
+    "trust_model": "collector-honest; cross-host joins only",
+    "unaccounted_incomplete_attempts": 0,
+    "unaccounted_join_failed": 0,
+    "unaccounted_peer_has_no_record": 0,
+    "undecided_conditions": 5,
+    "unmatched_inbound_rows": 2
+  },
+  "date_utc": "2026-09-14",
+  "derivation": {
+    "candidate_binary_sha256_on_workstation": "cbd5020a37d2b6b2ab94ee41a7ea9d2f50d0da36c6fb972f795c8a1fe3660128",
+    "derivation": "reproduced on all three hosts",
+    "fields_compared": [
+      "logical_history_sha256",
+      "audit_set_sha256",
+      "receipt_set_sha256",
+      "history_count",
+      "receipt_count",
+      "audit_event_count",
+      "incomplete_attempt_count",
+      "sqlite_integrity_result"
+    ],
+    "hosts": {
+      "lab-a": {
+        "audit_event_count": 4340,
+        "logical_history_sha256": "079784c01ca06147508c39f6b732f2d8d8eb8e21184e58c6a5047aee6a0efb36",
+        "mismatches": [],
+        "reproduced": true,
+        "store_sha256": "5072724a11c25102a35be95d3e4fa98d9689c2d6f53683410f1e034e23b708c0"
+      },
+      "lab-b": {
+        "audit_event_count": 5165,
+        "logical_history_sha256": "079784c01ca06147508c39f6b732f2d8d8eb8e21184e58c6a5047aee6a0efb36",
+        "mismatches": [],
+        "reproduced": true,
+        "store_sha256": "1d843f82d76ec471800e98a14c38d89db174023f20fa0cb6b33e8fc7b8a2a333"
+      },
+      "lab-c": {
+        "audit_event_count": 4819,
+        "logical_history_sha256": "079784c01ca06147508c39f6b732f2d8d8eb8e21184e58c6a5047aee6a0efb36",
+        "mismatches": [],
+        "reproduced": true,
+        "store_sha256": "1760ec44901fe357c129966e93480a083c686afa42f34876f747a85d916f133e"
+      }
+    },
+    "method": "podmesh-managerd --inspect-store run on the host against a copy of the store preserved after the typed shutdown; the digests and counts it reports must equal those the live post-cleanup capture projected",
+    "schema": "manager2-campaign-derivation/v1"
+  },
+  "does_not_qualify": "HA, fencing, DNS takeover, automatic failover, production use or long-running viability; a PASS is an exchange-accounting result",
+  "driver_incidents": [
+    {
+      "at": "2026-09-14T17:44:28Z",
+      "exit": 1,
+      "phase": "preserve lab-a"
+    }
+  ],
+  "harness_sha256": {
+    "activate-host.sh": "9cd57ef17ed79abe9aa344986b1abdf3ae3ed8bad19164b9cf785bb0a5083423",
+    "append-observation.py": "2e2382e6a0f1c1456b477c7397a0bdb429a4443288a381b653eadb1b81f0e389",
+    "capture-host.sh": "ebcc57c8a392c403da44adedb1a80594bc9af8e7ddf3a03cc0c9add1bf3f9eec",
+    "graceful-shutdown.py": "a462c753be7d2288230110cffb9f494ea1b46b7540bf7024cbf4171973b921ed",
+    "validate-dropin.py": "22c0c16081fc5521cb607f5fc3884a664a79612d6e7b324dd7aa4f277b5e8029",
+    "wait-ready.py": "8fdbb7e04faaf96f3b2b3e0ef0b1deb028ef50e8b46177ed2256b2a37ef8bc6c"
+  },
+  "preserved": {
+    "comparator_input": "the twelve stage files and their sidecars",
+    "comparator_result": "live-evidence/comparison.json",
+    "inspection_output": [
+      "live-evidence/lab-a/derived-inspection.json (private: raw identifiers)",
+      "live-evidence/lab-b/derived-inspection.json (private: raw identifiers)",
+      "live-evidence/lab-c/derived-inspection.json (private: raw identifiers)"
+    ],
+    "raw_stores": [
+      "live-evidence/lab-a/preserved-store/manager.sqlite",
+      "live-evidence/lab-b/preserved-store/manager.sqlite",
+      "live-evidence/lab-c/preserved-store/manager.sqlite"
+    ]
+  },
+  "result": "PASS",
+  "schema_version": "podmesh-manager-live-activation-public-summary/v2",
+  "steps": [
+    {
+      "at": "2026-09-14T17:31:46Z",
+      "exit": 0,
+      "phase": "prepare-dirs "
+    },
+    {
+      "at": "2026-09-14T17:33:16Z",
+      "exit": 0,
+      "phase": "activate lab-a"
+    },
+    {
+      "at": "2026-09-14T17:35:02Z",
+      "exit": 0,
+      "phase": "activate lab-b"
+    },
+    {
+      "at": "2026-09-14T17:37:22Z",
+      "exit": 0,
+      "phase": "activate lab-c"
+    },
+    {
+      "at": "2026-09-14T17:37:24Z",
+      "exit": 0,
+      "phase": "observe lab-a"
+    },
+    {
+      "at": "2026-09-14T17:37:25Z",
+      "exit": 0,
+      "phase": "observe lab-b"
+    },
+    {
+      "at": "2026-09-14T17:37:32Z",
+      "exit": 0,
+      "phase": "observe lab-c"
+    },
+    {
+      "at": "2026-09-14T17:37:43Z",
+      "exit": 0,
+      "phase": "wait-converged "
+    },
+    {
+      "at": "2026-09-14T17:38:51Z",
+      "exit": 0,
+      "phase": "converged lab-a"
+    },
+    {
+      "at": "2026-09-14T17:40:00Z",
+      "exit": 0,
+      "phase": "converged lab-b"
+    },
+    {
+      "at": "2026-09-14T17:41:34Z",
+      "exit": 0,
+      "phase": "converged lab-c"
+    },
+    {
+      "at": "2026-09-14T17:42:31Z",
+      "exit": 0,
+      "phase": "rollback lab-a"
+    },
+    {
+      "at": "2026-09-14T17:43:27Z",
+      "exit": 0,
+      "phase": "rollback lab-b"
+    },
+    {
+      "at": "2026-09-14T17:44:27Z",
+      "exit": 0,
+      "phase": "rollback lab-c"
+    },
+    {
+      "at": "2026-09-14T17:44:28Z",
+      "exit": 1,
+      "phase": "preserve lab-a"
+    },
+    {
+      "at": "2026-09-14T17:44:29Z",
+      "exit": 0,
+      "phase": "rollback lab-a"
+    },
+    {
+      "at": "2026-09-14T17:44:30Z",
+      "exit": 0,
+      "phase": "rollback lab-b"
+    },
+    {
+      "at": "2026-09-14T17:44:30Z",
+      "exit": 0,
+      "phase": "rollback lab-c"
+    },
+    {
+      "at": "2026-09-14T17:45:11Z",
+      "exit": 0,
+      "phase": "preserve lab-a"
+    },
+    {
+      "at": "2026-09-14T17:45:13Z",
+      "exit": 0,
+      "phase": "preserve lab-b"
+    },
+    {
+      "at": "2026-09-14T17:45:14Z",
+      "exit": 0,
+      "phase": "preserve lab-c"
+    },
+    {
+      "at": "2026-09-14T17:45:32Z",
+      "exit": 0,
+      "phase": "fetch "
+    },
+    {
+      "at": "2026-09-14T17:45:33Z",
+      "exit": 0,
+      "phase": "compare "
+    },
+    {
+      "at": "2026-09-14T17:45:34Z",
+      "exit": 0,
+      "phase": "derive "
+    }
+  ]
+}

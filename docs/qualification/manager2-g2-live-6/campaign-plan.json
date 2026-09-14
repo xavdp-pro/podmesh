@@ -1,0 +1,31 @@
+{
+  "campaign": "manager2-g2-live-6",
+  "convergence_wait": {
+    "max_polls": 60,
+    "poll_seconds": 5,
+    "rule": "three equal canonical digests and history_count grown by exactly three since the active baselines"
+  },
+  "does_not_qualify": "HA, fencing, DNS takeover, automatic failover, production use or long-running viability; a PASS is an exchange-accounting result",
+  "evidence_dir": "<campaign directory>/live-evidence/<alias>  (identical path on host and workstation)",
+  "harness": "harness6 on the hosts (host-side tools byte-identical to the current tree); the comparator is the current tree's",
+  "host_order": [
+    "lab-a",
+    "lab-b",
+    "lab-c"
+  ],
+  "observation_value": "g2-campaign-6-probe",
+  "operation_ids": {
+    "lab-a": "96b0742f-ac32-46e9-9e4c-8be2358d9099",
+    "lab-b": "dfcc4411-9c9f-4c11-b455-de991ed8c01c",
+    "lab-c": "726fa5f8-c240-4212-acc7-861d19155b80"
+  },
+  "precondition": "manager disabled and inactive, no g2 drop-in, campaign 5 ledgers complete; each host carries a populated store whose incomplete attempts become pre-existing debt",
+  "prepared_at_utc": "2026-09-14T17:31:30+00:00",
+  "purpose": "repeatable real evidence-v3 capture on three hosts, as Codex's direction of 2026-09-14 asks: raw stores preserved, inspection output preserved, comparator input and result preserved, derivation from the preserved stores compared with the live captures; able to fail honestly",
+  "scopes": {
+    "lab-a": "g2/lab-a/observations",
+    "lab-b": "g2/lab-b/observations",
+    "lab-c": "g2/lab-c/observations"
+  },
+  "subject": "campaign-probe"
+}

@@ -1,0 +1,39 @@
+{
+  "candidate_binary_sha256_on_workstation": "cbd5020a37d2b6b2ab94ee41a7ea9d2f50d0da36c6fb972f795c8a1fe3660128",
+  "derivation": "reproduced on all three hosts",
+  "fields_compared": [
+    "logical_history_sha256",
+    "audit_set_sha256",
+    "receipt_set_sha256",
+    "history_count",
+    "receipt_count",
+    "audit_event_count",
+    "incomplete_attempt_count",
+    "sqlite_integrity_result"
+  ],
+  "hosts": {
+    "lab-a": {
+      "audit_event_count": 4340,
+      "logical_history_sha256": "079784c01ca06147508c39f6b732f2d8d8eb8e21184e58c6a5047aee6a0efb36",
+      "mismatches": [],
+      "reproduced": true,
+      "store_sha256": "5072724a11c25102a35be95d3e4fa98d9689c2d6f53683410f1e034e23b708c0"
+    },
+    "lab-b": {
+      "audit_event_count": 5165,
+      "logical_history_sha256": "079784c01ca06147508c39f6b732f2d8d8eb8e21184e58c6a5047aee6a0efb36",
+      "mismatches": [],
+      "reproduced": true,
+      "store_sha256": "1d843f82d76ec471800e98a14c38d89db174023f20fa0cb6b33e8fc7b8a2a333"
+    },
+    "lab-c": {
+      "audit_event_count": 4819,
+      "logical_history_sha256": "079784c01ca06147508c39f6b732f2d8d8eb8e21184e58c6a5047aee6a0efb36",
+      "mismatches": [],
+      "reproduced": true,
+      "store_sha256": "1760ec44901fe357c129966e93480a083c686afa42f34876f747a85d916f133e"
+    }
+  },
+  "method": "podmesh-managerd --inspect-store run on the host against a copy of the store preserved after the typed shutdown; the digests and counts it reports must equal those the live post-cleanup capture projected",
+  "schema": "manager2-campaign-derivation/v1"
+}
