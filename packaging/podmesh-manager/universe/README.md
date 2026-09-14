@@ -39,7 +39,11 @@ there runs the HA-10 shape on three hosts and proves, by the frozen candidate's 
 - **Attested binary.** The check exports `/usr/lib/podmesh-manager/podmesh-managerd` from the
   universe and refuses any inspection unless its SHA-256 equals the inspector's on the
   workstation; both digests are recorded in the result.
-- **Alpine first.** See `ALPINE-PROOF.md`: the frozen candidate is a glibc ≥ 2.34 executable
+- **Alpine first, Debian as a recorded exception.** The image policy of 2026-09-14
+  (`/tmp/podmesh-claude/IMAGE-POLICY-UNIVERSES-2026-09-14.md`, kept beside the canon by the
+  operator) makes Alpine the default root image; `DEBIAN-EXCEPTION.md` records this universe's
+  exception in the policy's form — component, Alpine limitation, Debian dependency, smoke test —
+  and why it is the root and how it goes away. See `ALPINE-PROOF.md`: the frozen candidate is a glibc ≥ 2.34 executable
   that cannot be loaded on musl, with or without `gcompat` (`fcntl64: symbol not found`). The
   Debian 13 base is the recorded exception; an Alpine image needs a musl build of the candidate.
 - **Overlay copy-up.** A store that arrives in an image layer (a restored recovery point) is
