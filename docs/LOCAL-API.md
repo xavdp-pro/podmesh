@@ -268,14 +268,20 @@ timeliness of renewals and fences is the caller's obligation.
 lease. `stop` is never gated.
 
 - `activation_require` (`lease_seconds` 5–3600, `takeover_margin_seconds` ≥ 5, optional `desired_standbys`
-  0–16 and `eligible_hosts`) declares the policy. Absent standbys means none. A target no placement among the
-  eligible hosts can satisfy is refused at declaration. The `authorization_ref` is kept verbatim as
-  `allocation_decided_by`: the allowance is the operator's judgement and is never computed here.
+  0–16, `eligible_hosts` and `authority_id`) declares the policy. Absent standbys means none. A target no
+  placement among the eligible hosts can satisfy is refused at declaration. The `authorization_ref` is kept
+  verbatim as `allocation_decided_by`: the allowance is the operator's judgement and is never computed here.
+  An `authority_id` names the external gate whose **epochs** bind activation (below); absent means leases alone.
 - `activation_acquire` takes the lease for this host. It is idempotent while this host's lease is live, retakes
   this host's own lapsed lease with a new generation, and takes over another host's only once that lease has
-  lapsed by **at least the takeover margin** — before that it is refused and says when it may be taken.
+  lapsed by **at least the takeover margin** — before that it is refused and says when it may be taken. Under an
+  authority it also requires a `permit` (below) whose epoch is newer than the previous holder's.
 - `activation_renew` extends this host's live lease; a lapsed lease is **not** renewable and must be
-  re-acquired, so an entitlement that ended is never silently extended.
+  re-acquired, so an entitlement that ended is never silently extended; a superseded one is not renewable either.
+- `activation_supersede` (`permit`) delivers a newer grant, bound to whoever it was bound to, so that this host
+  learns it has been overtaken: the screen advances, and this host's lease, live or not, no longer entitles it —
+  the gate, the renewal and the fence all read that. A permit at or below the highest epoch seen is refused, so
+  the screen only ever moves forward.
 - `activation_release` surrenders it. `migration_complete_transfer` releases it under its own history event,
   `released_by_handoff`.
 - `activation_status` reports the policy, the lease, its history, the replication intent, this host's
@@ -285,10 +291,22 @@ lease. `stop` is never gated.
   holds no live lease for, and reports which it left alone and why. It must be called at least as often as the
   shortest lease, or a lapsed lease leaves a universe running.
 
+**Epochs, from the fencing laboratory.** `experiments/manager-fencing` in the web tree models exclusion as an
+epoch issued by one external gate, rotated only by an explicit trusted action, with each maker keeping a durable
+screen that refuses epochs it has seen superseded. A policy with an `authority_id` puts PodMesh in the maker's
+role. A `permit` is the laboratory's exact form — `authority_id`, `resource`, `epoch`, `replica_id`,
+`instance_id`, `grant_id`, no other field; identifiers `[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}`; epoch 1 to 2³¹−1 —
+and is bound to the universe (`resource`), this host (`replica_id`) and **this boot** (`instance_id` is the
+kernel's `boot_id`, so a rebooted host must be authorised again). The screen, `highest_epoch_seen`, is reported
+by `activation_status` with `superseded`. The gate's fourth refusal is "superseded by epoch N".
+
 **What a lease proves.** This host's own restraint: it will not start what it holds no lease for. It does
 **not** prove mutual exclusion — the lease lives in this host's journal, a host that never asks is not
 restrained by it, and the takeover margin is measured against this journal's copy. Every status answer and every
-promotion says so.
+promotion says so. **What a permit proves:** provenance from a root-only channel, and nothing more — PodMesh never
+contacts the gate and holds no key, so it cannot verify a permit's origin. The asymmetry is stated in every
+answer's `permit_verification`: a forged higher epoch can stop a universe here, never start a second one. Gate
+uniqueness and compare-and-swap rotation are the laboratory's, not PodMesh's.
 
 **Recovery points.** A stopped universe becomes an immutable, digested point; a point becomes a quarantined
 copy; a quarantined copy becomes the universe itself, under the lease.

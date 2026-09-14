@@ -15,6 +15,17 @@
 //! the manager's job and a later lot. Until then a partitioned host is restrained only by its
 //! own copy of this record.
 //!
+//! THE EPOCH HALF (lot H8). `experiments/manager-fencing` in the web tree models exclusion
+//! the other way round: not a lease that expires, but an EPOCH issued by one external gate,
+//! rotated only by an explicit trusted action, with each maker keeping a durable screen that
+//! refuses any epoch it has already seen superseded. A policy may name that gate's
+//! `authority_id`; acquisition then requires a permit in the laboratory's exact form, bound to
+//! this host and to this boot, and the screen below refuses stale ones. The agent that names
+//! the host is the laboratory's rotation controller; PodMesh is its maker. What PodMesh cannot
+//! do is verify a permit's origin -- there is no signature and it never contacts the gate --
+//! so a permit is provenance from a root-only channel, and the asymmetry is stated: a forged
+//! HIGHER epoch can stop a universe here (availability), never start a second one (safety).
+//!
 //! The takeover margin is what keeps two honest hosts apart. A different holder may acquire
 //! only after the previous lease's expiry PLUS the margin, so the window in which the previous
 //! holder still believes it is entitled and the window in which the new one starts cannot
@@ -35,6 +46,95 @@ const MAX_LEASE_SECONDS: u64 = 3600;
 const MIN_TAKEOVER_MARGIN_SECONDS: u64 = 5;
 /// A standby per remaining node and no more; beyond that the number describes nothing.
 const MAX_STANDBYS: u64 = 16;
+/// The fencing laboratory's permit bounds, taken as they are: an identifier is
+/// `[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}`, an epoch is 1 to 2^31-1, a permit is at most 4096 bytes.
+const MAX_IDENTIFIER: usize = 96;
+const MAX_EPOCH: i64 = i32::MAX as i64;
+const MAX_PERMIT_BYTES: usize = 4096;
+const PERMIT_FIELDS: [&str; 6] = ["authority_id", "resource", "epoch", "replica_id", "instance_id", "grant_id"];
+
+/// An identifier as the fencing laboratory defines one.
+fn identifier(value: &str, field: &str) -> Result<(), Error> {
+    let mut bytes = value.bytes();
+    let head = bytes.next().ok_or_else(|| format!("{field} must not be empty"))?;
+    if !head.is_ascii_alphanumeric() || value.len() > MAX_IDENTIFIER
+        || !bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b':' || b == b'-')
+    {
+        return Err(format!("{field} must be 1-{MAX_IDENTIFIER} ASCII characters from [A-Za-z0-9_.:-], starting alphanumeric").into());
+    }
+    Ok(())
+}
+
+/// This boot's identity. A permit is bound to the replica's current incarnation, and a host
+/// that has rebooted must be authorised again rather than resume under a permit it held
+/// before -- whatever it was doing then, nobody has re-decided it since.
+fn boot_id() -> Result<String, Error> {
+    Ok(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim().to_string())
+}
+
+/// The laboratory's permit, exactly six fields, no more and no less.
+pub struct Permit {
+    pub authority_id: String,
+    pub resource: String,
+    pub epoch: i64,
+    pub replica_id: String,
+    pub instance_id: String,
+    pub grant_id: String,
+}
+
+fn permit(request: &serde_json::Value) -> Result<Permit, Error> {
+    let value = request.get("permit").ok_or("This universe is gated by an authority: activation requires a permit")?;
+    let object = value.as_object().ok_or("permit must be an object")?;
+    // Defence in depth, unreachable through the API: a whole request is refused at the same
+    // size before this runs. Kept because the bound is part of the laboratory's definition of
+    // a permit, and stated so it is not mistaken for a tested rule.
+    if serde_json::to_string(value)?.len() > MAX_PERMIT_BYTES {
+        return Err(format!("permit exceeds {MAX_PERMIT_BYTES} bytes").into());
+    }
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let mut expected = PERMIT_FIELDS.to_vec();
+    expected.sort_unstable();
+    if keys != expected {
+        return Err(format!("permit must carry exactly the fields {}", PERMIT_FIELDS.join(", ")).into());
+    }
+    let text = |field: &str| -> Result<String, Error> {
+        let v = object[field].as_str().ok_or_else(|| format!("permit.{field} must be a string"))?;
+        identifier(v, &format!("permit.{field}"))?;
+        Ok(v.to_string())
+    };
+    let epoch = object["epoch"].as_i64().ok_or("permit.epoch must be an integer")?;
+    if epoch < 1 || epoch > MAX_EPOCH {
+        return Err(format!("permit.epoch must be from 1 to {MAX_EPOCH}").into());
+    }
+    Ok(Permit {
+        authority_id: text("authority_id")?,
+        resource: text("resource")?,
+        epoch,
+        replica_id: text("replica_id")?,
+        instance_id: text("instance_id")?,
+        grant_id: text("grant_id")?,
+    })
+}
+
+/// The highest epoch this host has seen for a universe: the maker's durable screen.
+fn highest_epoch_seen(db: &Connection, uuid: &str) -> Result<Option<i64>, Error> {
+    Ok(db
+        .query_row("SELECT epoch FROM activation_epochs WHERE universe_uuid=?1", [uuid], |r| r.get(0))
+        .optional()?)
+}
+
+fn screen(db: &Connection, uuid: &str, p: &Permit, id: &str) -> Result<(), Error> {
+    db.execute(
+        "INSERT INTO activation_epochs VALUES(?1,?2,?3,?4,?5,?6,?7)
+         ON CONFLICT(universe_uuid) DO UPDATE SET epoch=MAX(epoch,excluded.epoch),
+           authority_id=excluded.authority_id, grant_id=excluded.grant_id, replica_id=excluded.replica_id,
+           seen_at=excluded.seen_at, operation_id=excluded.operation_id
+         WHERE excluded.epoch>=epoch",
+        params![uuid, p.authority_id, p.epoch, p.grant_id, p.replica_id, crate::now() as i64, id],
+    )?;
+    Ok(())
+}
 
 /// What this host has, for a caller deciding where a standby can go.
 ///
@@ -90,22 +190,35 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             generation INTEGER NOT NULL,
             event TEXT NOT NULL,
             at INTEGER NOT NULL,
+            operation_id TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS activation_epochs(
+            universe_uuid TEXT PRIMARY KEY,
+            authority_id TEXT NOT NULL,
+            epoch INTEGER NOT NULL,
+            grant_id TEXT NOT NULL,
+            replica_id TEXT NOT NULL,
+            seen_at INTEGER NOT NULL,
             operation_id TEXT NOT NULL);",
     )?;
-    // A table created by an earlier version has neither column, and CREATE TABLE IF NOT
-    // EXISTS does not add them. Both carry a default, so an existing policy keeps working and
-    // simply declares no standby -- which is the truthful reading of a policy written before
-    // the field existed.
-    for column in ["desired_standbys INTEGER NOT NULL DEFAULT 0", "eligible_hosts TEXT NOT NULL DEFAULT '[]'",
-                   "authorization_ref TEXT NOT NULL DEFAULT ''"] {
+    // A table created by an earlier version lacks the later columns, and CREATE TABLE IF NOT
+    // EXISTS does not add them. Each carries a default that is the truthful reading of a row
+    // written before the field existed: no standby, no authority, epoch zero.
+    for (table, column) in [
+        ("activation_policy", "desired_standbys INTEGER NOT NULL DEFAULT 0"),
+        ("activation_policy", "eligible_hosts TEXT NOT NULL DEFAULT '[]'"),
+        ("activation_policy", "authorization_ref TEXT NOT NULL DEFAULT ''"),
+        ("activation_policy", "authority_id TEXT NOT NULL DEFAULT ''"),
+        ("activation_leases", "epoch INTEGER NOT NULL DEFAULT 0"),
+        ("activation_leases", "grant_id TEXT NOT NULL DEFAULT ''"),
+    ] {
         let name = column.split(' ').next().unwrap_or_default();
         let present: bool = db.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('activation_policy') WHERE name=?1",
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?1"),
             [name],
             |r| Ok(r.get::<_, i64>(0)? > 0),
         )?;
         if !present {
-            db.execute_batch(&format!("ALTER TABLE activation_policy ADD COLUMN {column};"))?;
+            db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column};"))?;
         }
     }
     Ok(())
@@ -124,12 +237,21 @@ pub struct Policy {
     pub eligible_hosts: Vec<String>,
     /// Who decided this allocation, recorded verbatim. Provenance, never a credential.
     pub authorization_ref: String,
+    /// The external gate whose epochs bind activation here; empty means the universe is
+    /// under leases alone, with no epoch screen.
+    pub authority_id: String,
+}
+
+impl Policy {
+    pub fn gated(&self) -> bool {
+        !self.authority_id.is_empty()
+    }
 }
 
 pub fn policy(db: &Connection, uuid: &str) -> Result<Option<Policy>, Error> {
     Ok(db
         .query_row(
-            "SELECT lease_seconds,takeover_margin_seconds,desired_standbys,eligible_hosts,authorization_ref FROM activation_policy WHERE universe_uuid=?1",
+            "SELECT lease_seconds,takeover_margin_seconds,desired_standbys,eligible_hosts,authorization_ref,authority_id FROM activation_policy WHERE universe_uuid=?1",
             [uuid],
             |r| {
                 let hosts: String = r.get(3)?;
@@ -139,6 +261,7 @@ pub fn policy(db: &Connection, uuid: &str) -> Result<Option<Policy>, Error> {
                     desired_standbys: r.get::<_, i64>(2)? as u64,
                     eligible_hosts: serde_json::from_str(&hosts).unwrap_or_default(),
                     authorization_ref: r.get(4)?,
+                    authority_id: r.get(5)?,
                 })
             },
         )
@@ -149,16 +272,25 @@ pub struct Lease {
     pub holder_host_uuid: String,
     pub generation: i64,
     pub expires_at: i64,
+    /// The epoch this lease was acquired under; zero for a lease under no authority.
+    pub epoch: i64,
+    pub grant_id: String,
 }
 
 pub fn lease(db: &Connection, uuid: &str) -> Result<Option<Lease>, Error> {
     Ok(db
         .query_row(
-            "SELECT holder_host_uuid,generation,expires_at FROM activation_leases WHERE universe_uuid=?1",
+            "SELECT holder_host_uuid,generation,expires_at,epoch,grant_id FROM activation_leases WHERE universe_uuid=?1",
             [uuid],
-            |r| Ok(Lease { holder_host_uuid: r.get(0)?, generation: r.get(1)?, expires_at: r.get(2)? }),
+            |r| Ok(Lease { holder_host_uuid: r.get(0)?, generation: r.get(1)?, expires_at: r.get(2)?, epoch: r.get(3)?, grant_id: r.get(4)? }),
         )
         .optional()?)
+}
+
+/// Whether this host's lease has been overtaken by an epoch it has seen: the maker's screen
+/// says a newer grant exists, so whatever this lease says, this host is no longer entitled.
+fn superseded(db: &Connection, uuid: &str, l: &Lease) -> Result<Option<i64>, Error> {
+    Ok(highest_epoch_seen(db, uuid)?.filter(|&seen| seen > l.epoch))
 }
 
 fn host_uuid(db: &Connection) -> Result<String, Error> {
@@ -188,6 +320,13 @@ pub fn refuse_if_not_activated(db: &Connection, uuid: &str, operation: &str) -> 
         Some(l) if l.expires_at <= now => Err(format!(
             "{operation} refused: this host's activation lease expired {} seconds ago",
             now - l.expires_at
+        )
+        .into()),
+        // The fourth reason, from the epoch screen: a newer grant has been seen here, so this
+        // host's lease, live or not, no longer entitles it. This is the maker's refusal.
+        Some(ref l) if superseded(db, uuid, l)?.is_some() => Err(format!(
+            "{operation} refused: this host's activation was superseded by epoch {}",
+            superseded(db, uuid, l)?.unwrap_or_default()
         )
         .into()),
         Some(_) => Ok(()),
@@ -253,6 +392,14 @@ fn view(db: &Connection, uuid: &str) -> Result<serde_json::Value, Error> {
         "expires_at": held.as_ref().map(|l| l.expires_at),
         "seconds_remaining": held.as_ref().map(|l| l.expires_at - now),
         "live": held.as_ref().is_some_and(|l| l.expires_at > now),
+        // The epoch half. A lease under an authority carries the epoch and grant it was taken
+        // under; the screen is the highest epoch this host has seen, whoever it was granted to.
+        "authority_id": policy.as_ref().map(|p| p.authority_id.clone()).filter(|a| !a.is_empty()),
+        "epoch": held.as_ref().map(|l| l.epoch).filter(|&e| e > 0),
+        "grant_id": held.as_ref().map(|l| l.grant_id.clone()).filter(|g| !g.is_empty()),
+        "highest_epoch_seen": highest_epoch_seen(db, uuid)?,
+        "superseded": match held.as_ref() { Some(l) => superseded(db, uuid, l)?.is_some(), None => false },
+        "permit_verification": "a permit is provenance from a root-only channel and is not verified: PodMesh never contacts the gate and holds no key; a forged higher epoch can stop a universe here, never start a second one",
         "desired_standbys": policy.as_ref().map(|p| p.desired_standbys),
         "eligible_hosts": policy.as_ref().map(|p| p.eligible_hosts.clone()),
         // The allocation is a judgement made against criteria PodMesh cannot see. It records
@@ -268,7 +415,7 @@ fn view(db: &Connection, uuid: &str) -> Result<serde_json::Value, Error> {
         "host_resources": host_resources(),
         // Said in every answer, because a caller reading only this object must not mistake a
         // local self-restraint for cross-host exclusion.
-        "scope": "this host's journal only; not mutual exclusion across hosts",
+        "scope": "this host's journal only; not mutual exclusion across hosts. Under an authority, an epoch screen refuses grants this host has seen superseded; the screen is fed by documents whose origin PodMesh cannot verify",
     }))
 }
 
@@ -338,15 +485,25 @@ pub fn execute(db: &Connection, request: &serde_json::Value) -> Result<serde_jso
                 )
                 .into());
             }
+            // Optional: the external gate whose epochs bind activation here. Absent means
+            // leases alone, which is what every policy declared before the field existed says.
+            let authority = match request.get("authority_id") {
+                None => String::new(),
+                Some(v) => {
+                    let a = v.as_str().ok_or("authority_id must be a string")?;
+                    identifier(a, "authority_id")?;
+                    a.to_string()
+                }
+            };
             db.execute(
-                "INSERT INTO activation_policy VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+                "INSERT INTO activation_policy VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
                  ON CONFLICT(universe_uuid) DO UPDATE SET lease_seconds=excluded.lease_seconds,
                    takeover_margin_seconds=excluded.takeover_margin_seconds,
                    declared_at=excluded.declared_at, operation_id=excluded.operation_id,
                    desired_standbys=excluded.desired_standbys, eligible_hosts=excluded.eligible_hosts,
-                   authorization_ref=excluded.authorization_ref",
+                   authorization_ref=excluded.authorization_ref, authority_id=excluded.authority_id",
                 params![uuid, lease_seconds as i64, margin as i64, now, id, standbys as i64,
-                        serde_json::to_string(&hosts)?, reference],
+                        serde_json::to_string(&hosts)?, reference, authority],
             )?;
             record(db, uuid, &this_host, 0, "policy_declared", id)?;
         }
@@ -355,6 +512,57 @@ pub fn execute(db: &Connection, request: &serde_json::Value) -> Result<serde_jso
                 return Err("This universe has no activation policy; declare one first".into());
             };
             let previous = lease(db, uuid)?;
+            // The epoch half, when the policy names an authority. The permit is bound to this
+            // universe, this host and this boot, and then screened: an epoch below the highest
+            // seen here is superseded whatever it says, and a takeover from another holder
+            // needs an epoch newer than the one that holder was granted -- the explicit
+            // rotation the laboratory requires, never inferred from a lapse alone.
+            let granted = if policy.gated() {
+                let p = permit(request)?;
+                if p.authority_id != policy.authority_id {
+                    return Err("The permit names a different authority than this universe's policy".into());
+                }
+                if p.resource != uuid {
+                    return Err("The permit is for a different resource than this universe".into());
+                }
+                if p.replica_id != this_host {
+                    return Err("The permit is bound to another replica, not this host".into());
+                }
+                if p.instance_id != boot_id()? {
+                    return Err("The permit is bound to another incarnation of this host; a rebooted host must be authorised again".into());
+                }
+                if let Some(seen) = highest_epoch_seen(db, uuid)?.filter(|&seen| seen > p.epoch) {
+                    return Err(format!("The permit's epoch {} is superseded: this host has already seen epoch {seen}", p.epoch).into());
+                }
+                // One grant per epoch is the gate's rule. A permit at the epoch this host has
+                // already recorded must be THAT grant, to the same replica; a second grant at
+                // one epoch is something the gate never issues, so it can only be a forgery or
+                // a copy, and is refused whatever it claims.
+                let recorded: Option<(String, String)> = db
+                    .query_row("SELECT grant_id,replica_id FROM activation_epochs WHERE universe_uuid=?1 AND epoch=?2",
+                               params![uuid, p.epoch], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()?;
+                if let Some((grant, replica)) = recorded {
+                    if grant != p.grant_id || replica != p.replica_id {
+                        return Err(format!("Epoch {} was already granted here under another grant; a second grant at one epoch is not something the gate issues", p.epoch).into());
+                    }
+                }
+                if let Some(ref l) = previous {
+                    if l.holder_host_uuid != this_host && l.epoch >= p.epoch {
+                        return Err(format!(
+                            "A takeover requires a newer epoch than the previous holder's {}; the permit carries {}",
+                            l.epoch, p.epoch
+                        )
+                        .into());
+                    }
+                }
+                Some(p)
+            } else {
+                if request.get("permit").is_some() {
+                    return Err("This universe's policy names no authority; a permit here would be checked against nothing".into());
+                }
+                None
+            };
             let generation = match previous {
                 // Renewing our own live lease is an acquisition of the same generation: it is
                 // idempotent by design, so a repeated request is not a takeover.
@@ -371,14 +579,48 @@ pub fn execute(db: &Connection, request: &serde_json::Value) -> Result<serde_jso
                 Some(ref l) => l.generation + 1,
                 None => 1,
             };
+            let (epoch, grant) = granted.as_ref().map_or((0, String::new()), |p| (p.epoch, p.grant_id.clone()));
             db.execute(
-                "INSERT INTO activation_leases VALUES(?1,?2,?3,?4,?5,?6)
+                "INSERT INTO activation_leases VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
                  ON CONFLICT(universe_uuid) DO UPDATE SET holder_host_uuid=excluded.holder_host_uuid,
                    generation=excluded.generation, acquired_at=excluded.acquired_at,
-                   expires_at=excluded.expires_at, operation_id=excluded.operation_id",
-                params![uuid, this_host, generation, now, now + policy.lease_seconds as i64, id],
+                   expires_at=excluded.expires_at, operation_id=excluded.operation_id,
+                   epoch=excluded.epoch, grant_id=excluded.grant_id",
+                params![uuid, this_host, generation, now, now + policy.lease_seconds as i64, id, epoch, grant],
             )?;
+            if let Some(p) = granted.as_ref() {
+                screen(db, uuid, p, id)?;
+            }
             record(db, uuid, &this_host, generation, "acquired", id)?;
+        }
+        "activation_supersede" => {
+            // A newer grant, bound to whoever it was bound to, delivered here so that this host
+            // learns it has been overtaken. The permit is not this host's to use and is not
+            // used: it advances the screen, and this host's lease, if any, is left in place and
+            // marked overtaken by the screen -- the gate, the renewal and the fence all read
+            // it. Delivering a stale one is refused, so the screen only ever moves forward.
+            let Some(policy) = policy(db, uuid)? else {
+                return Err("This universe has no activation policy".into());
+            };
+            if !policy.gated() {
+                return Err("This universe's policy names no authority; there is no epoch to supersede".into());
+            }
+            let p = permit(request)?;
+            if p.authority_id != policy.authority_id {
+                return Err("The permit names a different authority than this universe's policy".into());
+            }
+            if p.resource != uuid {
+                return Err("The permit is for a different resource than this universe".into());
+            }
+            if let Some(seen) = highest_epoch_seen(db, uuid)?.filter(|&seen| seen >= p.epoch) {
+                return Err(format!("Epoch {} does not supersede epoch {seen}, which this host has already seen", p.epoch).into());
+            }
+            screen(db, uuid, &p, id)?;
+            if let Some(l) = lease(db, uuid)? {
+                if l.holder_host_uuid == this_host {
+                    record(db, uuid, &this_host, l.generation, "superseded", id)?;
+                }
+            }
         }
         "activation_renew" => {
             let Some(policy) = policy(db, uuid)? else {
@@ -395,6 +637,9 @@ pub fn execute(db: &Connection, request: &serde_json::Value) -> Result<serde_jso
             // Retaking it is an acquisition, which is visible as such in the history.
             if l.expires_at <= now {
                 return Err("The activation lease has expired; acquire it again rather than renewing".into());
+            }
+            if let Some(seen) = superseded(db, uuid, &l)? {
+                return Err(format!("This host's activation was superseded by epoch {seen}; it cannot be renewed").into());
             }
             db.execute(
                 "UPDATE activation_leases SET expires_at=?2, operation_id=?3 WHERE universe_uuid=?1",
@@ -446,9 +691,10 @@ fn fence(db: &Connection, id: &str, timeout: u64) -> Result<serde_json::Value, E
     let mut left = Vec::new();
     for uuid in universes {
         let held = lease(db, &uuid)?;
+        let overtaken = match held.as_ref() { Some(l) => superseded(db, &uuid, l)?, None => None };
         let entitled = held
             .as_ref()
-            .is_some_and(|l| l.holder_host_uuid == this_host && l.expires_at > now);
+            .is_some_and(|l| l.holder_host_uuid == this_host && l.expires_at > now && overtaken.is_none());
         let observed = lc::observe(&uuid)?;
         let running = observed["present"] == serde_json::json!(true)
             && observed["running"] == serde_json::json!(true);
@@ -482,6 +728,7 @@ fn fence(db: &Connection, id: &str, timeout: u64) -> Result<serde_json::Value, E
             "forced": forced,
             "held_by": held.as_ref().map(|l| l.holder_host_uuid.clone()),
             "expired_seconds_ago": held.as_ref().map(|l| now - l.expires_at),
+            "superseded_by_epoch": overtaken,
         }));
     }
     Ok(serde_json::json!({

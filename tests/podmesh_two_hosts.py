@@ -69,6 +69,9 @@ def n_ready(seconds=60):
     raise RuntimeError('Service did not become ready')
 def n_time():
     return {'time': time.time(), 'time_ns': time.time_ns()}
+def n_boot_id():
+    """This boot's identity, the incarnation a permit is bound to."""
+    return {'boot_id': open('/proc/sys/kernel/random/boot_id').read().strip()}
 def n_marker(name, marker):
     """Whether a container's filesystem carries the marker file a running universe wrote: a fresh
     `podman export` of the container, searched for `/marker-<marker>` holding exactly the marker bytes.

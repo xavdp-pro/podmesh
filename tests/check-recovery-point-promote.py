@@ -93,7 +93,7 @@ try:
     # so the foreign holder is written straight into the journal as a fixture.
     now = int(time.time())
     j = sqlite3.connect(journal)
-    j.execute('INSERT INTO activation_leases VALUES(?,?,?,?,?,?)',
+    j.execute("INSERT INTO activation_leases VALUES(?,?,?,?,?,?,0,'')",
               (takeover, 'a-foreign-host-uuid', 3, now - 35, now - 5, 'fixture'))
     j.commit(); j.close()
     refused(op('activation_acquire', universe_uuid=takeover), 'may be taken over', 'acquire inside the takeover margin')
@@ -110,7 +110,7 @@ try:
     # The same foreign lease, lapsed well beyond the margin: the takeover is allowed, and the
     # generation advances.
     j = sqlite3.connect(journal)
-    j.execute('INSERT INTO activation_leases VALUES(?,?,?,?,?,?)',
+    j.execute("INSERT INTO activation_leases VALUES(?,?,?,?,?,?,0,'')",
               (takeover, 'a-foreign-host-uuid', 3, now - 335, now - 300, 'fixture'))
     j.commit(); j.close()
     taken = op('activation_acquire', universe_uuid=takeover)

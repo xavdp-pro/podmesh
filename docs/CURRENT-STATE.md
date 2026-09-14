@@ -293,7 +293,7 @@ destructive authorization.
 **Backup Server designed and pushed: `7e4e294`.** From Rules 12 and 16 of the canon rather than from
 Proxmox. See `docs/BACKUP-SERVER.md`; B1 is the first lot and must not be mixed with the G2 lot.
 
-## Universe high availability (lots H1 to H7), 2026-09-14 — built on one host, not published
+## Universe high availability (lots H1 to H8), 2026-09-14 — built, run on two lab hosts, not published
 
 The operator asked for HA for the universes of his choosing, with the agent naming the host
 and one or two standbys per universe depending on resources and on an allowance that is his
@@ -311,17 +311,25 @@ chain so level 1 cannot be raced (H4), `recovery_point_prepare` of a stopped uni
 an honestly **unsigned** point (H5), `recovery_point_restore` into a quarantined new
 identity that refuses a tampered archive, a non-canonical manifest and a manifest claiming
 a signature this build cannot verify (H6), and `recovery_point_promote` under the lease
-(H7). Level 2 is a complete sequence of typed operations on one host. Commits `c6e1e9c`,
-`6759318`, `05f6b01` and their predecessors on this tree.
+(H7), and epoch-bound activation (H8): `experiments/manager-fencing` in the web tree (Codex,
+2026-09-12) models exclusion as an epoch from one external gate rotated only by explicit
+trusted action, with makers keeping a durable screen; PodMesh is now that maker — a policy
+may name an `authority_id`, acquisition then needs a permit in the lab's exact form bound to
+the universe, this host and this boot, the screen refuses superseded epochs and second grants
+at one epoch, and `activation_supersede` voids this host's entitlement. Ten rules, each
+removed and watched go red. Commits `c6e1e9c`, `6759318`, `05f6b01`, `ecb21c1` and the H8
+commit after them.
 
 What it does not do, stated in every answer: the lease proves this host's restraint, not
 mutual exclusion — it is not replicated; no failure detector exists; no transport moves the
 point (the two-host suite's controller can carry it); no signing crate exists in this build
 and adding one is the operator's supply-chain decision; the manifest's origin is never
-verified. On 2026-09-14 the whole level 2 sequence ran between two lab hosts on a transient
-development service (`tests/check-recovery-point-two-hosts.py`, 28 checks passed, report in the
-gitignored `evidence/ha/`), after a first run found that a standby with no activation history
-had no activation tables — fixed, rebuilt, rerun. The transient units are stopped; their state
+verified; PodMesh never verifies a permit's origin (a forged higher epoch can stop a universe,
+never start a second one). On 2026-09-14 the whole level 2 sequence ran between two lab hosts
+on a transient development service (`tests/check-recovery-point-two-hosts.py`; 28 checks on
+the H7 binary, 37 with the epoch rotation on the H8 binary; reports in the gitignored
+`evidence/ha/`), after a first run found that a standby with no activation history had no
+activation tables — fixed, rebuilt, rerun. The transient units are stopped; their state
 directories and the installed binaries under `/opt/podmesh-dev-ha/` were left in place.
 
 ## Next actions, in order
@@ -374,11 +382,13 @@ directories and the installed binaries under `/opt/podmesh-dev-ha/` were left in
    are specified in the same document and should be built in the same lot.
 6. Continue the central checklist: networking/volumes, partitions and HA, fractal
    demonstration, sequential storage tests, Backup Server and product documentation.
-7. HA, in order: done — level 2's sequence across two lab hosts; next, replicate the lease as a manager
-   fact so the takeover margin is measured against the previous holder (new candidate,
-   requalification); a failure detector on the agent's side that only decides when the
-   standby's wait begins; the signing dependency once the operator decides it; then level
-   3 after B0 qualifies a storage backend.
+7. HA, in order: done — level 2's sequence across two lab hosts, with epoch-bound
+   activation from the fencing laboratory's model; next, a real gate the agent rotates
+   through (the laboratory's `Authority` or the manager's exclusive permit — an operator
+   decision, since the gate is where exclusion actually lives), a failure detector on the
+   agent's side that only decides when the standby's wait begins and when to rotate, the
+   signing dependency once the operator decides it, then level 3 after B0 qualifies a
+   storage backend.
 
 ## Cost and delegation policy
 

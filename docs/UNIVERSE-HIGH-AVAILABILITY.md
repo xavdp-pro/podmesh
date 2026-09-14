@@ -4,7 +4,7 @@
 >
 > **Perimeter**: P1 — it decides which host may run a workload, so a mistake runs two.
 
-Status: **lots H1 to H7 built and checked; level 1 complete; level 2's sequence run end to end across two lab hosts on 2026-09-14, unsigned, with the suite as transport and as failure detector; level 3 designed, not built.** Written 2026-09-14
+Status: **lots H1 to H8 built and checked; level 1 complete; level 2's sequence run end to end across two lab hosts on 2026-09-14, unsigned, with the suite as transport, as failure detector and as the epoch gate; level 3 designed, not built.** Written 2026-09-14
 against what PodMesh actually has, not against what an HA product usually has. Every
 capability named as missing was verified in the source, and the citations are below.
 
@@ -358,17 +358,46 @@ decides *when* the standby begins its wait, and the lease replicated as a fact s
 margin is measured against the previous holder's clock rather than a fixture. Until then the
 standby's wait is measured against its own journal, and the design says so.
 
+**Lot H8, the epoch half: PodMesh as the fencing laboratory's maker.** The lab in
+`experiments/manager-fencing` (Codex, 2026-09-12) models exclusion the other way round from
+the leases above: not a lease that expires, but an **epoch** issued by one external gate,
+rotated only by an explicit trusted action — never by a timeout, a stale observation or a
+host's absence — with each maker keeping a durable screen that refuses any epoch it has
+already seen superseded. It deliberately exposes no `start` adapter, because a Podman start
+after a gate check leaves a gap the gate cannot close. The two designs compose, and the
+composition is the operator's sentence "I choose the host with my agent": **the agent is the
+lab's rotation controller, and PodMesh is its maker.**
+
+A policy may name an `authority_id`. Acquisition then requires a permit in the lab's exact
+six-field form, bound to the universe, to this host and to this **boot** — a rebooted host
+must be authorised again, since whatever it was doing before, nobody has re-decided it. The
+screen refuses a permit at an epoch already seen superseded; a takeover from another holder
+needs an epoch newer than that holder's, on top of the margin; `activation_supersede`
+delivers a newer grant bound to someone else, after which the gate, the renewal and the fence
+all treat this host's lease as void. Nine rules, each removed in turn, each turning the check
+red with "accepted" at its own case.
+
+**What this changes about safety, and what it does not.** With epochs, two standbys cannot
+both activate for one rotation: the gate's compare-and-swap issues one permit per epoch, and
+that is the lab's proof, not PodMesh's. What remains PodMesh's is the maker's discipline —
+refuse what the screen says is stale — and the honest gap: PodMesh cannot verify a permit's
+origin (no signature, no gate call), so a permit is provenance from a root-only channel, and
+a forged **higher** epoch can stop a universe here but never start a second one. The margin
+stays, because the ungated start is exactly what the lab refuses to gate.
+
 ## Level 2 across two hosts, measured on 2026-09-14
 
 `tests/check-recovery-point-two-hosts.py` ran the whole sequence between two lab hosts, on a
-transient development service carrying the same release binary on both (sha256
-`aee5d980…8af9a0f`), with every product mutation through the API and the suite in the two roles
-the design leaves outside PodMesh: transport controller and agent. Twenty-eight checks, all
-passed, in this order:
+transient development service carrying the same release binary on both, with every product
+mutation through the API and the suite in the three roles the design leaves outside PodMesh:
+transport controller, agent, and the fencing laboratory's epoch gate. First on the H7 binary
+(sha256 `aee5d980…8af9a0f`, twenty-eight checks), then on the H8 binary (sha256
+`37d86fef…68ae72`, thirty-seven checks), all passed, in this order:
 
 1. The active host creates the universe, declares a policy of one standby among the two
-   hosts, is refused a start before any lease, acquires, starts. The container writes the
-   marker while running.
+   hosts under the gate's authority, is refused a start before any lease, is refused an
+   acquisition without a permit and one with the standby's permit, acquires under **epoch 1**,
+   starts. The container writes the marker while running.
 2. It captures: stop (not forced), `recovery_point_prepare` (8.6 MB, `signed: false`), renews
    the lease, starts again. Capture costs the universe a stop; that is level 2's price and it
    is stated.
@@ -381,8 +410,13 @@ passed, in this order:
    host's own clock**, a renewal is refused, the self-fence stops the universe without
    escalation, and a start there is refused.
 6. The suite waits the takeover margin, again on the active host's clock. The standby
-   declares the policy, is refused a promotion before the lease, acquires, promotes, and **the
-   marker is found in the promoted universe before its first start**; then it starts and runs.
+   declares the policy, is refused a promotion before the lease and an acquisition under the
+   active host's grant, and the gate rotates: the standby acquires under **epoch 2**, promotes,
+   and **the marker is found in the promoted universe before its first start**; then it
+   starts and runs.
+7. The active host returns. The agent delivers the standby's grant to it: its screen advances
+   to 2, and it is refused under its old grant, under a fresh permit at epoch 1, and under a
+   second grant at epoch 2 — only a new rotation could bring it back.
 
 **What the run found.** A standby that has never run an activation operation had no
 activation tables, and the promotion answered "no such table" where it should have said "no
@@ -390,12 +424,12 @@ activation policy". The single-host check cannot reach that state, because it st
 source before anything else; the two-host run reached it on its first attempt. The promotion
 now prepares that schema itself, and the run was repeated on the fixed binary.
 
-**What the run does not prove, recorded in its own report under `not_proven`:** mutual
-exclusion (the standby's lease is in the standby's journal; the active host could re-acquire
-in its own), failure detection (the suite decided when the wait began; no host did), the
-manifest's origin (unsigned), and transport (bytes were carried by the suite, not by PodMesh).
-The lease generations were 1 on both hosts, which is itself the point: two journals, each
-counting alone.
+**What the run does not prove, recorded in its own report under `not_proven`:** exclusion
+beyond the epoch (the gate was the suite; PodMesh verified permit binding and its screen,
+never a permit's origin), failure detection (the suite decided when the wait began and when to
+rotate; no host did), the manifest's origin (unsigned), and transport (bytes were carried by
+the suite, not by PodMesh). The lease generations were 1 on both hosts and the epochs 1 and 2:
+two journals each counting alone, and one rotation that both of them recorded.
 
 ## What PodMesh still has to gain
 

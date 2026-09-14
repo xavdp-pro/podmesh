@@ -167,7 +167,7 @@ if journal:
     db = sqlite3.connect(journal)
     now = int(_t.time())
     # A foreign lease that lapsed five seconds ago: inside the twenty-second margin.
-    db.execute("INSERT INTO activation_leases VALUES(?,?,?,?,?,?)",
+    db.execute("INSERT INTO activation_leases VALUES(?,?,?,?,?,?,0,'')",
                (w, 'a-foreign-host-uuid', 7, now - 35, now - 5, 'fixture'))
     db.commit(); db.close()
     refused(op('activation_acquire', w), 'may be taken over', 'acquire inside the takeover margin')

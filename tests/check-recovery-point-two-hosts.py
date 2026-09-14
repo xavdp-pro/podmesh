@@ -10,7 +10,8 @@ part the design gives the agent: it decides WHEN the standby's wait begins and i
 The sequence, as UNIVERSE-HIGH-AVAILABILITY.md states it: A runs the universe under a lease;
 A captures a recovery point (stop, prepare, start again); the point is carried to B; B restores
 it into quarantine; A "fails" -- it stops renewing; A self-fences once its lease has lapsed;
-the agent waits the takeover margin measured on A's clock; B acquires, promotes and starts.
+the agent waits the takeover margin measured on A's clock; the gate rotates the epoch to B; B acquires,
+promotes and starts; A, back, is superseded and refused.
 
 What this proves and what it does not is printed as one JSON report. The lease on B is B's own
 journal's: nothing here proves mutual exclusion, and the wait is the agent's obligation, not a
@@ -31,6 +32,13 @@ assert A.identity != B.identity, 'the two targets are the same host'
 
 LEASE, MARGIN = 20, 5
 reference = 'disposable-lab-ha'
+# The epoch gate is the fencing laboratory's trusted fixture, and here the suite plays it: it
+# mints one permit per rotation. PodMesh never sees the gate; it sees permits.
+AUTHORITY = 'gate-' + uuid.uuid4().hex[:12]
+def permit(host, resource, epoch):
+    boot = host.call('boot_id')['boot_id']
+    return {'authority_id': AUTHORITY, 'resource': resource, 'epoch': epoch,
+            'replica_id': host.identity, 'instance_id': boot, 'grant_id': 'grant-' + uuid.uuid4().hex[:12]}
 checks, report = [], {'suite': 'check-recovery-point-two-hosts', 'hosts': {'active': A.identity, 'standby': B.identity}}
 u = str(uuid.uuid4())            # the universe's own identity, on both hosts
 q = str(uuid.uuid4())            # the quarantined copy on B
@@ -62,9 +70,13 @@ try:
                  command=['sh', '-c', f"printf %s '{marker}' > /marker-{marker}; trap 'exit 0' TERM; sleep 600 & wait"]),
          'created', checks)
     A.ok(request('activation_require', u, reference, lease_seconds=LEASE, takeover_margin_seconds=MARGIN, desired_standbys=1,
-                 eligible_hosts=[A.identity, B.identity]), 'policy declared: one standby among the two hosts', checks)
+                 eligible_hosts=[A.identity, B.identity], authority_id=AUTHORITY), 'policy declared: one standby among the two hosts, under the gate', checks)
     refused(A, request('start', u, reference, observe_seconds=0), 'none is held', 'start before any lease')
-    lease = A.ok(request('activation_acquire', u, reference), 'lease acquired', checks)
+    refused(A, request('activation_acquire', u, reference), 'requires a permit', 'acquire without a permit under the gate')
+    refused(A, request('activation_acquire', u, reference, permit=permit(B, u, 1)), 'bound to another replica', 'acquire with the standby\'s permit')
+    epoch1 = permit(A, u, 1)
+    lease = A.ok(request('activation_acquire', u, reference, permit=epoch1), 'lease acquired under epoch 1', checks)
+    assert lease['epoch'] == 1 and lease['highest_epoch_seen'] == 1, lease
     A.ok(request('start', u, reference, observe_seconds=1), 'started under the lease', checks)
 
     # --- A captures a recovery point: stop, prepare, start again under a renewed lease.
@@ -116,9 +128,14 @@ try:
 
     # --- B takes over: policy, lease, promotion, start.
     B.ok(request('activation_require', u, reference, lease_seconds=LEASE, takeover_margin_seconds=MARGIN, desired_standbys=1,
-                 eligible_hosts=[A.identity, B.identity]), 'policy declared on the standby', checks)
+                 eligible_hosts=[A.identity, B.identity], authority_id=AUTHORITY), 'policy declared on the standby, under the gate', checks)
     refused(B, request('recovery_point_promote', u, reference, restored_universe_uuid=q), 'none is held', 'promote before the lease')
-    taken = B.ok(request('activation_acquire', u, reference), 'lease acquired on the standby', checks)
+    # The rotation: the gate (the suite) issues epoch 2 to the standby. The active host's old
+    # grant cannot be reused there: it is bound to the other replica.
+    refused(B, request('activation_acquire', u, reference, permit=epoch1), 'bound to another replica', 'standby acquiring with the active host\'s permit')
+    epoch2 = permit(B, u, 2)
+    taken = B.ok(request('activation_acquire', u, reference, permit=epoch2), 'lease acquired on the standby under epoch 2', checks)
+    assert taken['epoch'] == 2, taken
     promoted = B.ok(request('recovery_point_promote', u, reference, restored_universe_uuid=q), 'promoted into the universe identity', checks)
     assert promoted['universe_uuid'] == u and promoted['restored_universe_uuid'] == q and not promoted['started'], promoted
     assert 'not mutual exclusion' in promoted['scope'], promoted
@@ -130,12 +147,24 @@ try:
     assert state_b.get('stdout', '').strip() == 'true', state_b
     checks.append('[standby] universe running on the standby')
 
+    # --- The active host returns. The agent delivers the standby's grant to it: its screen
+    # advances, its old grant is refused as superseded, and even a fresh permit at the old
+    # epoch is refused. Only a NEW rotation could bring it back.
+    over = A.ok(request('activation_supersede', u, reference, permit=epoch2), 'supersession delivered to the active host', checks)
+    assert over['highest_epoch_seen'] == 2 and over['superseded'] is True, over
+    refused(A, request('activation_acquire', u, reference, permit=epoch1), 'is superseded', 'active host re-acquiring under its old grant')
+    refused(A, request('activation_acquire', u, reference, permit=permit(A, u, 1)), 'is superseded', 'active host acquiring a fresh permit at the old epoch')
+    refused(A, request('activation_acquire', u, reference, permit=permit(A, u, 2)), 'already granted here under another grant', 'active host acquiring a second grant at the standby\'s epoch')
+    refused(A, request('start', u, reference, observe_seconds=0), 'activation', 'start on the active host after supersession')
+    checks.append('[active] superseded: old grant, old epoch and the standby\'s epoch all refused; only a new rotation could bring it back')
+
     # --- What is and is not proven, in the record.
     report['takeover'] = {'standby_lease_generation': taken['generation'], 'promotion_lease_generation': promoted['lease_generation'],
+                          'active_epoch': 1, 'standby_epoch': 2, 'active_superseded': True,
                           'active_universe_running_after_takeover': False, 'standby_universe_running_after_takeover': True}
     report['not_proven'] = [
-        'mutual exclusion: the standby lease is in the standby journal; the active host could re-acquire in its own',
-        'failure detection: the suite decided when the wait began; no host did',
+        'mutual exclusion beyond the epoch: the gate was the suite; PodMesh verified permit binding and screen, never the permit origin',
+        'failure detection: the suite decided when the wait began and when to rotate; no host did',
         'manifest origin: the point is unsigned and the standby verified bytes against the manifest only',
         'transport: bytes were carried by the suite over SSH, not by any PodMesh mechanism',
     ]
