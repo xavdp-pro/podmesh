@@ -4,9 +4,14 @@
 >
 > **Perimeter**: P1 — it decides which host may run a workload, so a mistake runs two.
 
-Status: **design, nothing implemented.** Written 2026-09-14 against what PodMesh actually
-has, not against what an HA product usually has. Every capability it names as missing was
-verified in the source, and the citations are below.
+Status: **lot H1 built and checked; levels 1 to 3 designed, not built.** Written 2026-09-14
+against what PodMesh actually has, not against what an HA product usually has. Every
+capability named as missing was verified in the source, and the citations are below.
+
+H1 is the local half of exclusive activation: this host refuses to start a universe it holds
+no live lease for. That is a self-restraint, not mutual exclusion across hosts, and the
+distinction is kept in the code, in every status answer, and in the section that describes it.
+Nothing here is high availability yet: level 2 is the first that deserves the name.
 
 The operator's requirement, in their words: high availability for containers of their
 choice, with **the AI agent choosing the host or hosts**. That second half is not a detail —
