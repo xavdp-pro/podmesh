@@ -36,6 +36,7 @@ Subcommands:
                                  stop, prepare, renew, start again; carry; restore into quarantine on
                                  the standby; prune older copies
   takeover      --universe U --active SSH --standby SSH [--also SSH]... [--no-start]
+                                 [--network-profile isolated|managed --network-address IP]
                                  the standby takes over, under the lease and margin recorded by
                                  `activate` (never this invocation's defaults): refuses while the active host is reachable
                                  and entitled (that is a planned handoff, not a takeover); otherwise
@@ -316,7 +317,10 @@ def cmd_takeover(args):
     current = gate.inspect(u)
     permit = permit_for(gate, u, B, current['epoch'])
     lease = ok(B, request('activation_acquire', u, args.reference, permit=permit), 'activation_acquire on the standby')
-    promoted = ok(B, request('recovery_point_promote', u, args.reference, restored_universe_uuid=newest['quarantined_uuid']), 'recovery_point_promote')
+    promotion = {'restored_universe_uuid': newest['quarantined_uuid'], 'network_profile': args.network_profile}
+    if args.network_address:
+        promotion['network_address'] = args.network_address
+    promoted = ok(B, request('recovery_point_promote', u, args.reference, **promotion), 'recovery_point_promote')
     newest['promoted'] = int(time.time())
     ledger['rotations'].append({'epoch': permit['epoch'], 'to': B.identity, 'at': int(time.time()), 'by': 'takeover'})
     save_ledger(u, ledger)
@@ -363,6 +367,8 @@ def main():
     c.add_argument('--minimum-age', type=int, default=3600, help='seconds a recovery point must be old before the collector may take it')
     t = sub.add_parser('takeover'); t.add_argument('--universe', required=True); t.add_argument('--active', required=True); t.add_argument('--standby', required=True)
     t.add_argument('--no-start', action='store_true', help='promote but leave the start to the operator')
+    t.add_argument('--network-profile', default='isolated', choices=('isolated', 'managed'), help='the promoted universe\'s network profile')
+    t.add_argument('--network-address', help='managed only: the address to put the universe back at, as the restore reported it')
     t.add_argument('--also', action='append', help='another standby to inform of the new epoch (repeatable)')
     a.add_argument('--lease', type=int, default=20); a.add_argument('--margin', type=int, default=5); a.add_argument('--standbys', type=int, default=1)
     for s in (c, t):

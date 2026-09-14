@@ -103,20 +103,30 @@ def n_journal():
             rows[table] = []
     db.close()
     return rows
-def n_boxes():
-    """Every delivered document, by hash: the transport controller's view of both directories."""
+def _fingerprint(path):
+    st = os.stat(path)
+    return {'bytes': st.st_size, 'mtime_ns': st.st_mtime_ns, 'inode': st.st_ino, 'mode': oct(st.st_mode & 0o777)}
+def n_boxes(authorization=None, fingerprint=False):
+    """Every delivered document, by hash: the transport controller's view of both directories. With
+    `authorization`, that entry alone. With `fingerprint`, size, mtime, inode and mode instead of the
+    digest: what a refusal snapshot compares. Hashing every archive both directories hold made each
+    snapshot cost seconds per gigabyte of OTHER suites' leftovers, and a suite under a 20-second lease
+    lapsed on its own bookkeeping; a stat fingerprint catches any write PodMesh could make (a new
+    file, a rewrite, a chmod), and the digest stays what the transport compares."""
     listing = {}
     for box in ('inbox', 'outbox'):
         entries = {}
         root = os.path.join(_state(), box)
-        for authorization in sorted(os.listdir(root)) if os.path.isdir(root) else []:
-            directory = os.path.join(root, authorization)
+        names = ([authorization] if authorization is not None else sorted(os.listdir(root))) if os.path.isdir(root) else []
+        for name in names:
+            directory = os.path.join(root, name)
             if not os.path.isdir(directory):
                 continue
-            entries[authorization] = {f: {'sha256': _sha256(os.path.join(directory, f)), 'bytes': os.path.getsize(os.path.join(directory, f)),
-                                          'mode': oct(os.stat(os.path.join(directory, f)).st_mode & 0o777)}
-                                      for f in sorted(os.listdir(directory)) if os.path.isfile(os.path.join(directory, f))}
-            entries[authorization]['_mode'] = oct(os.stat(directory).st_mode & 0o777)
+            entries[name] = {f: (_fingerprint(os.path.join(directory, f)) if fingerprint else
+                                 {'sha256': _sha256(os.path.join(directory, f)), 'bytes': os.path.getsize(os.path.join(directory, f)),
+                                  'mode': oct(os.stat(os.path.join(directory, f)).st_mode & 0o777)})
+                             for f in sorted(os.listdir(directory)) if os.path.isfile(os.path.join(directory, f))}
+            entries[name]['_mode'] = oct(os.stat(directory).st_mode & 0o777)
         listing[box] = entries
     return listing
 def n_gc_runs():
@@ -158,7 +168,7 @@ def n_journal_delete(table, key_column, key):
     db.close()
     return n_journal_row(table, key_column, key)
 def n_snapshot():
-    return {'podman': n_podman_state(), 'journal': n_journal(), 'boxes': n_boxes()}
+    return {'podman': n_podman_state(), 'journal': n_journal(), 'boxes': n_boxes(fingerprint=True)}
 def n_inspect(name):
     if _podman('container', 'exists', name, check=False).returncode:
         return {'container': None}
@@ -573,8 +583,8 @@ def transfer(source, destination, authorization, files=('handoff.json', 'manifes
     out = source.ssh(f'sudo tar -C {source.state_dir}/{box} -cf - {members}')
     destination.ssh(f'sudo mkdir -p -m 0700 {destination.state_dir}/{into} && sudo tar -C {destination.state_dir}/{into} -xf -',
                     input_bytes=out.stdout)
-    sent = source.call('boxes')[box].get(authorization, {})
-    arrived = destination.call('boxes')[into].get(authorization, {})
+    sent = source.call('boxes', authorization=authorization)[box].get(authorization, {})
+    arrived = destination.call('boxes', authorization=authorization)[into].get(authorization, {})
     for f in files:
         assert sent[f]['sha256'] == arrived[f]['sha256'], (f, sent.get(f), arrived.get(f))
     return {'authorization_id': authorization, 'files': {f: arrived[f] for f in files}}

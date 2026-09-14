@@ -73,10 +73,14 @@ ID, verified replays as history, interrupted attempts re-evaluated) and all carr
 - `inspect`/`observe` report the requested profile from the labels and the effective network from
   Podman; a container without the labels is reported `unknown`, never `isolated`.
 
-Not carried yet by the managed profile, and refused rather than assumed: `clone`,
-`recovery_point_restore`, `recovery_point_promote`, `migration_restore` — they still create
-isolated containers and say so in their answers. Carrying the profile through them is the next
-step of this contract, after the replicated manager has run on the managed network.
+`recovery_point_restore` always creates its quarantined copy isolated — a quarantine is not on
+the network — and reports the source's network from the labels the manifest recorded
+(`source_network`: profile, address, network UUID). `recovery_point_promote` takes
+`network_profile`, required as for `create`, and under the managed profile the `network_address`
+to put the universe back at: the address allocated to its UUID, which the restore reported. A
+released allocation is history, so a universe deleted and put back is allocated again.
+Not carried yet by the managed profile, and refused rather than assumed: `clone` and
+`migration_restore` — they still create isolated containers and say so in their answers.
 
 ## Failure and cleanup states
 
@@ -168,6 +172,29 @@ that reached all three, verified from `podman cp` copies by the attested inspect
 returned every host's routes and networks to their initial state. Not shown: a real partition
 (the loss here is a stop, not a cut), a host loss, an agent path to the control API, and the
 replica actually serving at the service address.
+
+**Step 7 (2026-09-15), a recovery point combined with the running replica set:** `promote`
+carries the managed profile (above), the restore reports the source's network, and a released
+allocation no longer blocks the same universe from being allocated again (a second one-time
+rebuild of the allocations table: only live allocations are unique, per address and per
+universe). `tests/check-manager-recovery-managed.py` on the three hosts: three replicas
+converged with the governor announced on lab-a; lab-c's replica stopped through the typed stop,
+a recovery point prepared from it — its manifest recording the managed address — and the
+replica **deleted**, its address released; the two others moved on to a fourth fact it never
+saw, the announcement unmoved; the point restored on lab-c into quarantine (isolated, the
+source's managed address reported), a promotion at an address outside the host's pool refused,
+then promoted into the replica's own identity at its address under a lease, started, back at
+that address from Podman; it imported the fact it had missed from both peers, appended its own
+boot fact, and the three converged on five facts, the governor unchanged throughout; cleanup
+returned the hosts to their initial state. Not shown: a host loss (the rescue is on the same
+host, a replica's address living in its host's pool), a real partition, a signed manifest.
+The requirement of a profile on `promote` was removed and the single-host promote suite went
+red at its refusal; the reference build passed it again, with the network, two-host recovery,
+HA-tool, three-host, epoch, fence, restore, retention, governor and recovery suites. One
+defect of the two-host test helper surfaced on the way: each refusal snapshot hashed every
+archive both delivery directories held, so a suite under a 20-second lease lapsed on its own
+bookkeeping once other suites' leftovers reached gigabytes; snapshots now compare a stat
+fingerprint and transfers hash only their own documents.
 
 **Known deviation, stated:** Podman's network firewall source-NATs traffic leaving the bridge's
 subnet, so a universe reaching another host's universe is seen there with the host's address.

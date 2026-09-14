@@ -88,11 +88,23 @@ fn promotion_view(db: &Connection, id: &str, replayed: bool) -> Result<Option<Va
             |r| Ok(json!({
                 "universe_uuid": r.get::<_, String>(0)?, "restored_universe_uuid": r.get::<_, String>(1)?,
                 "recovery_point_uuid": r.get::<_, String>(2)?, "container_id": r.get::<_, String>(3)?,
-                "lease_generation": r.get::<_, i64>(4)?, "started": false, "network": "none",
+                "lease_generation": r.get::<_, i64>(4)?, "started": false,
                 "replayed": replayed, "scope": PROMOTION_SCOPE,
             })),
         )
-        .optional()?)
+        .optional()?
+        .map(|mut v| {
+            // The network the promoted universe was created with, read from its own create request:
+            // the profile the caller named, and the address if the managed profile was asked for.
+            let created: Option<String> = db
+                .query_row("SELECT request FROM operations WHERE id=?1", [format!("{id}-create")], |r| r.get(0))
+                .optional()
+                .ok()
+                .flatten();
+            let request: Value = created.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
+            v["network"] = json!({"profile": request["network_profile"], "requested_address": request["network_address"]});
+            v
+        }))
 }
 
 fn restore_view(db: &Connection, id: &str, replayed: bool) -> Result<Option<Value>, Error> {
@@ -493,7 +505,17 @@ fn restore(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error>
         "INSERT INTO recovery_point_restores VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,?9)",
         params![id, uuid, point, source, image, container_id, manifest_sha256, rootfs_sha256, crate::now() as i64],
     )?;
-    restore_view(db, id, false)?.ok_or_else(|| "The restore was recorded but cannot be read back".into())
+    let mut view = restore_view(db, id, false)?.ok_or("The restore was recorded but cannot be read back")?;
+    // What the source carried on its network, from the labels the manifest recorded: the profile it
+    // ran under and the address allocated to its UUID. A promotion that wants the universe back at
+    // that address names it; nothing here allocates on the caller's behalf.
+    let labels = &manifest["podman_config"]["labels"];
+    view["source_network"] = json!({
+        "profile": labels[crate::network::LABEL_PROFILE],
+        "ip": labels[crate::network::LABEL_IP],
+        "network_uuid": labels[crate::network::LABEL_NETWORK],
+    });
+    Ok(view)
 }
 
 /// The container a verified create left behind, whether the create just ran or replayed.
@@ -515,8 +537,9 @@ fn created_container(created: &Value) -> Result<String, Error> {
 /// takeover step. The universe must be under an activation policy here and this host must
 /// hold its live lease -- which `activation_acquire` grants only after the previous holder's
 /// lease has lapsed by the takeover margin. The promotion creates the universe from exactly
-/// the image and command the quarantined copy was created from, with no network and not
-/// started; starting it is the caller's, and goes through the same gate.
+/// the image and command the quarantined copy was created from, under the network profile the
+/// caller names (and, managed, at the address it names), not started; starting it is the
+/// caller's, and goes through the same gate.
 ///
 /// What the lease proves is written into every answer: this host's own restraint, in this
 /// host's journal. It does not prove the previous holder is stopped. The quarantined copy is
@@ -574,14 +597,20 @@ fn promote(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error>
     if quarantined["image"].as_str() != Some(image.as_str()) {
         return Err("The quarantined copy's creation names a different image than its restore record; nothing was promoted".into());
     }
-    let created = lc::execute(
-        db,
-        &json!({
-            "operation": "create", "operation_id": create_id, "universe_uuid": uuid,
-            "authorization_ref": reference, "image": image, "command": quarantined["command"],
-            "network_profile": crate::network::PROFILE_ISOLATED,
-        }),
-    )?;
+    // The network is the caller's decision, as for `create`: the profile is required, and under the
+    // managed profile the address may be named -- the one the restore reported as the source's, so
+    // that a universe put back keeps the address allocated to its UUID -- or left to the pool.
+    let profile = lc::text(request, "network_profile")
+        .map_err(|_| "recovery_point_promote requires network_profile (isolated or managed), as create does; a promoted universe's network is a decision, not a default")?;
+    let mut create_request = json!({
+        "operation": "create", "operation_id": create_id, "universe_uuid": uuid,
+        "authorization_ref": reference, "image": image, "command": quarantined["command"],
+        "network_profile": profile,
+    });
+    if let Some(address) = request.get("network_address") {
+        create_request["network_address"] = address.clone();
+    }
+    let created = lc::execute(db, &create_request)?;
     let container_id = created_container(&created)?;
     db.execute(
         "INSERT INTO recovery_point_promotions VALUES(?1,?2,?3,?4,?5,?6,?7)",

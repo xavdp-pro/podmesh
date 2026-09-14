@@ -79,11 +79,11 @@ try:
     # Refusals, each placed where the rule named for it is the ONLY thing refusing, so that
     # removing that rule from the daemon turns this check red with "accepted", not with
     # another rule's message.
-    refused(op('recovery_point_promote', universe_uuid=takeover, restored_universe_uuid=str(uuid.uuid4())),
+    refused(op('recovery_point_promote', universe_uuid=takeover, network_profile='isolated', restored_universe_uuid=str(uuid.uuid4())),
             'No quarantined restore under this identifier', 'promote an unknown copy')
-    refused(op('recovery_point_promote', universe_uuid=takeover, restored_universe_uuid=takeover),
+    refused(op('recovery_point_promote', universe_uuid=takeover, network_profile='isolated', restored_universe_uuid=takeover),
             'cannot be the same universe', 'promote a copy into itself')
-    refused(op('recovery_point_promote', universe_uuid=takeover, restored_universe_uuid=quarantined),
+    refused(op('recovery_point_promote', universe_uuid=takeover, network_profile='isolated', restored_universe_uuid=quarantined),
             'under no activation policy', 'promote with no policy declared')
 
     assert op('activation_require', universe_uuid=takeover, lease_seconds=30, takeover_margin_seconds=20)['ok']
@@ -97,14 +97,14 @@ try:
               (takeover, 'a-foreign-host-uuid', 3, now - 35, now - 5, 'fixture'))
     j.commit(); j.close()
     refused(op('activation_acquire', universe_uuid=takeover), 'may be taken over', 'acquire inside the takeover margin')
-    refused(op('recovery_point_promote', universe_uuid=takeover, restored_universe_uuid=quarantined),
+    refused(op('recovery_point_promote', universe_uuid=takeover, network_profile='isolated', restored_universe_uuid=quarantined),
             'held by another host', 'promote while the previous holder is inside the margin')
 
     # No lease at all, under a policy.
     j = sqlite3.connect(journal)
     assert j.execute('DELETE FROM activation_leases WHERE universe_uuid=?', (takeover,)).rowcount == 1
     j.commit(); j.close()
-    refused(op('recovery_point_promote', universe_uuid=takeover, restored_universe_uuid=quarantined),
+    refused(op('recovery_point_promote', universe_uuid=takeover, network_profile='isolated', restored_universe_uuid=quarantined),
             'none is held', 'promote with a policy but no lease')
 
     # The same foreign lease, lapsed well beyond the margin: the takeover is allowed, and the
@@ -118,17 +118,21 @@ try:
 
     # With the lease held, the copy of ANOTHER universe is still refused: only the source rule
     # stands between it and a promotion.
-    refused(op('recovery_point_promote', universe_uuid=takeover, restored_universe_uuid=other_quarantined),
+    refused(op('recovery_point_promote', universe_uuid=takeover, network_profile='isolated', restored_universe_uuid=other_quarantined),
             'not from this one', 'promote a copy of a different universe')
 
+    # The network is the caller's decision, as for create: a promotion naming no profile is refused.
+    refused(op('recovery_point_promote', universe_uuid=takeover, restored_universe_uuid=quarantined),
+            'requires network_profile', 'promote without a network profile')
     pid = str(uuid.uuid4())
     promoted = api({'operation': 'recovery_point_promote', 'operation_id': pid, 'universe_uuid': takeover,
-                    'authorization_ref': 'disposable-lab', 'restored_universe_uuid': quarantined})
+                    'authorization_ref': 'disposable-lab', 'restored_universe_uuid': quarantined, 'network_profile': 'isolated'})
     assert promoted['ok'], promoted
     d = promoted['data']
     cleanup.append('podmesh-' + takeover)
     assert d['universe_uuid'] == takeover and d['restored_universe_uuid'] == quarantined and d['recovery_point_uuid'] == point, d
     assert d['lease_generation'] == 4 and d['started'] is False and 'not mutual exclusion' in d['scope'], d
+    assert d['network'] == {'profile': 'isolated', 'requested_address': None}, d['network']
 
     # Created under the universe's own identity, not started, no network.
     insp = json.loads(subprocess.check_output(['podman', 'inspect', 'podmesh-' + takeover]))[0]
@@ -149,7 +153,7 @@ try:
 
     # Idempotent by operation ID.
     again = api({'operation': 'recovery_point_promote', 'operation_id': pid, 'universe_uuid': takeover,
-                 'authorization_ref': 'disposable-lab', 'restored_universe_uuid': quarantined})
+                 'authorization_ref': 'disposable-lab', 'restored_universe_uuid': quarantined, 'network_profile': 'isolated'})
     assert again['ok'] and again['data']['replayed'] is True and again['data']['container_id'] == d['container_id'], again
 
     # And once promoted, the fence applies to it like to any universe under a policy.

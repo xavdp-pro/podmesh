@@ -42,7 +42,7 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             via TEXT NOT NULL,
             network_uuid TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS network_allocations(
-            universe_uuid TEXT PRIMARY KEY,
+            universe_uuid TEXT NOT NULL,
             network_uuid TEXT NOT NULL,
             ip TEXT NOT NULL,
             allocated_at INTEGER NOT NULL,
@@ -50,6 +50,7 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             released_at INTEGER,
             released_by TEXT);
          CREATE UNIQUE INDEX IF NOT EXISTS network_allocations_live_ip ON network_allocations(ip) WHERE released_at IS NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS network_allocations_live_universe ON network_allocations(universe_uuid) WHERE released_at IS NULL;
          CREATE TABLE IF NOT EXISTS network_routes(
             ip TEXT PRIMARY KEY,
             universe_uuid TEXT NOT NULL,
@@ -67,25 +68,29 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
         db.execute_batch("ALTER TABLE network_routes ADD COLUMN exclusive_resource TEXT;")?;
     }
     // A table created by the first version made every address unique across released rows too, so
-    // a released address could never be allocated again. Only a LIVE allocation is unique per
-    // address; that table is rebuilt once, keeping its rows.
+    // a released address could never be allocated again; the second keyed the table by universe,
+    // so a universe deleted and put back (promoted from a recovery point at its own address) could
+    // never be allocated again either. Only a LIVE allocation is unique, per address and per
+    // universe; the released rows are history. An older table is rebuilt once, keeping its rows.
     let sql: Option<String> = db
         .query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='network_allocations'", [], |r| r.get(0))
         .optional()?;
-    if sql.is_some_and(|s| s.contains("UNIQUE")) {
+    if sql.is_some_and(|s| s.contains("UNIQUE") || s.contains("PRIMARY KEY")) {
         db.execute_batch(
-            "ALTER TABLE network_allocations RENAME TO network_allocations_v1;
+            "DROP INDEX IF EXISTS network_allocations_live_ip;
+             ALTER TABLE network_allocations RENAME TO network_allocations_old;
              CREATE TABLE network_allocations(
-                universe_uuid TEXT PRIMARY KEY,
+                universe_uuid TEXT NOT NULL,
                 network_uuid TEXT NOT NULL,
                 ip TEXT NOT NULL,
                 allocated_at INTEGER NOT NULL,
                 operation_id TEXT NOT NULL,
                 released_at INTEGER,
                 released_by TEXT);
-             INSERT INTO network_allocations SELECT * FROM network_allocations_v1;
-             DROP TABLE network_allocations_v1;
-             CREATE UNIQUE INDEX IF NOT EXISTS network_allocations_live_ip ON network_allocations(ip) WHERE released_at IS NULL;",
+             INSERT INTO network_allocations SELECT * FROM network_allocations_old;
+             DROP TABLE network_allocations_old;
+             CREATE UNIQUE INDEX IF NOT EXISTS network_allocations_live_ip ON network_allocations(ip) WHERE released_at IS NULL;
+             CREATE UNIQUE INDEX IF NOT EXISTS network_allocations_live_universe ON network_allocations(universe_uuid) WHERE released_at IS NULL;",
         )?;
     }
     Ok(())

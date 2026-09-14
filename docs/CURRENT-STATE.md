@@ -484,9 +484,14 @@ exactly one announcement of the service address at every observed moment, the ol
 withdrawal before the new publication, the stale permit and the old governor refused, all three
 replicas running and still converged across the takeover; (6) in the same suite, a duplicate
 address refused, and a replica stopped and restarted converging to a fourth fact on all three.
-Step 7 (recovery points combined with the running replica set) is not begun. Not shown: a
+(7) `recovery_point_promote` carries the managed profile (required `network_profile`, optional
+`network_address`), the restore reports the source's network, a released allocation no longer
+blocks re-allocating the same universe; `tests/check-manager-recovery-managed.py`: a replica
+stopped, captured, deleted, the set moving on without it, then restored, promoted at its own
+address and started, catching up the fact it missed and converging on all three while the
+governor's announcement never moved. All seven steps of Codex's order are done. Not shown: a
 real partition, a host loss, the replica serving at the service address, an agent path to the
-control API. Status: implemented, lab-tested on three hosts; not deployed, not
+control API, a signed manifest. Status: implemented, lab-tested on three hosts; not deployed, not
 production-qualified; nothing published.
 
 ## Next actions, in order

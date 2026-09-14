@@ -103,7 +103,7 @@ try:
     seen = B.call('marker', name='podmesh-' + q, marker=marker)
     assert seen['present'], f'the quarantined copy on the standby does not carry the marker: {seen}'
     checks.append('[standby] marker written on the active host found in the quarantined copy before any start')
-    refused(B, request('recovery_point_promote', u, reference, restored_universe_uuid=q),
+    refused(B, request('recovery_point_promote', u, reference, network_profile='isolated', restored_universe_uuid=q),
             'under no activation policy', 'promote before the standby has a policy')
 
     # --- A fails: it stops renewing. Its lease lapses on its own clock; then it self-fences.
@@ -129,14 +129,14 @@ try:
     # --- B takes over: policy, lease, promotion, start.
     B.ok(request('activation_require', u, reference, lease_seconds=LEASE, takeover_margin_seconds=MARGIN, desired_standbys=1,
                  eligible_hosts=[A.identity, B.identity], authority_id=AUTHORITY), 'policy declared on the standby, under the gate', checks)
-    refused(B, request('recovery_point_promote', u, reference, restored_universe_uuid=q), 'none is held', 'promote before the lease')
+    refused(B, request('recovery_point_promote', u, reference, network_profile='isolated', restored_universe_uuid=q), 'none is held', 'promote before the lease')
     # The rotation: the gate (the suite) issues epoch 2 to the standby. The active host's old
     # grant cannot be reused there: it is bound to the other replica.
     refused(B, request('activation_acquire', u, reference, permit=epoch1), 'bound to another replica', 'standby acquiring with the active host\'s permit')
     epoch2 = permit(B, u, 2)
     taken = B.ok(request('activation_acquire', u, reference, permit=epoch2), 'lease acquired on the standby under epoch 2', checks)
     assert taken['epoch'] == 2, taken
-    promoted = B.ok(request('recovery_point_promote', u, reference, restored_universe_uuid=q), 'promoted into the universe identity', checks)
+    promoted = B.ok(request('recovery_point_promote', u, reference, network_profile='isolated', restored_universe_uuid=q), 'promoted into the universe identity', checks)
     assert promoted['universe_uuid'] == u and promoted['restored_universe_uuid'] == q and not promoted['started'], promoted
     assert 'not mutual exclusion' in promoted['scope'], promoted
     seen = B.call('marker', name='podmesh-' + u, marker=marker)

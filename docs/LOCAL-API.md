@@ -362,9 +362,13 @@ copy; a quarantined copy becomes the universe itself, under the lease.
   its last user — the quarantined copy or the universe promoted from it — never while a container still uses
   it and never if it carries a name outside that repository; `delete` reports `restore_images_removed` and
   `restore_images_retained` with the reason, beside the clone snapshots' own fields.
-- `recovery_point_promote` (`restored_universe_uuid`) creates the universe named by `universe_uuid` from exactly
-  the image and command of that quarantined copy — read from the copy's own verified create — with no network
-  and not started. Refused, in this order: no such copy here; a copy of a different universe; a copy promoted
+- `recovery_point_promote` (`restored_universe_uuid`, `network_profile` required as for `create`, optional
+  `network_address` under the managed profile) creates the universe named by `universe_uuid` from exactly
+  the image and command of that quarantined copy — read from the copy's own verified create — under the
+  profile named, and not started. The restore's answer reports `source_network` (profile, address and
+  network UUID from the labels the manifest recorded), so a universe put back can be promoted at the address
+  allocated to its UUID; nothing allocates on the caller's behalf. The answer's `network` names the profile
+  and requested address the universe was created with. Refused, in this order: no such copy here; a copy of a different universe; a copy promoted
   into itself; no activation policy for the universe on this host; then the lease gate's three reasons. The
   quarantined copy is left in place. The answer carries the lease generation and the `scope` sentence above.
 
