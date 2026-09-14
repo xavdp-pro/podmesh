@@ -87,7 +87,7 @@ def evidence(i,stage):
                 "request_frame_bytes":2735,"reply_frame_bytes":626,"request_announced_body_bytes":2731,
                 "reply_announced_body_bytes":622,"outcomes":["accepted"],"replayed":False}
     inspection=None; exchanges=None
-    if stage=="active-baseline":
+    if stage in ("pre-activation","active-baseline"):
         inspection=inspect(h(f"baseline-{i}"),0,0,0,[],None); exchanges=[]
     if stage in ("converged","post-cleanup"):
         exchanges=[served(0),served(1)]
@@ -187,13 +187,13 @@ if "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation
 # revision where the collector's copy fell five fields behind the comparator's.
 absent=$(grep -o "{store_present:false[^']*}" "$root/capture-host.sh" | head -1 | jq -cn -f /dev/stdin)
 zero='0000000000000000000000000000000000000000000000000000000000000000'
-jq ".inspection=$absent" "$work/lab-a-pre-activation.json" > "$work/fresh-pre.json"
+jq ".inspection=$absent | .exchanges=null" "$work/lab-a-pre-activation.json" > "$work/fresh-pre.json"
 sidecar "$work/fresh-pre.json"
 args=("${host_args[@]}"); args[3]="$work/fresh-pre.json"
 "$root/compare-evidence.py" "${args[@]}" > "$work/fresh-baseline.json"
 jq -e '.status=="PASS"' "$work/fresh-baseline.json" >/dev/null || { echo 'refused a legitimate fresh-host baseline' >&2; exit 1; }
-reject_error 'absent store carrying a history digest' ".inspection=$absent | .inspection.logical_history_sha256=\"$zero\"" pre-activation 'absent store carries derived inspection fields'
-reject_error 'absent store carrying a count' ".inspection=$absent | .inspection.incomplete_attempt_count=0" pre-activation 'absent store carries derived inspection fields'
+reject_error 'absent store carrying a history digest' ".inspection=$absent | .inspection.logical_history_sha256=\"$zero\" | .exchanges=null" pre-activation 'absent store carries derived inspection fields'
+reject_error 'absent store carrying a count' ".inspection=$absent | .inspection.incomplete_attempt_count=0 | .exchanges=null" pre-activation 'absent store carries derived inspection fields'
 reject_error 'present store missing a derived field' '.inspection.history_count=null' active-baseline 'present store is missing derived inspection fields'
 reject_error 'inspection without the store_present discriminator' 'del(.inspection.store_present)' active-baseline 'unsafe shape'
 reject_error 'non-boolean store_present' '.inspection.store_present="false"' active-baseline 'store_present: must be a boolean'
@@ -227,7 +227,7 @@ reject_error 'joinable asserted rather than derived' '.exchanges[0].nonce_author
 reject_error 'an outbound exchange with a locally minted nonce' '.exchanges[0].nonce_authority="pre-authentication" | .exchanges[0].joinable=false | .exchanges[0].direction="outbound"' converged 'outbound exchange cannot carry a pre-authentication nonce'
 reject_error 'more phases than rows collapsed' '.exchanges[0].row_count=2' converged 'more phases than collapsed rows'
 reject_error 'a phase repeated in one folded row' '.exchanges[0].phases_reached=["inbound_request_observed","inbound_request_observed","inbound_import_committed","inbound_reply_prepared"]' converged 'repeats a phase'
-reject_error 'exchanges published with no store inspected' '.exchanges=[]' pre-activation 'exchanges published without an inspected present store'
+reject_error 'exchanges published with no store inspected' ".inspection=$absent | .exchanges=[]" pre-activation 'exchanges published without an inspected present store'
 reject_error 'a present store publishing no exchanges' '.exchanges=null' converged 'no exchanges were published'
 
 # The accounting predicate itself: a stranded sender attempt joined to the receiver that
@@ -297,7 +297,7 @@ three_refuse 'two hosts claim the receiver side' '' '' ".exchanges += [$served]"
 # Condition 5's honest retention: the sender must still be holding the attempt as prepared.
 # A sender claiming a later phase while remaining incomplete is not the shape the contract
 # describes, and the join must not paper over it.
-three_refuse 'the sender did not honestly retain the absence' '.inspection.incomplete_attempts[0].last_phase="outbound_exchange_completed"' '' '' 'did not retain the absence of a confirmed reply'
+three_refuse 'the sender did not honestly retain the absence' '.inspection.incomplete_attempts[0].last_phase="outbound_exchange_completed"' '' '' 'an incomplete attempt cannot have a terminal phase'
 # Condition 4: an unaudited import receipt anywhere puts the accounting evidence itself in
 # question, so no attempt is accounted for while one exists.
 three_refuse 'an unaudited import receipt exists' '' '' '.inspection.unaudited_import_receipt_count=1 | .inspection.unaudited_import_receipt_commitments=["sha256:dddd999999999999999999999999999999999999999999999999999999999999"]' 'unaudited import receipts exist'
@@ -320,7 +320,7 @@ two_on_one="[$strand, ($strand | .attempt_commitment=\"sha256:eeee99999999999999
 reject_error 'two attempts sharing one wire nonce' ".inspection.incomplete_attempts=$two_on_one | .inspection.incomplete_attempt_count=2 | .inspection.audit_event_count=9" converged 'two incomplete attempts share one wire nonce'
 reject_error 'attempts reported with no audit events' ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .inspection.audit_event_count=0" converged 'no audit events to derive them from'
 three_refuse 'the attempt names another operation' '.inspection.incomplete_attempts[0].operation_commitment="sha256:ffff999999999999999999999999999999999999999999999999999999999999"' '' '' 'name different operations'
-three_refuse 'an import committed without an accepted outcome' '' '.outcomes=["refused"]' '' 'import without an accepted outcome'
+three_refuse 'an import committed without an accepted outcome' '' '.outcomes=["authenticated_refusal"]' '' 'import without an accepted outcome'
 three_refuse 'a refusal recorded beside an accepted outcome' '' '.phases_reached=["inbound_request_observed","inbound_refusal_recorded","inbound_reply_prepared","inbound_reply_write_observed"] | .local_receipt_commitment=null' '' 'refusal and an accepted outcome at once'
 
 # Exchanges must account for the whole audit history: every audit row belongs to exactly

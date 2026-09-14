@@ -86,7 +86,7 @@ if [ "$mode" = activate ]; then
   "$root/validate-dropin.py" --dropin "$source" --quiet
   if [ ! -e "$evidence" ] && [ ! -L "$evidence" ]; then install -d -m 0700 -o root -g root -- "$evidence"; fi
   [ -d "$evidence" ] && [ ! -L "$evidence" ] && [ "$(stat -c '%a:%u:%g' -- "$evidence")" = 700:0:0 ] || { echo 'Activation evidence directory is unsafe' >&2; exit 2; }
-  capture pre-activation pre-activation.json
+  capture pre-activation pre-activation.json with-inspection
   jq -e '.service.active_state=="inactive" and .service.sub_state=="dead" and .service.unit_file_state=="disabled" and .manager_process.count==0 and (.dropin.present|not)' "$evidence/pre-activation.json" >/dev/null || { echo 'Manager is not in the required disabled/inactive precondition' >&2; exit 2; }
   expected=$(sha256sum -- "$source" | awk '{print $1}')
   write_ledger prepared "$(jq -n --arg dropin "$expected" --arg pre "$(awk '{print $1}' "$evidence/pre-activation.json.sha256")" '{dropin_sha256:$dropin,pre_evidence_sha256:$pre}')"
