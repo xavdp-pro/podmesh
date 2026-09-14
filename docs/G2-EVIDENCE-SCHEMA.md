@@ -37,7 +37,7 @@ and 8 are not evaluable at all.**
 
 One line caused it. The projection then at `capture-host.sh:137` reduced the canonical
 inspection to nine keys. *That citation is now stale by this lot's own hand: commit
-`eb0ccd3` moved the projection (to line 192 there, `:197` at the current state) and
+`eb0ccd3` moved the projection (line 192 there, `:198` at the current state) and
 widened it to sixteen keys.
 The line is kept in the past tense because this paragraph describes why the change was
 needed, and a reader following `:137` today lands in an unrelated systemd assertion.*
@@ -289,7 +289,7 @@ Inspection `schema_version` moves 3 → **4**; evidence
 ```
 
 `direction` and `last_phase` are enumerations of the candidate's own vocabulary
-(`AuditDirection` at `durable.rs:213-218`, `AuditPhase` at `:220-230`; an earlier `:220-232`
+(`AuditDirection` at `durable.rs:213-216`, `AuditPhase` at `:220-230`; an earlier `:220-232`
 named neither cleanly and reached into `AuditOutcome` at `:234`), not free text, and they
 identify nothing.
 

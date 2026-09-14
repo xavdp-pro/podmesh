@@ -357,6 +357,33 @@ expect=$( { cat "$saltfile"; printf '\000dropin\000'; cat "$work/good.conf"; } |
 [ "$salted" = "$expect" ] || { echo 'the validator and the collector disagree on the salted drop-in commitment' >&2; exit 1; }
 [ "$salted" != "$bare" ] || { echo 'the published drop-in digest is the raw digest, which confirms the peer address pair' >&2; exit 1; }
 
+# The evidence checksum. A third review found it removable with both suites green, which
+# makes it the most important omission in the file: without it a tampered body passes under
+# its original sidecar and every other check in this comparator is reasoning about a
+# document nobody verified.
+cp "$work/lab-a-post-cleanup.json" "$work/tampered.json"; cp "$work/lab-a-post-cleanup.json.sha256" "$work/tampered.json.sha256"
+sed -i 's/lab-a-post-cleanup.json/tampered.json/' "$work/tampered.json.sha256"
+jq '.inspection.history_count=4' "$work/lab-a-post-cleanup.json" > "$work/tampered.json"
+args=("${host_args[@]}"); args[9]="$work/tampered.json"
+if "$root/compare-evidence.py" "${args[@]}" > "$work/tampered-report.json" 2>/dev/null; then echo 'accepted evidence edited under its original checksum' >&2; exit 1; fi
+report_says "$work/tampered-report.json" '.status=="FAIL" and (.error|contains("evidence checksum mismatch"))' 'a tampered body was refused for another reason'
+
+# Other load-bearing checks a review found untested. Each is the only home of the property
+# it guards.
+reject_error 'a store failing its integrity check' '.inspection.sqlite_integrity_result="corrupt"' converged 'invalid read-only inspection'
+reject_error 'a package the host cannot prove clean' '.package.dpkg_verify="modified"' converged 'candidate is not proven installed and clean'
+# This one refuses through the failures list rather than a validation error, so it is
+# asserted with reject_host and its message checked separately below.
+reject_host 'an inspection bound to another replica' '.inspection.replica_commitment="sha256:9999111111111111111111111111111111111111111111111111111111111111"'
+
+# The corroboration rule cost a forger nothing: any row bearing the nonce satisfied it.
+junk="{\"nonce_commitment\":\"$N\",\"nonce_authority\":\"peer-validated\",\"joinable\":true,\"direction\":\"outbound\",\"phases_reached\":[\"outbound_request_prepared\"],\"row_count\":1,\"peer_commitment\":null,\"operation_commitment\":null,\"request_sha256_commitment\":null,\"reply_sha256_commitment\":null,\"local_receipt_commitment\":null,\"remote_receipt_commitment\":null,\"request_frame_bytes\":0,\"reply_frame_bytes\":0,\"request_announced_body_bytes\":null,\"reply_announced_body_bytes\":null,\"outcomes\":[\"accepted\"],\"replayed\":null}"
+reject_error 'an attempt corroborated by a row that is not a stranded attempt' ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges=[$junk] | .inspection.audit_event_count=1" converged 'not a stranded attempt'
+reject_error 'an attempt and its row naming different operations' ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges=[$sent | .operation_commitment=\"sha256:7777111111111111111111111111111111111111111111111111111111111111\"] | .inspection.audit_event_count=1" converged 'name different operations'
+# And the converse: a stranded row simply omitted from the list. Concealing an attempt was
+# cheaper than the forgery the corroboration rule was written to stop.
+reject_error 'a stranded row concealed from the attempt list' ".exchanges=[$sent] | .inspection.audit_event_count=1" converged 'missing from the incomplete-attempt list'
+
 printf '%s\n' 'PASS: strand accounting — one stranded attempt joined to its receiver, and eleven conditions each refused on its own.'
 
 printf '%s\n' 'PASS: four-stage activation evidence, effective policy, ownership, graceful cleanup, infrastructure stability, converged history boundaries, typed fresh-store absence, published incomplete attempts and folded exchanges.'

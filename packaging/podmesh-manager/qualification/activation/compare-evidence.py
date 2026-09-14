@@ -131,6 +131,12 @@ def validate_inspection(v, label):
     if v["incomplete_attempt_count"] > 0 and v["audit_event_count"] == 0:
         raise ValueError(f"{label}: incomplete attempts reported with no audit events to derive them from")
 
+def stranded(r):
+    """A folded row that is, on its face, a sender attempt with no terminal event: the shape
+    the frozen contract requires to remain explicitly incomplete."""
+    return (r["direction"]=="outbound" and r["phases_reached"]==["outbound_request_prepared"]
+            and r["outcomes"]==["incomplete"])
+
 def validate(v,label):
     p=obj(v["package"],f"{label}.package",("name","version","binary_sha256","dpkg_verify"))
     if p["name"]!="podmesh-manager" or p["dpkg_verify"]!="clean": raise ValueError(f"{label}.package: candidate is not proven installed and clean")
@@ -204,10 +210,28 @@ def validate(v,label):
         # rows. Without this, raising one integer is enough to conjure an attempt into a
         # baseline: the count check above is satisfied by a single fabricated row, and this
         # requires that row to be the attempt's own.
-        rows={r["nonce_commitment"] for r in (v["exchanges"] or [])}
+        rows={r["nonce_commitment"]: r for r in (v["exchanges"] or [])}
         for a in i["incomplete_attempts"]:
-            if a["nonce_commitment"] not in rows:
+            r=rows.get(a["nonce_commitment"])
+            if r is None:
                 raise ValueError(f"{label}: an incomplete attempt has no exchange row in its own capture")
+            # And the row must BE a stranded sender attempt, not merely bear the nonce. A
+            # row with one invented phase, one invented outcome and every commitment null
+            # satisfied the nonce test, so the corroboration cost a forger nothing: one junk
+            # row and one integer retired an unaccountable attempt as pre-existing debt.
+            if not stranded(r):
+                raise ValueError(f"{label}: an incomplete attempt is corroborated by a row that is not a stranded attempt")
+            if a["operation_commitment"] != r["operation_commitment"]:
+                raise ValueError(f"{label}: an incomplete attempt and its corroborating row name different operations")
+        # The converse, which is what closes the cheaper route in the other direction. A
+        # capture could carry a stranded outbound row and simply omit the attempt from its
+        # list, and nothing read the row as what it plainly is. Measured on a preserved
+        # campaign store the two sets are identical: 17 stranded rows, 17 attempts, the same
+        # seventeen nonces.
+        listed={a["nonce_commitment"] for a in i["incomplete_attempts"]}
+        for n,r in rows.items():
+            if stranded(r) and n not in listed:
+                raise ValueError(f"{label}: a stranded exchange row is missing from the incomplete-attempt list")
     # A capture that inspected a present store publishes exchanges; one that inspected an
     # absent store, or did not inspect at all, publishes none. An empty list and "no list"
     # are different claims and stay distinguishable.
@@ -249,10 +273,16 @@ def validate_exchanges(v, label):
         # The fold collapses rows; row_count says how many it collapsed, and a row claiming
         # more phases than rows collapsed did not come from this fold.
         if r["row_count"] < len(r["phases_reached"]): raise ValueError(f"{where}: more phases than collapsed rows")
-        # And bounded from ABOVE. A nonce carries at most the four inbound phases, so a row
-        # claiming to collapse more is absorbing audit history that belongs elsewhere --
-        # which is exactly how a host hides a competing receiver row while keeping the
-        # collapsed total equal to its reported audit count.
+        # And bounded from ABOVE, at four. The bound is MEASURED on the candidate's reachable
+        # emission paths, not entailed by the phase set: AuditPhase has seven inbound
+        # variants (durable.rs:220-230) and the store only forbids a repeat of one phase per
+        # attempt, so the type system permits more. What makes four right is that the
+        # terminal phases are mutually exclusive match arms in the sender
+        # (manager-network/src/lib.rs:1100-1160), and that all 67 nonces of a preserved
+        # campaign store collapse 1, 2 or 4 rows. A capture exceeding it is refused, not
+        # silently accepted -- which is the safe direction if the protocol ever grows a path.
+        # It closes the route where a host hides a competing receiver row by absorbing its
+        # audit rows into another row's count.
         if r["row_count"] > 4: raise ValueError(f"{where}: a folded row cannot collapse more than four audit rows")
         for f in ("peer_commitment","operation_commitment","request_sha256_commitment","reply_sha256_commitment","local_receipt_commitment","remote_receipt_commitment"):
             if r[f] is not None: commit(r[f],f"{where}.{f}")
@@ -307,6 +337,10 @@ def host_failures(pre,base,conv,cleanup):
     if not inspection_bound(cleanup): failures.append("cleanup inspection is absent or not bound to this replica")
     if inspection_bound(conv) and inspection_bound(cleanup):
         a,b=conv["inspection"],cleanup["inspection"]
+        # incomplete_attempt_count was excluded, so an attempt could vanish between the two
+        # stages with nothing noticing. Cleanup adds terminal rows and may retire attempts, so
+        # this is a floor on the OTHER counts only -- the attempts themselves are decided by
+        # identity, and a disappearance is caught by the two-way correspondence above.
         counts=("history_count","receipt_count","audit_event_count")
         unchanged_counts=all(b[f]==a[f] for f in counts)
         # The second home of the withdrawn demand for zero incomplete attempts, found by the
