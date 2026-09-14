@@ -651,7 +651,7 @@ def accepted_terminal_failure(host, sender, rows_by_nonce, cleanups, overhead, r
         return "the accepted completion does not bind the announced request size"
     if recv["request_frame_bytes"]!=recv["request_announced_body_bytes"]+overhead:
         return "the accepted completion does not bind a complete request"
-    if TERMINAL_IMPORT not in recv["phases_reached"] or recv["outcomes"]!=["accepted"]:
+    if TERMINAL_IMPORT not in recv["phases_reached"] or not completed(recv):
         return "the accepted completion has no accepted receiver import"
     if not complete_reply(recv,reply_overhead): return "the accepted completion has no complete receiver reply"
     return None
