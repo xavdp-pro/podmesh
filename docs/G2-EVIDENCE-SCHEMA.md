@@ -1,13 +1,15 @@
 # G2 evidence schema v3 — publishing what the accounting predicate needs
 
-Status: **implemented, independently reviewed as NO-GO, and not yet run against hosts.**
-Lot `codex/g2-accounted-attempts`.
+Status: **implemented at `024eb84`, independently reviewed as NO-GO, and not yet run
+against hosts.** Lot `codex/g2-accounted-attempts`.
 Work item 2 is this document; items 3 to 6 are in the collector, the fold, the comparator
 and the suites: typed fresh-store absence, the published `incomplete_attempts` records,
 the folded `exchanges` rows, and the eight-condition join that replaced the withdrawn
-demand for zero. The independent review found blocking accounting defects that must be
+demand for zero. The fifth independent review found two blocking defects: honest inbound
+incomplete attempts abort comparison (N1), and the accepting conditions are not isolated
+by the tests (N2). It also found the N3-N7 limits recorded below. Those defects must be
 corrected before preserved-store re-evaluation or another campaign. **No campaign has been
-run against this version, and nothing here qualifies G2.**
+run against this version, and nothing here qualifies G2 or manager HA.**
 
 **Two corrections this document made to itself, both from measurement rather than from
 reading, are recorded in place below**: an exchange is a fold over one to four audit rows
@@ -239,14 +241,13 @@ second sample.
   discipline already in `capture-host.sh` — one label per *kind* of value, never per
   observation site, or the join silently fails.
 - **Identities, never count deltas.** Cleanup legitimately adds terminal rows, so a
-  difference of totals describes nothing. The schema carries a **baseline set** and a
-  **post-campaign set** of attempt identities, and the comparator works on set
-  difference.
-- **Fresh-store absence is explicit, not an error.** Pre-activation is captured today
-  without `--with-inspection` (`activate-host.sh:89`), and `inspect_read_only` refuses a
-  missing store under `set -euo pipefail`. The baseline capture must tolerate "no store
-  yet" and say so in a typed field, or it breaks the very fresh-store campaign it exists
-  to serve.
+  difference of totals describes nothing. The schema carries the **pre-activation set**
+  and the **post-cleanup set** of attempt identities, and the comparator works on their
+  set difference. The stopped pre-activation capture is the sole debt anchor.
+- **Fresh-store absence is explicit, not required.** Pre-activation is captured with
+  `--with-inspection` before the first start and with manager process count zero. A typed
+  `store_present: false` is a valid fresh state. A present store is also valid and may
+  contain retained pre-existing debt; it is not described as empty or first-use.
 - **Current capture extent is explicit.** `exchanges` currently folds every audit row
   retained by the inspected store, one output row per nonce. It is not scoped by a
   published wall-clock window or row watermark. A future bounded projection requires a
@@ -334,16 +335,16 @@ Byte counts are published raw: they identify nothing and conditions 2 and 5 are 
 them. Digests are published as commitments rather than raw, because a raw request digest
 plus a guessed body is a confirmation oracle.
 
-## How each condition becomes decidable
+## How each condition is evaluated or declared undecidable
 
 | # | Decided by |
 | --- | --- |
-| 1 | the attempt commitment is in the post-campaign set and not in the baseline set, and `package` binds the candidate — already compared across stages |
-| 2 | one `exchanges` row on exactly one other host with the same `nonce_commitment`, whose `peer_commitment`, `operation_commitment`, `request_sha256_commitment`, `request_announced_body_bytes` and `request_frame_bytes` all bind |
+| 1 | the attempt commitment is in the post-cleanup set and not in the stopped pre-activation set, and `package` binds the candidate — already compared across stages; no narrower wall-clock window is declared |
+| 2 | one `exchanges` row on exactly one other host with the same `nonce_commitment`, whose `peer_commitment`, `operation_commitment`, `request_sha256_commitment`, `request_announced_body_bytes` and `request_frame_bytes` all bind. The sender's transferred request byte count is not published, so that sub-condition remains explicitly undecidable |
 | 3 | the receiver's `phases_reached` includes `inbound_import_committed` or `inbound_refusal_recorded`, its `outcomes` vocabulary is compatible with those phases, and the accepted-import branch carries a `local_receipt_commitment` |
 | 4 | `unaudited_import_receipt_count == 0` on every host, with the commitments published so a non-zero case names which |
 | 5 | the receiver's row reaches `inbound_reply_write_observed` with `reply_frame_bytes > 0`, **and** the sender's attempt is still `outbound_request_prepared` — the honest retention the contract requires |
-| 6 | a later `exchanges` row with the same `operation_commitment` and `replayed: true`, **or** the imported fact present in the converged history on all three replicas |
+| 6 | the reachable branch is a complete replay on the original receiver: a different peer-validated nonce, the same operation and peer commitments, `replayed: true`, accepted outcome, committed import and reply-write phases, the original receipt commitment, and a complete reply. The former all-replica convergence branch is unreachable for this candidate because operation IDs are per peer and import receipts are receiver-local |
 | 7 | `sqlite_integrity_result`, successful inspection — which entails the immutable-schema check — and each replica's receipt/audit set digests remaining consistent with its own later capture. The set digests are replica-local and must not be required to agree across replicas. |
 | 8 | the attempt is still in `incomplete_attempts` at post-cleanup — visible, not silently retired |
 
@@ -355,17 +356,17 @@ one folded** row for it — the pre-fold rule would have refused every real inbo
 exchange, see the correction above; two different non-null values for one field inside a
 fold; any binding field that disagrees across hosts; a receiver row that never
 reached the required phase set; a non-zero unaudited-receipt count; an attempt that appears in
-the post set, is claimed accounted, and is absent from `incomplete_attempts` at
-post-cleanup; and any attempt outside the declared window.
+the post-cleanup set, is claimed accounted, and is absent from `incomplete_attempts` at
+post-cleanup; and any attempt introduced after the stopped pre-activation debt anchor
+that cannot be classified individually. The capture publishes no narrower declared
+wall-clock window.
 
 Negative fixtures, one per refusal, plus: wrong peer, wrong nonce, wrong digest, short
-request, partial import, unsigned or wrong reply, missing retry with absent converged
-facts, a corrupt store, and an attempt outside the campaign window.
+request, partial import, unsigned or wrong reply, a missing or malformed replay, a corrupt
+store, and a new attempt that remains unaccounted at post-cleanup.
 
-Positive fixtures: a terminal attempt, a replay-accounted attempt, and a
-convergence-accounted superseded snapshot — the ninth strand of the measurement is
-exactly that third case, and it is the one no synthetic fixture would have thought to
-write.
+Positive fixtures: a terminal attempt and a replay-accounted attempt. The former
+all-replica accounting topology is not a valid candidate fixture and must not be used.
 
 ## Size, and what it costs
 
@@ -376,12 +377,40 @@ projection. The raw audit history is never published, but the current folded pro
 covers the whole locally retained audit table and can therefore grow without bound. A
 bounded window remains a separate, versioned change.
 
+## Known implementation limits at `024eb84`
+
+The schema describes the intended decision contract. The fifth independent review found
+that the implementation at `024eb84` does not yet meet it:
+
+- **N1:** corroboration accepts only outbound strands. An honest inbound incomplete
+  attempt, including pre-existing inbound debt, aborts comparison instead of receiving a
+  direction-aware classification.
+- **N2:** the accepting conditions are not independently pinned by the test suites; a
+  number of single-condition mutants can still turn a refusal into a pass.
+- **N3:** pre-activation debt is not yet required to remain byte-identical at every later
+  stage and can disappear from the result.
+- **N4:** the replay branch currently rests on a receiver row without requiring the
+  matching sender retry row, and unmatched inbound rows are not reported. Until this is
+  corrected, replay evidence is receiver-asserted under the published trust model.
+- **N5:** the all-replica convergence branch is unreachable and must be removed from the
+  implementation and its fixtures; it is not part of the contract above.
+- **N6:** the pre-activation capture does not re-read unit and process state after store
+  inspection, leaving a small capture race.
+- **N7:** peer, operation, request digest and announced size are not frozen per nonce
+  across stages, and outbound folded row shape is not capped.
+
+After N1, direction-aware corroboration must bind the same direction, nonce, authority
+and operation, require the listed last phase to be the highest observed non-terminal
+phase, and classify a new inbound strand still open at post-cleanup as unaccounted rather
+than aborting the comparator.
+
 ## What this design does not do
 
 It does not qualify G2, does not change a threshold, does not touch a captured file, and
-does not decide whether the nine measured attempts are accounted for. It makes the
-question answerable from sealed evidence; the answer is a campaign's business.
+does not decide whether the nine measured attempts are accounted for. Even after the
+limits above are corrected, a G2 result proves bounded authenticated exchange accounting
+only. It does not prove takeover, fencing, exclusive activation, DNS recovery, host-loss
+recovery, long-running viability, or manager HA.
 
 It also does nothing about the receiver's unbounded pre-reply verification. That defect
-has its own lot, and a passing G2 under this schema would still say nothing about
-long-running operational viability.
+has its own lot and must not be hidden by a G2 result.

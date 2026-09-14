@@ -80,8 +80,11 @@ candidate input inspected by the collector remains private inspection version `3
 The matching comparator output is
 `podmesh-manager-live-activation-comparison/v3`. The activation seal refuses a
 converged file or active baseline carrying another evidence version, and the comparator
-must likewise refuse evidence `/v2`, published inspection `3`, and comparison `/v2`
-rather than interpreting old and new shapes under one name.
+refuses evidence `/v2`, published inspection `3`, and comparison `/v2` rather than
+interpreting old and new shapes under one name. At reviewed commit `024eb84`, a `/v2`
+evidence object is rejected by the exact-shape check before the version check, so the
+error is the generic `unsafe shape`; the rejection is real, but its diagnostic does not
+yet name the unsupported version.
 
 Historical `/v2` captures are immutable. Reproduce their stored comparison with the
 activation comparator at commit `9d814b2`, or capture preserved stores again as new `/v3`
@@ -90,7 +93,8 @@ evidence with new checksums. Never rewrite a `/v2` file to claim `/v3` compatibi
 The comparator requires four captures for every host:
 
 1. pre-activation: manager disabled, inactive and absent, with the reviewed G2
-   configuration already installed and an empty first-use state directory.
+   configuration already installed, manager process count zero, and a typed inspection
+   of either an absent fresh store or a present durable store containing retained debt.
 2. active-baseline: the exact manager process, TCP listener, control socket,
    effective systemd policy and initial canonical store inspection after typed
    readiness.
@@ -101,10 +105,13 @@ The comparator requires four captures for every host:
 
 Convergence is derived only from stages 3 and 4. The three canonical history
 digests must agree, contain at least three facts, and remain converged after all
-residents stop. Incomplete attempts are retained and classified by identity as
-pre-existing, terminal, accounted, or unaccounted; G2 requires zero **unaccounted**
-new incomplete attempts. It never requires deletion or fabrication of a terminal
-row. Equal diagnostic status counters do not prove convergence.
+residents stop. The intended contract retains and classifies incomplete attempts by
+identity as pre-existing, terminal, accounted, or unaccounted; G2 requires zero
+**unaccounted** new incomplete attempts. It never requires deletion or fabrication of a terminal
+row. At reviewed commit `024eb84`, this is implemented only for outbound attempts:
+honest inbound incomplete attempts abort comparison. No campaign may run until N1 adds
+direction-aware inbound corroboration and classification. Equal diagnostic status
+counters do not prove convergence.
 
 A G2 PASS is an exchange-accounting result over the captured manager processes. It
 must report the full attempt vocabulary, the conditions the published evidence could
@@ -117,6 +124,29 @@ and replica commitments, reciprocal peer and pair-key commitments, one stable
 manager invocation per active campaign, exact state/runtime/socket ownership
 and modes, and unchanged existing PodMesh services, rootful containers, routes
 and nftables commitments.
+
+
+## Known NO-GO limits at `024eb84`
+
+The fifth independent review found that the harness is not ready for another campaign:
+
+- N1: honest inbound incomplete attempts abort comparison instead of being classified.
+- N2: the replay join, accepted-terminal join, debt anchor, stopped-manager checks and
+  old-version refusal are not independently pinned by tests.
+- N3: pre-activation debt can disappear instead of remaining byte-identical through all
+  later stages.
+- N4: replay currently requires only the receiver row; it does not require the sender's
+  retry row or report unmatched inbound rows. Such evidence is receiver-asserted.
+- N5: the all-replica convergence accounting branch is unreachable for this candidate
+  and is excluded from the documented acceptance contract.
+- N6: pre-activation unit and process state are not re-read after store inspection.
+- N7: row binding fields and the permitted outbound folded-row shape are not frozen
+  across stages.
+
+After N1, corroboration must be direction-aware. An inbound attempt binds to a local
+inbound folded row with the same nonce, authority and operation, whose highest phase is
+the listed non-terminal phase. A new inbound strand still open at post-cleanup is
+unaccounted and fails the campaign; pre-existing inbound debt remains reported as debt.
 
 ## Per-host activation
 
