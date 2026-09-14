@@ -226,7 +226,7 @@ fn view(db: &Connection) -> Result<Value, Error> {
 
 /// Allocate the next free address of the local pool to a universe, for `create`. Refuses without a
 /// declaration, and returns an existing live allocation of the same universe unchanged.
-pub(crate) fn allocate(db: &Connection, uuid: &str, id: &str) -> Result<(String, String, String), Error> {
+pub(crate) fn allocate(db: &Connection, uuid: &str, id: &str, requested: Option<&str>) -> Result<(String, String, String), Error> {
     ensure_schema(db)?;
     let d = declared(db)?.ok_or("The managed profile needs a network declared on this host (network_declare); none is")?;
     if d.state != "effective" {
@@ -246,16 +246,36 @@ pub(crate) fn allocate(db: &Connection, uuid: &str, id: &str) -> Result<(String,
         .filter_map(|r| r.ok())
         .filter_map(|s| s.parse::<Ipv4Addr>().ok().map(u32::from))
         .collect();
-    let mut candidate = pool.first() + 1;
-    let ip = loop {
-        if candidate >= pool.last() {
-            return Err("The local pool has no free address left".into());
+    // A requested address is honoured only inside the local pool, not the gateway, and free: it
+    // lets an operator choose addresses that other universes' configurations name before those
+    // universes exist. Without one, the next free address of the pool.
+    let ip = match requested {
+        Some(text) => {
+            let a = identifier_ip(text, "network_address")?;
+            if !pool.contains(a) || u32::from(a) == pool.first() || u32::from(a) == pool.last() {
+                return Err(format!("network_address {a} is outside the local pool {}", pool.text()).into());
+            }
+            if a == gateway {
+                return Err(format!("network_address {a} is the pool's gateway").into());
+            }
+            if used.contains(&u32::from(a)) {
+                return Err(format!("network_address {a} is allocated to another universe").into());
+            }
+            a
         }
-        let a = Ipv4Addr::from(candidate);
-        if a != gateway && !used.contains(&candidate) {
-            break a;
+        None => {
+            let mut candidate = pool.first() + 1;
+            loop {
+                if candidate >= pool.last() {
+                    return Err("The local pool has no free address left".into());
+                }
+                let a = Ipv4Addr::from(candidate);
+                if a != gateway && !used.contains(&candidate) {
+                    break a;
+                }
+                candidate += 1;
+            }
         }
-        candidate += 1;
     };
     db.execute(
         "INSERT INTO network_allocations(universe_uuid,network_uuid,ip,allocated_at,operation_id) VALUES(?1,?2,?3,?4,?5)",

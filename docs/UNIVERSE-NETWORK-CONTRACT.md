@@ -117,6 +117,16 @@ address; a `/32` published and withdrawn, a second announcement and a route outs
 refused, undeclare refused while anything remains; and cleanup that left the host's routes and
 networks byte-identical to its initial state.
 
+**Step 4 (2026-09-14):** `create` may name the address it wants inside the local pool
+(`network_address`), so that universes whose configurations name each other can exist; and
+`tests/check-manager-replicas-managed.py` ran **three manager replicas of one logical manager
+concurrently on the managed network across the three lab hosts** — one bridge per pool, two peer
+routes per host, each replica at its declared address, explicit authenticated endpoints, no DNS —
+and proved from outside, with all three running, that their facts converged: three boot facts,
+one per owned scope, byte-identical sets on every replica, authenticated import receipts from
+both peers on each, exchange audit rows present, integrity ok; cleanup returned every host's
+routes and networks to their initial state. This is campaign 6's data path inside universes.
+
 **Known deviation, stated:** Podman's network firewall source-NATs traffic leaving the bridge's
 subnet, so a universe reaching another host's universe is seen there with the host's address.
 Identity between manager replicas is the HMAC pair key, never the address; removing the NAT

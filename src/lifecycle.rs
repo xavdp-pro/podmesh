@@ -75,6 +75,7 @@ enum Params<'a> {
         image: &'a str,
         command: Vec<&'a str>,
         profile: &'a str,
+        address: Option<&'a str>,
     },
     Clone {
         source: &'a str,
@@ -376,7 +377,11 @@ fn parse<'a>(operation: &str, uuid: &str, request: &'a Value) -> Result<Params<'
             if profile != crate::network::PROFILE_ISOLATED && profile != crate::network::PROFILE_MANAGED {
                 return Err("network_profile must be isolated or managed".into());
             }
-            Params::Create { image, command, profile }
+            let address = request.get("network_address").map(|v| v.as_str().ok_or("network_address must be a string")).transpose()?;
+            if address.is_some() && profile != crate::network::PROFILE_MANAGED {
+                return Err("network_address is only meaningful with the managed profile".into());
+            }
+            Params::Create { image, command, profile, address }
         }
         "clone" => {
             let source = text(request, "source_uuid")?;
@@ -723,7 +728,7 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
         migration::refuse_identity_reuse(db, uuid, params.name())?;
     }
     match params {
-        Params::Create { image, command, profile } => create(db, id, uuid, &name, existing, image, command, profile),
+        Params::Create { image, command, profile, address } => create(db, id, uuid, &name, existing, image, command, profile, *address),
         Params::Clone { source } => clone(db, id, uuid, source, &name, existing),
         Params::Delete => delete(db, uuid, &name, existing),
         Params::Start { observe_seconds } => start(db, attempt, id, uuid, &name, existing, *observe_seconds),
@@ -759,7 +764,7 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
     }
 }
 #[allow(clippy::too_many_arguments)]
-fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Value>, image: &str, command: &[&str], profile: &str) -> Result<Value, Error> {
+fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Value>, image: &str, command: &[&str], profile: &str, address: Option<&str>) -> Result<Value, Error> {
     if let Some(ref c) = existing {
         if label(c, CREATION) != Some(id) {
             return Err("Universe already exists under another creation operation".into());
@@ -772,7 +777,7 @@ fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Va
         // The managed profile: one stable address allocated to the universe UUID from this host's
         // pool, on the host's bridge. The isolated profile: no network, as every lot before had it.
         let managed = if profile == crate::network::PROFILE_MANAGED {
-            Some(crate::network::allocate(db, uuid, id)?)
+            Some(crate::network::allocate(db, uuid, id, address)?)
         } else {
             None
         };

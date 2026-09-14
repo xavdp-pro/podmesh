@@ -463,6 +463,23 @@ including the unreachable-host takeover.
 Status vocabulary for everything above: **implemented, locally tested, lab-tested** on two
 transient hosts; nothing is deployed and nothing is production-qualified.
 
+## M-U2, the networked replicated manager (Codex's direction of 2026-09-14) — steps 1 to 4 done the same night
+
+The operator decided that networking is part of the normal universe contract; Codex's direction
+sets an invariant (three replicas run concurrently, one governs) and an order. Done, one commit
+per step: (1) `docs/UNIVERSE-NETWORK-CONTRACT.md`; (2) `src/network.rs` and the required
+`network_profile` on `create` — isolated kept as it was, managed = a bridge per host on its `/24`
+pool, one stable address per universe UUID, journaled declare/undeclare/route publish/withdraw
+verified from `podman network inspect` and `ip route`, exactly one announcement per address;
+(3) `tests/check-network-managed.py` on lab-a, 17 checks, host state restored; (4)
+`tests/check-manager-replicas-managed.py`: three Alpine manager universes (musl resident,
+`packaging/podmesh-manager/universe/replicated/` in the web tree generates the private replica
+set) concurrently on three hosts, facts converged while all three ran, inspected from `podman cp`
+copies by the attested inspector. Steps 5 to 7 (governor role under the epoch gate with all three
+running, stale permit, old-active rejoin, duplicate route refusal, peer loss and reconnection,
+recovery points combined) are not begun. Status: implemented, lab-tested on three hosts; not
+deployed, not production-qualified; nothing published.
+
 ## Next actions, in order
 
 1. Done: independent read-only counter-review of the source-side milestone (Claude
