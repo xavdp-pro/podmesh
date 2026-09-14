@@ -182,8 +182,16 @@ with the public evidence under `docs/qualification/manager2-g2-live-6/`. Result:
 evidenced, 103 new incomplete attempts all accounted, 0 unaccounted, 211 pre-existing
 retained, derivation reproduced on all three hosts; one observation needed 114 resubmissions
 (latency defect, third data point). Private campaign copy: `.podmesh-builds/manager2-g2-campaigns/campaign-6/`.
-Lab-tested; nothing deployed; `ha_claim` absent. Codex's items 2 and 3 (replication data path
-qualified separately; three-host takeover experiment with an external authority) are not begun.
+Lab-tested; nothing deployed; `ha_claim` absent. Codex's item 2 is done the same evening:
+`docs/MANAGER-REPLICATION-DATA-PATH.md` (web tree) states, from the three preserved stores,
+what converges (the fact set: 18/18/18 identical, one digest, one view), what is immutable
+but per host (receipts, audit, open attempts — hence the cross-host join), and what is still
+an exclusive decision (absent from the campaign, unreachable from the resident); derived by
+`campaign/replication-path.py`, published as `replication-path.json`. Item 3 (three-host
+takeover experiment with an external authority) is not begun.
+On the operator's "go" (2026-09-14 evening) the HA recommendations became the tool's
+defaults by hypothesis (`64892c4`): retention declared from every cycle (keep 3, one hour),
+three quarantined copies, 20/5 lease and margin, the laboratory's gate, no timer.
 
 ## Manager2 G2 live activation (Codex's lot, taken over 2026-09-13) — converged, not passed
 
