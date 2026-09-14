@@ -332,6 +332,21 @@ the H7 binary, 37 with the epoch rotation on the H8 binary; reports in the gitig
 activation tables — fixed, rebuilt, rerun. The transient units are stopped; their state
 directories and the installed binaries under `/opt/podmesh-dev-ha/` were left in place.
 
+## Collector class 5 for recovery points (lot M5), 2026-09-14 — built and checked, not published
+
+Every capture leaves an archive in the outbox and nothing collected it: four Alpine runs left
+33 MB per side, and a real universe is gigabytes per capture. The contract's class 5 is now
+implemented **for recovery points only** (`src/retention.rs`, `src/collector.rs`, checked by
+`tests/check-recovery-point-retention.py`): a declared retention (`keep_latest`,
+`minimum_age_seconds`), **both hold scopes** interpreted in one function and applied to every
+class, a retained manifest committed with the terminal state before any byte is removed, a
+fresh re-hash immediately before the effect, a `max_bytes` bound, recovery that finishes an
+interrupted removal rather than repeating a decision, and a prepare that replays from the
+retained manifest. Six rules removed in turn and watched go red; the apply-time hold guard is
+defence in depth for class 5 and the only rule for class 3 with a reclaim, which the single-host
+check cannot reach — unit-tested and annotated. Checkpoint artifacts and inbox copies are not
+collected; class 4 is still not implemented. Collector version 2, policy version 2.
+
 ## Next actions, in order
 
 1. Done: independent read-only counter-review of the source-side milestone (Claude
@@ -350,7 +365,8 @@ directories and the installed binaries under `/opt/podmesh-dev-ha/` were left in
    classes 1 and 2 with their tombstones, and class 3 delegated to the existing abort.
    Codex's four findings fixed and the suites rerun; its closing review is the gate, and
    publication is withheld until then. See the M4 section above. Artifact retention with
-   evidence holds (class 5) and a failed local restore (class 4) are the lot after it.
+   evidence holds (class 5) is done for recovery points on 2026-09-14 (M5 section above);
+   a failed local restore (class 4) and checkpoint artifacts remain.
    No autonomous timer in either.
    Two documentation corrections now fall to me, once the review closes and before the
    commit: LOCAL-API.md still says the migration operations are "not packaged" at its two

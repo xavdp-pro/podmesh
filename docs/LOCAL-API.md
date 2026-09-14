@@ -189,7 +189,8 @@ Both operations are host-wide — they are the only ones that name no universe �
   plan as history with a fresh observation. Only the *number* of candidates is bounded: the count of settled
   reservations a host-wide plan reports, and the size of one candidate's proofs, are not.
 - `garbage_collect_apply` (`plan_operation_id`, `candidates`, optional `max_effects` — default 1, maximum 10
-  — `max_runtime_reclaims` — default 0, maximum 5 — and `reclaim_processes`) acts only on candidates a
+  — `max_runtime_reclaims` — default 0, maximum 5 — `max_bytes` — default 4 GiB, maximum 1 TiB — and
+  `reclaim_processes`) acts only on candidates a
   recorded plan of this host examined, classified the same way and found collectable. Immediately before
   each effect it repeats that candidate's whole classification from fresh facts and refuses on any mismatch;
   afterwards it verifies the result from outside, and an observation it cannot make is an unknown that fails
@@ -199,11 +200,13 @@ Both operations are host-wide — they are the only ones that name no universe �
   effect it carries verified; otherwise its record says `completed_with_unverified_effects` and names the
   blockers. Each effect is recorded durably in the same transaction as the effect itself, so a retry of the
   same operation ID after an interruption **recovers** what was already committed instead of repeating it,
-  and a replayed operation ID returns its historical record and repeats nothing.
+  and a replayed operation ID returns its historical record and repeats nothing. A plan enumerates
+  reservations, unresolved restore claims and prepared recovery points.
 
-Three classes are implemented. Class 4 (a failed local restore) and class 5 (operation artifacts after a
-declared retention, with evidence holds and retained manifests) are **not**, so no artifact is ever deleted
-by this version and no retention interval exists in it.
+Four classes are implemented: the three below, and class 5 **for recovery point archives only** (further
+down). Class 4 (a failed local restore) is **not**, and checkpoint artifacts are not collected: the only
+files this version ever removes are a recovery point's archive and manifest, after the conditions stated for
+class 5, and the manifest survives in the journal.
 
 - **Class 1, `terminal_reservation_all_authorizations_not_restored`.** A `checkpointed` reservation whose
   every authorization ended `not_restored` — the dead end lot M3 named, where no release and no abandonment
@@ -242,15 +245,42 @@ runtime reclaims it reserved, the ones it performed and the processes it signall
 is also recorded in `garbage_collection_effects` inside the effect's own transaction, which is what lets an
 interrupted run recover. A tombstone carries a copy of the proofs its collection rested on.
 
-**Neither hold scope is implemented in this version, and nothing here deletes evidence.** The open question
-this lot raised — whether a hold should also prevent *releasing a reservation* or *removing the runtime a
-failed restore left* — was decided on 2026-09-13, and the contract now defines two scopes: an
-`evidence_hold` blocks artifact deletion and runtime reclaim but not, by default, a history-preserving
-terminal reservation transition; an `investigation_hold` blocks every apply effect; and a hold record that
-is missing, unreadable, ambiguous or expired without a verified decision blocks the effect it governs. This
-version implements **neither** and claims neither behaviour. It collects no artifact, removes no incident
-record and keeps every archive, manifest, log and reclaim record a lot ever wrote, so nothing here is
-protected by a hold and nothing here needs to be.
+- **Class 5, `recovery_point_archive_after_retention`.** The archive and manifest a `recovery_point_prepare`
+  left in this host's outbox. A point is a candidate only when **all** of these hold, each recorded as a proof
+  or a blocker: the point is `prepared` and its manifest still hashes to what its record binds; a retention
+  is **declared** for the universe (`collection_retention_declare`, below — without one there is no elapsed
+  retention to prove, and the plan says so rather than assuming one); the point is outside the newest
+  `keep_latest` generations and older than `minimum_age_seconds`; no hold applies and the hold state could be
+  read; the outbox path recomputed from the identifier agrees with the record; the archive is a regular file
+  of the recorded size — and, immediately before the effect, it still hashes to the recorded digest, so a
+  tampered archive is kept as evidence and never collected. The effect writes a **retained manifest**
+  (`recovery_point_retained`: the manifest's full content, both digests, sizes, the preparing and collecting
+  operations, the terminal state and the retention it was collected under) and marks the point `collected`
+  in one transaction, and only then removes the archive, the manifest file and the directory, verified from
+  outside. A run interrupted between the two finishes the removal on retry rather than repeating anything;
+  a replay of the collection repeats nothing; and a replay of the point's own `recovery_point_prepare`
+  serves the retained manifest with `collected: true`. `max_bytes` (default 4 GiB, at most 1 TiB) bounds
+  what one run may remove and is reserved before each removal. Inbox copies on a standby are the transport
+  controller's, which wrote them, and are not collected. Plans share their candidate bound three ways so
+  that archives filling a disk cannot be hidden by dead reservations.
+
+**Both hold scopes are implemented**, as the contract amended on 2026-09-13 defines them, and interpreted in
+one place (`retention::hold_blocks`): an `investigation_hold` blocks every apply effect of every class; an
+`evidence_hold` blocks artifact deletion (class 5) and runtime reclaim (class 3 with `reclaim_processes`)
+and not a history-preserving terminal reservation transition. A hold that cannot be read is a hold: the
+effect it would govern is blocked and the plan says why. Holds never expire on their own; a hold ends when
+someone releases it under their own operation, and the release is kept beside it.
+
+- `collection_retention_declare` (`keep_latest` 1–1000, `minimum_age_seconds` 0 to ten years) declares, per
+  universe, how many newest recovery points are kept whatever their age and how old a point must be before
+  it is a candidate. At least one is always kept. The `authorization_ref` is kept as `declared_by`.
+- `collection_hold_declare` (`scope`: `evidence_hold` or `investigation_hold`, `reason`) places a hold; its
+  identity is the declaring operation, so a replay is the same hold. `collection_hold_release` (`hold_id`)
+  ends it and records who did. `collection_status` reports the retention, the holds in force, the released
+  ones and the retained manifests of a universe.
+
+The class 3 reclaim path under an evidence hold is not reachable from a single host; `hold_blocks` is
+unit-tested for it and the apply-time guard says so beside the code.
 
 Who may apply is provenance, not proof, exactly as for a reclaim: the request records its
 `authorization_ref`, the root-only socket remains the access boundary, and the collector still refuses

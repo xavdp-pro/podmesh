@@ -1,6 +1,7 @@
 mod cleanup;
 mod activation;
 mod recovery_point;
+mod retention;
 mod collector;
 mod lifecycle;
 mod migration;
@@ -111,6 +112,7 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
             | "migration_restore_abort" => lifecycle::execute(db, request)?,
             // Host-wide by design: the collector is the only operation that does not name one universe.
             "garbage_collect_plan" | "garbage_collect_apply" => collector::execute(db, request)?,
+            "collection_retention_declare" | "collection_hold_declare" | "collection_hold_release" | "collection_status" => retention::execute(db, request)?,
             "activation_require" | "activation_acquire" | "activation_renew" | "activation_release"
             | "activation_supersede" | "activation_status" | "activation_fence" => activation::execute(db, request)?,
             "recovery_point_prepare" | "recovery_point_status" | "recovery_point_restore" | "recovery_point_promote" => recovery_point::execute(db, request)?,
@@ -121,7 +123,7 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
                 "experimental_operations":["migration_preflight","migration_checkpoint","migration_status","migration_authorize_transfer",
                     "migration_complete_transfer","migration_retire_source","migration_release","migration_abandon","migration_restore_local",
                     "migration_destination_preflight","migration_restore","migration_restore_abort",
-                    "garbage_collect_plan","garbage_collect_apply"],
+                    "garbage_collect_plan","garbage_collect_apply","collection_retention_declare","collection_hold_declare","collection_hold_release","collection_status"],
                 "experimental_contracts":{
                     "migration_preflight":"read-only compatibility report bound to universe UUID, container ID, image ID, source and destination host UUIDs; no reservation, suspension or artifact",
                     "migration_checkpoint":"source: fresh checks before suspension, durable reservation, checkpoint with the packaged podmesh-vzcriu runtime in its own scope, archive/manifest/hashes under the state directory; never an authorization to restore",

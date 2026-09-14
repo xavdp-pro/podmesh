@@ -23,9 +23,20 @@
 //! that exact container ID if it ever comes back out of band. Reusing a collected identity needs a verified
 //! handoff restore or an explicit replacement procedure, exactly as the contract requires.
 //!
-//! Class 4 (a failed local restore) and class 5 (operation artifacts after declared retention) are not
-//! implemented here and nothing in this file assumes they exist.
+//! * **Class 5, for recovery points** — the archive a `recovery_point_prepare` left in this host's outbox,
+//!   once the universe has a DECLARED retention, the point is outside the generations that retention keeps
+//!   and older than its minimum age, no hold applies, and the archive still hashes to what the manifest bound.
+//!   The effect writes a retained manifest first, in the same transaction that marks the point collected,
+//!   and only then removes the archive; a run interrupted between the two finishes the removal on retry
+//!   rather than repeating anything. Other operation artifacts (checkpoints) are NOT collected here.
+//!
+//! Both hold scopes of the contract are honoured for every class: an `investigation_hold` blocks every
+//! effect, an `evidence_hold` blocks artifact deletion (class 5) and runtime reclaim (class 3 with
+//! `reclaim_processes`) but not a history-preserving terminal transition. A hold that cannot be read blocks.
+//!
+//! Class 4 (a failed local restore) is not implemented here and nothing in this file assumes it exists.
 use crate::cleanup;
+use crate::retention as rt;
 use crate::lifecycle::{self as lc, failure, Error};
 use crate::migration::{self as mg, Reservation, COLLECTED};
 use crate::restore as ds;
@@ -33,16 +44,16 @@ use crate::transfer as tr;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
-const COLLECTOR_VERSION: &str = "podmesh-collector/1";
-/// What this version is allowed to collect at all. A retention policy only becomes meaningful with the
-/// artifact class, which this version does not implement.
-const POLICY_VERSION: &str = "podmesh-collection-policy/1: terminal reservation classes 1 and 2, and failed restore claims through migration_restore_abort; no artifact collection and no retention interval in this version";
+const COLLECTOR_VERSION: &str = "podmesh-collector/2";
+/// What this version is allowed to collect at all.
+const POLICY_VERSION: &str = "podmesh-collection-policy/2: terminal reservation classes 1 and 2, failed restore claims through migration_restore_abort, and recovery point archives after a declared retention with both hold scopes; checkpoint artifacts are not collected";
 const AUTHORITY: &str = "A plan is read-only and authorizes nothing. An apply is a separate operation that names the plan it applies, the candidates it may act on and its own bounds; it repeats every proof immediately before each effect and verifies the result from outside. There is no timer: nothing here ever runs on its own.";
 
 /// Contract class names, as they appear in a plan, in an apply request and in a tombstone.
 pub(crate) const CLASS_TERMINAL_NOT_RESTORED: &str = "terminal_reservation_all_authorizations_not_restored";
 pub(crate) const CLASS_TERMINAL_ABSENT: &str = "terminal_reservation_container_absent";
 pub(crate) const CLASS_FAILED_RESTORE_CLAIM: &str = "failed_restore_claim";
+pub(crate) const CLASS_RECOVERY_POINT_AFTER_RETENTION: &str = "recovery_point_archive_after_retention";
 
 /// Reservation states that still owe someone a decision. A settled reservation is a finished record: the
 /// collector counts it and leaves it alone.
@@ -62,6 +73,10 @@ const DEFAULT_MAX_EFFECTS: usize = 1;
 const LIMIT_MAX_EFFECTS: usize = 10;
 const DEFAULT_MAX_RUNTIME_RECLAIMS: usize = 0;
 const LIMIT_MAX_RUNTIME_RECLAIMS: usize = 5;
+/// Bytes of archive one apply run may remove. The default is small on purpose: a real universe's export is
+/// gigabytes, and letting those go should be an explicit number in the request.
+const DEFAULT_MAX_BYTES: usize = 4 << 30;
+const LIMIT_MAX_BYTES: usize = 1 << 40;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -96,6 +111,8 @@ pub(crate) fn ensure_schema(db: &Connection) -> Result<(), Error> {
          PRIMARY KEY(operation_id, candidate_key));",
     )?;
     mg::ensure_schema(db)?;
+    rt::ensure_schema(db)?;
+    crate::recovery_point::ensure_schema(db)?;
     Ok(())
 }
 /// Durable progress of one effect. Written inside the effect's own transaction with `verification: pending`
@@ -133,6 +150,12 @@ fn already_applied(db: &Connection, operation: &str, t: &Target) -> Result<bool,
     if t.class == CLASS_FAILED_RESTORE_CLAIM {
         return claim_closed_by(db, &t.authorization_id, operation);
     }
+    if t.class == CLASS_RECOVERY_POINT_AFTER_RETENTION {
+        let by: Option<String> = db
+            .query_row("SELECT collecting_operation_id FROM recovery_point_retained WHERE recovery_point_uuid=?1", [&t.recovery_point_uuid], |r| r.get(0))
+            .optional()?;
+        return Ok(by.as_deref() == Some(operation));
+    }
     Ok(mg::collection_history(db, &t.universe_uuid)?
         .iter()
         .any(|c| c["collected_by_operation"].as_str() == Some(operation)))
@@ -162,6 +185,7 @@ struct Limits {
     max_candidates: usize,
     max_effects: usize,
     max_runtime_reclaims: usize,
+    max_bytes: usize,
 }
 fn bounded(request: &Value, key: &str, default: usize, cap: usize) -> Result<usize, Error> {
     match request.get(key) {
@@ -184,13 +208,14 @@ impl Limits {
                 DEFAULT_MAX_RUNTIME_RECLAIMS,
                 LIMIT_MAX_RUNTIME_RECLAIMS,
             )?,
+            max_bytes: bounded(request, "max_bytes", DEFAULT_MAX_BYTES, LIMIT_MAX_BYTES)?,
         })
     }
     fn view(&self, mode: Mode) -> Value {
         match mode {
             Mode::Plan => json!({"max_candidates": self.max_candidates}),
             Mode::Apply => json!({"max_candidates": self.max_candidates, "max_effects": self.max_effects,
-                "max_runtime_reclaims": self.max_runtime_reclaims}),
+                "max_runtime_reclaims": self.max_runtime_reclaims, "max_bytes": self.max_bytes}),
         }
     }
 }
@@ -201,11 +226,14 @@ struct Target {
     class: String,
     universe_uuid: String,
     authorization_id: String,
+    recovery_point_uuid: String,
 }
 impl Target {
     fn key(&self) -> &str {
         if self.class == CLASS_FAILED_RESTORE_CLAIM {
             &self.authorization_id
+        } else if self.class == CLASS_RECOVERY_POINT_AFTER_RETENTION {
+            &self.recovery_point_uuid
         } else {
             &self.universe_uuid
         }
@@ -213,6 +241,8 @@ impl Target {
     fn view(&self) -> Value {
         if self.class == CLASS_FAILED_RESTORE_CLAIM {
             json!({"class": self.class, "authorization_id": self.authorization_id, "universe_uuid": self.universe_uuid})
+        } else if self.class == CLASS_RECOVERY_POINT_AFTER_RETENTION {
+            json!({"class": self.class, "recovery_point_uuid": self.recovery_point_uuid, "universe_uuid": self.universe_uuid})
         } else {
             json!({"class": self.class, "universe_uuid": self.universe_uuid})
         }
@@ -237,7 +267,7 @@ fn parse_targets(request: &Value, limits: &Limits) -> Result<Vec<Target>, Error>
     let mut targets = vec![];
     for entry in listed {
         let class = lc::text(entry, "class")?.to_string();
-        if ![CLASS_TERMINAL_NOT_RESTORED, CLASS_TERMINAL_ABSENT, CLASS_FAILED_RESTORE_CLAIM].contains(&class.as_str()) {
+        if ![CLASS_TERMINAL_NOT_RESTORED, CLASS_TERMINAL_ABSENT, CLASS_FAILED_RESTORE_CLAIM, CLASS_RECOVERY_POINT_AFTER_RETENTION].contains(&class.as_str()) {
             return Err(format!("{class} is not a collection class of this version").into());
         }
         let universe_uuid = lc::text(entry, "universe_uuid")?.to_string();
@@ -253,10 +283,18 @@ fn parse_targets(request: &Value, limits: &Limits) -> Result<Vec<Target>, Error>
         } else {
             String::new()
         };
+        let recovery_point_uuid = if class == CLASS_RECOVERY_POINT_AFTER_RETENTION {
+            let value = lc::text(entry, "recovery_point_uuid")?.to_string();
+            lc::token(&value)?;
+            value
+        } else {
+            String::new()
+        };
         targets.push(Target {
             class,
             universe_uuid,
             authorization_id,
+            recovery_point_uuid,
         });
     }
     Ok(targets)
@@ -658,6 +696,185 @@ fn classify_claim(db: &Connection, k: &Value, observed: Option<&Value>) -> Resul
 
 /// One bounded inventory read and one bounded inspection of the candidate names that exist, so that a plan
 /// over many reservations still costs two read-only Podman calls.
+/// One prepared recovery point of this host, as the journal records it.
+struct Point {
+    recovery_point_uuid: String,
+    universe_uuid: String,
+    generation: i64,
+    operation_id: String,
+    state: String,
+    manifest_sha256: String,
+    rootfs_sha256: String,
+    rootfs_bytes: i64,
+    prepared_at: i64,
+    outbox: String,
+}
+fn point_row(r: &rusqlite::Row) -> rusqlite::Result<Point> {
+    Ok(Point {
+        recovery_point_uuid: r.get(0)?,
+        universe_uuid: r.get(1)?,
+        generation: r.get(2)?,
+        operation_id: r.get(3)?,
+        state: r.get(4)?,
+        manifest_sha256: r.get(5)?,
+        rootfs_sha256: r.get(6)?,
+        rootfs_bytes: r.get(7)?,
+        prepared_at: r.get(8)?,
+        outbox: r.get(9)?,
+    })
+}
+const POINT_COLUMNS: &str = "recovery_point_uuid,universe_uuid,generation,operation_id,state,manifest_sha256,rootfs_sha256,rootfs_bytes,prepared_at,outbox";
+/// Every prepared point, oldest generation first, so that the bound falls on the newest ones -- which the
+/// retention keeps anyway.
+fn prepared_points(db: &Connection) -> Result<Vec<Point>, Error> {
+    let mut s = db.prepare(&format!(
+        "SELECT {POINT_COLUMNS} FROM recovery_points WHERE state='prepared' ORDER BY universe_uuid,generation"
+    ))?;
+    let rows = s.query_map([], point_row)?.collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+fn one_point(db: &Connection, point: &str) -> Result<Option<Point>, Error> {
+    Ok(db
+        .query_row(&format!("SELECT {POINT_COLUMNS} FROM recovery_points WHERE recovery_point_uuid=?1"), [point], point_row)
+        .optional()?)
+}
+fn newest_generation(db: &Connection, uuid: &str) -> Result<i64, Error> {
+    Ok(db.query_row("SELECT COALESCE(MAX(generation),0) FROM recovery_points WHERE universe_uuid=?1", [uuid], |r| r.get(0))?)
+}
+
+/// The class 5 candidate: every condition of the contract, each either a proof or a blocker, and the archive
+/// re-hashed against what the manifest bound. `hash` is false in a plan, where the archive is only sized, and
+/// true immediately before an effect, where nothing is removed that does not still hash to its record.
+fn classify_point(db: &Connection, p: &Point, hash: bool) -> Result<Candidate, Error> {
+    let now = crate::now() as i64;
+    let mut blockers = vec![];
+    let mut proofs = json!({
+        "recovery_point_uuid": p.recovery_point_uuid, "universe_uuid": p.universe_uuid, "generation": p.generation,
+        "prepare_operation_id": p.operation_id, "state": p.state, "prepared_at": p.prepared_at,
+        "age_seconds": now - p.prepared_at, "recorded_rootfs_bytes": p.rootfs_bytes, "recorded_rootfs_sha256": p.rootfs_sha256,
+    });
+    // 1. The operation is terminal and its result is in the journal. A prepare keeps its own durable
+    //    record -- the point row, written only once the export was digested -- and its terminal artifact is
+    //    the manifest, which must still hash to what that record bound: that is what survives as the
+    //    retained manifest, so it is checked before anything else.
+    if p.state != "prepared" {
+        blockers.push(format!("the point is in state {}, not prepared", p.state));
+    }
+    let manifest_path = std::path::Path::new(&p.outbox).join(crate::recovery_point::MANIFEST);
+    match std::fs::read(&manifest_path) {
+        Ok(bytes) => {
+            let digest = mg::sha256_bytes(&bytes)?;
+            proofs["manifest"] = json!({"present": true, "sha256_matches_record": digest == p.manifest_sha256});
+            if digest != p.manifest_sha256 {
+                blockers.push("the manifest on disk does not hash to the digest its record binds; nothing is collected on an inconsistent record".into());
+            }
+        }
+        Err(e) => {
+            proofs["manifest"] = json!({"present": false, "error": e.to_string()});
+            blockers.push(format!("the manifest could not be read ({e}); a point without its manifest is an inconsistency to investigate"));
+        }
+    }
+    // 2. Nothing references it: a newer generation only names it as lineage, each archive is a full export;
+    //    what does reference it is the retention's own kept set, checked below.
+    // 3. A declared retention has elapsed.
+    match rt::retention(db, &p.universe_uuid)? {
+        None => {
+            proofs["retention"] = Value::Null;
+            blockers.push("no retention is declared for this universe; without one there is no elapsed retention to prove".into());
+        }
+        Some(r) => {
+            let newest = newest_generation(db, &p.universe_uuid)?;
+            let kept = p.generation > newest - r.keep_latest as i64;
+            let age = now - p.prepared_at;
+            proofs["retention"] = r.view();
+            proofs["newest_generation"] = json!(newest);
+            proofs["within_kept_generations"] = json!(kept);
+            proofs["minimum_age_elapsed"] = json!(age >= r.minimum_age_seconds as i64);
+            if kept {
+                blockers.push(format!("generation {} is among the newest {} the retention keeps (newest is {newest})", p.generation, r.keep_latest));
+            }
+            if age < r.minimum_age_seconds as i64 {
+                blockers.push(format!("the point is {age} seconds old and the retention keeps every point younger than {}", r.minimum_age_seconds));
+            }
+        }
+    }
+    // 4. No hold. An unreadable hold state is a hold.
+    match rt::holds(db, &p.universe_uuid) {
+        Err(e) => {
+            proofs["holds"] = json!({"readable": false, "error": e.to_string()});
+            blockers.push(format!("the hold state could not be read ({e}); an unknown hold is a hold"));
+        }
+        Ok(held) => {
+            proofs["holds"] = json!({"readable": true, "in_force": held.iter().map(rt::Hold::view).collect::<Vec<_>>()});
+            if let Some(why) = rt::hold_blocks(&held, true, false) {
+                blockers.push(why);
+            }
+        }
+    }
+    // 6. The path is this service's own outbox for this point, and nothing else: recomputed from the
+    //    identifier, never taken from the record or the caller, and the record must agree. Not reachable
+    //    by the check: every record this service writes agrees with itself, and the removal below derives
+    //    the path again from the identifier, so a forged record could at most block, never redirect.
+    let expected = tr::outbox(&p.recovery_point_uuid)?;
+    let path_matches = expected.to_string_lossy() == p.outbox;
+    proofs["outbox_path_recomputed_from_identifier"] = json!(path_matches);
+    if !path_matches {
+        blockers.push("the recorded outbox path is not the path this service derives for the point; nothing under it is touched".into());
+    }
+    let rootfs = expected.join(crate::recovery_point::ROOTFS);
+    match tr::regular_file(&rootfs) {
+        Err(e) => {
+            proofs["archive"] = json!({"present": false, "error": e.to_string()});
+            blockers.push(format!("the archive is not a regular file ({e})"));
+        }
+        Ok(None) => {
+            proofs["archive"] = json!({"present": false});
+            blockers.push("the archive is absent: a point whose archive is already gone is an inconsistency to investigate, not something to collect".into());
+        }
+        Ok(Some(size)) => {
+            proofs["archive"] = json!({"present": true, "bytes": size, "bytes_match_record": size == p.rootfs_bytes as u64});
+            if size != p.rootfs_bytes as u64 {
+                blockers.push(format!("the archive is {size} bytes, not the {} its record binds", p.rootfs_bytes));
+            } else if hash {
+                let digest = mg::sha256(&rootfs)?;
+                proofs["archive"]["sha256_rehashed"] = json!(digest);
+                proofs["archive"]["sha256_matches_record"] = json!(digest == p.rootfs_sha256);
+                if digest != p.rootfs_sha256 {
+                    blockers.push("the archive no longer hashes to the digest its record binds; it is kept as evidence, never collected".into());
+                }
+            }
+        }
+    }
+    Ok(Candidate {
+        kind: "recovery_point",
+        key: p.recovery_point_uuid.clone(),
+        universe_uuid: p.universe_uuid.clone(),
+        class: Some(CLASS_RECOVERY_POINT_AFTER_RETENTION),
+        class_number: Some(5),
+        proofs,
+        blockers,
+        effect: json!({"proposed": "write a retained manifest and mark the point collected in one transaction, then remove the archive and its directory; the manifest's content survives in the journal"}),
+    })
+}
+
+/// Holds for the reservation and claim classes, added after their own classification: an investigation
+/// hold blocks the terminal transition and the abort alike; an evidence hold blocks only a reclaim, which is
+/// decided at apply time by the request, so a plan records the hold and lets the apply refuse the reclaim.
+fn add_hold_blockers(db: &Connection, c: &mut Candidate, reclaims_runtime: bool) {
+    match rt::holds(db, &c.universe_uuid) {
+        Err(e) => {
+            c.proofs["holds"] = json!({"readable": false, "error": e.to_string()});
+            c.blockers.push(format!("the hold state could not be read ({e}); an unknown hold is a hold"));
+        }
+        Ok(held) => {
+            c.proofs["holds"] = json!({"readable": true, "in_force": held.iter().map(rt::Hold::view).collect::<Vec<_>>()});
+            if let Some(why) = rt::hold_blocks(&held, false, reclaims_runtime) {
+                c.blockers.push(why);
+            }
+        }
+    }
+}
+
 fn observe_names(all: &[Value], names: &[String]) -> Result<Vec<Value>, Error> {
     let present: Vec<&str> = names
         .iter()
@@ -747,17 +964,31 @@ fn plan(db: &Connection, limits: &Limits, scope: Option<&Vec<String>>) -> Result
     if let Some(scope) = scope {
         claims.retain(|k| scope.contains(&k["universe_uuid"].as_str().unwrap_or("").to_string()));
     }
-    // One bound for the whole run, shared so that neither kind starves the other: each is guaranteed half
-    // of it and may use whatever the other leaves. A host with many dead reservations must not hide the
-    // failed restore claim that is holding processes and disk right now.
-    let half = limits.max_candidates.div_ceil(2);
-    let claims_budget = limits.max_candidates.saturating_sub(open.len().min(half));
-    let examined_claims: Vec<&Value> = claims.iter().take(claims_budget).collect();
+    let mut points = prepared_points(db)?;
+    if let Some(scope) = scope {
+        points.retain(|p| scope.contains(&p.universe_uuid));
+    }
+    // One bound for the whole run, shared so that no kind starves another: each is guaranteed a third of it
+    // and may use whatever the others leave. A host with many dead reservations must not hide the failed
+    // restore claim that is holding processes and disk right now, nor the archives filling the disk.
+    let third = limits.max_candidates.div_ceil(3);
+    let claims_take = claims.len().min(third);
+    let points_take = points.len().min(third);
     let examined_reservations: Vec<&&(String, Reservation)> = open
         .iter()
-        .take(limits.max_candidates.saturating_sub(examined_claims.len()))
+        .take(limits.max_candidates.saturating_sub(claims_take + points_take))
         .collect();
-    let truncated = open.len() > examined_reservations.len() || claims.len() > examined_claims.len();
+    let examined_claims: Vec<&Value> = claims
+        .iter()
+        .take(limits.max_candidates.saturating_sub(examined_reservations.len() + points_take))
+        .collect();
+    let examined_points: Vec<&Point> = points
+        .iter()
+        .take(limits.max_candidates.saturating_sub(examined_reservations.len() + examined_claims.len()))
+        .collect();
+    let truncated = open.len() > examined_reservations.len()
+        || claims.len() > examined_claims.len()
+        || points.len() > examined_points.len();
 
     let mut names: Vec<String> = examined_reservations.iter().map(|(u, _)| format!("podmesh-{u}")).collect();
     names.extend(
@@ -772,11 +1003,18 @@ fn plan(db: &Connection, limits: &Limits, scope: Option<&Vec<String>>) -> Result
     let mut candidates = vec![];
     for (uuid, r) in &examined_reservations {
         let observed = named(&inspected, &format!("podmesh-{uuid}"));
-        candidates.push(classify_reservation(db, uuid, r, observed, &all, &host)?);
+        let mut c = classify_reservation(db, uuid, r, observed, &all, &host)?;
+        add_hold_blockers(db, &mut c, false);
+        candidates.push(c);
     }
     for k in &examined_claims {
         let observed = named(&inspected, &format!("podmesh-{}", k["universe_uuid"].as_str().unwrap_or("")));
-        candidates.push(classify_claim(db, k, observed)?);
+        let mut c = classify_claim(db, k, observed)?;
+        add_hold_blockers(db, &mut c, false);
+        candidates.push(c);
+    }
+    for p in &examined_points {
+        candidates.push(classify_point(db, p, false)?);
     }
     let collectable = candidates.iter().filter(|c| c.collectable()).count();
     let mut by_class = json!({});
@@ -787,12 +1025,13 @@ fn plan(db: &Connection, limits: &Limits, scope: Option<&Vec<String>>) -> Result
     Ok(json!({
         "host_uuid": host,
         "scope": match scope {
-            None => json!({"universes": "every reservation and unresolved restore claim on this host, up to the bound"}),
+            None => json!({"universes": "every reservation, unresolved restore claim and prepared recovery point on this host, up to the bound"}),
             Some(s) => json!({"universe_uuids": s}),
         },
         "limits": {"max_candidates": limits.max_candidates, "reservations_open": open.len(),
             "reservations_examined": examined_reservations.len(), "unresolved_restore_claims": claims.len(),
-            "restore_claims_examined": examined_claims.len(), "truncated": truncated,
+            "restore_claims_examined": examined_claims.len(), "prepared_recovery_points": points.len(),
+            "recovery_points_examined": examined_points.len(), "truncated": truncated,
             "note": "a settled reservation (released, abandoned, transferred, collected) is a finished record, not a decision owed to someone: it is counted, never examined. Only the number of candidates is bounded: the counts of settled rows, and the size of one candidate's proofs, are not"},
         "settled_reservations": {"count": settled.len(), "states": settled},
         "candidates": candidates.iter().map(Candidate::view).collect::<Vec<_>>(),
@@ -1115,6 +1354,7 @@ fn apply(db: &Connection, id: &str, reference: &str, limits: &Limits, request: &
     let mut reserved_reclaims = 0usize;
     let mut performed_reclaims = 0usize;
     let mut signalled = 0usize;
+    let mut bytes_removed = 0usize;
     let mut stopped: Option<Value> = None;
     for t in targets {
         // An effect this very operation already committed is recovered, never repeated: a run interrupted
@@ -1122,13 +1362,20 @@ fn apply(db: &Connection, id: &str, reference: &str, limits: &Limits, request: &
         let progress = recorded_effect(db, id, t.key())?;
         let done_before = progress.is_some() || already_applied(db, id, t)?;
         if done_before {
-            let mut entry = match (progress, t.class == CLASS_FAILED_RESTORE_CLAIM) {
-                (Some(p), false) if p["verification"] != "pending" => p,
-                (_, false) => verify_collection(db, t, None, None, &Value::Null),
-                (Some(p), true) => p,
-                (None, true) => json!({"action": "aborted_failed_restore", "universe_uuid": t.universe_uuid,
-                    "authorization_id": t.authorization_id, "class": t.class,
-                    "note": "recovered from the claim this operation closed; the collector's own progress row was lost"}),
+            let mut entry = if t.class == CLASS_RECOVERY_POINT_AFTER_RETENTION {
+                // The retained manifest is committed; the removal may not have happened. Finishing it is
+                // completing the recorded effect, not repeating one: what is removed is what the journal
+                // already says is collected.
+                finish_point_removal(db, id, t)?
+            } else {
+                match (progress, t.class == CLASS_FAILED_RESTORE_CLAIM) {
+                    (Some(p), false) if p["verification"] != "pending" => p,
+                    (_, false) => verify_collection(db, t, None, None, &Value::Null),
+                    (Some(p), true) => p,
+                    (None, true) => json!({"action": "aborted_failed_restore", "universe_uuid": t.universe_uuid,
+                        "authorization_id": t.authorization_id, "class": t.class,
+                        "note": "recovered from the claim this operation closed; the collector's own progress row was lost"}),
+                }
             };
             entry["applied"] = json!(true);
             entry["recovered"] = json!(true);
@@ -1186,6 +1433,44 @@ fn apply(db: &Connection, id: &str, reference: &str, limits: &Limits, request: &
         // it: the abort observes the processes itself, so what this run predicted cannot bound what it may
         // do. Every attempt authorized to signal costs one unit, whether it ends up signalling or not.
         let may_signal = reclaim && t.class == CLASS_FAILED_RESTORE_CLAIM;
+        // The holds, read again right now for the effect this request actually asks for: an evidence hold
+        // that a plan could only record becomes a refusal here once the request says it may reclaim.
+        //
+        // For class 5 this is defence in depth: the fresh classification above already carries the hold as
+        // a blocker, and removing this guard leaves the retention check green -- which is why that is
+        // written here. For class 3 with `reclaim_processes` it is THE rule (an evidence hold blocks a
+        // runtime reclaim and nothing upstream knows what the request asked), and the single-host check
+        // cannot reach it: `retention::hold_blocks` is unit-tested for that case instead.
+        let hold_refusal = match rt::holds(db, &t.universe_uuid) {
+            Err(e) => Some(format!("the hold state could not be read ({e}); an unknown hold is a hold")),
+            Ok(held) => rt::hold_blocks(&held, t.class == CLASS_RECOVERY_POINT_AFTER_RETENTION, may_signal),
+        };
+        if let Some(why) = hold_refusal {
+            let e = failure(format!("A hold blocks this effect: {why}"), json!({"candidate": t.view()}));
+            if effects == 0 {
+                return Err(failure(format!("Collection refused: {e}"), json!({"candidate": t.view(), "applied": results})));
+            }
+            results.push(json!({"candidate": t.view(), "applied": false, "refused": e.to_string()}));
+            stopped = Some(json!({"candidate": t.view(), "reason": e.to_string()}));
+            break;
+        }
+        // The bytes bound, reserved before the removal like the reclaim budget: an archive larger than what
+        // the run has left is not removed, and the run says so rather than exceeding its own number.
+        if t.class == CLASS_RECOVERY_POINT_AFTER_RETENTION {
+            let size = candidate.proofs["archive"]["bytes"].as_u64().unwrap_or(u64::MAX) as usize;
+            if bytes_removed.saturating_add(size) > limits.max_bytes {
+                stopped = Some(json!({"candidate": t.view(), "reason": format!(
+                    "removing this {size}-byte archive would exceed the run's max_bytes of {} ({bytes_removed} already removed); it was not acted on",
+                    limits.max_bytes)}));
+                if effects == 0 {
+                    return Err(failure(
+                        format!("Collection refused: the archive of {} is {size} bytes and the run's max_bytes is {}; nothing was collected", t.key(), limits.max_bytes),
+                        json!({"candidate": t.view(), "limits": limits.view(Mode::Apply)}),
+                    ));
+                }
+                break;
+            }
+        }
         if may_signal && reserved_reclaims >= limits.max_runtime_reclaims {
             stopped = Some(json!({"candidate": t.view(), "reason": format!(
                 "the run's allowance of {} runtime reclaim(s) is spent; this candidate was not acted on, because a delegated abort authorized to signal must have budget reserved before it is called",
@@ -1197,12 +1482,15 @@ fn apply(db: &Connection, id: &str, reference: &str, limits: &Limits, request: &
         }
         let outcome = if t.class == CLASS_FAILED_RESTORE_CLAIM {
             abort_failed_restore(db, id, reference, t, &candidate, reclaim)
+        } else if t.class == CLASS_RECOVERY_POINT_AFTER_RETENTION {
+            collect_point(db, id, t, &candidate)
         } else {
             collect_reservation(db, id, reference, t, &candidate)
         };
         match outcome {
             Ok(mut done) => {
                 effects += 1;
+                bytes_removed += done["bytes_removed"].as_u64().unwrap_or(0) as usize;
                 if done["reclaim_performed"] == true {
                     performed_reclaims += 1;
                 }
@@ -1256,6 +1544,7 @@ fn apply(db: &Connection, id: &str, reference: &str, limits: &Limits, request: &
         "runtime_reclaims_reserved": reserved_reclaims,
         "runtime_reclaims_performed": performed_reclaims,
         "processes_signalled": signalled,
+        "bytes_removed": bytes_removed,
         "verified": unverified.is_empty(),
         "unverified_effects": unverified,
         "stopped_before_the_rest": stopped,
@@ -1263,9 +1552,124 @@ fn apply(db: &Connection, id: &str, reference: &str, limits: &Limits, request: &
     }))
 }
 
+/// What the removal must leave: nothing at the point's outbox path. Read from outside the journal.
+fn point_removal_verdict(dir: &std::path::Path) -> (bool, Vec<String>) {
+    let mut blockers = vec![];
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => blockers.push(format!("the outbox directory could not be observed after the removal: {e}")),
+        Ok(_) => blockers.push("the outbox directory is still present after the removal".into()),
+    }
+    (blockers.is_empty(), blockers)
+}
+/// Removes what the retained manifest already covers: the archive, the manifest file, the directory. Bounded
+/// to the point's own directory, which is recomputed from its identifier; nothing is traversed.
+fn remove_point_files(point: &str) -> Result<u64, Error> {
+    let dir = tr::outbox(point)?;
+    let mut removed = 0u64;
+    for name in [crate::recovery_point::ROOTFS, crate::recovery_point::MANIFEST, "rootfs.tar.partial"] {
+        let path = dir.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+            Ok(m) if m.is_file() => {
+                removed += m.len();
+                std::fs::remove_file(&path)?;
+            }
+            Ok(_) => return Err(format!("{} is not a regular file; nothing under the directory is removed", path.display()).into()),
+        }
+    }
+    match std::fs::remove_dir(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("the point's directory could not be removed ({e}); anything else it holds was not written by this service").into()),
+    }
+    Ok(removed)
+}
+/// The class 5 effect. The retained manifest and the terminal state are committed together BEFORE any byte
+/// is removed, so that a crash between the two leaves a journal that already says what was collected and a
+/// retry that finishes the removal rather than repeating a decision. The ORDER is not reachable by the
+/// check -- it simulates the crash from a copy of the files, which passes whichever side of the commit the
+/// removal sits on -- and is stated here as the contract's own requirement rather than a tested one.
+fn collect_point(db: &Connection, id: &str, t: &Target, candidate: &Candidate) -> Result<Value, Error> {
+    let p = one_point(db, &t.recovery_point_uuid)?.ok_or("The point vanished between its proof and its effect")?;
+    let dir = tr::outbox(&p.recovery_point_uuid)?;
+    let manifest_bytes = std::fs::read(dir.join(crate::recovery_point::MANIFEST))?;
+    let manifest_digest = mg::sha256_bytes(&manifest_bytes)?;
+    if manifest_digest != p.manifest_sha256 {
+        return Err(failure(
+            "The manifest on disk does not hash to the digest its record binds; it is kept as evidence and nothing was collected",
+            json!({"candidate": t.view()}),
+        ));
+    }
+    let manifest_text = String::from_utf8(manifest_bytes)?;
+    let tx = db.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO recovery_point_retained VALUES(?1,?2,?3,'outbox',?4,?5,?6,?7,?8,'collected',?9,?10,?11)",
+        params![
+            p.recovery_point_uuid, p.universe_uuid, p.generation, manifest_text, p.manifest_sha256, p.rootfs_sha256,
+            p.rootfs_bytes, p.operation_id, crate::now() as i64, id, candidate.proofs["retention"].to_string()
+        ],
+    )?;
+    tx.execute("UPDATE recovery_points SET state='collected' WHERE recovery_point_uuid=?1", [&p.recovery_point_uuid])?;
+    record_effect(&tx, id, t, &json!({"action": "collected_recovery_point", "class": t.class, "universe_uuid": t.universe_uuid,
+        "recovery_point_uuid": t.recovery_point_uuid, "verification": "pending"}))?;
+    tx.commit()?;
+    let removed = remove_point_files(&p.recovery_point_uuid)?;
+    let (verified, blockers) = point_removal_verdict(&dir);
+    let done = json!({
+        "action": "collected_recovery_point", "class": t.class, "universe_uuid": t.universe_uuid,
+        "recovery_point_uuid": t.recovery_point_uuid, "generation": p.generation,
+        "retained_manifest": {"manifest_sha256": p.manifest_sha256, "rootfs_sha256": p.rootfs_sha256, "rootfs_bytes": p.rootfs_bytes,
+            "prepare_operation_id": p.operation_id, "terminal_state": "collected", "collecting_operation_id": id},
+        "bytes_removed": removed, "verified": verified, "verification_blockers": blockers,
+        "verification": "recorded",
+    });
+    record_effect(db, id, t, &done)?;
+    Ok(done)
+}
+/// A recovered class 5 effect: the journal already says the point is collected under this operation; what
+/// may be left is the removal itself, which is finished here and verified from outside.
+fn finish_point_removal(db: &Connection, id: &str, t: &Target) -> Result<Value, Error> {
+    let removed = remove_point_files(&t.recovery_point_uuid)?;
+    let dir = tr::outbox(&t.recovery_point_uuid)?;
+    let (verified, blockers) = point_removal_verdict(&dir);
+    let done = json!({
+        "action": "collected_recovery_point", "class": t.class, "universe_uuid": t.universe_uuid,
+        "recovery_point_uuid": t.recovery_point_uuid, "bytes_removed": removed,
+        "verified": verified, "verification_blockers": blockers, "verification": "recorded",
+        "note": "the retained manifest was already committed by this operation; the removal was finished, not repeated",
+    });
+    record_effect(db, id, t, &done)?;
+    Ok(done)
+}
+
 /// The fresh classification of one named candidate, immediately before its effect.
 fn fresh(db: &Connection, t: &Target, host: &str) -> Result<Result<Candidate, Error>, Error> {
     let uuid = t.universe_uuid.as_str();
+    if t.class == CLASS_RECOVERY_POINT_AFTER_RETENTION {
+        let Some(p) = one_point(db, &t.recovery_point_uuid)? else {
+            return Ok(Err(failure(
+                format!("No recovery point {} is recorded on this host", t.recovery_point_uuid),
+                json!({"candidate": t.view()}),
+            )));
+        };
+        if p.universe_uuid != uuid {
+            return Ok(Err(failure("The recovery point belongs to another universe", json!({"candidate": t.view()}))));
+        }
+        let candidate = classify_point(db, &p, true)?;
+        if !candidate.blockers.is_empty() {
+            return Ok(Err(failure(
+                format!(
+                    "The proofs repeated immediately before the effect no longer hold for {}: {}",
+                    t.key(),
+                    candidate.blockers.join("; ")
+                ),
+                json!({"candidate": t.view(), "blockers": candidate.blockers, "proofs": candidate.proofs}),
+            )));
+        }
+        return Ok(Ok(candidate));
+    }
     let name = format!("podmesh-{uuid}");
     let observed = lc::inspect(&name)?;
     let candidate = if t.class == CLASS_FAILED_RESTORE_CLAIM {
@@ -1337,7 +1741,7 @@ fn replay(db: &Connection, id: &str, record: Option<String>) -> Result<Value, Er
                 v.iter()
                     .map(|r| {
                         if r["universe_uuid"].is_string() {
-                            json!({"class": r["class"], "universe_uuid": r["universe_uuid"]})
+                            json!({"class": r["class"], "universe_uuid": r["universe_uuid"], "recovery_point_uuid": r["recovery_point_uuid"]})
                         } else {
                             r["candidate"].clone()
                         }
@@ -1356,6 +1760,15 @@ fn replay(db: &Connection, id: &str, record: Option<String>) -> Result<Value, Er
     };
     for k in keys {
         let Some(uuid) = k["universe_uuid"].as_str() else { continue };
+        if k["class"].as_str() == Some(CLASS_RECOVERY_POINT_AFTER_RETENTION) {
+            let point = k["recovery_point_uuid"].as_str().or(k["key"].as_str()).unwrap_or("");
+            let state: Option<String> = db
+                .query_row("SELECT state FROM recovery_points WHERE recovery_point_uuid=?1", [point], |r| r.get(0))
+                .optional()?;
+            let present = tr::outbox(point).ok().map(|d| d.exists());
+            current.push(json!({"universe_uuid": uuid, "recovery_point_uuid": point, "state": state, "outbox_present": present}));
+            continue;
+        }
         let reservation = mg::reservation(db, uuid)?.map(|r| json!({"state": r.state, "updated_at": r.updated_at}));
         current.push(
             json!({"universe_uuid": uuid, "reservation": reservation, "tombstone": mg::tombstone(db, uuid)?,
@@ -1434,7 +1847,7 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
                 "policy_version": POLICY_VERSION,
                 "started_at": started, "finished_at": finished,
                 "authority": AUTHORITY,
-                "scope": "docs/GARBAGE-COLLECTION.md classes 1 and 2 (terminal reservations, with tombstones) and class 3 by delegation to migration_restore_abort; no artifact collection, no retention interval, no timer",
+                "scope": "docs/GARBAGE-COLLECTION.md classes 1 and 2 (terminal reservations, with tombstones), class 3 by delegation to migration_restore_abort, and class 5 for recovery point archives after a declared retention with both hold scopes; checkpoint artifacts are not collected; no timer",
             });
             if let (Some(target), Some(source)) = (record.as_object_mut(), body.as_object()) {
                 for (k, v) in source {

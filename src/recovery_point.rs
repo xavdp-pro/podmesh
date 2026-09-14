@@ -134,9 +134,19 @@ fn by_operation(db: &Connection, id: &str) -> Result<Option<Value>, Error> {
         )
         .optional()?;
     let Some((point, outbox)) = row else { return Ok(None) };
+    // A collected point's archive is gone; its manifest survives in the retained record, and the replay
+    // serves that rather than failing on a file the collector removed.
+    let retained: Option<String> = db
+        .query_row("SELECT manifest FROM recovery_point_retained WHERE recovery_point_uuid=?1", [&point], |r| r.get(0))
+        .optional()?;
+    if let Some(text) = retained {
+        let manifest: Value = serde_json::from_str(&text)?;
+        return Ok(Some(json!({"recovery_point_uuid": point, "outbox": outbox, "manifest": manifest, "replayed": true,
+            "collected": true, "note": "the archive was collected after its declared retention; this manifest is the retained one"})));
+    }
     let manifest_path = Path::new(&outbox).join(MANIFEST);
     let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
-    Ok(Some(json!({"recovery_point_uuid": point, "outbox": outbox, "manifest": manifest, "replayed": true})))
+    Ok(Some(json!({"recovery_point_uuid": point, "outbox": outbox, "manifest": manifest, "replayed": true, "collected": false})))
 }
 
 /// What the manifest says about the stop, read from the container and not from a journal.
@@ -160,6 +170,9 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
     lc::token(uuid)?;
     lc::ensure_schema(db)?;
     ensure_schema(db)?;
+    // The retained-manifest table belongs to the collector's retention module; a replay of a
+    // collected point reads it, so it is prepared here too rather than assumed.
+    crate::retention::ensure_schema(db)?;
     if operation == "recovery_point_status" {
         let points: Vec<Value> = {
             let mut s = db.prepare(
