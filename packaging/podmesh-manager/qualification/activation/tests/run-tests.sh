@@ -260,7 +260,7 @@ strand_refuse() {
   local label=$1 filter=$2 expected=$3
   if build_strand "$filter"; then echo "accepted $label" >&2; exit 1; fi
   report_says "$work/strand-report.json" '.status=="FAIL"' "$label did not produce a verdict"
-  grep -q "$expected" <(jq -r '.failures[]?' "$work/strand-report.json") || { echo "$label was refused for another reason: $(jq -c '.failures' "$work/strand-report.json")" >&2; exit 1; }
+  grep -q "$expected" <(jq -r '(.failures[]?), (.error // empty)' "$work/strand-report.json") || { echo "$label was refused for another reason: $(jq -c '.failures' "$work/strand-report.json")" >&2; exit 1; }
 }
 strand_refuse 'no receiver bears the nonce'        '.nonce_commitment="sha256:9999999999999999999999999999999999999999999999999999999999999999" | .joinable=true' 'no receiver-side request bears this wire nonce'
 strand_refuse 'the receiver authenticated another sender' '.peer_commitment="sha256:aaaa999999999999999999999999999999999999999999999999999999999999"' 'did not authenticate the sending host as its peer'
@@ -282,14 +282,14 @@ strand_refuse 'the reply was truncated'             '.reply_frame_bytes=600' 'di
 strand_three() {   # $1 applied to lab-a, $2 to lab-b's served row, $3 to lab-c
   jq ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges += [$sent] | .inspection.audit_event_count=([.exchanges[].row_count]|add) | .inspection.imported_operation_commitments=[\"$OP\"]${1:+ | $1}" "$work/lab-a-post-cleanup.json" > "$work/sa.json"; sidecar "$work/sa.json"
   jq ".exchanges += [$served${2:+ | $2}] | .inspection.audit_event_count=([.exchanges[].row_count]|add) | .inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-b-post-cleanup.json" > "$work/sb.json"; sidecar "$work/sb.json"
-  jq ".inspection.imported_operation_commitments=[\"$OP\"]${3:+ | $3}" "$work/lab-c-post-cleanup.json" > "$work/sc.json"; sidecar "$work/sc.json"
+  jq ".inspection.imported_operation_commitments=[\"$OP\"]${3:+ | $3} | .inspection.audit_event_count=([.exchanges[].row_count]|add)" "$work/lab-c-post-cleanup.json" > "$work/sc.json"; sidecar "$work/sc.json"
   "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work"/*-converged.json --cleanup "$work/sa.json" "$work/sb.json" "$work/sc.json" > "$work/strand-report.json" 2>"$work/strand-err.txt"
 }
 three_refuse() {
   local label=$1 fa=$2 fb=$3 fc=$4 expected=$5
   if strand_three "$fa" "$fb" "$fc"; then echo "accepted $label" >&2; exit 1; fi
   report_says "$work/strand-report.json" '.status=="FAIL"' "$label did not produce a verdict"
-  grep -q "$expected" <(jq -r '.failures[]?' "$work/strand-report.json") || { echo "$label was refused for another reason: $(jq -c '.failures' "$work/strand-report.json")" >&2; exit 1; }
+  grep -q "$expected" <(jq -r '(.failures[]?), (.error // empty)' "$work/strand-report.json") || { echo "$label was refused for another reason: $(jq -c '.failures' "$work/strand-report.json")" >&2; exit 1; }
 }
 # Condition 2's uniqueness: two hosts claiming to have served one wire nonce means neither
 # can be believed, and the attempt is unaccounted rather than accounted twice.
@@ -321,7 +321,7 @@ reject_error 'two attempts sharing one wire nonce' ".inspection.incomplete_attem
 reject_error 'attempts reported with no audit events' ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .inspection.audit_event_count=0" converged 'no audit events to derive them from'
 three_refuse 'the attempt names another operation' '.inspection.incomplete_attempts[0].operation_commitment="sha256:ffff999999999999999999999999999999999999999999999999999999999999"' '' '' 'name different operations'
 three_refuse 'an import committed without an accepted outcome' '' '.outcomes=["refused"]' '' 'import without an accepted outcome'
-three_refuse 'a refusal recorded beside an accepted outcome' '' '.phases_reached += ["inbound_refusal_recorded"] | .row_count=5' '' 'refusal and an accepted outcome at once'
+three_refuse 'a refusal recorded beside an accepted outcome' '' '.phases_reached=["inbound_request_observed","inbound_refusal_recorded","inbound_reply_prepared","inbound_reply_write_observed"] | .local_receipt_commitment=null' '' 'refusal and an accepted outcome at once'
 
 # Exchanges must account for the whole audit history: every audit row belongs to exactly
 # one folded exchange. Without this a host publishes an empty exchange list beside a
@@ -330,6 +330,32 @@ three_refuse 'exchanges that do not account for the audit history' '.inspection.
 # And the framing overhead is the protocol constant, not whatever the campaign agrees on:
 # deriving it from the rows under test made the per-row comparison unable to fail.
 three_refuse 'frames not carrying the protocol overhead' '' '.request_frame_bytes=2827 | .request_announced_body_bytes=2731' '' 'do not carry the protocol framing overhead'
+
+# The forgeries a second independent review demonstrated. Finding 3 survived the first
+# correction: refusing "attempts with zero audit events" was defeated by raising that one
+# integer, so a host still listed a brand-new attempt in its own baseline and retired it as
+# pre-existing debt, PASS with no failures.
+three_refuse 'an attempt conjured into a capture with no row of its own' '.inspection.incomplete_attempts[0].nonce_commitment="sha256:aaaa111111111111111111111111111111111111111111111111111111111111"' '' '' 'no exchange row in its own capture'
+# row_count was bounded from below only, so a host could absorb a competing receiver row
+# into another row's count and keep the collapsed total equal to its reported audit count.
+three_refuse 'a folded row absorbing more rows than a nonce can have' '' '.row_count=8' '' 'cannot collapse more than four audit rows'
+# Condition 6 rests on this list, and it was bound to nothing the same host publishes.
+three_refuse 'more imported operations than receipts to hold them' '' '' '.inspection.imported_operation_commitments=["sha256:bbbb111111111111111111111111111111111111111111111111111111111111","sha256:cccc111111111111111111111111111111111111111111111111111111111111","sha256:dddd111111111111111111111111111111111111111111111111111111111111","sha256:eeee111111111111111111111111111111111111111111111111111111111111"]' 'more imported operations than receipts'
+three_refuse 'a repeated imported operation' '' '' '.inspection.imported_operation_commitments=["sha256:bbbb111111111111111111111111111111111111111111111111111111111111","sha256:bbbb111111111111111111111111111111111111111111111111111111111111"]' 'repeats an operation'
+# The campaign-wide reply framing check is the only one that reaches a row no attempt joins.
+three_refuse 'a reply frame not carrying the protocol overhead' '' '' '.exchanges[0].reply_frame_bytes=999' 'reply frames do not carry the protocol framing overhead'
+# An empty reply body satisfied "completely written" arithmetically.
+three_refuse 'an empty reply body counted as written' '' '.reply_announced_body_bytes=0 | .reply_frame_bytes=4' '' 'did not completely write the reply it announced'
+
+# The salted drop-in digest closes a confirmation oracle for the peer address pair, and
+# nothing exercised the salted path: the suite called validate-dropin.py without a salt, so
+# reverting the salting left both suites green.
+saltfile="$work/salt.bin"; head -c 64 /dev/urandom > "$saltfile"
+salted=$(python3 "$root/validate-dropin.py" --dropin "$work/good.conf" --salt-file "$saltfile" | jq -r .sha256)
+bare=$(sha256sum -- "$work/good.conf" | awk '{print $1}')
+expect=$( { cat "$saltfile"; printf '\000dropin\000'; cat "$work/good.conf"; } | sha256sum | awk '{print $1}')
+[ "$salted" = "$expect" ] || { echo 'the validator and the collector disagree on the salted drop-in commitment' >&2; exit 1; }
+[ "$salted" != "$bare" ] || { echo 'the published drop-in digest is the raw digest, which confirms the peer address pair' >&2; exit 1; }
 
 printf '%s\n' 'PASS: strand accounting — one stranded attempt joined to its receiver, and eleven conditions each refused on its own.'
 

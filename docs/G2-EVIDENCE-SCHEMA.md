@@ -37,7 +37,8 @@ and 8 are not evaluable at all.**
 
 One line caused it. The projection then at `capture-host.sh:137` reduced the canonical
 inspection to nine keys. *That citation is now stale by this lot's own hand: commit
-`eb0ccd3` moved the projection to `capture-host.sh:197` and widened it to sixteen keys.
+`eb0ccd3` moved the projection (to line 192 there, `:197` at the current state) and
+widened it to sixteen keys.
 The line is kept in the past tense because this paragraph describes why the change was
 needed, and a reader following `:137` today lands in an unrelated systemd assertion.*
 
@@ -214,10 +215,13 @@ Every incomplete attempt in a real store is the exact shape the frozen Stage D c
 describes, and the count the withdrawn gate demanded to be zero is 17. Condition 4 holds
 on this store with nothing to explain.
 
-The collector's own helpers were then replayed verbatim over that output: 315
-commitments in one batch, 67 folded exchange rows, and both the projected inspection and
-the folded rows **accepted by the comparator's validators**. No raw identifier reached
-the published rows.
+The collector's own helpers were then replayed verbatim over that output, and **re-run at
+each later state of the branch** rather than left describing a chain from several commits
+ago. At the current state: 321 commitments in one batch, 67 folded exchange rows whose
+largest collapses four audit rows and which together collapse **165 rows against a
+reported 165**, 17 published attempt records, and 10 imported operations against 13
+receipts. Both the projected inspection and the folded rows are **accepted by the
+comparator's validators**, and no raw identifier reaches the published rows.
 
 What this does not do: it covers one host, so no cross-host join was exercised against
 real data — the join is exercised only by the constructed strand in the suite. The other

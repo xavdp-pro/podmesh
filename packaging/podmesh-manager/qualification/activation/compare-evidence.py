@@ -117,6 +117,13 @@ def validate_inspection(v, label):
     if len(set(nonces)) != len(nonces): raise ValueError(f"{label}: two incomplete attempts share one wire nonce")
     if not isinstance(v["imported_operation_commitments"],list): raise ValueError(f"{label}.imported_operation_commitments: must be a list")
     for i,c in enumerate(v["imported_operation_commitments"]): commit(c,f"{label}.imported_operation_commitments[{i}]")
+    # The collector derives this as the distinct wire operations among the receipts this
+    # replica holds, so it cannot exceed the receipt count. Unbounded, it is a free-text
+    # list on which condition 6 rests its "held with a receipt on every replica".
+    if len(v["imported_operation_commitments"]) > v["receipt_count"]:
+        raise ValueError(f"{label}: more imported operations than receipts to hold them")
+    if len(set(v["imported_operation_commitments"])) != len(v["imported_operation_commitments"]):
+        raise ValueError(f"{label}: imported_operation_commitments repeats an operation")
     # An incomplete attempt is derived from audit rows, so a store reporting attempts while
     # reporting no audit event at all is describing something it cannot have observed. This
     # is what stops a freshly started replica from listing attempts at the baseline capture
@@ -183,11 +190,27 @@ def validate(v,label):
         commit(x["commitment"],label)
     validate_inspection(v["inspection"],f"{label}.inspection")
     validate_exchanges(v["exchanges"],f"{label}.exchanges")
+    i=v["inspection"]
+    if i is not None and i["store_present"] and v["exchanges"] is None:
+        raise ValueError(f"{label}: a present store was inspected but no exchanges were published")
+    if i is not None and i["store_present"]:
+        # Applied to EVERY stage, not only post-cleanup. Checking it at post-cleanup alone
+        # left the baseline captures unexamined, and a baseline is exactly where a forger
+        # lists a brand-new attempt in order to retire it later as pre-existing debt.
+        collapsed=sum(r["row_count"] for r in (v["exchanges"] or []))
+        if collapsed != i["audit_event_count"]:
+            raise ValueError(f"{label}: the folded exchanges collapse {collapsed} audit rows but the store reports {i['audit_event_count']}")
+        # Every attempt a capture lists must be corroborated by that capture's own exchange
+        # rows. Without this, raising one integer is enough to conjure an attempt into a
+        # baseline: the count check above is satisfied by a single fabricated row, and this
+        # requires that row to be the attempt's own.
+        rows={r["nonce_commitment"] for r in (v["exchanges"] or [])}
+        for a in i["incomplete_attempts"]:
+            if a["nonce_commitment"] not in rows:
+                raise ValueError(f"{label}: an incomplete attempt has no exchange row in its own capture")
     # A capture that inspected a present store publishes exchanges; one that inspected an
     # absent store, or did not inspect at all, publishes none. An empty list and "no list"
     # are different claims and stay distinguishable.
-    if v["inspection"] is not None and v["inspection"]["store_present"] and v["exchanges"] is None:
-        raise ValueError(f"{label}: a present store was inspected but no exchanges were published")
     if (v["inspection"] is None or not v["inspection"]["store_present"]) and v["exchanges"] is not None:
         raise ValueError(f"{label}: exchanges published without an inspected present store")
     if v["graceful_shutdown"] is not None and v["graceful_shutdown"] != SHUTDOWN: raise ValueError(f"{label}.graceful_shutdown: invalid exact typed-shutdown proof")
@@ -226,6 +249,11 @@ def validate_exchanges(v, label):
         # The fold collapses rows; row_count says how many it collapsed, and a row claiming
         # more phases than rows collapsed did not come from this fold.
         if r["row_count"] < len(r["phases_reached"]): raise ValueError(f"{where}: more phases than collapsed rows")
+        # And bounded from ABOVE. A nonce carries at most the four inbound phases, so a row
+        # claiming to collapse more is absorbing audit history that belongs elsewhere --
+        # which is exactly how a host hides a competing receiver row while keeping the
+        # collapsed total equal to its reported audit count.
+        if r["row_count"] > 4: raise ValueError(f"{where}: a folded row cannot collapse more than four audit rows")
         for f in ("peer_commitment","operation_commitment","request_sha256_commitment","reply_sha256_commitment","local_receipt_commitment","remote_receipt_commitment"):
             if r[f] is not None: commit(r[f],f"{where}.{f}")
         for f in ("request_frame_bytes","reply_frame_bytes"): integer(r[f],f"{where}.{f}")
@@ -315,10 +343,9 @@ def account_attempts(bases, cleanups, convs):
     unaudited=sum(c["inspection"]["unaudited_import_receipt_count"] for c in cleanups if c["inspection"] and c["inspection"]["store_present"])
     if unaudited: failures.append(f"{unaudited} unaudited import receipts exist; no attempt can be accounted for while an import receipt has no audit")
 
-    # The framing overhead is not hard-coded. Every row carries both an announced body size
-    # and a frame size, so the campaign must simply agree with itself about the difference;
-    # a truncated or padded frame breaks that agreement without the comparator needing to
-    # know the protocol constant.
+    # Each row carries an announced body size and a frame size, and the difference must be
+    # the protocol's own framing constant. Deriving that constant from the campaign instead
+    # was a tautology: the row under test contributed to the set it was compared against.
     def overhead_of(frame, announced):
         d={r[frame]-r[announced] for c in cleanups if c["exchanges"]
            for r in c["exchanges"] if r[frame]>0 and r[announced] is not None}
@@ -331,21 +358,13 @@ def account_attempts(bases, cleanups, convs):
     # Every audit row belongs to exactly one folded exchange, so the rows collapsed must
     # account for the whole audit history the same capture reports. Without this a host can
     # publish an empty exchange list beside a non-zero audit count and nothing binds them.
-    for h,c in enumerate(cleanups):
-        i=c["inspection"]
-        if i is None or not i["store_present"]: continue
-        collapsed=sum(r["row_count"] for r in (c["exchanges"] or []))
-        if collapsed != i["audit_event_count"]:
-            failures.append(f"host {h}: the folded exchanges collapse {collapsed} audit rows but the store reports {i['audit_event_count']}")
+    # The collapsed-rows rule now lives in validate(), where it covers every stage.
 
     # Every folded exchange row in the campaign, indexed by nonce and by host.
     rows_by_nonce={}
     for host,c in enumerate(cleanups):
         for r in (c["exchanges"] or []):
             rows_by_nonce.setdefault(r["nonce_commitment"],[]).append((host,r))
-
-    converged_digests={c["inspection"]["logical_history_sha256"] for c in convs if c["inspection"] and c["inspection"]["store_present"]}
-    history_converged = len(converged_digests)==1 and len(converged_digests)>0
 
     accounted=[]; unaccounted=[]; debt=[]
     for host,(base,cleanup) in enumerate(zip(bases,cleanups)):
@@ -357,7 +376,7 @@ def account_attempts(bases, cleanups, convs):
                 # Pre-existing debt: retained and reported, never silently folded into a
                 # success claim, and never a reason to fail a new bounded campaign.
                 debt.append({"host":host,"attempt_commitment":a["attempt_commitment"],"last_phase":a["last_phase"]}); continue
-            why=classify(host,a,rows_by_nonce,cleanups,overhead,reply_overhead,history_converged)
+            why=classify(host,a,rows_by_nonce,cleanups,overhead,reply_overhead)
             if why is None: accounted.append({"host":host,"attempt_commitment":a["attempt_commitment"]})
             else:
                 unaccounted.append({"host":host,"attempt_commitment":a["attempt_commitment"],"reason":why})
@@ -368,7 +387,7 @@ def account_attempts(bases, cleanups, convs):
              "unaccounted_detail":unaccounted,
              "preexisting_detail":debt}, failures)
 
-def classify(host, attempt, rows_by_nonce, cleanups, overhead, reply_overhead, history_converged):
+def classify(host, attempt, rows_by_nonce, cleanups, overhead, reply_overhead):
     """None when the attempt is accounted for; otherwise the first condition it fails.
     Each condition is a separate refusal: there is no aggregate that compensates for a
     missing one."""
@@ -409,7 +428,7 @@ def classify(host, attempt, rows_by_nonce, cleanups, overhead, reply_overhead, h
     if sender["request_announced_body_bytes"] is None or recv["request_announced_body_bytes"] is None \
        or sender["request_announced_body_bytes"]!=recv["request_announced_body_bytes"]:
         return "the announced request size does not bind sender to receiver (condition 2)"
-    if overhead is None or recv["request_frame_bytes"] != recv["request_announced_body_bytes"]+overhead:
+    if recv["request_frame_bytes"] != recv["request_announced_body_bytes"]+overhead:
         return "the receiver did not record a complete request frame (conditions 2 and 3)"
     # Condition 3: a terminal, with a receipt.
     if TERMINAL_IMPORT not in recv["phases_reached"] and TERMINAL_REFUSAL not in recv["phases_reached"]:
@@ -432,7 +451,7 @@ def classify(host, attempt, rows_by_nonce, cleanups, overhead, reply_overhead, h
     # complete one, and an unbound reply satisfies it too.
     if recv["reply_sha256_commitment"] is None:
         return "the receiver's reply is not bound by a digest (condition 5)"
-    if reply_overhead is None or recv["reply_announced_body_bytes"] is None \
+    if recv["reply_announced_body_bytes"] is None or recv["reply_announced_body_bytes"] <= 0 \
        or recv["reply_frame_bytes"] != recv["reply_announced_body_bytes"]+reply_overhead:
         return "the receiver did not completely write the reply it announced (condition 5)"
     if attempt["last_phase"]!=SENDER_PREPARED:

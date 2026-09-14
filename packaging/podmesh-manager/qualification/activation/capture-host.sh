@@ -51,6 +51,7 @@ commitment_keys() {
                                         ["request-digest",.request_sha256],["reply-digest",.reply_sha256],
                                         ["receipt-digest",.local_receipt_sha256],["receipt-digest",.remote_receipt_sha256],
                                         ["receipt-operation-id",.local_receipt_operation_id],["receipt-operation-id",.remote_receipt_operation_id]]),
+      (.ordered_receipts | map([["receipt-operation-id", .operation_id], ["wire-operation-id", .wire_operation_id], ["receipt-digest", .sha256], ["replica-id", .source_replica_id]]) | add),
       (.unaudited_import_receipt_ids | map(["receipt-operation-id", .]))
     ] | add | map(select(.[1] != null)) | map(.[0] + "\t" + .[1]) | unique | .[]'
 }
