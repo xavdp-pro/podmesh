@@ -74,7 +74,8 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             declared_at INTEGER NOT NULL,
             operation_id TEXT NOT NULL,
             desired_standbys INTEGER NOT NULL DEFAULT 0,
-            eligible_hosts TEXT NOT NULL DEFAULT '[]');
+            eligible_hosts TEXT NOT NULL DEFAULT '[]',
+            authorization_ref TEXT NOT NULL DEFAULT '');
          CREATE TABLE IF NOT EXISTS activation_leases(
             universe_uuid TEXT PRIMARY KEY,
             holder_host_uuid TEXT NOT NULL,
@@ -95,7 +96,8 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
     // EXISTS does not add them. Both carry a default, so an existing policy keeps working and
     // simply declares no standby -- which is the truthful reading of a policy written before
     // the field existed.
-    for column in ["desired_standbys INTEGER NOT NULL DEFAULT 0", "eligible_hosts TEXT NOT NULL DEFAULT '[]'"] {
+    for column in ["desired_standbys INTEGER NOT NULL DEFAULT 0", "eligible_hosts TEXT NOT NULL DEFAULT '[]'",
+                   "authorization_ref TEXT NOT NULL DEFAULT ''"] {
         let name = column.split(' ').next().unwrap_or_default();
         let present: bool = db.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('activation_policy') WHERE name=?1",
@@ -120,12 +122,14 @@ pub struct Policy {
     /// The hosts the operator will accept as a placement. Empty means none has been named,
     /// which is recorded as an absence rather than read as "anywhere".
     pub eligible_hosts: Vec<String>,
+    /// Who decided this allocation, recorded verbatim. Provenance, never a credential.
+    pub authorization_ref: String,
 }
 
 pub fn policy(db: &Connection, uuid: &str) -> Result<Option<Policy>, Error> {
     Ok(db
         .query_row(
-            "SELECT lease_seconds,takeover_margin_seconds,desired_standbys,eligible_hosts FROM activation_policy WHERE universe_uuid=?1",
+            "SELECT lease_seconds,takeover_margin_seconds,desired_standbys,eligible_hosts,authorization_ref FROM activation_policy WHERE universe_uuid=?1",
             [uuid],
             |r| {
                 let hosts: String = r.get(3)?;
@@ -134,6 +138,7 @@ pub fn policy(db: &Connection, uuid: &str) -> Result<Option<Policy>, Error> {
                     takeover_margin_seconds: r.get::<_, i64>(1)? as u64,
                     desired_standbys: r.get::<_, i64>(2)? as u64,
                     eligible_hosts: serde_json::from_str(&hosts).unwrap_or_default(),
+                    authorization_ref: r.get(4)?,
                 })
             },
         )
@@ -226,6 +231,10 @@ fn view(db: &Connection, uuid: &str) -> Result<serde_json::Value, Error> {
         "live": held.as_ref().is_some_and(|l| l.expires_at > now),
         "desired_standbys": policy.as_ref().map(|p| p.desired_standbys),
         "eligible_hosts": policy.as_ref().map(|p| p.eligible_hosts.clone()),
+        // The allocation is a judgement made against criteria PodMesh cannot see. It records
+        // who made it and reports it back, and it models nothing about how they decided.
+        "allocation_decided_by": policy.as_ref().map(|p| p.authorization_ref.clone()),
+        "allocation_is_a_judgement": true,
         // Declared, never observed. PodMesh sees one host -- this one -- so it cannot say how
         // many standbys exist, and a number here would be a claim about hosts it has never
         // contacted. The count is what the operator asked for, and the placement is unverified
@@ -262,7 +271,13 @@ pub fn execute(db: &Connection, request: &serde_json::Value) -> Result<serde_jso
     }
     let id = lc::text(request, "operation_id")?;
     lc::token(id)?;
-    let _ = lc::text(request, "authorization_ref")?;
+    // How much a universe is allowed is a judgement -- the administrator weighs criteria
+    // PodMesh cannot see and would be wrong to model. What PodMesh owes that judgement is a
+    // record of WHO made it, kept verbatim beside the policy it produced. It is provenance
+    // and never a checked credential, exactly as PREPARE-A-HOST.md says of every
+    // authorization_ref: validating it and then discarding it, which is what this did until
+    // now, keeps the obligation and loses the only part worth keeping.
+    let reference = lc::text(request, "authorization_ref")?;
     let now = crate::now() as i64;
     let this_host = host_uuid(db)?;
 
@@ -300,13 +315,14 @@ pub fn execute(db: &Connection, request: &serde_json::Value) -> Result<serde_jso
                 .into());
             }
             db.execute(
-                "INSERT INTO activation_policy VALUES(?1,?2,?3,?4,?5,?6,?7)
+                "INSERT INTO activation_policy VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
                  ON CONFLICT(universe_uuid) DO UPDATE SET lease_seconds=excluded.lease_seconds,
                    takeover_margin_seconds=excluded.takeover_margin_seconds,
                    declared_at=excluded.declared_at, operation_id=excluded.operation_id,
-                   desired_standbys=excluded.desired_standbys, eligible_hosts=excluded.eligible_hosts",
+                   desired_standbys=excluded.desired_standbys, eligible_hosts=excluded.eligible_hosts,
+                   authorization_ref=excluded.authorization_ref",
                 params![uuid, lease_seconds as i64, margin as i64, now, id, standbys as i64,
-                        serde_json::to_string(&hosts)?],
+                        serde_json::to_string(&hosts)?, reference],
             )?;
             record(db, uuid, &this_host, 0, "policy_declared", id)?;
         }

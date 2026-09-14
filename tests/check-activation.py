@@ -109,6 +109,17 @@ assert declared['ok'], declared
 assert declared['data']['desired_standbys'] == 2, declared
 assert declared['data']['eligible_hosts'] == [h1, h2, h3], declared
 
+# How much a universe is allowed is a judgement made against criteria PodMesh cannot see.
+# What it owes that judgement is a record of who made it, kept verbatim.
+decided = api({'operation': 'activation_require', 'operation_id': str(uuid.uuid4()),
+               'universe_uuid': r, 'authorization_ref': 'cto-allocation-2026-09',
+               'lease_seconds': 60, 'takeover_margin_seconds': 10,
+               'desired_standbys': 2, 'eligible_hosts': [h1, h2, h3]})
+assert decided['ok'], decided
+assert decided['data']['allocation_decided_by'] == 'cto-allocation-2026-09', decided
+assert decided['data']['allocation_is_a_judgement'] is True, decided
+assert op('activation_status', r)['data']['allocation_decided_by'] == 'cto-allocation-2026-09'
+
 # PodMesh sees one host, so it must not claim a placement it cannot see.
 assert declared['data']['standbys_placed'] is None, declared
 assert declared['data']['placement_verified'] is False, declared

@@ -218,10 +218,23 @@ These are **facts and not a decision**. Nothing in PodMesh decides whether a sta
 that depends on what the universe needs and on whatever allowance the operator has granted it,
 neither of which PodMesh knows. An admission rule that guessed would be worse than none.
 
-**The allowance itself does not exist yet.** Credits per universe need a unit, a ledger and an
-authority that grants them, and PodMesh has none of the three. It is named here as the
-operator's decision rather than modelled, because a budget invented by the implementer is a
-budget nobody agreed to.
+**The allowance is a judgement, and it is meant to stay one.** An earlier draft of this
+section treated "credits" as a missing feature needing a unit, a ledger and an authority. The
+operator has corrected that: the word was an image. What it names is the administrator
+weighing their own criteria and deciding what a given container gets — **entirely subjective,
+and outside the system by design**.
+
+That changes what PodMesh owes it. Not a model: any unit it invented would be a budget nobody
+agreed to, and any admission rule built on one would refuse or permit on grounds the
+administrator never set. What it owes is **a record of who decided**, kept verbatim beside the
+policy that decision produced. `activation_require` already required an `authorization_ref`
+like every other operation, validated it, and threw it away — which keeps the obligation and
+loses the only part worth keeping. It is now stored and reported as `allocation_decided_by`,
+and every status answer says `allocation_is_a_judgement: true` so nothing downstream reads it
+as a computed figure.
+
+It is provenance and never a checked credential, exactly as `PREPARE-A-HOST.md:38` says of
+every `authorization_ref` in PodMesh.
 
 ## What PodMesh still has to gain
 
