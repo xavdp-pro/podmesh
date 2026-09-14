@@ -29,7 +29,9 @@ keys() {
 keys "$fixture" | jq -Rn '[inputs | {key:., value:("sha256:stub-" + (.|@base64))}] | from_entries' > "$work/commitments.json"
 commitments=$(cat "$work/commitments.json")
 
-fold() { jq --argjson commitments "$commitments" -f "$root/fold-exchanges.jq" "$1"; }
+# The map is slurped from a file, as the collector does: passing it as an argument
+# overflows ARG_MAX on a real store, which a live campaign found and no fixture would.
+fold() { jq --slurpfile commitment_file "$work/commitments.json" -f "$root/fold-exchanges.jq" "$1"; }
 
 # --- the positive case -------------------------------------------------------------
 fold "$fixture" > "$work/folded.json"
@@ -109,7 +111,7 @@ jq --arg n "$preauth" '
                                   | .event.authenticated_peer_id = null
                                   | .event.operation_id = null ]}' "$fixture" > "$work/preauth.json"
 keys "$work/preauth.json" | jq -Rn '[inputs | {key:., value:("sha256:stub-" + (.|@base64))}] | from_entries' > "$work/preauth-commitments.json"
-jq --argjson commitments "$(cat "$work/preauth-commitments.json")" -f "$root/fold-exchanges.jq" "$work/preauth.json" > "$work/preauth-folded.json"
+jq --slurpfile commitment_file "$work/preauth-commitments.json" -f "$root/fold-exchanges.jq" "$work/preauth.json" > "$work/preauth-folded.json"
 jq -e 'length >= 1 and all(.[]; .nonce_authority == "pre-authentication" and .joinable == false)' "$work/preauth-folded.json" >/dev/null \
   || { echo 'a pre-authentication nonce was not marked non-joinable' >&2; exit 1; }
 

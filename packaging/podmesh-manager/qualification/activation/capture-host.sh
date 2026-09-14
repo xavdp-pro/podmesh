@@ -208,7 +208,8 @@ inspection() {
   commitment_keys < "$work/inspection-raw.json" | commit_batch > "$work/commitments.json" || return 1
   jq -ce --arg logical "$(commit_text logical-manager-id "$(jq -r .logical_manager_id <<<"$raw")")" \
      --arg replica "$(commit_text replica-id "$(jq -r .replica_id <<<"$raw")")" \
-     --argjson commitments "$(cat "$work/commitments.json")" '
+     --slurpfile commitment_file "$work/commitments.json" '
+    ($commitment_file[0]) as $commitments |
     def c($kind; $v): if $v == null then null else ($commitments[$kind + "\t" + $v] // error("no commitment for " + $kind)) end;
     # Candidate inspection/v3 is the frozen private input contract. This collector
     # publishes a different, privacy-preserving projection whose schema is v4. Keeping
@@ -242,7 +243,7 @@ inspection() {
 exchanges() {
   [ "$with_inspection" -eq 1 ] || { printf '%s\n' null; return; }
   [ -s "$work/inspection-raw.json" ] || { printf '%s\n' null; return; }
-  jq -c --argjson commitments "$(cat "$work/commitments.json")" -f "$root/fold-exchanges.jq" "$work/inspection-raw.json"
+  jq -c --slurpfile commitment_file "$work/commitments.json" -f "$root/fold-exchanges.jq" "$work/inspection-raw.json"
 }
 
 jq -e '.schema_version=="podmesh-manager-candidate-verification/v2" and .package=="podmesh-manager" and (.version|type=="string") and (.binary_sha256|test("^[a-f0-9]{64}$"))' "$report" >/dev/null || { echo 'Candidate verification report is invalid' >&2; exit 2; }

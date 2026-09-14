@@ -30,10 +30,15 @@
 # operation id, not the digest, so the two kinds would have collided under one label and the
 # join would have failed silently — the failure this discipline exists to prevent.
 #
+# $commitments arrives as a slurped FILE rather than a command-line argument: a real store
+# produces thousands of commitments and `--argjson "$(cat …)"` overflows the argument list.
+# Found on a live campaign; the 165-row store used in development never came close.
+def commitments: $commitment_file[0];
+
 # `label` is a jq keyword, so the parameter cannot be named $label.
 def commitment($kind; $value):
   if $value == null then null
-  else ($commitments[$kind + "\t" + $value]
+  else (commitments[$kind + "\t" + $value]
         // error("no commitment for " + $kind + "; the collector and this fold disagree on labels"))
   end;
 
