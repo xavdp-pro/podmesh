@@ -256,8 +256,138 @@ def host_failures(pre,base,conv,cleanup):
         a,b=conv["inspection"],cleanup["inspection"]
         counts=("history_count","receipt_count","audit_event_count")
         unchanged_counts=all(b[f]==a[f] for f in counts)
-        if b["incomplete_attempt_count"]!=0 or any(b[f]<a[f] for f in counts) or (unchanged_counts and b["logical_history_sha256"]!=a["logical_history_sha256"]): failures.append("cleanup canonical inspection regressed")
+        # The second home of the withdrawn demand for zero incomplete attempts, found by the
+        # strand test rather than by reading: removing it from the convergence lines alone
+        # left this one standing, and it refused the very case the frozen contract requires.
+        # What a regression means here is a count going BACKWARDS or a history mutating with
+        # no growth to explain it. A retained incomplete attempt is not a regression; it is
+        # decided by identity in the accounting, not by a threshold here.
+        if any(b[f]<a[f] for f in counts) or (unchanged_counts and b["logical_history_sha256"]!=a["logical_history_sha256"]): failures.append("cleanup canonical inspection regressed")
     return failures
+
+TERMINAL_IMPORT="inbound_import_committed"
+TERMINAL_REFUSAL="inbound_refusal_recorded"
+REPLY_WRITTEN="inbound_reply_write_observed"
+SENDER_PREPARED="outbound_request_prepared"
+
+def attempt_ids(capture):
+    i=capture["inspection"]
+    if i is None or not i["store_present"]: return set()
+    return {a["attempt_commitment"] for a in i["incomplete_attempts"]}
+
+def account_attempts(bases, cleanups, convs):
+    """Decide, for each incomplete attempt created inside the campaign window, whether it is
+    accounted for. Returns (summary, failures).
+
+    The predicate is about one attempt at a time. A timeout, a matching total or eventual
+    convergence alone is insufficient, and count subtraction is forbidden: cleanup
+    legitimately adds terminal rows, so a difference of totals describes nothing. Every set
+    below is a set of attempt IDENTITIES."""
+    failures=[]
+    # Condition 4, and part of 7, are campaign-wide: an unaudited import receipt anywhere
+    # means no attempt is accounted for, because the evidence that would account for it is
+    # itself in question.
+    unaudited=sum(c["inspection"]["unaudited_import_receipt_count"] for c in cleanups if c["inspection"] and c["inspection"]["store_present"])
+    if unaudited: failures.append(f"{unaudited} unaudited import receipts exist; no attempt can be accounted for while an import receipt has no audit")
+
+    # The framing overhead is not hard-coded. Every row carries both an announced body size
+    # and a frame size, so the campaign must simply agree with itself about the difference;
+    # a truncated or padded frame breaks that agreement without the comparator needing to
+    # know the protocol constant.
+    deltas={r["request_frame_bytes"]-r["request_announced_body_bytes"]
+            for c in cleanups if c["exchanges"]
+            for r in c["exchanges"] if r["request_frame_bytes"]>0 and r["request_announced_body_bytes"] is not None}
+    if len(deltas)>1: failures.append("request framing overhead is not consistent across the campaign")
+    overhead=deltas.pop() if len(deltas)==1 else None
+
+    # Every folded exchange row in the campaign, indexed by nonce and by host.
+    rows_by_nonce={}
+    for host,c in enumerate(cleanups):
+        for r in (c["exchanges"] or []):
+            rows_by_nonce.setdefault(r["nonce_commitment"],[]).append((host,r))
+
+    converged_digests={c["inspection"]["logical_history_sha256"] for c in convs if c["inspection"] and c["inspection"]["store_present"]}
+    history_converged = len(converged_digests)==1 and len(converged_digests)>0
+
+    accounted=[]; unaccounted=[]; debt=[]
+    for host,(base,cleanup) in enumerate(zip(bases,cleanups)):
+        baseline=attempt_ids(base); post_capture=cleanup["inspection"]
+        if post_capture is None or not post_capture["store_present"]:
+            failures.append(f"host {host}: post-cleanup published no store, so no attempt can be classified"); continue
+        for a in post_capture["incomplete_attempts"]:
+            if a["attempt_commitment"] in baseline:
+                # Pre-existing debt: retained and reported, never silently folded into a
+                # success claim, and never a reason to fail a new bounded campaign.
+                debt.append({"host":host,"attempt_commitment":a["attempt_commitment"],"last_phase":a["last_phase"]}); continue
+            why=classify(host,a,rows_by_nonce,cleanups,overhead,history_converged)
+            if why is None: accounted.append({"host":host,"attempt_commitment":a["attempt_commitment"]})
+            else:
+                unaccounted.append({"host":host,"attempt_commitment":a["attempt_commitment"],"reason":why})
+                failures.append(f"host {host}: an incomplete attempt is unaccounted for: {why}")
+    return ({"accounted_incomplete_attempts":len(accounted),
+             "unaccounted_incomplete_attempts":len(unaccounted),
+             "preexisting_incomplete_attempts":len(debt),
+             "unaccounted_detail":unaccounted,
+             "preexisting_detail":debt}, failures)
+
+def classify(host, attempt, rows_by_nonce, cleanups, overhead, history_converged):
+    """None when the attempt is accounted for; otherwise the first condition it fails.
+    Each condition is a separate refusal: there is no aggregate that compensates for a
+    missing one."""
+    # An attempt whose nonce was minted locally can never be joined to another host. It is
+    # unaccounted, and saying so is the honest answer rather than hunting a row that cannot
+    # exist.
+    if attempt["nonce_authority"]!="peer-validated":
+        return "its wire nonce is a locally minted pre-authentication value and can never bind to a receiver"
+    if attempt["direction"]!="outbound":
+        return "an inbound incomplete attempt has no receiver-side join defined"
+    nonce=attempt["nonce_commitment"]
+    candidates=rows_by_nonce.get(nonce,[])
+    sender=[r for h,r in candidates if h==host and r["direction"]=="outbound"]
+    if len(sender)!=1: return "its own host publishes no single outbound exchange row for this nonce"
+    sender=sender[0]
+    # Condition 2: exactly one authenticated receiver-side request, on exactly one OTHER host.
+    receivers=[(h,r) for h,r in candidates if h!=host and r["direction"]=="inbound"]
+    if not receivers: return "no receiver-side request bears this wire nonce (condition 2)"
+    if len(receivers)>1: return "more than one host claims the receiver side of this wire nonce (condition 2)"
+    rhost,recv=receivers[0]
+    # The peer field is always THE OTHER PARTY, never the observer: a sender's row names the
+    # receiver and a receiver's row names the sender. Requiring the two to be equal would
+    # have refused every genuine join. What must hold is that each side names the other, and
+    # each host publishes its own replica commitment for exactly that comparison.
+    sender_replica=cleanups[host]["inspection"]["replica_commitment"]
+    receiver_replica=cleanups[rhost]["inspection"]["replica_commitment"]
+    if sender["peer_commitment"]!=receiver_replica:
+        return "the sender's declared peer is not the host that served the request (condition 2)"
+    if recv["peer_commitment"]!=sender_replica:
+        return "the receiver did not authenticate the sending host as its peer (condition 2)"
+    for field,name in (("operation_commitment","operation ID"),("request_sha256_commitment","request digest")):
+        if sender[field] is None or recv[field] is None or sender[field]!=recv[field]:
+            return f"the {name} does not bind sender to receiver (condition 2)"
+    if sender["request_announced_body_bytes"] is None or recv["request_announced_body_bytes"] is None \
+       or sender["request_announced_body_bytes"]!=recv["request_announced_body_bytes"]:
+        return "the announced request size does not bind sender to receiver (condition 2)"
+    if overhead is None or recv["request_frame_bytes"] != recv["request_announced_body_bytes"]+overhead:
+        return "the receiver did not record a complete request frame (conditions 2 and 3)"
+    # Condition 3: a terminal, with a receipt.
+    if TERMINAL_IMPORT not in recv["phases_reached"] and TERMINAL_REFUSAL not in recv["phases_reached"]:
+        return "the receiver committed neither an import receipt nor a typed refusal (condition 3)"
+    if TERMINAL_IMPORT in recv["phases_reached"] and recv["local_receipt_commitment"] is None:
+        return "the receiver committed an import with no receipt (condition 3)"
+    # Condition 5: the reply was completely written, and the sender honestly retained its
+    # absence. This is the shape the frozen contract requires, not a defect.
+    if REPLY_WRITTEN not in recv["phases_reached"] or recv["reply_frame_bytes"]<=0:
+        return "the receiver did not completely write a bound reply (condition 5)"
+    if attempt["last_phase"]!=SENDER_PREPARED:
+        return "the sender did not retain the absence of a confirmed reply as prepared/incomplete (condition 5)"
+    # Condition 6: a replayed retry, or the facts independently converged on every replica.
+    replayed=any(r["operation_commitment"]==sender["operation_commitment"] and r["replayed"]
+                 for rows in rows_by_nonce.values() for _,r in rows)
+    if not replayed and not history_converged:
+        return "no identical retry returned a replayed receipt and the canonical histories do not converge (condition 6)"
+    # Condition 7 is checked campaign-wide by the caller and by the convergence checks; 8 is
+    # satisfied by the attempt being in this list at post-cleanup, which is how we read it.
+    return None
 
 def three_host_failures(pres,bases,convs,cleanups):
     failures=[]
@@ -284,12 +414,21 @@ def three_host_failures(pres,bases,convs,cleanups):
     # converged capture reporting an absent store would have reached `None >= 3` and
     # raised a TypeError — a crash instead of a verdict, which is not fail-closed. An
     # absent store at converged or post-cleanup is simply a failure, and is reported.
-    live_convergence=all(inspection_bound(x) for x in convs) and len({i["logical_history_sha256"] for i in inspections})==1 and all(i["history_count"]>=3 and i["incomplete_attempt_count"]==0 for i in inspections)
-    final_convergence=all(inspection_bound(x) for x in cleanups) and len({i["logical_history_sha256"] for i in final_inspections})==1 and all(i["history_count"]>=3 and i["incomplete_attempt_count"]==0 for i in final_inspections)
+    # `incomplete_attempt_count == 0` used to be part of both lines below, and that demand
+    # is withdrawn. The frozen Stage D contract REQUIRES a prepared attempt with no terminal
+    # event to remain explicitly incomplete when a reply is lost after the destination
+    # commits, so the old gate made a contractually required representation fail — and
+    # turned a correctness gate into a reliability bar that passed only if a specified
+    # failure mode happened not to occur. Convergence is now about the history; the attempts
+    # are decided one at a time, by identity, below.
+    live_convergence=all(inspection_bound(x) for x in convs) and len({i["logical_history_sha256"] for i in inspections})==1 and all(i["history_count"]>=3 for i in inspections)
+    final_convergence=all(inspection_bound(x) for x in cleanups) and len({i["logical_history_sha256"] for i in final_inspections})==1 and all(i["history_count"]>=3 for i in final_inspections)
     convergence=live_convergence and final_convergence
     if not live_convergence: failures.append("converged captures do not prove one complete logical history of at least three events")
     if not final_convergence: failures.append("post-cleanup captures do not retain one complete logical history")
-    return failures,convergence
+    accounting,accounting_failures=account_attempts(bases,cleanups,convs)
+    failures.extend(accounting_failures)
+    return failures,convergence,accounting
 
 def main():
     p=argparse.ArgumentParser(); p.add_argument("--phase",required=True,choices=("host","three-host")); p.add_argument("--pre",required=True,nargs="+"); p.add_argument("--active-baseline",required=True,nargs="+"); p.add_argument("--converged",required=True,nargs="+"); p.add_argument("--cleanup",required=True,nargs="+"); a=p.parse_args()
@@ -302,9 +441,9 @@ def main():
         maps=[{x["host_alias"]:x for x in g} for g in groups]
         if any(len(m)!=count for m in maps) or any(set(m)!=set(maps[0]) for m in maps[1:]): raise ValueError("evidence aliases do not form matching distinct sets")
         aliases=sorted(maps[0]); ordered=[[m[x] for x in aliases] for m in maps]
-        if a.phase=="host": failures=host_failures(*(g[0] for g in ordered)); convergence=False
-        else: failures,convergence=three_host_failures(*ordered)
+        if a.phase=="host": failures=host_failures(*(g[0] for g in ordered)); convergence=False; accounting=None
+        else: failures,convergence,accounting=three_host_failures(*ordered)
     except (OSError,ValueError,json.JSONDecodeError) as error:
         print(json.dumps({"status":"FAIL","error":str(error)},sort_keys=True)); return 2
-    print(json.dumps({"schema_version":OUT_SCHEMA,"phase":a.phase,"subject":",".join(aliases),"status":"PASS" if not failures else "FAIL","failures":failures,"canonical_convergence_evidenced":convergence,"ha_claim":"absent"},sort_keys=True)); return 0 if not failures else 1
+    print(json.dumps({"schema_version":OUT_SCHEMA,"phase":a.phase,"subject":",".join(aliases),"status":"PASS" if not failures else "FAIL","failures":failures,"canonical_convergence_evidenced":convergence,"incomplete_attempt_accounting":accounting,"ha_claim":"absent"},sort_keys=True)); return 0 if not failures else 1
 if __name__=="__main__": sys.exit(main())

@@ -225,4 +225,88 @@ reject_error 'a phase repeated in one folded row' '.exchanges[0].phases_reached=
 reject_error 'exchanges published with no store inspected' '.exchanges=[]' pre-activation 'exchanges published without an inspected present store'
 reject_error 'a present store publishing no exchanges' '.exchanges=null' converged 'no exchanges were published'
 
+# The accounting predicate itself: a stranded sender attempt joined to the receiver that
+# served it. This is the case the frozen Stage D contract REQUIRES to exist -- a reply lost
+# after the destination commits leaves the source holding a prepared, incomplete attempt --
+# and the gate that demanded zero such attempts is what this lot withdrew. Nothing below
+# erases or fabricates a terminal event to reach a number.
+N='sha256:3333333333333333333333333333333333333333333333333333333333333333'
+OP='sha256:4444444444444444444444444444444444444444444444444444444444444444'
+RQ='sha256:5555555555555555555555555555555555555555555555555555555555555555'
+RA=$(jq -r '.inspection.replica_commitment' "$work/lab-a-post-cleanup.json")
+RB=$(jq -r '.inspection.replica_commitment' "$work/lab-b-post-cleanup.json")
+strand="{\"attempt_commitment\":\"sha256:6666666666666666666666666666666666666666666666666666666666666666\",\"nonce_commitment\":\"$N\",\"nonce_authority\":\"peer-validated\",\"operation_commitment\":\"$OP\",\"direction\":\"outbound\",\"last_phase\":\"outbound_request_prepared\"}"
+sent="{\"nonce_commitment\":\"$N\",\"nonce_authority\":\"peer-validated\",\"joinable\":true,\"direction\":\"outbound\",\"phases_reached\":[\"outbound_request_prepared\"],\"row_count\":1,\"peer_commitment\":\"$RB\",\"operation_commitment\":\"$OP\",\"request_sha256_commitment\":\"$RQ\",\"reply_sha256_commitment\":null,\"local_receipt_commitment\":null,\"remote_receipt_commitment\":null,\"request_frame_bytes\":0,\"reply_frame_bytes\":0,\"request_announced_body_bytes\":2731,\"outcomes\":[\"incomplete\"],\"replayed\":null}"
+served="{\"nonce_commitment\":\"$N\",\"nonce_authority\":\"peer-validated\",\"joinable\":true,\"direction\":\"inbound\",\"phases_reached\":[\"inbound_request_observed\",\"inbound_import_committed\",\"inbound_reply_prepared\",\"inbound_reply_write_observed\"],\"row_count\":4,\"peer_commitment\":\"$RA\",\"operation_commitment\":\"$OP\",\"request_sha256_commitment\":\"$RQ\",\"reply_sha256_commitment\":\"sha256:7777777777777777777777777777777777777777777777777777777777777777\",\"local_receipt_commitment\":\"sha256:8888888888888888888888888888888888888888888888888888888888888888\",\"remote_receipt_commitment\":null,\"request_frame_bytes\":2735,\"reply_frame_bytes\":625,\"request_announced_body_bytes\":2731,\"outcomes\":[\"accepted\"],\"replayed\":false}"
+
+# $1 is an optional jq filter applied to the RECEIVER's served row, to break one condition.
+build_strand() {
+  jq ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges += [$sent]" "$work/lab-a-post-cleanup.json" > "$work/sa.json"; sidecar "$work/sa.json"
+  jq ".exchanges += [$served${1:+ | $1}]" "$work/lab-b-post-cleanup.json" > "$work/sb.json"; sidecar "$work/sb.json"
+  "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work"/*-converged.json --cleanup "$work/sa.json" "$work/sb.json" "$work/lab-c-post-cleanup.json" > "$work/strand-report.json" 2>"$work/strand-err.txt"
+}
+build_strand
+report_says "$work/strand-report.json" '.status=="PASS" and .incomplete_attempt_accounting.accounted_incomplete_attempts==1 and .incomplete_attempt_accounting.unaccounted_incomplete_attempts==0' 'a stranded attempt joined to the receiver that served it was not accounted for'
+
+# One refusal per condition. Each must fail for its OWN reason: an aggregate that could
+# compensate for a missing condition is exactly what the predicate forbids.
+strand_refuse() {
+  local label=$1 filter=$2 expected=$3
+  if build_strand "$filter"; then echo "accepted $label" >&2; exit 1; fi
+  report_says "$work/strand-report.json" '.status=="FAIL"' "$label did not produce a verdict"
+  grep -q "$expected" <(jq -r '.failures[]?' "$work/strand-report.json") || { echo "$label was refused for another reason: $(jq -c '.failures' "$work/strand-report.json")" >&2; exit 1; }
+}
+strand_refuse 'no receiver bears the nonce'        '.nonce_commitment="sha256:9999999999999999999999999999999999999999999999999999999999999999" | .joinable=true' 'no receiver-side request bears this wire nonce'
+strand_refuse 'the receiver authenticated another sender' '.peer_commitment="sha256:aaaa999999999999999999999999999999999999999999999999999999999999"' 'did not authenticate the sending host as its peer'
+strand_refuse 'the operation does not bind'        '.operation_commitment="sha256:bbbb999999999999999999999999999999999999999999999999999999999999"' 'operation ID does not bind sender to receiver'
+strand_refuse 'the request digest does not bind'   '.request_sha256_commitment="sha256:cccc999999999999999999999999999999999999999999999999999999999999"' 'request digest does not bind sender to receiver'
+strand_refuse 'the announced size does not bind'   '.request_announced_body_bytes=999 | .request_frame_bytes=1003' 'announced request size does not bind'
+strand_refuse 'the request frame is short'         '.request_frame_bytes=2700' 'did not record a complete request frame'
+strand_refuse 'no import and no typed refusal'     '.phases_reached=["inbound_request_observed","inbound_reply_prepared","inbound_reply_write_observed"] | .row_count=3' 'committed neither an import receipt nor a typed refusal'
+strand_refuse 'an import with no receipt'          '.local_receipt_commitment=null' 'committed an import with no receipt'
+strand_refuse 'the reply was never written'        '.reply_frame_bytes=0' 'did not completely write a bound reply'
+
+# Four conditions the nine refusals above do not reach, found by weakening the comparator
+# and watching the suite stay green. A refusal path nothing exercises is a refusal path
+# nobody has, and three of these guard the clauses the predicate is most about.
+strand_three() {   # $1 applied to lab-a, $2 to lab-b's served row, $3 to lab-c
+  jq ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges += [$sent]${1:+ | $1}" "$work/lab-a-post-cleanup.json" > "$work/sa.json"; sidecar "$work/sa.json"
+  jq ".exchanges += [$served${2:+ | $2}]" "$work/lab-b-post-cleanup.json" > "$work/sb.json"; sidecar "$work/sb.json"
+  jq "${3:-.}" "$work/lab-c-post-cleanup.json" > "$work/sc.json"; sidecar "$work/sc.json"
+  "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work"/*-converged.json --cleanup "$work/sa.json" "$work/sb.json" "$work/sc.json" > "$work/strand-report.json" 2>"$work/strand-err.txt"
+}
+three_refuse() {
+  local label=$1 fa=$2 fb=$3 fc=$4 expected=$5
+  if strand_three "$fa" "$fb" "$fc"; then echo "accepted $label" >&2; exit 1; fi
+  report_says "$work/strand-report.json" '.status=="FAIL"' "$label did not produce a verdict"
+  grep -q "$expected" <(jq -r '.failures[]?' "$work/strand-report.json") || { echo "$label was refused for another reason: $(jq -c '.failures' "$work/strand-report.json")" >&2; exit 1; }
+}
+# Condition 2's uniqueness: two hosts claiming to have served one wire nonce means neither
+# can be believed, and the attempt is unaccounted rather than accounted twice.
+three_refuse 'two hosts claim the receiver side' '' '' ".exchanges += [$served]" 'more than one host claims the receiver side'
+# Condition 5's honest retention: the sender must still be holding the attempt as prepared.
+# A sender claiming a later phase while remaining incomplete is not the shape the contract
+# describes, and the join must not paper over it.
+three_refuse 'the sender did not honestly retain the absence' '.inspection.incomplete_attempts[0].last_phase="outbound_exchange_completed"' '' '' 'did not retain the absence of a confirmed reply'
+# Condition 4: an unaudited import receipt anywhere puts the accounting evidence itself in
+# question, so no attempt is accounted for while one exists.
+three_refuse 'an unaudited import receipt exists' '' '' '.inspection.unaudited_import_receipt_count=1 | .inspection.unaudited_import_receipt_commitments=["sha256:dddd999999999999999999999999999999999999999999999999999999999999"]' 'unaudited import receipts exist'
+# Condition 6: with no replayed retry and no converged canonical history, eventual
+# convergence cannot stand in for a per-attempt proof.
+# Condition 6 reads convergence from the CONVERGED stage, so it has to be broken there
+# rather than at post-cleanup. Divergence also fails the convergence check in its own right;
+# both failures are true at once and the assertion looks for this one among them, rather
+# than pretending the case can be isolated.
+jq ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges += [$sent]" "$work/lab-a-post-cleanup.json" > "$work/sa.json"; sidecar "$work/sa.json"
+jq ".exchanges += [$served]" "$work/lab-b-post-cleanup.json" > "$work/sb.json"; sidecar "$work/sb.json"
+jq '.inspection.logical_history_sha256="00000000000000000000000000000000000000000000000000000000000000ff"' "$work/lab-a-converged.json" > "$work/divconv.json"; sidecar "$work/divconv.json"
+if "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work/divconv.json" "$work/lab-b-converged.json" "$work/lab-c-converged.json" --cleanup "$work/sa.json" "$work/sb.json" "$work/lab-c-post-cleanup.json" > "$work/c6.json" 2>/dev/null; then
+  echo 'accepted an attempt with no replay and no converged history' >&2; exit 1
+fi
+report_says "$work/c6.json" '.status=="FAIL"' 'no replay and no converged history did not produce a verdict'
+grep -q 'no identical retry returned a replayed receipt' <(jq -r '.failures[]?' "$work/c6.json") \
+  || { echo "condition 6 was not among the failures: $(jq -c '.failures' "$work/c6.json")" >&2; exit 1; }
+
+printf '%s\n' 'PASS: strand accounting — one stranded attempt joined to its receiver, and nine conditions each refused on its own.'
+
 printf '%s\n' 'PASS: four-stage activation evidence, effective policy, ownership, graceful cleanup, infrastructure stability, converged history boundaries, typed fresh-store absence, published incomplete attempts and folded exchanges.'
