@@ -110,6 +110,13 @@ fourth fact on all three. What this proves is the exclusivity of the announcemen
 does not yet serve at that address (an address alias inside the container is a later step), and
 the loss exercised is a stop, not a cut.
 
+**M-U2, step 7 (2026-09-15):** a recovery point as rescue, not as the only copy. One replica
+stopped, captured, deleted with its address released; the two others moved on to a fact it never
+saw; the point restored into quarantine on its host, promoted into the replica's own identity at
+its managed address and started: it caught up the missed fact from both peers, appended its own
+boot fact, and the three converged again, the governor's announcement never moving. The rescue is
+on the same host, since a replica's address lives in its host's pool; a host loss is not shown.
+
 Three findings the candidate taught, each handled in the universe definition and recorded in
 its README: the resident handles no signal, so PID 1 must translate the stop; the overlay's
 copy-up changes a restored store's inode between the resident's preflight and its open, which
