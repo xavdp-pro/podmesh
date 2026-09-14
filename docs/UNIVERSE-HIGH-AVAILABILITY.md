@@ -450,13 +450,39 @@ and 5 are what turn a safety property into availability.
 
 ## What is the operator's to decide
 
-- **The recovery point.** Level 2's capture interval is the data you agree to lose. There is no
-  correct answer, only a chosen one.
-- **The fencing mechanism**, and if it is out-of-band, who may cut power to a host.
-- **Which universes.** HA per universe is a choice with a cost, not a default. A universe that
-  is cheap to rebuild does not want it.
+Restated on 2026-09-14, after lots H1 to H8 and M5: these are the decisions that now stand
+between the measured level 2 and a production mandate. Each has a recommendation; none is
+taken here.
+
+- **The gate.** Epochs need one external authority that rotates them. Three candidates: the
+  fencing laboratory's `Authority` (a single SQLite compare-and-swap gate, qualified by its own
+  22 tests, run on the agent's host), the manager's `authorize_exclusive_service` permit (a
+  new candidate and a requalification campaign), or a storage lease once level 3's storage
+  exists. **Recommendation: the laboratory's gate first**, on the host the agent runs on, with
+  its documented precondition — one current copy, never cloned or rolled back — stated as the
+  operator's obligation. It is the only one that exists and is qualified today.
+- **Signing.** The recovery point manifest is unsigned because this build has no signing
+  crate and the registry is unreachable from it. Adding one is a supply-chain decision (which
+  crate, how it is vendored, who reviews it). Until then a standby verifies bytes against a
+  manifest whose origin it cannot verify. **Recommendation: decide the crate before any host
+  outside the lab receives a point.**
+- **The recovery point interval and retention.** Level 2's capture interval is the data you
+  agree to lose; `keep_latest` and `minimum_age_seconds` are what the disk keeps. There is no
+  correct answer, only a chosen one per universe. **Recommendation: declare both at the same
+  time as the activation policy, never leave a universe under HA without a retention.**
+- **The fencing mechanism**, and if it is out-of-band, who may cut power to a host. The
+  self-fence is built and its margin is the contract; it trusts a sick host to act.
+  **Recommendation: keep the self-fence and the margin, and add out-of-band fencing for
+  production once someone is named who may cut power.**
+- **Which universes.** HA per universe is a choice with a cost — a standby's storage and
+  headroom, a capture's stop — not a default. A universe cheap to rebuild does not want it.
 - **What happens when the agent is wrong.** If the agent names a host that cannot serve, does
-  the system refuse and wait, or fall back? Refusing is safer and is the recommendation.
+  the system refuse and wait, or fall back? **Refusing is safer and is the recommendation**,
+  and it is what every operation here does.
+- **Who runs the agent's side.** Failure detection, the wait, the rotation and the transport
+  are the agent's; nothing in PodMesh runs on its own, by the canon's rule. The next lot
+  makes that side runnable as a tool rather than a test; whether it may ever be a timer is a
+  production mandate, exactly as for the collector.
 
 ## What this document does not claim
 
