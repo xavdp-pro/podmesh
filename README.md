@@ -28,6 +28,13 @@ The service currently exposes a root-only Unix socket and uses the default rootf
 
 See [the intent](INTENT.md), [delivery checklist](docs/DELIVERY-CHECKLIST.md), and [acceptance test plan](docs/ACCEPTANCE-TEST-PLAN.md) for requirements and qualified status.
 
+The development tree, not yet packaged, also carries: the [local API reference](docs/LOCAL-API.md) of every
+operation; [universe high availability](docs/UNIVERSE-HIGH-AVAILABILITY.md) — activation leases, epochs from an
+external gate, recovery points, restore into quarantine, promotion, and the agent's side as
+[`tools/ha-standby.py`](tools/ha-standby.py); the [garbage collection contract](docs/GARBAGE-COLLECTION.md) and its
+implemented classes; and the [Backup Server design](docs/BACKUP-SERVER.md). Each states what it proves and what it
+does not, and [CURRENT-STATE.md](docs/CURRENT-STATE.md) is the handoff to read first.
+
 ## Debian delivery
 
 [deb.xavdp.pro](https://deb.xavdp.pro) hosts the signed experimental APT repository. The published package is `0.1.0~experimental5` for Debian 13 amd64. The repository keeps one version per suite, so an earlier package is reinstallable only from a host's own APT cache. Stable and other architectures are not validated.
