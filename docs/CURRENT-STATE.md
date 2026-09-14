@@ -196,6 +196,18 @@ replica as a PodMesh universe under the epoch gate — recommended). The univers
 exercised on three lab hosts: `tools/ha-standby.py` now serves one or more standbys, and
 `tests/check-ha-three-hosts.py` plays HA-10's shape (takeover to one standby, the other
 informed and refusing a stale permit, the old active superseded and rejoining as a standby).
+Codex reviewed the diff the same evening (`/tmp/podmesh-claude/CODEX-REVIEW-H5-H10-M5-G2-2026-09-14.md`):
+GO for the next laboratory candidate, no GO for publication or a production HA claim; and
+decided the manager takeover: the manager is one logical universe under PodMesh's HA
+mechanism and the epoch gate, no manager-specific election. Candidate M-U1 was built and run
+the same night: `packaging/podmesh-manager/universe/` (web tree) and
+`tests/check-manager-universe-ha.py` (here) — the packaged resident inside a universe with no
+network, its stop translated into the typed shutdown by the entrypoint, boot facts appended
+from inside, the store copied up before the resident opens it (the overlay's copy-up otherwise
+trips the resident's store-identity preflight); on three lab hosts the frozen candidate's
+inspection showed the store follow the universe through capture, restore, promotion and
+restart (2 → 3 → 4 chained facts, integrity ok). Still a universe contract decision: a
+network (no replication inside universes without one) and a reachable control socket.
 On the operator's "go" (2026-09-14 evening) the HA recommendations became the tool's
 defaults by hypothesis (`64892c4`): retention declared from every cycle (keep 3, one hour),
 three quarantined copies, 20/5 lease and margin, the laboratory's gate, no timer.
