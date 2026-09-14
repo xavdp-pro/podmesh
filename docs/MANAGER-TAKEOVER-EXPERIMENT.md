@@ -61,6 +61,27 @@ restores into quarantine on it without any journal reset; the gate stands at epo
 HA-10's shape without a real partition: the active host "fails" by not renewing, and no
 network was cut.
 
+## Measured after Codex's decision: candidate M-U1, the manager as a universe
+
+Codex chose the second way the same evening. `packaging/podmesh-manager/universe/` is the
+universe definition, and `tests/check-manager-universe-ha.py` (main tree) ran it on three lab
+hosts: the packaged resident runs inside a PodMesh universe with no network; a capture cycle
+stops it gracefully — the entrypoint turns the stop signal into the typed shutdown — and
+restores the point on both standbys; the frozen candidate's own inspection of the exported
+stores shows two boot facts on the active host, three in the promoted universe on the standby
+before its first start, four after it started there, chained, integrity ok; the other standby
+refuses a stale permit and the old active is refused. **The manager's durable state follows the
+universe through capture, restore, promotion and restart on another host**, under the same
+mechanism as any universe and with no manager-specific election.
+
+Three findings the candidate taught, each handled in the universe definition and recorded in
+its README: the resident handles no signal, so PID 1 must translate the stop; the overlay's
+copy-up changes a restored store's inode between the resident's preflight and its open, which
+it refuses as a swapped store; and the control socket is unreachable from the host, so the
+only writer inside is the entrypoint. What still needs a universe contract decision: a network
+(without one, replicas cannot replicate inside universes and the campaign-6 data path is not
+exercised there) and a way for an agent to reach the control socket.
+
 ## What it does not show
 
 A real partition, a real host loss (HA-04 requires power loss, not network loss), the manager's
