@@ -93,8 +93,22 @@ Codex's.
 universe contract, PodMesh gained a managed profile (main tree, `docs/UNIVERSE-NETWORK-CONTRACT.md`),
 and three Alpine manager universes ran **concurrently** on it across the three hosts as three
 replicas of one logical manager, with explicit authenticated endpoints: their facts converged
-while all three kept running. The replicated manager exists inside universes; the governor role
-under the epoch gate, with all three running, is the next step.
+while all three kept running. The replicated manager exists inside universes.
+
+**M-U2, steps 5 and 6 (the same night):** the governor role, under the same epoch gate as any
+universe, with all three replicas running. The activation resource is the logical manager's
+UUID; the exclusive effect is the announcement of its service address, a `/32` route that only
+the host holding a live, unsuperseded lease on that resource may publish, and that the host's
+self-fence withdraws once the lease is gone. Measured on the three hosts
+(`tests/check-manager-governor-managed.py` in the main tree): one announcement at every
+observed moment; on the rotation from epoch 1 to epoch 2 the old governor's fence withdrew the
+route before the new governor published it; the old governor was refused when it tried to
+publish again, a forged stale permit was refused on the third host, which was also refused
+without the role; the three replicas never stopped, and their facts were still converged after
+the takeover; a duplicate address was refused; a replica stopped and restarted rejoined with a
+fourth fact on all three. What this proves is the exclusivity of the announcement; the replica
+does not yet serve at that address (an address alias inside the container is a later step), and
+the loss exercised is a stop, not a cut.
 
 Three findings the candidate taught, each handled in the universe definition and recorded in
 its README: the resident handles no signal, so PID 1 must translate the stop; the overlay's
@@ -106,6 +120,6 @@ exercised there) and a way for an agent to reach the control socket.
 
 ## What it does not show
 
-A real partition, a real host loss (HA-04 requires power loss, not network loss), the manager's
-own exclusive effect, DNS, or a long run. The latency curve of the pre-reply verification is
+A real partition, a real host loss (HA-04 requires power loss, not network loss), the manager
+serving at its service address (only the announcement is exclusive so far), DNS, or a long run. The latency curve of the pre-reply verification is
 unchanged and is the other thing that decides whether this manager can run for a day.
