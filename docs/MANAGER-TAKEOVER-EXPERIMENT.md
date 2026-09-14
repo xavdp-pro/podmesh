@@ -1,0 +1,68 @@
+# The three-host manager takeover experiment: design, and where it stops today
+
+Status: **designed; the universe half is exercised on three lab hosts; the manager half waits
+for a decision on the candidate.** Codex's third engineering item of 2026-09-14: *design and
+test a three-host manager takeover experiment; it needs an external authority/fencing decision,
+durable epoch screening, an old-active exclusion proof, a bootstrap path independent of manager
+DNS, and an explicit reconciliation rule after a partition; do not replace these with a numeric
+priority.*
+
+## The five requirements, and what exists for each
+
+| requirement | exists | where | measured |
+| --- | --- | --- | --- |
+| external authority / fencing decision | the fencing laboratory's `Authority` gate (one SQLite compare-and-swap, explicit rotation, 22 tests); the self-fence with a takeover margin | `experiments/manager-fencing`; PodMesh `activation_fence` | two- and three-host checks in the main tree |
+| durable epoch screening | PodMesh is the maker: `activation_epochs` screen, permit bound to universe, host and boot, one grant per epoch | main tree `src/activation.rs` (H8) | ten rules mutated; lab runs |
+| old-active exclusion proof | supersession voids the lease in the gate, the renewal and the fence; a stale grant, a fresh permit at the old epoch and a second grant at the new epoch are all refused | `activation_supersede`, `check-ha-three-hosts.py` | HA-10 shape on three hosts, without a real partition |
+| bootstrap independent of manager DNS | the G2 configuration is static IPv4 peers under `IPAddressAllow`; nothing resolves a name | `activation/README.md`, G2 drop-in | six campaigns |
+| reconciliation rule after a partition | `Reconciliation::after_full_exchange`: only after every declared replica holds the identical history; the coordinator is the lowest replica ID **of that agreed set**, and it decides nothing about which data is true; a permit dies with the history it names | `manager-ha/src/lib.rs` | model only (G0); no partition campaign |
+
+Nothing above is a numeric priority. The lowest ID selects a *coordinator* after the histories
+are already identical; it never selects a winner between diverging histories, and it grants
+nothing by itself.
+
+## Why the manager half cannot be tested today
+
+A takeover of the *manager* means an exclusive effect of the manager — publishing the active
+route, answering as the authority — moves from one replica to another under the gate. The
+model has it: a fact with `exclusive_resource` and `active_claim`, and
+`authorize_exclusive_service` issuing a permit to the reconciled coordinator. **The packaged
+resident exposes three control operations — `status`, `shutdown`, `append_observation` — and
+no permit path**, and campaign 6 carries zero exclusive facts (`MANAGER-REPLICATION-DATA-PATH.md`).
+There is no effect to move, and no gate call the resident makes.
+
+Two ways to get one, both Codex's since either changes the candidate:
+
+1. **Expose the permit path in a new candidate**: a `check_service` control operation that
+   asks the reconciled view for a permit and an effect (a route, a marker file, a counter as in
+   the laboratory) that is only performed under it, screened by epoch. Then HA-04/HA-10 run
+   against the manager itself.
+2. **Run each manager replica as a PodMesh universe** — the intended architecture says the
+   manager is a ShaperOS universe replicated to each chosen host — and let PodMesh's
+   activation screen be G3's enforcement point for it, with no new manager code: the replica
+   process is the universe, its exclusive role is the activation lease under the epoch gate,
+   its takeover is the tool's. The replication data path stays what campaign 6 qualified.
+
+The recommendation is the second: it uses only what is built and measured, keeps the
+candidate frozen, and turns the manager's HA into an instance of the universe HA rather than a
+second mechanism. Its cost is an operational one — the manager's configuration, socket and
+state directory move into a universe — and that is exactly the kind of decision this document
+leaves where it belongs.
+
+## What is exercised today, on three hosts
+
+`tests/check-ha-three-hosts.py` in the main tree drives `tools/ha-standby.py` across lab-a,
+lab-b and lab-c on a universe: one capture cycle restored into quarantine on both standbys with
+the marker present; the active host lapses; one standby takes over under epoch 2 and the other
+is informed and refuses a stale epoch-1 permit bound to it; the old active rejoins **as a
+standby** — superseded, refused under its old grant, under a fresh permit at the old epoch and
+under a second grant at the new epoch, its copy fenced, and a cycle from the new active
+restores into quarantine on it without any journal reset; the gate stands at epoch 2. That is
+HA-10's shape without a real partition: the active host "fails" by not renewing, and no
+network was cut.
+
+## What it does not show
+
+A real partition, a real host loss (HA-04 requires power loss, not network loss), the manager's
+own exclusive effect, DNS, or a long run. The latency curve of the pre-reply verification is
+unchanged and is the other thing that decides whether this manager can run for a day.
