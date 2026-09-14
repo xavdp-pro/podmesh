@@ -33,7 +33,7 @@ A creation request contains:
 }
 ```
 
-The UUID and image above are placeholders, not executable examples. The CLI sets the operation field from its first argument. The initial creation operation produces a stopped container with networking disabled; it does not start the application. Image pulling is not implicit.
+The UUID and image above are placeholders, not executable examples. The CLI sets the operation field from its first argument. The initial creation operation produces a stopped container; it does not start the application. Image pulling is not implicit. In the packaged releases the container has networking disabled; in the development tree `create` requires a `network_profile` (`isolated`, the same `--network=none`, or `managed`), see the network section below and `UNIVERSE-NETWORK-CONTRACT.md`.
 
 Clone requests additionally identify `source_uuid` and use a new target `universe_uuid`. Deletion identifies the target universe and must not be used to imply a stop operation. Consult installed capabilities and the release's tested scope for exact restrictions.
 
@@ -321,7 +321,9 @@ lease. `stop` is never gated.
   and a `scope` sentence stating what the lease proves.
 - `activation_fence` (`timeout_seconds`; no `universe_uuid`) stops every universe under a policy that this host
   holds no live lease for, and reports which it left alone and why. It must be called at least as often as the
-  shortest lease, or a lapsed lease leaves a universe running.
+  shortest lease, or a lapsed lease leaves a universe running. It also withdraws every exclusive route (below)
+  published under a resource this host no longer holds a live, unsuperseded lease for, verified from the
+  kernel, and reports them as `routes_withdrawn`; a withdrawal that does not take is reported, never claimed.
 
 **Epochs, from the fencing laboratory.** `experiments/manager-fencing` in the web tree models exclusion as an
 epoch issued by one external gate, rotated only by an explicit trusted action, with each maker keeping a durable
@@ -368,6 +370,24 @@ copy; a quarantined copy becomes the universe itself, under the lease.
 
 How the two files reach the inbox is the transport controller's, as for migrations: PodMesh reads
 `inbox/` and never writes it. The two-host suite's controller carries an outbox to an inbox over SSH.
+
+## Experimental: the universe network (development tree, not packaged)
+
+The contract is `UNIVERSE-NETWORK-CONTRACT.md`; the operations are journaled like every other and verified from
+`podman network inspect` and `ip route`, never from the tables alone.
+
+- `network_declare` (host-wide; `network_uuid`, `prefix`, `pool`, optional `peer_pools` `[{pool, via}]`),
+  `network_undeclare` (host-wide; `network_uuid`), `network_status` (read-only).
+- `create` with `network_profile` `managed` allocates the next free address of the host's pool to the universe
+  UUID, or the one named by `network_address` inside that pool; `delete` releases it.
+- `network_route_publish` (host-wide; `universe_uuid`, `ip`, `via`, optional `exclusive_resource`) publishes the
+  `/32` of an address placed elsewhere; refused while any route for that address is effective here or while
+  the universe is allocated here. With `exclusive_resource` the route is the **exclusive effect of a role**
+  — a logical manager's service address, for instance — and is published only by the host holding a live,
+  unsuperseded activation lease on that resource under the epoch gate: refused, in this order, when the
+  resource is under no activation policy here, then for the lease gate's four reasons (none held, held
+  elsewhere, expired, superseded). The route records the resource, and `activation_fence` withdraws it once
+  the lease is gone. `network_route_withdraw` (`universe_uuid`) removes the routes of a universe.
 
 ## Facts for a watching agent
 

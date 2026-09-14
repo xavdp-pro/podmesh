@@ -23,6 +23,11 @@ Subcommands:
   gate init                      create the gate; prints its authority_id
   gate declare  --universe U     declare the universe as a gated resource (epoch 0, no owner)
   gate inspect  --universe U
+  rotate        --universe R --host SSH [--lease S --margin S --standbys N]
+                                 rotate the epoch of a resource (a universe, or a role such as a logical
+                                 manager whose replicas all keep running) to a host and acquire it there;
+                                 nothing promoted or started; prints the permit, which the agent delivers
+                                 to the other hosts as `activation_supersede` before they fence
   activate      --universe U --host SSH [--lease S --margin S --standbys N]
                                  declare the policy on the host under the gate's authority, rotate the
                                  epoch to it, acquire; starting is the operator's (the API's `start`)
@@ -172,6 +177,29 @@ def cmd_activate(args):
     save_ledger(u, ledger)
     out({'universe': u, 'host': host.identity, 'epoch': permit['epoch'], 'lease': {k: lease[k] for k in ('generation', 'expires_at', 'live')},
          'started': False, 'note': 'starting is the operator\'s: the API\'s start goes through the gate'})
+
+
+def cmd_rotate(args):
+    """Rotate the epoch of a resource to a host and acquire it there: the exclusive ROLE moves,
+    nothing is promoted or started -- the running replicas keep running. The permit is printed
+    so that the agent can deliver it to the other hosts as a supersession."""
+    gate = gate_or_refuse()
+    (host,) = hosts(args, ('host', args.host))
+    u = args.universe
+    ledger = load_ledger(u)
+    policy = ledger.get('policy') or {'lease_seconds': args.lease, 'takeover_margin_seconds': args.margin, 'desired_standbys': args.standbys,
+                                      'authority_id': gate.authority_id}
+    ok(host, request('activation_require', u, args.reference, lease_seconds=policy['lease_seconds'], takeover_margin_seconds=policy['takeover_margin_seconds'],
+                     desired_standbys=policy['desired_standbys'], authority_id=gate.authority_id), 'activation_require')
+    current = gate.inspect(u)
+    permit = permit_for(gate, u, host, current['epoch'])
+    lease = ok(host, request('activation_acquire', u, args.reference, permit=permit), 'activation_acquire')
+    ledger['policy'] = dict(policy, authority_id=gate.authority_id, declared_on=host.identity, declared_at=int(time.time()))
+    ledger['rotations'].append({'epoch': permit['epoch'], 'to': host.identity, 'at': int(time.time()), 'by': 'rotate'})
+    save_ledger(u, ledger)
+    out({'resource': u, 'host': host.identity, 'epoch': permit['epoch'], 'permit': permit,
+         'lease': {k: lease[k] for k in ('generation', 'expires_at', 'live')},
+         'note': 'the role moved; no universe was promoted or started, and the other hosts learn the epoch only when the permit is delivered to them'})
 
 
 def cmd_cycle(args):
@@ -326,6 +354,8 @@ def main():
     sub = p.add_subparsers(dest='command', required=True)
     g = sub.add_parser('gate'); g.add_argument('gate_command', choices=['init', 'declare', 'inspect']); g.add_argument('--universe')
     a = sub.add_parser('activate'); a.add_argument('--universe', required=True); a.add_argument('--host', required=True)
+    ro = sub.add_parser('rotate'); ro.add_argument('--universe', required=True); ro.add_argument('--host', required=True)
+    ro.add_argument('--lease', type=int, default=20); ro.add_argument('--margin', type=int, default=5); ro.add_argument('--standbys', type=int, default=2)
     c = sub.add_parser('cycle'); c.add_argument('--universe', required=True); c.add_argument('--active', required=True); c.add_argument('--standby', required=True)
     c.add_argument('--also', action='append', help='a further standby (repeatable): one capture, restored on each')
     c.add_argument('--keep', type=int, default=3, help='quarantined copies kept on each standby')
@@ -339,7 +369,7 @@ def main():
         s.add_argument('--stop-timeout', type=int, default=10)
     args = p.parse_args()
     try:
-        {'gate': cmd_gate, 'activate': cmd_activate, 'cycle': cmd_cycle, 'takeover': cmd_takeover}[args.command](args)
+        {'gate': cmd_gate, 'activate': cmd_activate, 'rotate': cmd_rotate, 'cycle': cmd_cycle, 'takeover': cmd_takeover}[args.command](args)
     except Refusal as e:
         out({'refused': str(e)}, 2)
 

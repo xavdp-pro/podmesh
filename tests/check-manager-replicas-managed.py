@@ -60,7 +60,16 @@ def inspect_running(h, u):
     attested against the inspector first, from the same copy."""
     d = tempfile.mkdtemp(prefix='podmesh-mu2-store-'); os.chmod(d, 0o700)
     remote = h.ssh(f'sudo -n mktemp -d').stdout.decode().strip()
-    h.ssh(f'sudo -n podman cp podmesh-{u}:/var/lib/podmesh-manager {remote}/state && sudo -n podman cp podmesh-{u}:/etc/podmesh-manager/config.json {remote}/config.json && sudo -n podman cp podmesh-{u}:/usr/lib/podmesh-manager/podmesh-managerd {remote}/podmesh-managerd')
+    # The store is copied while the resident runs: SQLite's -shm/-wal files come, go and grow between
+    # the copier's listing and its read, so a copy the copier could not complete is retried, never trusted.
+    for attempt in range(5):
+        try:
+            h.ssh(f'sudo -n podman cp podmesh-{u}:/var/lib/podmesh-manager {remote}/state && sudo -n podman cp podmesh-{u}:/etc/podmesh-manager/config.json {remote}/config.json && sudo -n podman cp podmesh-{u}:/usr/lib/podmesh-manager/podmesh-managerd {remote}/podmesh-managerd')
+            break
+        except RuntimeError as e:
+            if attempt == 4 or 'copying from container' not in str(e):
+                raise
+            h.ssh(f'sudo -n rm -rf {remote}/state {remote}/config.json {remote}/podmesh-managerd'); time.sleep(1)
     tar = h.ssh(f'sudo -n tar -C {remote} -cf - .').stdout
     h.ssh(f'sudo -n rm -rf {remote}')
     with tarfile.open(fileobj=io.BytesIO(tar)) as t:

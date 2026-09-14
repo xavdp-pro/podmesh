@@ -740,9 +740,17 @@ fn fence(db: &Connection, id: &str, timeout: u64) -> Result<serde_json::Value, E
             "superseded_by_epoch": overtaken,
         }));
     }
+    // Exclusive routes go the same way as universes: a route published under a resource this host
+    // no longer holds a live, unsuperseded lease for is withdrawn, verified from the kernel.
+    let routes_withdrawn = crate::network::withdraw_unentitled(db, &|resource: &str| {
+        lease(db, resource).ok().flatten().is_some_and(|l| {
+            l.holder_host_uuid == this_host && l.expires_at > now && superseded(db, resource, &l).ok().flatten().is_none()
+        })
+    })?;
     Ok(serde_json::json!({
         "this_host_uuid": this_host,
         "fenced": fenced,
+        "routes_withdrawn": routes_withdrawn,
         "left_running_or_absent": left,
         "scope": "this host only; a host that never runs this operation is not fenced by it",
     }))

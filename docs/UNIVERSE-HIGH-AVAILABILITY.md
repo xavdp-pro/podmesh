@@ -172,7 +172,10 @@ refusal to renew a lapsed lease.
 **Lot H2, self-fencing.** `activation_fence` stops every universe under a policy that this
 host holds no live lease for — whether the lease lapsed, was never taken, or belongs to
 another host. A universe whose lease is live is left alone and the report says so, rather
-than the operation silently doing nothing.
+than the operation silently doing nothing. Since M-U2 it fences roles as well as universes:
+an exclusive route (`network_route_publish` with `exclusive_resource`, the service address of
+a logical manager whose replicas all keep running) is withdrawn, verified from the kernel, once
+this host's lease on that resource has lapsed or been superseded.
 
 **It is an operation and not a timer, deliberately.** PodMesh does not act on its own; the
 garbage collector carries the same constraint for the same reason. So the *timeliness* is the

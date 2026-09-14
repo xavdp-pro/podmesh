@@ -55,8 +55,17 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             universe_uuid TEXT NOT NULL,
             via TEXT NOT NULL,
             published_at INTEGER NOT NULL,
-            operation_id TEXT NOT NULL);",
+            operation_id TEXT NOT NULL,
+            exclusive_resource TEXT);",
     )?;
+    let has_resource: bool = db.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('network_routes') WHERE name='exclusive_resource'",
+        [],
+        |r| Ok(r.get::<_, i64>(0)? > 0),
+    )?;
+    if !has_resource {
+        db.execute_batch("ALTER TABLE network_routes ADD COLUMN exclusive_resource TEXT;")?;
+    }
     // A table created by the first version made every address unique across released rows too, so
     // a released address could never be allocated again. Only a LIVE allocation is unique per
     // address; that table is rebuilt once, keeping its rows.
@@ -192,13 +201,13 @@ fn effective(db: &Connection) -> Result<Value, Error> {
                    "routes": held})
         })
         .collect();
-    let mut routes = db.prepare("SELECT ip,universe_uuid,via FROM network_routes ORDER BY ip")?;
-    let route_rows: Vec<(String, String, String)> = routes.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+    let mut routes = db.prepare("SELECT ip,universe_uuid,via,exclusive_resource FROM network_routes ORDER BY ip")?;
+    let route_rows: Vec<(String, String, String, Option<String>)> = routes.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
     let published: Vec<Value> = route_rows
         .iter()
-        .map(|(ip, u, via)| {
+        .map(|(ip, u, via, resource)| {
             let held = routes_for(&format!("{ip}/32"));
-            json!({"ip": ip, "universe_uuid": u, "via": via,
+            json!({"ip": ip, "universe_uuid": u, "via": via, "exclusive_resource": resource,
                    "effective": held.as_ref().map(|h| h.iter().any(|l| l.contains(&format!("via {via}")))), "routes": held})
         })
         .collect();
@@ -441,6 +450,21 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
             if placed_here > 0 {
                 return Err("the universe is allocated on this host; a route to elsewhere would announce it twice".into());
             }
+            // An exclusive route -- the service address of a role only one host may hold -- is published
+            // only by the host holding that role's live activation lease under the epoch gate. The
+            // route records the resource, and the self-fence withdraws it when the lease is gone.
+            let resource = match request.get("exclusive_resource") {
+                None => None,
+                Some(v) => {
+                    let r = v.as_str().ok_or("exclusive_resource must be a string")?;
+                    lc::token(r)?;
+                    if crate::activation::policy(db, r)?.is_none() {
+                        return Err(format!("exclusive_resource {r} is under no activation policy on this host; an exclusive route needs the lease of a declared resource").into());
+                    }
+                    crate::activation::refuse_if_not_activated(db, r, "network_route_publish")?;
+                    Some(r.to_string())
+                }
+            };
             let dst = format!("{ip}/32");
             match routes_for(&dst) {
                 None => return Err("the kernel's routes could not be read; refusing on an unknown state".into()),
@@ -453,8 +477,8 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
                 return Err(format!("the route for {ip} via {via} is not effective: {held:?}").into());
             }
             db.execute(
-                "INSERT INTO network_routes VALUES(?1,?2,?3,?4,?5)",
-                params![ip.to_string(), uuid, via.to_string(), now, id],
+                "INSERT INTO network_routes VALUES(?1,?2,?3,?4,?5,?6)",
+                params![ip.to_string(), uuid, via.to_string(), now, id, resource],
             )?;
         }
         "network_route_withdraw" => {
@@ -478,4 +502,34 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
         _ => return Err("Unsupported network operation".into()),
     }
     view(db)
+}
+
+/// Withdraw every published route bound to an exclusive resource this host no longer holds --
+/// called by the self-fence, which is the one operation that acts on what a host is not entitled
+/// to. Each withdrawal is verified from the kernel; one that does not take is reported, never
+/// reported as done.
+pub(crate) fn withdraw_unentitled(db: &Connection, entitled: &dyn Fn(&str) -> bool) -> Result<Vec<Value>, Error> {
+    ensure_schema(db)?;
+    let mut s = db.prepare("SELECT ip,universe_uuid,via,exclusive_resource FROM network_routes WHERE exclusive_resource IS NOT NULL")?;
+    let rows: Vec<(String, String, String, String)> = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
+    let mut report = vec![];
+    for (ip, u, via, resource) in rows {
+        if entitled(&resource) {
+            continue;
+        }
+        let dst = format!("{ip}/32");
+        if routes_for(&dst).is_some_and(|h| h.iter().any(|l| l.contains(&format!("via {via}")))) {
+            if let Err(e) = ip_route(&["-4", "route", "del", &dst, "via", &via]) {
+                report.push(json!({"ip": ip, "universe_uuid": u, "exclusive_resource": resource, "withdrawn": false, "error": e.to_string()}));
+                continue;
+            }
+        }
+        let still = routes_for(&dst);
+        let gone = still.as_ref().is_some_and(|h| h.is_empty());
+        if gone {
+            db.execute("DELETE FROM network_routes WHERE ip=?1", [&ip])?;
+        }
+        report.push(json!({"ip": ip, "universe_uuid": u, "exclusive_resource": resource, "withdrawn": gone, "routes_now": still}));
+    }
+    Ok(report)
 }

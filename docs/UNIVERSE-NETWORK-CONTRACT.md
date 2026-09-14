@@ -63,6 +63,11 @@ ID, verified replays as history, interrupted attempts re-evaluated) and all carr
 - `delete` releases the allocation of a managed universe when the container is gone.
 - `network_route_publish` / `network_route_withdraw` (`universe_uuid`, `ip`, `via`): the `/32`
   that follows a universe placed elsewhere, with the refusals above; both verified from `ip route`.
+  With `exclusive_resource`, the route is the exclusive effect of a role — the service address
+  of a logical manager, whose three replicas all run — and is published only by the host holding
+  a live, unsuperseded activation lease on that resource under the epoch gate
+  (`UNIVERSE-HIGH-AVAILABILITY.md`); the self-fence withdraws it once the lease is gone, so the
+  old governor's withdrawal precedes any new publication the agent asks for.
 - `network_status` (read-only): declaration, allocations, published routes, and the effective
   state read from Podman and the kernel; an observation that cannot be made is `unknown`.
 - `inspect`/`observe` report the requested profile from the labels and the effective network from
@@ -126,6 +131,35 @@ and proved from outside, with all three running, that their facts converged: thr
 one per owned scope, byte-identical sets on every replica, authenticated import receipts from
 both peers on each, exchange audit rows present, integrity ok; cleanup returned every host's
 routes and networks to their initial state. This is campaign 6's data path inside universes.
+
+**Step 5 (2026-09-14), the governor role with all three running:** `network_route_publish`
+takes an optional `exclusive_resource`: the route is then the exclusive effect of a role, and is
+accepted only from the host holding a live, unsuperseded activation lease on that resource
+under the epoch gate — refused under no policy, then for the lease gate's four reasons — and
+recorded with the resource; `activation_fence` withdraws every exclusive route whose resource
+this host no longer holds, verified from the kernel, and reports `routes_withdrawn`. The tool
+gained `rotate`, which rotates the epoch of a resource to a host and acquires it there without
+promoting or starting anything, and prints the permit for the other hosts' supersession. The
+resource is the logical manager's UUID; the exclusive effect is the `/32` of its service
+address (`10.86.0.100` in the lab, inside the prefix and outside every pool). Answering traffic
+at that address inside the replica is not built: what is proven is the announcement.
+`tests/check-manager-governor-managed.py` on the three hosts: step 4 reproduced; no host may
+publish before a policy exists; after `rotate` to lab-a (epoch 1) only lab-a publishes, lab-b
+is refused; `rotate` to lab-b (epoch 2), lab-a and lab-c superseded, lab-a's fence **withdrew
+the service route before lab-b published it**, the kernels showed no announcement in between
+and exactly one at every observed moment; lab-a refused to publish again under its superseded
+lease; a forged epoch-1 permit bound to lab-c was refused, and lab-c refused to publish without
+the role; **all three replicas ran throughout**, and their facts were still converged after the
+takeover. Each of the three rules was removed in turn and the suite rerun on the hosts: without
+the policy precondition, the first refusal was accepted; without the lease gate, lab-b's
+publication was accepted; without the fence's withdrawal, the fence reported no route withdrawn
+and the check on it failed — each red at its own case, then green again on the reference build.
+Two things the suite learned: the gate must be durable across runs (the resource is a fixed
+UUID and every host keeps the highest epoch it has seen, so a fresh gate per run is refused as
+superseded by the second run — the laboratory's precondition, met the hard way; a gate found
+behind the hosts is brought forward by explicit transfers and the report says so), and a store
+copied out of a running replica is a moving target (SQLite's WAL files come, go and grow under
+the copier), so a copy the copier could not complete is retried rather than trusted.
 
 **Known deviation, stated:** Podman's network firewall source-NATs traffic leaving the bridge's
 subnet, so a universe reaching another host's universe is seen there with the host's address.

@@ -475,10 +475,19 @@ verified from `podman network inspect` and `ip route`, exactly one announcement 
 `tests/check-manager-replicas-managed.py`: three Alpine manager universes (musl resident,
 `packaging/podmesh-manager/universe/replicated/` in the web tree generates the private replica
 set) concurrently on three hosts, facts converged while all three ran, inspected from `podman cp`
-copies by the attested inspector. Steps 5 to 7 (governor role under the epoch gate with all three
-running, stale permit, old-active rejoin, duplicate route refusal, peer loss and reconnection,
-recovery points combined) are not begun. Status: implemented, lab-tested on three hosts; not
-deployed, not production-qualified; nothing published.
+copies by the attested inspector; (5) the governor role under the existing epoch gate with all
+three running: `network_route_publish` with `exclusive_resource` is accepted only from the host
+holding a live, unsuperseded lease on the resource (the logical manager UUID), `activation_fence`
+withdraws exclusive routes of resources the host no longer holds, the tool's `rotate` moves the
+role without promoting or starting anything; `tests/check-manager-governor-managed.py` proved
+exactly one announcement of the service address at every observed moment, the old governor's
+withdrawal before the new publication, the stale permit and the old governor refused, all three
+replicas running and still converged across the takeover; Steps 6 (stale permit and old-active rejoin are covered above; duplicate address
+and peer loss and reconnection remain) and 7 (recovery points combined with the running replica set)
+are not begun. Not shown: a
+real partition, a host loss, the replica serving at the service address, an agent path to the
+control API. Status: implemented, lab-tested on three hosts; not deployed, not
+production-qualified; nothing published.
 
 ## Next actions, in order
 
