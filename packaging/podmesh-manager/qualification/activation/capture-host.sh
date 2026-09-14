@@ -128,7 +128,7 @@ dropin() {
   if [ -e "$installed" ]; then
     [ -f "$installed" ] && [ ! -L "$installed" ] || { echo 'Activation drop-in is unsafe' >&2; return 1; }
     local limits environment families allows denies expected_allow actual_allow policy
-    limits=$(python3 "$root/validate-dropin.py" --dropin "$installed") || return 1
+    limits=$(python3 "$root/validate-dropin.py" --dropin "$installed" --salt-file "$salt") || return 1
     environment=$(systemctl show podmesh-manager.service -p Environment --value) || return 1
     families=$(systemctl show podmesh-manager.service -p RestrictAddressFamilies --value) || return 1
     allows=$(systemctl show podmesh-manager.service -p IPAddressAllow --value) || return 1
@@ -143,7 +143,7 @@ dropin() {
       *) echo 'Effective deny-all policy is absent' >&2; return 1;;
     esac
     policy=$(printf '%s\0%s\0%s\0%s' "$environment" "$families" "$allows" "$denies" | commit_stdin effective-unit-network-policy)
-    jq -cn --arg sha "$(sha256sum -- "$installed"|awk '{print $1}')" --arg fragment "$(sha256sum -- "$packaged"|awk '{print $1}')" --arg policy "$policy" --argjson limits "$limits" '{present:true,sha256:$sha,semantic_limits:$limits,packaged_fragment_sha256:$fragment,inherited_deny_all:true,effective_policy_configured:true,effective_policy_commitment:$policy}'
+    jq -cn --arg sha "$(commit_file dropin "$installed" | sed 's/^sha256://')" --arg fragment "$(sha256sum -- "$packaged"|awk '{print $1}')" --arg policy "$policy" --argjson limits "$limits" '{present:true,sha256:$sha,semantic_limits:$limits,packaged_fragment_sha256:$fragment,inherited_deny_all:true,effective_policy_configured:true,effective_policy_commitment:$policy}'
   else
     jq -cn --arg fragment "$(sha256sum -- "$packaged"|awk '{print $1}')" '{present:false,sha256:null,semantic_limits:{network_mode:null,address_families:[],peer_allow_count:0,peer_allow_prefix_length:null},packaged_fragment_sha256:$fragment,inherited_deny_all:true,effective_policy_configured:false,effective_policy_commitment:null}'
   fi

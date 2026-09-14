@@ -48,6 +48,16 @@ DERIVED=("schema_version","logical_manager_commitment","replica_commitment","log
          "imported_operation_commitments")
 COUNTS=("history_count","receipt_count","audit_event_count","incomplete_attempt_count","unaudited_import_receipt_count")
 DIRECTIONS=("inbound","outbound")
+# The wire protocol prefixes each body with a big-endian u32 length
+# (manager-network/src/lib.rs:1543, :1613), so a complete frame is exactly its announced
+# body plus four bytes. Measured at four on every one of the fifty rows of a preserved
+# campaign store, in both directions.
+#
+# Deriving this from the campaign instead was a tautology and not a weaker check: the row
+# under test contributes to the set the overhead is taken from, so when the set had one
+# member the per-row comparison could not fail. The comparator is pinned to a frozen
+# candidate, so pinning its framing constant is the same commitment.
+FRAME_OVERHEAD=4
 AUTHORITIES=("peer-validated","pre-authentication")
 
 def validate_attempt(v, label):
@@ -315,10 +325,18 @@ def account_attempts(bases, cleanups, convs):
         return d
     rq=overhead_of("request_frame_bytes","request_announced_body_bytes")
     rp=overhead_of("reply_frame_bytes","reply_announced_body_bytes")
-    if len(rq)>1: failures.append("request framing overhead is not consistent across the campaign")
-    if len(rp)>1: failures.append("reply framing overhead is not consistent across the campaign")
-    overhead=rq.pop() if len(rq)==1 else None
-    reply_overhead=rp.pop() if len(rp)==1 else None
+    if rq-{FRAME_OVERHEAD}: failures.append("request frames do not carry the protocol framing overhead")
+    if rp-{FRAME_OVERHEAD}: failures.append("reply frames do not carry the protocol framing overhead")
+    overhead=reply_overhead=FRAME_OVERHEAD
+    # Every audit row belongs to exactly one folded exchange, so the rows collapsed must
+    # account for the whole audit history the same capture reports. Without this a host can
+    # publish an empty exchange list beside a non-zero audit count and nothing binds them.
+    for h,c in enumerate(cleanups):
+        i=c["inspection"]
+        if i is None or not i["store_present"]: continue
+        collapsed=sum(r["row_count"] for r in (c["exchanges"] or []))
+        if collapsed != i["audit_event_count"]:
+            failures.append(f"host {h}: the folded exchanges collapse {collapsed} audit rows but the store reports {i['audit_event_count']}")
 
     # Every folded exchange row in the campaign, indexed by nonce and by host.
     rows_by_nonce={}

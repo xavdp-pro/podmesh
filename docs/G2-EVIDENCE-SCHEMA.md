@@ -23,7 +23,7 @@ that lacks `exchanges` and would need a v4 a week later for the same lot. So the
 strings stay at their current values while the lot is open, and the inspection object
 grows on the branch under matched collector-and-comparator commits. Nothing sealed by a
 past campaign is read by this comparator; preserved evidence is re-derived by re-running
-the collector against preserved store copies, which is work item 6.
+the collector against preserved store copies, which is work item 7.
 
 Date: 2026-09-13. Authority: `/tmp/podmesh-claude/DECISIONS-CODEX-2026-09-13.md`,
 Decision 1. Predicate: [MANAGER-HA-ACCEPTANCE.md](MANAGER-HA-ACCEPTANCE.md), "The G2
@@ -35,17 +35,22 @@ A field-level inventory of the current pipeline established that **only conditio
 the eight is even partially evaluable from today's sealed evidence; conditions 1 to 6
 and 8 are not evaluable at all.**
 
-One line causes it. `capture-host.sh:137` projects the canonical inspection to nine
-keys. In doing so it folds `incomplete_attempts` — a vector of structs each carrying
-`direction`, `attempt_id`, `wire_nonce`, `wire_operation_id` and `last_phase`
-(`durable.rs:323-331`) — into a single integer, and drops four fields outright:
+One line caused it. The projection then at `capture-host.sh:137` reduced the canonical
+inspection to nine keys. *That citation is now stale by this lot's own hand: commit
+`eb0ccd3` moved the projection to `capture-host.sh:197` and widened it to sixteen keys.
+The line is kept in the past tense because this paragraph describes why the change was
+needed, and a reader following `:137` today lands in an unrelated systemd assertion.*
+
+What that projection did: it folded `incomplete_attempts` — a vector of structs each
+carrying `direction`, `attempt_id`, `wire_nonce`, `wire_operation_id` and `last_phase`
+(`durable.rs:323-331`) — into a single integer, and dropped four fields outright:
 
 | Dropped | Where it lives | What is lost |
 | --- | --- | --- |
 | `ordered_audit_events` | `durable.rs:316` | every per-attempt fact the join needs: peer, operation, nonce, phase, outcome, request digest, announced size, transferred bytes, reply bytes and digest, local and remote receipts, `replayed` |
 | `ordered_receipts`, `receipt_set_sha256` | `durable.rs:313-314` | per-receipt identity and set completeness |
 | `audit_set_sha256` | `durable.rs:317` | audit-set completeness across replicas |
-| `unaudited_import_receipt_ids` | `durable.rs:319`, computed `:2662-2676` (the diff itself at `:2667`) | **the** field condition 4 is about |
+| `unaudited_import_receipt_ids` | `durable.rs:319`, computed `:2662-2676` (the set difference itself at `:2673`; `:2667` is only the binding head) | **the** field condition 4 is about |
 
 The amended predicate is therefore not merely unmet — it cannot be computed from what a
 campaign seals. This is a collector and schema change first, and a comparator change
@@ -65,7 +70,8 @@ It does not. `CanonicalStoreInspection` (`durable.rs:302-321`) already declares
 plain `Serialize` with no `skip` attribute anywhere; and `--inspect-store` serializes the
 whole struct (`main.rs:32`). Every field the amended predicate needs is on the frozen
 candidate's stdout today and is thrown away by one projection in the collector
-(`capture-host.sh:137`). **v4 is a collector and comparator change, start to finish.**
+(the projection, now `capture-host.sh:197`). **v4 is a collector and comparator change,
+start to finish.**
 
 ### Correction: `immutable_schema_verified` cannot be published
 
@@ -236,8 +242,8 @@ second sample.
 - **Bounded.** Per-exchange rows are scoped to the campaign window, so a host publishes
   on the order of one row per inbound exchange it served — about 125 in the measured
   campaign, not the whole audit history.
-- **Versioned in lockstep.** `compare-evidence.py` pins the inspection object to exactly
-  nine keys against a sealed schema string, so the collector, the comparator, its
+- **Versioned in lockstep.** `compare-evidence.py` pins the inspection object to an exact
+  key set against a sealed schema string — nine keys when this was written, sixteen now, so the collector, the comparator, its
   fixtures and the schema version change together and are re-sealed together.
 
 ## The schema
@@ -279,7 +285,9 @@ Inspection `schema_version` moves 3 → **4**; evidence
 ```
 
 `direction` and `last_phase` are enumerations of the candidate's own vocabulary
-(`durable.rs:220-232`), not free text, and they identify nothing.
+(`AuditDirection` at `durable.rs:213-218`, `AuditPhase` at `:220-230`; an earlier `:220-232`
+named neither cleanly and reached into `AuditOutcome` at `:234`), not free text, and they
+identify nothing.
 
 ### `exchanges` — the receiver side of the join
 

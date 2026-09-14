@@ -90,7 +90,8 @@ def evidence(i,stage):
     if stage=="active-baseline":
         inspection=inspect(h(f"baseline-{i}"),0,0,0,[],None); exchanges=[]
     if stage in ("converged","post-cleanup"):
-        inspection=inspect(h("history"),3,3,9,[],None); exchanges=[served(0),served(1)]
+        exchanges=[served(0),served(1)]
+        inspection=inspect(h("history"),3,3,sum(r["row_count"] for r in exchanges),[],None)
     return {"schema_version":"podmesh-manager-live-activation-evidence/v2","host_alias":aliases[i],"stage":stage,
       "package":{"name":"podmesh-manager","version":"0.1.0~manager2","binary_sha256":h("binary"),"dpkg_verify":"clean"},
       "configuration":{"document_commitment":c(f"config-{i}"),"logical_manager_commitment":c("logical"),"local_replica_commitment":replicas[i],"local_host_commitment":hosts[i],"topology_commitment":c("topology"),"peer_count":2,"peers":peers},
@@ -245,8 +246,8 @@ served="{\"nonce_commitment\":\"$N\",\"nonce_authority\":\"peer-validated\",\"jo
 
 # $1 is an optional jq filter applied to the RECEIVER's served row, to break one condition.
 build_strand() {
-  jq ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .inspection.audit_event_count=9 | .exchanges += [$sent] | .inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-a-post-cleanup.json" > "$work/sa.json"; sidecar "$work/sa.json"
-  jq ".exchanges += [$served${1:+ | $1}] | .inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-b-post-cleanup.json" > "$work/sb.json"; sidecar "$work/sb.json"
+  jq ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges += [$sent] | .inspection.audit_event_count=([.exchanges[].row_count]|add) | .inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-a-post-cleanup.json" > "$work/sa.json"; sidecar "$work/sa.json"
+  jq ".exchanges += [$served${1:+ | $1}] | .inspection.audit_event_count=([.exchanges[].row_count]|add) | .inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-b-post-cleanup.json" > "$work/sb.json"; sidecar "$work/sb.json"
   jq ".inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-c-post-cleanup.json" > "$work/sc0.json"; sidecar "$work/sc0.json"
   "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work"/*-converged.json --cleanup "$work/sa.json" "$work/sb.json" "$work/sc0.json" > "$work/strand-report.json" 2>"$work/strand-err.txt"
 }
@@ -279,8 +280,8 @@ strand_refuse 'the reply was truncated'             '.reply_frame_bytes=600' 'di
 # and watching the suite stay green. A refusal path nothing exercises is a refusal path
 # nobody has, and three of these guard the clauses the predicate is most about.
 strand_three() {   # $1 applied to lab-a, $2 to lab-b's served row, $3 to lab-c
-  jq ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .inspection.audit_event_count=9 | .exchanges += [$sent] | .inspection.imported_operation_commitments=[\"$OP\"]${1:+ | $1}" "$work/lab-a-post-cleanup.json" > "$work/sa.json"; sidecar "$work/sa.json"
-  jq ".exchanges += [$served${2:+ | $2}] | .inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-b-post-cleanup.json" > "$work/sb.json"; sidecar "$work/sb.json"
+  jq ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges += [$sent] | .inspection.audit_event_count=([.exchanges[].row_count]|add) | .inspection.imported_operation_commitments=[\"$OP\"]${1:+ | $1}" "$work/lab-a-post-cleanup.json" > "$work/sa.json"; sidecar "$work/sa.json"
+  jq ".exchanges += [$served${2:+ | $2}] | .inspection.audit_event_count=([.exchanges[].row_count]|add) | .inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-b-post-cleanup.json" > "$work/sb.json"; sidecar "$work/sb.json"
   jq ".inspection.imported_operation_commitments=[\"$OP\"]${3:+ | $3}" "$work/lab-c-post-cleanup.json" > "$work/sc.json"; sidecar "$work/sc.json"
   "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work"/*-converged.json --cleanup "$work/sa.json" "$work/sb.json" "$work/sc.json" > "$work/strand-report.json" 2>"$work/strand-err.txt"
 }
@@ -321,6 +322,14 @@ reject_error 'attempts reported with no audit events' ".inspection.incomplete_at
 three_refuse 'the attempt names another operation' '.inspection.incomplete_attempts[0].operation_commitment="sha256:ffff999999999999999999999999999999999999999999999999999999999999"' '' '' 'name different operations'
 three_refuse 'an import committed without an accepted outcome' '' '.outcomes=["refused"]' '' 'import without an accepted outcome'
 three_refuse 'a refusal recorded beside an accepted outcome' '' '.phases_reached += ["inbound_refusal_recorded"] | .row_count=5' '' 'refusal and an accepted outcome at once'
+
+# Exchanges must account for the whole audit history: every audit row belongs to exactly
+# one folded exchange. Without this a host publishes an empty exchange list beside a
+# non-zero audit count and nothing binds the two.
+three_refuse 'exchanges that do not account for the audit history' '.inspection.audit_event_count += 3' '' '' 'collapse'
+# And the framing overhead is the protocol constant, not whatever the campaign agrees on:
+# deriving it from the rows under test made the per-row comparison unable to fail.
+three_refuse 'frames not carrying the protocol overhead' '' '.request_frame_bytes=2827 | .request_announced_body_bytes=2731' '' 'do not carry the protocol framing overhead'
 
 printf '%s\n' 'PASS: strand accounting — one stranded attempt joined to its receiver, and eleven conditions each refused on its own.'
 

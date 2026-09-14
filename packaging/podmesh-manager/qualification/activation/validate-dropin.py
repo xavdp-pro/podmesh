@@ -12,7 +12,7 @@ def fail(message):
     raise ValueError(message)
 
 
-def validate(path):
+def validate(path, salt=None):
     raw = Path(path).read_bytes()
     if b"\x00" in raw:
         fail("drop-in contains a NUL byte")
@@ -66,7 +66,14 @@ def validate(path):
     if len(set(addresses)) != 2:
         fail("peer /32 allowances are duplicated")
     return {
-        "sha256": hashlib.sha256(raw).hexdigest(),
+        # A salted commitment, not a bare digest. The drop-in's content is a fixed
+        # four-line template plus the two peer IPv4 addresses, so a raw digest of it is a
+        # confirmation oracle: anyone with the template can enumerate a lab subnet and
+        # recover the peer pair from published evidence. Decision 1 forbids publishing
+        # endpoints, and the collector salts every other identifier for exactly this
+        # reason. The collector recomputes this independently, so equality still proves
+        # both tools read the same bytes.
+        "sha256": commitment(raw, salt),
         "network_mode": "authenticated-static-peers",
         "address_families": ["AF_UNIX", "AF_INET"],
         "peer_allow_count": 2,
@@ -74,13 +81,20 @@ def validate(path):
     }
 
 
+def commitment(raw, salt):
+    if salt is None:
+        return hashlib.sha256(raw).hexdigest()
+    return hashlib.sha256(salt + b"\x00dropin\x00" + raw).hexdigest()
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dropin", required=True)
+    parser.add_argument("--salt-file", help="commit the drop-in digest under this private campaign salt")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
     try:
-        value = validate(args.dropin)
+        salt = Path(args.salt_file).read_bytes() if args.salt_file else None
+        value = validate(args.dropin, salt)
     except (OSError, ValueError) as error:
         print(f"drop-in refused: {error}", file=sys.stderr)
         return 2
