@@ -79,13 +79,19 @@ def evidence(i,stage):
     peers=[{"replica_id_commitment":replicas[j],"endpoint_commitment":c(f"endpoint-{j}"),"shared_key_commitment":keys[tuple(sorted((i,j)))]} for j in range(3) if j!=i]
     limits={"network_mode":"authenticated-static-peers","address_families":["AF_UNIX","AF_INET"],"peer_allow_count":2,"peer_allow_prefix_length":32,"sha256":h("dropin")} if running else {"network_mode":None,"address_families":[],"peer_allow_count":0,"peer_allow_prefix_length":None}
     def inspect(history, hc, rc, ac, attempts, exchanges):
+        exchanges = exchanges or []
         return {"store_present":True,"schema_version":4,"logical_manager_commitment":c("logical"),
                 "replica_commitment":replicas[i],"logical_history_sha256":history,
                 "receipt_set_sha256":h(f"receipts-{i}-{stage}"),"audit_set_sha256":h(f"audits-{i}-{stage}"),
                 "sqlite_integrity_result":"ok","history_count":hc,"receipt_count":rc,"audit_event_count":ac,
                 "incomplete_attempt_count":len(attempts),"incomplete_attempts":attempts,
                 "unaudited_import_receipt_count":0,"unaudited_import_receipt_commitments":[],
-                "imported_operation_commitments":[]}
+                # Derived from the rows that back it, never asserted: a replica holds an
+                # imported operation exactly when one of its own inbound rows committed the
+                # import and carries the receipt.
+                "imported_operation_commitments":sorted({r["operation_commitment"] for r in (exchanges or [])
+                    if r["direction"]=="inbound" and "inbound_import_committed" in r["phases_reached"]
+                    and r["local_receipt_commitment"] is not None and r["operation_commitment"] is not None})}
     # One folded exchange per nonce: an inbound exchange collapses four audit rows, a
     # completed outbound attempt two. The shapes are the ones measured on a preserved store.
     def served(k):
@@ -99,10 +105,10 @@ def evidence(i,stage):
                 "reply_announced_body_bytes":622,"outcomes":["accepted"],"replayed":False}
     inspection=None; exchanges=None
     if stage in ("pre-activation","active-baseline"):
-        inspection=inspect(h(f"baseline-{i}"),0,0,0,[],None); exchanges=[]
+        exchanges=[]; inspection=inspect(h(f"baseline-{i}"),0,0,0,[],exchanges)
     if stage in ("converged","post-cleanup"):
         exchanges=[served(0),served(1)]
-        inspection=inspect(h("history"),3,3,sum(r["row_count"] for r in exchanges),[],None)
+        inspection=inspect(h("history"),3,3,sum(r["row_count"] for r in exchanges),[],exchanges)
     return {"schema_version":"podmesh-manager-live-activation-evidence/v3","host_alias":aliases[i],"stage":stage,
       "package":{"name":"podmesh-manager","version":"0.1.0~manager2","binary_sha256":h("binary"),"dpkg_verify":"clean"},
       "configuration":{"document_commitment":c(f"config-{i}"),"logical_manager_commitment":c("logical"),"local_replica_commitment":replicas[i],"local_host_commitment":hosts[i],"topology_commitment":c("topology"),"peer_count":2,"peers":peers},
@@ -119,6 +125,11 @@ for i in range(3):
         path.write_text(json.dumps(evidence(i,stage)))
         (r/f"{path.name}.sha256").write_text(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path}\n")
 PY
+
+# A replica holds an imported operation exactly when one of its own inbound rows committed
+# the import and carries the receipt. Derived, never asserted: a fixture that asserts it
+# independently models a host that cannot exist, and the comparator now refuses that.
+derive_imported='if .inspection == null or (.inspection.store_present | not) then . else .inspection.imported_operation_commitments=([(.exchanges // [])[] | select(.direction=="inbound" and (.phases_reached|index("inbound_import_committed")) and .local_receipt_commitment!=null and .operation_commitment!=null) | .operation_commitment] | unique) end'
 
 sidecar() { sha256sum -- "$1" > "$1.sha256"; }
 # `jq -e` on an EMPTY file exits 0 without ever evaluating its filter. So an assertion made
@@ -137,8 +148,8 @@ jq -e '.status=="PASS" and .canonical_convergence_evidenced and .ha_claim=="abse
 jq -e '(.dropin.semantic_limits|length)==5 and .dropin.semantic_limits.sha256==.dropin.sha256' "$work/lab-a-active-baseline.json" >/dev/null
 jq -e '(.dropin.semantic_limits|length)==4 and (.dropin.semantic_limits|has("sha256")|not)' "$work/lab-a-pre-activation.json" >/dev/null
 
-reject_host() { local label=$1 filter=$2; jq "$filter" "$work/lab-a-${3:-post-cleanup}.json" > "$work/bad.json"; sidecar "$work/bad.json"; local args=("${host_args[@]}"); case ${3:-post-cleanup} in pre-activation) args[3]="$work/bad.json";; active-baseline) args[5]="$work/bad.json";; converged) args[7]="$work/bad.json";; post-cleanup) args[9]="$work/bad.json";; esac; if "$root/compare-evidence.py" "${args[@]}" >/dev/null; then echo "accepted $label" >&2; exit 1; fi; }
-reject_three() { local label=$1 filter=$2 stage=$3; jq "$filter" "$work/lab-a-$stage.json" > "$work/bad.json"; sidecar "$work/bad.json"; local args=("${three_args[@]}"); case $stage in active-baseline) args=(--phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work/bad.json" "$work/lab-b-active-baseline.json" "$work/lab-c-active-baseline.json" --converged "$work"/*-converged.json --cleanup "$work"/*-post-cleanup.json);; converged) args=(--phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work/bad.json" "$work/lab-b-converged.json" "$work/lab-c-converged.json" --cleanup "$work"/*-post-cleanup.json);; esac; if "$root/compare-evidence.py" "${args[@]}" >/dev/null; then echo "accepted $label" >&2; exit 1; fi; }
+reject_host() { local label=$1 filter=$2; jq "$filter | $derive_imported" "$work/lab-a-${3:-post-cleanup}.json" > "$work/bad.json"; sidecar "$work/bad.json"; local args=("${host_args[@]}"); case ${3:-post-cleanup} in pre-activation) args[3]="$work/bad.json";; active-baseline) args[5]="$work/bad.json";; converged) args[7]="$work/bad.json";; post-cleanup) args[9]="$work/bad.json";; esac; if "$root/compare-evidence.py" "${args[@]}" >/dev/null; then echo "accepted $label" >&2; exit 1; fi; }
+reject_three() { local label=$1 filter=$2 stage=$3; jq "$filter | $derive_imported" "$work/lab-a-$stage.json" > "$work/bad.json"; sidecar "$work/bad.json"; local args=("${three_args[@]}"); case $stage in active-baseline) args=(--phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work/bad.json" "$work/lab-b-active-baseline.json" "$work/lab-c-active-baseline.json" --converged "$work"/*-converged.json --cleanup "$work"/*-post-cleanup.json);; converged) args=(--phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work/bad.json" "$work/lab-b-converged.json" "$work/lab-c-converged.json" --cleanup "$work"/*-post-cleanup.json);; esac; if "$root/compare-evidence.py" "${args[@]}" >/dev/null; then echo "accepted $label" >&2; exit 1; fi; }
 
 reject_host 'unknown route observation' '.stability.routes.status="unknown"'
 reject_host 'failed service result' '.service.result="signal"'
@@ -150,7 +161,7 @@ reject_host 'socket wrong owner' '.paths.control_socket.uid=996' converged
 reject_host 'state owner changed' '.paths.state.uid=996' converged
 reject_host 'cleanup inspection regression' '.inspection.history_count=2'
 reject_host 'cleanup history mutation without count growth' '.inspection.logical_history_sha256="0000000000000000000000000000000000000000000000000000000000000000"'
-reject_error() { local label=$1 filter=$2 stage=$3 expected=$4; jq "$filter" "$work/lab-a-$stage.json" > "$work/bad.json"; sidecar "$work/bad.json"; local args=("${host_args[@]}"); case $stage in pre-activation) args[3]="$work/bad.json";; active-baseline) args[5]="$work/bad.json";; converged) args[7]="$work/bad.json";; post-cleanup) args[9]="$work/bad.json";; esac; if "$root/compare-evidence.py" "${args[@]}" > "$work/bad-report.json"; then echo "accepted $label" >&2; exit 1; fi; [ -s "$work/bad-report.json" ] || { echo "$label: the comparator produced no report at all, which is a crash and not a refusal" >&2; exit 1; }; jq -e --arg e "$expected" '.status=="FAIL" and (.error|contains($e))' "$work/bad-report.json" >/dev/null || { echo "$label was refused for another reason: $(cat "$work/bad-report.json")" >&2; exit 1; }; }
+reject_error() { local label=$1 filter=$2 stage=$3 expected=$4; jq "$filter | $derive_imported" "$work/lab-a-$stage.json" > "$work/bad.json"; sidecar "$work/bad.json"; local args=("${host_args[@]}"); case $stage in pre-activation) args[3]="$work/bad.json";; active-baseline) args[5]="$work/bad.json";; converged) args[7]="$work/bad.json";; post-cleanup) args[9]="$work/bad.json";; esac; if "$root/compare-evidence.py" "${args[@]}" > "$work/bad-report.json"; then echo "accepted $label" >&2; exit 1; fi; [ -s "$work/bad-report.json" ] || { echo "$label: the comparator produced no report at all, which is a crash and not a refusal" >&2; exit 1; }; jq -e --arg e "$expected" '.status=="FAIL" and (.error|contains($e))' "$work/bad-report.json" >/dev/null || { echo "$label was refused for another reason: $(cat "$work/bad-report.json")" >&2; exit 1; }; }
 reject_error 'active drop-in without validated hash' 'del(.dropin.semantic_limits.sha256)' active-baseline 'dropin.semantic_limits: unsafe shape'
 reject_error 'malformed validated drop-in hash' '.dropin.semantic_limits.sha256="not-a-sha256"' active-baseline 'dropin.semantic_limits.sha256: invalid SHA-256'
 reject_error 'validated drop-in hash unbound from installed drop-in' '.dropin.semantic_limits.sha256="0000000000000000000000000000000000000000000000000000000000000000"' active-baseline 'validated drop-in hash is not the installed drop-in hash'
@@ -260,9 +271,9 @@ retry_served="{\"nonce_commitment\":\"$RN\",\"nonce_authority\":\"peer-validated
 
 # $1 is an optional jq filter applied to the RECEIVER's served row, to break one condition.
 build_strand() {
-  jq ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges += [$sent,$retry_sent] | .inspection.audit_event_count=([.exchanges[].row_count]|add) | .inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-a-post-cleanup.json" > "$work/sa.json"; sidecar "$work/sa.json"
-  jq ".exchanges += [$served${1:+ | $1},$retry_served] | .inspection.audit_event_count=([.exchanges[].row_count]|add) | .inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-b-post-cleanup.json" > "$work/sb.json"; sidecar "$work/sb.json"
-  jq ".inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-c-post-cleanup.json" > "$work/sc0.json"; sidecar "$work/sc0.json"
+  jq ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges += [$sent,$retry_sent] | .inspection.audit_event_count=([.exchanges[].row_count]|add) | $derive_imported" "$work/lab-a-post-cleanup.json" > "$work/sa.json"; sidecar "$work/sa.json"
+  jq ".exchanges += [$served${1:+ | $1},$retry_served] | $derive_imported | .inspection.audit_event_count=([.exchanges[].row_count]|add)" "$work/lab-b-post-cleanup.json" > "$work/sb.json"; sidecar "$work/sb.json"
+  jq "$derive_imported" "$work/lab-c-post-cleanup.json" > "$work/sc0.json"; sidecar "$work/sc0.json"
   "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work"/*-converged.json --cleanup "$work/sa.json" "$work/sb.json" "$work/sc0.json" > "$work/strand-report.json" 2>"$work/strand-err.txt"
 }
 build_strand
@@ -293,15 +304,15 @@ strand_refuse 'the reply was truncated'             '.reply_frame_bytes=600' 'di
 # Four conditions the nine refusals above do not reach, found by weakening the comparator
 # and watching the suite stay green. A refusal path nothing exercises is a refusal path
 # nobody has, and three of these guard the clauses the predicate is most about.
-strand_three() {   # $1 applied to lab-a, $2 to lab-b's served row, $3 to lab-c
-  jq ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges += [$sent] | .inspection.audit_event_count=([.exchanges[].row_count]|add) | .inspection.imported_operation_commitments=[\"$OP\"]${1:+ | $1}" "$work/lab-a-post-cleanup.json" > "$work/sa.json"; sidecar "$work/sa.json"
-  jq ".exchanges += [$served${2:+ | $2}] | .inspection.audit_event_count=([.exchanges[].row_count]|add) | .inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-b-post-cleanup.json" > "$work/sb.json"; sidecar "$work/sb.json"
-  jq ".inspection.imported_operation_commitments=[\"$OP\"]${3:+ | $3} | .inspection.audit_event_count=([.exchanges[].row_count]|add)" "$work/lab-c-post-cleanup.json" > "$work/sc.json"; sidecar "$work/sc.json"
+strand_three() {   # $1 lab-a, $2 lab-b's served row, $3 lab-c before deriving, $4 lab-c after
+  jq ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges += [$sent] | $derive_imported | .inspection.audit_event_count=([.exchanges[].row_count]|add)${1:+ | $1}" "$work/lab-a-post-cleanup.json" > "$work/sa.json"; sidecar "$work/sa.json"
+  jq ".exchanges += [$served${2:+ | $2}] | $derive_imported | .inspection.audit_event_count=([.exchanges[].row_count]|add)" "$work/lab-b-post-cleanup.json" > "$work/sb.json"; sidecar "$work/sb.json"
+  jq "${3:+ $3 | }$derive_imported | .inspection.audit_event_count=([.exchanges[].row_count]|add)${4:+ | $4}" "$work/lab-c-post-cleanup.json" > "$work/sc.json"; sidecar "$work/sc.json"
   "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work"/*-converged.json --cleanup "$work/sa.json" "$work/sb.json" "$work/sc.json" > "$work/strand-report.json" 2>"$work/strand-err.txt"
 }
 three_refuse() {
-  local label=$1 fa=$2 fb=$3 fc=$4 expected=$5
-  if strand_three "$fa" "$fb" "$fc"; then echo "accepted $label" >&2; exit 1; fi
+  local label=$1 fa=$2 fb=$3 fc=$4 expected=$5 fc_after=${6:-}
+  if strand_three "$fa" "$fb" "$fc" "$fc_after"; then echo "accepted $label" >&2; exit 1; fi
   report_says "$work/strand-report.json" '.status=="FAIL"' "$label did not produce a verdict"
   grep -q "$expected" <(jq -r '(.failures[]?), (.error // empty)' "$work/strand-report.json") || { echo "$label was refused for another reason: $(jq -c '.failures' "$work/strand-report.json")" >&2; exit 1; }
 }
@@ -319,10 +330,10 @@ three_refuse 'an unaudited import receipt exists' '' '' '.inspection.unaudited_i
 # proof. The former every-replica receipt branch was unreachable for the candidate because
 # an import receipt belongs to its receiver. With no receiver-observed replay, the attempt
 # remains unaccounted even when every fixture claims the operation globally.
-three_refuse 'history convergence alone does not account for an attempt' '' '' '.inspection.imported_operation_commitments=[]' 'no receiver observed a complete replay'
+three_refuse 'history convergence alone does not account for an attempt' '' '' '' 'no receiver observed a complete replay'
 # And the replay must be observed by someone else: a sender asserting `replayed` on its own
 # outbound row closed the condition by itself before.
-three_refuse 'the sender asserts its own replay' '.exchanges[-1].replayed=true' '' '.inspection.imported_operation_commitments=[]' 'no receiver observed a complete replay'
+three_refuse 'the sender asserts its own replay' '.exchanges[-1].replayed=true' '' '' 'no receiver observed a complete replay'
 
 # The forgeries an independent review demonstrated against this comparator. Each check that
 # closes one is exercised here, because implementing a check and never testing it leaves the
@@ -351,8 +362,11 @@ three_refuse 'an attempt conjured into a capture with no row of its own' '.inspe
 # into another row's count and keep the collapsed total equal to its reported audit count.
 three_refuse 'a folded row absorbing more rows than a nonce can have' '' '.row_count=8' '' 'cannot collapse more than four audit rows'
 # Condition 6 rests on this list, and it was bound to nothing the same host publishes.
-three_refuse 'more imported operations than receipts to hold them' '' '' '.inspection.imported_operation_commitments=["sha256:bbbb111111111111111111111111111111111111111111111111111111111111","sha256:cccc111111111111111111111111111111111111111111111111111111111111","sha256:dddd111111111111111111111111111111111111111111111111111111111111","sha256:eeee111111111111111111111111111111111111111111111111111111111111"]' 'more imported operations than receipts'
-three_refuse 'a repeated imported operation' '' '' '.inspection.imported_operation_commitments=["sha256:bbbb111111111111111111111111111111111111111111111111111111111111","sha256:bbbb111111111111111111111111111111111111111111111111111111111111"]' 'repeats an operation'
+# The receipt_count bound these two were written against is withdrawn: it rested on an
+# integer the same host asserts. What replaced it binds the list to the capture's own
+# committed inbound rows, and that is what is tested now.
+three_refuse 'an imported operation with no committed row behind it' '' '' '' 'not exactly the operations this capture committed an import for' '.inspection.imported_operation_commitments += ["sha256:bbbb111111111111111111111111111111111111111111111111111111111111"]'
+three_refuse 'a committed import missing from the imported list' '' '' '' 'not exactly the operations this capture committed an import for' '.inspection.imported_operation_commitments=[]'
 # The campaign-wide reply framing check is the only one that reaches a row no attempt joins.
 three_refuse 'a reply frame not carrying the protocol overhead' '' '' '.exchanges[0].reply_frame_bytes=999' 'reply frames do not carry the protocol framing overhead'
 # An empty reply body satisfied "completely written" arithmetically.

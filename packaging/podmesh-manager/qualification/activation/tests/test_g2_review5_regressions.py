@@ -122,7 +122,6 @@ class ReviewFiveCase(ComparatorCase):
         receiver = copy.deepcopy(RECEIVER_SERVED)
         self.fixtures[("lab-a", stage)]["exchanges"].append(sender)
         self.fixtures[("lab-b", stage)]["exchanges"].append(receiver)
-        self.fixtures[("lab-b", stage)]["inspection"]["imported_operation_commitments"] = [OPERATION]
         recount(self.fixtures[("lab-a", stage)])
         recount(self.fixtures[("lab-b", stage)])
         return sender, receiver
@@ -161,7 +160,6 @@ class ReviewFiveCase(ComparatorCase):
         capture["exchanges"].append(copy.deepcopy(row))
         capture["inspection"]["history_count"] = max(capture["inspection"]["history_count"], 1)
         capture["inspection"]["receipt_count"] = max(capture["inspection"]["receipt_count"], 1)
-        capture["inspection"]["imported_operation_commitments"] = [operation]
         recount(capture)
         return attempt, row
 
@@ -210,6 +208,10 @@ class ReplayMutationTests(ReviewFiveCase):
     def test_r8_replay_binds_the_original_operation(self) -> None:
         self.install_valid_replay()
         self.replay_receiver()["operation_commitment"] = commitment("different-operation")
+        for host in ("lab-a", "lab-b", "lab-c"):
+            capture = self.fixtures[(host, "post-cleanup")]
+            if capture["inspection"] and capture["inspection"].get("store_present"):
+                recount(capture)
         self.assert_refuses_for(self.REPLAY_REASON)
 
     def test_r9_original_nonce_cannot_claim_to_be_its_own_replay(self) -> None:
@@ -375,9 +377,11 @@ class ReportingAndReachabilityTests(ReviewFiveCase):
         self.assertEqual(len(unmatched["detail"]), 1, report)
 
     def test_n5_impossible_every_replica_receipt_branch_does_not_account(self) -> None:
+        # The list is no longer asserted here: a replica holds an imported operation only
+        # when one of its own inbound rows committed the import, so only the receiver holds
+        # it. That is what makes the branch impossible to satisfy on its own, which is what
+        # this test is about -- previously the setup had to fabricate the impossible state.
         self.install_strand("post-cleanup")
-        for host in ("lab-a", "lab-b", "lab-c"):
-            self.fixtures[(host, "post-cleanup")]["inspection"]["imported_operation_commitments"] = [OPERATION]
         self.assert_refuses_for("no receiver observed a complete replay carrying the durable receipt")
 
 
@@ -401,6 +405,11 @@ class CaptureAndIdentityTests(ReviewFiveCase):
                 if value["nonce_commitment"] == NONCE
             )
             row["operation_commitment"] = commitment("rewritten-operation")
+            # A host that rewrote an operation would publish an imported list to match, so
+            # the capture is made self-consistent before the cross-stage rule is asked about
+            # it. Otherwise a stricter within-capture rule answers first and this test passes
+            # for the wrong reason.
+            recount(self.fixtures[(host, "post-cleanup")])
         self.assert_refuses_for("exchange operation_commitment changed")
 
     def test_n7_outbound_fold_is_capped_at_two_rows(self) -> None:

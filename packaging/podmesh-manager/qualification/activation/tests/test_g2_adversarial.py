@@ -141,7 +141,6 @@ class ComparatorCase(unittest.TestCase):
         if receiver:
             target = self.fixtures[("lab-b", stage)]
             target["exchanges"].append(copy.deepcopy(RECEIVER_SERVED))
-            target["inspection"]["imported_operation_commitments"] = [OPERATION]
             recount(target)
 
     def install_replay(self, *, valid: bool) -> None:

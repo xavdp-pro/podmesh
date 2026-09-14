@@ -204,13 +204,32 @@ def build_fixture(comparator: Path) -> dict[tuple[str, str], dict]:
             "graceful_shutdown": copy.deepcopy(shutdown) if cleanup else None,
         }
 
-    return {(alias, stage): evidence(index, stage) for index, alias in enumerate(ALIASES) for stage in STAGES}
+    built = {(alias, stage): evidence(index, stage) for index, alias in enumerate(ALIASES) for stage in STAGES}
+    # Every capture is made self-consistent at build time, so a fixture starts out describing
+    # a host that could exist. Tests that want an inconsistent capture create it deliberately
+    # afterwards, which is the only way an inconsistency should ever appear.
+    for capture in built.values():
+        if capture["inspection"] and capture["inspection"].get("store_present"):
+            recount(capture)
+    return built
 
 
 def recount(capture: dict) -> None:
     inspection = capture["inspection"]
     inspection["audit_event_count"] = sum(row["row_count"] for row in capture["exchanges"])
     inspection["incomplete_attempt_count"] = len(inspection["incomplete_attempts"])
+    # A replica holds an imported operation exactly when one of its OWN inbound rows
+    # committed an import and carries the receipt. Derived here rather than asserted, because
+    # a fixture that asserts it independently models a host that cannot exist -- and the
+    # comparator's bound on this list is what carries condition 6's every-replica branch.
+    # Measured on a live three-host campaign the two sets are equal on every host: 28/28,
+    # 32/32, 32/32.
+    inspection["imported_operation_commitments"] = sorted(
+        {row["operation_commitment"] for row in capture["exchanges"]
+         if row["direction"] == "inbound"
+         and "inbound_import_committed" in row["phases_reached"]
+         and row["local_receipt_commitment"] is not None
+         and row["operation_commitment"] is not None})
 
 
 def seal(directory: Path, fixtures: dict[tuple[str, str], dict]) -> None:

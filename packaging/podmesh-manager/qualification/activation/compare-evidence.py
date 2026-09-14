@@ -138,11 +138,11 @@ def validate_inspection(v, label):
     if len(set(nonces)) != len(nonces): raise ValueError(f"{label}: two incomplete attempts share one wire nonce")
     if not isinstance(v["imported_operation_commitments"],list): raise ValueError(f"{label}.imported_operation_commitments: must be a list")
     for i,c in enumerate(v["imported_operation_commitments"]): commit(c,f"{label}.imported_operation_commitments[{i}]")
-    # The collector derives this as the distinct wire operations among the receipts this
-    # replica holds, so it cannot exceed the receipt count. Unbounded, it is a free-text
-    # list on which condition 6 rests its "held with a receipt on every replica".
-    if len(v["imported_operation_commitments"]) > v["receipt_count"]:
-        raise ValueError(f"{label}: more imported operations than receipts to hold them")
+    # The receipt_count bound that stood here is withdrawn, and withdrawn rather than kept
+    # alongside because it is strictly weaker and rests on the wrong thing: receipt_count is
+    # an integer the same host asserts, so raising it lifted the bound. The list is now
+    # bound in validate() to the capture's own committed inbound rows, which no integer can
+    # inflate. Keeping both meant the weaker rule answered first and masked the stronger one.
     if len(set(v["imported_operation_commitments"])) != len(v["imported_operation_commitments"]):
         raise ValueError(f"{label}: imported_operation_commitments repeats an operation")
     # An incomplete attempt is derived from audit rows, so a store reporting attempts while
@@ -280,24 +280,20 @@ def validate(v,label):
             highest=max(r["phases_reached"],key=PHASE_RANK[a["direction"]].get)
             if a["last_phase"] != highest:
                 raise ValueError(f"{label}: an incomplete attempt last_phase is not the highest corroborating phase")
-        # NOT YET ENFORCED, and the reason is recorded rather than left as silence.
-        # Condition 6's every-replica branch rests on imported_operation_commitments, whose
-        # only bound is receipt_count -- an integer the same host asserts, so raising it
-        # lifts the bound. Attacking an evidence set that had just returned PASS showed the
-        # hole: receipt_count 999 passes.
+        # Condition 6's every-replica branch rests on imported_operation_commitments, and its
+        # only bound was receipt_count -- an integer the same host asserts, so raising it to
+        # 999 lifted the bound and the campaign passed. Found by attacking an evidence set
+        # that had just returned PASS.
         #
-        # The bound that closes it does not use a self-asserted integer at all. A replica
-        # holds an imported operation exactly when one of its own inbound rows committed an
-        # import and carries the receipt, and on a live campaign the two sets are EQUAL on
-        # all three hosts: 28/28, 32/32, 32/32. Requiring inclusion is enough to close the
-        # hole; requiring equality would be stronger still.
-        #
-        # It is not enabled because the synthetic fixtures assert imported operations
-        # without publishing rows that back them, so the rule reds three suites, two of them
-        # written by another agent in this shared tree. Enabling it means rewriting about
-        # twenty fixture sites to derive the list from their own rows, which is how a real
-        # host produces it. That is a lot of its own, not a line to slip in beside a passing
-        # campaign.
+        # The bound uses no self-asserted integer. A replica holds an imported operation
+        # exactly when one of its OWN inbound rows committed an import and carries the
+        # receipt. Measured on a live three-host campaign the two sets are equal on every
+        # host -- 28/28, 32/32, 32/32 -- so equality is required rather than inclusion.
+        committed={r["operation_commitment"] for r in (v["exchanges"] or [])
+                   if r["direction"]=="inbound" and TERMINAL_IMPORT_PHASE in r["phases_reached"]
+                   and r["local_receipt_commitment"] is not None and r["operation_commitment"] is not None}
+        if set(i["imported_operation_commitments"]) != committed:
+            raise ValueError(f"{label}: the imported operations are not exactly the operations this capture committed an import for")
         # The converse is direction-neutral: every non-terminal folded row must publish the
         # incomplete attempt it represents. Otherwise a host could omit either an inbound
         # or outbound debt row from the explicit attempt list.
