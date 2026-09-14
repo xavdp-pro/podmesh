@@ -60,6 +60,9 @@ try:
     assert B.call('marker', name='podmesh-' + q1, marker=marker)['present'], 'the first quarantined copy lacks the marker'
     second = tool('cycle', '--universe', u, '--active', os.environ['PODMESH_SOURCE_SSH'], '--standby', os.environ['PODMESH_DESTINATION_SSH'], '--keep', '1')
     assert second['cycle']['generation'] == 2 and second['points_on_active_outbox'] == 2, second
+    assert second['retention_declared_on_active'] == {'keep_latest': 3, 'minimum_age_seconds': 3600}, second
+    rt = A.ok(request('collection_status', u, reference))
+    assert rt['retention']['keep_latest'] == 3 and rt['retention']['minimum_age_seconds'] == 3600, rt
     q2 = second['quarantined']
     assert q1 in second['pruned_on_standby'] or any(k['quarantined_uuid'] == q1 for k in second['prune_refused']), second
     checks.append('two capture cycles: generations 1 and 2, the marker in the quarantined copy, the older copy pruned or its refusal recorded (%s)'

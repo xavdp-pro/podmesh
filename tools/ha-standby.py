@@ -26,9 +26,10 @@ Subcommands:
   activate      --universe U --host SSH [--lease S --margin S --standbys N]
                                  declare the policy on the host under the gate's authority, rotate the
                                  epoch to it, acquire; starting is the operator's (the API's `start`)
-  cycle         --universe U --active SSH --standby SSH [--keep N]
-                                 one capture: stop, prepare, renew, start again on the active host;
-                                 carry; restore into quarantine on the standby; prune older copies
+  cycle         --universe U --active SSH --standby SSH [--keep N --keep-points N --minimum-age S]
+                                 one capture: declare the collector's retention on the active host,
+                                 stop, prepare, renew, start again; carry; restore into quarantine on
+                                 the standby; prune older copies
   takeover      --universe U --active SSH --standby SSH [--no-start]
                                  the standby takes over, under the lease and margin recorded by
                                  `activate` (never this invocation's defaults): refuses while the active host is reachable
@@ -180,6 +181,10 @@ def cmd_cycle(args):
     status = ok(A, request('activation_status', u, args.reference), 'status')
     if not status['live'] or status['holder_host_uuid'] != A.identity:
         raise Refusal('the active host does not hold a live lease for the universe; a capture cycle renews a lease it holds, it does not take one')
+    # The active host's archives are the collector's, after a declared retention: the cycle declares
+    # it every time with the same values, so a universe under this tool is never left without one.
+    ok(A, request('collection_retention_declare', u, args.reference, keep_latest=args.keep_points, minimum_age_seconds=args.minimum_age),
+       'collection_retention_declare')
     began = A.call('time')['time']
     stopped = ok(A, request('stop', u, args.reference, timeout_seconds=args.stop_timeout, on_timeout='kill'), 'stop for capture')
     if stopped.get('forced') is not False:
@@ -220,7 +225,8 @@ def cmd_cycle(args):
          'stopped_for_seconds': round(stopped_for, 2), 'quarantined': restored['restored_universe_uuid'],
          'manifest_signed': restored['manifest_signed'], 'pruned_on_standby': pruned, 'prune_refused': kept,
          'points_on_active_outbox': len(points['recovery_points']),
-         'note': 'the active host\'s archives are the collector\'s (class 5, after a declared retention); this tool never deletes them'})
+         'retention_declared_on_active': {'keep_latest': args.keep_points, 'minimum_age_seconds': args.minimum_age},
+         'note': 'the active host\'s archives are the collector\'s (class 5, under the retention declared here); this tool never deletes them'})
 
 
 def cmd_takeover(args):
@@ -296,7 +302,9 @@ def main():
     g = sub.add_parser('gate'); g.add_argument('gate_command', choices=['init', 'declare', 'inspect']); g.add_argument('--universe')
     a = sub.add_parser('activate'); a.add_argument('--universe', required=True); a.add_argument('--host', required=True)
     c = sub.add_parser('cycle'); c.add_argument('--universe', required=True); c.add_argument('--active', required=True); c.add_argument('--standby', required=True)
-    c.add_argument('--keep', type=int, default=2, help='quarantined copies kept on the standby')
+    c.add_argument('--keep', type=int, default=3, help='quarantined copies kept on the standby')
+    c.add_argument('--keep-points', type=int, default=3, help='recovery points the collector keeps on the active host whatever their age')
+    c.add_argument('--minimum-age', type=int, default=3600, help='seconds a recovery point must be old before the collector may take it')
     t = sub.add_parser('takeover'); t.add_argument('--universe', required=True); t.add_argument('--active', required=True); t.add_argument('--standby', required=True)
     t.add_argument('--no-start', action='store_true', help='promote but leave the start to the operator')
     a.add_argument('--lease', type=int, default=20); a.add_argument('--margin', type=int, default=5); a.add_argument('--standbys', type=int, default=1)

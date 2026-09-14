@@ -492,8 +492,12 @@ and 5 are what turn a safety property into availability.
 ## What is the operator's to decide
 
 Restated on 2026-09-14, after lots H1 to H8 and M5: these are the decisions that now stand
-between the measured level 2 and a production mandate. Each has a recommendation; none is
-taken here.
+between the measured level 2 and a production mandate. Each has a recommendation. **On the
+operator's "go" of the same evening, the recommendations below are taken as the tool's
+defaults, by hypothesis and revocable**: the laboratory's gate; capture cycles the agent
+runs (the operator's figure: every fifteen minutes), `keep_latest` 3 on the active host with
+a minimum age of one hour, three quarantined copies on the standby; a 20-second lease with
+a 5-second margin; the self-fence; no timer. Signing stays open — there is no crate to take.
 
 - **The gate.** Epochs need one external authority that rotates them. Three candidates: the
   fencing laboratory's `Authority` (a single SQLite compare-and-swap gate, qualified by its own
