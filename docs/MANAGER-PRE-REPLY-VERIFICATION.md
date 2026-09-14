@@ -141,3 +141,41 @@ and why neither escapes the scan. That changes the candidate, so it is a new
 candidate, a new binary digest, and a requalification of everything pinned to the current
 one. It is its own lot and it is the one that decides whether this manager can run for a
 day.
+
+## Addendum, 2026-09-14: what a durable digest can and cannot buy
+
+The paragraph above says a durable running digest makes a reply O(new): verify the rows added
+since the digest, compare one value for everything older. Before that becomes a lot, the
+claim has to survive the test that refused attempt one.
+
+**It does not.** `audit_rows_are_immutable_idempotent_bounded_and_fail_closed` drops the
+append-only trigger, edits a column of an *old* row, restores the trigger, and requires the
+store to notice. A digest stored beside the rows, however it is computed, was computed before
+that edit and says nothing about it. Noticing an edit to an old row means reading that row —
+there is no digest, chained, Merkle or otherwise, that lets a verifier detect a change to a
+leaf it does not read. Attempt two measured exactly this: every column, every row, still
+linear. A durable digest changes only *who* pays the first scan (the writer, once) and not
+whether every subsequent verification pays it again, if "verification" keeps meaning "detect
+any edit to any row before this reply".
+
+So the choice is not an implementation detail; it is **what the reply path promises**, and
+it is the candidate's contract, which makes it Codex's decision. The two honest shapes:
+
+1. **Full verification stays on the reply path.** The curve stays. The sender's timeout, the
+   retry storm and the runaway loop are then facts of the design, and the manager cannot run
+   for a day at three hosts. This is the current candidate.
+2. **Full verification leaves the reply path.** It runs once at startup (O(all), before the
+   first reply), and again periodically in a bounded background pass; a reply verifies only
+   the rows appended since the last full pass, against a durable digest of that pass — O(new)
+   — and the store's claim becomes "an edit to an old row is detected at the next full pass or
+   restart, never later than the declared interval", instead of "before every reply". The
+   immutability test is then re-expressed against that claim (it edits, then asserts the
+   next full pass refuses), not weakened; the G2 predicate, which rests on attempts being
+   accounted for, is untouched. This is a new candidate, a new binary digest and a
+   requalification, as the paragraph above already said — plus one sentence in the contract
+   that the operator has to accept: detection has an interval.
+
+The recommendation is the second, with the interval stated as a number the operator chooses,
+because the first is a manager that stops answering. Neither is built here: this addendum
+exists so that the lot starts from the true shape of the problem rather than from a digest
+that would have been refused by the same test as attempt one.
