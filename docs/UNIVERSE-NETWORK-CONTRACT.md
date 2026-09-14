@@ -93,4 +93,31 @@ production fencing of a route. Each is its own contract.
 
 ## What is built
 
-Nothing, as of the moment this contract was written. The next commits say what changes.
+**Step 2 (2026-09-14):** `src/network.rs` and the profile in `create`. `network_profile` is
+required on `create` (`isolated` or `managed`); a managed universe receives the next free
+address of the host's pool, allocated to its UUID and carried by the container as labels;
+`delete` releases it; observations report the requested profile and the effective network.
+`network_declare` creates the bridge (`podmesh-managed`, DNS disabled, subnet = the local
+pool) and one route per peer pool, verifies both from outside, refuses any overlap with an
+existing route and a second declaration; `network_undeclare` refuses while a live allocation or
+a published route remains, removes the routes and the bridge and verifies their absence;
+`network_route_publish`/`network_route_withdraw` keep exactly one announcement per address,
+verified from `ip route`; `network_status` reads the effective state and reports `null` for
+what could not be observed. Clone, restore, promote and migration restore still create
+isolated containers and say so. A first version made every address unique across released
+allocations, so a released address could never be reused; the table is rebuilt once.
+
+**Step 3 (2026-09-14):** `tests/check-network-managed.py` on lab-a, as root, verified from the
+host — 17 checks passed: three refusals of a create without or with an unknown profile and
+without a declaration; three refusals of bad pools (outside the prefix, a host address, an
+overlap with the host's own LAN); a declaration effective with the bridge and two peer routes;
+a second declaration refused; a managed universe created, started and reached from the host at
+its allocated address, with Podman and the labels agreeing; a second universe with a distinct
+address; a `/32` published and withdrawn, a second announcement and a route outside the prefix
+refused, undeclare refused while anything remains; and cleanup that left the host's routes and
+networks byte-identical to its initial state.
+
+**Known deviation, stated:** Podman's network firewall source-NATs traffic leaving the bridge's
+subnet, so a universe reaching another host's universe is seen there with the host's address.
+Identity between manager replicas is the HMAC pair key, never the address; removing the NAT
+for the logical prefix is a later step of this contract.
