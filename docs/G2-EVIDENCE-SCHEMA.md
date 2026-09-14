@@ -1,9 +1,19 @@
 # G2 evidence schema v3 — publishing what the accounting predicate needs
 
-Status: **design, landing incrementally.** Lot `codex/g2-accounted-attempts`, work item 2
-(this document) and work item 3 (typed fresh-store absence, now in the collector, the
-comparator and the tests). The rest — the `incomplete_attempts` list, the `exchanges`
-object and the fail-closed join — is still design and changes no captured file.
+Status: **implemented, not yet run against hosts.** Lot `codex/g2-accounted-attempts`.
+Work item 2 is this document; items 3 to 6 are in the collector, the fold, the comparator
+and the suites: typed fresh-store absence, the published `incomplete_attempts` records,
+the folded `exchanges` rows, and the eight-condition join that replaced the withdrawn
+demand for zero. What remains is re-evaluating the preserved stores (item 7) and an
+independent review (item 8). **No campaign has been run against this, and nothing here
+qualifies G2.**
+
+**Two corrections this document made to itself, both from measurement rather than from
+reading, are recorded in place below**: an exchange is a fold over one to four audit rows
+rather than a single row, and "set" means non-null for identities but non-zero for the
+byte counters. A third came from the implementation: the peer field always names the
+other party, so the two sides of a join are bound by each naming the other against the
+published replica commitments, never by equality.
 
 **On the version numbers, which are deliberately not bumped yet.** The constraint below
 is that collector, comparator, fixtures and schema version move together and are re-sealed
@@ -172,6 +182,41 @@ Each folded row therefore carries `nonce_authority`: `peer-validated` or
 Pre-authentication rows are published as observations that are explicitly not joinable,
 are never counted as a duplicate, and never cause a refusal by their absence from the
 other side.
+
+## Run end to end against a preserved store
+
+Work item 7, for one host. Not a campaign, and it qualifies nothing — but it is the first
+time the whole chain has been exercised on real data rather than on fixtures.
+
+The frozen candidate binary was located, its digest checked against the pinned
+`cbd5020a…3660128`, and run as `--inspect-store` against a **copy** of a preserved
+campaign store. Its configuration was rebuilt from the store's own recorded topology
+rather than supplied, which is why the first three attempts were refused with
+`identity_mismatch`: the grants that produce the scope owners have to be reconstructed
+from them.
+
+What the candidate reports for that store:
+
+| | |
+| --- | --- |
+| history / receipts / audit events | 7 / 13 / 165 |
+| incomplete attempts | 17, **every one** outbound at `outbound_request_prepared` |
+| unaudited import receipts | 0 |
+| SQLite integrity | ok |
+
+Every incomplete attempt in a real store is the exact shape the frozen Stage D contract
+describes, and the count the withdrawn gate demanded to be zero is 17. Condition 4 holds
+on this store with nothing to explain.
+
+The collector's own helpers were then replayed verbatim over that output: 315
+commitments in one batch, 67 folded exchange rows, and both the projected inspection and
+the folded rows **accepted by the comparator's validators**. No raw identifier reached
+the published rows.
+
+What this does not do: it covers one host, so no cross-host join was exercised against
+real data — the join is exercised only by the constructed strand in the suite. The other
+preserved copy holds zero audit events, which is the fresh-store case rather than a
+second sample.
 
 ## Constraints the schema must satisfy
 
