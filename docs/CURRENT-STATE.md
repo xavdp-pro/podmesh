@@ -387,6 +387,25 @@ concurrent submission. Regression after the fixes: seven local suites, clippy wi
 denied, unit tests, and on the lab hosts the two-host suite (37) and the tool check
 including the unreachable-host takeover.
 
+## Hygiene before publication, as Codex directed on 2026-09-14 (`/tmp/podmesh-claude/NEXT-DIRECTION-AFTER-H10-2026-09-14.md`)
+
+1. Six tracked `__pycache__/*.pyc` files removed from version control and ignored
+   (`205e211`); no source or evidence altered.
+2. Local checks rerun on `205e211` (debug binary `aaf8534afcd5…`), all exit 0:
+   `PODMESH_STATE_DIR=<tmp> PODMESH_SOCKET=/tmp/pmr/api.sock PODMESH_JOURNAL=<tmp>/state.sqlite
+   python3 -B tests/<suite>.py` for check-activation, -epoch, -fence, check-recovery-point,
+   -restore, -promote, -retention.
+3. Two-host development checks rerun on the lab hosts with the transient unit
+   `podmesh-dev-ha` and the release binary `d312222d0f72…` (same source as `7181700`), all
+   exit 0: `check-recovery-point-two-hosts` (37 checks), `check-ha-standby-tool` (8),
+   `check-migration-collector` (79). Reports preserved under the gitignored
+   `evidence/ha/after-hygiene-205e211/`. Units stopped afterwards; nothing installed.
+4. Every commit stays local until Codex has reviewed the diff; nothing is published and
+   no development service is installed as a service.
+
+Status vocabulary for everything above: **implemented, locally tested, lab-tested** on two
+transient hosts; nothing is deployed and nothing is production-qualified.
+
 ## Next actions, in order
 
 1. Done: independent read-only counter-review of the source-side milestone (Claude
