@@ -74,6 +74,14 @@ refuses a stale permit and the old active is refused. **The manager's durable st
 universe through capture, restore, promotion and restart on another host**, under the same
 mechanism as any universe and with no manager-specific election.
 
+Codex reviewed that run the same night — GO for the narrow claim, NO-GO for packaging until
+four corrections — and the corrections were made and rerun on the three hosts: the binary
+inside the universe is attested byte-equal to the inspector before any inspection; a boot fact
+that is not observed makes the start fail and a typed shutdown that is not acknowledged makes
+the stop an honest failure the capture cycle refuses after; the configuration is labelled a
+single-replica portability fixture; and Alpine was tried first, failing on the candidate's
+glibc ≥ 2.34 dependency (`ALPINE-PROOF.md`), which is the recorded reason for the Debian image.
+
 Three findings the candidate taught, each handled in the universe definition and recorded in
 its README: the resident handles no signal, so PID 1 must translate the stop; the overlay's
 copy-up changes a restored store's inode between the resident's preflight and its open, which

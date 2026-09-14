@@ -1,7 +1,11 @@
+# Debian, not Alpine, and only because of the candidate: the frozen resident is a glibc-linked PIE
+# (GLIBC_2.34, see the package's binary.glibc-max) built for Debian, and this image must carry that
+# exact binary so that its digest can be attested against the inspector. Alpine's musl cannot run
+# it; an Alpine image needs a musl build of the resident, which is a new candidate, not this one.
 FROM docker.io/library/debian:13-slim
 RUN apt-get -qq update && apt-get -qq install -y --no-install-recommends python3-minimal ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY podmesh-managerd /usr/lib/podmesh-manager/podmesh-managerd
-COPY config.json /etc/podmesh-manager/config.json
+COPY config.single-replica-fixture.json /etc/podmesh-manager/config.json
 COPY entrypoint.sh /usr/local/bin/manager-universe
 RUN chmod 755 /usr/lib/podmesh-manager/podmesh-managerd /usr/local/bin/manager-universe && chmod 600 /etc/podmesh-manager/config.json \
  && mkdir -p /run/podmesh-manager /var/lib/podmesh-manager && chmod 700 /run/podmesh-manager /var/lib/podmesh-manager

@@ -1,9 +1,14 @@
 #!/bin/sh
-# PID 1 of the manager universe: runs the resident and turns the container's stop signal into the
-# resident's own typed shutdown, so that a PodMesh stop is graceful and a capture keeps its class.
-# The acknowledgement is written to the container log, which is the only channel out of a universe.
-set -u
+# PID 1 of the manager universe. It runs the resident, records each start as a fact through the
+# control socket only this process can reach, and turns the container's stop signal into the
+# resident's typed shutdown. Every failure is terminal and visible from outside: a start whose boot
+# fact is not observed exits 2 (the universe is then "not running when observed"), a stop whose typed
+# shutdown is not acknowledged exits 3 (an honest failed stop, never a silent wait for escalation).
+# The optional argument `--fault boot|shutdown` injects those failures for the laboratory check.
+set -eu
 umask 077
+fault=${2:-none}
+[ "${1:-}" = "--fault" ] || fault=none
 mkdir -p /run/podmesh-manager /var/lib/podmesh-manager && chmod 700 /run/podmesh-manager /var/lib/podmesh-manager
 # A universe restored from a capture may carry the previous incarnation's control socket file; the
 # resident refuses an existing path rather than unlink it, so the stale file is removed here, where
@@ -14,40 +19,22 @@ rm -f /run/podmesh-manager/control.sock
 # and its open; the resident refuses that as a swapped store. Rewriting the file here, before the
 # resident starts, puts it in the writable layer once, with a stable identity.
 for f in /var/lib/podmesh-manager/manager.sqlite /var/lib/podmesh-manager/manager.sqlite-wal /var/lib/podmesh-manager/manager.sqlite-shm; do
-  [ -f "$f" ] && cp -p -- "$f" "$f.copyup" && mv -f -- "$f.copyup" "$f"
+  if [ -f "$f" ]; then cp -p -- "$f" "$f.copyup" && mv -f -- "$f.copyup" "$f"; fi
 done
 export PODMESH_MANAGER_NETWORK_MODE=authenticated-static-peers
 /usr/lib/podmesh-manager/podmesh-managerd --config /etc/podmesh-manager/config.json --state-dir /var/lib/podmesh-manager --runtime-dir /run/podmesh-manager &
 child=$!
 echo "manager-universe: resident started pid=$child"
-# Each start records itself as a fact in the replica's own scope, through the control socket only
-# this process can reach: the store then carries content that a takeover has to move, not merely a
-# schema. The boot identity is the value; the operation ID is fresh, so a replayed start is not.
-boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
-opid=$(cat /proc/sys/kernel/random/uuid)
-python3 - "$boot" "$opid" <<'EOF' 2>&1 | sed 's/^/manager-universe: boot fact: /'
-import socket, json, sys, time, os
-path = '/run/podmesh-manager/control.sock'
-for _ in range(100):
-    if os.path.exists(path): break
+
+control() { # control <socket> <json>: one typed request, read to end of stream, reply on stdout
+  python3 - "$1" "$2" <<'EOF'
+import socket, sys, os, time
+path, req = sys.argv[1], sys.argv[2].encode()
+for _ in range(50):
+    if os.path.exists(path):
+        break
     time.sleep(0.1)
-req = json.dumps({"operation": "append_observation", "operation_id": sys.argv[2], "scope": "lab/manager-universe/observations",
-                  "subject": "boot", "value": "boot-" + sys.argv[1]}).encode()
 s = socket.socket(socket.AF_UNIX); s.settimeout(15); s.connect(path); s.sendall(req); s.shutdown(socket.SHUT_WR)
-reply = b""
-while True:
-    chunk = s.recv(4096)
-    if not chunk: break
-    reply += chunk
-print(reply.decode().strip()[:300])
-EOF
-shutdown() {
-  echo "manager-universe: stop signal received; requesting the typed shutdown"
-  # The resident reads the request to end of stream: no newline, then the write side is closed.
-  python3 - <<'EOF' 2>&1 | sed 's/^/manager-universe: shutdown reply: /'
-import socket
-s = socket.socket(socket.AF_UNIX); s.settimeout(10); s.connect('/run/podmesh-manager/control.sock')
-s.sendall(b'{"operation":"shutdown"}'); s.shutdown(socket.SHUT_WR)
 reply = b""
 while True:
     chunk = s.recv(4096)
@@ -57,11 +44,39 @@ while True:
 print(reply.decode().strip())
 EOF
 }
+socket_path=/run/podmesh-manager/control.sock
+[ "$fault" = boot ] && boot_socket=/run/podmesh-manager/no-such.sock || boot_socket=$socket_path
+[ "$fault" = shutdown ] && stop_socket=/run/podmesh-manager/no-such.sock || stop_socket=$socket_path
+
+# Readiness requirement: the start is not a start until the resident has observed this boot's fact.
+boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+opid=$(cat /proc/sys/kernel/random/uuid)
+if reply=$(control "$boot_socket" "{\"operation\":\"append_observation\",\"operation_id\":\"$opid\",\"scope\":\"lab/manager-universe/observations\",\"subject\":\"boot\",\"value\":\"boot-$boot\"}" 2>&1) \
+   && printf '%s' "$reply" | grep -q '"result":"observed"'; then
+  echo "manager-universe: boot fact observed: $(printf '%s' "$reply" | cut -c1-120)"
+else
+  echo "manager-universe: BOOT FACT NOT OBSERVED; refusing to run: $(printf '%s' "$reply" | tail -1 | cut -c1-200)"
+  kill -KILL "$child" 2>/dev/null || true
+  exit 2
+fi
+
+shutdown_rc=0
+shutdown() {
+  echo "manager-universe: stop signal received; requesting the typed shutdown"
+  if reply=$(control "$stop_socket" '{"operation":"shutdown"}' 2>&1) && printf '%s' "$reply" | grep -q '"shutdown_requested":true'; then
+    echo "manager-universe: shutdown acknowledged: $reply"
+  else
+    echo "manager-universe: TYPED SHUTDOWN FAILED: $(printf '%s' "$reply" | tail -1 | cut -c1-200); stopping the resident by force and exiting 3"
+    shutdown_rc=3
+    kill -KILL "$child" 2>/dev/null || true
+  fi
+}
 trap shutdown TERM INT
 rc=0
 while :; do
-  wait $child; rc=$?
-  kill -0 $child 2>/dev/null || break
+  set +e; wait "$child"; rc=$?; set -e
+  kill -0 "$child" 2>/dev/null || break
 done
+if [ "$shutdown_rc" -ne 0 ]; then echo "manager-universe: resident ended after a failed typed shutdown"; exit "$shutdown_rc"; fi
 echo "manager-universe: resident exited rc=$rc"
-exit $rc
+exit "$rc"
