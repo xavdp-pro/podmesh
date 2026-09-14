@@ -4,7 +4,7 @@
 >
 > **Perimeter**: P1 — it decides which host may run a workload, so a mistake runs two.
 
-Status: **lots H1 to H8 built and checked; level 1 complete; level 2's sequence run end to end across two lab hosts on 2026-09-14, unsigned, with the suite as transport, as failure detector and as the epoch gate; level 3 designed, not built.** Written 2026-09-14
+Status: **lots H1 to H9 built and checked; level 1 complete; level 2 runs end to end across two lab hosts, driven by `tools/ha-standby.py` with the fencing laboratory's gate, unsigned; the collector keeps its archives in bounds (M5); level 3 designed, not built.** Written 2026-09-14
 against what PodMesh actually has, not against what an HA product usually has. Every
 capability named as missing was verified in the source, and the citations are below.
 
@@ -430,6 +430,46 @@ never a permit's origin), failure detection (the suite decided when the wait beg
 rotate; no host did), the manifest's origin (unsigned), and transport (bytes were carried by
 the suite, not by PodMesh). The lease generations were 1 on both hosts and the epochs 1 and 2:
 two journals each counting alone, and one rotation that both of them recorded.
+
+## Lot H9 — the agent's side, as a tool and not a timer
+
+Everything level 2 needs outside the two hosts is the agent's by the canon's rule, and until now
+it lived inside a test. `tools/ha-standby.py` is that side made runnable by a human or an agent
+from a workstation: invoked, one bounded thing, one JSON report, exit. Whether it may ever run
+on a schedule is a production mandate, exactly as for the collector.
+
+Four subcommands. `gate` creates and drives the epoch gate — the fencing laboratory's own
+`Authority`, imported from its tree (reviewed candidate `0c3756fb…`) and never copied, one
+SQLite compare-and-swap file on the host the tool runs on, with the laboratory's precondition
+(one current copy, never cloned or rolled back) stated as the operator's obligation.
+`activate` declares the policy under that authority, rotates the epoch to a host and acquires;
+starting stays the operator's. `cycle` is one capture: stop, prepare, renew, start again on the
+active host, carry the two files, restore into quarantine on the standby, prune the older
+quarantined copies through the API and keep a ledger; it refuses from a host that does not
+hold the lease, and reports how long the universe was stopped. `takeover` refuses while the
+active host is reachable and entitled — that is a planned handoff, not a takeover, and the
+tool will not start a second writer; otherwise it fences the active host if it can be reached
+and waits the margin on that host's clock, or, if it cannot, waits **lease plus margin on the
+standby's clock** — any lease the active host holds expires at most a lease after its last
+renewal, which is not later than now, and the margin is the clock-skew budget; then it
+rotates the epoch, acquires, promotes the newest quarantined copy, starts, and supersedes the
+active host if it can be reached. Every report carries `data_lost_since_seconds` and a
+`not_proven` list.
+
+Measured on the two lab hosts (`tests/check-ha-standby-tool.py`, the tool driven as a
+subprocess): a cycle from the wrong host refused; two cycles with the marker in the quarantined
+copy and the older copy pruned; a takeover refused as a handoff while the active host was
+entitled; a takeover after the lapse with the fence, the margin on the active clock, epoch 2,
+the marker present before the first start, the active host stopped, refused and superseded;
+and **a takeover with the active host unreachable**: 26 seconds waited on the standby's clock,
+promoted and started there, and the active host — still running its copy exactly as a
+partitioned host would — stopped by its own fence when that was run, without escalation, its
+lease having lapsed before the standby started. The two windows did not overlap; that is
+level 2's safety claim, and it held.
+
+What the tool does not do: verify a permit's origin (nobody can, yet), prove the unreachable
+host stopped (the wait is the design's margin, not a proof), or delete the active host's
+archives (those are the collector's, after a declared retention).
 
 ## What PodMesh still has to gain
 

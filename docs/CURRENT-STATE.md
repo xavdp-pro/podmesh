@@ -350,6 +350,15 @@ Regression on two lab hosts the same day: Codex's `check-migration-collector.py`
 checks) once it built the two survey shapes it had been finding among leftovers of earlier
 suites on the shared journal (commit `0ffca5d`), and the HA two-host suite passed again (37).
 
+## The agent's side as a tool (lot H9), 2026-09-14 — built, run on two lab hosts, not published
+
+`tools/ha-standby.py`: `gate` (the fencing laboratory's `Authority`, imported from
+`PODMESH_FENCING_LAB`, never copied), `activate`, `cycle`, `takeover`; one JSON report each, no
+timer. `tests/check-ha-standby-tool.py` drove it on the lab hosts: refusals, two cycles with
+pruning, takeover after a lapse with the active host reachable, and takeover with the active
+host **unreachable** — 26 s waited on the standby's clock, the active host's own fence then
+stopped its copy without escalation. The transient units are stopped again.
+
 ## Next actions, in order
 
 1. Done: independent read-only counter-review of the source-side milestone (Claude
@@ -401,13 +410,13 @@ suites on the shared journal (commit `0ffca5d`), and the HA two-host suite passe
    are specified in the same document and should be built in the same lot.
 6. Continue the central checklist: networking/volumes, partitions and HA, fractal
    demonstration, sequential storage tests, Backup Server and product documentation.
-7. HA, in order: done — level 2's sequence across two lab hosts, with epoch-bound
-   activation from the fencing laboratory's model; next, a real gate the agent rotates
-   through (the laboratory's `Authority` or the manager's exclusive permit — an operator
-   decision, since the gate is where exclusion actually lives), a failure detector on the
-   agent's side that only decides when the standby's wait begins and when to rotate, the
-   signing dependency once the operator decides it, then level 3 after B0 qualifies a
-   storage backend.
+7. HA, in order: done — level 2 across two lab hosts, epoch-bound activation, the
+   collector's class 5 for archives, and the agent's side as a tool driving the
+   laboratory's gate. What remains is the operator's (UNIVERSE-HIGH-AVAILABILITY.md, "What
+   is the operator's to decide"): which gate for production, the signing crate, the capture
+   interval and retention per universe, out-of-band fencing and who may cut power, which
+   universes, and whether the tool may ever be a timer. Then Codex's review, packaging, and
+   level 3 after B0 qualifies a storage backend.
 
 ## Cost and delegation policy
 
