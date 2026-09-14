@@ -625,6 +625,13 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
     ) {
         migration::refuse_if_reserved(db, uuid, params.name())?;
     }
+    // A universe under an activation policy runs only where a live lease says it may. This is
+    // a self-restraint on THIS host, not exclusion across hosts: it stops an agent that names
+    // the wrong host, and it does not stop a host that never asks. `stop` stays available for
+    // the same reason it survives a reservation -- stopping can never produce a second writer.
+    if matches!(params, Params::Start { .. } | Params::Clone { .. }) {
+        crate::activation::refuse_if_not_activated(db, uuid, params.name())?;
+    }
     // A garbage collection leaves a tombstone: the identity of a collected universe is never given a new
     // meaning by a blind create, or by a clone into it. Operating the container a collection released, and
     // restoring a verified handoff, stay available (docs/GARBAGE-COLLECTION.md).

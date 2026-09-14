@@ -1,4 +1,5 @@
 mod cleanup;
+mod activation;
 mod collector;
 mod lifecycle;
 mod migration;
@@ -109,10 +110,12 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
             | "migration_restore_abort" => lifecycle::execute(db, request)?,
             // Host-wide by design: the collector is the only operation that does not name one universe.
             "garbage_collect_plan" | "garbage_collect_apply" => collector::execute(db, request)?,
+            "activation_require" | "activation_acquire" | "activation_renew" | "activation_release"
+            | "activation_status" => activation::execute(db, request)?,
             "migration_status" => migration::status(db, request)?,
             "capabilities" => json!({
                 "version":option_env!("PODMESH_PACKAGE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
-                "operations":["capabilities","identity","inventory","observations","create","delete","clone","start","stop"],
+                "operations":["capabilities","identity","inventory","observations","activation_require","activation_acquire","activation_renew","activation_release","activation_status","create","delete","clone","start","stop"],
                 "experimental_operations":["migration_preflight","migration_checkpoint","migration_status","migration_authorize_transfer",
                     "migration_complete_transfer","migration_retire_source","migration_release","migration_abandon","migration_restore_local",
                     "migration_destination_preflight","migration_restore","migration_restore_abort",

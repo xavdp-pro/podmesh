@@ -126,7 +126,45 @@ overlap.
 contract**, and storage leases when the storage layer exists. Out-of-band fencing is the right
 answer for production and it is an operator decision, not an engineering one.
 
-## What PodMesh has to gain, concretely
+## What is built
+
+**Lot H1, the local half of exclusive activation.** Implemented in `src/activation.rs`,
+gated in `src/lifecycle.rs`, checked by `tests/check-activation.py`.
+
+A universe may be put under an activation policy naming a lease duration and a takeover
+margin. `start` and `clone` then refuse unless this host holds a lease that has not expired,
+and the refusal says which of the three reasons applies: no lease at all, a lease held by
+another host, or one of this host's own that has lapsed. `stop` stays available, for the same
+reason it survives a migration reservation — stopping can never produce a second writer.
+
+Five typed operations, each idempotent by operation ID like every other PodMesh operation:
+`activation_require`, `activation_acquire`, `activation_renew`, `activation_release`,
+`activation_status`.
+
+Three rules are worth naming because each is a place this could have been got wrong:
+
+- **A lapsed lease is retaken by acquisition, never by renewal.** Renewing would silently
+  extend an entitlement that had already ended, while another host may already have begun its
+  takeover wait.
+- **Re-acquiring one's own live lease keeps the generation.** A repeat is idempotent, not a
+  takeover, and the history says so.
+- **A different holder may acquire only after the previous expiry plus the margin.** The
+  margin is therefore also the clock-skew budget between two hosts, since wall clock is the
+  only clock two hosts share. It is stated rather than assumed.
+
+**What H1 proves: a self-restraint.** This host will not start a universe it has no lease
+for, which is what stops an agent that names the wrong host. **What it does not prove: mutual
+exclusion.** The lease lives in this host's journal; a host that never asks is not restrained
+by it, and a partitioned host is restrained only by its own copy. Every status answer carries
+that sentence in a `scope` field so a caller reading only the object cannot mistake one for
+the other. Mutual exclusion needs the lease replicated as a fact and a permit issued against a
+reconciled history — the manager's job, and the next lot.
+
+Each of the four rules was verified by weakening it in the source and confirming the check
+goes red at the case named for it: the gate itself, the expiry, the takeover margin, and the
+refusal to renew a lapsed lease.
+
+## What PodMesh still has to gain
 
 1. **An exclusive claim per universe**, carried as a fact with `exclusive_resource` set to the
    universe UUID, replicated by the manager that G2 just qualified.
