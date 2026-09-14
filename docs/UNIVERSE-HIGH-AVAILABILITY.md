@@ -4,7 +4,7 @@
 >
 > **Perimeter**: P1 — it decides which host may run a workload, so a mistake runs two.
 
-Status: **lots H1 to H4 built and checked; level 1 complete; levels 2 and 3 designed, not built.** Written 2026-09-14
+Status: **lots H1 to H5 built and checked; level 1 complete; level 2's capture side built, unsigned; level 3 designed, not built.** Written 2026-09-14
 against what PodMesh actually has, not against what an HA product usually has. Every
 capability named as missing was verified in the source, and the citations are below.
 
@@ -262,6 +262,43 @@ named as such — a request well-formed enough to pass parsing and no further, s
 check's refusal cannot be mistaken for this one.
 
 Level 1 is now complete as designed: a planned handoff that cannot be raced.
+
+**Lot H5, the capture side of level 2.** `recovery_point_prepare` turns a stopped universe
+into an immutable, digested recovery point in this host's outbox, with a manifest binding
+every field the Backup Server design requires of one. It is B1's step 1 and the first half
+of step 2, and it is what level 2 restores from.
+
+**It is `prepared`, not `sealed`, and the manifest says so.** This code base carries no
+signing crate — serde_json and rusqlite are its entire dependency list, and the crate
+registry answers 403 from this build — so the Ed25519 signature the design's root of trust
+rests on cannot be produced here. Rather than pretend, the point sits in the `prepared` state
+of the design's own typed list with `signed: false`, `signature: null`, and a format string
+ending in `unsigned-unencrypted`. A verifier that treats it as sealed is wrong; one that
+refuses it is doing its job. Adding a signing dependency is a supply-chain decision, and it is
+the operator's.
+
+Three things in it were got right only because the design had already been wrong about them:
+
+- **The stop is observed, not looked up.** The observations journal keys by operation name
+  and cannot attribute a past `stop` to a universe. So the manifest records the container's
+  own status, exit code and finish time, and treats exit code 137 as the escalation signature
+  the API document names.
+- **An escalated stop has no class.** The capture is refused outright — never downgraded to
+  `crash-consistent`, which the adapter section forbids, and never `incoherent`, which is
+  defined for a running universe. This is the rule revision 6 corrected in prose; H5 is the
+  first code that enforces it, and the check reaches it with a bare `sleep` as PID 1.
+- **The export is renamed only once it has a size and a digest**, Rule 12's own discipline,
+  applied to the one archive B1 does produce.
+
+**The check verifies the marker inside the exported tar.** An export of a never-started
+container is byte-identical to its image, so a check that compared digests alone would pass
+on a capture that captured nothing. That is the false-pass trap the fifth review named, and
+the check writes the marker as a literal in the container's command — in both the file name
+and the contents — exactly as step 0 specifies.
+
+Level 2 still needs: a signed manifest, a transport controller pulling the outbox, a datastore
+that verifies and catalogues, and a restore on another host. The capture is the half that
+did not exist an hour ago.
 
 ## What PodMesh still has to gain
 

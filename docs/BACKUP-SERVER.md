@@ -1020,6 +1020,17 @@ constraints; ordinary backup storage must not inherit them.
 
 The normal standalone version is built first. Everything else is an integration of it.
 
+## B1 — what is built, as of 2026-09-14
+
+Steps 1 and the capture half of step 2 exist as `recovery_point_prepare` in PodMesh
+(`src/recovery_point.rs`, checked by `tests/check-recovery-point.py`). It produces a
+recovery point in the **`prepared`** state: stopped-universe export, manifest with every
+field below, digests bound to the files, generations chained, idempotent by operation ID,
+escalated stops refused with no class. It is **not sealed**: no signing crate is available
+to this build and none has been added, because that is a dependency decision for the
+operator. The manifest carries `signed: false` and a format string ending in
+`unsigned-unencrypted` so that no verifier can mistake it. Steps 3 to 10 are not started.
+
 ## B1 — the corrected first lot
 
 Deliberately small, and shaped by the reviewer:
