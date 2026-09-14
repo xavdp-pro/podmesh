@@ -73,7 +73,8 @@ def evidence(i,stage):
                 "receipt_set_sha256":h(f"receipts-{i}-{stage}"),"audit_set_sha256":h(f"audits-{i}-{stage}"),
                 "sqlite_integrity_result":"ok","history_count":hc,"receipt_count":rc,"audit_event_count":ac,
                 "incomplete_attempt_count":len(attempts),"incomplete_attempts":attempts,
-                "unaudited_import_receipt_count":0,"unaudited_import_receipt_commitments":[]}
+                "unaudited_import_receipt_count":0,"unaudited_import_receipt_commitments":[],
+                "imported_operation_commitments":[]}
     # One folded exchange per nonce: an inbound exchange collapses four audit rows, a
     # completed outbound attempt two. The shapes are the ones measured on a preserved store.
     def served(k):
@@ -180,7 +181,10 @@ if "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation
 # serve cannot produce a baseline at all. Three states are typed and all three are tested:
 # not inspected (null), inspected and absent, inspected and present. The negatives below
 # exist because "absent" must not become a way to smuggle a capture past validation.
-absent='{"store_present":false,"schema_version":null,"logical_manager_commitment":null,"replica_commitment":null,"logical_history_sha256":null,"receipt_set_sha256":null,"audit_set_sha256":null,"sqlite_integrity_result":null,"history_count":null,"receipt_count":null,"audit_event_count":null,"incomplete_attempt_count":null,"incomplete_attempts":null,"unaudited_import_receipt_count":null,"unaudited_import_receipt_commitments":null}'
+# Extracted from capture-host.sh itself rather than written beside it. A hand-written
+# literal is a second copy of the collector's list, and it stayed green through the
+# revision where the collector's copy fell five fields behind the comparator's.
+absent=$(grep -o "{store_present:false[^']*}" "$root/capture-host.sh" | head -1 | jq -cn -f /dev/stdin)
 zero='0000000000000000000000000000000000000000000000000000000000000000'
 jq ".inspection=$absent" "$work/lab-a-pre-activation.json" > "$work/fresh-pre.json"
 sidecar "$work/fresh-pre.json"
@@ -241,9 +245,10 @@ served="{\"nonce_commitment\":\"$N\",\"nonce_authority\":\"peer-validated\",\"jo
 
 # $1 is an optional jq filter applied to the RECEIVER's served row, to break one condition.
 build_strand() {
-  jq ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges += [$sent]" "$work/lab-a-post-cleanup.json" > "$work/sa.json"; sidecar "$work/sa.json"
-  jq ".exchanges += [$served${1:+ | $1}]" "$work/lab-b-post-cleanup.json" > "$work/sb.json"; sidecar "$work/sb.json"
-  "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work"/*-converged.json --cleanup "$work/sa.json" "$work/sb.json" "$work/lab-c-post-cleanup.json" > "$work/strand-report.json" 2>"$work/strand-err.txt"
+  jq ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .inspection.audit_event_count=9 | .exchanges += [$sent] | .inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-a-post-cleanup.json" > "$work/sa.json"; sidecar "$work/sa.json"
+  jq ".exchanges += [$served${1:+ | $1}] | .inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-b-post-cleanup.json" > "$work/sb.json"; sidecar "$work/sb.json"
+  jq ".inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-c-post-cleanup.json" > "$work/sc0.json"; sidecar "$work/sc0.json"
+  "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work"/*-converged.json --cleanup "$work/sa.json" "$work/sb.json" "$work/sc0.json" > "$work/strand-report.json" 2>"$work/strand-err.txt"
 }
 build_strand
 report_says "$work/strand-report.json" '.status=="PASS" and .incomplete_attempt_accounting.accounted_incomplete_attempts==1 and .incomplete_attempt_accounting.unaccounted_incomplete_attempts==0' 'a stranded attempt joined to the receiver that served it was not accounted for'
@@ -274,9 +279,9 @@ strand_refuse 'the reply was truncated'             '.reply_frame_bytes=600' 'di
 # and watching the suite stay green. A refusal path nothing exercises is a refusal path
 # nobody has, and three of these guard the clauses the predicate is most about.
 strand_three() {   # $1 applied to lab-a, $2 to lab-b's served row, $3 to lab-c
-  jq ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges += [$sent]${1:+ | $1}" "$work/lab-a-post-cleanup.json" > "$work/sa.json"; sidecar "$work/sa.json"
-  jq ".exchanges += [$served${2:+ | $2}]" "$work/lab-b-post-cleanup.json" > "$work/sb.json"; sidecar "$work/sb.json"
-  jq "${3:-.}" "$work/lab-c-post-cleanup.json" > "$work/sc.json"; sidecar "$work/sc.json"
+  jq ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .inspection.audit_event_count=9 | .exchanges += [$sent] | .inspection.imported_operation_commitments=[\"$OP\"]${1:+ | $1}" "$work/lab-a-post-cleanup.json" > "$work/sa.json"; sidecar "$work/sa.json"
+  jq ".exchanges += [$served${2:+ | $2}] | .inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-b-post-cleanup.json" > "$work/sb.json"; sidecar "$work/sb.json"
+  jq ".inspection.imported_operation_commitments=[\"$OP\"]${3:+ | $3}" "$work/lab-c-post-cleanup.json" > "$work/sc.json"; sidecar "$work/sc.json"
   "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work"/*-converged.json --cleanup "$work/sa.json" "$work/sb.json" "$work/sc.json" > "$work/strand-report.json" 2>"$work/strand-err.txt"
 }
 three_refuse() {
@@ -297,19 +302,25 @@ three_refuse 'the sender did not honestly retain the absence' '.inspection.incom
 three_refuse 'an unaudited import receipt exists' '' '' '.inspection.unaudited_import_receipt_count=1 | .inspection.unaudited_import_receipt_commitments=["sha256:dddd999999999999999999999999999999999999999999999999999999999999"]' 'unaudited import receipts exist'
 # Condition 6: with no replayed retry and no converged canonical history, eventual
 # convergence cannot stand in for a per-attempt proof.
-# Condition 6 reads convergence from the CONVERGED stage, so it has to be broken there
-# rather than at post-cleanup. Divergence also fails the convergence check in its own right;
-# both failures are true at once and the assertion looks for this one among them, rather
-# than pretending the case can be isolated.
-jq ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges += [$sent]" "$work/lab-a-post-cleanup.json" > "$work/sa.json"; sidecar "$work/sa.json"
-jq ".exchanges += [$served]" "$work/lab-b-post-cleanup.json" > "$work/sb.json"; sidecar "$work/sb.json"
-jq '.inspection.logical_history_sha256="00000000000000000000000000000000000000000000000000000000000000ff"' "$work/lab-a-converged.json" > "$work/divconv.json"; sidecar "$work/divconv.json"
-if "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work/divconv.json" "$work/lab-b-converged.json" "$work/lab-c-converged.json" --cleanup "$work/sa.json" "$work/sb.json" "$work/lab-c-post-cleanup.json" > "$work/c6.json" 2>/dev/null; then
-  echo 'accepted an attempt with no replay and no converged history' >&2; exit 1
-fi
-report_says "$work/c6.json" '.status=="FAIL"' 'no replay and no converged history did not produce a verdict'
-grep -q 'no identical retry returned a replayed receipt' <(jq -r '.failures[]?' "$work/c6.json") \
-  || { echo "condition 6 was not among the failures: $(jq -c '.failures' "$work/c6.json")" >&2; exit 1; }
+# Condition 6, both branches. It used to read "a replayed retry OR the histories converge",
+# and the convergence half was the same digest equality the gate already asserts for any
+# campaign that reaches this point -- so the condition could never refuse. It now asks what
+# the condition asks: is THIS operation held, with a receipt, on EVERY replica. One replica
+# missing it, and no other host observing a replay, is unaccounted.
+three_refuse 'the operation is not held on every replica' '' '' '.inspection.imported_operation_commitments=[]' 'not held with a receipt on every replica'
+# And the replay must be observed by someone else: a sender asserting `replayed` on its own
+# outbound row closed the condition by itself before.
+three_refuse 'the sender asserts its own replay' '.exchanges[-1].replayed=true' '' '.inspection.imported_operation_commitments=[]' 'not held with a receipt on every replica'
+
+# The forgeries an independent review demonstrated against this comparator. Each check that
+# closes one is exercised here, because implementing a check and never testing it leaves the
+# suite green while the hole is reopened.
+two_on_one="[$strand, ($strand | .attempt_commitment=\"sha256:eeee999999999999999999999999999999999999999999999999999999999999\")]"
+reject_error 'two attempts sharing one wire nonce' ".inspection.incomplete_attempts=$two_on_one | .inspection.incomplete_attempt_count=2 | .inspection.audit_event_count=9" converged 'two incomplete attempts share one wire nonce'
+reject_error 'attempts reported with no audit events' ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .inspection.audit_event_count=0" converged 'no audit events to derive them from'
+three_refuse 'the attempt names another operation' '.inspection.incomplete_attempts[0].operation_commitment="sha256:ffff999999999999999999999999999999999999999999999999999999999999"' '' '' 'name different operations'
+three_refuse 'an import committed without an accepted outcome' '' '.outcomes=["refused"]' '' 'import without an accepted outcome'
+three_refuse 'a refusal recorded beside an accepted outcome' '' '.phases_reached += ["inbound_refusal_recorded"] | .row_count=5' '' 'refusal and an accepted outcome at once'
 
 printf '%s\n' 'PASS: strand accounting — one stranded attempt joined to its receiver, and eleven conditions each refused on its own.'
 

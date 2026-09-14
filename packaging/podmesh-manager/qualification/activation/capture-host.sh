@@ -177,7 +177,12 @@ inspection() {
     # created on first run. A missing directory is therefore not a fresh host, it is a
     # host that is not in the state this capture assumes, and it stays fatal.
     [ -d /var/lib/podmesh-manager ] && [ ! -L /var/lib/podmesh-manager ] || { echo 'Manager state directory is absent or is not a directory' >&2; return 1; }
-    jq -cn '{store_present:false,schema_version:null,logical_manager_commitment:null,replica_commitment:null,logical_history_sha256:null,sqlite_integrity_result:null,history_count:null,receipt_count:null,audit_event_count:null,incomplete_attempt_count:null}'
+    # EVERY derived field, null. The list grew when incomplete attempts and the two set
+    # digests were published and this branch did not grow with it, so a genuinely fresh host
+    # emitted ten keys where the comparator required fifteen and the whole campaign was
+    # refused with a shape error naming nothing — defeating the very case this branch exists
+    # to serve. The comparator's DERIVED tuple and this literal are one list in two places.
+    jq -cn '{store_present:false,schema_version:null,logical_manager_commitment:null,replica_commitment:null,logical_history_sha256:null,receipt_set_sha256:null,audit_set_sha256:null,sqlite_integrity_result:null,history_count:null,receipt_count:null,audit_event_count:null,incomplete_attempt_count:null,incomplete_attempts:null,unaudited_import_receipt_count:null,unaudited_import_receipt_commitments:null,imported_operation_commitments:null}'
     return
   fi
   raw=$(runuser -u podmesh-manager -- /usr/lib/podmesh-manager/podmesh-managerd --inspect-store --config /etc/podmesh-manager/config.json --state-dir /var/lib/podmesh-manager) || { echo 'Read-only canonical inspection failed' >&2; return 1; }
@@ -202,7 +207,14 @@ inspection() {
         operation_commitment: c("wire-operation-id"; .wire_operation_id),
         direction, last_phase}],
      unaudited_import_receipt_count:(.unaudited_import_receipt_ids|length),
-     unaudited_import_receipt_commitments:[.unaudited_import_receipt_ids[] | c("receipt-operation-id"; .)]}' <<<"$raw"
+     unaudited_import_receipt_commitments:[.unaudited_import_receipt_ids[] | c("receipt-operation-id"; .)],
+     # The wire operations this replica holds a receipt for. Without these, the convergence
+     # branch of condition 6 has nothing to check but the history digests, which the gate
+     # already compares elsewhere -- so the branch could never refuse, and the warning in
+     # the predicate that eventual history convergence alone is insufficient was exactly
+     # what the code did. (No apostrophes here: this whole jq program is a shell single-
+     # quoted string, and one apostrophe ends it mid-filter.)
+     imported_operation_commitments:[.ordered_receipts[] | select(.wire_operation_id != null) | c("wire-operation-id"; .wire_operation_id)] | unique}' <<<"$raw"
 }
 # The receiver side of the join, folded to one row per wire nonce. Present only on a
 # capture taken --with-inspection and only when a store exists: absence of a store is not

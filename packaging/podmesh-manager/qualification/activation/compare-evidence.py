@@ -44,7 +44,8 @@ def read(path):
 DERIVED=("schema_version","logical_manager_commitment","replica_commitment","logical_history_sha256",
          "receipt_set_sha256","audit_set_sha256","sqlite_integrity_result","history_count","receipt_count",
          "audit_event_count","incomplete_attempt_count","incomplete_attempts",
-         "unaudited_import_receipt_count","unaudited_import_receipt_commitments")
+         "unaudited_import_receipt_count","unaudited_import_receipt_commitments",
+         "imported_operation_commitments")
 COUNTS=("history_count","receipt_count","audit_event_count","incomplete_attempt_count","unaudited_import_receipt_count")
 DIRECTIONS=("inbound","outbound")
 AUTHORITIES=("peer-validated","pre-authentication")
@@ -99,6 +100,19 @@ def validate_inspection(v, label):
     # two, or two as one, and the predicate works on identities rather than on totals.
     ids=[a["attempt_commitment"] for a in v["incomplete_attempts"]]
     if len(set(ids)) != len(ids): raise ValueError(f"{label}: incomplete_attempts repeats an attempt identity")
+    # Two attempts on one wire nonce would let a single honest receiver row account for
+    # both -- and for ten. The predicate is about one attempt at a time, so a nonce names
+    # at most one attempt.
+    nonces=[a["nonce_commitment"] for a in v["incomplete_attempts"]]
+    if len(set(nonces)) != len(nonces): raise ValueError(f"{label}: two incomplete attempts share one wire nonce")
+    if not isinstance(v["imported_operation_commitments"],list): raise ValueError(f"{label}.imported_operation_commitments: must be a list")
+    for i,c in enumerate(v["imported_operation_commitments"]): commit(c,f"{label}.imported_operation_commitments[{i}]")
+    # An incomplete attempt is derived from audit rows, so a store reporting attempts while
+    # reporting no audit event at all is describing something it cannot have observed. This
+    # is what stops a freshly started replica from listing attempts at the baseline capture
+    # in order to retire them later as pre-existing debt.
+    if v["incomplete_attempt_count"] > 0 and v["audit_event_count"] == 0:
+        raise ValueError(f"{label}: incomplete attempts reported with no audit events to derive them from")
 
 def validate(v,label):
     p=obj(v["package"],f"{label}.package",("name","version","binary_sha256","dpkg_verify"))
@@ -352,6 +366,10 @@ def classify(host, attempt, rows_by_nonce, cleanups, overhead, reply_overhead, h
     sender=[r for h,r in candidates if h==host and r["direction"]=="outbound"]
     if len(sender)!=1: return "its own host publishes no single outbound exchange row for this nonce"
     sender=sender[0]
+    # The attempt publishes its own operation commitment; until now nothing read it, so an
+    # attempt could name any operation at all and still be accounted by its host's row.
+    if attempt["operation_commitment"] != sender["operation_commitment"]:
+        return "the attempt and its own exchange row name different operations (condition 2)"
     # Condition 2: exactly one authenticated receiver-side request, on exactly one OTHER host.
     receivers=[(h,r) for h,r in candidates if h!=host and r["direction"]=="inbound"]
     if not receivers: return "no receiver-side request bears this wire nonce (condition 2)"
@@ -380,6 +398,13 @@ def classify(host, attempt, rows_by_nonce, cleanups, overhead, reply_overhead, h
         return "the receiver committed neither an import receipt nor a typed refusal (condition 3)"
     if TERMINAL_IMPORT in recv["phases_reached"] and recv["local_receipt_commitment"] is None:
         return "the receiver committed an import with no receipt (condition 3)"
+    # "the EXPECTED import receipt OR A TYPED REFUSAL" -- the outcome has to agree with the
+    # terminal the receiver reached. Published and never read until now, so a receiver could
+    # report a refusal outcome beside a committed import and be accounted.
+    if TERMINAL_IMPORT in recv["phases_reached"] and "accepted" not in recv["outcomes"]:
+        return "the receiver committed an import without an accepted outcome (condition 3)"
+    if TERMINAL_REFUSAL in recv["phases_reached"] and "accepted" in recv["outcomes"]:
+        return "the receiver recorded a refusal and an accepted outcome at once (condition 3)"
     # Condition 5: the reply was completely written, and the sender honestly retained its
     # absence. This is the shape the frozen contract requires, not a defect.
     if REPLY_WRITTEN not in recv["phases_reached"] or recv["reply_frame_bytes"]<=0:
@@ -395,10 +420,21 @@ def classify(host, attempt, rows_by_nonce, cleanups, overhead, reply_overhead, h
     if attempt["last_phase"]!=SENDER_PREPARED:
         return "the sender did not retain the absence of a confirmed reply as prepared/incomplete (condition 5)"
     # Condition 6: a replayed retry, or the facts independently converged on every replica.
-    replayed=any(r["operation_commitment"]==sender["operation_commitment"] and r["replayed"]
-                 for rows in rows_by_nonce.values() for _,r in rows)
-    if not replayed and not history_converged:
-        return "no identical retry returned a replayed receipt and the canonical histories do not converge (condition 6)"
+    # The replay must be OBSERVED BY SOMEONE ELSE. Scanning every row including the
+    # attempt's own host let the sender assert `replayed` on its own outbound row and close
+    # the condition by itself.
+    replayed=any(h!=host and r["operation_commitment"]==sender["operation_commitment"] and r["replayed"]
+                 for rows in rows_by_nonce.values() for h,r in rows)
+    # The convergence branch was `history_converged`, which is the same digest equality the
+    # gate already asserts for every campaign that gets this far -- so it could never refuse,
+    # and the predicate warns in terms that eventual convergence ALONE is insufficient. It
+    # now asks what the condition actually asks: is THIS operation held, with a receipt, on
+    # EVERY replica.
+    everywhere=all(c["inspection"] is not None and c["inspection"]["store_present"]
+                   and sender["operation_commitment"] in c["inspection"]["imported_operation_commitments"]
+                   for c in cleanups)
+    if not replayed and not everywhere:
+        return "no other host observed a replayed retry and this operation is not held with a receipt on every replica (condition 6)"
     # Condition 7 is not checked here because it is already checked earlier and for every
     # capture: validate_inspection refuses any store whose sqlite_integrity_result is not
     # "ok", and the immutable-chain half is entailed by the inspection having succeeded at
