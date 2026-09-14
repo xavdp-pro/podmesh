@@ -3,8 +3,8 @@
 import argparse, hashlib, json, re, sys
 from pathlib import Path
 
-SCHEMA = "podmesh-manager-live-activation-evidence/v2"
-OUT_SCHEMA = "podmesh-manager-live-activation-comparison/v2"
+SCHEMA = "podmesh-manager-live-activation-evidence/v3"
+OUT_SCHEMA = "podmesh-manager-live-activation-comparison/v3"
 COMMITMENT = re.compile(r"^sha256:[0-9a-f]{64}$")
 SHA = re.compile(r"^[0-9a-f]{64}$")
 STAGES = ("pre-activation", "active-baseline", "converged", "post-cleanup")
@@ -112,7 +112,7 @@ def validate_inspection(v, label):
         if any(v[f] is not None for f in DERIVED): raise ValueError(f"{label}: absent store carries derived inspection fields")
         return
     if any(v[f] is None for f in DERIVED): raise ValueError(f"{label}: present store is missing derived inspection fields")
-    if v["schema_version"] != 3 or v["sqlite_integrity_result"] != "ok": raise ValueError(f"{label}: invalid read-only inspection")
+    if v["schema_version"] != 4 or v["sqlite_integrity_result"] != "ok": raise ValueError(f"{label}: invalid read-only inspection")
     commit(v["logical_manager_commitment"],label); commit(v["replica_commitment"],label)
     for f in ("logical_history_sha256","receipt_set_sha256","audit_set_sha256"): sha(v[f],f"{label}.{f}")
     for f in COUNTS: integer(v[f],f"{label}.{f}")

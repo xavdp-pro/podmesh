@@ -68,7 +68,7 @@ def evidence(i,stage):
     peers=[{"replica_id_commitment":replicas[j],"endpoint_commitment":c(f"endpoint-{j}"),"shared_key_commitment":keys[tuple(sorted((i,j)))]} for j in range(3) if j!=i]
     limits={"network_mode":"authenticated-static-peers","address_families":["AF_UNIX","AF_INET"],"peer_allow_count":2,"peer_allow_prefix_length":32,"sha256":h("dropin")} if running else {"network_mode":None,"address_families":[],"peer_allow_count":0,"peer_allow_prefix_length":None}
     def inspect(history, hc, rc, ac, attempts, exchanges):
-        return {"store_present":True,"schema_version":3,"logical_manager_commitment":c("logical"),
+        return {"store_present":True,"schema_version":4,"logical_manager_commitment":c("logical"),
                 "replica_commitment":replicas[i],"logical_history_sha256":history,
                 "receipt_set_sha256":h(f"receipts-{i}-{stage}"),"audit_set_sha256":h(f"audits-{i}-{stage}"),
                 "sqlite_integrity_result":"ok","history_count":hc,"receipt_count":rc,"audit_event_count":ac,
@@ -92,7 +92,7 @@ def evidence(i,stage):
     if stage in ("converged","post-cleanup"):
         exchanges=[served(0),served(1)]
         inspection=inspect(h("history"),3,3,sum(r["row_count"] for r in exchanges),[],None)
-    return {"schema_version":"podmesh-manager-live-activation-evidence/v2","host_alias":aliases[i],"stage":stage,
+    return {"schema_version":"podmesh-manager-live-activation-evidence/v3","host_alias":aliases[i],"stage":stage,
       "package":{"name":"podmesh-manager","version":"0.1.0~manager2","binary_sha256":h("binary"),"dpkg_verify":"clean"},
       "configuration":{"document_commitment":c(f"config-{i}"),"logical_manager_commitment":c("logical"),"local_replica_commitment":replicas[i],"local_host_commitment":hosts[i],"topology_commitment":c("topology"),"peer_count":2,"peers":peers},
       "dropin":{"present":running,"sha256":h("dropin") if running else None,"semantic_limits":limits,"packaged_fragment_sha256":h("fragment"),"inherited_deny_all":True,"effective_policy_configured":running,"effective_policy_commitment":c("effective-policy") if running else None},
@@ -121,7 +121,7 @@ three_args=(--phase three-host --pre "$work"/*-pre-activation.json --active-base
 "$root/compare-evidence.py" "${host_args[@]}" > "$work/host.json"
 jq -e '.status=="PASS" and (.canonical_convergence_evidenced|not) and .ha_claim=="absent"' "$work/host.json" >/dev/null
 "$root/compare-evidence.py" "${three_args[@]}" > "$work/three.json"
-jq -e '.status=="PASS" and .canonical_convergence_evidenced and .ha_claim=="absent" and .schema_version=="podmesh-manager-live-activation-comparison/v2"' "$work/three.json" >/dev/null
+jq -e '.status=="PASS" and .canonical_convergence_evidenced and .ha_claim=="absent" and .schema_version=="podmesh-manager-live-activation-comparison/v3"' "$work/three.json" >/dev/null
 # The passing fixtures must exercise the bound hash rather than bypass it: five fields with the inner hash equal to the outer one while active, four fields while absent.
 jq -e '(.dropin.semantic_limits|length)==5 and .dropin.semantic_limits.sha256==.dropin.sha256' "$work/lab-a-active-baseline.json" >/dev/null
 jq -e '(.dropin.semantic_limits|length)==4 and (.dropin.semantic_limits|has("sha256")|not)' "$work/lab-a-pre-activation.json" >/dev/null
