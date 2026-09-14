@@ -1,6 +1,6 @@
 # PodMesh — current state and resumption guide
 
-Updated: 2026-09-11. Owner: Xavier de Poorter, collaborating with OpenAI Codex.
+Updated: 2026-09-14. Owner: Xavier de Poorter, collaborating with OpenAI Codex and Claude.
 
 This is a handoff, not a replacement for INTENT.md or the detailed contracts.
 Read this file first, then the relevant checklist item and its evidence. Do not
@@ -293,6 +293,33 @@ destructive authorization.
 **Backup Server designed and pushed: `7e4e294`.** From Rules 12 and 16 of the canon rather than from
 Proxmox. See `docs/BACKUP-SERVER.md`; B1 is the first lot and must not be mixed with the G2 lot.
 
+## Universe high availability (lots H1 to H7), 2026-09-14 — built on one host, not published
+
+The operator asked for HA for the universes of his choosing, with the agent naming the host
+and one or two standbys per universe depending on resources and on an allowance that is his
+own judgement. The design is `docs/UNIVERSE-HIGH-AVAILABILITY.md`; the operations are in
+`docs/LOCAL-API.md` under "activation leases and recovery points". Three honest levels:
+planned handoff (level 1), warm standby from a recovery point (level 2), continuous disk
+replication (level 3). Fencing is the whole safety problem; the agent's choice removes
+election, never safety.
+
+Built and checked, each rule verified by weakening it and watching its check go red at its
+own case: activation policies and leases with a takeover margin (H1), self-fencing as an
+operation the caller must drive (H2), replication intent plus host resource facts with the
+allowance kept as provenance and never computed (H3), the lease following the migration
+chain so level 1 cannot be raced (H4), `recovery_point_prepare` of a stopped universe into
+an honestly **unsigned** point (H5), `recovery_point_restore` into a quarantined new
+identity that refuses a tampered archive, a non-canonical manifest and a manifest claiming
+a signature this build cannot verify (H6), and `recovery_point_promote` under the lease
+(H7). Level 2 is a complete sequence of typed operations on one host. Commits `c6e1e9c`,
+`6759318`, `05f6b01` and their predecessors on this tree.
+
+What it does not do, stated in every answer: the lease proves this host's restraint, not
+mutual exclusion — it is not replicated; no failure detector exists; no transport moves the
+point (the two-host suite's controller can carry it); no signing crate exists in this build
+and adding one is the operator's supply-chain decision; the manifest's origin is never
+verified. None of this has run on two lab hosts yet.
+
 ## Next actions, in order
 
 1. Done: independent read-only counter-review of the source-side milestone (Claude
@@ -343,6 +370,12 @@ Proxmox. See `docs/BACKUP-SERVER.md`; B1 is the first lot and must not be mixed 
    are specified in the same document and should be built in the same lot.
 6. Continue the central checklist: networking/volumes, partitions and HA, fractal
    demonstration, sequential storage tests, Backup Server and product documentation.
+7. HA, in order: run level 2's sequence across two lab hosts with the transient dev
+   service and the two-host controller as transport; replicate the lease as a manager
+   fact so the takeover margin is measured against the previous holder (new candidate,
+   requalification); a failure detector on the agent's side that only decides when the
+   standby's wait begins; the signing dependency once the operator decides it; then level
+   3 after B0 qualifies a storage backend.
 
 ## Cost and delegation policy
 
