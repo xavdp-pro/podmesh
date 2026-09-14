@@ -487,8 +487,19 @@ def account_attempts(pres, bases, cleanups, convs):
     # the protocol's own framing constant. Deriving that constant from the campaign instead
     # was a tautology: the row under test contributed to the set it was compared against.
     def overhead_of(frame, announced):
+        # Only rows that COMPLETED are asked to carry the framing constant. A row whose
+        # outcome set names a failure is recording a transfer that stopped part-way, and its
+        # frame is honestly smaller than the body it announced -- which is a faithful record,
+        # not a malformed one.
+        #
+        # Measured on a live campaign: one sender row read the four-byte length prefix of a
+        # reply announcing 690 bytes and then lost the connection, outcome `unavailable`,
+        # frame 4 against announced 690. Applied to every row, this check would have failed
+        # any real campaign containing a single mid-reply disconnection -- the exact failure
+        # this lot exists to account for.
         d={r[frame]-r[announced] for c in cleanups if c["exchanges"]
-           for r in c["exchanges"] if r[frame]>0 and r[announced] is not None}
+           for r in c["exchanges"] if r[frame]>0 and r[announced] is not None
+           and set(r["outcomes"]) <= {"accepted"}}
         return d
     rq=overhead_of("request_frame_bytes","request_announced_body_bytes")
     rp=overhead_of("reply_frame_bytes","reply_announced_body_bytes")
