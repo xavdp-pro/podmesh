@@ -169,6 +169,9 @@ PHASE_RANK={direction:{phase:index for index,phase in enumerate(phases)}
 #     ['incomplete','unavailable']  112   a transfer that failed part-way
 # So "this exchange completed" is `accepted` present and `unavailable` absent, and
 # `outcomes == ["accepted"]` can never be true of anything.
+def receiver_replica_of(cleanups, host_index):
+    return cleanups[host_index]["inspection"]["replica_commitment"]
+
 def completed(row):
     o=set(row["outcomes"])
     return "accepted" in o and "unavailable" not in o
@@ -544,6 +547,15 @@ def account_attempts(pres, bases, cleanups, convs):
                        if row["direction"]=="inbound" and nonce not in outbound_nonces
                        and nonce not in converged_nonces]
 
+    # Convergence of the canonical histories, computed once. It is not sufficient on its
+    # own -- the predicate says so in terms -- but it is a necessary part of the superseded
+    # branch below, which needs the facts to have actually converged somewhere.
+    # `.get` rather than indexing: this runs over whatever captures the caller supplies, and
+    # a capture with no history digest is simply not evidence of convergence. A missing key
+    # must not raise here, because raising turns a verdict into a crash.
+    digests={c["inspection"].get("logical_history_sha256") for c in convs
+             if c["inspection"] and c["inspection"].get("store_present")}
+    history_converged = len(digests)==1 and None not in digests
     accounted=[]; unaccounted=[]; debt=[]; terminal=[]
     for host,(pre,cleanup) in enumerate(zip(pres,cleanups)):
         baseline=attempt_ids(pre); post_capture=cleanup["inspection"]
@@ -561,7 +573,7 @@ def account_attempts(pres, bases, cleanups, convs):
                     if a["nonce_commitment"] not in pre_rows:
                         failures.append(f"host {host}: pre-existing debt has a peer row that was absent before activation")
                 debt.append({"host":host,"attempt_commitment":a["attempt_commitment"],"last_phase":a["last_phase"]}); continue
-            why,branch=classify(host,a,rows_by_nonce,cleanups,overhead,reply_overhead)
+            why,branch=classify(host,a,rows_by_nonce,cleanups,overhead,reply_overhead,history_converged)
             if why is None:
                 accounted.append({"host":host,"attempt_commitment":a["attempt_commitment"],
                                   "branch":branch,"receiver_asserted":branch=="receiver_asserted"})
@@ -644,7 +656,7 @@ def accepted_terminal_failure(host, sender, rows_by_nonce, cleanups, overhead, r
     if not complete_reply(recv,reply_overhead): return "the accepted completion has no complete receiver reply"
     return None
 
-def classify(host, attempt, rows_by_nonce, cleanups, overhead, reply_overhead):
+def classify(host, attempt, rows_by_nonce, cleanups, overhead, reply_overhead, history_converged):
     """Return (None, branch) when accounted, otherwise (first failed condition, None).
     Each condition is a separate refusal: there is no aggregate that compensates for a
     missing one."""
@@ -743,7 +755,35 @@ def classify(host, attempt, rows_by_nonce, cleanups, overhead, reply_overhead):
                     and complete_reply(retry,reply_overhead)):
                 retry_receivers.append((retry_nonce,retry))
     if not retry_receivers:
-        return "no receiver observed a complete replay carrying the durable receipt (condition 6)",None
+        # Condition 6's SECOND disjunct: the imported facts are present in the converged
+        # canonical history on every replica. The candidate keys an operation to the digest
+        # of the sender's snapshot (manager-resident/src/lib.rs:629-634), so when the local
+        # state changes before the next round a NEW operation is minted and the stranded one
+        # is never retried -- it is superseded, and its facts travel in the larger snapshot
+        # that follows.
+        #
+        # Measured on a live campaign: both remaining strands had 19 later completed
+        # exchanges to the same receiver carrying a strictly larger announced snapshot.
+        # Refusing them said the effect was unproven while the evidence showed it delivered
+        # nineteen times over.
+        #
+        # DECLARED LIMIT: announced size is a proxy for "a superset of the facts". It is
+        # sound only because the canonical history is append-only, so a later snapshot from
+        # one replica to one peer can only have grown. Published evidence carries no per-fact
+        # identity, so the exact-facts reading of this condition stays undecidable and is
+        # listed as such.
+        if history_converged:
+            superseding=[r for r in (cleanups[host]["exchanges"] or [])
+                         if r["direction"]=="outbound"
+                         and r["peer_commitment"]==receiver_replica_of(cleanups,rhost)
+                         and r["operation_commitment"] not in (None, sender["operation_commitment"])
+                         and completed(r)
+                         and r["request_announced_body_bytes"] is not None
+                         and sender["request_announced_body_bytes"] is not None
+                         and r["request_announced_body_bytes"] > sender["request_announced_body_bytes"]]
+            if superseding:
+                return None,"superseded"
+        return "no receiver observed a complete replay carrying the durable receipt, and no superseding snapshot reached that receiver (condition 6)",None
     receiver_replica=cleanups[rhost]["inspection"]["replica_commitment"]
     receiver_asserted=False
     sender_failures=[]

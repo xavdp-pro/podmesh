@@ -102,11 +102,11 @@ class ReviewFixes(unittest.TestCase):
             cleanups.append({"inspection":{"replica_commitment":replica,"store_present":True,
                                              "imported_operation_commitments":operations}})
         rows={C("2"):[(0,sender),(1,receiver)], C("a"):[(1,retry)]}
-        reason,branch=G2.classify(0,attempt(),rows,cleanups,4,4)
+        reason,branch=G2.classify(0,attempt(),rows,cleanups,4,4,False)
         self.assertIsNone(branch)
         self.assertIn("durable receipt",reason)
         retry["local_receipt_commitment"]=C("8")
-        reason,branch=G2.classify(0,attempt(),rows,cleanups,4,4)
+        reason,branch=G2.classify(0,attempt(),rows,cleanups,4,4,False)
         self.assertIsNone(reason)
         self.assertEqual(branch,"receiver_asserted")
         retry_sender=exchange(nonce=C("a"),
@@ -115,7 +115,7 @@ class ReviewFixes(unittest.TestCase):
         retry_sender.update(peer_commitment=C("5"), reply_sha256_commitment=C("7"),
                             remote_receipt_commitment=C("8"))
         rows[C("a")].append((0,retry_sender))
-        reason,branch=G2.classify(0,attempt(),rows,cleanups,4,4)
+        reason,branch=G2.classify(0,attempt(),rows,cleanups,4,4,False)
         self.assertIsNone(reason)
         self.assertEqual(branch,"replay")
 
