@@ -172,6 +172,19 @@ published a wrong diagnosis twice today and both times only measurement correcte
 is in [[methode-mesurer-avant-de-publier]]. Commits `991987b` and `9d814b2`, pushed, PR 2
 commented. No store erased, no gate or captured file altered, no checkbox ticked.
 
+## Manager2 G2 campaign 6 (2026-09-14) — G2 PASS on real evidence v3, from a repeatable driver
+
+Codex's first engineering item of the day. The web tree now carries
+`packaging/podmesh-manager/qualification/activation/campaign/run-campaign.sh` (one command,
+stops at the first failure, rolls back, preserves raw stores at rest with a derived
+inspection, public summary with driver incidents listed) and `docs/G2-CAMPAIGN-6-MEASUREMENT.md`
+with the public evidence under `docs/qualification/manager2-g2-live-6/`. Result: convergence
+evidenced, 103 new incomplete attempts all accounted, 0 unaccounted, 211 pre-existing
+retained, derivation reproduced on all three hosts; one observation needed 114 resubmissions
+(latency defect, third data point). Private campaign copy: `.podmesh-builds/manager2-g2-campaigns/campaign-6/`.
+Lab-tested; nothing deployed; `ha_claim` absent. Codex's items 2 and 3 (replication data path
+qualified separately; three-host takeover experiment with an external authority) are not begun.
+
 ## Manager2 G2 live activation (Codex's lot, taken over 2026-09-13) — converged, not passed
 
 Codex's handoff `/tmp/podmesh-claude/PODMESH-REMAINING-WORK-2026-09-13.md` named one blocker
