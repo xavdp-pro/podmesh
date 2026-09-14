@@ -4,7 +4,7 @@
 >
 > **Perimeter**: P1 — it decides which host may run a workload, so a mistake runs two.
 
-Status: **lot H1 built and checked; levels 1 to 3 designed, not built.** Written 2026-09-14
+Status: **lots H1 and H2 built and checked; levels 1 to 3 designed, not built.** Written 2026-09-14
 against what PodMesh actually has, not against what an HA product usually has. Every
 capability named as missing was verified in the source, and the citations are below.
 
@@ -168,6 +168,29 @@ reconciled history — the manager's job, and the next lot.
 Each of the four rules was verified by weakening it in the source and confirming the check
 goes red at the case named for it: the gate itself, the expiry, the takeover margin, and the
 refusal to renew a lapsed lease.
+
+**Lot H2, self-fencing.** `activation_fence` stops every universe under a policy that this
+host holds no live lease for — whether the lease lapsed, was never taken, or belongs to
+another host. A universe whose lease is live is left alone and the report says so, rather
+than the operation silently doing nothing.
+
+**It is an operation and not a timer, deliberately.** PodMesh does not act on its own; the
+garbage collector carries the same constraint for the same reason. So the *timeliness* is the
+caller's obligation: whoever drives it must call it at least as often as the shortest lease,
+or a lapsed lease leaves a universe running. That dependence is precisely why self-fencing is
+the weakest of the three mechanisms — a host too sick to renew may be too sick to fence, and
+then nothing here stops it. What makes it defensible is the takeover margin: the standby waits
+strictly longer than the lease plus the margin, so an honest but slow host has already been
+asked to stop before anyone else may start. A storage lease or out-of-band fencing proves what
+this only asks for.
+
+Checked against a real container: a live lease is left alone, an unentitled universe is
+stopped without escalating to SIGKILL, the fence is idempotent, and the gate still refuses the
+restart afterwards. Two of its three rules were verified by weakening them and watching the
+check go red. The third — refusing to report a stop that did not happen — is defence in depth
+and unreachable by the check, since it guards `podman stop` succeeding while the container
+still runs. That is written in the code beside it rather than left looking like a tested
+safeguard.
 
 ## What PodMesh still has to gain
 

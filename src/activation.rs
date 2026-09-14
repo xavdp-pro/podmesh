@@ -168,10 +168,22 @@ fn view(db: &Connection, uuid: &str) -> Result<serde_json::Value, Error> {
 
 pub fn execute(db: &Connection, request: &serde_json::Value) -> Result<serde_json::Value, Error> {
     let operation = lc::text(request, "operation")?;
-    let uuid = lc::text(request, "universe_uuid")?;
-    lc::token(uuid)?;
     lc::ensure_schema(db)?;
     ensure_schema(db)?;
+    // Fencing is the one operation that is not about one universe: it acts on every universe
+    // this host is not entitled to run, so it takes no universe and says so by refusing one.
+    if operation == "activation_fence" {
+        if request.get("universe_uuid").is_some() {
+            return Err("activation_fence acts on every universe under a policy and takes no universe_uuid".into());
+        }
+        let id = lc::text(request, "operation_id")?;
+        lc::token(id)?;
+        let _ = lc::text(request, "authorization_ref")?;
+        let timeout = bounded(request, "timeout_seconds", 0, 300)?;
+        return fence(db, id, timeout);
+    }
+    let uuid = lc::text(request, "universe_uuid")?;
+    lc::token(uuid)?;
     if operation == "activation_status" {
         return view(db, uuid);
     }
@@ -264,4 +276,79 @@ pub fn execute(db: &Connection, request: &serde_json::Value) -> Result<serde_jso
         _ => return Err("Unsupported activation operation".into()),
     }
     view(db, uuid)
+}
+
+/// Stop every universe this host is not entitled to run.
+///
+/// SELF-FENCING, AND WHY IT IS A TYPED OPERATION RATHER THAN A TIMER. PodMesh does not act on
+/// its own -- the garbage collector carries the same constraint, and for the same reason: an
+/// autonomous timer takes a decision nobody asked for. So the effect is an operation and its
+/// TIMELINESS is the caller's obligation: whoever drives it must call it at least as often as
+/// the shortest lease, or a lapsed lease leaves a universe running.
+///
+/// That dependence is exactly why self-fencing is the weakest of the three fencing
+/// mechanisms. A host too sick to renew its lease may be too sick to run the fence, and then
+/// nothing here stops it. It is defensible only through the takeover margin: the standby
+/// waits strictly longer than the lease plus the margin, so an honest but slow host has
+/// already been asked to stop before anyone else may start. A storage lease or out-of-band
+/// fencing proves what this only asks for.
+///
+/// A universe is fenced when it is under a policy and this host has no live lease for it --
+/// whether the lease lapsed, was never taken, or belongs to another host. A universe whose
+/// lease is live is left alone, and that is a refusal to act rather than an omission.
+fn fence(db: &Connection, id: &str, timeout: u64) -> Result<serde_json::Value, Error> {
+    let now = crate::now() as i64;
+    let this_host = host_uuid(db)?;
+    let mut statement = db.prepare("SELECT universe_uuid FROM activation_policy ORDER BY universe_uuid")?;
+    let universes: Vec<String> = statement
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    let mut fenced = Vec::new();
+    let mut left = Vec::new();
+    for uuid in universes {
+        let held = lease(db, &uuid)?;
+        let entitled = held
+            .as_ref()
+            .is_some_and(|l| l.holder_host_uuid == this_host && l.expires_at > now);
+        let observed = lc::observe(&uuid)?;
+        let running = observed["present"] == serde_json::json!(true)
+            && observed["running"] == serde_json::json!(true);
+        if entitled {
+            left.push(serde_json::json!({"universe_uuid": uuid, "reason": "lease is live", "running": running}));
+            continue;
+        }
+        if !running {
+            left.push(serde_json::json!({"universe_uuid": uuid, "reason": "not running", "running": false}));
+            continue;
+        }
+        let name = format!("podmesh-{uuid}");
+        let out = lc::run_podman(timeout + 5, &["stop", "--time", &timeout.to_string(), &name])?;
+        // Podman reports its escalation to SIGKILL only as a warning on stderr, and a fence
+        // that had to kill is a different fact from one that asked politely.
+        let forced = String::from_utf8_lossy(&out.stderr).contains("resorting to SIGKILL");
+        let after = lc::observe(&uuid)?;
+        let stopped = after["running"] != serde_json::json!(true);
+        // DEFENCE IN DEPTH, and not reachable by the check beside this file: `podman stop`
+        // returning success while the container still runs is the case it guards, and the
+        // check cannot manufacture it. Removing this line leaves the suite green, which is
+        // why it is written down here rather than left to look like a tested safeguard. It
+        // stays because a fence that reports a stop it did not perform is the one lie this
+        // operation must never tell -- everything downstream reads the report, not the host.
+        if !stopped {
+            return Err(format!("Fencing {uuid} did not stop it; refusing to report a fence that did not happen").into());
+        }
+        record(db, &uuid, &this_host, held.as_ref().map_or(0, |l| l.generation), "fenced", id)?;
+        fenced.push(serde_json::json!({
+            "universe_uuid": uuid,
+            "forced": forced,
+            "held_by": held.as_ref().map(|l| l.holder_host_uuid.clone()),
+            "expired_seconds_ago": held.as_ref().map(|l| now - l.expires_at),
+        }));
+    }
+    Ok(serde_json::json!({
+        "this_host_uuid": this_host,
+        "fenced": fenced,
+        "left_running_or_absent": left,
+        "scope": "this host only; a host that never runs this operation is not fenced by it",
+    }))
 }

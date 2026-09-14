@@ -182,7 +182,7 @@ fn empty_scratch() -> Result<(), Error> {
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
-fn run_podman(timeout: u64, args: &[&str]) -> Result<Output, Error> {
+pub(crate) fn run_podman(timeout: u64, args: &[&str]) -> Result<Output, Error> {
     // GNU timeout bounds this process group; no shell evaluates caller input.
     let limit = timeout.to_string();
     let scratch = SCRATCH.get().ok_or("Podman scratch directory not prepared")?;
