@@ -156,6 +156,18 @@ try:
     assert op('activation_release', universe_uuid=takeover)['ok']
     refused(op('start', universe_uuid=takeover, observe_seconds=0), 'none is held', 'start after the lease was released')
 
+    # The imported image is shared by the quarantined copy and the promoted universe. Deleting the copy
+    # keeps it -- it is in use -- and says so; deleting the promoted universe, its last user, removes it.
+    tag = f'localhost/podmesh-restore:{point}'
+    listed = lambda: tag in subprocess.run(['podman', 'images', '--format', '{{.Repository}}:{{.Tag}}'], capture_output=True, text=True).stdout.split()
+    assert listed(), 'the restore image is not where the restore tagged it'
+    gone = op('delete', universe_uuid=quarantined)
+    assert gone['ok'] and gone['data']['restore_images_removed'] == [] and gone['data']['restore_images_retained'], gone
+    assert listed(), 'deleting the quarantined copy removed an image the promoted universe still uses'
+    gone = op('delete', universe_uuid=takeover)
+    assert gone['ok'] and len(gone['data']['restore_images_removed']) == 1, gone
+    assert not listed(), 'deleting the last user of the restore image left it behind'
+
     print('PASS: promotion — refused for an unknown copy, a copy of another universe, a copy into itself, '
           'no policy, no lease, and a previous holder inside the takeover margin; allowed after the margin '
           'with the generation advanced; created under the universe\'s own identity, quarantined copy left in '

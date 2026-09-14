@@ -729,8 +729,11 @@ fn delete(db: &Connection, uuid: &str, name: &str, existing: Option<Value>) -> R
         return Err("Container still present after removal".into());
     }
     let (removed, retained) = remove_snapshots(db, uuid)?;
+    // A restored or promoted universe's imported image goes the same way, once nothing uses it.
+    let (restore_removed, restore_retained) = crate::recovery_point::remove_restore_images(db, uuid)?;
     Ok(
-        json!({"status":"verified","universe_uuid":uuid,"absent":true,"volumes":"retained","snapshot_images_removed":removed,"snapshot_images_retained":retained}),
+        json!({"status":"verified","universe_uuid":uuid,"absent":true,"volumes":"retained","snapshot_images_removed":removed,"snapshot_images_retained":retained,
+               "restore_images_removed":restore_removed,"restore_images_retained":restore_retained}),
     )
 }
 /// Start time of the earliest earlier attempt of this operation, if an attempt was interrupted

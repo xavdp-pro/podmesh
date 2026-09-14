@@ -35,6 +35,8 @@ type Error = Box<dyn std::error::Error>;
 pub const FORMAT: &str = "podmesh-recovery-point/0-unsigned-unencrypted";
 pub const MANIFEST: &str = "recovery-point-manifest.json";
 pub const ROOTFS: &str = "rootfs.tar";
+/// Where a restore's imported image is tagged; only images named nowhere else are ever removed.
+pub const RESTORE_REPOSITORY: &str = "localhost/podmesh-restore:";
 const EXPORT_TIMEOUT_SECONDS: u64 = 900;
 const KILLED_EXIT_CODE: i64 = 137;
 
@@ -441,7 +443,7 @@ fn restore(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error>
                 args.push(format!("ENTRYPOINT {}", serde_json::to_string(entry)?));
             }
             args.push(rootfs.to_string_lossy().to_string());
-            args.push(format!("localhost/podmesh-restore:{point}"));
+            args.push(format!("{RESTORE_REPOSITORY}{point}"));
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let out = lc::run_podman(EXPORT_TIMEOUT_SECONDS, &refs)?;
             if !out.status.success() {
@@ -559,4 +561,46 @@ fn promote(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error>
         params![id, uuid, restored, point, container_id, generation, crate::now() as i64],
     )?;
     promotion_view(db, id, false)?.ok_or_else(|| "The promotion was recorded but cannot be read back".into())
+}
+
+/// The images a restore imported for a universe -- the quarantined copy's own, or, for a promoted
+/// universe, the copy it was promoted from -- removed when the universe is deleted and nothing else
+/// uses them. Called from `delete`, beside the clone snapshots' own cleanup, for the same reason:
+/// an image nobody can start any more is a disk cost with no owner, and on a standby it is one per
+/// capture cycle. An image with any name outside the restore repository, or one a container still
+/// uses, is retained and the reason is reported; nothing here forces a removal.
+pub(crate) fn remove_restore_images(db: &Connection, uuid: &str) -> Result<(Vec<String>, Vec<Value>), Error> {
+    ensure_schema(db)?;
+    let mut ids: Vec<String> = {
+        let mut s = db.prepare(
+            "SELECT imported_image_id FROM recovery_point_restores WHERE restored_universe_uuid=?1
+             UNION SELECT r.imported_image_id FROM recovery_point_promotions p
+               JOIN recovery_point_restores r ON r.restored_universe_uuid=p.restored_universe_uuid
+               WHERE p.universe_uuid=?1",
+        )?;
+        let rows = s.query_map([uuid], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    ids.sort();
+    ids.dedup();
+    let (mut removed, mut retained) = (vec![], vec![]);
+    if ids.is_empty() {
+        return Ok((removed, retained));
+    }
+    let present = lc::images()?;
+    for id in ids {
+        let bare = id.trim_start_matches("sha256:").to_string();
+        let Some(image) = present.iter().find(|i| lc::image_id(i) == bare) else { continue };
+        let names: Vec<&str> = image["Names"].as_array().map(|n| n.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        if names.iter().any(|n| !n.starts_with(RESTORE_REPOSITORY)) {
+            retained.push(json!({"image": bare, "reason": "image has names outside the PodMesh restore repository"}));
+            continue;
+        }
+        match lc::run_podman(lc::QUICK, &["image", "rm", &bare]) {
+            Ok(out) if out.status.success() => removed.push(bare),
+            Ok(out) => retained.push(json!({"image": bare, "reason": String::from_utf8_lossy(&out.stderr).trim().to_string()})),
+            Err(e) => retained.push(json!({"image": bare, "reason": e.to_string()})),
+        }
+    }
+    Ok((removed, retained))
 }

@@ -354,6 +354,10 @@ copy; a quarantined copy becomes the universe itself, under the lease.
   refused**: this build cannot verify one, and a signature nobody can check is not a signature. The manifest's
   origin is not verified, and the answer's `manifest_verification` says so. The container is created through
   the ordinary `create` under the derived operation ID `<operation_id>-create`, so ownership needs no new rule.
+  The image it imports is tagged `localhost/podmesh-restore:<recovery_point_uuid>` and is removed by `delete` of
+  its last user — the quarantined copy or the universe promoted from it — never while a container still uses
+  it and never if it carries a name outside that repository; `delete` reports `restore_images_removed` and
+  `restore_images_retained` with the reason, beside the clone snapshots' own fields.
 - `recovery_point_promote` (`restored_universe_uuid`) creates the universe named by `universe_uuid` from exactly
   the image and command of that quarantined copy — read from the copy's own verified create — with no network
   and not started. Refused, in this order: no such copy here; a copy of a different universe; a copy promoted

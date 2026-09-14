@@ -357,7 +357,9 @@ suites on the shared journal (commit `0ffca5d`), and the HA two-host suite passe
 timer. `tests/check-ha-standby-tool.py` drove it on the lab hosts: refusals, two cycles with
 pruning, takeover after a lapse with the active host reachable, and takeover with the active
 host **unreachable** — 26 s waited on the standby's clock, the active host's own fence then
-stopped its copy without escalation. The transient units are stopped again.
+stopped its copy without escalation. The transient units are stopped again. The image a
+restore imports on the standby is now removed by `delete` of its last user (H10), so a
+standby's disk no longer grows by one image per cycle.
 
 ## Next actions, in order
 
