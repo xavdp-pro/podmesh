@@ -719,12 +719,26 @@ def classify(host, attempt, rows_by_nonce, cleanups, overhead, reply_overhead):
     for retry_nonce,rows in rows_by_nonce.items():
         if retry_nonce==nonce: continue
         for retry_host,retry in rows:
+            # `replayed` is NOT required of the sibling exchange, and requiring it was a
+            # reading of the flag as an ordering. It means "this request replayed an
+            # operation I already held a receipt for", so it marks whichever exchange the
+            # receiver saw SECOND -- and that can be the stranded one. Measured on a live
+            # campaign: a strand whose own receiver row carried replayed:true beside an
+            # earlier completed exchange carrying replayed:false, both bearing the same
+            # durable receipt. The strand was the replay.
+            #
+            # What the condition actually asks is whether the durable receipt this exchange
+            # produced is the one a fully bound, completed exchange of the same operation
+            # also carries on the same receiver. Which of the two came first decides nothing
+            # about whether the effect is durable.
             if (retry_host==rhost and retry["direction"]=="inbound"
                     and retry["nonce_authority"]=="peer-validated"
                     and retry["operation_commitment"]==sender["operation_commitment"]
-                    and retry["peer_commitment"]==sender_replica and retry["replayed"] is True
+                    and retry["peer_commitment"]==sender_replica
+                    and (retry["replayed"] is True or recv["replayed"] is True)
                     and TERMINAL_IMPORT in retry["phases_reached"] and REPLY_WRITTEN in retry["phases_reached"]
                     and completed(retry)
+                    and retry["local_receipt_commitment"] is not None
                     and retry["local_receipt_commitment"]==recv["local_receipt_commitment"]
                     and complete_reply(retry,reply_overhead)):
                 retry_receivers.append((retry_nonce,retry))
