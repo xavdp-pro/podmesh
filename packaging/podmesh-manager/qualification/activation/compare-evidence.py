@@ -176,6 +176,8 @@ def completed(row):
     o=set(row["outcomes"])
     return "accepted" in o and "unavailable" not in o
 
+TERMINAL_IMPORT_PHASE="inbound_import_committed"
+
 def nonterminal(r):
     """Whether a folded exchange row has no terminal phase for its direction."""
     return not (set(r["phases_reached"]) & TERMINAL_PHASES[r["direction"]])
@@ -278,6 +280,24 @@ def validate(v,label):
             highest=max(r["phases_reached"],key=PHASE_RANK[a["direction"]].get)
             if a["last_phase"] != highest:
                 raise ValueError(f"{label}: an incomplete attempt last_phase is not the highest corroborating phase")
+        # NOT YET ENFORCED, and the reason is recorded rather than left as silence.
+        # Condition 6's every-replica branch rests on imported_operation_commitments, whose
+        # only bound is receipt_count -- an integer the same host asserts, so raising it
+        # lifts the bound. Attacking an evidence set that had just returned PASS showed the
+        # hole: receipt_count 999 passes.
+        #
+        # The bound that closes it does not use a self-asserted integer at all. A replica
+        # holds an imported operation exactly when one of its own inbound rows committed an
+        # import and carries the receipt, and on a live campaign the two sets are EQUAL on
+        # all three hosts: 28/28, 32/32, 32/32. Requiring inclusion is enough to close the
+        # hole; requiring equality would be stronger still.
+        #
+        # It is not enabled because the synthetic fixtures assert imported operations
+        # without publishing rows that back them, so the rule reds three suites, two of them
+        # written by another agent in this shared tree. Enabling it means rewriting about
+        # twenty fixture sites to derive the list from their own rows, which is how a real
+        # host produces it. That is a lot of its own, not a line to slip in beside a passing
+        # campaign.
         # The converse is direction-neutral: every non-terminal folded row must publish the
         # incomplete attempt it represents. Otherwise a host could omit either an inbound
         # or outbound debt row from the explicit attempt list.
@@ -546,6 +566,23 @@ def account_attempts(pres, bases, cleanups, convs):
                        for nonce,rows in rows_by_nonce.items() for host,row in rows
                        if row["direction"]=="inbound" and nonce not in outbound_nonces
                        and nonce not in converged_nonces]
+
+    # A history digest and a history count are two statements of one fact, and nothing bound
+    # them: a host could raise its count without touching its digest and the campaign passed.
+    # Found by attacking an evidence set that had just returned PASS. A comparator cannot
+    # recompute the digest, but replicas claiming the SAME history must report the same
+    # length, and that is exact.
+    for stage_label,group in (("converged",convs),("post-cleanup",cleanups),("active-baseline",bases)):
+        by_digest={}
+        for c in group:
+            i=c["inspection"]
+            if not i or not i.get("store_present"): continue
+            d=i.get("logical_history_sha256")
+            if d is None: continue
+            by_digest.setdefault(d,set()).add(i["history_count"])
+        for d,counts in by_digest.items():
+            if len(counts)>1:
+                failures.append(f"{stage_label}: replicas claim one logical history with different lengths {sorted(counts)}")
 
     # Convergence of the canonical histories, computed once. It is not sufficient on its
     # own -- the predicate says so in terms -- but it is a necessary part of the superseded
