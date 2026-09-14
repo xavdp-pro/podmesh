@@ -72,6 +72,21 @@ transition is a separate prerequisite under config-transition/.
 
 ## Four evidence stages
 
+### Version contract
+
+New captures use `podmesh-manager-live-activation-evidence/v3`. A present
+privacy-preserving `inspection` projection uses integer schema version `4`; the frozen
+candidate input inspected by the collector remains private inspection version `3`.
+The matching comparator output is
+`podmesh-manager-live-activation-comparison/v3`. The activation seal refuses a
+converged file or active baseline carrying another evidence version, and the comparator
+must likewise refuse evidence `/v2`, published inspection `3`, and comparison `/v2`
+rather than interpreting old and new shapes under one name.
+
+Historical `/v2` captures are immutable. Reproduce their stored comparison with the
+activation comparator at commit `9d814b2`, or capture preserved stores again as new `/v3`
+evidence with new checksums. Never rewrite a `/v2` file to claim `/v3` compatibility.
+
 The comparator requires four captures for every host:
 
 1. pre-activation: manager disabled, inactive and absent, with the reviewed G2
@@ -85,9 +100,17 @@ The comparator requires four captures for every host:
    exact fragment removal.
 
 Convergence is derived only from stages 3 and 4. The three canonical history
-digests must agree, contain at least three facts, have zero incomplete attempts,
-and remain converged after all residents stop. Equal diagnostic status counters
-do not prove convergence.
+digests must agree, contain at least three facts, and remain converged after all
+residents stop. Incomplete attempts are retained and classified by identity as
+pre-existing, terminal, accounted, or unaccounted; G2 requires zero **unaccounted**
+new incomplete attempts. It never requires deletion or fabrication of a terminal
+row. Equal diagnostic status counters do not prove convergence.
+
+A G2 PASS is an exchange-accounting result over the captured manager processes. It
+must report the full attempt vocabulary, the conditions the published evidence could
+not decide, and its collector-honest trust model. It does not prove takeover, fencing,
+exclusive activation, DNS recovery, host-loss recovery, long-running viability, or
+manager high availability. Those remain later gates even when G2 passes.
 
 The comparator also proves the same package and topology, distinct local host
 and replica commitments, reciprocal peer and pair-key commitments, one stable

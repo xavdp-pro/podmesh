@@ -1,12 +1,13 @@
 # G2 evidence schema v3 — publishing what the accounting predicate needs
 
-Status: **implemented, not yet run against hosts.** Lot `codex/g2-accounted-attempts`.
+Status: **implemented, independently reviewed as NO-GO, and not yet run against hosts.**
+Lot `codex/g2-accounted-attempts`.
 Work item 2 is this document; items 3 to 6 are in the collector, the fold, the comparator
 and the suites: typed fresh-store absence, the published `incomplete_attempts` records,
 the folded `exchanges` rows, and the eight-condition join that replaced the withdrawn
-demand for zero. What remains is re-evaluating the preserved stores (item 7) and an
-independent review (item 8). **No campaign has been run against this, and nothing here
-qualifies G2.**
+demand for zero. The independent review found blocking accounting defects that must be
+corrected before preserved-store re-evaluation or another campaign. **No campaign has been
+run against this version, and nothing here qualifies G2.**
 
 **Two corrections this document made to itself, both from measurement rather than from
 reading, are recorded in place below**: an exchange is a fold over one to four audit rows
@@ -15,15 +16,17 @@ byte counters. A third came from the implementation: the peer field always names
 other party, so the two sides of a join are bound by each naming the other against the
 published replica commitments, never by equality.
 
-**On the version numbers, which are deliberately not bumped yet.** The constraint below
-is that collector, comparator, fixtures and schema version move together and are re-sealed
-together. They are, but the seal happens **once, when the lot closes**, not on each
-intermediate commit: bumping the public evidence string to `/v3` now would advertise a v3
-that lacks `exchanges` and would need a v4 a week later for the same lot. So the wire
-strings stay at their current values while the lot is open, and the inspection object
-grows on the branch under matched collector-and-comparator commits. Nothing sealed by a
-past campaign is read by this comparator; preserved evidence is re-derived by re-running
-the collector against preserved store copies, which is work item 7.
+**The versions are bumped before another capture is allowed.** Evidence `/v2`, comparison
+`/v2`, and published inspection `3` name the historical shape only. The widened collector
+emits evidence `/v3` with published inspection `4`; the corresponding comparator must emit
+comparison `/v3` and refuse the old strings. The frozen candidate still supplies its
+private inspection input as version `3`. `capture-host.sh` checks that private contract and
+projects it into the distinct, privacy-preserving published inspection version `4`.
+
+Historical `/v2` evidence is not rewritten or silently accepted by the new comparator. It
+remains reproducible with the comparator at commit `9d814b2`, the last comparator commit
+that consumes that shape. Preserved stores may be captured again under `/v3`, but those new
+files are new evidence and must receive new sidecars and a new comparison.
 
 Date: 2026-09-13. Authority: `/tmp/podmesh-claude/DECISIONS-CODEX-2026-09-13.md`,
 Decision 1. Predicate: [MANAGER-HA-ACCEPTANCE.md](MANAGER-HA-ACCEPTANCE.md), "The G2
@@ -50,7 +53,7 @@ carrying `direction`, `attempt_id`, `wire_nonce`, `wire_operation_id` and `last_
 | --- | --- | --- |
 | `ordered_audit_events` | `durable.rs:316` | every per-attempt fact the join needs: peer, operation, nonce, phase, outcome, request digest, announced size, transferred bytes, reply bytes and digest, local and remote receipts, `replayed` |
 | `ordered_receipts`, `receipt_set_sha256` | `durable.rs:313-314` | per-receipt identity and set completeness |
-| `audit_set_sha256` | `durable.rs:317` | audit-set completeness across replicas |
+| `audit_set_sha256` | `durable.rs:317` | local audit-set completeness and stage consistency; replica-local audit sets are not expected to equal one another |
 | `unaudited_import_receipt_ids` | `durable.rs:319`, computed `:2662-2676` (the set difference itself at `:2673`; `:2667` is only the binding head) | **the** field condition 4 is about |
 
 The amended predicate is therefore not merely unmet — it cannot be computed from what a
@@ -71,8 +74,9 @@ It does not. `CanonicalStoreInspection` (`durable.rs:302-321`) already declares
 plain `Serialize` with no `skip` attribute anywhere; and `--inspect-store` serializes the
 whole struct (`main.rs:32`). Every field the amended predicate needs is on the frozen
 candidate's stdout today and is thrown away by one projection in the collector
-(the projection, now `capture-host.sh:197`). **v4 is a collector and comparator change,
-start to finish.**
+(the projection, now `capture-host.sh:197`). Published inspection v4 is a collector and
+comparator contract. It is not a claim that the frozen candidate's private inspection
+input changed from v3.
 
 ### Correction: `immutable_schema_verified` cannot be published
 
@@ -243,9 +247,10 @@ second sample.
   missing store under `set -euo pipefail`. The baseline capture must tolerate "no store
   yet" and say so in a typed field, or it breaks the very fresh-store campaign it exists
   to serve.
-- **Bounded.** Per-exchange rows are scoped to the campaign window, so a host publishes
-  on the order of one row per inbound exchange it served — about 125 in the measured
-  campaign, not the whole audit history.
+- **Current capture extent is explicit.** `exchanges` currently folds every audit row
+  retained by the inspected store, one output row per nonce. It is not scoped by a
+  published wall-clock window or row watermark. A future bounded projection requires a
+  new evidence version and must not be implied by this schema.
 - **Versioned in lockstep.** `compare-evidence.py` pins the inspection object to an exact
   key set against a sealed schema string — nine keys when this was written, sixteen now, so the collector, the comparator, its
   fixtures and the schema version change together and are re-sealed together.
@@ -280,7 +285,7 @@ Inspection `schema_version` moves 3 → **4**; evidence
       "attempt_commitment": "sha256:…",     // commit_text attempt-id
       "nonce_commitment": "sha256:…",       // commit_text wire-nonce   ← the join key
       "operation_commitment": "sha256:…",   // commit_text wire-operation-id, null when absent
-      "peer_commitment": "sha256:…",        // commit_text replica-id
+      "nonce_authority": "peer-validated",  // or "pre-authentication"
       "direction": "outbound",
       "last_phase": "outbound_request_prepared"
     }
@@ -293,23 +298,23 @@ Inspection `schema_version` moves 3 → **4**; evidence
 named neither cleanly and reached into `AuditOutcome` at `:234`), not free text, and they
 identify nothing.
 
-### `exchanges` — the receiver side of the join
+### `exchanges` — all locally retained folded exchange strands
 
-A new sibling of `inspection`, present only on a capture taken `--with-inspection`, and
-scoped to the campaign window by the baseline watermark:
+A sibling of `inspection`, present only on a capture taken `--with-inspection`. It is an
+array, and each element folds every audit row retained locally for one nonce. The current
+collector publishes the whole retained audit table; no `window` or `rows` wrapper exists.
 
 ```jsonc
-{
-  "window": { "from_audit_row": 2557, "to_audit_row": 3303 },
-  "rows": [
-    {
+[
+  {
       "nonce_commitment": "sha256:…",       // the join key
       "nonce_authority": "peer-validated",  // or "pre-authentication": published, never joined
+      "joinable": true,
       "direction": "inbound",
       "phases_reached": ["inbound_request_observed","inbound_import_committed",
                          "inbound_reply_prepared","inbound_reply_write_observed"],
-      "terminal_phase": "inbound_reply_write_observed",   // derived from the set above
-      "outcome": "accepted",
+      "row_count": 4,
+      "outcomes": ["accepted"],
       "peer_commitment": "sha256:…",
       "operation_commitment": "sha256:…",
       "request_sha256_commitment": "sha256:…",
@@ -319,10 +324,10 @@ scoped to the campaign window by the baseline watermark:
       "reply_sha256_commitment": "sha256:…",
       "local_receipt_commitment": "sha256:…",
       "remote_receipt_commitment": "sha256:…",
+      "reply_announced_body_bytes": 689,
       "replayed": true
-    }
-  ]
-}
+  }
+]
 ```
 
 Byte counts are published raw: they identify nothing and conditions 2 and 5 are about
@@ -335,11 +340,11 @@ plus a guessed body is a confirmation oracle.
 | --- | --- |
 | 1 | the attempt commitment is in the post-campaign set and not in the baseline set, and `package` binds the candidate — already compared across stages |
 | 2 | one `exchanges` row on exactly one other host with the same `nonce_commitment`, whose `peer_commitment`, `operation_commitment`, `request_sha256_commitment`, `request_announced_body_bytes` and `request_frame_bytes` all bind |
-| 3 | that row's `terminal_phase` is `inbound_import_committed` or `inbound_refusal_recorded` with a matching `outcome`, and it carries a `local_receipt_commitment` |
+| 3 | the receiver's `phases_reached` includes `inbound_import_committed` or `inbound_refusal_recorded`, its `outcomes` vocabulary is compatible with those phases, and the accepted-import branch carries a `local_receipt_commitment` |
 | 4 | `unaudited_import_receipt_count == 0` on every host, with the commitments published so a non-zero case names which |
 | 5 | the receiver's row reaches `inbound_reply_write_observed` with `reply_frame_bytes > 0`, **and** the sender's attempt is still `outbound_request_prepared` — the honest retention the contract requires |
 | 6 | a later `exchanges` row with the same `operation_commitment` and `replayed: true`, **or** the imported fact present in the converged history on all three replicas |
-| 7 | `sqlite_integrity_result`, the inspection having succeeded at all — which is what entails the immutable-schema check — and the two set digests agreeing across replicas |
+| 7 | `sqlite_integrity_result`, successful inspection — which entails the immutable-schema check — and each replica's receipt/audit set digests remaining consistent with its own later capture. The set digests are replica-local and must not be required to agree across replicas. |
 | 8 | the attempt is still in `incomplete_attempts` at post-cleanup — visible, not silently retired |
 
 ## What the comparator must gain
@@ -349,7 +354,7 @@ only. It refuses on: no receiver row for a peer-validated nonce commitment; **mo
 one folded** row for it — the pre-fold rule would have refused every real inbound
 exchange, see the correction above; two different non-null values for one field inside a
 fold; any binding field that disagrees across hosts; a receiver row that never
-reached a terminal phase; a non-zero unaudited-receipt count; an attempt that appears in
+reached the required phase set; a non-zero unaudited-receipt count; an attempt that appears in
 the post set, is claimed accounted, and is absent from `incomplete_attempts` at
 post-cleanup; and any attempt outside the declared window.
 
@@ -364,10 +369,12 @@ write.
 
 ## Size, and what it costs
 
-Per host in the measured campaign: about 33 incomplete-attempt records, and one folded
-exchange row per nonce — 67 in the preserved store measured, folded from 165 audit rows. On the order of tens of kilobytes per stage file, against 13 KB today.
-The audit history itself is never published — only a window of summaries and two set
-digests over it.
+Per host in the measured store: about 33 incomplete-attempt records, and one folded
+exchange row per nonce — 67 in the preserved store measured, folded from 165 audit rows.
+That was on the order of tens of kilobytes per stage file, against 13 KB before this
+projection. The raw audit history is never published, but the current folded projection
+covers the whole locally retained audit table and can therefore grow without bound. A
+bounded window remains a separate, versioned change.
 
 ## What this design does not do
 

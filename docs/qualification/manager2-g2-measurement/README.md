@@ -50,21 +50,38 @@ for the full diagnosis, what it rules out, and what it leaves unproven.
   three-host comparison (**PASS**).
 - `SHA256SUMS` — covers everything else in this directory.
 
-Both comparisons reproduce byte for byte from this directory with the checked-in
-comparators:
+The activation comparison is historical evidence `/v2`. It reproduces byte for byte
+only with the activation comparator at commit `9d814b2`, the last comparator that
+consumes that shape. The replacement evidence-v3 comparator intentionally refuses `/v2`; it must not be
+used to claim reproduction of this file. The configuration-transition comparison still
+reproduces with its checked-in comparator.
 
 ```sh
-packaging/podmesh-manager/qualification/activation/compare-evidence.py --phase three-host \
-  --pre lab-*/pre-activation.json --active-baseline lab-*/active-baseline.json \
-  --converged lab-*/converged.json --cleanup lab-*/post-cleanup.json
+repo=$(git rev-parse --show-toplevel)
+evidence=$repo/docs/qualification/manager2-g2-measurement
 
-packaging/podmesh-manager/qualification/activation/config-transition/compare-three-hosts.py \
-  --transition incoming-workers transition/lab-*/config-transition-result.json
+git -C "$repo" show \
+  9d814b2:packaging/podmesh-manager/qualification/activation/compare-evidence.py \
+  > /tmp/podmesh-manager-activation-comparator-v2.py
+python3 /tmp/podmesh-manager-activation-comparator-v2.py --phase three-host \
+  --pre "$evidence"/lab-*/pre-activation.json \
+  --active-baseline "$evidence"/lab-*/active-baseline.json \
+  --converged "$evidence"/lab-*/converged.json \
+  --cleanup "$evidence"/lab-*/post-cleanup.json \
+  > /tmp/podmesh-manager-activation-comparison-v2.json
+cmp /tmp/podmesh-manager-activation-comparison-v2.json "$evidence"/comparison.json
+
+"$repo"/packaging/podmesh-manager/qualification/activation/config-transition/compare-three-hosts.py \
+  --transition incoming-workers \
+  "$evidence"/transition/lab-*/config-transition-result.json \
+  > /tmp/podmesh-manager-config-transition-comparison.json
+cmp /tmp/podmesh-manager-config-transition-comparison.json \
+  "$evidence"/transition/comparison.json
 ```
 
 ## What is not claimed
 
-Nothing. This run qualifies no gate and establishes no capability. It is a
+Nothing. This run qualifies no gate and establishes no HA capability. It is a
 measurement whose result was that the hypothesis under test — that raising the
 incoming worker limit removes the strand mechanism — is false. The converged
 captures were taken exactly once per host with no retry, because retrying until the

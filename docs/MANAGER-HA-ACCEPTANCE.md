@@ -81,7 +81,7 @@ Missing data is `unknown`; it is never recorded as zero or stopped.
 | --- | --- | --- |
 | G0 Local reducer | Deterministic three-copy reconciliation and conflict quarantine | Qualified in the isolated model |
 | G1 Durable process | Crash/restart, concurrent writers, checked facts and receipts | Qualified locally; no host deployment |
-| G2 Authenticated exchange | Three real processes, bounded mutual peer authentication and durable imports, with **every incomplete attempt individually accounted for** — see "The G2 acceptance predicate" below | Not yet qualified. Two live three-host campaigns of candidate `0.1.0~manager2+gff77b1f946e8` each converged to one canonical digest on all three replicas, at the converged stage and again after typed cleanup, with unchanged unrelated services, containers, routes and firewall. The checked-in comparator still does not PASS: every store retains outbound exchange attempts the candidate deliberately leaves uncertain when a peer at its one-connection incoming limit drops the connection, and the gate requires zero. A reviewed transition then raised `incoming_workers` to 2 on all three hosts and a measurement run showed the accept-and-drop eliminated (`rejected_connections: 0`) with nine strands still appearing, every one of them received, imported and replied to by its peer. The gate's `incomplete_attempt_count == 0` therefore requires that a failure mode the frozen Stage D contract explicitly specifies (`MANAGER-G2-DURABLE-EXCHANGE.md:470`, invariant G2-I07) never occurs during a campaign. Whether that is the right predicate is a specification question for this document's author; separately, the receiver's pre-reply path is O(audit table) and unbounded, which is a real defect. See [FINDING-MANAGER2-LATE-REPLY-STRANDS.md](FINDING-MANAGER2-LATE-REPLY-STRANDS.md) |
+| G2 Authenticated exchange | Three real processes, bounded mutual peer authentication and durable imports, with **every attempt individually terminal or accounted for** and every undecidable sub-condition reported — see "The G2 acceptance predicate" below | Not yet qualified. Historical evidence v2 records two live three-host campaigns and one measurement run; they establish that the three processes exchanged authenticated observations and converged, but their FAIL comparison is reproducible only with the comparator at commit `9d814b2`. Evidence v3, published inspection v4 and comparison v3 are the next contract. No v3 campaign may run until the independently reviewed accounting defects are corrected. A G2 PASS will remain an exchange-accounting result, not proof of takeover, fencing, DNS recovery, exclusive activation, host-loss recovery, long-running viability, or HA. |
 | G3 Effect exclusion | Current epoch enforced outside manager memory and old epoch refused | Not yet qualified |
 | G4 Host deployment | Signed package, preserved identity, upgrade/rollback and clean install on three hosts | Signed installation, protected three-replica configuration, offline validation and default-disabled refusal pass on three existing hosts; durable identity restart, lifecycle, upgrade/rollback and clean-host requirements remain open |
 | G5 Manager service recovery | Real process/host loss, restart and stale return under external observation | Not yet qualified |
@@ -128,8 +128,12 @@ reach that number.
 
 ### When an incomplete outbound attempt is accounted for
 
-Only when a deterministic join proves **all** of the following. Each is a separate
-refusal; there is no aggregate that can compensate for a missing one.
+The intended acceptance conditions are listed below. A result may call an incomplete
+attempt `accounted` only through a named `replay` or `convergence` branch and must state
+which conditions the published evidence actually decided. Privacy-preserving evidence
+currently cannot decide every part of conditions 4, 5, 6, and 8; a PASS must publish
+those limits instead of implying that all eight were proven. Each decidable mismatch is
+a separate refusal; there is no aggregate that can compensate for it.
 
 1. the attempt belongs to the qualified campaign window and the exact candidate;
 2. its declared peer, operation ID, wire nonce, request digest, announced size and
@@ -167,6 +171,13 @@ folded into a success claim. Every new attempt is classified individually.
 `terminal_attempts` · `accounted_incomplete_attempts` ·
 `unaccounted_incomplete_attempts` · `preexisting_incomplete_attempts` ·
 `new_incomplete_attempts`.
+
+The comparison also emits `undecided_conditions`, `trust_model`, and a per-attempt
+`branch`. At minimum, the present privacy boundary makes
+`C4-partial-import`, `C5-signature`, `C6-exact-facts`, and `C8-diagnostics`
+undecidable from sealed evidence. The trust model is
+`collector-honest; cross-host joins only`: same-host counts, terminals, and digest
+sidecars remain producer assertions unless another host's evidence anchors them.
 
 ### What this amendment does not do
 

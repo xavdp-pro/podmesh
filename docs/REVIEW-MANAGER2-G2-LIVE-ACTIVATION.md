@@ -69,12 +69,13 @@ on all three hosts before either campaign and were not modified.
 | `incomplete_attempt_count` converged (a/b/c) | 1 / 0 / 1 | 51 / 40 / 23 |
 | `incomplete_attempt_count` post-cleanup (a/b/c) | 0 / 0 / 2 | 50 / 46 / 27 |
 | Comparator as of `cfffd7a` | FAIL: `active-baseline:lab-a.dropin.semantic_limits: unsafe shape` | — |
-| Comparator of this commit | FAIL, 17 failures, all cross-host joins plus convergence | FAIL, 5 failures, all `incomplete_attempt_count` |
+| Comparator at commit `9d814b2` | FAIL, 17 failures, all cross-host joins plus convergence | FAIL, 5 failures, all `incomplete_attempt_count` |
 
 The second campaign's twelve stage files and their sidecars are published
 byte-for-byte under `docs/qualification/manager2-g2-live/`, with the strict
-comparison and a public summary; the checked-in comparator reproduces
-`comparison.json` from that directory. The sidecars carry the evidence path the
+comparison and a public summary; the activation comparator at commit `9d814b2`
+reproduces `comparison.json` from that directory. The replacement evidence-v3 comparator
+refuses the historical v2 shape. The sidecars carry the evidence path the
 producing hosts wrote them under, which names aliases only. The summary separates
 what the twelve files carry from what was read live during the campaign and is
 therefore reported, not reproducible from the directory. The first campaign's files are retained
@@ -139,7 +140,7 @@ tree to be mirrored path-for-path and made the published copy unverifiable in
 place. It now accepts a sidecar whose file name matches and still refuses one
 naming another file; the digest still has to match the bytes. Tests cover the
 relocated and the misnamed case. The published evidence is therefore verifiable
-with the checked-in comparator exactly as produced, sidecars included.
+with the comparator at commit `9d814b2` exactly as produced, sidecars included.
 
 ## The remaining failure, and why campaign 1 nearly passed
 
@@ -172,13 +173,12 @@ at converged and 0 / 0 / 2 after cleanup. It was one or two collisions away from
 a pass. A pass of the gate as written is therefore a matter of timing, not of
 correctness, for this candidate and this configuration.
 
-The gate is not wrong to ask. `docs/MANAGER-HA-ACCEPTANCE.md` HA-01 requires
-byte-equivalent logical histories, distinct identities, no conflict, no
-undeclared peer and no effect; the activation README adds zero incomplete
-attempts so that a history called complete carries no unresolved exchange. An
-uncertain outbound attempt is not a partial import, but it is an unresolved
-question the store keeps honestly, and a gate that ignored it would be weaker
-than the candidate's own bookkeeping.
+At the time of these campaigns, the activation README required zero incomplete
+attempts. That historical gate is now withdrawn: the Stage D contract requires an
+uncertain outbound attempt to remain visible when a reply is lost after destination
+commit. The replacement predicate classifies every attempt by identity and requires
+zero **unaccounted new** incomplete attempts. The historical captures and their FAIL
+result remain unchanged; this correction does not qualify them retroactively.
 
 ## What the evidence proves, and what it does not
 
@@ -193,7 +193,7 @@ stage and again after every resident had stopped; typed graceful shutdown with
 `Result=success` and `ExecMainStatus=0`; unchanged existing PodMesh services,
 rootful containers, routes and nftables commitments across all four stages.
 
-Not proven, and not claimed: G2 as gated by the checked-in comparator; HA-01;
+Not proven, and not claimed: G2 as gated by the historical comparator; HA-01;
 any activation authority; takeover, fencing, DNS, exclusive activation,
 host-loss recovery or high availability. Nothing here says the manager is HA.
 
@@ -340,7 +340,7 @@ threshold and would make a campaign diagnosable rather than merely judged.
   `git diff --check` clean; every relative link in `docs/*.md` resolves.
 - The published evidence directory: 27 files — twelve stage files, their twelve
   sidecars, the strict comparison, the public summary and `SHA256SUMS`, which
-  lists the other 26 and verifies; the checked-in comparator reproduces
+  lists the other 26 and verifies; the comparator at commit `9d814b2` reproduces
   `comparison.json` from it; scanned for raw addresses, UUIDs, the campaign
   salt, the alias map and the replica identifiers, none present.
 - Final host state, read after the campaign: manager inactive and disabled on
@@ -365,7 +365,8 @@ A second fresh, read-only Claude Opus context reviewed the whole lot before this
 commit: the three additions that post-date the first review, the published
 directory, every number in this document and in `campaign-summary.json` against
 the stage files, the claim boundaries of the three edited documents, and privacy.
-It reproduced `comparison.json` byte for byte from the published directory, and
+Using the comparator now pinned as commit `9d814b2`, it reproduced
+`comparison.json` byte for byte from the published directory, and
 showed that `incomplete_attempt_count` is the sole blocker by setting it to zero
 in a scratch copy, changing nothing else, and obtaining `status: PASS` with an
 empty failure list. Verdict GO, conditional on one blocking finding — this

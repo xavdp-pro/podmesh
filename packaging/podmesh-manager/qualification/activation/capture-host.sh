@@ -190,12 +190,20 @@ inspection() {
   # The store is read ONCE. Two projections derive from that single read, so the published
   # inspection and the published exchanges can never describe two different moments.
   printf '%s' "$raw" > "$work/inspection-raw.json"
+  jq -e 'type == "object" and .schema_version == 3' "$work/inspection-raw.json" >/dev/null || {
+    echo 'Unsupported candidate inspection schema; expected private input version 3' >&2
+    return 1
+  }
   commitment_keys < "$work/inspection-raw.json" | commit_batch > "$work/commitments.json" || return 1
   jq -ce --arg logical "$(commit_text logical-manager-id "$(jq -r .logical_manager_id <<<"$raw")")" \
      --arg replica "$(commit_text replica-id "$(jq -r .replica_id <<<"$raw")")" \
      --argjson commitments "$(cat "$work/commitments.json")" '
     def c($kind; $v): if $v == null then null else ($commitments[$kind + "\t" + $v] // error("no commitment for " + $kind)) end;
-    {store_present:true,schema_version,logical_manager_commitment:$logical,replica_commitment:$replica,
+    # Candidate inspection/v3 is the frozen private input contract. This collector
+    # publishes a different, privacy-preserving projection whose schema is v4. Keeping
+    # those versions separate prevents the widened projection from being sealed as v3.
+    if .schema_version != 3 then error("unsupported candidate inspection schema") else
+    {store_present:true,schema_version:4,logical_manager_commitment:$logical,replica_commitment:$replica,
      logical_history_sha256,receipt_set_sha256,audit_set_sha256,sqlite_integrity_result,
      history_count,receipt_count,audit_event_count,
      incomplete_attempt_count:(.incomplete_attempts|length),
@@ -215,7 +223,8 @@ inspection() {
      # the predicate that eventual history convergence alone is insufficient was exactly
      # what the code did. (No apostrophes here: this whole jq program is a shell single-
      # quoted string, and one apostrophe ends it mid-filter.)
-     imported_operation_commitments:[.ordered_receipts[] | select(.wire_operation_id != null) | c("wire-operation-id"; .wire_operation_id)] | unique}' <<<"$raw"
+     imported_operation_commitments:[.ordered_receipts[] | select(.wire_operation_id != null) | c("wire-operation-id"; .wire_operation_id)] | unique}
+    end' <<<"$raw"
 }
 # The receiver side of the join, folded to one row per wire nonce. Present only on a
 # capture taken --with-inspection and only when a store exists: absence of a store is not
@@ -246,5 +255,5 @@ shutdown=null
 if [ -n "$shutdown_report" ]; then
   shutdown=$(jq -ce 'select(.schema_version=="podmesh-manager-graceful-shutdown/v1" and .typed_request_acknowledged==true and .process_exited_successfully==true and .service_inactive==true and .control_socket_absent==true and .forced_signal_used==false)' "$shutdown_report") || { echo 'Graceful shutdown report is invalid' >&2; exit 2; }
 fi
-jq -nS --arg alias "$alias_name" --arg stage "$stage" --arg version "$version" --arg binary "$binary_hash" --argjson configuration "$config" --argjson dropin "$dropin_value" --argjson service "$service" --argjson process "$process" --argjson state "$state" --argjson runtime "$runtime" --argjson socket "$socket" --argjson listeners "$listener" --arg existing "$existing" --arg containers "$containers" --argjson routes "$routes" --argjson firewall "$firewall" --argjson inspection "$inspect" --argjson exchanges "$exchange_rows" --argjson shutdown "$shutdown" '{schema_version:"podmesh-manager-live-activation-evidence/v2",host_alias:$alias,stage:$stage,package:{name:"podmesh-manager",version:$version,binary_sha256:$binary,dpkg_verify:"clean"},configuration:$configuration,dropin:$dropin,service:$service,manager_process:$process,paths:{state:$state,runtime:$runtime,control_socket:$socket},listeners:$listeners,stability:{existing_services_commitment:$existing,podman_containers_commitment:$containers,routes:$routes,firewall:$firewall},inspection:$inspection,exchanges:$exchanges,graceful_shutdown:$shutdown}' > "$work/evidence.json"
+jq -nS --arg alias "$alias_name" --arg stage "$stage" --arg version "$version" --arg binary "$binary_hash" --argjson configuration "$config" --argjson dropin "$dropin_value" --argjson service "$service" --argjson process "$process" --argjson state "$state" --argjson runtime "$runtime" --argjson socket "$socket" --argjson listeners "$listener" --arg existing "$existing" --arg containers "$containers" --argjson routes "$routes" --argjson firewall "$firewall" --argjson inspection "$inspect" --argjson exchanges "$exchange_rows" --argjson shutdown "$shutdown" '{schema_version:"podmesh-manager-live-activation-evidence/v3",host_alias:$alias,stage:$stage,package:{name:"podmesh-manager",version:$version,binary_sha256:$binary,dpkg_verify:"clean"},configuration:$configuration,dropin:$dropin,service:$service,manager_process:$process,paths:{state:$state,runtime:$runtime,control_socket:$socket},listeners:$listeners,stability:{existing_services_commitment:$existing,podman_containers_commitment:$containers,routes:$routes,firewall:$firewall},inspection:$inspection,exchanges:$exchanges,graceful_shutdown:$shutdown}' > "$work/evidence.json"
 mkdir -p -- "$(dirname -- "$output")"; mv -- "$work/evidence.json" "$output"; sha256sum -- "$output" > "$output.sha256"

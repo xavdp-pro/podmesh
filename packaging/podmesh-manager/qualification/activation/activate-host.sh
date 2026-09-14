@@ -131,7 +131,7 @@ if [ "$mode" = seal-converged ]; then
   converged=$evidence/converged.json
   [ -f "$converged" ] && [ -f "$converged.sha256" ] || { echo 'Converged evidence and sidecar are required' >&2; exit 2; }
   (cd -- "$evidence" && sha256sum -c -- converged.json.sha256 >/dev/null) || { echo 'Converged evidence checksum mismatch' >&2; exit 2; }
-  jq -e --arg alias "$alias_name" --slurpfile baseline "$evidence/active-baseline.json" '.schema_version=="podmesh-manager-live-activation-evidence/v2" and .stage=="converged" and .host_alias==$alias and .package==$baseline[0].package and .configuration==$baseline[0].configuration' "$converged" >/dev/null || { echo 'Converged evidence does not bind the active host and candidate' >&2; exit 2; }
+  jq -e --arg alias "$alias_name" --slurpfile baseline "$evidence/active-baseline.json" '.schema_version=="podmesh-manager-live-activation-evidence/v3" and $baseline[0].schema_version=="podmesh-manager-live-activation-evidence/v3" and .stage=="converged" and .host_alias==$alias and .package==$baseline[0].package and .configuration==$baseline[0].configuration' "$converged" >/dev/null || { echo 'Converged evidence does not bind the active host, candidate, and v3 evidence contract' >&2; exit 2; }
   write_ledger converged "$(jq -n --arg converged "$(awk '{print $1}' "$converged.sha256")" '{converged_evidence_sha256:$converged}')"
   exit 0
 fi
