@@ -187,8 +187,15 @@ Lab-tested; nothing deployed; `ha_claim` absent. Codex's item 2 is done the same
 what converges (the fact set: 18/18/18 identical, one digest, one view), what is immutable
 but per host (receipts, audit, open attempts — hence the cross-host join), and what is still
 an exclusive decision (absent from the campaign, unreachable from the resident); derived by
-`campaign/replication-path.py`, published as `replication-path.json`. Item 3 (three-host
-takeover experiment with an external authority) is not begun.
+`campaign/replication-path.py`, published as `replication-path.json`. Item 3: designed in
+the web tree's `docs/MANAGER-TAKEOVER-EXPERIMENT.md` — the five requirements mapped to what
+exists; the manager half cannot be tested because the resident exposes no permit path
+(`status`, `shutdown`, `append_observation` only) and the campaign carries no exclusive
+fact; two ways forward, both Codex's (expose a permit path in a new candidate, or run each
+replica as a PodMesh universe under the epoch gate — recommended). The universe half is
+exercised on three lab hosts: `tools/ha-standby.py` now serves one or more standbys, and
+`tests/check-ha-three-hosts.py` plays HA-10's shape (takeover to one standby, the other
+informed and refusing a stale permit, the old active superseded and rejoining as a standby).
 On the operator's "go" (2026-09-14 evening) the HA recommendations became the tool's
 defaults by hypothesis (`64892c4`): retention declared from every cycle (keep 3, one hour),
 three quarantined copies, 20/5 lease and margin, the laboratory's gate, no timer.

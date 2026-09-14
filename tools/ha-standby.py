@@ -26,11 +26,11 @@ Subcommands:
   activate      --universe U --host SSH [--lease S --margin S --standbys N]
                                  declare the policy on the host under the gate's authority, rotate the
                                  epoch to it, acquire; starting is the operator's (the API's `start`)
-  cycle         --universe U --active SSH --standby SSH [--keep N --keep-points N --minimum-age S]
+  cycle         --universe U --active SSH --standby SSH [--also SSH]... [--keep N --keep-points N --minimum-age S]
                                  one capture: declare the collector's retention on the active host,
                                  stop, prepare, renew, start again; carry; restore into quarantine on
                                  the standby; prune older copies
-  takeover      --universe U --active SSH --standby SSH [--no-start]
+  takeover      --universe U --active SSH --standby SSH [--also SSH]... [--no-start]
                                  the standby takes over, under the lease and margin recorded by
                                  `activate` (never this invocation's defaults): refuses while the active host is reachable
                                  and entitled (that is a planned handoff, not a takeover); otherwise
@@ -175,7 +175,11 @@ def cmd_activate(args):
 
 
 def cmd_cycle(args):
-    A, B = hosts(args, ('active', args.active), ('standby', args.standby))
+    targets = [args.standby] + list(args.also or [])
+    all_hosts = hosts(args, ('active', args.active), *[(f'standby-{i+1}', s) for i, s in enumerate(targets)])
+    A, standbys = all_hosts[0], all_hosts[1:]
+    if len({h.identity for h in all_hosts}) != len(all_hosts):
+        raise Refusal('the active host and the standbys must be distinct hosts')
     u = args.universe
     ledger = load_ledger(u)
     status = ok(A, request('activation_status', u, args.reference), 'status')
@@ -198,32 +202,38 @@ def cmd_cycle(args):
     ok(A, request('activation_renew', u, args.reference), 'activation_renew')
     ok(A, request('start', u, args.reference, observe_seconds=1), 'start after capture')
     stopped_for = A.call('time')['time'] - began
-    carried = transfer(A, B, point, files=('recovery-point-manifest.json', 'rootfs.tar'))
-    q = str(uuid.uuid4())
-    restored = ok(B, request('recovery_point_restore', q, args.reference, recovery_point_uuid=point), 'recovery_point_restore')
-    cycle = {'point': point, 'generation': prepared['generation'], 'prepared_at': row['prepared_at'],
-             'rootfs_sha256': prepared['rootfs_sha256'], 'rootfs_bytes': prepared['rootfs_bytes'],
-             'quarantined_uuid': q, 'restored_at': int(time.time()), 'carried_bytes': carried['files']['rootfs.tar']['bytes']}
-    ledger['cycles'].append(cycle)
-    # Prune: the newest `keep` quarantined copies stay; older ones are deleted through the API, and a
-    # refusal is reported rather than forced -- a copy that was promoted is a universe now, not a copy.
-    pruned, kept = [], []
-    older = ledger['cycles'][:max(len(ledger['cycles']) - args.keep, 0)]
-    for old in older:
-        if old.get('pruned') or old.get('promoted'):
-            continue
-        r = B.api(request('delete', old['quarantined_uuid'], args.reference))
-        if r.get('ok'):
-            old['pruned'] = int(time.time())
-            pruned.append(old['quarantined_uuid'])
-        else:
-            old['prune_refused'] = r.get('error')
-            kept.append({'quarantined_uuid': old['quarantined_uuid'], 'refused': r.get('error')})
+    # One capture, carried to every standby and restored into quarantine on each; the ledger keeps
+    # every copy under the standby it lives on, so a takeover can pick the newest copy of its host.
+    copies, pruned, kept = [], [], []
+    for B in standbys:
+        carried = transfer(A, B, point, files=('recovery-point-manifest.json', 'rootfs.tar'))
+        q = str(uuid.uuid4())
+        restored = ok(B, request('recovery_point_restore', q, args.reference, recovery_point_uuid=point), f'recovery_point_restore on {B.role}')
+        cycle = {'point': point, 'generation': prepared['generation'], 'prepared_at': row['prepared_at'],
+                 'rootfs_sha256': prepared['rootfs_sha256'], 'rootfs_bytes': prepared['rootfs_bytes'],
+                 'standby': B.identity, 'quarantined_uuid': q, 'restored_at': int(time.time()),
+                 'carried_bytes': carried['files']['rootfs.tar']['bytes'], 'manifest_signed': restored['manifest_signed']}
+        ledger['cycles'].append(cycle)
+        copies.append({'standby': B.identity, 'quarantined_uuid': q})
+        # Prune: the newest `keep` quarantined copies on THIS standby stay; older ones are deleted through
+        # the API, and a refusal is reported rather than forced -- a promoted copy is a universe now.
+        mine = [c for c in ledger['cycles'] if c.get('standby') == B.identity]
+        for old in mine[:max(len(mine) - args.keep, 0)]:
+            if old.get('pruned') or old.get('promoted'):
+                continue
+            r = B.api(request('delete', old['quarantined_uuid'], args.reference))
+            if r.get('ok'):
+                old['pruned'] = int(time.time())
+                pruned.append(old['quarantined_uuid'])
+            else:
+                old['prune_refused'] = r.get('error')
+                kept.append({'quarantined_uuid': old['quarantined_uuid'], 'refused': r.get('error')})
     save_ledger(u, ledger)
     points = listed
-    out({'universe': u, 'active': A.identity, 'standby': B.identity, 'cycle': cycle,
-         'stopped_for_seconds': round(stopped_for, 2), 'quarantined': restored['restored_universe_uuid'],
-         'manifest_signed': restored['manifest_signed'], 'pruned_on_standby': pruned, 'prune_refused': kept,
+    out({'universe': u, 'active': A.identity, 'standbys': [B.identity for B in standbys], 'point': point,
+         'generation': prepared['generation'], 'copies': copies, 'quarantined': copies[0]['quarantined_uuid'],
+         'stopped_for_seconds': round(stopped_for, 2), 'manifest_signed': copies and restored['manifest_signed'],
+         'pruned_on_standbys': pruned, 'prune_refused': kept,
          'points_on_active_outbox': len(points['recovery_points']),
          'retention_declared_on_active': {'keep_latest': args.keep_points, 'minimum_age_seconds': args.minimum_age},
          'note': 'the active host\'s archives are the collector\'s (class 5, under the retention declared here); this tool never deletes them'})
@@ -234,9 +244,9 @@ def cmd_takeover(args):
     (B,) = hosts(args, ('standby', args.standby))
     u = args.universe
     ledger = load_ledger(u)
-    copies = [c for c in ledger['cycles'] if not c.get('pruned') and not c.get('promoted')]
+    copies = [c for c in ledger['cycles'] if not c.get('pruned') and not c.get('promoted') and c.get('standby', B.identity) == B.identity]
     if not copies:
-        raise Refusal('no quarantined copy of this universe is recorded on the standby; run a cycle first')
+        raise Refusal('no quarantined copy of this universe is recorded on this standby; run a cycle to it first')
     newest = copies[-1]
     policy = ledger.get('policy')
     if not policy:
@@ -281,16 +291,27 @@ def cmd_takeover(args):
     started = None
     if not args.no_start:
         started = ok(B, request('start', u, args.reference, observe_seconds=1), 'start on the standby')
+    # The new grant is delivered to every other host that can be reached -- the old active, and any
+    # other standby -- so that each screen learns the epoch and a stale permit bound to it is refused.
     superseded = None
+    others = []
     if A is not None:
         r = A.api(request('activation_supersede', u, args.reference, permit=permit))
         superseded = {'delivered': bool(r.get('ok')), 'highest_epoch_seen': (r.get('data') or {}).get('highest_epoch_seen'), 'error': r.get('error')}
+    for target in (args.also or []):
+        C = try_host('other', target)
+        if C is None:
+            others.append({'target': 'unreachable'}); continue
+        ok(C, request('activation_require', u, args.reference, lease_seconds=policy['lease_seconds'], takeover_margin_seconds=policy['takeover_margin_seconds'],
+                      desired_standbys=policy['desired_standbys'], authority_id=gate.authority_id), f'activation_require on {C.role}')
+        r = C.api(request('activation_supersede', u, args.reference, permit=permit))
+        others.append({'host': C.identity, 'delivered': bool(r.get('ok')), 'highest_epoch_seen': (r.get('data') or {}).get('highest_epoch_seen'), 'error': r.get('error')})
     out({'universe': u, 'standby': B.identity, 'active': A.identity if A else None, 'active_reachable': A is not None,
          'waited': waited, 'epoch': permit['epoch'], 'lease': {k: lease[k] for k in ('generation', 'expires_at', 'live')},
          'promoted_from': {'point': newest['point'], 'generation': newest['generation'], 'prepared_at': newest['prepared_at'],
                            'quarantined_uuid': newest['quarantined_uuid']},
          'data_lost_since_seconds': int(time.time()) - newest['prepared_at'],
-         'started': started is not None, 'active_superseded': superseded,
+         'started': started is not None, 'active_superseded': superseded, 'other_standbys_informed': others,
          'not_proven': ['mutual exclusion beyond the epoch: the gate is this workstation\'s file and PodMesh cannot verify a permit\'s origin',
                         'that the active host is stopped when it is unreachable: the wait is the design\'s margin, not a proof']})
 
@@ -302,11 +323,13 @@ def main():
     g = sub.add_parser('gate'); g.add_argument('gate_command', choices=['init', 'declare', 'inspect']); g.add_argument('--universe')
     a = sub.add_parser('activate'); a.add_argument('--universe', required=True); a.add_argument('--host', required=True)
     c = sub.add_parser('cycle'); c.add_argument('--universe', required=True); c.add_argument('--active', required=True); c.add_argument('--standby', required=True)
-    c.add_argument('--keep', type=int, default=3, help='quarantined copies kept on the standby')
+    c.add_argument('--also', action='append', help='a further standby (repeatable): one capture, restored on each')
+    c.add_argument('--keep', type=int, default=3, help='quarantined copies kept on each standby')
     c.add_argument('--keep-points', type=int, default=3, help='recovery points the collector keeps on the active host whatever their age')
     c.add_argument('--minimum-age', type=int, default=3600, help='seconds a recovery point must be old before the collector may take it')
     t = sub.add_parser('takeover'); t.add_argument('--universe', required=True); t.add_argument('--active', required=True); t.add_argument('--standby', required=True)
     t.add_argument('--no-start', action='store_true', help='promote but leave the start to the operator')
+    t.add_argument('--also', action='append', help='another standby to inform of the new epoch (repeatable)')
     a.add_argument('--lease', type=int, default=20); a.add_argument('--margin', type=int, default=5); a.add_argument('--standbys', type=int, default=1)
     for s in (c, t):
         s.add_argument('--stop-timeout', type=int, default=10)

@@ -443,9 +443,11 @@ Four subcommands. `gate` creates and drives the epoch gate — the fencing labor
 SQLite compare-and-swap file on the host the tool runs on, with the laboratory's precondition
 (one current copy, never cloned or rolled back) stated as the operator's obligation.
 `activate` declares the policy under that authority, rotates the epoch to a host and acquires;
-starting stays the operator's. `cycle` is one capture: stop, prepare, renew, start again on the
-active host, carry the two files, restore into quarantine on the standby, prune the older
-quarantined copies through the API and keep a ledger; it refuses from a host that does not
+starting stays the operator's. `cycle` is one capture: declare the collector's retention on the active host, stop,
+prepare, renew, start again, carry the two files to **one or more standbys** (`--also`),
+restore into quarantine on each, prune the older quarantined copies of each through the API
+and keep a ledger per standby — with three nodes, one or two replicas per universe, as the
+operator asked; it refuses from a host that does not
 hold the lease, and reports how long the universe was stopped. `takeover` refuses while the
 active host is reachable and entitled — that is a planned handoff, not a takeover, and the
 tool will not start a second writer; otherwise it fences the active host if it can be reached
@@ -467,6 +469,16 @@ promoted and started there, and the active host — still running its copy exact
 partitioned host would — stopped by its own fence when that was run, without escalation, its
 lease having lapsed before the standby started. The two windows did not overlap; that is
 level 2's safety claim, and it held.
+
+**Three hosts, and the old active rejoining** (`tests/check-ha-three-hosts.py`, on lab-a,
+lab-b and lab-c): one cycle restored the point into quarantine on both standbys with the
+marker; the active host lapsed; one standby took over under epoch 2 and the other was
+informed — its screen refused a stale epoch-1 permit bound to it; the old active, superseded,
+was refused under its old grant, under a fresh permit at the old epoch and under a second
+grant at epoch 2, and then **rejoined as a standby**: a cycle from the new active restored a
+quarantined copy on it, marker present, with no journal reset. That is the shape of the
+acceptance document's HA-10 without a real partition — the active host fails by not
+renewing, and no network was cut.
 
 What the tool does not do: verify a permit's origin (nobody can, yet), prove the unreachable
 host stopped (the wait is the design's margin, not a proof), or delete the active host's
