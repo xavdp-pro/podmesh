@@ -51,7 +51,10 @@ socket_path=/run/podmesh-manager/control.sock
 # Readiness requirement: the start is not a start until the resident has observed this boot's fact.
 boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
 opid=$(cat /proc/sys/kernel/random/uuid)
-if reply=$(control "$boot_socket" "{\"operation\":\"append_observation\",\"operation_id\":\"$opid\",\"scope\":\"lab/manager-universe/observations\",\"subject\":\"boot\",\"value\":\"boot-$boot\"}" 2>&1) \
+# The scope this replica owns, read from its own configuration: a fact appended outside an owned
+# scope is refused by the resident, and rightly so.
+scope=$(python3 -c 'import json,sys; c=json.load(open("/etc/podmesh-manager/config.json")); r=c["network"]["replica_id"]; print([g["scope"] for g in c["network"]["manager"]["grants"] if g["owner_replica_id"]==r][0])')
+if reply=$(control "$boot_socket" "{\"operation\":\"append_observation\",\"operation_id\":\"$opid\",\"scope\":\"$scope\",\"subject\":\"boot\",\"value\":\"boot-$boot\"}" 2>&1) \
    && printf '%s' "$reply" | grep -q '"result":"observed"'; then
   echo "manager-universe: boot fact observed: $(printf '%s' "$reply" | cut -c1-120)"
 else

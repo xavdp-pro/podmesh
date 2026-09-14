@@ -73,3 +73,19 @@ integrity ok and the same digests as the active host's store; the resident start
 chained a fourth; the other standby refused a stale epoch-1 permit; the old active was refused.
 Nothing here proves a partition, a host loss, DNS, remote transport, replication, or that an
 agent can operate the manager inside the universe.
+
+## The replicated set (M-U2)
+
+`replicated/generate-replica-set.py` writes the three configurations of one logical manager
+replicated as three universes on the managed network: one logical manager UUID, three replica
+UUIDs bound to the three PodMesh host UUIDs, three owned scopes `m-u2/<alias>/observations`,
+one distinct pair key per pair, and explicit authenticated endpoints at each replica's managed
+address — no name is ever resolved. Its output holds keys and stays out of Git; each host builds
+its own image from its own configuration with the Alpine Containerfile. The entrypoint reads the
+scope its replica owns from the configuration before appending the boot fact.
+
+Measured on 2026-09-14 (`tests/check-manager-replicas-managed.py`, main tree): three replicas
+running concurrently across three hosts converged their facts — three boot facts, byte-identical
+sets, authenticated imports from both peers on each replica, exchange audit rows — verified from
+outside with all three running. What it does not prove: the governor role, takeover, partitions,
+and agent access to the control API.

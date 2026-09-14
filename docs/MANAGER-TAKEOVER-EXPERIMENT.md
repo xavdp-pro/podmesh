@@ -89,6 +89,13 @@ proof with that binary attested as both resident and inspector, and the Debian i
 compatibility branch for the frozen glibc candidate. Freezing the musl build as a candidate is
 Codex's.
 
+**M-U2, step 4 (the same night):** on the operator's decision that networking is part of the
+universe contract, PodMesh gained a managed profile (main tree, `docs/UNIVERSE-NETWORK-CONTRACT.md`),
+and three Alpine manager universes ran **concurrently** on it across the three hosts as three
+replicas of one logical manager, with explicit authenticated endpoints: their facts converged
+while all three kept running. The replicated manager exists inside universes; the governor role
+under the epoch gate, with all three running, is the next step.
+
 Three findings the candidate taught, each handled in the universe definition and recorded in
 its README: the resident handles no signal, so PID 1 must translate the stop; the overlay's
 copy-up changes a restored store's inode between the resident's preflight and its open, which
