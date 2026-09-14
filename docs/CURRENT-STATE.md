@@ -346,6 +346,9 @@ retained manifest. Six rules removed in turn and watched go red; the apply-time 
 defence in depth for class 5 and the only rule for class 3 with a reclaim, which the single-host
 check cannot reach — unit-tested and annotated. Checkpoint artifacts and inbox copies are not
 collected; class 4 is still not implemented. Collector version 2, policy version 2.
+Regression on two lab hosts the same day: Codex's `check-migration-collector.py` passed (79
+checks) once it built the two survey shapes it had been finding among leftovers of earlier
+suites on the shared journal (commit `0ffca5d`), and the HA two-host suite passed again (37).
 
 ## Next actions, in order
 
