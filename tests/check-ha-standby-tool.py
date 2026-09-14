@@ -42,7 +42,7 @@ try:
     assert tool('gate', 'declare', '--universe', u)['epoch'] == 0
     checks.append('gate created and the universe declared as its resource at epoch 0')
 
-    A.ok(request('create', u, reference, image=image_on(A),
+    A.ok(request('create', u, reference, image=image_on(A), network_profile='isolated',
                  command=['sh', '-c', f"printf %s '{marker}' > /marker-{marker}; trap 'exit 0' TERM; sleep 600 & wait"]))
     activated = tool('activate', '--universe', u, '--host', os.environ['PODMESH_SOURCE_SSH'], '--lease', '20', '--margin', '5')
     assert activated['epoch'] == 1 and activated['lease']['live'] and activated['started'] is False, activated
@@ -106,7 +106,7 @@ try:
     # its OWN fence when that is run there: the two windows did not overlap, which is the design's claim.
     v = str(uuid.uuid4()); marker2 = uuid.uuid4().hex
     tool('gate', 'declare', '--universe', v)
-    A.ok(request('create', v, reference, image=image_on(A),
+    A.ok(request('create', v, reference, image=image_on(A), network_profile='isolated',
                  command=['sh', '-c', f"printf %s '{marker2}' > /marker-{marker2}; trap 'exit 0' TERM; sleep 600 & wait"]))
     # Activated with a LONGER lease and margin than the tool's defaults: the takeover carries no
     # flags, and the wait must come from what was activated, not from a default. A first version

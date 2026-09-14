@@ -34,7 +34,7 @@ name = 'podmesh-' + u
 try:
     # A container that handles its stop signal, so a polite fence is polite and an escalation
     # to SIGKILL means something went wrong rather than that the image ignores signals.
-    created = op('create', universe_uuid=u, image=image,
+    created = op('create', universe_uuid=u, image=image, network_profile='isolated',
                  command=['sh', '-c', "trap 'exit 0' TERM; sleep 600 & wait"])
     assert created['ok'], created
 

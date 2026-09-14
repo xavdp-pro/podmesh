@@ -67,7 +67,7 @@ def authorized(u, command, grow_to=0):
     """A universe created, started, checkpointed and authorized on the source, delivered to the destination.
     `grow_to` waits for the fixture's memory before checkpointing, so that the archive really holds one."""
     universes.append(u)
-    A.ok(request('create', u, REF, image='sha256:' + alpine, command=command))
+    A.ok(request('create', u, REF, image='sha256:' + alpine, network_profile='isolated', command=command))
     A.ok(request('start', u, REF))
     deadline = time.time() + 180
     while grow_to and A.call('memory', uuid_value=u)['memory_current_bytes'] < grow_to:
@@ -231,7 +231,7 @@ try:
     assert any(e.startswith('reclaim-') for e in written_reclaim['entries']), written_reclaim
     checks.append('[destination] the operation directory keeps the reclaim record beside the failure diagnostics: '
                   + ', '.join(e for e in written_reclaim['entries'] if e.startswith(('reclaim-', 'failure-', 'abort-'))))
-    assert B.ok(request('create', F, REF, image='sha256:' + alpine, command=['true']))
+    assert B.ok(request('create', F, REF, image='sha256:' + alpine, network_profile='isolated', command=['true']))
     B.ok(request('delete', F, REF), 'the closed claim no longer blocks generic operations on the destination', checks)
     results['reclaim'] = {'abort': aborted, 'claim': f_claim, 'watched': watched}
 

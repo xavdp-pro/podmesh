@@ -96,7 +96,7 @@ try:
     # Intentional failures first, each on its own disposable universe, so that a failure inside the
     # universe is proven to be terminal and visible from outside before the honest run is trusted.
     v1 = str(uuid.uuid4()); faults.append(v1)
-    A.ok(request('create', v1, reference, image=image, command=['/usr/local/bin/manager-universe', '--fault', 'boot']))
+    A.ok(request('create', v1, reference, image=image, network_profile='isolated', command=['/usr/local/bin/manager-universe', '--fault', 'boot']))
     started = A.ok(request('start', v1, reference, observe_seconds=8))
     state = A.call('podman_run', args=['inspect', '--format', '{{.State.Status}} {{.State.ExitCode}}', 'podmesh-' + v1])['stdout'].strip()
     logs = A.call('podman_run', args=['logs', '--tail', '6', 'podmesh-' + v1], check=False)
@@ -104,7 +104,7 @@ try:
     assert 'BOOT FACT NOT OBSERVED' in (logs.get('stdout', '') + logs.get('stderr', '')), logs
     checks.append('injected boot-fact failure: the universe exits 2 and PodMesh observes it not running -- a start that cannot record its boot is not a start')
     v2 = str(uuid.uuid4()); faults.append(v2)
-    A.ok(request('create', v2, reference, image=image, command=['/usr/local/bin/manager-universe', '--fault', 'shutdown']))
+    A.ok(request('create', v2, reference, image=image, network_profile='isolated', command=['/usr/local/bin/manager-universe', '--fault', 'shutdown']))
     assert A.ok(request('start', v2, reference, observe_seconds=3))['application_outcome'] == 'running_when_observed'
     stopped = A.ok(request('stop', v2, reference, timeout_seconds=15, on_timeout='kill'))
     state = A.call('podman_run', args=['inspect', '--format', '{{.State.Status}} {{.State.ExitCode}}', 'podmesh-' + v2])['stdout'].strip()
@@ -120,7 +120,7 @@ try:
     assert 'did not stop cleanly' in refused['refused'] and 'exit code 3' in refused['refused'], refused
     checks.append('the capture cycle refuses to take a point after a stop the universe reported as failed')
 
-    A.ok(request('create', u, reference, image=image, command=['/usr/local/bin/manager-universe']))
+    A.ok(request('create', u, reference, image=image, network_profile='isolated', command=['/usr/local/bin/manager-universe']))
     # A 60-second lease: exporting the manager's filesystem for inspection takes longer than a
     # 20-second lease, and a lapsed lease is retaken, never renewed -- which is right, and slow here.
     tool('activate', '--universe', u, '--host', SA, '--lease', '60', '--margin', '5', '--standbys', '2')

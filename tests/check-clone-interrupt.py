@@ -53,7 +53,7 @@ A, B = 'podmesh-' + a, 'podmesh-' + b
 clone = request('clone', b, source_uuid=a)
 ref = 'localhost/podmesh-clone:' + clone['operation_id']
 try:
-    assert api(request('create', a, image='sha256:' + alpine, command=['sh', '-c', 'cat /clone-marker']))['ok']
+    assert api(request('create', a, image='sha256:' + alpine, network_profile='isolated', command=['sh', '-c', 'cat /clone-marker']))['ok']
     digest = hashlib.sha256()
     with tempfile.TemporaryDirectory(dir='/var/tmp') as d:
         blob = os.path.join(d, 'blob')

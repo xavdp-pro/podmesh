@@ -484,6 +484,8 @@ fn restore(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error>
     let create_request = json!({
         "operation": "create", "operation_id": create_id, "universe_uuid": uuid,
         "authorization_ref": reference, "image": image, "command": cmd,
+        // A restore does not carry the managed profile yet (docs/UNIVERSE-NETWORK-CONTRACT.md).
+        "network_profile": crate::network::PROFILE_ISOLATED,
     });
     let created = lc::execute(db, &create_request)?;
     let container_id = created_container(&created)?;
@@ -577,6 +579,7 @@ fn promote(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error>
         &json!({
             "operation": "create", "operation_id": create_id, "universe_uuid": uuid,
             "authorization_ref": reference, "image": image, "command": quarantined["command"],
+            "network_profile": crate::network::PROFILE_ISOLATED,
         }),
     )?;
     let container_id = created_container(&created)?;

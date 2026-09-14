@@ -66,7 +66,7 @@ try:
     report['image'] = image
 
     # --- A runs the universe under a lease, and writes the marker while running.
-    A.ok(request('create', u, reference, image=image,
+    A.ok(request('create', u, reference, image=image, network_profile='isolated',
                  command=['sh', '-c', f"printf %s '{marker}' > /marker-{marker}; trap 'exit 0' TERM; sleep 600 & wait"]),
          'created', checks)
     A.ok(request('activation_require', u, reference, lease_seconds=LEASE, takeover_margin_seconds=MARGIN, desired_standbys=1,

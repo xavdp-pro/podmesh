@@ -62,7 +62,7 @@ def get(name, path):
         f = os.path.join(d, 'f'); out('cp', f'{name}:{path}', f); return open(f, 'rb').read()
 def universe(command):
     u = str(uuid.uuid4()); universes.append(u)
-    r = request('create', u, image='sha256:' + alpine, command=command); ok(r)
+    r = request('create', u, image='sha256:' + alpine, network_profile='isolated', command=command); ok(r)
     return u, 'podmesh-' + u, r['operation_id']
 def fixture(name, *args):
     fixtures.append(name)

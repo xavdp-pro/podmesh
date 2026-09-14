@@ -51,7 +51,7 @@ if not image.startswith('sha256:'):
 
 u = str(uuid.uuid4()); name = 'podmesh-' + u
 try:
-    assert op('create', universe_uuid=u, image=image, command=['sh', '-c', "trap 'exit 0' TERM; sleep 600 & wait"])['ok']
+    assert op('create', universe_uuid=u, image=image, network_profile='isolated', command=['sh', '-c', "trap 'exit 0' TERM; sleep 600 & wait"])['ok']
     assert op('start', universe_uuid=u, observe_seconds=1)['ok']
     assert op('stop', universe_uuid=u, timeout_seconds=10, on_timeout='kill')['data']['forced'] is False
     prepares, points = [], []

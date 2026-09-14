@@ -38,7 +38,7 @@ def reserved(u, command=COUNTER, image=None):
     """A started universe, observed from outside, then checkpointed for a recorded destination that is
     never contacted. The counter samples are taken before the checkpoint stops the application."""
     universes.append(u)
-    A.ok(request('create', u, REF, image='sha256:' + (image or alpine), command=command))
+    A.ok(request('create', u, REF, image='sha256:' + (image or alpine), network_profile='isolated', command=command))
     A.ok(request('start', u, REF))
     container = inspect(u)
     before = counter(u)
@@ -223,7 +223,7 @@ try:
     status = A.status(Z)
     assert status['reservation']['state'] == 'abandoned'
     assert status['recovery']['release']['permitted'] is False and status['recovery']['restore_local']['permitted'] is False
-    for operation, extra, label in [('create', {'image': 'sha256:' + alpine, 'command': ['true']}, 'create'), ('start', {}, 'start')]:
+    for operation, extra, label in [('create', {'image': 'sha256:' + alpine, 'command': ['true'], 'network_profile': 'isolated'}, 'create'), ('start', {}, 'start')]:
         A.refused(request(operation, Z, REF, **extra), f'{label} of an abandoned universe UUID', 'reserved', checks)
     A.refused(request('migration_abandon', Z, REF, checkpoint_operation_id=z_checkpoint),
               'a second abandonment of the same reservation', 'only a reserved, checkpointing', checks)

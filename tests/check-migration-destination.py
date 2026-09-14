@@ -49,7 +49,7 @@ def fixture(host, name, *args, run=False):
     return name
 def universe(host, u, image, command):
     universes.append(u)
-    host.ok(request('create', u, REF, image='sha256:' + image, command=command))
+    host.ok(request('create', u, REF, image='sha256:' + image, network_profile='isolated', command=command))
     host.ok(request('start', u, REF))
     return inspect(host, u)
 
@@ -105,7 +105,7 @@ try:
                       destination_host_uuid=B.identity),
               'second authorization of an already authorized reservation', 'only a checkpointed reservation can be authorized', checks)
 
-    for operation, extra, label in [('start', {}, 'start'), ('delete', {}, 'delete'), ('create', {'image': 'sha256:' + alpine, 'command': ['true']}, 'create')]:
+    for operation, extra, label in [('start', {}, 'start'), ('delete', {}, 'delete'), ('create', {'image': 'sha256:' + alpine, 'command': ['true'], 'network_profile': 'isolated'}, 'create')]:
         A.refused(request(operation, U, REF, **extra), f'{label} of a transfer_authorized source', 'reserved', checks)
     A.refused(request('clone', str(uuid.uuid4()), REF, source_uuid=U), 'clone from a transfer_authorized source', 'reserved', checks)
     A.refused(dict(checkpoint_request, operation_id=str(uuid.uuid4())), 'second checkpoint of a transfer_authorized source', 'already reserved', checks)
@@ -234,7 +234,7 @@ try:
     checks.append('[source] repeating the completion with the same operation ID is historical, with a fresh reading of the reservation it left')
     A.refused(request('migration_complete_transfer', U, REF, authorization_id=A1), 'second completion of the same authorization',
               'already completed by operation', checks)
-    for operation, extra, label in [('start', {}, 'start'), ('delete', {}, 'delete'), ('create', {'image': 'sha256:' + alpine, 'command': ['true']}, 'create')]:
+    for operation, extra, label in [('start', {}, 'start'), ('delete', {}, 'delete'), ('create', {'image': 'sha256:' + alpine, 'command': ['true'], 'network_profile': 'isolated'}, 'create')]:
         A.refused(request(operation, U, REF, **extra), f'{label} of a transferred source', 'reserved', checks)
 
     retirement = A.ok(request('migration_retire_source', U, REF, authorization_id=A1), 'source retired: only the stopped checkpointed container removed', checks)
@@ -243,7 +243,7 @@ try:
     status = A.status(U)
     assert status['reservation']['state'] == 'transferred' and status['artifacts']['archive_sha256_matches'] is True
     assert status['transfer_authorizations'][0]['state'] == 'completed_restored'
-    A.refused(request('create', U, REF, image='sha256:' + alpine, command=['true']), 'create reusing a transferred universe UUID on the source', 'reserved', checks)
+    A.refused(request('create', U, REF, image='sha256:' + alpine, network_profile='isolated', command=['true']), 'create reusing a transferred universe UUID on the source', 'reserved', checks)
 
     # The source must refuse the handoff it issued: restoring it here would activate a second copy.
     transfer(A, A, A1, files=('handoff.json', 'manifest.json', 'checkpoint.tar.zst'))
@@ -335,7 +335,7 @@ try:
     assert B.status(U)['reservation']['state'] == 'transferred'
     B.ok(request('migration_retire_source', U, REF, authorization_id=A2), 'first destination retired its stopped source after the return', checks)
     assert inspect(B, U) is None
-    B.refused(request('create', U, REF, image='sha256:' + alpine, command=['true']), 'create reusing the universe UUID on the host it left', 'reserved', checks)
+    B.refused(request('create', U, REF, image='sha256:' + alpine, network_profile='isolated', command=['true']), 'create reusing the universe UUID on the host it left', 'reserved', checks)
 
     A.ok(request('stop', U, REF, timeout_seconds=10, on_timeout='kill'), 'stop of the returned universe', checks)
     A.ok(request('start', U, REF))

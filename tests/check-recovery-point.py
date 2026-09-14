@@ -34,7 +34,7 @@ k = str(uuid.uuid4()); killed = 'podmesh-' + k
 try:
     # Step 0 of the design, verbatim: the marker is a literal in the command, in both the
     # file name and the contents, and PID 1 handles its stop signal.
-    created = op('create', universe_uuid=u, image=image,
+    created = op('create', universe_uuid=u, image=image, network_profile='isolated',
                  command=['sh', '-c', f"printf %s '{marker}' > /marker-{marker}; trap 'exit 0' TERM; sleep 600 & wait"])
     assert created['ok'], created
 
@@ -97,7 +97,7 @@ try:
 
     # A stop that escalated to SIGKILL has no class, and the capture is refused rather than
     # downgraded. A bare `sleep` as PID 1 ignores SIGTERM, which is what forces the escalation.
-    assert op('create', universe_uuid=k, image=image, command=['sleep', '600'])['ok']
+    assert op('create', universe_uuid=k, image=image, network_profile='isolated', command=['sleep', '600'])['ok']
     assert op('start', universe_uuid=k, observe_seconds=1)['ok']
     forced = op('stop', universe_uuid=k, timeout_seconds=1, on_timeout='kill')
     assert forced['ok'] and forced['data'].get('forced') is True, f'expected the stop to escalate: {forced}'

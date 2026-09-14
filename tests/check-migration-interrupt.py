@@ -56,7 +56,7 @@ host = api({'operation': 'identity'})['data']['host_uuid']
 baseline = state()
 u = str(uuid.uuid4()); name = 'podmesh-' + u
 try:
-    ok(request('create', u, image='sha256:' + alpine, command=HOG))
+    ok(request('create', u, image='sha256:' + alpine, network_profile='isolated', command=HOG))
     ok(request('start', u))
     c = inspect(name)
     cgroup = '/sys/fs/cgroup' + c['State']['CgroupPath']

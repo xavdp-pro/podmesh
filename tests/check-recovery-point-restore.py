@@ -40,7 +40,7 @@ src = str(uuid.uuid4()); new = str(uuid.uuid4())
 cleanup = ['podmesh-' + src, 'podmesh-' + new]
 try:
     # Capture, exactly as the capture check does it.
-    assert op('create', universe_uuid=src, image=image,
+    assert op('create', universe_uuid=src, image=image, network_profile='isolated',
               command=['sh', '-c', f"printf %s '{marker}' > /marker-{marker}; trap 'exit 0' TERM; sleep 600 & wait"])['ok']
     assert op('start', universe_uuid=src, observe_seconds=1)['ok']
     assert op('stop', universe_uuid=src, timeout_seconds=10, on_timeout='kill')['data']['forced'] is False

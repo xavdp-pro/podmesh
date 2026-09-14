@@ -12,7 +12,7 @@ before={c['Id'] for c in inventory()}
 u=str(uuid.uuid4()); name='podmesh-'+u
 images=json.loads(subprocess.check_output(['podman','images','--format','json']))
 image=next(i['Id'] for i in images if any('alpine' in n for n in i.get('Names') or []))
-r={'operation':'create','operation_id':str(uuid.uuid4()),'universe_uuid':u,'authorization_ref':'disposable-lab-acceptance','image':'sha256:'+image,'command':['sleep','300']}
+r={'operation':'create','operation_id':str(uuid.uuid4()),'universe_uuid':u,'authorization_ref':'disposable-lab-acceptance','image':'sha256:'+image,'command':['sleep','300'],'network_profile':'isolated'}
 a=api(r); assert a['ok'], a
 b=api(r); assert b['ok'] and b['data']['replayed'],b
 changed=dict(r,command=['false']); assert not api(changed)['ok']

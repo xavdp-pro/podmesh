@@ -52,7 +52,7 @@ u = str(uuid.uuid4()); marker = uuid.uuid4().hex
 quarantined = {}
 try:
     tool('gate', 'init'); tool('gate', 'declare', '--universe', u)
-    A.ok(request('create', u, reference, image=image_on(A),
+    A.ok(request('create', u, reference, image=image_on(A), network_profile='isolated',
                  command=['sh', '-c', f"printf %s '{marker}' > /marker-{marker}; trap 'exit 0' TERM; sleep 600 & wait"]))
     tool('activate', '--universe', u, '--host', SA, '--lease', '20', '--margin', '5', '--standbys', '2')
     A.ok(request('start', u, reference, observe_seconds=1))

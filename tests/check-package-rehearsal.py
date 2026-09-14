@@ -72,10 +72,10 @@ assert identity == before['host_uuid']
 u, v, w = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
 U, V, W = 'podmesh-' + u, 'podmesh-' + v, 'podmesh-' + w
 try:
-    ok(request('create', u, image='sha256:' + alpine, command=TRAP))
+    ok(request('create', u, image='sha256:' + alpine, network_profile='isolated', command=TRAP))
     start_u = request('start', u)
     assert ok(start_u)['running'] is True
-    create_v = request('create', v, image='sha256:' + alpine, command=['true'])
+    create_v = request('create', v, image='sha256:' + alpine, network_profile='isolated', command=['true'])
     ok(create_v)
     u_started = inspect(U)['State']['StartedAt']
 
@@ -108,7 +108,7 @@ try:
     assert package() == f'{old} installed'
     assert api({'operation': 'capabilities'})['data']['version'] == old
     assert api({'operation': 'identity'})['data']['host_uuid'] == identity
-    create_w = request('create', w, image='sha256:' + alpine, command=['true'])
+    create_w = request('create', w, image='sha256:' + alpine, network_profile='isolated', command=['true'])
     observed['rollback_create'] = api(create_w)
     observed['rollback_delete'] = api(request('delete', w))
     assert observed['rollback_create']['ok'] and observed['rollback_delete']['ok'] and not exists(W), observed

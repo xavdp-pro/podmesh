@@ -69,7 +69,7 @@ def ready():
 def image_of(ref): return next(i['Id'] for i in images() if ref in (i.get('Names') or []))
 def universe(image, command):
     u = str(uuid.uuid4()); universes.append(u)
-    ok(request('create', u, image='sha256:' + image, command=command))
+    ok(request('create', u, image='sha256:' + image, network_profile='isolated', command=command))
     return u, 'podmesh-' + u
 def fixture(name, *args):
     fixtures.append(name)
@@ -226,7 +226,7 @@ try:
 
     # The API refuses to remove the reserved universe; this test removes its own fixture container.
     podman('rm', '--force', '--time', '0', C); removed_by_test[c] = 'reserved checkpointed fixture removed directly by the test'
-    refused(request('create', c, image='sha256:' + alpine, command=['true']), 'create reusing a reserved universe UUID', 'reserved')
+    refused(request('create', c, image='sha256:' + alpine, network_profile='isolated', command=['true']), 'create reusing a reserved universe UUID', 'reserved')
     refused(request('delete', c), 'delete of an absent reserved universe', 'reserved')
     gone = status(c)
     assert gone['reservation']['state'] == 'checkpointed' and gone['release']['preconditions_observed']['source_container_present'] is False

@@ -74,6 +74,7 @@ enum Params<'a> {
     Create {
         image: &'a str,
         command: Vec<&'a str>,
+        profile: &'a str,
     },
     Clone {
         source: &'a str,
@@ -305,6 +306,7 @@ pub(crate) fn observe(uuid: &str) -> Result<Value, Error> {
             let mut view = state_view(&c);
             view["present"] = json!(true);
             view["managed_label"] = json!(label(&c, UNIVERSE) == Some(uuid));
+            view["network"] = crate::network::of_container(&c);
             view
         }
     })
@@ -368,7 +370,13 @@ fn parse<'a>(operation: &str, uuid: &str, request: &'a Value) -> Result<Params<'
             if command.is_empty() {
                 return Err("Explicit command required".into());
             }
-            Params::Create { image, command }
+            // A universe's network is a decision, not a default that depends on host state.
+            let profile = text(request, "network_profile")
+                .map_err(|_| "network_profile is required: isolated or managed (docs/UNIVERSE-NETWORK-CONTRACT.md)")?;
+            if profile != crate::network::PROFILE_ISOLATED && profile != crate::network::PROFILE_MANAGED {
+                return Err("network_profile must be isolated or managed".into());
+            }
+            Params::Create { image, command, profile }
         }
         "clone" => {
             let source = text(request, "source_uuid")?;
@@ -715,7 +723,7 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
         migration::refuse_identity_reuse(db, uuid, params.name())?;
     }
     match params {
-        Params::Create { image, command } => create(id, uuid, &name, existing, image, command),
+        Params::Create { image, command, profile } => create(db, id, uuid, &name, existing, image, command, profile),
         Params::Clone { source } => clone(db, id, uuid, source, &name, existing),
         Params::Delete => delete(db, uuid, &name, existing),
         Params::Start { observe_seconds } => start(db, attempt, id, uuid, &name, existing, *observe_seconds),
@@ -750,7 +758,8 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
         } => restore::abort(db, id, uuid, &name, authorization, reference, *reclaim_processes, existing),
     }
 }
-fn create(id: &str, uuid: &str, name: &str, existing: Option<Value>, image: &str, command: &[&str]) -> Result<Value, Error> {
+#[allow(clippy::too_many_arguments)]
+fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Value>, image: &str, command: &[&str], profile: &str) -> Result<Value, Error> {
     if let Some(ref c) = existing {
         if label(c, CREATION) != Some(id) {
             return Err("Universe already exists under another creation operation".into());
@@ -758,24 +767,59 @@ fn create(id: &str, uuid: &str, name: &str, existing: Option<Value>, image: &str
     } else {
         let label = format!("{UNIVERSE}={uuid}");
         let provenance = format!("{CREATION}={id}");
-        let mut args = vec![
-            "create",
-            "--pull=never",
-            "--network=none",
-            "--name",
-            name,
-            "--label",
-            &label,
-            "--label",
-            &provenance,
-            image,
-        ];
+        let profile_label = format!("{}={profile}", crate::network::LABEL_PROFILE);
+        let mut args = vec!["create", "--pull=never"];
+        // The managed profile: one stable address allocated to the universe UUID from this host's
+        // pool, on the host's bridge. The isolated profile: no network, as every lot before had it.
+        let managed = if profile == crate::network::PROFILE_MANAGED {
+            Some(crate::network::allocate(db, uuid, id)?)
+        } else {
+            None
+        };
+        let (network_arg, ip_label, network_label);
+        match managed.as_ref() {
+            Some((bridge, ip, network_uuid)) => {
+                network_arg = format!("--network={bridge}");
+                ip_label = format!("{}={ip}", crate::network::LABEL_IP);
+                network_label = format!("{}={network_uuid}", crate::network::LABEL_NETWORK);
+                args.extend(["--network", bridge, "--ip", ip, "--label", &ip_label, "--label", &network_label]);
+                let _ = &network_arg;
+            }
+            None => args.push("--network=none"),
+        }
+        args.extend(["--name", name, "--label", &label, "--label", &provenance, "--label", &profile_label, image]);
         args.extend(command);
-        podman(QUICK, &args)?;
+        if let Err(e) = podman(QUICK, &args) {
+            // A managed create that did not produce a container releases its address; nothing is kept
+            // that Podman does not carry.
+            if managed.is_some() {
+                let _ = crate::network::release(db, uuid, id);
+            }
+            return Err(e);
+        }
     }
     let c = inspect(name)?.ok_or("Created container not observable")?;
+    let network = crate::network::of_container(&c);
+    if profile == crate::network::PROFILE_MANAGED {
+        let requested = network["requested"]["ip"].as_str().unwrap_or("").to_string();
+        let bridge = c["Config"]["Labels"][crate::network::LABEL_PROFILE].as_str().map(|_| crate::network::BRIDGE).unwrap_or("");
+        // Before a start the address is not up, and Podman records a created container's static
+        // address only in the command it will run; after a start it is in the network settings.
+        // Both are read back from Podman, never from this service's own allocation table, and a
+        // container that carries neither is removed and its address released: nothing is kept that
+        // Podman does not carry.
+        let effective = network["effective"].as_array().is_some_and(|v| v.iter().any(|n| n["ip"].as_str() == Some(requested.as_str())));
+        let create_command: Vec<&str> = c["Config"]["CreateCommand"].as_array().map(|v| v.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        let carried = create_command.windows(2).any(|w| w[0] == "--ip" && w[1] == requested)
+            && c["NetworkSettings"]["Networks"].as_object().is_some_and(|m| m.contains_key(bridge));
+        if !effective && !carried {
+            let _ = podman(QUICK, &["rm", name]);
+            let _ = crate::network::release(db, uuid, id);
+            return Err(format!("the container does not carry the allocated address {requested}; it was removed and the address released").into());
+        }
+    }
     Ok(
-        json!({"status":"verified","state":c["State"]["Status"],"universe_uuid":uuid,"container_id":c["Id"],"network":"none","started":false}),
+        json!({"status":"verified","state":c["State"]["Status"],"universe_uuid":uuid,"container_id":c["Id"],"network":network,"started":false}),
     )
 }
 fn delete(db: &Connection, uuid: &str, name: &str, existing: Option<Value>) -> Result<Value, Error> {
@@ -791,9 +835,12 @@ fn delete(db: &Connection, uuid: &str, name: &str, existing: Option<Value>) -> R
     let (removed, retained) = remove_snapshots(db, uuid)?;
     // A restored or promoted universe's imported image goes the same way, once nothing uses it.
     let (restore_removed, restore_retained) = crate::recovery_point::remove_restore_images(db, uuid)?;
+    // A managed universe's address is released once its container is gone: bound to the UUID
+    // while the universe exists here, free afterwards, recorded either way.
+    let released_ip = crate::network::release(db, uuid, "delete")?;
     Ok(
         json!({"status":"verified","universe_uuid":uuid,"absent":true,"volumes":"retained","snapshot_images_removed":removed,"snapshot_images_retained":retained,
-               "restore_images_removed":restore_removed,"restore_images_retained":restore_retained}),
+               "restore_images_removed":restore_removed,"restore_images_retained":restore_retained,"network_address_released":released_ip}),
     )
 }
 /// Start time of the earliest earlier attempt of this operation, if an attempt was interrupted
@@ -1110,6 +1157,9 @@ fn clone(db: &Connection, id: &str, uuid: &str, source: &str, name: &str, existi
         };
         let label = format!("{UNIVERSE}={uuid}");
         let provenance = format!("{CREATION}={id}");
+        // A clone does not carry the managed profile yet: it is created isolated, labelled so, and its
+        // answer says so (docs/UNIVERSE-NETWORK-CONTRACT.md).
+        let profile_label = format!("{}={}", crate::network::LABEL_PROFILE, crate::network::PROFILE_ISOLATED);
         podman(
             QUICK,
             &[
@@ -1122,6 +1172,8 @@ fn clone(db: &Connection, id: &str, uuid: &str, source: &str, name: &str, existi
                 &label,
                 "--label",
                 &provenance,
+                "--label",
+                &profile_label,
                 &image,
             ],
         )?;
@@ -1147,7 +1199,7 @@ fn clone(db: &Connection, id: &str, uuid: &str, source: &str, name: &str, existi
     Ok(
         json!({"status":"verified","universe_uuid":uuid,"source_uuid":source,"container_id":c["Id"],"state":c["State"]["Status"],
         "source_container_id":l[SNAPSHOT_SOURCE],"snapshot_image":image,"snapshot_reference":reference,"snapshot_reused":reused,
-        "started":false,"network":"none","scope":"stopped container root filesystem; no volumes or bind mounts"}),
+        "started":false,"network":"isolated (a clone does not carry the managed profile yet)","scope":"stopped container root filesystem; no volumes or bind mounts"}),
     )
 }
 /// A snapshot image may be removed for a universe only if this host's journal records the

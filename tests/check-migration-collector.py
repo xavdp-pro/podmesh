@@ -83,7 +83,7 @@ def checkpointed(host, u, destination, command=COUNTER, samples=False, grow_to=0
     """A started universe, checkpointed for a recorded destination. Returns its container, the create and
     checkpoint operation IDs, and the counter samples taken before the checkpoint stopped it."""
     universes.append(u)
-    create = request('create', u, REF, image='sha256:' + alpine, command=command)
+    create = request('create', u, REF, image='sha256:' + alpine, network_profile='isolated', command=command)
     host.ok(create)
     host.ok(request('start', u, REF))
     deadline = time.time() + 180
@@ -255,11 +255,11 @@ try:
     assert status['watch']['reservation']['blocks_generic_operations'] is False
     assert status['watch']['reservation']['awaiting_decision'] is False
     checks.append('migration_status reports the tombstone and tells a watcher the reservation no longer blocks anything and owes no decision')
-    A.refused(request('create', U1, REF, image='sha256:' + alpine, command=['true']),
+    A.refused(request('create', U1, REF, image='sha256:' + alpine, network_profile='isolated', command=['true']),
               'create reusing a collected universe UUID', 'was collected on this host', checks)
     source_for_clone = str(uuid.uuid4())
     universes.append(source_for_clone)
-    A.ok(request('create', source_for_clone, REF, image='sha256:' + alpine, command=['sleep', '3600']))
+    A.ok(request('create', source_for_clone, REF, image='sha256:' + alpine, network_profile='isolated', command=['sleep', '3600']))
     A.refused(request('clone', U1, REF, source_uuid=source_for_clone),
               'clone into a collected universe UUID', 'was collected on this host', checks)
     A.ok(request('delete', source_for_clone, REF))
@@ -275,7 +275,7 @@ try:
     status = A.status(U1)
     assert status['reservation'] is None and status['reservation_history'][-1]['state'] == 'restored_locally'
     assert status['tombstone']['class'] == CLASS1, 'the tombstone survives the local restore'
-    A.refused(request('create', U1, REF, image='sha256:' + alpine, command=['true']),
+    A.refused(request('create', U1, REF, image='sha256:' + alpine, network_profile='isolated', command=['true']),
               'create of that universe UUID even after a verified local restore brought it back', 'was collected on this host', checks)
     checks.append('the tombstone is not lifted by the restore: the identity can be operated and restored, never blindly created again')
     A.ok(request('stop', U1, REF, timeout_seconds=10, on_timeout='kill'))
@@ -384,7 +384,7 @@ try:
     assert rest['effects_applied'] == 2 and all(r['verified'] is True for r in rest['results'])
     assert [r['class'] for r in rest['results']] == [CLASS2, CLASS1]
     for u in (U3, U4):
-        A.refused(request('create', u, REF, image='sha256:' + alpine, command=['true']),
+        A.refused(request('create', u, REF, image='sha256:' + alpine, network_profile='isolated', command=['true']),
                   f'create reusing the collected universe UUID of a class 2 collection ({u[:8]})', 'was collected on this host', checks)
     A.refused(collection('garbage_collect_apply', plan_operation_id=third_id, candidates=[{'class': CLASS2, 'universe_uuid': U3}]),
               'a second collection of an already collected reservation, under a new operation ID', 'no longer hold', checks)
@@ -454,7 +454,7 @@ try:
     assert status['reservation']['operation_id'] == u5_again['operation_id'] and status['reservation']['state'] == 'checkpointed'
     assert [h for h in status['reservation_history'] if h['state'] == 'collected'], status['reservation_history']
     assert status['tombstone']['class'] == CLASS1, 'the identity protection survives the new reservation'
-    A.refused(request('create', U5, REF, image='sha256:' + alpine, command=['true']),
+    A.refused(request('create', U5, REF, image='sha256:' + alpine, network_profile='isolated', command=['true']),
               'create of a collected universe UUID that is checkpointed again (the new reservation refuses first, the tombstone behind it)',
               'is reserved by migration operation', checks)
     decline(U5, A.ok(request('migration_authorize_transfer', U5, REF, checkpoint_operation_id=u5_again['operation_id'],
@@ -470,7 +470,7 @@ try:
     history = A.status(U5)['collection_history']
     assert len(history) == 2 and history[0]['collected_by_operation'] != history[1]['collected_by_operation'], history
     assert A.status(U5)['tombstone']['collected_by_operation'] == history[0]['collected_by_operation'], 'the tombstone keeps the first proof'
-    A.refused(request('create', U5, REF, image='sha256:' + alpine, command=['true']),
+    A.refused(request('create', U5, REF, image='sha256:' + alpine, network_profile='isolated', command=['true']),
               'create after a second collection of the same universe UUID', 'was collected on this host', checks)
     checks.append('the full cycle ran twice for one universe — collection, life again, checkpoint, a second terminal authorization, collection '
                   'again — and left two occurrences in the collection history under one tombstone that still refuses a blind create')

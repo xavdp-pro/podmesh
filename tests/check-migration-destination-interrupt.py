@@ -51,7 +51,7 @@ def write(host, box, authorization, name, value):
 def authorized(u, command, image):
     """A universe created, started, checkpointed and authorized on the source, delivered to the destination."""
     universes.append(u)
-    A.ok(request('create', u, REF, image='sha256:' + image, command=command))
+    A.ok(request('create', u, REF, image='sha256:' + image, network_profile='isolated', command=command))
     A.ok(request('start', u, REF))
     container = inspect(A, u)
     checkpoint = request('migration_checkpoint', u, REF, container_id=container['Id'], image='sha256:' + image,
@@ -70,7 +70,7 @@ try:
     # ---------------------------------------------------------------- service killed during the restore
     H = str(uuid.uuid4())
     universes.append(H)
-    A.ok(request('create', H, REF, image='sha256:' + alpine, command=HOG))
+    A.ok(request('create', H, REF, image='sha256:' + alpine, network_profile='isolated', command=HOG))
     A.ok(request('start', H, REF))
     deadline = time.time() + 120
     while A.call('memory', uuid_value=H)['memory_current_bytes'] < 400 * 1024 * 1024:
@@ -182,7 +182,7 @@ try:
     checks.append('[destination] after the failure the restore scope is finished and the conmon process is gone (container left: %s; its empty '
                   'conmon scope cgroup still present until the container is removed: %s)'
                   % ('yes, not running' if leftover else 'no', conmon['conmon_scope_exists']))
-    B.refused(request('create', F, REF, image='sha256:' + alpine, command=['true']), 'create while a restore claim is unresolved',
+    B.refused(request('create', F, REF, image='sha256:' + alpine, network_profile='isolated', command=['true']), 'create while a restore claim is unresolved',
               'unresolved restore claim', checks)
     again = B.api(failing)
     assert again['ok'] is False and 'migration_restore_abort' in again['error'], again
@@ -201,7 +201,7 @@ try:
     assert B.call('scope', unit=failed_scope)['active_state'] in ('inactive', 'failed')
     assert failed_conmon_scope is None or gone(B, failed_conmon_scope), 'the conmon scope cgroup must disappear with the removed container'
     checks.append('[destination] after the abort the universe container, its conmon scope cgroup and the restore scope are all gone')
-    B.ok(request('create', F, REF, image='sha256:' + alpine, command=['true']), 'the closed claim no longer blocks generic operations', checks)
+    B.ok(request('create', F, REF, image='sha256:' + alpine, network_profile='isolated', command=['true']), 'the closed claim no longer blocks generic operations', checks)
     B.ok(request('delete', F, REF))
     # The destination claimed, and reports on, the forged handoff it actually received. Its outcome is bound to
     # that handoff, so it cannot end the authorization the source issued: the source stays held, which is the

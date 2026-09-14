@@ -41,7 +41,7 @@ def capture_and_restore(marker, src, new, as_source=None):
     With `as_source`, the manifest carried to the inbox names that UUID as the universe it
     was taken from -- which is how a second host sees it: a source it has never created.
     """
-    assert op('create', universe_uuid=src, image=image,
+    assert op('create', universe_uuid=src, image=image, network_profile='isolated',
               command=['sh', '-c', f"printf %s '{marker}' > /marker-{marker}; trap 'exit 0' TERM; sleep 600 & wait"])['ok']
     assert op('start', universe_uuid=src, observe_seconds=1)['ok']
     assert op('stop', universe_uuid=src, timeout_seconds=10, on_timeout='kill')['data']['forced'] is False

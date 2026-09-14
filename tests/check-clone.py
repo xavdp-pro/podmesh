@@ -60,7 +60,7 @@ alpine = next(i['Id'] for i in images() if any('alpine' in n for n in i.get('Nam
 baseline = state()
 try:
     a, A = new_universe()
-    create_a = request('create', a, image='sha256:' + alpine, command=['sh', '-c', 'cat /clone-marker'])
+    create_a = request('create', a, image='sha256:' + alpine, network_profile='isolated', command=['sh', '-c', 'cat /clone-marker'])
     ok(create_a, 'create clone source')
     blob = os.urandom(1 << 20)
     put(A, '/clone-marker', b'source-a'); put(A, '/clone-blob', blob)
@@ -77,7 +77,7 @@ try:
     unmanaged('podmesh-' + y, f'io.podmesh.universe={y}', 'io.podmesh.creation-operation=' + create_a['operation_id'])
     refused(request('clone', b, source_uuid=y), 'source label borrowing another universe operation', 'does not match')
     e, E = new_universe()
-    create_e = request('create', e, image='sha256:' + alpine, command=['true'])
+    create_e = request('create', e, image='sha256:' + alpine, network_profile='isolated', command=['true'])
     ok(create_e)
     out('rm', E); forged.append(E)
     unmanaged(E, f'io.podmesh.universe={e}', 'io.podmesh.creation-operation=' + create_e['operation_id'])
@@ -87,7 +87,7 @@ try:
     refused(request('clone', o, source_uuid=a), 'target name held by an unmanaged container', 'not managed')
     assert inspect('podmesh-' + o)['Id'] == occupant
     r, R = new_universe()
-    ok(request('create', r, image='sha256:' + alpine, command=['sleep', '120']))
+    ok(request('create', r, image='sha256:' + alpine, network_profile='isolated', command=['sleep', '120']))
     out('start', R)
     refused(request('clone', b, source_uuid=r), 'running source', 'must be stopped')
     out('pause', R)
