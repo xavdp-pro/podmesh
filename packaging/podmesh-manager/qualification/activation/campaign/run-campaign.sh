@@ -164,6 +164,9 @@ print(json.dumps({a: h['reproduced'] for a, h in out['hosts'].items()}), out['de
 sys.exit(0 if ok_all else 5)
 PY
   ;;
+replication-path)  # what converged, what is per host, what is exclusive -- from the derived inspections
+  "$(dirname -- "$COMPARATOR")/campaign/replication-path.py" $E/lab-a/derived-inspection.json $E/lab-b/derived-inspection.json $E/lab-c/derived-inspection.json > "$E/replication-path.json"; rc=$?
+  jq -c '{replication_path_qualified_for, converged:(.converged|del(.per_scope))}' "$E/replication-path.json"; exit $rc;;
 summary)  # public summary: aliases, hashes, counts, verdicts; never an address or a key
   python3 - "$W" <<'PY'
 import json, sys, pathlib, re, datetime, hashlib
@@ -224,6 +227,7 @@ finish)  # resume after the live phases: preserve, fetch, compare, derive, summa
   step fetch || { "$0" summary; exit 1; }
   step compare || true
   step derive || true
+  step replication-path || true
   "$0" summary;;
-*) echo "usage: $0 campaign | finish | prepare-dirs | activate <alias> | observe <alias> | inspect | wait-converged | converged <alias> | rollback <alias> | preserve <alias> | fetch | compare | derive | summary" >&2; exit 2;;
+*) echo "usage: $0 campaign | finish | prepare-dirs | activate <alias> | observe <alias> | inspect | wait-converged | converged <alias> | rollback <alias> | preserve <alias> | fetch | compare | derive | replication-path | summary" >&2; exit 2;;
 esac

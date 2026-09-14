@@ -1,0 +1,84 @@
+{
+  "converged": {
+    "every_scope_has_one_origin_replica": true,
+    "fact_set_identical_on_every_host": true,
+    "facts": 18,
+    "logical_history_sha256_identical": true,
+    "materialized_view_identical": true,
+    "per_scope": {
+      "34a991c12b43": {
+        "distinct_origin_replicas": 1,
+        "facts": 6,
+        "predecessor_chained": true,
+        "subject_revisions_contiguous": true
+      },
+      "4badfb6a1cd6": {
+        "distinct_origin_replicas": 1,
+        "facts": 6,
+        "predecessor_chained": true,
+        "subject_revisions_contiguous": true
+      },
+      "ccb3e0b8005c": {
+        "distinct_origin_replicas": 1,
+        "facts": 6,
+        "predecessor_chained": true,
+        "subject_revisions_contiguous": true
+      }
+    },
+    "scopes": 3
+  },
+  "distinct_replica_identities": true,
+  "exclusive_decisions": {
+    "blocked_exclusive_resources_per_host": [
+      0,
+      0,
+      0
+    ],
+    "conflicts_per_host": [
+      0,
+      0,
+      0
+    ],
+    "facts_with_active_claim": 0,
+    "facts_with_exclusive_resource": 0,
+    "note": "an exclusive decision is a fact carrying exclusive_resource with active_claim, and a permit issued by authorize_exclusive_service against a reconciled history; this campaign carries none, so nothing here is evidence about exclusion"
+  },
+  "hosts": 3,
+  "immutable_history": {
+    "facts_are_content_addressed": true,
+    "note": "a fact is an immutable event: identity collision with different bytes is refused at import (Replica::ingest); facts, receipts and audit rows are protected by refuse-update and refuse-delete triggers in the store"
+  },
+  "one_logical_manager": true,
+  "per_host_not_replicated": {
+    "audit_events_per_host": [
+      4340,
+      5165,
+      4819
+    ],
+    "audit_set_sha256_distinct": 3,
+    "incomplete_attempt_phases": [
+      {
+        "outbound_request_prepared": 130
+      },
+      {
+        "outbound_request_prepared": 103
+      },
+      {
+        "outbound_request_prepared": 81
+      }
+    ],
+    "incomplete_attempts_per_host": [
+      130,
+      103,
+      81
+    ],
+    "receipt_sets_identical": false,
+    "receipts_per_host": [
+      40,
+      44,
+      44
+    ]
+  },
+  "replication_path_qualified_for": "non-exclusive observations in owned scopes: the fact set, its digest and the materialised view converged on every host",
+  "schema": "manager2-replication-data-path/v1"
+}
