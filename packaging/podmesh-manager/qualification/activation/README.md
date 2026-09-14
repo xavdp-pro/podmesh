@@ -81,10 +81,10 @@ The matching comparator output is
 `podmesh-manager-live-activation-comparison/v3`. The activation seal refuses a
 converged file or active baseline carrying another evidence version, and the comparator
 refuses evidence `/v2`, published inspection `3`, and comparison `/v2` rather than
-interpreting old and new shapes under one name. At reviewed commit `024eb84`, a `/v2`
-evidence object is rejected by the exact-shape check before the version check, so the
-error is the generic `unsafe shape`; the rejection is real, but its diagnostic does not
-yet name the unsupported version.
+interpreting old and new shapes under one name. A `/v2` evidence object is rejected by
+the exact-shape check before the version check, so the error is the generic `unsafe
+shape`; the rejection is real, although its diagnostic does not name the unsupported
+version.
 
 Historical `/v2` captures are immutable. Reproduce their stored comparison with the
 activation comparator at commit `9d814b2`, or capture preserved stores again as new `/v3`
@@ -105,13 +105,12 @@ The comparator requires four captures for every host:
 
 Convergence is derived only from stages 3 and 4. The three canonical history
 digests must agree, contain at least three facts, and remain converged after all
-residents stop. The intended contract retains and classifies incomplete attempts by
+residents stop. The contract retains and classifies incomplete attempts by
 identity as pre-existing, terminal, accounted, or unaccounted; G2 requires zero
 **unaccounted** new incomplete attempts. It never requires deletion or fabrication of a terminal
-row. At reviewed commit `024eb84`, this is implemented only for outbound attempts:
-honest inbound incomplete attempts abort comparison. No campaign may run until N1 adds
-direction-aware inbound corroboration and classification. Equal diagnostic status
-counters do not prove convergence.
+row. Corroboration is direction-aware: inbound and outbound attempts bind to their own
+valid non-terminal folded rows, while a new strand still open at post-cleanup is reported
+as unaccounted. Equal diagnostic status counters do not prove convergence.
 
 A G2 PASS is an exchange-accounting result over the captured manager processes. It
 must report the full attempt vocabulary, the conditions the published evidence could
@@ -126,27 +125,24 @@ and modes, and unchanged existing PodMesh services, rootful containers, routes
 and nftables commitments.
 
 
-## Known NO-GO limits at `024eb84`
+## Independent-review closure and remaining boundary
 
-The fifth independent review found that the harness is not ready for another campaign:
+The fifth review findings N1-N7 are covered by the offline regression suites. Corroboration is
+direction-aware; the fifteen non-equivalent mutations named by the review are caught by their
+named unit or CLI tests;
+pre-activation debt remains byte-identical; replay evidence is labelled `replay` when a
+matching sender retry exists and `receiver_asserted` when only the receiver retained the
+replay; the unreachable all-replica branch is absent; pre-activation quiescence is checked
+again after inspection; and row identities and shapes are frozen across stages.
 
-- N1: honest inbound incomplete attempts abort comparison instead of being classified.
-- N2: the replay join, accepted-terminal join, debt anchor, stopped-manager checks and
-  old-version refusal are not independently pinned by tests.
-- N3: pre-activation debt can disappear instead of remaining byte-identical through all
-  later stages.
-- N4: replay currently requires only the receiver row; it does not require the sender's
-  retry row or report unmatched inbound rows. Such evidence is receiver-asserted.
-- N5: the all-replica convergence accounting branch is unreachable for this candidate
-  and is excluded from the documented acceptance contract.
-- N6: pre-activation unit and process state are not re-read after store inspection.
-- N7: row binding fields and the permitted outbound folded-row shape are not frozen
-  across stages.
+More than one valid replay of the same operation is legitimate. Any fully joined replay
+is sufficient for the `replay` branch. A receiver-only replay may satisfy the weaker
+`receiver_asserted` branch under the published collector-honest trust model. Inbound rows
+that appear only after the converged capture and have no matching sender are reported in
+`unmatched_inbound_rows` rather than silently strengthening the result.
 
-After N1, corroboration must be direction-aware. An inbound attempt binds to a local
-inbound folded row with the same nonce, authority and operation, whose highest phase is
-the listed non-terminal phase. A new inbound strand still open at post-cleanup is
-unaccounted and fails the campaign; pre-existing inbound debt remains reported as debt.
+This closes the offline gate only. A real evidence-v3 campaign and preserved-store
+derivation across at least two hosts remain required before G2 can be qualified.
 
 ## Per-host activation
 

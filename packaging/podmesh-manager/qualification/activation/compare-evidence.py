@@ -690,28 +690,40 @@ def classify(host, attempt, rows_by_nonce, cleanups, overhead, reply_overhead):
                     and retry["local_receipt_commitment"]==recv["local_receipt_commitment"]
                     and complete_reply(retry,reply_overhead)):
                 retry_receivers.append((retry_nonce,retry))
-    if len(retry_receivers)!=1:
+    if not retry_receivers:
         return "no receiver observed a complete replay carrying the durable receipt (condition 6)",None
-    retry_nonce,retry=retry_receivers[0]
-    retry_senders=[r for h,r in rows_by_nonce[retry_nonce]
-                   if h==host and r["direction"]=="outbound"]
-    if not retry_senders:
-        return None,"receiver_asserted"
-    if len(retry_senders)!=1:
-        return "the replay retry has more than one sender-side row (condition 6)",None
-    retry_sender=retry_senders[0]
     receiver_replica=cleanups[rhost]["inspection"]["replica_commitment"]
-    for field in ("operation_commitment","request_sha256_commitment",
-                  "request_announced_body_bytes","reply_sha256_commitment"):
-        if retry_sender[field] is None or retry_sender[field]!=retry[field]:
-            return f"the replay sender does not bind {field} to the receiver (condition 6)",None
-    if retry_sender["peer_commitment"]!=receiver_replica:
-        return "the replay sender does not bind the receiver replica (condition 6)",None
-    if ("outbound_exchange_completed" not in retry_sender["phases_reached"]
-            or "accepted" not in retry_sender["outcomes"]):
-        return "the replay sender did not record an accepted completion (condition 6)",None
-    if retry_sender["remote_receipt_commitment"]!=retry["local_receipt_commitment"]:
-        return "the replay sender does not bind the durable receiver receipt (condition 6)",None
+    receiver_asserted=False
+    sender_failures=[]
+    for retry_nonce,retry in retry_receivers:
+        retry_senders=[r for h,r in rows_by_nonce[retry_nonce]
+                       if h==host and r["direction"]=="outbound"]
+        if not retry_senders:
+            receiver_asserted=True
+            continue
+        if len(retry_senders)!=1:
+            sender_failures.append("the replay retry has more than one sender-side row (condition 6)")
+            continue
+        retry_sender=retry_senders[0]
+        mismatch=None
+        for field in ("operation_commitment","request_sha256_commitment",
+                      "request_announced_body_bytes","reply_sha256_commitment"):
+            if retry_sender[field] is None or retry_sender[field]!=retry[field]:
+                mismatch=f"the replay sender does not bind {field} to the receiver (condition 6)"
+                break
+        if mismatch is None and retry_sender["peer_commitment"]!=receiver_replica:
+            mismatch="the replay sender does not bind the receiver replica (condition 6)"
+        if mismatch is None and ("outbound_exchange_completed" not in retry_sender["phases_reached"]
+                                 or "accepted" not in retry_sender["outcomes"]):
+            mismatch="the replay sender did not record an accepted completion (condition 6)"
+        if mismatch is None and retry_sender["remote_receipt_commitment"]!=retry["local_receipt_commitment"]:
+            mismatch="the replay sender does not bind the durable receiver receipt (condition 6)"
+        if mismatch is None:
+            return None,"replay"
+        sender_failures.append(mismatch)
+    if receiver_asserted:
+        return None,"receiver_asserted"
+    return sender_failures[0],None
     # Condition 7 is not checked here because it is already checked earlier and for every
     # capture: validate_inspection refuses any store whose sqlite_integrity_result is not
     # "ok", and the immutable-chain half is entailed by the inspection having succeeded at
@@ -750,7 +762,7 @@ def classify(host, attempt, rows_by_nonce, cleanups, overhead, reply_overhead):
     # The original strand is cross-host joined: a sender claim is decided by the receiver.
     # A retry without its sender row remains explicitly receiver_asserted and carries less
     # evidentiary weight than the fully joined replay branch.
-    return None,"replay"
+    raise AssertionError("replay classification must return from the replay loop")
 
 def three_host_failures(pres,bases,convs,cleanups):
     failures=[]

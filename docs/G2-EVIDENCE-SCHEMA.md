@@ -1,15 +1,14 @@
 # G2 evidence schema v3 — publishing what the accounting predicate needs
 
-Status: **implemented at `024eb84`, independently reviewed as NO-GO, and not yet run
+Status: **implemented, independently reviewed and corrected offline, and not yet run
 against hosts.** Lot `codex/g2-accounted-attempts`.
 Work item 2 is this document; items 3 to 6 are in the collector, the fold, the comparator
 and the suites: typed fresh-store absence, the published `incomplete_attempts` records,
 the folded `exchanges` rows, and the eight-condition join that replaced the withdrawn
-demand for zero. The fifth independent review found two blocking defects: honest inbound
-incomplete attempts abort comparison (N1), and the accepting conditions are not isolated
-by the tests (N2). It also found the N3-N7 limits recorded below. Those defects must be
-corrected before preserved-store re-evaluation or another campaign. **No campaign has been
-run against this version, and nothing here qualifies G2 or manager HA.**
+demand for zero. The fifth and sixth independent reviews found N1-N8 and the
+multiple-replay defect; the current offline gate closes those findings and pins the
+accepting branches with CLI tests. **No campaign has been run against this version, and
+nothing here qualifies G2 or manager HA.**
 
 **Two corrections this document made to itself, both from measurement rather than from
 reading, are recorded in place below**: an exchange is a fold over one to four audit rows
@@ -344,7 +343,7 @@ plus a guessed body is a confirmation oracle.
 | 3 | the receiver's `phases_reached` includes `inbound_import_committed` or `inbound_refusal_recorded`, its `outcomes` vocabulary is compatible with those phases, and the accepted-import branch carries a `local_receipt_commitment` |
 | 4 | `unaudited_import_receipt_count == 0` on every host, with the commitments published so a non-zero case names which |
 | 5 | the receiver's row reaches `inbound_reply_write_observed` with `reply_frame_bytes > 0`, **and** the sender's attempt is still `outbound_request_prepared` — the honest retention the contract requires |
-| 6 | the reachable branch is a complete replay on the original receiver: a different peer-validated nonce, the same operation and peer commitments, `replayed: true`, accepted outcome, committed import and reply-write phases, the original receipt commitment, and a complete reply. The former all-replica convergence branch is unreachable for this candidate because operation IDs are per peer and import receipts are receiver-local |
+| 6 | the reachable branch is one or more complete replays on the original receiver: each candidate uses a different peer-validated nonce, the same operation and peer commitments, `replayed: true`, accepted outcome, committed import and reply-write phases, the original receipt commitment, and a complete reply. At least one fully sender-joined retry yields branch `replay`; only receiver-side evidence yields the explicitly weaker branch `receiver_asserted`. The former all-replica convergence branch is unreachable for this candidate because operation IDs are per peer and import receipts are receiver-local |
 | 7 | `sqlite_integrity_result`, successful inspection — which entails the immutable-schema check — and each replica's receipt/audit set digests remaining consistent with its own later capture. The set digests are replica-local and must not be required to agree across replicas. |
 | 8 | the attempt is still in `incomplete_attempts` at post-cleanup — visible, not silently retired |
 
@@ -377,32 +376,23 @@ projection. The raw audit history is never published, but the current folded pro
 covers the whole locally retained audit table and can therefore grow without bound. A
 bounded window remains a separate, versioned change.
 
-## Known implementation limits at `024eb84`
+## Corrected offline implementation and remaining limits
 
-The schema describes the intended decision contract. The fifth independent review found
-that the implementation at `024eb84` does not yet meet it:
+The implementation now binds incomplete attempts in both directions, keeps pre-activation
+debt byte-identical, freezes row identity and shape across stages, and rechecks manager
+quiescence after inspection. The unreachable all-replica convergence branch is removed.
+Fifteen non-equivalent mutations from the fifth review are each caught by a named CLI test.
 
-- **N1:** corroboration accepts only outbound strands. An honest inbound incomplete
-  attempt, including pre-existing inbound debt, aborts comparison instead of receiving a
-  direction-aware classification.
-- **N2:** the accepting conditions are not independently pinned by the test suites; a
-  number of single-condition mutants can still turn a refusal into a pass.
-- **N3:** pre-activation debt is not yet required to remain byte-identical at every later
-  stage and can disappear from the result.
-- **N4:** the replay branch currently rests on a receiver row without requiring the
-  matching sender retry row, and unmatched inbound rows are not reported. Until this is
-  corrected, replay evidence is receiver-asserted under the published trust model.
-- **N5:** the all-replica convergence branch is unreachable and must be removed from the
-  implementation and its fixtures; it is not part of the contract above.
-- **N6:** the pre-activation capture does not re-read unit and process state after store
-  inspection, leaving a small capture race.
-- **N7:** peer, operation, request digest and announced size are not frozen per nonce
-  across stages, and outbound folded row shape is not capped.
+Condition 6 accepts any fully joined replay of the operation, including when several valid
+replays exist. It emits branch `replay` when at least one retry has a matching sender row,
+or `receiver_asserted` when a qualifying replay exists only in receiver evidence. The
+latter is deliberately weaker and remains inside the declared `collector-honest;
+cross-host joins only` trust model. New unmatched inbound rows appearing after the
+converged capture are reported separately.
 
-After N1, direction-aware corroboration must bind the same direction, nonce, authority
-and operation, require the listed last phase to be the highest observed non-terminal
-phase, and classify a new inbound strand still open at post-cleanup as unaccounted rather
-than aborting the comparator.
+The sender's transferred request byte count and the named C4, C5, C6 and C8 subconditions
+remain undecidable from the privacy-preserving projection. A real `/v3` capture on the
+three hosts and a preserved-store derivation over at least two hosts remain required.
 
 ## What this design does not do
 

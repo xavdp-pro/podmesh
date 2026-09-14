@@ -81,7 +81,7 @@ Missing data is `unknown`; it is never recorded as zero or stopped.
 | --- | --- | --- |
 | G0 Local reducer | Deterministic three-copy reconciliation and conflict quarantine | Qualified in the isolated model |
 | G1 Durable process | Crash/restart, concurrent writers, checked facts and receipts | Qualified locally; no host deployment |
-| G2 Authenticated exchange | Three real processes, bounded mutual peer authentication and durable imports, with **every attempt individually terminal or accounted for** and every undecidable sub-condition reported — see "The G2 acceptance predicate" below | Not yet qualified. Historical evidence v2 records two live three-host campaigns and one measurement run; they establish that the three processes exchanged authenticated observations and converged, but their FAIL comparison is reproducible only with the comparator at commit `9d814b2`. Evidence v3, published inspection v4 and comparison v3 are the next contract. The fifth independent review of `024eb84` remains NO-GO: N1 and N2 are blocking, with N3-N7 also open. No v3 campaign may run until those production and test corrections are present. A G2 PASS will remain an exchange-accounting result, not proof of takeover, fencing, DNS recovery, exclusive activation, host-loss recovery, long-running viability, or HA. |
+| G2 Authenticated exchange | Three real processes, bounded mutual peer authentication and durable imports, with **every attempt individually terminal or accounted for** and every undecidable sub-condition reported — see "The G2 acceptance predicate" below | Not yet qualified. Historical evidence v2 records two live three-host campaigns and one measurement run; they establish that the three processes exchanged authenticated observations and converged, but their FAIL comparison is reproducible only with the comparator at commit `9d814b2`. The offline evidence-v3, published-inspection-v4 and comparison-v3 gate has been corrected after the fifth and sixth independent reviews, with the accepting branches pinned by the offline regression suites. A new real three-host v3 campaign and preserved-store derivation over at least two hosts remain required. A G2 PASS will remain an exchange-accounting result, not proof of takeover, fencing, DNS recovery, exclusive activation, host-loss recovery, long-running viability, or HA. |
 | G3 Effect exclusion | Current epoch enforced outside manager memory and old epoch refused | Not yet qualified |
 | G4 Host deployment | Signed package, preserved identity, upgrade/rollback and clean install on three hosts | Signed installation, protected three-replica configuration, offline validation and default-disabled refusal pass on three existing hosts; durable identity restart, lifecycle, upgrade/rollback and clean-host requirements remain open |
 | G5 Manager service recovery | Real process/host loss, restart and stale return under external observation | Not yet qualified |
@@ -130,7 +130,8 @@ reach that number.
 ### When an incomplete attempt is accounted for
 
 The intended acceptance conditions are listed below. A result may call an incomplete
-attempt `accounted` only through the named `replay` branch and must state which conditions
+attempt `accounted` through the cross-host `replay` branch or the explicitly weaker
+`receiver_asserted` branch, and must state which conditions
 the published evidence actually decided. Privacy-preserving evidence currently cannot
 decide the sender's transferred request byte count in condition 2 or every part of
 conditions 4, 5, 6, and 8; a PASS must publish those limits instead of implying that all
@@ -147,20 +148,22 @@ a separate refusal; there is no aggregate that can compensate for it.
 4. no partial import and no unaudited import receipt exists;
 5. the receiver prepared and completely wrote the correctly bound signed reply, while
    the sender honestly retained the absence of a confirmed reply as incomplete;
-6. an identical retry is recorded on the original receiver under a different
+6. one or more identical retries are recorded on the original receiver under different
    peer-validated nonce, with the same operation, peer and original receipt commitments,
    `replayed: true`, accepted outcome, committed import and reply-write phases, and a
-   complete reply. The former all-replica convergence branch is unreachable for this
-   candidate because operation IDs are per peer and import receipts are receiver-local;
+   complete reply. Any fully matching sender-receiver retry yields branch `replay`; if no
+   such joined retry exists and at least one qualifying retry has only receiver-side evidence,
+   the result is labelled `receiver_asserted` under the published trust model. The former
+   all-replica convergence branch is unreachable
+   for this candidate because operation IDs are per peer and import receipts are receiver-local;
 7. every store passes integrity and immutable-chain verification;
 8. the incomplete record remains visible in evidence and in operational diagnostics.
 
 For an outbound attempt, absence of the authenticated receiver-side join makes it
-unaccounted and fails the campaign. After N1, an inbound attempt must instead bind to a
+unaccounted and fails the campaign. An inbound attempt must bind to a
 local inbound folded row with the same direction, nonce, authority and operation, whose
 highest phase is the listed non-terminal phase. A new inbound strand still open at
-post-cleanup is unaccounted; pre-existing inbound debt remains reported as debt. At
-`024eb84`, inbound strands abort comparison and this contract is not implemented. A
+post-cleanup is unaccounted; pre-existing inbound debt remains reported as debt. A
 timeout, a missing heartbeat, a matching total, or eventual history convergence
 **alone** is insufficient — each of those is a story about the whole, and
 this predicate is about one attempt at a time.
@@ -185,21 +188,23 @@ folded into a success claim. Every new attempt is classified individually.
 
 The comparison also emits `undecided_conditions`, `trust_model`, and a per-attempt
 `branch`. At minimum, the present privacy boundary makes
-`C2-transferred-request-bytes`, `C4-partial-import`, `C5-signature`,
+`C2-sender-transferred-request-bytes`, `C4-partial-import`, `C5-signature`,
 `C6-exact-facts`, and `C8-diagnostics` undecidable from sealed evidence. The trust model is
 `collector-honest; cross-host joins only`: same-host counts, terminals, and digest
 sidecars remain producer assertions unless another host's evidence anchors them.
 
-### Implementation limits found at `024eb84`
+### Offline implementation state
 
-The fifth independent review remains NO-GO. N1 and N2 are blocking: inbound incomplete
-attempts cannot be classified, and the accepting conditions are not independently pinned
-by tests. N3 permits pre-activation debt to disappear. N4 accepts receiver-only replay
-claims and does not report unmatched inbound rows. N5 is the unreachable convergence
-branch removed from the contract above. N6 leaves a pre-activation capture race because
-unit and process state are not re-read after inspection. N7 does not freeze row binding
-fields and folded-row shape across stages. Until these are corrected in production and
-tests, this section states the target predicate rather than a qualified capability.
+The fifth-review findings N1-N7 are corrected and pinned by the offline unit and CLI regression suites. Direction-aware
+attempts, immutable pre-activation debt, sender-bound replay, removal of the unreachable
+convergence branch, post-inspection quiescence and stable row identities are implemented.
+The sixth review also found and corrected the legitimate multiple-replay case: any fully
+joined retry can establish branch `replay`; receiver-only replay remains explicitly
+`receiver_asserted`. New unmatched inbound rows are reported only when they appear after
+the converged capture, which is the bounded diagnostic scope of this comparison.
+
+This is readiness for real capture, not G2 qualification. No evidence-v3 campaign has run
+on the three hosts yet.
 
 ### What this amendment does not do
 

@@ -67,6 +67,38 @@ class ReviewFiveCase(ComparatorCase):
         target["exchanges"].append(self.replay_row())
         recount(target)
 
+    def install_joined_replay(self, label: str) -> tuple[dict, dict]:
+        nonce = commitment(f"nonce-retry-{label}")
+        request = commitment(f"rq-retry-{label}")
+        reply = commitment(f"rp-retry-{label}")
+        receiver = self.replay_row()
+        receiver.update(
+            nonce_commitment=nonce,
+            request_sha256_commitment=request,
+            reply_sha256_commitment=reply,
+        )
+        sender = copy.deepcopy(SENDER_PREPARED)
+        sender.update(
+            nonce_commitment=nonce,
+            phases_reached=["outbound_exchange_completed", "outbound_request_prepared"],
+            row_count=2,
+            peer_commitment=RB,
+            operation_commitment=OPERATION,
+            request_sha256_commitment=request,
+            reply_sha256_commitment=reply,
+            remote_receipt_commitment=RECEIPT,
+            request_frame_bytes=2735,
+            reply_frame_bytes=626,
+            reply_announced_body_bytes=622,
+            outcomes=["accepted", "incomplete"],
+            replayed=True,
+        )
+        self.fixtures[("lab-a", "post-cleanup")]["exchanges"].append(sender)
+        self.fixtures[("lab-b", "post-cleanup")]["exchanges"].append(receiver)
+        recount(self.fixtures[("lab-a", "post-cleanup")])
+        recount(self.fixtures[("lab-b", "post-cleanup")])
+        return sender, receiver
+
     def replay_receiver(self, host: str = "lab-b") -> dict:
         return next(
             row
@@ -189,6 +221,27 @@ class ReplayMutationTests(ReviewFiveCase):
         )
         original["replayed"] = True
         self.assert_refuses_for(self.REPLAY_REASON)
+
+    def test_multiple_fully_joined_replays_account_for_one_strand(self) -> None:
+        self.install_strand("post-cleanup")
+        self.install_joined_replay("one")
+        self.install_joined_replay("two")
+        report = self.assert_passes()
+        details = report["incomplete_attempt_accounting"]["accounted_detail"]
+        self.assertEqual(details[0]["branch"], "replay", report)
+
+    def test_fully_joined_replay_is_preferred_over_receiver_only_replay(self) -> None:
+        self.install_valid_replay()
+        self.install_joined_replay("joined-after-receiver-only")
+        report = self.assert_passes()
+        details = report["incomplete_attempt_accounting"]["accounted_detail"]
+        self.assertEqual(details[0]["branch"], "replay", report)
+
+    def test_mismatched_replay_sender_is_refused(self) -> None:
+        self.install_strand("post-cleanup")
+        sender, _ = self.install_joined_replay("mismatch")
+        sender["peer_commitment"] = RC
+        self.assert_refuses_for("replay sender does not bind the receiver replica")
 
 
 class TerminalMutationTests(ReviewFiveCase):
