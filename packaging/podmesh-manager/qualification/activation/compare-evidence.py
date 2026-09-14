@@ -531,6 +531,19 @@ def classify(host, attempt, rows_by_nonce, cleanups, overhead, reply_overhead):
     #       proves that THESE imported facts and THIS receipt are the ones present on every
     #       replica; that would need per-fact publication.
     #   C8  the operational-diagnostics half is outside a comparator's reach entirely.
+    #
+    # AND ONE LIMIT THAT SPANS THEM ALL, stated because a reader would otherwise take the
+    # cross-checks for more than they are. Every rule that binds one published field to
+    # another -- folded rows against `audit_event_count`, imported operations against
+    # `receipt_count` -- compares two values the SAME host asserts. They catch a capture
+    # that contradicts itself, which is what a buggy collector or a careless edit produces,
+    # and they cost a deliberate forger one extra integer. No third-party anchor exists in
+    # published evidence: `audit_set_sha256` and `receipt_set_sha256` are digests over the
+    # candidate's full ordered records, and the collector publishes a fold rather than those
+    # records, so a comparator cannot recompute either from what it is given. Anchoring them
+    # would mean publishing the records themselves, which the privacy constraint forbids.
+    # What is NOT self-asserted is the cross-host join: a sender's claim is decided by
+    # another host's rows, and that is where the predicate's weight sits.
     return None
 
 def three_host_failures(pres,bases,convs,cleanups):
