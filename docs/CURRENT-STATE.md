@@ -419,6 +419,12 @@ standby's disk no longer grows by one image per cycle.
    interval and retention per universe, out-of-band fencing and who may cut power, which
    universes, and whether the tool may ever be a timer. Then Codex's review, packaging, and
    level 3 after B0 qualifies a storage backend.
+8. Manager pre-reply verification (Codex's candidate): the web tree's
+   `docs/MANAGER-PRE-REPLY-VERIFICATION.md` gained an addendum on 2026-09-14 — a durable
+   digest cannot detect an edit to a row the verifier does not read, so an O(new) reply
+   path is honest only if full verification leaves the reply path and the contract states
+   a detection interval. Two shapes and a recommendation are recorded; the choice is the
+   candidate's contract and Codex's.
 
 ## Cost and delegation policy
 
