@@ -243,11 +243,14 @@ RB=$(jq -r '.inspection.replica_commitment' "$work/lab-b-post-cleanup.json")
 strand="{\"attempt_commitment\":\"sha256:6666666666666666666666666666666666666666666666666666666666666666\",\"nonce_commitment\":\"$N\",\"nonce_authority\":\"peer-validated\",\"operation_commitment\":\"$OP\",\"direction\":\"outbound\",\"last_phase\":\"outbound_request_prepared\"}"
 sent="{\"nonce_commitment\":\"$N\",\"nonce_authority\":\"peer-validated\",\"joinable\":true,\"direction\":\"outbound\",\"phases_reached\":[\"outbound_request_prepared\"],\"row_count\":1,\"peer_commitment\":\"$RB\",\"operation_commitment\":\"$OP\",\"request_sha256_commitment\":\"$RQ\",\"reply_sha256_commitment\":null,\"local_receipt_commitment\":null,\"remote_receipt_commitment\":null,\"request_frame_bytes\":0,\"reply_frame_bytes\":0,\"request_announced_body_bytes\":2731,\"reply_announced_body_bytes\":null,\"outcomes\":[\"incomplete\"],\"replayed\":null}"
 served="{\"nonce_commitment\":\"$N\",\"nonce_authority\":\"peer-validated\",\"joinable\":true,\"direction\":\"inbound\",\"phases_reached\":[\"inbound_request_observed\",\"inbound_import_committed\",\"inbound_reply_prepared\",\"inbound_reply_write_observed\"],\"row_count\":4,\"peer_commitment\":\"$RA\",\"operation_commitment\":\"$OP\",\"request_sha256_commitment\":\"$RQ\",\"reply_sha256_commitment\":\"sha256:7777777777777777777777777777777777777777777777777777777777777777\",\"local_receipt_commitment\":\"sha256:8888888888888888888888888888888888888888888888888888888888888888\",\"remote_receipt_commitment\":null,\"request_frame_bytes\":2735,\"reply_frame_bytes\":626,\"request_announced_body_bytes\":2731,\"reply_announced_body_bytes\":622,\"outcomes\":[\"accepted\"],\"replayed\":false}"
+RN='sha256:abababababababababababababababababababababababababababababababab'
+retry_sent="{\"nonce_commitment\":\"$RN\",\"nonce_authority\":\"peer-validated\",\"joinable\":true,\"direction\":\"outbound\",\"phases_reached\":[\"outbound_request_prepared\",\"outbound_exchange_completed\"],\"row_count\":2,\"peer_commitment\":\"$RB\",\"operation_commitment\":\"$OP\",\"request_sha256_commitment\":\"$RQ\",\"reply_sha256_commitment\":\"sha256:7777777777777777777777777777777777777777777777777777777777777777\",\"local_receipt_commitment\":null,\"remote_receipt_commitment\":\"sha256:8888888888888888888888888888888888888888888888888888888888888888\",\"request_frame_bytes\":2735,\"reply_frame_bytes\":626,\"request_announced_body_bytes\":2731,\"reply_announced_body_bytes\":622,\"outcomes\":[\"accepted\",\"incomplete\"],\"replayed\":null}"
+retry_served="{\"nonce_commitment\":\"$RN\",\"nonce_authority\":\"peer-validated\",\"joinable\":true,\"direction\":\"inbound\",\"phases_reached\":[\"inbound_request_observed\",\"inbound_import_committed\",\"inbound_reply_prepared\",\"inbound_reply_write_observed\"],\"row_count\":4,\"peer_commitment\":\"$RA\",\"operation_commitment\":\"$OP\",\"request_sha256_commitment\":\"$RQ\",\"reply_sha256_commitment\":\"sha256:7777777777777777777777777777777777777777777777777777777777777777\",\"local_receipt_commitment\":\"sha256:8888888888888888888888888888888888888888888888888888888888888888\",\"remote_receipt_commitment\":null,\"request_frame_bytes\":2735,\"reply_frame_bytes\":626,\"request_announced_body_bytes\":2731,\"reply_announced_body_bytes\":622,\"outcomes\":[\"accepted\"],\"replayed\":true}"
 
 # $1 is an optional jq filter applied to the RECEIVER's served row, to break one condition.
 build_strand() {
-  jq ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges += [$sent] | .inspection.audit_event_count=([.exchanges[].row_count]|add) | .inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-a-post-cleanup.json" > "$work/sa.json"; sidecar "$work/sa.json"
-  jq ".exchanges += [$served${1:+ | $1}] | .inspection.audit_event_count=([.exchanges[].row_count]|add) | .inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-b-post-cleanup.json" > "$work/sb.json"; sidecar "$work/sb.json"
+  jq ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges += [$sent,$retry_sent] | .inspection.audit_event_count=([.exchanges[].row_count]|add) | .inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-a-post-cleanup.json" > "$work/sa.json"; sidecar "$work/sa.json"
+  jq ".exchanges += [$served${1:+ | $1},$retry_served] | .inspection.audit_event_count=([.exchanges[].row_count]|add) | .inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-b-post-cleanup.json" > "$work/sb.json"; sidecar "$work/sb.json"
   jq ".inspection.imported_operation_commitments=[\"$OP\"]" "$work/lab-c-post-cleanup.json" > "$work/sc0.json"; sidecar "$work/sc0.json"
   "$root/compare-evidence.py" --phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work"/*-converged.json --cleanup "$work/sa.json" "$work/sb.json" "$work/sc0.json" > "$work/strand-report.json" 2>"$work/strand-err.txt"
 }
@@ -301,17 +304,14 @@ three_refuse 'the sender did not honestly retain the absence' '.inspection.incom
 # Condition 4: an unaudited import receipt anywhere puts the accounting evidence itself in
 # question, so no attempt is accounted for while one exists.
 three_refuse 'an unaudited import receipt exists' '' '' '.inspection.unaudited_import_receipt_count=1 | .inspection.unaudited_import_receipt_commitments=["sha256:dddd999999999999999999999999999999999999999999999999999999999999"]' 'unaudited import receipts exist'
-# Condition 6: with no replayed retry and no converged canonical history, eventual
-# convergence cannot stand in for a per-attempt proof.
-# Condition 6, both branches. It used to read "a replayed retry OR the histories converge",
-# and the convergence half was the same digest equality the gate already asserts for any
-# campaign that reaches this point -- so the condition could never refuse. It now asks what
-# the condition asks: is THIS operation held, with a receipt, on EVERY replica. One replica
-# missing it, and no other host observing a replay, is unaccounted.
-three_refuse 'the operation is not held on every replica' '' '' '.inspection.imported_operation_commitments=[]' 'not held with a receipt on every replica'
+# Condition 6: canonical history convergence never substitutes for a per-attempt replay
+# proof. The former every-replica receipt branch was unreachable for the candidate because
+# an import receipt belongs to its receiver. With no receiver-observed replay, the attempt
+# remains unaccounted even when every fixture claims the operation globally.
+three_refuse 'history convergence alone does not account for an attempt' '' '' '.inspection.imported_operation_commitments=[]' 'no receiver observed a complete replay'
 # And the replay must be observed by someone else: a sender asserting `replayed` on its own
 # outbound row closed the condition by itself before.
-three_refuse 'the sender asserts its own replay' '.exchanges[-1].replayed=true' '' '.inspection.imported_operation_commitments=[]' 'not held with a receipt on every replica'
+three_refuse 'the sender asserts its own replay' '.exchanges[-1].replayed=true' '' '.inspection.imported_operation_commitments=[]' 'no receiver observed a complete replay'
 
 # The forgeries an independent review demonstrated against this comparator. Each check that
 # closes one is exercised here, because implementing a check and never testing it leaves the
@@ -378,7 +378,7 @@ reject_host 'an inspection bound to another replica' '.inspection.replica_commit
 
 # The corroboration rule cost a forger nothing: any row bearing the nonce satisfied it.
 junk="{\"nonce_commitment\":\"$N\",\"nonce_authority\":\"peer-validated\",\"joinable\":true,\"direction\":\"outbound\",\"phases_reached\":[\"outbound_request_prepared\"],\"row_count\":1,\"peer_commitment\":null,\"operation_commitment\":null,\"request_sha256_commitment\":null,\"reply_sha256_commitment\":null,\"local_receipt_commitment\":null,\"remote_receipt_commitment\":null,\"request_frame_bytes\":0,\"reply_frame_bytes\":0,\"request_announced_body_bytes\":null,\"reply_announced_body_bytes\":null,\"outcomes\":[\"accepted\"],\"replayed\":null}"
-reject_error 'an attempt corroborated by a row that is not a stranded attempt' ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges=[$junk] | .inspection.audit_event_count=1" converged 'not a stranded attempt'
+reject_error 'an attempt corroborated by a row naming another operation' ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges=[$junk] | .inspection.audit_event_count=1" converged 'name different operations'
 reject_error 'an attempt and its row naming different operations' ".inspection.incomplete_attempts=[$strand] | .inspection.incomplete_attempt_count=1 | .exchanges=[$sent | .operation_commitment=\"sha256:7777111111111111111111111111111111111111111111111111111111111111\"] | .inspection.audit_event_count=1" converged 'name different operations'
 # And the converse: a stranded row simply omitted from the list. Concealing an attempt was
 # cheaper than the forgery the corroboration rule was written to stop.

@@ -108,7 +108,39 @@ class ReviewFixes(unittest.TestCase):
         retry["local_receipt_commitment"]=C("8")
         reason,branch=G2.classify(0,attempt(),rows,cleanups,4,4)
         self.assertIsNone(reason)
+        self.assertEqual(branch,"receiver_asserted")
+        retry_sender=exchange(nonce=C("a"),
+                              phases=["outbound_request_prepared","outbound_exchange_completed"],
+                              outcomes=["accepted","incomplete"])
+        retry_sender.update(peer_commitment=C("5"), reply_sha256_commitment=C("7"),
+                            remote_receipt_commitment=C("8"))
+        rows[C("a")].append((0,retry_sender))
+        reason,branch=G2.classify(0,attempt(),rows,cleanups,4,4)
+        self.assertIsNone(reason)
         self.assertEqual(branch,"replay")
+
+    def test_inbound_incomplete_is_direction_aware(self):
+        row=exchange("inbound",phases=["inbound_request_observed","inbound_reply_prepared"],
+                     outcomes=["incomplete"])
+        inbound=attempt("inbound_reply_prepared")
+        inbound.update(direction="inbound")
+        self.assertTrue(G2.corroborates_attempt(row,inbound))
+        inbound["last_phase"]="inbound_request_observed"
+        self.assertFalse(G2.corroborates_attempt(row,inbound))
+
+    def test_outbound_fold_is_capped_at_two_rows(self):
+        row=exchange(phases=["outbound_request_prepared","outbound_exchange_completed"],
+                     outcomes=["accepted","incomplete"])
+        row["row_count"]=3
+        with self.assertRaisesRegex(ValueError,"outbound exchange cannot collapse more than two audit rows"):
+            G2.validate_exchanges([row],"rows")
+
+    def test_preexisting_debt_is_byte_identical(self):
+        old={"inspection":inspection([attempt()]),"exchanges":[exchange()]}
+        changed=exchange(); changed["peer_commitment"]=C("9")
+        later={"inspection":inspection([attempt()]),"exchanges":[changed]}
+        failures=G2.preexisting_debt_failures(old,later,"cleanup")
+        self.assertTrue(any("exchange row changed" in failure for failure in failures))
 
     def test_campaign_debt_comes_from_stopped_pre_activation_capture(self):
         pres=[]; bases=[]; cleanups=[]

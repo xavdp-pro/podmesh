@@ -217,12 +217,10 @@ inspection() {
         direction, last_phase}],
      unaudited_import_receipt_count:(.unaudited_import_receipt_ids|length),
      unaudited_import_receipt_commitments:[.unaudited_import_receipt_ids[] | c("receipt-operation-id"; .)],
-     # The wire operations this replica holds a receipt for. Without these, the convergence
-     # branch of condition 6 has nothing to check but the history digests, which the gate
-     # already compares elsewhere -- so the branch could never refuse, and the warning in
-     # the predicate that eventual history convergence alone is insufficient was exactly
-     # what the code did. (No apostrophes here: this whole jq program is a shell single-
-     # quoted string, and one apostrophe ends it mid-filter.)
+     # The wire operations this replica holds a receipt for. They remain published for
+     # diagnostics and future per-fact verification; replay accounting does not treat global
+     # history convergence as proof of one operation. (No apostrophes here: this whole jq
+     # program is a shell single-quoted string, and one apostrophe ends it mid-filter.)
      imported_operation_commitments:[.ordered_receipts[] | select(.wire_operation_id != null) | c("wire-operation-id"; .wire_operation_id)] | unique}
     end' <<<"$raw"
 }
@@ -251,6 +249,18 @@ state=$(metadata /var/lib/podmesh-manager); runtime=$(metadata /run/podmesh-mana
 existing=$( { systemctl show podmesh.service -p ActiveState -p SubState -p MainPID -p InvocationID -p NRestarts; systemctl show podmesh-web-observer.service -p ActiveState -p SubState -p MainPID -p InvocationID -p NRestarts; } | commit_stdin existing-services)
 containers=$(podman ps -a --format json | jq -cS 'map({id:(.Id//.ID),state:(.State//""),started_at:(.StartedAt//""),pid:(.Pid//0),restarts:(.Restarts//0)})|sort_by(.id)' | commit_stdin rootful-podman-containers)
 routes=$(observe routes ip -4 route show table all); firewall=$(observe firewall nft list ruleset); listener=$(listeners); inspect=$(inspection); exchange_rows=$(exchanges)   # exchanges() reads what inspection() wrote; the order is required
+if [ "$stage" = pre-activation ]; then
+  # Inspection can take long enough for a concurrent activation to invalidate the stopped
+  # baseline. Re-read both systemd and /proc after inspection and seal nothing unless the
+  # host stayed quiescent for the whole capture.
+  service_after_inspection=$(unit podmesh-manager.service)
+  pid_after_inspection=$(jq -r .main_pid <<<"$service_after_inspection")
+  process_after_inspection=$(manager_process "$pid_after_inspection")
+  [ "$service_after_inspection" = "$service" ] && [ "$process_after_inspection" = "$process" ] \
+    && jq -e '.active_state=="inactive" and .sub_state=="dead" and .unit_file_state=="disabled" and .main_pid==0' <<<"$service_after_inspection" >/dev/null \
+    && jq -e '.count==0' <<<"$process_after_inspection" >/dev/null \
+    || { echo 'Pre-activation manager changed during inspection or was not quiescent' >&2; exit 2; }
+fi
 shutdown=null
 if [ -n "$shutdown_report" ]; then
   shutdown=$(jq -ce 'select(.schema_version=="podmesh-manager-graceful-shutdown/v1" and .typed_request_acknowledged==true and .process_exited_successfully==true and .service_inactive==true and .control_socket_absent==true and .forced_signal_used==false)' "$shutdown_report") || { echo 'Graceful shutdown report is invalid' >&2; exit 2; }
