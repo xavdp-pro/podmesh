@@ -553,8 +553,19 @@ def account_attempts(pres, bases, cleanups, convs):
                 accounted.append({"host":host,"attempt_commitment":a["attempt_commitment"],
                                   "branch":branch,"receiver_asserted":branch=="receiver_asserted"})
             else:
-                unaccounted.append({"host":host,"attempt_commitment":a["attempt_commitment"],"reason":why})
-                failures.append(f"host {host}: an incomplete attempt is unaccounted for: {why}")
+                # Two populations, reported apart. An attempt whose wire nonce appears on NO
+                # other host is a request that never reached a peer -- the sender prepared it
+                # and nothing was transferred. An attempt whose nonce IS elsewhere but whose
+                # join fails is a different fact about the exchange itself. Both are
+                # unaccounted and both fail the campaign; reporting them under one number
+                # tells an operator the gate refused without telling them what to look at.
+                # Measured: a live campaign produced 149 unaccounted attempts of which 123
+                # had reached no peer at all.
+                seen_elsewhere=any(h!=host for h,_ in rows_by_nonce.get(a["nonce_commitment"],[]))
+                kind="peer-has-no-record" if not seen_elsewhere else "join-failed"
+                unaccounted.append({"host":host,"attempt_commitment":a["attempt_commitment"],
+                                    "reason":why,"kind":kind})
+                failures.append(f"host {host}: an incomplete attempt is unaccounted for ({kind}): {why}")
 
         pre_nonces={r["nonce_commitment"] for r in (pre["exchanges"] or [])}
         for row in (cleanup["exchanges"] or []):
@@ -581,6 +592,9 @@ def account_attempts(pres, bases, cleanups, convs):
              "new_incomplete_attempts":new_incomplete,
              "accounted_incomplete_attempts":len(accounted),
              "unaccounted_incomplete_attempts":len(unaccounted),
+             # The split above, so a verdict says which fact it is describing.
+             "unaccounted_peer_has_no_record":sum(1 for u in unaccounted if u["kind"]=="peer-has-no-record"),
+             "unaccounted_join_failed":sum(1 for u in unaccounted if u["kind"]=="join-failed"),
              "preexisting_incomplete_attempts":len(debt),
              "accounted_detail":accounted,
              "terminal_detail":terminal,
