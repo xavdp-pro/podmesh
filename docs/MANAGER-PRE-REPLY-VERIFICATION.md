@@ -84,6 +84,42 @@ It also explains the population the gate now separates: 123 of campaign 4's 149 
 attempts had reached no peer at all. Those are connections that failed before the receiver
 read anything, which is what a receiver too busy to accept looks like from the other side.
 
+## Two fixes attempted and measured, neither kept
+
+Both were written, built, run against the candidate's own 69-test suite and timed against a
+real campaign store of 3672 audit rows, release build, on one workstation. The baseline for
+all three numbers is the unmodified candidate.
+
+**Attempt one: remember which rows this process already verified.** Refused immediately by
+`audit_rows_are_immutable_idempotent_bounded_and_fail_closed`, which drops the update
+trigger, edits a column, restores the trigger and requires the store to notice. It was right
+to refuse. The append-only trigger is a guard, not a proof, and a cache that trusts it makes
+the store blind to exactly the tampering it exists to detect. **A weakening, not an
+optimisation.**
+
+**Attempt two: fingerprint the tables, and skip the per-row proof while the fingerprint is
+unchanged.** One scan and one hash against a re-serialisation, a SHA-256 and an SQL query per
+row. This keeps every detection: any change to any column moves the fingerprint, whether or
+not it was made through this connection and whether or not the triggers were in place. All
+69 tests pass.
+
+A first version of it hashed three columns that look like identity — `audit_event_id`,
+`record_json`, `sha256` — and the immutability test walked straight through it, because it
+edits `request_frame_bytes`, a column that version never read. **A fingerprint that does not
+cover a column cannot notice that column changing.** Widened to every column, the test
+passes again.
+
+| | ms per operation, 3672 rows |
+| --- | ---: |
+| unmodified candidate | 140 |
+| fingerprint over three columns — **unsafe** | 70 |
+| fingerprint over every column | 100 |
+
+Thirty per cent, and still linear: hashing twenty-one columns costs about what the per-row
+proof saves. **The change was reverted.** Thirty per cent does not justify a new binary
+digest and the requalification of everything pinned to the current one, and it does not
+change the shape of the curve — which is the whole problem.
+
 ## What a fix has to be, and what it is not
 
 **Not a longer sender timeout.** Raising `IO_TIMEOUT` moves the crossing point and keeps the
@@ -92,9 +128,16 @@ curve. The table still grows and the receiver still verifies all of it.
 **Not skipping verification.** The immutable-chain and receipt verification are what make the
 store's claims worth anything, and the G2 predicate rests on them.
 
-The shape of an answer is to make the work per reply independent of the table's size:
-verify incrementally from a durable watermark rather than from the beginning, so a replica
-re-verifies only what it has not verified before. That changes the candidate, so it is a new
+**Not a cheaper full pass either**, which is what the two attempts above measured. Any
+scheme that still touches every row on every reply keeps the curve and only changes its
+slope.
+
+The work per reply has to stop depending on the table's size at all. That means a **durable**
+running digest, maintained as rows are appended and stored beside them, so a replica verifies
+the new rows and compares one value for everything older — O(new) instead of O(all). It
+cannot be per-process: a fingerprint this process computed proves nothing about a table a
+previous process wrote, which is why both attempts above recompute from scratch at startup
+and why neither escapes the scan. That changes the candidate, so it is a new
 candidate, a new binary digest, and a requalification of everything pinned to the current
 one. It is its own lot and it is the one that decides whether this manager can run for a
 day.
