@@ -1029,7 +1029,26 @@ field below, digests bound to the files, generations chained, idempotent by oper
 escalated stops refused with no class. It is **not sealed**: no signing crate is available
 to this build and none has been added, because that is a dependency decision for the
 operator. The manifest carries `signed: false` and a format string ending in
-`unsigned-unencrypted` so that no verifier can mistake it. Steps 3 to 10 are not started.
+`unsigned-unencrypted` so that no verifier can mistake it.
+
+Step 6 exists as `recovery_point_restore` (same file, checked by
+`tests/check-recovery-point-restore.py`). From a point in this host's inbox it creates a
+**quarantined, new-identity** universe: no network, not started, under a UUID the caller
+chooses that must differ from the source's — refused even when the source is unknown on this
+host, which is the second-host case. Before it imports anything it checks the archive's size
+and digest against the manifest, the manifest's canonical form and pinned format, and that
+the manifest does **not** claim a signature: a signature this build cannot verify is refused
+rather than trusted, because accepting it would be anchoring in the manifest's own say-so.
+The container is created through the ordinary `create` operation under a derived operation
+ID, so the restored universe is owned the way every universe is owned and no new ownership
+rule exists for it. The check proves the round trip by the marker the source wrote while
+running, found again in a fresh export of the restored container; and it proves the refusals
+by weakening the daemon and watching each one turn the check red for the stated reason.
+
+What step 6 does **not** do: verify the manifest's origin. The archive is bound to the
+manifest by digest; nothing binds the manifest to a producer, and the response says so in a
+`manifest_verification` field. Steps 3 to 5 and 7 to 10 are not started: there is no
+transport controller, no datastore, no catalogue, no signed manifest.
 
 ## B1 — the corrected first lot
 

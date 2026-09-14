@@ -4,7 +4,7 @@
 >
 > **Perimeter**: P1 — it decides which host may run a workload, so a mistake runs two.
 
-Status: **lots H1 to H5 built and checked; level 1 complete; level 2's capture side built, unsigned; level 3 designed, not built.** Written 2026-09-14
+Status: **lots H1 to H6 built and checked; level 1 complete; level 2's capture and restore built, unsigned, with no transport; level 3 designed, not built.** Written 2026-09-14
 against what PodMesh actually has, not against what an HA product usually has. Every
 capability named as missing was verified in the source, and the citations are below.
 
@@ -296,9 +296,28 @@ on a capture that captured nothing. That is the false-pass trap the fifth review
 the check writes the marker as a literal in the container's command — in both the file name
 and the contents — exactly as step 0 specifies.
 
-Level 2 still needs: a signed manifest, a transport controller pulling the outbox, a datastore
-that verifies and catalogues, and a restore on another host. The capture is the half that
-did not exist an hour ago.
+**Lot H6, the restore side of level 2.** `recovery_point_restore` takes a point from this
+host's inbox and creates a quarantined, new-identity universe from it: no network, not
+started, under a UUID that must differ from the source's — and that rule is enforced even
+when the source is unknown here, which is exactly the standby host's situation. The archive is
+checked against the manifest's size and digest, the manifest against its canonical form and
+pinned format, and a manifest that claims a signature is refused: this build cannot verify
+one, and a signature nobody can check is not a signature. The container is created through
+the ordinary `create` under a derived operation ID, so ownership needs no new rule, and the
+restored universe starts and stops like any other once the operator lifts the quarantine.
+The check proves the round trip by the marker the source wrote while running, found again in
+a fresh export of the restored container, and proves each refusal by weakening the daemon.
+
+Two things it does not claim. It does not verify the manifest's **origin**: the archive is
+bound to the manifest, nothing binds the manifest to a producer, and the response says so.
+And it does not move bytes: the check copies the outbox into the inbox by hand, because the
+transport controller is the design's, not PodMesh's, and it does not exist.
+
+Level 2 still needs: a signed manifest, a transport controller pulling the outbox, and a
+datastore that verifies and catalogues. With those, "warm standby from a proven recovery
+point" becomes a schedule: capture on the active host, transport, restore on the standby,
+and a lease takeover that starts the restored copy. Without them, capture and restore are
+two operations on one host that happen to agree.
 
 ## What PodMesh still has to gain
 

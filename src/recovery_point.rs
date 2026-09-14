@@ -51,9 +51,38 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             rootfs_sha256 TEXT NOT NULL,
             rootfs_bytes INTEGER NOT NULL,
             prepared_at INTEGER NOT NULL,
-            outbox TEXT NOT NULL);",
+            outbox TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS recovery_point_restores(
+            operation_id TEXT PRIMARY KEY,
+            restored_universe_uuid TEXT NOT NULL UNIQUE,
+            recovery_point_uuid TEXT NOT NULL,
+            source_universe_uuid TEXT NOT NULL,
+            imported_image_id TEXT NOT NULL,
+            container_id TEXT NOT NULL,
+            manifest_sha256 TEXT NOT NULL,
+            rootfs_sha256 TEXT NOT NULL,
+            manifest_signed INTEGER NOT NULL,
+            restored_at INTEGER NOT NULL);",
     )?;
     Ok(())
+}
+
+fn restore_view(db: &Connection, id: &str, replayed: bool) -> Result<Option<Value>, Error> {
+    Ok(db
+        .query_row(
+            "SELECT restored_universe_uuid,recovery_point_uuid,source_universe_uuid,imported_image_id,container_id,manifest_sha256,rootfs_sha256,manifest_signed
+             FROM recovery_point_restores WHERE operation_id=?1",
+            [id],
+            |r| Ok(json!({
+                "restored_universe_uuid": r.get::<_, String>(0)?, "recovery_point_uuid": r.get::<_, String>(1)?,
+                "source_universe_uuid": r.get::<_, String>(2)?, "imported_image_id": r.get::<_, String>(3)?,
+                "container_id": r.get::<_, String>(4)?, "manifest_sha256": r.get::<_, String>(5)?,
+                "rootfs_sha256": r.get::<_, String>(6)?, "manifest_signed": r.get::<_, i64>(7)? != 0,
+                "quarantined": true, "network": "none", "started": false, "replayed": replayed,
+                "manifest_verification": "unsigned: the archive is bound to the manifest by digest; the manifest's origin is not authenticated, and this build could not check a signature if one were present",
+            })),
+        )
+        .optional()?)
 }
 
 fn host_uuid(db: &Connection) -> Result<String, Error> {
@@ -125,6 +154,9 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
         };
         return Ok(json!({"universe_uuid": uuid, "recovery_points": points,
             "note": "every point here is prepared and unsigned; none is sealed, because this build can produce no signature"}));
+    }
+    if operation == "recovery_point_restore" {
+        return restore(db, request, uuid);
     }
     if operation != "recovery_point_prepare" {
         return Err("Unsupported recovery point operation".into());
@@ -275,4 +307,132 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
         "replayed": false,
         "note": "prepared and unsigned: one step short of the design's sealed state, and the manifest says so",
     }))
+}
+
+/// Restore a prepared recovery point from this host's inbox as a QUARANTINED, NEW-IDENTITY
+/// universe: created with no network and not started, under a universe UUID the caller
+/// chooses and that must differ from the source's. This is B1's step 6.
+///
+/// What is verified, and what cannot be. The archive is bound to the manifest by digest and
+/// size, the manifest is required to be in canonical form, and its format is pinned. Its
+/// ORIGIN is not verified: the manifest is unsigned, and this build could not check a
+/// signature if one were present. A manifest that claims to be signed is therefore refused
+/// outright -- accepting a signature nobody can verify would be trusting the manifest on its
+/// own say-so, which is the anchoring-in-nothing the design exists to forbid.
+///
+/// The container is created through the ordinary `create` operation under a derived
+/// operation ID, so the restored universe is owned the way every created universe is owned:
+/// by a verified creation in this journal binding it to its container. No new ownership rule
+/// was added for it, which is the point.
+fn restore(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error> {
+    let id = lc::text(request, "operation_id")?;
+    lc::token(id)?;
+    let reference = lc::text(request, "authorization_ref")?;
+    let point = lc::text(request, "recovery_point_uuid")?;
+    lc::token(point)?;
+    if let Some(previous) = restore_view(db, id, true)? {
+        return Ok(previous);
+    }
+    let create_id = format!("{id}-create");
+    lc::token(&create_id)?;
+    let inbox = tr::inbox(point)?;
+    if !inbox.is_dir() {
+        return Err("No recovery point with this identifier in the inbox; nothing was restored".into());
+    }
+    let (bytes, manifest) = tr::read_document(&inbox, MANIFEST)?
+        .ok_or("The inbox holds no manifest for this recovery point; nothing was restored")?;
+    let manifest_sha256 = mg::sha256_bytes(&bytes)?;
+    if manifest["format_version"].as_str() != Some(FORMAT) {
+        return Err(format!("The manifest format {:?} is not {FORMAT}; nothing was restored", manifest["format_version"]).into());
+    }
+    if serde_json::to_string(&manifest)?.as_bytes() != bytes.as_slice() {
+        return Err("The manifest is not in canonical form; its digest cannot be trusted to name it, and nothing was restored".into());
+    }
+    if manifest["signed"] != json!(false) {
+        return Err("The manifest claims a signature this build cannot verify; a signature nobody can check is refused rather than trusted, and nothing was restored".into());
+    }
+    let source = manifest["universe_uuid"].as_str().ok_or("The manifest names no source universe")?;
+    if source == uuid {
+        return Err("A restore creates a new identity: the restored universe must not reuse the source universe's UUID".into());
+    }
+    let piece = &manifest["pieces"][0];
+    let expected_sha = piece["plaintext_sha256"].as_str().ok_or("The manifest's piece has no digest")?;
+    let expected_bytes = piece["bytes"].as_u64().ok_or("The manifest's piece has no size")?;
+    let rootfs = inbox.join(ROOTFS);
+    let Some(size) = tr::regular_file(&rootfs)? else {
+        return Err("The inbox holds no rootfs archive for this recovery point; nothing was restored".into());
+    };
+    if size != expected_bytes {
+        return Err(format!("The rootfs archive is {size} bytes, not the {expected_bytes} the manifest binds; nothing was restored").into());
+    }
+    let rootfs_sha256 = mg::sha256(&rootfs)?;
+    if rootfs_sha256 != expected_sha {
+        return Err("The rootfs archive does not hash to the digest the manifest binds; nothing was restored".into());
+    }
+    let cmd: Vec<String> = serde_json::from_value(manifest["podman_config"]["cmd"].clone())
+        .map_err(|_| "The manifest carries no usable command; nothing was restored")?;
+    if cmd.is_empty() {
+        return Err("The manifest's command is empty and PodMesh creates nothing without an explicit command".into());
+    }
+
+    // If this operation already imported and created on an earlier attempt that died before
+    // recording, the derived create is verified in the journal and names the image it used.
+    // Reuse that image rather than importing a second time and recording a different one.
+    //
+    // Measured 2026-09-14: `podman import` of the same archive returns the existing image
+    // (same ID, same creation time) while that image is still in storage, so this branch
+    // changes the outcome only when the image was pruned between the create and the resume.
+    // That cannot be manufactured in the lab without removing the container too, so the
+    // check `tests/check-recovery-point-restore.py` proves the resume, not this branch.
+    let earlier: Option<String> = db
+        .query_row("SELECT request FROM operations WHERE id=?1 AND status='verified'", [&create_id], |r| r.get(0))
+        .optional()?;
+    let image = match earlier {
+        Some(req) => {
+            let v: Value = serde_json::from_str(&req)?;
+            v["image"].as_str().ok_or("The earlier create names no image")?.to_string()
+        }
+        None => {
+            let mut args: Vec<String> = vec!["import".into(), "--change".into(), format!("CMD {}", serde_json::to_string(&cmd)?)];
+            if let Some(entry) = manifest["podman_config"]["entrypoint"].as_array().filter(|a| !a.is_empty()) {
+                args.push("--change".into());
+                args.push(format!("ENTRYPOINT {}", serde_json::to_string(entry)?));
+            }
+            args.push(rootfs.to_string_lossy().to_string());
+            args.push(format!("localhost/podmesh-restore:{point}"));
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = lc::run_podman(EXPORT_TIMEOUT_SECONDS, &refs)?;
+            if !out.status.success() {
+                return Err(format!("podman import failed: {}", String::from_utf8_lossy(&out.stderr).trim()).into());
+            }
+            let imported = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let hex = imported.strip_prefix("sha256:").unwrap_or(&imported);
+            if !tr::is_sha256(hex) {
+                return Err(format!("podman import did not report an image digest: {imported:?}").into());
+            }
+            format!("sha256:{hex}")
+        }
+    };
+    let create_request = json!({
+        "operation": "create", "operation_id": create_id, "universe_uuid": uuid,
+        "authorization_ref": reference, "image": image, "command": cmd,
+    });
+    let created = lc::execute(db, &create_request)?;
+    // On resume the create replays: its persisted result is under `original_result`, and the
+    // container it names must still be the one Podman has, or the resume is not a resume.
+    let container_id = if created["replayed"] == json!(true) {
+        if created["current_matches_recorded_container"] != json!(true) {
+            return Err("The earlier create's container is no longer the one Podman holds; the restore cannot be resumed and nothing was recorded".into());
+        }
+        created["original_result"]["container_id"].as_str()
+    } else {
+        created["container_id"].as_str()
+    }
+    .ok_or("The create reported no container")?
+    .to_string();
+    db.execute(
+        "INSERT INTO recovery_point_restores VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,?9)",
+        params![id, uuid, point, source, image, container_id, manifest_sha256, rootfs_sha256, crate::now() as i64],
+    )?;
+    restore_view(db, id, false)?.ok_or_else(|| "The restore was recorded but cannot be read back".into())
 }
