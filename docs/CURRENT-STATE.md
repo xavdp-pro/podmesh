@@ -361,6 +361,32 @@ stopped its copy without escalation. The transient units are stopped again. The 
 restore imports on the standby is now removed by `delete` of its last user (H10), so a
 standby's disk no longer grows by one image per cycle.
 
+## Independent counter-review of lots H5–H10 and M5 (Claude Sonnet 5, read-only), 2026-09-14
+
+Five findings, all verified and fixed the same day, each fix proven by removing it and
+watching a check go red:
+
+1. **The tool's takeover with the active host unreachable waited on its own CLI defaults,
+   not on the lease and margin that had been activated** — the one finding with a second
+   writer at the end of it. `activate` now records the policy in the ledger, `takeover` waits
+   on that record and refuses without it; the lab check activates with 30/10 and takes over
+   with no flags, and waits 41 s (a first version waited 26).
+2. `activation_*` and the collection declarations did not keep the operations journal, so a
+   retry of a release looked like a failure and a repeated ID with another request silently
+   overwrote. All three modules now go through one shared `lifecycle::journaled` (same
+   canonical-request comparison, verified replay as flat history, pending re-evaluated).
+3. The recovery point replays looked up by operation ID without comparing the request —
+   covered by the same helper; the per-table lookups remain as defence in depth.
+4. `collect_point` could turn a committed collection into a refusal if the removal or the
+   progress record failed after the commit; both are best-effort now, as for classes 1 and 2,
+   and a removal that did not finish is a verification blocker the retry finishes.
+5. `--keep 0` pruned nothing.
+
+Not verified by the review, by its own statement: real partitions, real clock skew, and
+concurrent submission. Regression after the fixes: seven local suites, clippy with warnings
+denied, unit tests, and on the lab hosts the two-host suite (37) and the tool check
+including the unreachable-host takeover.
+
 ## Next actions, in order
 
 1. Done: independent read-only counter-review of the source-side milestone (Claude

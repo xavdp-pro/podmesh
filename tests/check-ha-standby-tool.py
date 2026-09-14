@@ -78,7 +78,7 @@ try:
     status = A.ok(request('activation_status', u, reference))
     while A.call('time')['time'] < status['expires_at'] + 1:
         time.sleep(.5)
-    took = tool('takeover', '--universe', u, '--active', os.environ['PODMESH_SOURCE_SSH'], '--standby', os.environ['PODMESH_DESTINATION_SSH'], '--no-start', '--lease', '20', '--margin', '5')
+    took = tool('takeover', '--universe', u, '--active', os.environ['PODMESH_SOURCE_SSH'], '--standby', os.environ['PODMESH_DESTINATION_SSH'], '--no-start')
     assert took['epoch'] == 2 and took['active_reachable'] and took['started'] is False, took
     assert took['waited']['fence'] and took['waited']['fence'].get('forced') is False, took['waited']
     assert took['promoted_from']['quarantined_uuid'] == q2 and took['active_superseded']['delivered'] and took['active_superseded']['highest_epoch_seen'] == 2, took
@@ -105,25 +105,29 @@ try:
     tool('gate', 'declare', '--universe', v)
     A.ok(request('create', v, reference, image=image_on(A),
                  command=['sh', '-c', f"printf %s '{marker2}' > /marker-{marker2}; trap 'exit 0' TERM; sleep 600 & wait"]))
-    tool('activate', '--universe', v, '--host', os.environ['PODMESH_SOURCE_SSH'], '--lease', '20', '--margin', '5')
+    # Activated with a LONGER lease and margin than the tool's defaults: the takeover carries no
+    # flags, and the wait must come from what was activated, not from a default. A first version
+    # of the tool waited on its own defaults here, which the independent review caught.
+    tool('activate', '--universe', v, '--host', os.environ['PODMESH_SOURCE_SSH'], '--lease', '30', '--margin', '10')
     A.ok(request('start', v, reference, observe_seconds=1))
     one = tool('cycle', '--universe', v, '--active', os.environ['PODMESH_SOURCE_SSH'], '--standby', os.environ['PODMESH_DESTINATION_SSH'])
     q3 = one['quarantined']
     renewed_at = A.call('time')['time']
     began = time.time()
-    took2 = tool('takeover', '--universe', v, '--active', 'lab@203.0.113.1', '--standby', os.environ['PODMESH_DESTINATION_SSH'], '--lease', '20', '--margin', '5')
+    took2 = tool('takeover', '--universe', v, '--active', 'lab@203.0.113.1', '--standby', os.environ['PODMESH_DESTINATION_SSH'])
     waited = time.time() - began
     assert took2['active_reachable'] is False and took2['active_superseded'] is None and took2['started'] is True, took2
     assert took2['waited']['margin']['on'].startswith("the standby's clock"), took2['waited']
-    assert waited >= 26, f'the tool did not wait lease + margin on the standby: {waited:.1f}s'
+    assert took2['waited']['margin']['lease_seconds'] == 30 and took2['waited']['margin']['takeover_margin_seconds'] == 10, took2['waited']
+    assert waited >= 41, f'the tool did not wait the ACTIVATED lease + margin on the standby: {waited:.1f}s'
     assert B.call('marker', name='podmesh-' + v, marker=marker2)['present'], 'the promoted second universe lacks its marker'
     lapsed = A.ok(request('activation_status', v, reference))
-    assert lapsed['live'] is False and lapsed['expires_at'] <= renewed_at + 20, lapsed
+    assert lapsed['live'] is False and lapsed['expires_at'] <= renewed_at + 30, lapsed
     fenced = A.ok({'operation': 'activation_fence', 'operation_id': str(uuid.uuid4()), 'authorization_ref': reference, 'timeout_seconds': 10})
     hit = {e['universe_uuid']: e for e in fenced['fenced']}
     assert v in hit and hit[v]['forced'] is False, f'the active host did not fence its copy after the lapse: {fenced}'
     assert A.call('podman_run', args=['inspect', '--format', '{{.State.Running}}', 'podmesh-' + v])['stdout'].strip() == 'false'
-    checks.append('takeover with the active host unreachable: waited %.0fs (lease + margin) on the standby\'s clock, promoted and started there; '
+    checks.append('takeover with the active host unreachable: waited %.0fs (the ACTIVATED lease 30 + margin 10, not the tool\'s defaults) on the standby\'s clock, promoted and started there; '
                   'the active host\'s lease had lapsed by then and its own fence stopped its copy without escalation' % waited)
     print(json.dumps({'result': 'PASS', 'checks': checks, 'universe': u, 'quarantined': [q1, q2, q3]}, indent=2))
 finally:

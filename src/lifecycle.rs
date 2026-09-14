@@ -561,6 +561,66 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
     }
     outcome
 }
+/// The journal contract, for modules whose operations are not lifecycle operations: a stable
+/// operation ID, one request per ID, a verified operation replayed as its persisted result
+/// (flat, marked `replayed` and `historical`) and never executed again, a pending one -- an
+/// interrupted attempt -- re-evaluated by running again, and a durable attempt record either
+/// way. The canonical form compared is the request's own serialization, exactly as above.
+pub(crate) fn journaled(
+    db: &Connection,
+    request: &Value,
+    run: impl FnOnce(&Connection) -> Result<Value, Error>,
+) -> Result<Value, Error> {
+    let id = text(request, "operation_id")?;
+    token(id)?;
+    ensure_schema(db)?;
+    let canonical = request.to_string();
+    let previous: Option<(String, String, Option<String>)> = db
+        .query_row("SELECT request,status,result FROM operations WHERE id=?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()?;
+    if let Some((saved, status, result)) = previous {
+        if saved != canonical {
+            return Err("Operation ID already belongs to a different request".into());
+        }
+        if status == "verified" {
+            let mut original: Value = serde_json::from_str(&result.ok_or("Missing persisted result")?)?;
+            original["replayed"] = json!(true);
+            original["historical"] = json!(true);
+            original["notice"] = json!("this is the result persisted when the operation was verified, not current state; a replay repeats no effect");
+            return Ok(original);
+        }
+    } else {
+        db.execute("INSERT INTO operations VALUES(?1,?2,'pending',NULL)", params![id, canonical])?;
+    }
+    db.execute(
+        "INSERT INTO operation_attempts(operation_id,started_at) VALUES(?1,?2)",
+        params![id, crate::now() as i64],
+    )?;
+    let attempt = db.last_insert_rowid();
+    let outcome = run(db);
+    let finished = crate::now() as i64;
+    match &outcome {
+        Ok(result) => {
+            db.execute("UPDATE operations SET status='verified', result=?2 WHERE id=?1", params![id, result.to_string()])?;
+            db.execute(
+                "UPDATE operation_attempts SET finished_at=?2, outcome='verified' WHERE id=?1",
+                params![attempt, finished],
+            )?;
+        }
+        Err(e) => {
+            let record = json!({"error": e.to_string()}).to_string();
+            db.execute("UPDATE operations SET status='failed', result=?2 WHERE id=?1", params![id, record])?;
+            db.execute(
+                "UPDATE operation_attempts SET finished_at=?2, outcome='failed', detail=?3 WHERE id=?1",
+                params![attempt, finished, record],
+            )?;
+        }
+    }
+    outcome
+}
+
 /// A verified operation is never executed again. Its persisted result is returned as
 /// history, next to a fresh observation that may contradict it.
 fn replay(db: &Connection, id: &str, uuid: &str, operation: &str, result: Option<String>) -> Result<Value, Error> {

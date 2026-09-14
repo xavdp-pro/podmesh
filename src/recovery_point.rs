@@ -176,6 +176,30 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
     // collected point reads it, so it is prepared here too rather than assumed.
     crate::retention::ensure_schema(db)?;
     if operation == "recovery_point_status" {
+        return perform(db, request);
+    }
+    // The journal contract of every other operation. The per-table replay lookups inside
+    // `perform` (by operation ID in the point, restore and promotion tables) are reached only
+    // when the journal has no verified row for the ID -- an attempt interrupted after its
+    // record and before the journal's own update -- and are defence in depth for that window.
+    let mut result = lc::journaled(db, request, |db| perform(db, request))?;
+    // A replayed prepare is history; beside it, as every replay in this service does, the
+    // present: the point's state now, and its manifest -- from the outbox while the archive
+    // is there, from the retained record once the collector has taken the archive.
+    if result["replayed"] == json!(true) && operation == "recovery_point_prepare" {
+        let id = lc::text(request, "operation_id")?;
+        if let Some(now) = by_operation(db, id)? {
+            result["collected"] = now["collected"].clone();
+            result["current_manifest"] = now["manifest"].clone();
+        }
+    }
+    Ok(result)
+}
+
+fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
+    let operation = lc::text(request, "operation")?;
+    let uuid = lc::text(request, "universe_uuid")?;
+    if operation == "recovery_point_status" {
         let points: Vec<Value> = {
             let mut s = db.prepare(
                 "SELECT recovery_point_uuid,generation,parent_recovery_point_uuid,state,manifest_sha256,rootfs_sha256,rootfs_bytes,prepared_at,outbox

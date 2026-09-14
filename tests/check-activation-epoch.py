@@ -114,6 +114,21 @@ assert fenced['ok'], fenced
 mine = {e['universe_uuid']: e for e in fenced['data']['left_running_or_absent']}
 assert u in mine and mine[u]['reason'] == 'not running', f'a superseded lease must not count as live: {mine.get(u)}'
 
+# --- The journal contract, as for every other operation: a repeated request under its operation
+# ID is history and repeats nothing; the same ID under a different request is refused.
+sid = str(uuid.uuid4())
+first_time = api({'operation': 'activation_supersede', 'operation_id': sid, 'universe_uuid': u, 'authorization_ref': 'disposable-lab',
+                  'permit': permit(u, 3, replica='other-host', grant='grant-three-b')})
+refused(first_time, 'does not supersede', 'a supersede that is refused is recorded as failed and re-evaluated on retry')
+rid = str(uuid.uuid4()); rq = {'operation': 'activation_require', 'operation_id': rid, 'universe_uuid': u, 'authorization_ref': 'disposable-lab',
+                               'lease_seconds': 60, 'takeover_margin_seconds': 10, 'authority_id': AUTHORITY}
+assert api(rq)['ok']
+again = api(rq)
+assert again['ok'] and again['data']['replayed'] is True and again['data']['historical'] is True, again
+different = dict(rq, lease_seconds=61)
+refused(api(different), 'already belongs to a different request', 'the same operation ID under a different request')
+assert op('activation_status', u)['data']['lease_seconds'] == 60, 'a refused reuse must not have overwritten the policy'
+
 # --- Rotation back to this host: epoch 4, bound here, takes over cleanly.
 back = op('activation_acquire', u, permit=permit(u, 4, grant='grant-four'))
 assert back['ok'] and back['data']['epoch'] == 4 and back['data']['superseded'] is False, back

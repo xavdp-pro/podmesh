@@ -30,7 +30,8 @@ Subcommands:
                                  one capture: stop, prepare, renew, start again on the active host;
                                  carry; restore into quarantine on the standby; prune older copies
   takeover      --universe U --active SSH --standby SSH [--no-start]
-                                 the standby takes over: refuses while the active host is reachable
+                                 the standby takes over, under the lease and margin recorded by
+                                 `activate` (never this invocation's defaults): refuses while the active host is reachable
                                  and entitled (that is a planned handoff, not a takeover); otherwise
                                  fences it if reachable, waits the margin on its clock (or lease +
                                  margin on the standby's clock if it is not), rotates the epoch,
@@ -162,6 +163,10 @@ def cmd_activate(args):
     permit = permit_for(gate, u, host, current['epoch'])
     lease = ok(host, request('activation_acquire', u, args.reference, permit=permit), 'activation_acquire')
     ledger = load_ledger(u)
+    # The policy as declared, kept where the takeover reads it: the wait for an unreachable host
+    # is computed from THIS lease and margin, never from a later invocation's defaults.
+    ledger['policy'] = {'lease_seconds': args.lease, 'takeover_margin_seconds': args.margin, 'desired_standbys': args.standbys,
+                        'authority_id': gate.authority_id, 'declared_on': host.identity, 'declared_at': int(time.time())}
     ledger['rotations'].append({'epoch': permit['epoch'], 'to': host.identity, 'at': int(time.time()), 'by': 'activate'})
     save_ledger(u, ledger)
     out({'universe': u, 'host': host.identity, 'epoch': permit['epoch'], 'lease': {k: lease[k] for k in ('generation', 'expires_at', 'live')},
@@ -198,7 +203,8 @@ def cmd_cycle(args):
     # Prune: the newest `keep` quarantined copies stay; older ones are deleted through the API, and a
     # refusal is reported rather than forced -- a copy that was promoted is a universe now, not a copy.
     pruned, kept = [], []
-    for old in ledger['cycles'][:-args.keep]:
+    older = ledger['cycles'][:max(len(ledger['cycles']) - args.keep, 0)]
+    for old in older:
         if old.get('pruned') or old.get('promoted'):
             continue
         r = B.api(request('delete', old['quarantined_uuid'], args.reference))
@@ -226,6 +232,9 @@ def cmd_takeover(args):
     if not copies:
         raise Refusal('no quarantined copy of this universe is recorded on the standby; run a cycle first')
     newest = copies[-1]
+    policy = ledger.get('policy')
+    if not policy:
+        raise Refusal('the ledger records no policy for this universe (no `activate` was run through this tool); the wait for an unreachable host must be computed from the real lease and margin, and this tool will not guess them')
     A = try_host('active', args.active)
     waited = {}
     if A is not None:
@@ -247,15 +256,15 @@ def cmd_takeover(args):
         # Unreachable: nothing can be observed there. Any lease it holds expires at most lease_seconds
         # after the moment it was last renewed, which is not later than now; lease + margin from now on
         # the standby's clock is the wait, and the margin is the clock-skew budget the design states.
-        policy = ok(B, request('activation_status', u, args.reference), 'status on the standby')
-        lease = policy.get('lease_seconds') or args.lease
-        margin = policy.get('takeover_margin_seconds') or args.margin
+        lease = policy['lease_seconds']
+        margin = policy['takeover_margin_seconds']
         until = B.call('time')['time'] + lease + margin + 1
-        waited['margin'] = {'on': 'the standby\'s clock, the active host being unreachable', 'seconds': lease + margin + 1}
+        waited['margin'] = {'on': 'the standby\'s clock, the active host being unreachable', 'seconds': lease + margin + 1,
+                            'lease_seconds': lease, 'takeover_margin_seconds': margin, 'from': 'the ledger\'s record of the policy as activated'}
         while B.call('time')['time'] < until:
             time.sleep(.5)
-    ok(B, request('activation_require', u, args.reference, lease_seconds=args.lease, takeover_margin_seconds=args.margin,
-                  desired_standbys=args.standbys, authority_id=gate.authority_id), 'activation_require on the standby')
+    ok(B, request('activation_require', u, args.reference, lease_seconds=policy['lease_seconds'], takeover_margin_seconds=policy['takeover_margin_seconds'],
+                  desired_standbys=policy['desired_standbys'], authority_id=gate.authority_id), 'activation_require on the standby')
     current = gate.inspect(u)
     permit = permit_for(gate, u, B, current['epoch'])
     lease = ok(B, request('activation_acquire', u, args.reference, permit=permit), 'activation_acquire on the standby')
@@ -290,9 +299,9 @@ def main():
     c.add_argument('--keep', type=int, default=2, help='quarantined copies kept on the standby')
     t = sub.add_parser('takeover'); t.add_argument('--universe', required=True); t.add_argument('--active', required=True); t.add_argument('--standby', required=True)
     t.add_argument('--no-start', action='store_true', help='promote but leave the start to the operator')
-    for s in (a, c, t):
-        s.add_argument('--lease', type=int, default=20); s.add_argument('--margin', type=int, default=5)
-        s.add_argument('--standbys', type=int, default=1); s.add_argument('--stop-timeout', type=int, default=10)
+    a.add_argument('--lease', type=int, default=20); a.add_argument('--margin', type=int, default=5); a.add_argument('--standbys', type=int, default=1)
+    for s in (c, t):
+        s.add_argument('--stop-timeout', type=int, default=10)
     args = p.parse_args()
     try:
         {'gate': cmd_gate, 'activate': cmd_activate, 'cycle': cmd_cycle, 'takeover': cmd_takeover}[args.command](args)

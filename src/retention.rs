@@ -191,6 +191,14 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
     if operation == "collection_status" {
         return view(db, uuid);
     }
+    // The journal contract of every other operation: a repeated declaration with the same
+    // request is its own history, one with a different request is refused, never overwritten.
+    lc::journaled(db, request, |db| perform(db, request))
+}
+
+fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
+    let operation = lc::text(request, "operation")?;
+    let uuid = lc::text(request, "universe_uuid")?;
     let id = lc::text(request, "operation_id")?;
     lc::token(id)?;
     let reference = lc::text(request, "authorization_ref")?;

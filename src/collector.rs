@@ -1615,8 +1615,16 @@ fn collect_point(db: &Connection, id: &str, t: &Target, candidate: &Candidate) -
     record_effect(&tx, id, t, &json!({"action": "collected_recovery_point", "class": t.class, "universe_uuid": t.universe_uuid,
         "recovery_point_uuid": t.recovery_point_uuid, "verification": "pending"}))?;
     tx.commit()?;
-    let removed = remove_point_files(&p.recovery_point_uuid)?;
-    let (verified, blockers) = point_removal_verdict(&dir);
+    // Nothing after the commit may fail this call: the point is collected and its manifest
+    // retained, which is a fact, and a removal that did not finish is a verification blocker
+    // the retry of this same operation finishes -- never a refusal of something that happened.
+    let (removed, mut blockers) = match remove_point_files(&p.recovery_point_uuid) {
+        Ok(n) => (n, vec![]),
+        Err(e) => (0, vec![format!("the removal did not finish after the record was committed: {e}")]),
+    };
+    let (clean, more) = point_removal_verdict(&dir);
+    blockers.extend(more);
+    let verified = clean && blockers.is_empty();
     let done = json!({
         "action": "collected_recovery_point", "class": t.class, "universe_uuid": t.universe_uuid,
         "recovery_point_uuid": t.recovery_point_uuid, "generation": p.generation,
@@ -1625,22 +1633,27 @@ fn collect_point(db: &Connection, id: &str, t: &Target, candidate: &Candidate) -
         "bytes_removed": removed, "verified": verified, "verification_blockers": blockers,
         "verification": "recorded",
     });
-    record_effect(db, id, t, &done)?;
+    let _ = record_effect(db, id, t, &done);
     Ok(done)
 }
 /// A recovered class 5 effect: the journal already says the point is collected under this operation; what
 /// may be left is the removal itself, which is finished here and verified from outside.
 fn finish_point_removal(db: &Connection, id: &str, t: &Target) -> Result<Value, Error> {
-    let removed = remove_point_files(&t.recovery_point_uuid)?;
+    let (removed, mut blockers) = match remove_point_files(&t.recovery_point_uuid) {
+        Ok(n) => (n, vec![]),
+        Err(e) => (0, vec![format!("the removal did not finish: {e}")]),
+    };
     let dir = tr::outbox(&t.recovery_point_uuid)?;
-    let (verified, blockers) = point_removal_verdict(&dir);
+    let (clean, more) = point_removal_verdict(&dir);
+    blockers.extend(more);
+    let verified = clean && blockers.is_empty();
     let done = json!({
         "action": "collected_recovery_point", "class": t.class, "universe_uuid": t.universe_uuid,
         "recovery_point_uuid": t.recovery_point_uuid, "bytes_removed": removed,
         "verified": verified, "verification_blockers": blockers, "verification": "recorded",
         "note": "the retained manifest was already committed by this operation; the removal was finished, not repeated",
     });
-    record_effect(db, id, t, &done)?;
+    let _ = record_effect(db, id, t, &done);
     Ok(done)
 }
 

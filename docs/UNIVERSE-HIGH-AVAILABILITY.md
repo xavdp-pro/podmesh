@@ -450,7 +450,8 @@ hold the lease, and reports how long the universe was stopped. `takeover` refuse
 active host is reachable and entitled — that is a planned handoff, not a takeover, and the
 tool will not start a second writer; otherwise it fences the active host if it can be reached
 and waits the margin on that host's clock, or, if it cannot, waits **lease plus margin on the
-standby's clock** — any lease the active host holds expires at most a lease after its last
+standby's clock, as recorded in the ledger when the universe was activated** — never this
+invocation's defaults, which is what the independent review caught in the first version — — any lease the active host holds expires at most a lease after its last
 renewal, which is not later than now, and the margin is the clock-skew budget; then it
 rotates the epoch, acquires, promotes the newest quarantined copy, starts, and supersedes the
 active host if it can be reached. Every report carries `data_lost_since_seconds` and a

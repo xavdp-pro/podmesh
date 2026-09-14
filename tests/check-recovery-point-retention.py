@@ -103,6 +103,13 @@ try:
     assert hold['ok'] and hold['data']['holds'][0]['scope'] == 'evidence_hold', hold
     hid = hold['data']['holds'][0]['hold_id']
     refused(op('collection_hold_declare', universe_uuid=u, scope='legal', reason='x'), 'scope must be', 'unknown hold scope')
+    # The journal contract: the same declaration under its ID is history; a different one under that ID is refused.
+    hq = {'operation': 'collection_hold_declare', 'operation_id': hid, 'universe_uuid': u, 'authorization_ref': 'disposable-lab',
+          'scope': 'evidence_hold', 'reason': 'incident 42 under review'}
+    replay = api(hq)
+    assert replay['ok'] and replay['data']['replayed'] is True and len(replay['data']['holds']) == 1, replay
+    refused(api(dict(hq, reason='something else')), 'already belongs to a different request', 'hold declaration reused under a different request')
+    assert len(op('collection_status', universe_uuid=u)['data']['holds']) == 1
     p3 = plan([u])
     assert any('evidence hold' in b and 'artifact deletion' in b for b in candidate(p3, g1)['blockers']), candidate(p3, g1)['blockers']
     refused(apply(p2['data']['collection_operation_id'], [target(g1, u)]), 'evidence hold', 'apply under an evidence hold')
@@ -149,7 +156,7 @@ try:
     assert cs['retained_manifests'][0]['recovery_point_uuid'] == g1 and cs['retained_manifests'][0]['collecting_operation_id'] == aid, cs
     replayed = api({'operation': 'recovery_point_prepare', 'operation_id': prepares[0], 'universe_uuid': u, 'authorization_ref': 'disposable-lab'})
     assert replayed['ok'] and replayed['data']['replayed'] is True and replayed['data']['collected'] is True, replayed
-    assert replayed['data']['manifest']['pieces'][0]['plaintext_sha256'] == candidate(p2, g1)['proofs']['recorded_rootfs_sha256'], replayed
+    assert replayed['data']['current_manifest']['pieces'][0]['plaintext_sha256'] == candidate(p2, g1)['proofs']['recorded_rootfs_sha256'], replayed
     # Once collected it is no longer a candidate, and an apply naming it is refused, not repeated.
     p4 = plan([u])
     assert all(c['key'] != g1 for c in p4['data']['candidates']), 'a collected point is still a candidate'

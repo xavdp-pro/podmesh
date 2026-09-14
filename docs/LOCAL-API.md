@@ -290,8 +290,10 @@ anything it cannot prove. A plan authorizes nothing.
 
 The design is [UNIVERSE-HIGH-AVAILABILITY.md](UNIVERSE-HIGH-AVAILABILITY.md); the recovery point's format is
 [BACKUP-SERVER.md](BACKUP-SERVER.md). Every operation here carries `operation_id`, `universe_uuid` and
-`authorization_ref` with the same replay contract as the rest, except `activation_fence`, which is host-wide
-and names no universe. There is **no timer** and no failure detector: nothing here runs on its own, and the
+`authorization_ref` with the same replay contract as the rest — through the same journal, so a repeated
+request under its ID is flat history marked `replayed` and `historical`, a different request under that ID is
+refused, and an interrupted one is re-evaluated — except `activation_fence`, which is host-wide and names no
+universe, and the read-only `*_status` operations, which carry no operation ID. There is **no timer** and no failure detector: nothing here runs on its own, and the
 timeliness of renewals and fences is the caller's obligation.
 
 **Activation.** A universe under a policy may be started, cloned or restored only by a host holding its live

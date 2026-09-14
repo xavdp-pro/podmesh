@@ -423,6 +423,18 @@ pub fn execute(db: &Connection, request: &serde_json::Value) -> Result<serde_jso
     let operation = lc::text(request, "operation")?;
     lc::ensure_schema(db)?;
     ensure_schema(db)?;
+    if operation == "activation_status" {
+        let uuid = lc::text(request, "universe_uuid")?;
+        lc::token(uuid)?;
+        return view(db, uuid);
+    }
+    // Every mutation here keeps the journal contract of every other operation: one request per
+    // operation ID, a verified one replayed and never repeated, an interrupted one re-evaluated.
+    lc::journaled(db, request, |db| perform(db, request))
+}
+
+fn perform(db: &Connection, request: &serde_json::Value) -> Result<serde_json::Value, Error> {
+    let operation = lc::text(request, "operation")?;
     // Fencing is the one operation that is not about one universe: it acts on every universe
     // this host is not entitled to run, so it takes no universe and says so by refusing one.
     if operation == "activation_fence" {
@@ -437,9 +449,6 @@ pub fn execute(db: &Connection, request: &serde_json::Value) -> Result<serde_jso
     }
     let uuid = lc::text(request, "universe_uuid")?;
     lc::token(uuid)?;
-    if operation == "activation_status" {
-        return view(db, uuid);
-    }
     let id = lc::text(request, "operation_id")?;
     lc::token(id)?;
     // How much a universe is allowed is a judgement -- the administrator weighs criteria

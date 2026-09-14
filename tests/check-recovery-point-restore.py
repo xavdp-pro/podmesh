@@ -125,6 +125,8 @@ try:
     import sqlite3
     j = sqlite3.connect(os.path.join(state, 'state.sqlite'))
     assert j.execute('DELETE FROM recovery_point_restores WHERE operation_id=?', (rid,)).rowcount == 1
+    # A crash before the journal's own update leaves the operation pending, which is what a retry re-evaluates.
+    assert j.execute("UPDATE operations SET status='pending', result=NULL WHERE id=?", (rid,)).rowcount == 1
     j.commit(); j.close()
     before = subprocess.check_output(['podman', 'images', '-q']).split()
     resumed = api({'operation': 'recovery_point_restore', 'operation_id': rid, 'universe_uuid': new,
