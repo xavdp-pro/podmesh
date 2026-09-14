@@ -56,6 +56,15 @@ def store_digests(host, name):
     d = tempfile.mkdtemp(prefix='podmesh-mu-store-'); os.chmod(d, 0o700)
     with tarfile.open(fileobj=io.BytesIO(tar)) as t:
         members = {m.name.strip('./'): m for m in t.getmembers()}
+        # Attestation: the binary inside the universe must be byte-identical to the inspector this check
+        # runs on the workstation; otherwise no inspection is accepted, and both digests are recorded.
+        import hashlib
+        binary = 'usr/lib/podmesh-manager/podmesh-managerd'
+        assert binary in members, f'{binary} is not in the export of {name}'
+        in_image = hashlib.sha256(t.extractfile(members[binary]).read()).hexdigest()
+        inspector = hashlib.sha256(open(CANDIDATE, 'rb').read()).hexdigest()
+        assert in_image == inspector, f'the binary in the universe ({in_image}) is not the inspector ({inspector}); inspection refused'
+        attestation.update({'binary_in_universe_sha256': in_image, 'inspector_sha256': inspector, 'equal': True})
         for want in ('var/lib/podmesh-manager/manager.sqlite', 'etc/podmesh-manager/config.json'):
             assert want in members, f'{want} is not in the export of {name}'
             with open(os.path.join(d, os.path.basename(want)), 'wb') as f:
@@ -79,9 +88,38 @@ def store_digests(host, name):
 
 u = str(uuid.uuid4())
 quarantined = {}
+attestation = {}
+faults = []
 try:
     image = next(l.split()[0] for l in A.call('podman_run', args=['images', '--no-trunc', '--format', '{{.ID}} {{.Repository}}:{{.Tag}}'])['stdout'].splitlines() if l.endswith(' ' + IMAGE_TAG))
     tool('gate', 'init'); tool('gate', 'declare', '--universe', u)
+    # Intentional failures first, each on its own disposable universe, so that a failure inside the
+    # universe is proven to be terminal and visible from outside before the honest run is trusted.
+    v1 = str(uuid.uuid4()); faults.append(v1)
+    A.ok(request('create', v1, reference, image=image, command=['/usr/local/bin/manager-universe', '--fault', 'boot']))
+    started = A.ok(request('start', v1, reference, observe_seconds=8))
+    state = A.call('podman_run', args=['inspect', '--format', '{{.State.Status}} {{.State.ExitCode}}', 'podmesh-' + v1])['stdout'].strip()
+    logs = A.call('podman_run', args=['logs', '--tail', '6', 'podmesh-' + v1], check=False)
+    assert started['application_outcome'] == 'not_running_when_observed' and state == 'exited 2', (started.get('application_outcome'), state)
+    assert 'BOOT FACT NOT OBSERVED' in (logs.get('stdout', '') + logs.get('stderr', '')), logs
+    checks.append('injected boot-fact failure: the universe exits 2 and PodMesh observes it not running -- a start that cannot record its boot is not a start')
+    v2 = str(uuid.uuid4()); faults.append(v2)
+    A.ok(request('create', v2, reference, image=image, command=['/usr/local/bin/manager-universe', '--fault', 'shutdown']))
+    assert A.ok(request('start', v2, reference, observe_seconds=3))['application_outcome'] == 'running_when_observed'
+    stopped = A.ok(request('stop', v2, reference, timeout_seconds=15, on_timeout='kill'))
+    state = A.call('podman_run', args=['inspect', '--format', '{{.State.Status}} {{.State.ExitCode}}', 'podmesh-' + v2])['stdout'].strip()
+    logs = A.call('podman_run', args=['logs', '--tail', '6', 'podmesh-' + v2], check=False)
+    assert stopped.get('forced') is False and state == 'exited 3', (stopped, state)
+    assert 'TYPED SHUTDOWN FAILED' in (logs.get('stdout', '') + logs.get('stderr', '')), logs
+    checks.append('injected typed-shutdown failure: the universe exits 3 within the timeout, PodMesh reports the stop with that exit code and no escalation -- an honest failed stop')
+    # And the tool will not capture after such a stop: the point it would take has no class.
+    tool('gate', 'declare', '--universe', v2)
+    tool('activate', '--universe', v2, '--host', SA, '--lease', '60', '--margin', '5')
+    A.ok(request('start', v2, reference, observe_seconds=3))
+    refused = tool('cycle', '--universe', v2, '--active', SA, '--standby', SB, expect=2)
+    assert 'did not stop cleanly' in refused['refused'] and 'exit code 3' in refused['refused'], refused
+    checks.append('the capture cycle refuses to take a point after a stop the universe reported as failed')
+
     A.ok(request('create', u, reference, image=image, command=['/usr/local/bin/manager-universe']))
     # A 60-second lease: exporting the manager's filesystem for inspection takes longer than a
     # 20-second lease, and a lapsed lease is retaken, never renewed -- which is right, and slow here.
@@ -109,7 +147,7 @@ try:
     second = tool('cycle', '--universe', u, '--active', SA, '--standby', SB, '--also', SC)
     for c in second['copies']:
         quarantined.setdefault(B.role if c['standby'] == B.identity else C.role, []).append(c['quarantined_uuid'])
-    checks.append('store inspected on the active host by the frozen candidate: integrity ok, two boot facts recorded by the universe itself')
+    checks.append('binary in the universe attested equal to the inspector; store inspected on the active host: integrity ok, two boot facts recorded by the universe itself')
 
     # The active host lapses; B takes over; the promoted universe's store, inspected BEFORE its first
     # start on B, carries exactly the digests the active host had.
@@ -141,14 +179,14 @@ try:
     r = C.api(request('activation_acquire', u, reference, permit=stale))
     assert not r['ok'] and 'superseded' in json.dumps(r), r
     checks.append('the old active is refused and the other standby refuses a stale epoch-1 permit; the gate stands at epoch 2')
-    print(json.dumps({'result': 'PASS', 'checks': checks, 'universe': u, 'store_before_takeover': before, 'store_after_takeover': after,
+    print(json.dumps({'result': 'PASS', 'checks': checks, 'universe': u, 'binary_attestation': attestation, 'store_before_takeover': before, 'store_after_takeover': after,
                       'not_proven': ['operating the manager inside the universe: its control socket is unreachable from the host under the universe contract (no network, no exec, no mounts)',
                                      'replication between replicas: impossible in a universe with no network; the single-replica configuration exchanges nothing',
                                      'a real partition, power loss, DNS, remote transport, continuous replication, production fencing']}, indent=2))
 finally:
     for host in (A, B, C):
         host.api(request('stop', u, reference, timeout_seconds=15, on_timeout='kill'))
-        for n in [u] + quarantined.get(host.role, []):
+        for n in [u] + quarantined.get(host.role, []) + (faults if host is A else []):
             host.call('podman_run', args=['rm', '--force', '--time', '0', 'podmesh-' + n], check=False)
         tags = host.call('podman_run', args=['images', '--format', '{{.Repository}}:{{.Tag}}'], check=False).get('stdout', '').split()
         for tag in tags:

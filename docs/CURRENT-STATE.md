@@ -206,7 +206,16 @@ network, its stop translated into the typed shutdown by the entrypoint, boot fac
 from inside, the store copied up before the resident opens it (the overlay's copy-up otherwise
 trips the resident's store-identity preflight); on three lab hosts the frozen candidate's
 inspection showed the store follow the universe through capture, restore, promotion and
-restart (2 → 3 → 4 chained facts, integrity ok). Still a universe contract decision: a
+restart (2 → 3 → 4 chained facts, integrity ok). Codex reviewed M-U1 the same night
+(`/tmp/podmesh-claude/CODEX-REVIEW-M-U1-2026-09-14.md`): GO for the narrow claim, NO-GO for
+packaging until four corrections — all made and rerun on the three hosts: the binary inside
+the universe is attested byte-equal to the inspector before any inspection; a boot fact that is
+not observed makes the start fail (exit 2, "not running when observed") and a typed shutdown
+that is not acknowledged makes the stop an honest failure (exit 3, no escalation) that the
+capture cycle refuses to capture after; the configuration is labelled a single-replica
+portability fixture; and Alpine was tried first, with the failed proof and the exact
+dependency recorded beside the Debian image (see the web tree's
+`packaging/podmesh-manager/universe/ALPINE-PROOF.md`). Still a universe contract decision: a
 network (no replication inside universes without one) and a reachable control socket.
 On the operator's "go" (2026-09-14 evening) the HA recommendations became the tool's
 defaults by hypothesis (`64892c4`): retention declared from every cycle (keep 3, one hour),

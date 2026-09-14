@@ -194,6 +194,10 @@ def cmd_cycle(args):
     if stopped.get('forced') is not False:
         # The universe is left stopped and the report says so: a capture after an escalated stop has no class.
         raise Refusal(f'the stop escalated ({stopped}); no capture was taken and the universe is stopped on the active host')
+    if stopped.get('exit_code') not in (0, None):
+        # A universe that reports its own stop as failed (a non-zero exit under the stop signal) is not a
+        # quiescent capture either: what it left on disk is whatever a failed shutdown leaves.
+        raise Refusal(f'the universe did not stop cleanly (exit code {stopped.get("exit_code")}); no capture was taken and the universe is stopped on the active host')
     prepared = ok(A, request('recovery_point_prepare', u, args.reference), 'recovery_point_prepare')
     point = prepared['recovery_point_uuid']
     # The point's own record on the active host, for the time it was prepared at on that host's clock.
