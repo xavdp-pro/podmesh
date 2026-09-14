@@ -113,11 +113,11 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
             "garbage_collect_plan" | "garbage_collect_apply" => collector::execute(db, request)?,
             "activation_require" | "activation_acquire" | "activation_renew" | "activation_release"
             | "activation_status" | "activation_fence" => activation::execute(db, request)?,
-            "recovery_point_prepare" | "recovery_point_status" | "recovery_point_restore" => recovery_point::execute(db, request)?,
+            "recovery_point_prepare" | "recovery_point_status" | "recovery_point_restore" | "recovery_point_promote" => recovery_point::execute(db, request)?,
             "migration_status" => migration::status(db, request)?,
             "capabilities" => json!({
                 "version":option_env!("PODMESH_PACKAGE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
-                "operations":["capabilities","identity","inventory","observations","activation_require","activation_acquire","activation_renew","activation_release","activation_status","activation_fence","recovery_point_prepare","recovery_point_status","recovery_point_restore","create","delete","clone","start","stop"],
+                "operations":["capabilities","identity","inventory","observations","activation_require","activation_acquire","activation_renew","activation_release","activation_status","activation_fence","recovery_point_prepare","recovery_point_status","recovery_point_restore","recovery_point_promote","create","delete","clone","start","stop"],
                 "experimental_operations":["migration_preflight","migration_checkpoint","migration_status","migration_authorize_transfer",
                     "migration_complete_transfer","migration_retire_source","migration_release","migration_abandon","migration_restore_local",
                     "migration_destination_preflight","migration_restore","migration_restore_abort",

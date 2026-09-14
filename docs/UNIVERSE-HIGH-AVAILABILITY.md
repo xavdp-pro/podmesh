@@ -4,7 +4,7 @@
 >
 > **Perimeter**: P1 — it decides which host may run a workload, so a mistake runs two.
 
-Status: **lots H1 to H6 built and checked; level 1 complete; level 2's capture and restore built, unsigned, with no transport; level 3 designed, not built.** Written 2026-09-14
+Status: **lots H1 to H7 built and checked; level 1 complete; level 2's capture, restore and takeover built on one host, unsigned, with no transport and no failure detector; level 3 designed, not built.** Written 2026-09-14
 against what PodMesh actually has, not against what an HA product usually has. Every
 capability named as missing was verified in the source, and the citations are below.
 
@@ -313,11 +313,50 @@ bound to the manifest, nothing binds the manifest to a producer, and the respons
 And it does not move bytes: the check copies the outbox into the inbox by hand, because the
 transport controller is the design's, not PodMesh's, and it does not exist.
 
-Level 2 still needs: a signed manifest, a transport controller pulling the outbox, and a
-datastore that verifies and catalogues. With those, "warm standby from a proven recovery
-point" becomes a schedule: capture on the active host, transport, restore on the standby,
-and a lease takeover that starts the restored copy. Without them, capture and restore are
-two operations on one host that happen to agree.
+**Lot H7, the takeover: promotion under the lease.** A quarantined restore has a new
+identity by design, and the lease is per universe — so a standby holding a lease for the
+universe and a quarantined copy of it had no typed way to make the one run as the other.
+`recovery_point_promote` is that step. It names the quarantined copy and the identity it is
+promoted into, and creates that universe from exactly the image and command the copy was
+created from — read from the copy's own verified create in the journal, not from the manifest
+again, so what runs is what the operator inspected. No network, not started; the start is
+the caller's and goes through the same gate.
+
+Its contract is refused in a stated order, and each refusal was verified by removing the rule
+and watching the check go red **with "accepted"** at its own case — a first draft of the check
+had three of them going red for a neighbouring rule's reason, which proves nothing about the
+rule removed:
+
+- no quarantined copy under that identifier here; a copy of a different universe; a copy
+  promoted into itself;
+- the universe is under no activation policy on this host — a promotion is a takeover, and a
+  takeover with no lease semantics would be a start on nobody's authority;
+- the lease gate itself, with its three reasons: none held, held by another host, this host's
+  own lapsed. The decisive case is the previous holder's lease **inside the takeover margin**:
+  the acquisition is refused, and so is the promotion; once the margin has passed the
+  acquisition advances the generation and the promotion records it.
+
+**The proof is taken before the first start, and that is not a detail.** The check exports
+the promoted container while it is still `created` and finds the marker the source wrote
+while running. Taken after a start, the same assertion is vacuous — the universe's own
+command writes the marker again — and a promotion from the pristine image passed it until
+the check was moved. The restore check already took it before the start; this one now does.
+
+**What the lease proves, in every answer.** `scope` says: the lease lives in this host's
+journal; it proves this host's own restraint, not mutual exclusion; nothing here proves the
+previous holder is stopped. That is the honest state of H1 carried forward, not a new
+weakness. The quarantined copy is left in place: removing it is the collector's or the
+operator's, never a side effect of a takeover.
+
+**Level 2 on one host is now a complete sequence of typed operations**: stop, prepare,
+carry outbox to inbox, restore into quarantine, require and acquire after the margin,
+promote, start. The two-host suite's controller already carries an outbox to an inbox over
+SSH for migrations, and the recovery point's two files ride it unchanged. What is still
+missing is exactly what no single host can supply: a signed manifest (the operator's
+dependency decision), a datastore that verifies and catalogues, a failure detector that
+decides *when* the standby begins its wait, and the lease replicated as a fact so that the
+margin is measured against the previous holder's clock rather than a fixture. Until then the
+standby's wait is measured against its own journal, and the design says so.
 
 ## What PodMesh still has to gain
 

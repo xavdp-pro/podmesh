@@ -256,6 +256,65 @@ Who may apply is provenance, not proof, exactly as for a reclaim: the request re
 `authorization_ref`, the root-only socket remains the access boundary, and the collector still refuses
 anything it cannot prove. A plan authorizes nothing.
 
+## Experimental: activation leases and recovery points (development tree, not packaged)
+
+The design is [UNIVERSE-HIGH-AVAILABILITY.md](UNIVERSE-HIGH-AVAILABILITY.md); the recovery point's format is
+[BACKUP-SERVER.md](BACKUP-SERVER.md). Every operation here carries `operation_id`, `universe_uuid` and
+`authorization_ref` with the same replay contract as the rest, except `activation_fence`, which is host-wide
+and names no universe. There is **no timer** and no failure detector: nothing here runs on its own, and the
+timeliness of renewals and fences is the caller's obligation.
+
+**Activation.** A universe under a policy may be started, cloned or restored only by a host holding its live
+lease. `stop` is never gated.
+
+- `activation_require` (`lease_seconds` 5–3600, `takeover_margin_seconds` ≥ 5, optional `desired_standbys`
+  0–16 and `eligible_hosts`) declares the policy. Absent standbys means none. A target no placement among the
+  eligible hosts can satisfy is refused at declaration. The `authorization_ref` is kept verbatim as
+  `allocation_decided_by`: the allowance is the operator's judgement and is never computed here.
+- `activation_acquire` takes the lease for this host. It is idempotent while this host's lease is live, retakes
+  this host's own lapsed lease with a new generation, and takes over another host's only once that lease has
+  lapsed by **at least the takeover margin** — before that it is refused and says when it may be taken.
+- `activation_renew` extends this host's live lease; a lapsed lease is **not** renewable and must be
+  re-acquired, so an entitlement that ended is never silently extended.
+- `activation_release` surrenders it. `migration_complete_transfer` releases it under its own history event,
+  `released_by_handoff`.
+- `activation_status` reports the policy, the lease, its history, the replication intent, this host's
+  resources (memory available, CPU count, one-minute load, state-directory space — facts, never a decision)
+  and a `scope` sentence stating what the lease proves.
+- `activation_fence` (`timeout_seconds`; no `universe_uuid`) stops every universe under a policy that this host
+  holds no live lease for, and reports which it left alone and why. It must be called at least as often as the
+  shortest lease, or a lapsed lease leaves a universe running.
+
+**What a lease proves.** This host's own restraint: it will not start what it holds no lease for. It does
+**not** prove mutual exclusion — the lease lives in this host's journal, a host that never asks is not
+restrained by it, and the takeover margin is measured against this journal's copy. Every status answer and every
+promotion says so.
+
+**Recovery points.** A stopped universe becomes an immutable, digested point; a point becomes a quarantined
+copy; a quarantined copy becomes the universe itself, under the lease.
+
+- `recovery_point_prepare` exports a **stopped** universe to `outbox/<recovery_point_uuid>/` with a canonical
+  manifest. A running universe is refused rather than stopped; a stop that escalated to SIGKILL (exit code 137)
+  has no consistency class and is refused rather than downgraded. The manifest is **unsigned** and says so:
+  `signed: false`, `state: "prepared"`, a format string ending in `unsigned-unencrypted`. No signing dependency
+  exists in this build, and adding one is the operator's decision.
+- `recovery_point_status` lists a universe's points by generation.
+- `recovery_point_restore` (`recovery_point_uuid`) creates a **quarantined, new-identity** universe from a point in
+  `inbox/<recovery_point_uuid>/`: no network, not started, under a `universe_uuid` that must differ from the
+  source's — even when the source is unknown here. The archive is checked against the manifest's size and digest,
+  the manifest against its canonical form and pinned format, and a manifest that **claims a signature is
+  refused**: this build cannot verify one, and a signature nobody can check is not a signature. The manifest's
+  origin is not verified, and the answer's `manifest_verification` says so. The container is created through
+  the ordinary `create` under the derived operation ID `<operation_id>-create`, so ownership needs no new rule.
+- `recovery_point_promote` (`restored_universe_uuid`) creates the universe named by `universe_uuid` from exactly
+  the image and command of that quarantined copy — read from the copy's own verified create — with no network
+  and not started. Refused, in this order: no such copy here; a copy of a different universe; a copy promoted
+  into itself; no activation policy for the universe on this host; then the lease gate's three reasons. The
+  quarantined copy is left in place. The answer carries the lease generation and the `scope` sentence above.
+
+How the two files reach the inbox is the transport controller's, as for migrations: PodMesh reads
+`inbox/` and never writes it. The two-host suite's controller carries an outbox to an inbox over SSH.
+
 ## Facts for a watching agent
 
 The intended first consumer of these read-only facts is a watching agent that observes and reports: it has

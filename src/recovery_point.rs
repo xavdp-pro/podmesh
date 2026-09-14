@@ -62,9 +62,35 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             manifest_sha256 TEXT NOT NULL,
             rootfs_sha256 TEXT NOT NULL,
             manifest_signed INTEGER NOT NULL,
-            restored_at INTEGER NOT NULL);",
+            restored_at INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS recovery_point_promotions(
+            operation_id TEXT PRIMARY KEY,
+            universe_uuid TEXT NOT NULL,
+            restored_universe_uuid TEXT NOT NULL,
+            recovery_point_uuid TEXT NOT NULL,
+            container_id TEXT NOT NULL,
+            lease_generation INTEGER NOT NULL,
+            promoted_at INTEGER NOT NULL);",
     )?;
     Ok(())
+}
+
+const PROMOTION_SCOPE: &str = "The lease this promotion required lives in this host's journal. It proves this host's own restraint, not mutual exclusion: a host that never asks is not restrained by it. Nothing here proves the previous holder is stopped.";
+
+fn promotion_view(db: &Connection, id: &str, replayed: bool) -> Result<Option<Value>, Error> {
+    Ok(db
+        .query_row(
+            "SELECT universe_uuid,restored_universe_uuid,recovery_point_uuid,container_id,lease_generation
+             FROM recovery_point_promotions WHERE operation_id=?1",
+            [id],
+            |r| Ok(json!({
+                "universe_uuid": r.get::<_, String>(0)?, "restored_universe_uuid": r.get::<_, String>(1)?,
+                "recovery_point_uuid": r.get::<_, String>(2)?, "container_id": r.get::<_, String>(3)?,
+                "lease_generation": r.get::<_, i64>(4)?, "started": false, "network": "none",
+                "replayed": replayed, "scope": PROMOTION_SCOPE,
+            })),
+        )
+        .optional()?)
 }
 
 fn restore_view(db: &Connection, id: &str, replayed: bool) -> Result<Option<Value>, Error> {
@@ -157,6 +183,9 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
     }
     if operation == "recovery_point_restore" {
         return restore(db, request, uuid);
+    }
+    if operation == "recovery_point_promote" {
+        return promote(db, request, uuid);
     }
     if operation != "recovery_point_prepare" {
         return Err("Unsupported recovery point operation".into());
@@ -418,21 +447,97 @@ fn restore(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error>
         "authorization_ref": reference, "image": image, "command": cmd,
     });
     let created = lc::execute(db, &create_request)?;
-    // On resume the create replays: its persisted result is under `original_result`, and the
-    // container it names must still be the one Podman has, or the resume is not a resume.
-    let container_id = if created["replayed"] == json!(true) {
-        if created["current_matches_recorded_container"] != json!(true) {
-            return Err("The earlier create's container is no longer the one Podman holds; the restore cannot be resumed and nothing was recorded".into());
-        }
-        created["original_result"]["container_id"].as_str()
-    } else {
-        created["container_id"].as_str()
-    }
-    .ok_or("The create reported no container")?
-    .to_string();
+    let container_id = created_container(&created)?;
     db.execute(
         "INSERT INTO recovery_point_restores VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,?9)",
         params![id, uuid, point, source, image, container_id, manifest_sha256, rootfs_sha256, crate::now() as i64],
     )?;
     restore_view(db, id, false)?.ok_or_else(|| "The restore was recorded but cannot be read back".into())
+}
+
+/// The container a verified create left behind, whether the create just ran or replayed.
+fn created_container(created: &Value) -> Result<String, Error> {
+    // On resume the create replays: its persisted result is under `original_result`, and the
+    // container it names must still be the one Podman has, or the resume is not a resume.
+    let id = if created["replayed"] == json!(true) {
+        if created["current_matches_recorded_container"] != json!(true) {
+            return Err("The earlier create's container is no longer the one Podman holds; the operation cannot be resumed and nothing was recorded".into());
+        }
+        created["original_result"]["container_id"].as_str()
+    } else {
+        created["container_id"].as_str()
+    };
+    Ok(id.ok_or("The create reported no container")?.to_string())
+}
+
+/// Promote a quarantined restore into the universe's OWN identity on this host: level 2's
+/// takeover step. The universe must be under an activation policy here and this host must
+/// hold its live lease -- which `activation_acquire` grants only after the previous holder's
+/// lease has lapsed by the takeover margin. The promotion creates the universe from exactly
+/// the image and command the quarantined copy was created from, with no network and not
+/// started; starting it is the caller's, and goes through the same gate.
+///
+/// What the lease proves is written into every answer: this host's own restraint, in this
+/// host's journal. It does not prove the previous holder is stopped. The quarantined copy is
+/// left where it is; removing it is the collector's or the operator's, never a side effect.
+fn promote(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error> {
+    let id = lc::text(request, "operation_id")?;
+    lc::token(id)?;
+    let reference = lc::text(request, "authorization_ref")?;
+    let restored = lc::text(request, "restored_universe_uuid")?;
+    lc::token(restored)?;
+    if let Some(previous) = promotion_view(db, id, true)? {
+        return Ok(previous);
+    }
+    let create_id = format!("{id}-create");
+    lc::token(&create_id)?;
+    if restored == uuid {
+        return Err("A promotion names the quarantined copy and the identity it is promoted into, and they cannot be the same universe".into());
+    }
+    let row: Option<(String, String, String, String)> = db
+        .query_row(
+            "SELECT operation_id,recovery_point_uuid,source_universe_uuid,imported_image_id FROM recovery_point_restores WHERE restored_universe_uuid=?1",
+            [restored],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((restore_id, point, source, image)) = row else {
+        return Err("No quarantined restore under this identifier on this host; nothing was promoted".into());
+    };
+    if source != uuid {
+        return Err(format!("The quarantined copy was restored from universe {source}, not from this one; nothing was promoted").into());
+    }
+    // The takeover contract, in the order it is refused: a policy must exist here, because a
+    // promotion without lease semantics would be a start on nobody's authority; then the lease
+    // gate itself, whose three refusals say why.
+    if crate::activation::policy(db, uuid)?.is_none() {
+        return Err("recovery_point_promote refused: this universe is under no activation policy on this host; declare one with activation_require and acquire its lease first".into());
+    }
+    crate::activation::refuse_if_not_activated(db, uuid, "recovery_point_promote")?;
+    // Defence in depth, not the rule: the gate above has already refused every case in which
+    // this lookup could find nothing, so this refusal is unreachable by the check and says so.
+    let generation = crate::activation::lease(db, uuid)?.map(|l| l.generation).ok_or("The lease vanished between the gate and the record")?;
+    // The command is the quarantined copy's own, read from its verified create rather than
+    // from the manifest again, so the promoted universe is the copy the operator inspected.
+    let quarantined_request: String = db
+        .query_row("SELECT request FROM operations WHERE id=?1 AND status='verified'", [format!("{restore_id}-create")], |r| r.get(0))
+        .optional()?
+        .ok_or("The quarantined copy's creation is not verified in this journal; nothing was promoted")?;
+    let quarantined: Value = serde_json::from_str(&quarantined_request)?;
+    if quarantined["image"].as_str() != Some(image.as_str()) {
+        return Err("The quarantined copy's creation names a different image than its restore record; nothing was promoted".into());
+    }
+    let created = lc::execute(
+        db,
+        &json!({
+            "operation": "create", "operation_id": create_id, "universe_uuid": uuid,
+            "authorization_ref": reference, "image": image, "command": quarantined["command"],
+        }),
+    )?;
+    let container_id = created_container(&created)?;
+    db.execute(
+        "INSERT INTO recovery_point_promotions VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![id, uuid, restored, point, container_id, generation, crate::now() as i64],
+    )?;
+    promotion_view(db, id, false)?.ok_or_else(|| "The promotion was recorded but cannot be read back".into())
 }
