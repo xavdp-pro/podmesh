@@ -169,6 +169,18 @@ try:
         A.remove_fixture('podmesh-' + u, note='reserved container removed directly to build the contract class 2 shape')
         out_of_band[u] = 'reserved container removed directly with Podman (no authorization was ever issued for it)'
     assert inspect(A, U3) is None and inspect(A, U4) is None
+    # A reservation whose transfer authorization is still open: the host-wide survey below expects to find
+    # one blocked for that reason. Earlier runs found it among the leftovers of the suites run before this
+    # one on the same journal; on a fresh journal it has to be built here, and it stays open on purpose.
+    U7 = str(uuid.uuid4())
+    c7, create7, ck7, _ = checkpointed(A, U7, B.identity)
+    A.ok(request('migration_authorize_transfer', U7, REF, checkpoint_operation_id=ck7, destination_host_uuid=B.identity))
+    # And one settled reservation -- released, so a finished record -- which the survey expects to count and
+    # never examine; the same leftover assumption, built here for the same reason.
+    U8 = str(uuid.uuid4())
+    c8, create8, ck8, _ = checkpointed(A, U8, str(uuid.uuid4()))
+    A.ok(request('migration_release', U8, REF, checkpoint_operation_id=ck8))
+    assert A.status(U8)['reservation']['state'] == 'released'
     checks.append('two class 1 shapes (every authorization ended not_restored, container still checkpointed) and two class 2 shapes '
                   '(container gone before any authorization) built through the API on the source')
 
@@ -628,6 +640,11 @@ try:
     A.ok(request('delete', U6, REF))
     assert inspect(A, U6) is None
     A.remove_fixture('podmesh-' + U2, note='reserved container of the running/paused refusals, removed directly by the test')
+    # The two survey shapes: the released reservation is deleted through the ordinary API, the one whose
+    # authorization is still open cannot be, and goes the way U2 does.
+    A.ok(request('delete', U8, REF))
+    A.remove_fixture('podmesh-' + U7, note='reserved container whose transfer authorization is left open on purpose, removed directly by the test')
+    out_of_band[U7] = 'reserved container removed directly with Podman (its transfer authorization is left open on purpose)'
     A.ok(request('delete', U5, REF),
          'the second class 1 collection also lifted the gate: its stopped, checkpointed source is deleted through the ordinary API', checks)
     assert inspect(A, U5) is None
@@ -659,4 +676,4 @@ print(json.dumps({'status': 'PASS', 'source_host_uuid': A.identity, 'destination
                   'collected': {'class1': [U1, U5], 'class1_collected_twice': [U5], 'class2': [U3, U4, R],
                                 'class3': [f_authorization, h_authorization]},
                   'out_of_band_universes': out_of_band, 'memory_continuity': continuity, 'events': events, 'results': results,
-                  'reserved_universes_left_in_journals': {A.role: [U2, F, H], B.role: []}}))
+                  'reserved_universes_left_in_journals': {A.role: [U2, F, H, U7], B.role: []}}))
