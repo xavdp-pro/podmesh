@@ -83,8 +83,8 @@ def evidence(i,stage):
                 "peer_commitment":replicas[(i+1)%3],"operation_commitment":c(f"op-{i}-{k}"),
                 "request_sha256_commitment":c(f"rq-{i}-{k}"),"reply_sha256_commitment":c(f"rp-{i}-{k}"),
                 "local_receipt_commitment":c(f"rcpt-{i}-{k}"),"remote_receipt_commitment":None,
-                "request_frame_bytes":2735,"reply_frame_bytes":625,"request_announced_body_bytes":2731,
-                "outcomes":["accepted"],"replayed":False}
+                "request_frame_bytes":2735,"reply_frame_bytes":626,"request_announced_body_bytes":2731,
+                "reply_announced_body_bytes":622,"outcomes":["accepted"],"replayed":False}
     inspection=None; exchanges=None
     if stage=="active-baseline":
         inspection=inspect(h(f"baseline-{i}"),0,0,0,[],None); exchanges=[]
@@ -236,8 +236,8 @@ RQ='sha256:5555555555555555555555555555555555555555555555555555555555555555'
 RA=$(jq -r '.inspection.replica_commitment' "$work/lab-a-post-cleanup.json")
 RB=$(jq -r '.inspection.replica_commitment' "$work/lab-b-post-cleanup.json")
 strand="{\"attempt_commitment\":\"sha256:6666666666666666666666666666666666666666666666666666666666666666\",\"nonce_commitment\":\"$N\",\"nonce_authority\":\"peer-validated\",\"operation_commitment\":\"$OP\",\"direction\":\"outbound\",\"last_phase\":\"outbound_request_prepared\"}"
-sent="{\"nonce_commitment\":\"$N\",\"nonce_authority\":\"peer-validated\",\"joinable\":true,\"direction\":\"outbound\",\"phases_reached\":[\"outbound_request_prepared\"],\"row_count\":1,\"peer_commitment\":\"$RB\",\"operation_commitment\":\"$OP\",\"request_sha256_commitment\":\"$RQ\",\"reply_sha256_commitment\":null,\"local_receipt_commitment\":null,\"remote_receipt_commitment\":null,\"request_frame_bytes\":0,\"reply_frame_bytes\":0,\"request_announced_body_bytes\":2731,\"outcomes\":[\"incomplete\"],\"replayed\":null}"
-served="{\"nonce_commitment\":\"$N\",\"nonce_authority\":\"peer-validated\",\"joinable\":true,\"direction\":\"inbound\",\"phases_reached\":[\"inbound_request_observed\",\"inbound_import_committed\",\"inbound_reply_prepared\",\"inbound_reply_write_observed\"],\"row_count\":4,\"peer_commitment\":\"$RA\",\"operation_commitment\":\"$OP\",\"request_sha256_commitment\":\"$RQ\",\"reply_sha256_commitment\":\"sha256:7777777777777777777777777777777777777777777777777777777777777777\",\"local_receipt_commitment\":\"sha256:8888888888888888888888888888888888888888888888888888888888888888\",\"remote_receipt_commitment\":null,\"request_frame_bytes\":2735,\"reply_frame_bytes\":625,\"request_announced_body_bytes\":2731,\"outcomes\":[\"accepted\"],\"replayed\":false}"
+sent="{\"nonce_commitment\":\"$N\",\"nonce_authority\":\"peer-validated\",\"joinable\":true,\"direction\":\"outbound\",\"phases_reached\":[\"outbound_request_prepared\"],\"row_count\":1,\"peer_commitment\":\"$RB\",\"operation_commitment\":\"$OP\",\"request_sha256_commitment\":\"$RQ\",\"reply_sha256_commitment\":null,\"local_receipt_commitment\":null,\"remote_receipt_commitment\":null,\"request_frame_bytes\":0,\"reply_frame_bytes\":0,\"request_announced_body_bytes\":2731,\"reply_announced_body_bytes\":null,\"outcomes\":[\"incomplete\"],\"replayed\":null}"
+served="{\"nonce_commitment\":\"$N\",\"nonce_authority\":\"peer-validated\",\"joinable\":true,\"direction\":\"inbound\",\"phases_reached\":[\"inbound_request_observed\",\"inbound_import_committed\",\"inbound_reply_prepared\",\"inbound_reply_write_observed\"],\"row_count\":4,\"peer_commitment\":\"$RA\",\"operation_commitment\":\"$OP\",\"request_sha256_commitment\":\"$RQ\",\"reply_sha256_commitment\":\"sha256:7777777777777777777777777777777777777777777777777777777777777777\",\"local_receipt_commitment\":\"sha256:8888888888888888888888888888888888888888888888888888888888888888\",\"remote_receipt_commitment\":null,\"request_frame_bytes\":2735,\"reply_frame_bytes\":626,\"request_announced_body_bytes\":2731,\"reply_announced_body_bytes\":622,\"outcomes\":[\"accepted\"],\"replayed\":false}"
 
 # $1 is an optional jq filter applied to the RECEIVER's served row, to break one condition.
 build_strand() {
@@ -264,7 +264,11 @@ strand_refuse 'the announced size does not bind'   '.request_announced_body_byte
 strand_refuse 'the request frame is short'         '.request_frame_bytes=2700' 'did not record a complete request frame'
 strand_refuse 'no import and no typed refusal'     '.phases_reached=["inbound_request_observed","inbound_reply_prepared","inbound_reply_write_observed"] | .row_count=3' 'committed neither an import receipt nor a typed refusal'
 strand_refuse 'an import with no receipt'          '.local_receipt_commitment=null' 'committed an import with no receipt'
-strand_refuse 'the reply was never written'        '.reply_frame_bytes=0' 'did not completely write a bound reply'
+strand_refuse 'the reply was never written'        '.reply_frame_bytes=0' 'did not write a reply at all'
+# "Completely wrote the correctly bound reply" has two halves. Checking only that bytes
+# left the receiver passes a truncated write and an unbound one alike.
+strand_refuse 'the reply is not bound by a digest'  '.reply_sha256_commitment=null' 'reply is not bound by a digest'
+strand_refuse 'the reply was truncated'             '.reply_frame_bytes=600' 'did not completely write the reply it announced'
 
 # Four conditions the nine refusals above do not reach, found by weakening the comparator
 # and watching the suite stay green. A refusal path nothing exercises is a refusal path
@@ -307,6 +311,6 @@ report_says "$work/c6.json" '.status=="FAIL"' 'no replay and no converged histor
 grep -q 'no identical retry returned a replayed receipt' <(jq -r '.failures[]?' "$work/c6.json") \
   || { echo "condition 6 was not among the failures: $(jq -c '.failures' "$work/c6.json")" >&2; exit 1; }
 
-printf '%s\n' 'PASS: strand accounting — one stranded attempt joined to its receiver, and nine conditions each refused on its own.'
+printf '%s\n' 'PASS: strand accounting — one stranded attempt joined to its receiver, and eleven conditions each refused on its own.'
 
 printf '%s\n' 'PASS: four-stage activation evidence, effective policy, ownership, graceful cleanup, infrastructure stability, converged history boundaries, typed fresh-store absence, published incomplete attempts and folded exchanges.'

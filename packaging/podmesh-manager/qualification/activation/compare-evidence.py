@@ -171,7 +171,7 @@ def validate(v,label):
 EXCHANGE=("nonce_commitment","nonce_authority","joinable","direction","phases_reached","row_count",
           "peer_commitment","operation_commitment","request_sha256_commitment","reply_sha256_commitment",
           "local_receipt_commitment","remote_receipt_commitment","request_frame_bytes","reply_frame_bytes",
-          "request_announced_body_bytes","outcomes","replayed")
+          "request_announced_body_bytes","reply_announced_body_bytes","outcomes","replayed")
 
 def validate_exchanges(v, label):
     # One folded row per wire nonce, never one per audit row. An exchange is one to four
@@ -205,7 +205,8 @@ def validate_exchanges(v, label):
         for f in ("peer_commitment","operation_commitment","request_sha256_commitment","reply_sha256_commitment","local_receipt_commitment","remote_receipt_commitment"):
             if r[f] is not None: commit(r[f],f"{where}.{f}")
         for f in ("request_frame_bytes","reply_frame_bytes"): integer(r[f],f"{where}.{f}")
-        if r["request_announced_body_bytes"] is not None: integer(r["request_announced_body_bytes"],f"{where}.request_announced_body_bytes")
+        for f in ("request_announced_body_bytes","reply_announced_body_bytes"):
+            if r[f] is not None: integer(r[f],f"{where}.{f}")
         if not isinstance(r["outcomes"],list) or not r["outcomes"]: raise ValueError(f"{where}.outcomes: must be a non-empty list")
         for o in r["outcomes"]: string(o,f"{where}.outcomes")
         if r["replayed"] is not None and not isinstance(r["replayed"],bool): raise ValueError(f"{where}.replayed: must be a boolean or null")
@@ -294,11 +295,16 @@ def account_attempts(bases, cleanups, convs):
     # and a frame size, so the campaign must simply agree with itself about the difference;
     # a truncated or padded frame breaks that agreement without the comparator needing to
     # know the protocol constant.
-    deltas={r["request_frame_bytes"]-r["request_announced_body_bytes"]
-            for c in cleanups if c["exchanges"]
-            for r in c["exchanges"] if r["request_frame_bytes"]>0 and r["request_announced_body_bytes"] is not None}
-    if len(deltas)>1: failures.append("request framing overhead is not consistent across the campaign")
-    overhead=deltas.pop() if len(deltas)==1 else None
+    def overhead_of(frame, announced):
+        d={r[frame]-r[announced] for c in cleanups if c["exchanges"]
+           for r in c["exchanges"] if r[frame]>0 and r[announced] is not None}
+        return d
+    rq=overhead_of("request_frame_bytes","request_announced_body_bytes")
+    rp=overhead_of("reply_frame_bytes","reply_announced_body_bytes")
+    if len(rq)>1: failures.append("request framing overhead is not consistent across the campaign")
+    if len(rp)>1: failures.append("reply framing overhead is not consistent across the campaign")
+    overhead=rq.pop() if len(rq)==1 else None
+    reply_overhead=rp.pop() if len(rp)==1 else None
 
     # Every folded exchange row in the campaign, indexed by nonce and by host.
     rows_by_nonce={}
@@ -319,7 +325,7 @@ def account_attempts(bases, cleanups, convs):
                 # Pre-existing debt: retained and reported, never silently folded into a
                 # success claim, and never a reason to fail a new bounded campaign.
                 debt.append({"host":host,"attempt_commitment":a["attempt_commitment"],"last_phase":a["last_phase"]}); continue
-            why=classify(host,a,rows_by_nonce,cleanups,overhead,history_converged)
+            why=classify(host,a,rows_by_nonce,cleanups,overhead,reply_overhead,history_converged)
             if why is None: accounted.append({"host":host,"attempt_commitment":a["attempt_commitment"]})
             else:
                 unaccounted.append({"host":host,"attempt_commitment":a["attempt_commitment"],"reason":why})
@@ -330,7 +336,7 @@ def account_attempts(bases, cleanups, convs):
              "unaccounted_detail":unaccounted,
              "preexisting_detail":debt}, failures)
 
-def classify(host, attempt, rows_by_nonce, cleanups, overhead, history_converged):
+def classify(host, attempt, rows_by_nonce, cleanups, overhead, reply_overhead, history_converged):
     """None when the attempt is accounted for; otherwise the first condition it fails.
     Each condition is a separate refusal: there is no aggregate that compensates for a
     missing one."""
@@ -377,7 +383,15 @@ def classify(host, attempt, rows_by_nonce, cleanups, overhead, history_converged
     # Condition 5: the reply was completely written, and the sender honestly retained its
     # absence. This is the shape the frozen contract requires, not a defect.
     if REPLY_WRITTEN not in recv["phases_reached"] or recv["reply_frame_bytes"]<=0:
-        return "the receiver did not completely write a bound reply (condition 5)"
+        return "the receiver did not write a reply at all (condition 5)"
+    # "Completely wrote the correctly BOUND reply" has two halves, and checking only that
+    # some bytes left is the weaker one: a truncated write satisfies it as well as a
+    # complete one, and an unbound reply satisfies it too.
+    if recv["reply_sha256_commitment"] is None:
+        return "the receiver's reply is not bound by a digest (condition 5)"
+    if reply_overhead is None or recv["reply_announced_body_bytes"] is None \
+       or recv["reply_frame_bytes"] != recv["reply_announced_body_bytes"]+reply_overhead:
+        return "the receiver did not completely write the reply it announced (condition 5)"
     if attempt["last_phase"]!=SENDER_PREPARED:
         return "the sender did not retain the absence of a confirmed reply as prepared/incomplete (condition 5)"
     # Condition 6: a replayed retry, or the facts independently converged on every replica.
@@ -385,8 +399,31 @@ def classify(host, attempt, rows_by_nonce, cleanups, overhead, history_converged
                  for rows in rows_by_nonce.values() for _,r in rows)
     if not replayed and not history_converged:
         return "no identical retry returned a replayed receipt and the canonical histories do not converge (condition 6)"
-    # Condition 7 is checked campaign-wide by the caller and by the convergence checks; 8 is
-    # satisfied by the attempt being in this list at post-cleanup, which is how we read it.
+    # Condition 7 is not checked here because it is already checked earlier and for every
+    # capture: validate_inspection refuses any store whose sqlite_integrity_result is not
+    # "ok", and the immutable-chain half is entailed by the inspection having succeeded at
+    # all, since the candidate verifies it and returns an error when it fails.
+    #
+    # Condition 8's evidence half is satisfied by the attempt being in this very list at
+    # post-cleanup: we are reading it there.
+    #
+    # DECLARED COVERAGE LIMITS, so that they are limits rather than silence. Each is a part
+    # of a condition that published evidence cannot decide:
+    #   C1  the campaign window is the baseline-to-post-cleanup set difference and nothing
+    #       narrower. An attempt already present at the baseline is classified as debt, not
+    #       as new, and no wall-clock window is enforced anywhere. The candidate binding is
+    #       checked, across all four stages and across all three hosts, but elsewhere.
+    #   C4  "no partial import" is approached from both sides -- an import with no receipt,
+    #       and a receipt with no audit -- but a partial import is not a state the published
+    #       evidence names, so it is not directly checked.
+    #   C5  the reply is proved bound and completely written; that it was SIGNED is not
+    #       visible in published evidence, which carries a digest commitment, not a
+    #       signature.
+    #   C6  the replay branch matches an operation commitment carrying `replayed`, and the
+    #       convergence branch checks that the canonical history digests agree. Neither
+    #       proves that THESE imported facts and THIS receipt are the ones present on every
+    #       replica; that would need per-fact publication.
+    #   C8  the operational-diagnostics half is outside a comparator's reach entirely.
     return None
 
 def three_host_failures(pres,bases,convs,cleanups):

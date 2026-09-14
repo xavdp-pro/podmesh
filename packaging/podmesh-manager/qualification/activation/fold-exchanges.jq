@@ -82,6 +82,7 @@ def fold($field; $zero_is_unset; $nonce_index):
     | ($rows | fold("request_frame_bytes"; true; $i)) as $request_frame
     | ($rows | fold("reply_frame_bytes"; true; $i)) as $reply_frame
     | ($rows | fold("request_announced_body_bytes"; true; $i)) as $announced
+    | ($rows | fold("reply_announced_body_bytes"; true; $i)) as $reply_announced
     | ($rows | map(select(.phase | endswith("request_observed") or endswith("request_prepared") | not)) ) as $after_request
     | ([ $after_request[].replayed ] | unique) as $replayed_values
     | {
@@ -100,6 +101,10 @@ def fold($field; $zero_is_unset; $nonce_index):
         request_frame_bytes: ($request_frame // 0),
         reply_frame_bytes: ($reply_frame // 0),
         request_announced_body_bytes: $announced,
+        # Published so that "the receiver COMPLETELY wrote the reply" is checkable at all.
+        # Without it the only evidence of a reply is that some bytes went out, which a
+        # truncated write satisfies as well as a complete one.
+        reply_announced_body_bytes: $reply_announced,
         outcomes: ($rows | map(.outcome) | unique),
         replayed: (if ($replayed_values | length) > 1
                    then error("exchange #\($i): rows disagree on replayed")
