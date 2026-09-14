@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Step 5 of M-U2: the governor role under the epoch gate while all three replicas keep
+"""Steps 5 and 6 of M-U2: the governor role under the epoch gate while all three replicas keep
 running; exactly one exclusive route before and after a takeover; withdrawal observed before the
-new publication; stale permit and old active refused. A duplicate address refused, a peer lost and
-reconnected are step 6. Same environment as check-manager-replicas-managed.py, plus PODMESH_FENCING_LAB; PODMESH_GATE and
+new publication; stale permit and old active refused; duplicate address refused; a peer lost and
+reconnected. Same environment as check-manager-replicas-managed.py, plus PODMESH_FENCING_LAB; PODMESH_GATE and
 PODMESH_HA_LEDGER default to ~/.podmesh-ha (private, never in the repository), and the gate is
 DURABLE across runs: the resource is the logical manager's fixed UUID and every host keeps the
 highest epoch it has seen, so a fresh gate per run would be refused as superseded by the second
@@ -205,7 +205,16 @@ try:
     converged(3)
     checks.append('facts still converged after the takeover: replication was never interrupted')
 
-    views = converged(3)
+    # 6a. duplicate address: a fourth universe asking for a replica's address is refused
+    refused(A, request('create', str(uuid.uuid4()), reference, image=image_on(A, 'lab-a'), command=['sleep', '60'], network_profile='managed', network_address=addresses['lab-a']),
+            'allocated to another universe', 'a second universe at an allocated address')
+    # 6b. peer loss and reconnection: lab-c's replica stops, the two others stay converged; it comes back with a new boot fact
+    C.ok(request('stop', universes['lab-c'], reference, timeout_seconds=15, on_timeout='kill'))
+    assert not running(C, universes['lab-c'])
+    converged(3)
+    assert C.ok(request('start', universes['lab-c'], reference, observe_seconds=3))['application_outcome'] == 'running_when_observed'
+    views = converged(4)
+    checks.append('peer loss and reconnection: with lab-c stopped the two others stayed converged; back, it appended a fourth boot fact that reached all three')
     print(json.dumps({'result': 'PASS', 'checks': checks, 'service_address': SERVICE, 'announced_at_end': service_announced(), 'facts': views,
                       'gate': gate_state, 'epochs': [e1, e1 + 1],
                       'not_proven': ['answering traffic at the service address inside the replica: the announcement is the exclusive effect proven here',

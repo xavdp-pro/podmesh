@@ -482,9 +482,9 @@ withdraws exclusive routes of resources the host no longer holds, the tool's `ro
 role without promoting or starting anything; `tests/check-manager-governor-managed.py` proved
 exactly one announcement of the service address at every observed moment, the old governor's
 withdrawal before the new publication, the stale permit and the old governor refused, all three
-replicas running and still converged across the takeover; Steps 6 (stale permit and old-active rejoin are covered above; duplicate address
-and peer loss and reconnection remain) and 7 (recovery points combined with the running replica set)
-are not begun. Not shown: a
+replicas running and still converged across the takeover; (6) in the same suite, a duplicate
+address refused, and a replica stopped and restarted converging to a fourth fact on all three.
+Step 7 (recovery points combined with the running replica set) is not begun. Not shown: a
 real partition, a host loss, the replica serving at the service address, an agent path to the
 control API. Status: implemented, lab-tested on three hosts; not deployed, not
 production-qualified; nothing published.

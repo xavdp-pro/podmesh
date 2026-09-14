@@ -161,6 +161,14 @@ behind the hosts is brought forward by explicit transfers and the report says so
 copied out of a running replica is a moving target (SQLite's WAL files come, go and grow under
 the copier), so a copy the copier could not complete is retried rather than trusted.
 
+**Step 6 (2026-09-14), the refusals and the reconnection:** in the same suite, a fourth
+universe asking for a replica's address was refused (no address is allocated twice); lab-c's
+replica was stopped, the two others stayed converged, and back it appended a fourth boot fact
+that reached all three, verified from `podman cp` copies by the attested inspector. Cleanup
+returned every host's routes and networks to their initial state. Not shown: a real partition
+(the loss here is a stop, not a cut), a host loss, an agent path to the control API, and the
+replica actually serving at the service address.
+
 **Known deviation, stated:** Podman's network firewall source-NATs traffic leaving the bridge's
 subnet, so a universe reaching another host's universe is seen there with the host's address.
 Identity between manager replicas is the HMAC pair key, never the address; removing the NAT
