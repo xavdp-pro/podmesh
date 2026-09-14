@@ -36,6 +36,17 @@ for fn, calls in required.items():
 stale = {"local-replica", "peer-replica", "inspection-replica", "logical-manager", "inspection-logical", "peer-endpoint", "bind-endpoint"} & set(re.findall(r'commit_text (\S+) ', code(text)))
 if stale: raise SystemExit(f"site-specific commitment labels break the comparator join: {sorted(stale)}")
 PY
+# The collector must never name a database file. The store path is `.network.database_path`
+# in the configuration the daemon is given, and a hard-coded `store.sqlite` stood in the
+# presence test while every real host uses `manager.sqlite` -- so a populated store was
+# reported absent, on every capture, which is the fail-open the typed-absence branch exists
+# to prevent. No fixture catches it because no fixture runs the collector against a host, so
+# the guard is static.
+if sed 's/#.*//' "$root/capture-host.sh" | grep -qE '[A-Za-z0-9_-]+\.sqlite'; then
+  echo 'capture-host.sh names a database file in code; the path must come from .network.database_path' >&2; exit 1
+fi
+grep -q "jq -er '.network.database_path'" "$root/capture-host.sh" || { echo 'capture-host.sh no longer reads the configured database path' >&2; exit 1; }
+
 python3 "$root/tests/test_helpers.py" -q
 rg -q '/run/podmesh-manager-qualification' "$root/activate-host.sh"
 rg -q '/etc/podmesh-manager/.manager2-activation-started' "$root/activate-host.sh"

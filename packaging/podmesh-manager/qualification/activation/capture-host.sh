@@ -172,12 +172,23 @@ listeners() {
 # exactly the fail-open the accounting predicate cannot survive.
 inspection() {
   [ "$with_inspection" -eq 1 ] || { printf '%s\n' null; return; }
-  local store=/var/lib/podmesh-manager/store.sqlite raw
+  # The store path is READ FROM THE CONFIGURATION the daemon is given, never guessed. A
+  # hard-coded /var/lib/podmesh-manager/store.sqlite stood here and the real database is
+  # `manager.sqlite`, named by `.network.database_path` -- so the presence test looked for a
+  # file that exists on no host, and every capture of a populated store reported
+  # `store_present: false`. That is the fail-open this branch was written to prevent: an
+  # absence must be OBSERVED, and observing the wrong path observes nothing. Found by running
+  # a real campaign; no fixture could have caught it, because no fixture runs the collector.
+  local store raw
+  store=$(jq -er '.network.database_path' /etc/podmesh-manager/config.json) \
+    || { echo 'Manager configuration does not name a database path' >&2; return 1; }
+  case "$store" in /*) ;; *) echo 'Manager database path is not absolute' >&2; return 1;; esac
+  local statedir; statedir=$(dirname -- "$store")
   if [ ! -e "$store" ] && [ ! -L "$store" ]; then
     # The installed package creates the state directory; only the store itself is
     # created on first run. A missing directory is therefore not a fresh host, it is a
     # host that is not in the state this capture assumes, and it stays fatal.
-    [ -d /var/lib/podmesh-manager ] && [ ! -L /var/lib/podmesh-manager ] || { echo 'Manager state directory is absent or is not a directory' >&2; return 1; }
+    [ -d "$statedir" ] && [ ! -L "$statedir" ] || { echo 'Manager state directory is absent or is not a directory' >&2; return 1; }
     # EVERY derived field, null. The list grew when incomplete attempts and the two set
     # digests were published and this branch did not grow with it, so a genuinely fresh host
     # emitted ten keys where the comparator required fifteen and the whole campaign was
