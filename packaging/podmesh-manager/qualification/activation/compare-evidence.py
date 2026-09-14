@@ -160,6 +160,19 @@ PHASE_RANK={direction:{phase:index for index,phase in enumerate(phases)}
                            "inbound_connection_closed"),
             }.items()}
 
+# A folded row's `outcomes` is the UNION over the audit rows it collapses, so any check
+# comparing it to a single value is unsatisfiable. Every row carries `incomplete` from its
+# first phase, where nothing is decided yet. Measured over 4320 folded rows of a live
+# three-host campaign, the vocabulary is exactly three shapes:
+#     ['accepted','incomplete']    3997   a completed exchange
+#     ['incomplete']                211   a strand: nothing decided
+#     ['incomplete','unavailable']  112   a transfer that failed part-way
+# So "this exchange completed" is `accepted` present and `unavailable` absent, and
+# `outcomes == ["accepted"]` can never be true of anything.
+def completed(row):
+    o=set(row["outcomes"])
+    return "accepted" in o and "unavailable" not in o
+
 def nonterminal(r):
     """Whether a folded exchange row has no terminal phase for its direction."""
     return not (set(r["phases_reached"]) & TERMINAL_PHASES[r["direction"]])
@@ -499,7 +512,7 @@ def account_attempts(pres, bases, cleanups, convs):
         # this lot exists to account for.
         d={r[frame]-r[announced] for c in cleanups if c["exchanges"]
            for r in c["exchanges"] if r[frame]>0 and r[announced] is not None
-           and set(r["outcomes"]) <= {"accepted"}}
+           and completed(r)}
         return d
     rq=overhead_of("request_frame_bytes","request_announced_body_bytes")
     rp=overhead_of("reply_frame_bytes","reply_announced_body_bytes")
@@ -711,7 +724,7 @@ def classify(host, attempt, rows_by_nonce, cleanups, overhead, reply_overhead):
                     and retry["operation_commitment"]==sender["operation_commitment"]
                     and retry["peer_commitment"]==sender_replica and retry["replayed"] is True
                     and TERMINAL_IMPORT in retry["phases_reached"] and REPLY_WRITTEN in retry["phases_reached"]
-                    and retry["outcomes"]==["accepted"]
+                    and completed(retry)
                     and retry["local_receipt_commitment"]==recv["local_receipt_commitment"]
                     and complete_reply(retry,reply_overhead)):
                 retry_receivers.append((retry_nonce,retry))
