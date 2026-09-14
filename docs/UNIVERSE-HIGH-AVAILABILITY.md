@@ -4,7 +4,7 @@
 >
 > **Perimeter**: P1 — it decides which host may run a workload, so a mistake runs two.
 
-Status: **lots H1 and H2 built and checked; levels 1 to 3 designed, not built.** Written 2026-09-14
+Status: **lots H1 to H3 built and checked; levels 1 to 3 designed, not built.** Written 2026-09-14
 against what PodMesh actually has, not against what an HA product usually has. Every
 capability named as missing was verified in the source, and the citations are below.
 
@@ -191,6 +191,37 @@ check go red. The third — refusing to report a stop that did not happen — is
 and unreachable by the check, since it guards `podman stop` succeeding while the container
 still runs. That is written in the code beside it rather than left looking like a tested
 safeguard.
+
+**Lot H3, the replication intent and the facts to decide it on.** How many standbys a
+universe gets is a **per-universe choice**, not a cluster setting: a standby costs storage and
+reserved headroom, so a universe cheap to rebuild wants none and one that must not stop wants
+two. With three nodes that is one or two.
+
+The policy now carries `desired_standbys` and `eligible_hosts`. Absent means **none**, never
+"as many as possible" — a policy that says nothing about standbys is declaring none. A target
+no placement can satisfy is refused at declaration rather than discovered later: two standbys
+named among two eligible hosts, one of which runs it, cannot be honoured.
+
+**PodMesh reports the intent and refuses to claim the placement.** It sees one host — this one
+— so `standbys_placed` is null and `placement_verified` is false, always. A number there would
+be a claim about hosts it has never contacted. Verifying a placement needs something that can
+see the other hosts, which is the manager's job and the lot after next.
+
+**And it now measures what it never measured.** PodMesh knew disk and nothing else, so "does
+this host have room for a standby" could not be answered honestly at all. `activation_status`
+reports memory available, CPU count, one-minute load and state-directory space. `MemAvailable`
+is read rather than `MemFree`, because free memory on a busy host is small and says nothing —
+page cache is reclaimable, and the kernel's own estimate of what a new workload can claim is
+the question being asked.
+
+These are **facts and not a decision**. Nothing in PodMesh decides whether a standby fits:
+that depends on what the universe needs and on whatever allowance the operator has granted it,
+neither of which PodMesh knows. An admission rule that guessed would be worse than none.
+
+**The allowance itself does not exist yet.** Credits per universe need a unit, a ledger and an
+authority that grants them, and PodMesh has none of the three. It is named here as the
+operator's decision rather than modelled, because a budget invented by the implementer is a
+budget nobody agreed to.
 
 ## What PodMesh still has to gain
 

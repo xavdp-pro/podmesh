@@ -33,6 +33,37 @@ const MAX_LEASE_SECONDS: u64 = 3600;
 /// Smallest takeover margin. It is the clock-skew budget between two hosts as well as the
 /// guard between the old holder's belief and the new holder's start.
 const MIN_TAKEOVER_MARGIN_SECONDS: u64 = 5;
+/// A standby per remaining node and no more; beyond that the number describes nothing.
+const MAX_STANDBYS: u64 = 16;
+
+/// What this host has, for a caller deciding where a standby can go.
+///
+/// PodMesh measured disk and nothing else, so "does this host have room for a standby" could
+/// not be answered honestly at all. Memory and CPU are read from the kernel rather than
+/// inferred: `MemAvailable` is the kernel's own estimate of what a new workload can claim
+/// without swapping, which is the question, and it is not `MemFree` -- free memory on a busy
+/// host is small and says nothing, because page cache is reclaimable.
+///
+/// These are FACTS AND NOT A DECISION. Nothing here decides whether a standby fits: that
+/// depends on what the universe needs and on whatever allowance the operator has granted it,
+/// neither of which PodMesh knows. An admission rule that guessed would be worse than none.
+fn host_resources() -> serde_json::Value {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let kb = |key: &str| -> Option<u64> {
+        meminfo.lines().find(|l| l.starts_with(key)).and_then(|l| {
+            l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok())
+        })
+    };
+    serde_json::json!({
+        "memory_total_bytes": kb("MemTotal:").map(|v| v * 1024),
+        "memory_available_bytes": kb("MemAvailable:").map(|v| v * 1024),
+        "cpu_count": std::thread::available_parallelism().map(std::num::NonZeroUsize::get).ok(),
+        "load_average_1m": std::fs::read_to_string("/proc/loadavg").ok()
+            .and_then(|l| l.split_whitespace().next().and_then(|v| v.parse::<f64>().ok())),
+        "state_directory_available_bytes": crate::migration::base().ok().map(|b| crate::migration::available_bytes(&b)),
+        "note": "facts only; whether a standby fits depends on what the universe needs and on its allowance, neither of which PodMesh knows",
+    })
+}
 
 pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
     db.execute_batch(
@@ -41,7 +72,9 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             lease_seconds INTEGER NOT NULL,
             takeover_margin_seconds INTEGER NOT NULL,
             declared_at INTEGER NOT NULL,
-            operation_id TEXT NOT NULL);
+            operation_id TEXT NOT NULL,
+            desired_standbys INTEGER NOT NULL DEFAULT 0,
+            eligible_hosts TEXT NOT NULL DEFAULT '[]');
          CREATE TABLE IF NOT EXISTS activation_leases(
             universe_uuid TEXT PRIMARY KEY,
             holder_host_uuid TEXT NOT NULL,
@@ -58,20 +91,51 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             at INTEGER NOT NULL,
             operation_id TEXT NOT NULL);",
     )?;
+    // A table created by an earlier version has neither column, and CREATE TABLE IF NOT
+    // EXISTS does not add them. Both carry a default, so an existing policy keeps working and
+    // simply declares no standby -- which is the truthful reading of a policy written before
+    // the field existed.
+    for column in ["desired_standbys INTEGER NOT NULL DEFAULT 0", "eligible_hosts TEXT NOT NULL DEFAULT '[]'"] {
+        let name = column.split(' ').next().unwrap_or_default();
+        let present: bool = db.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('activation_policy') WHERE name=?1",
+            [name],
+            |r| Ok(r.get::<_, i64>(0)? > 0),
+        )?;
+        if !present {
+            db.execute_batch(&format!("ALTER TABLE activation_policy ADD COLUMN {column};"))?;
+        }
+    }
     Ok(())
 }
 
 pub struct Policy {
     pub lease_seconds: u64,
     pub takeover_margin_seconds: u64,
+    /// How many standbys the operator wants for this universe, beyond the one that runs.
+    /// With three nodes that is one or two, and it is a per-universe choice rather than a
+    /// cluster-wide setting: a standby costs storage and reserved headroom, so a universe
+    /// cheap to rebuild does not want one and a universe that must not stop wants two.
+    pub desired_standbys: u64,
+    /// The hosts the operator will accept as a placement. Empty means none has been named,
+    /// which is recorded as an absence rather than read as "anywhere".
+    pub eligible_hosts: Vec<String>,
 }
 
 pub fn policy(db: &Connection, uuid: &str) -> Result<Option<Policy>, Error> {
     Ok(db
         .query_row(
-            "SELECT lease_seconds,takeover_margin_seconds FROM activation_policy WHERE universe_uuid=?1",
+            "SELECT lease_seconds,takeover_margin_seconds,desired_standbys,eligible_hosts FROM activation_policy WHERE universe_uuid=?1",
             [uuid],
-            |r| Ok(Policy { lease_seconds: r.get::<_, i64>(0)? as u64, takeover_margin_seconds: r.get::<_, i64>(1)? as u64 }),
+            |r| {
+                let hosts: String = r.get(3)?;
+                Ok(Policy {
+                    lease_seconds: r.get::<_, i64>(0)? as u64,
+                    takeover_margin_seconds: r.get::<_, i64>(1)? as u64,
+                    desired_standbys: r.get::<_, i64>(2)? as u64,
+                    eligible_hosts: serde_json::from_str(&hosts).unwrap_or_default(),
+                })
+            },
         )
         .optional()?)
 }
@@ -160,6 +224,15 @@ fn view(db: &Connection, uuid: &str) -> Result<serde_json::Value, Error> {
         "expires_at": held.as_ref().map(|l| l.expires_at),
         "seconds_remaining": held.as_ref().map(|l| l.expires_at - now),
         "live": held.as_ref().is_some_and(|l| l.expires_at > now),
+        "desired_standbys": policy.as_ref().map(|p| p.desired_standbys),
+        "eligible_hosts": policy.as_ref().map(|p| p.eligible_hosts.clone()),
+        // Declared, never observed. PodMesh sees one host -- this one -- so it cannot say how
+        // many standbys exist, and a number here would be a claim about hosts it has never
+        // contacted. The count is what the operator asked for, and the placement is unverified
+        // until something that can see the other hosts verifies it.
+        "standbys_placed": serde_json::Value::Null,
+        "placement_verified": false,
+        "host_resources": host_resources(),
         // Said in every answer, because a caller reading only this object must not mistake a
         // local self-restraint for cross-host exclusion.
         "scope": "this host's journal only; not mutual exclusion across hosts",
@@ -202,12 +275,38 @@ pub fn execute(db: &Connection, request: &serde_json::Value) -> Result<serde_jso
                 MIN_TAKEOVER_MARGIN_SECONDS,
                 MAX_LEASE_SECONDS,
             )?;
+            // Optional, and absent means zero rather than unlimited: a policy that says
+            // nothing about standbys is declaring none, not declaring "as many as possible".
+            let standbys = match request.get("desired_standbys") {
+                None => 0,
+                Some(_) => bounded(request, "desired_standbys", 0, MAX_STANDBYS)?,
+            };
+            let hosts: Vec<String> = match request.get("eligible_hosts") {
+                None => Vec::new(),
+                Some(v) => serde_json::from_value(v.clone())
+                    .map_err(|_| "eligible_hosts must be a list of host UUIDs")?,
+            };
+            for host in &hosts {
+                lc::token(host)?;
+            }
+            // A target no placement can satisfy is refused at declaration rather than
+            // discovered later: naming two standbys among two eligible hosts, one of which
+            // runs it, cannot be honoured and saying so now is cheaper than a surprise.
+            if standbys > 0 && !hosts.is_empty() && (standbys as usize) + 1 > hosts.len() {
+                return Err(format!(
+                    "desired_standbys {standbys} plus the running host exceeds the {} eligible hosts named",
+                    hosts.len()
+                )
+                .into());
+            }
             db.execute(
-                "INSERT INTO activation_policy VALUES(?1,?2,?3,?4,?5)
+                "INSERT INTO activation_policy VALUES(?1,?2,?3,?4,?5,?6,?7)
                  ON CONFLICT(universe_uuid) DO UPDATE SET lease_seconds=excluded.lease_seconds,
                    takeover_margin_seconds=excluded.takeover_margin_seconds,
-                   declared_at=excluded.declared_at, operation_id=excluded.operation_id",
-                params![uuid, lease_seconds as i64, margin as i64, now, id],
+                   declared_at=excluded.declared_at, operation_id=excluded.operation_id,
+                   desired_standbys=excluded.desired_standbys, eligible_hosts=excluded.eligible_hosts",
+                params![uuid, lease_seconds as i64, margin as i64, now, id, standbys as i64,
+                        serde_json::to_string(&hosts)?],
             )?;
             record(db, uuid, &this_host, 0, "policy_declared", id)?;
         }

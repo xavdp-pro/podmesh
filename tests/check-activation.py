@@ -88,6 +88,38 @@ refused(op('start', v, observe_seconds=0), "activation lease expired", 'start on
 retaken = op('activation_acquire', v)
 assert retaken['ok'] and retaken['data']['generation'] == 1, f'own lapsed lease should not bump the generation: {retaken}'
 
+# The replication intent: how many standbys, and on which hosts. It is a per-universe
+# choice because a standby is not free -- it costs storage and reserved headroom -- so a
+# universe cheap to rebuild wants none and one that must not stop wants two.
+r = str(uuid.uuid4())
+h1, h2, h3 = (str(uuid.uuid4()) for _ in range(3))
+
+# Absent means none, never "as many as possible".
+assert op('activation_require', r, lease_seconds=60, takeover_margin_seconds=10)['ok']
+assert op('activation_status', r)['data']['desired_standbys'] == 0
+
+# A target no placement can satisfy is refused at declaration rather than discovered later.
+refused(op('activation_require', r, lease_seconds=60, takeover_margin_seconds=10,
+           desired_standbys=2, eligible_hosts=[h1, h2]),
+        'exceeds the 2 eligible hosts named', 'two standbys among two hosts')
+
+declared = op('activation_require', r, lease_seconds=60, takeover_margin_seconds=10,
+              desired_standbys=2, eligible_hosts=[h1, h2, h3])
+assert declared['ok'], declared
+assert declared['data']['desired_standbys'] == 2, declared
+assert declared['data']['eligible_hosts'] == [h1, h2, h3], declared
+
+# PodMesh sees one host, so it must not claim a placement it cannot see.
+assert declared['data']['standbys_placed'] is None, declared
+assert declared['data']['placement_verified'] is False, declared
+
+# The facts a caller needs to decide where a standby can go. Facts, not a decision.
+res = declared['data']['host_resources']
+assert res['memory_available_bytes'] and res['memory_available_bytes'] > 0, res
+assert res['cpu_count'] and res['cpu_count'] >= 1, res
+assert res['state_directory_available_bytes'] is not None, res
+assert 'PodMesh knows' in res['note'], res
+
 # The takeover margin, which is the rule that actually keeps two honest hosts apart. It
 # cannot be reached through the API from one host -- every lease the API grants is held by
 # this host -- so the foreign holder is written straight into the journal as a fixture. The
