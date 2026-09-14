@@ -20,7 +20,10 @@ Debian internal container for the component — is not expressible in that contr
 exception has to be the root image of this one universe. It changes nothing for any other
 universe, whose root stays Alpine by default.
 
-The exception is removable by either of two things, both outside this candidate: a **musl build
+**Status after the same day's musl build:** the Alpine root image exists (`Containerfile.alpine`,
+`MUSL-BUILD.md`) and passed the same proof, so the exception now covers only the **frozen glibc
+candidate** `cbd5020a…` — the Debian image is the compatibility branch that runs that exact
+binary until Codex freezes the musl build as a candidate. The two things that remove it entirely: a **musl build
 of the resident** (`x86_64-unknown-linux-musl`, statically linked), which is a new candidate
 with a new binary digest and needs Codex's build and review; or **internal containers** in the
 universe contract, after which the resident moves into a Debian internal container under an

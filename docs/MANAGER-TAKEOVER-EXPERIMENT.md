@@ -82,6 +82,13 @@ the stop an honest failure the capture cycle refuses after; the configuration is
 single-replica portability fixture; and Alpine was tried first, failing on the candidate's
 glibc ≥ 2.34 dependency (`ALPINE-PROOF.md`), which is the recorded reason for the Debian image.
 
+The operator's image policy of the same day (Alpine root by default, Debian only as a local,
+documented exception) was then applied: the resident was built for musl from the frozen source
+commit in an Alpine Rust container, an Alpine root image (60 MB) passed the identical three-host
+proof with that binary attested as both resident and inspector, and the Debian image became the
+compatibility branch for the frozen glibc candidate. Freezing the musl build as a candidate is
+Codex's.
+
 Three findings the candidate taught, each handled in the universe definition and recorded in
 its README: the resident handles no signal, so PID 1 must translate the stop; the overlay's
 copy-up changes a restored store's inode between the resident's preflight and its open, which

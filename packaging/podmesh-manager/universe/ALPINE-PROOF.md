@@ -22,3 +22,13 @@ digest and is a new candidate, not this one. Until then the Debian 13 image is t
 the hierarchy allows, with this file as the reason beside it. Both images, when a musl
 candidate exists, must implement the same universe contract and pass the same smoke, stop and
 store proof.
+
+## Addendum, the same night: Alpine has a viable path
+
+A musl build of the resident from the same frozen source commit (`MUSL-BUILD.md`) runs on
+`alpine:3.22` with nothing but `python3` for the entrypoint: smoke exit 0 with the boot fact
+observed and the typed shutdown acknowledged; `--fault boot` exit 2; `--fault shutdown` exit 3;
+and the full three-host proof PASS with that binary attested as both resident and inspector.
+The limitation above is therefore the frozen glibc binary's, not the resident's: an Alpine root
+image is the default from here, and the Debian image is the compatibility branch for the frozen
+candidate.

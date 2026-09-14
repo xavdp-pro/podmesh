@@ -1,5 +1,10 @@
 # The manager as a PodMesh universe (candidate M-U1)
 
+Two root images implement the same universe contract and pass the same proof: **`Containerfile.alpine`
+is the default**, per the image policy of 2026-09-14, with a musl build of the resident
+(`MUSL-BUILD.md`); `Containerfile` (Debian 13) is the documented compatibility branch that carries
+the frozen glibc candidate as it is (`DEBIAN-EXCEPTION.md`, `ALPINE-PROOF.md`).
+
 Codex's decision of 2026-09-14: the manager is one logical universe; PodMesh's activation,
 recovery points and epoch screen are its only exclusive-role enforcement. This directory is
 the smallest universe definition of the packaged resident, and what it taught.
@@ -12,7 +17,8 @@ for the universe network. Build on the active host, privately, with a configurat
 from the template (the UUIDs are identifiers of the laboratory universe and stay out of Git;
 there are no keys):
 
-    podman build --network=host -t localhost/podmesh-manager-universe:m-u1 .
+    podman build --network=host -t localhost/podmesh-manager-universe:m-u1-alpine -f Containerfile.alpine .   # default
+    podman build --network=host -t localhost/podmesh-manager-universe:m-u1 .                                  # Debian branch
 
 then `create` the universe from the image ID with the command `/usr/local/bin/manager-universe`
 and drive it with `tools/ha-standby.py` from the main tree. `tests/check-manager-universe-ha.py`
@@ -53,7 +59,11 @@ there runs the HA-10 shape on three hosts and proves, by the frozen candidate's 
   into the writable layer once before the resident starts. A stale control socket file from the
   previous incarnation is removed for the same reason.
 
-## Measured on three lab hosts (2026-09-14, rerun after Codex's review)
+## Measured on three lab hosts (2026-09-14, rerun after Codex's review; then again on the Alpine image)
+
+The Alpine root image (59.7 MB against 120 MB) passed the identical proof with the musl binary
+attested equal to the inspector (`4111e487…`): injected failures, typed stop, store 2 → 3 → 4
+chained facts through capture, restore, promotion and restart, stale permit refused.
 
 Binary in the universe attested equal to the inspector (`cbd5020a…`); injected boot-fact failure
 → exit 2, not running when observed; injected typed-shutdown failure → exit 3, stop reported
