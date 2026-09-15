@@ -1,0 +1,36 @@
+#!/bin/sh
+# The self-fence on a timer, under a written mandate -- and under nothing else.
+#
+# PodMesh acts on nothing by itself: `activation_fence` is an operation the agent calls, and it
+# must be called at least as often as the shortest lease or a lapsed lease leaves a universe
+# running and a lapsed role keeps its address. A host the agent cannot reach -- a real partition
+# -- is exactly the case where no agent calls it. This script is what a systemd timer runs so that
+# the host fences ITSELF once its leases lapse on its own clock: it refuses to run without the
+# operator's mandate file, builds one typed request with a fresh operation ID and the mandate's
+# provenance, and hands it to the CLI. It decides nothing; the daemon's fence does, and its report
+# goes to the journal. Enabling the timer is the operator's decision (UNIVERSE-HIGH-AVAILABILITY.md).
+#
+# Mandate file (default /etc/podmesh/fence-mandate), root-only, shell-free key=value lines:
+#   authorization_ref=<the mandate's name, recorded as provenance in every fence>
+#   timeout_seconds=<the stop timeout the fence gives a universe it must stop; default 10>
+set -eu
+umask 077
+mandate=${PODMESH_FENCE_MANDATE:-/etc/podmesh/fence-mandate}
+cli=${PODMESH_CLI:-/usr/bin/podmesh}
+if [ ! -f "$mandate" ]; then
+  echo "podmesh-fence: no mandate at $mandate; nothing is fenced without one" >&2
+  exit 3
+fi
+ref=$(sed -n 's/^authorization_ref=//p' "$mandate" | head -1)
+timeout=$(sed -n 's/^timeout_seconds=//p' "$mandate" | head -1)
+[ -n "$timeout" ] || timeout=10
+case "$ref" in
+  ''|*[!A-Za-z0-9_.:-]*) echo "podmesh-fence: the mandate names no usable authorization_ref; nothing is fenced" >&2; exit 3 ;;
+esac
+case "$timeout" in
+  ''|*[!0-9]*) echo "podmesh-fence: the mandate's timeout_seconds is not a number; nothing is fenced" >&2; exit 3 ;;
+esac
+request=$(mktemp)
+trap 'rm -f "$request"' EXIT
+printf '{"operation_id":"%s","authorization_ref":"%s","timeout_seconds":%s}\n' "$(cat /proc/sys/kernel/random/uuid)" "$ref" "$timeout" > "$request"
+exec "$cli" activation_fence "$request"

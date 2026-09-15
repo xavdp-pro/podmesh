@@ -177,6 +177,23 @@ an exclusive route (`network_route_publish` with `exclusive_resource`, the servi
 a logical manager whose replicas all keep running) is withdrawn, verified from the kernel, once
 this host's lease on that resource has lapsed or been superseded.
 
+**The timer, packaged and disabled (2026-09-15).** `packaging/podmesh-fence` is what a
+systemd timer runs so that a host fences *itself* once its leases lapse on its own clock — the
+one case no agent covers, a host the agent cannot reach. It refuses to run without the
+operator's mandate file (`/etc/podmesh/fence-mandate`: `authorization_ref`, recorded as
+provenance in every fence, and `timeout_seconds`), builds one typed `activation_fence` request
+with a fresh operation ID, and hands it to the CLI; it decides nothing. `podmesh-fence.timer`
+(every 5 seconds, at least twice per shortest lease of 20 seconds or more) is shipped
+**disabled**, and the package's postinst never enables it: writing the mandate and enabling the
+timer is the operator's decision 4. `tests/check-fence-timer.py` on lab-a: without a mandate
+the script refused (exit 3) and withdrew nothing; under a transient timer every 2 seconds the
+fence ran while the lease was live and withdrew nothing; once the lease had lapsed on the host's
+clock, nobody renewing it and nobody calling anything, the role's route and the address its
+universe carried were gone within one interval (5.2 s after the lapse, observation included),
+the universe under no policy of its own still running. With the timer enabled, a partition that
+cuts the agent from the governor's host ends the way the takeover margin assumes: the cut host
+fences itself when its lease lapses, and the standby that waited lease + margin takes over.
+
 **It is an operation and not a timer, deliberately.** PodMesh does not act on its own; the
 garbage collector carries the same constraint for the same reason. So the *timeliness* is the
 caller's obligation: whoever drives it must call it at least as often as the shortest lease,

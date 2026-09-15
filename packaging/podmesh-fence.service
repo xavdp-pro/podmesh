@@ -1,0 +1,10 @@
+[Unit]
+Description=PodMesh self-fence, once, under the operator's mandate
+Documentation=file:/usr/share/doc/podmesh/UNIVERSE-HIGH-AVAILABILITY.md
+After=podmesh.service
+Requisite=podmesh.service
+ConditionPathExists=/etc/podmesh/fence-mandate
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/podmesh-fence
+UMask=0077

@@ -1,0 +1,12 @@
+[Unit]
+Description=PodMesh self-fence on a timer (disabled unless the operator enables it)
+Documentation=file:/usr/share/doc/podmesh/UNIVERSE-HIGH-AVAILABILITY.md
+ConditionPathExists=/etc/podmesh/fence-mandate
+[Timer]
+# At least twice per shortest lease: the packaged default suits leases of 20 seconds and more.
+# A lease shorter than that needs a drop-in with a shorter interval, or it can lapse unfenced.
+OnBootSec=15s
+OnUnitActiveSec=5s
+AccuracySec=1s
+[Install]
+WantedBy=timers.target

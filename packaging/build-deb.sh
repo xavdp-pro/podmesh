@@ -11,7 +11,8 @@ trap 'rm -rf "$work"' EXIT
 chmod 755 "$work"
 mkdir -p "$work/DEBIAN" "$work/usr/bin" "$work/usr/lib/systemd/system"
 install -m755 target/release/podmesh target/release/podmeshd "$work/usr/bin/"
-install -m644 packaging/podmesh.service "$work/usr/lib/systemd/system/"
+install -m644 packaging/podmesh.service packaging/podmesh-fence.service packaging/podmesh-fence.timer "$work/usr/lib/systemd/system/"
+install -m755 packaging/podmesh-fence "$work/usr/bin/"
 cat > "$work/DEBIAN/control" <<CONTROL
 Package: podmesh
 Version: $version
@@ -35,7 +36,8 @@ Description: Experimental local Podman lifecycle service
  retirement, and the recovery of a reservation that never left its host. They
  require the separately packaged podmesh-vzcriu runtime and its helper shim.
  Networking, volumes and high availability are not implemented in this version,
- and a reservation is not fencing.
+ and a reservation is not fencing. The self-fence timer (podmesh-fence.timer) is
+ shipped disabled and runs nothing without the operator's mandate file.
 CONTROL
 cat > "$work/DEBIAN/postinst" <<'SCRIPT'
 #!/bin/sh
@@ -44,14 +46,17 @@ if [ "$1" = configure ] && [ -d /run/systemd/system ]; then
  systemctl daemon-reload
  systemctl enable podmesh.service
  systemctl restart podmesh.service
+ # podmesh-fence.timer is deliberately NOT enabled here: whether the host may fence itself on a
+ # schedule is the operator's decision, taken by writing /etc/podmesh/fence-mandate and enabling it.
 fi
 SCRIPT
 cat > "$work/DEBIAN/prerm" <<'SCRIPT'
 #!/bin/sh
 set -e
 if [ -d /run/systemd/system ]; then
+ systemctl stop podmesh-fence.timer 2>/dev/null || true
  systemctl stop podmesh.service
- if [ "$1" = remove ]; then systemctl disable podmesh.service; fi
+ if [ "$1" = remove ]; then systemctl disable podmesh-fence.timer 2>/dev/null || true; systemctl disable podmesh.service; fi
 fi
 SCRIPT
 cat > "$work/DEBIAN/postrm" <<'SCRIPT'

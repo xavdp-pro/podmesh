@@ -510,9 +510,14 @@ with the cut host fenced on request, and on reconnection the cut replica converg
 replica. Then the source NAT removed inside the prefix: the declaration creates an nftables
 table (`notrack` for prefix-to-prefix traffic) and the undeclaration removes it, both verified;
 `tests/check-network-no-nat.py` on two hosts saw each universe with its own address at the
-other's. Not shown: a partition that also cuts the agent from the governor's host (that host
-keeps its alias until an agent reaches it: no timer), a host loss, an authenticated exchange at
-the service address, a signed manifest.
+other's. Then the self-fence on a timer under a mandate, packaged disabled
+(`packaging/podmesh-fence`, `podmesh-fence.service`, `podmesh-fence.timer`; the postinst never
+enables it): `tests/check-fence-timer.py` on lab-a — no mandate, nothing fenced; lease live,
+nothing withdrawn; lease lapsed on the host's clock with nobody calling anything, the role's
+route and the carried address gone within one interval, the universe still running. What that
+closes, once the operator enables it: a partition that also cuts the agent from the governor's
+host. Not shown: a host loss, an authenticated exchange at the service address, a signed
+manifest, the packaged units themselves under a real installation.
 Status: implemented, lab-tested on three hosts; not deployed, not
 production-qualified; nothing published.
 
