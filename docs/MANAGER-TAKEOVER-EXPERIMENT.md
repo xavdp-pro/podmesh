@@ -143,6 +143,16 @@ governor's host — that host keeps its alias until an agent reaches it, because
 is an operation and nothing in PodMesh runs on a timer; that is decision 4 of the operator's
 list.
 
+**The publishing connector follows the governor (2026-09-15, the operator's decision):** the
+manager's public hostname is served through one Cloudflare tunnel by exactly one `cloudflared`,
+co-located with the governor replica, started only under its live unsuperseded lease with the
+service address effective and the origin answering ready at the epoch, stopped by the fence before
+the address goes (`docs/MANAGER-PUBLISHER-CONTRACT.md` in the main tree). Measured with a real
+laboratory tunnel: an external request answered with the governor's replica and epoch, then the
+new governor's after the rotation; and, the hard test, the governor's host cut from its peer and
+the agent with its Internet kept withdrew its connector by its own timer 5.8 s after its lease
+lapsed, 30.5 s before the standby published. Decision 4 is thereby measured, not only prepared.
+
 Three findings the candidate taught, each handled in the universe definition and recorded in
 its README: the resident handles no signal, so PID 1 must translate the stop; the overlay's
 copy-up changes a restored store's inode between the resident's preflight and its open, which
