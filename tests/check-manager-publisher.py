@@ -75,10 +75,16 @@ def routes(h):
 def networks(h):
     return sorted(h.call('podman_run', args=['network', 'ls', '--format', '{{.Name}}'])['stdout'].split())
 
-def refused(r, fragment, label):
+LEASE_GATE_REASONS = ('none is held', 'held by another host', 'expired', 'superseded')
+
+def refused(r, fragments, label):
+    """Refused for one of the named reasons; which one is recorded, since a host that took part in an
+    earlier run may hold an expired or superseded lease rather than none at all."""
+    fragments = (fragments,) if isinstance(fragments, str) else fragments
     assert not r.get('ok'), (label, 'accepted, expected refusal', r)
-    assert fragment in json.dumps(r), (label, 'refused for another reason', r.get('error'))
-    checks.append(f'refused ({fragment}): {label}')
+    reason = next((f for f in fragments if f in json.dumps(r)), None)
+    assert reason, (label, 'refused for another reason', r.get('error'))
+    checks.append(f'refused ({reason}): {label}')
 
 def declare_credential(h):
     h.ssh(f'sudo -n mkdir -p -m 0700 {state_dir}/inbox/secrets && sudo -n install -m 0600 -o root -g root /dev/stdin {state_dir}/inbox/secrets/{CREDENTIAL}', input_bytes=CREDENTIALS)
@@ -158,10 +164,11 @@ try:
     checks.append(f'{len(aliases)} replicas running with their credential declared on every host, the publisher declared on every host, the role on {G} under epoch {e1}')
 
     # a standby may not publish; the governor may not without the service address, nor without accounting for the previous publisher
-    refused(pub('publisher_start', S, previous={'none': True}), 'none is held', f'{S} starting a connector without the lease')
+    refused(pub('publisher_start', S, previous={'none': True}), LEASE_GATE_REASONS, f'{S} starting a connector without the lease')
     refused(pub('publisher_start', G, previous={'none': True}), 'no effective exclusive route', f'{G} starting a connector before publishing the service address')
     hosts[G].ok(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=addresses[G], exclusive_resource=LOGICAL))
-    refused(pub('publisher_start', G), 'previous', f'{G} starting a connector without an account of the previous publisher')
+    refused(pub('publisher_start', G), 'requires', f'{G} starting a connector without naming the previous publisher at all')
+    refused(pub('publisher_start', G, previous={}), 'not accounted for', f'{G} starting a connector with a previous publisher neither fenced, waited nor none')
     st = pub('publisher_status', G)['data']
     assert st['publisher_eligible'] is True and st['origin_readiness']['status'] == 503, st
     checks.append('before the start: the governor eligible, its origin answering 503 (no governor mark yet)')
@@ -178,7 +185,7 @@ try:
     checks.append(f'an external request to https://{HOSTNAME}/ready answered 200 with the logical manager, {G}\'s replica and epoch {e1}; recorded')
 
     # the rotation: the old governor's fence stops the connector and removes the mark before the address goes
-    rot2 = tool('rotate', '--universe', LOGICAL, '--host', targets[S], '--lease', '120', '--margin', '5')
+    rot2 = tool('rotate', '--universe', LOGICAL, '--host', targets[S], '--lease', '20', '--margin', '5')  # short: the permit gate is tested alone at the end
     e2 = rot2['epoch']
     for a in aliases:
         if a != S:
@@ -207,6 +214,17 @@ try:
     assert status == 200 and body['epoch'] == e2 and body['replica_id'] == replica_ids[S], (status, body)
     pub('publisher_observed', S, observation={'hostname': HOSTNAME, 'status': status, 'body': body, 'from': 'workstation'})
     checks.append(f'{S} published the service address and started its connector; the same public hostname answers with {S}\'s replica and epoch {e2}')
+
+    # the permit gate alone: the connector stopped, the lease left to lapse with the route and the alias
+    # still effective (no fence ran), a start is refused by the lease gate and by nothing else
+    assert pub('publisher_stop', S).get('ok')
+    expires = hosts[S].ok(request('activation_status', LOGICAL, reference))['expires_at']
+    while hosts[S].call('time')['time'] <= expires:
+        time.sleep(1)
+    st = pub('publisher_status', S)['data']
+    assert st['service'] and st['publisher_eligible'] is False, st
+    refused(pub('publisher_start', S, previous={'none': True}), 'expired', f'{S} starting a connector under a lapsed lease while its route and alias are still effective')
+    checks.append('the permit gate alone refused: the service address still effective, the lease lapsed, no fence run')
     print(json.dumps({'result': 'PASS', 'checks': checks, 'hostname': HOSTNAME, 'tunnel': TUNNEL_ID[:8], 'epochs': [e1, e2], 'gate': gate_state,
                       'not_proven': ['the partition that cuts the old governor from peers and agent while it keeps its Internet egress: its own suite',
                                      'the manager\'s web interface behind the origin: the origin is the readiness responder',

@@ -546,6 +546,18 @@ directions, a stateful firewall passing under `null-snat` and blocking under `no
 Podman's NAT kept outside the prefix and for host-address traffic, the table intact after a
 fence's reconciliation, removed by the undeclaration. The rest follows in Codex's order.
 
+## The publishing connector follows the governor (2026-09-15, the operator's decision)
+
+`docs/MANAGER-PUBLISHER-CONTRACT.md` and `src/publisher.rs`: one Cloudflare tunnel, one public
+hostname, exactly one `cloudflared`, co-located with the governor replica, started only under
+the live unsuperseded lease with the service address effective, the previous publisher accounted
+for, the governor mark written inside the carrier and the origin answering ready at the epoch;
+stopped by the fence before the address goes. Measured on lab-b and lab-c with a real laboratory
+tunnel: an external request through the public hostname answered with the governor's replica and
+epoch, then, after the rotation and the old governor's fence, with the new governor's. I1–I4 of
+Codex's review are done the same day (lease-expiry self-withdrawal named, the fence preview,
+the relay bound to the container's identity, the HA document reconciled).
+
 ## Next actions, in order
 
 1. Done: independent read-only counter-review of the source-side milestone (Claude

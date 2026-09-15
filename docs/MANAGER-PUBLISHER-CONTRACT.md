@@ -96,4 +96,19 @@ wedged (lease-expiry self-withdrawal needs the daemon alive).
 
 ## What is built
 
-See the entries below, each dated, each measured on the laboratory's hosts.
+**2026-09-15, the single publisher:** `src/publisher.rs` on the network effects ledger, the
+operations above, the origin responder in the manager universe's entrypoint (web tree), the
+fence stopping the connector and removing the mark before the address goes, the preview counting
+a connector without entitlement. `tests/check-manager-publisher.py` on lab-b (governor) and lab-c
+(standby) with a real laboratory tunnel and hostname: the standby's start refused by the lease
+gate; the governor's start refused before the service address and without an account of the
+previous publisher; started, its unit active, a connection registered, the origin ready at the
+epoch with the governor's replica; **an external request through the public hostname answered
+with the logical manager, that replica and that epoch**; after the rotation the old governor's
+fence stopped its connector and removed its mark before withdrawing its alias and route, its
+origin answered 503 at its own address, it was no longer eligible; the new governor published,
+started, and the same hostname answered with its replica and the new epoch. Two hosts, not
+three, on that day (the third was out of reach). The laboratory tunnel and hostname are the
+operator's private fixtures, disposable; the credential reaches a host only as a PodMesh secret.
+Cloudflare's edge answered 403 (error 1010) to a bare python User-Agent; the external request
+carries a browser-like one — the edge's own gate, not the manager's.

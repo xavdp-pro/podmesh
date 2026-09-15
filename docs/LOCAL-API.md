@@ -426,6 +426,19 @@ or stopped. `secret_status` (read-only) lists names, digests and presence in the
 durable copy of a secret is the operator's, outside PodMesh; Podman's store at rest is root-only files on the
 host, the laboratory's accepted boundary.
 
+## Experimental: the publishing connector that follows the governor (development tree, not packaged)
+
+The contract is `MANAGER-PUBLISHER-CONTRACT.md`. `publisher_declare` (`resource`, `hostname`, `tunnel_uuid`,
+`credential`, optional `origin_port`) records the connector by reference; `publisher_start` (`resource`,
+`previous`) is refused unless the resource's lease is live and unsuperseded here, the exclusive route and alias
+are effective, the credential is in Podman's store and the previous publisher is accounted for, then writes
+the governor mark inside the carrier universe, requires the origin to answer ready with the expected logical
+manager, replica and epoch, and runs `cloudflared` as a transient unit from a root-only runtime copy of the
+credential; `publisher_stop` stops it and removes the mark; `activation_fence` does the same first for every
+resource this host no longer holds (`publishers_withdrawn`); `publisher_observed` records an external request;
+`publisher_status` (read-only) reports the unit, the connector's identity, the lease, the origin's readiness and
+`publisher_eligible` with reasons. Every step is recorded in the network effects ledger before it is made.
+
 ## Experimental: the agent's door to a manager universe (development tree, not packaged)
 
 A manager universe runs the frozen manager resident behind one Unix socket at a contract path inside the

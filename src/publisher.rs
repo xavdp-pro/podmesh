@@ -161,6 +161,8 @@ fn origin_ready(ip: &str, port: u16) -> Result<(u16, Value), String> {
 
 /// The governor mark inside the carrier universe: written and removed with `podman exec`, root-only.
 pub(crate) fn mark_write(carrier: &str, resource: &str, epoch: i64) -> Result<(), Error> {
+    // Lab-only: a mark one epoch behind, so that the readiness check has a lie to catch.
+    let epoch = if std::env::var("PODMESH_FAULT").as_deref() == Ok("publisher-stale-mark") { epoch - 1 } else { epoch };
     let content = json!({"resource": resource, "epoch": epoch, "marked_at": crate::now()}).to_string();
     lc::podman(lc::QUICK, &["exec", &format!("podmesh-{carrier}"), "sh", "-c", &format!("umask 077; printf '%s' '{content}' > {MARK_PATH}.tmp && mv -f {MARK_PATH}.tmp {MARK_PATH}")])?;
     Ok(())
