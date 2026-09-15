@@ -423,6 +423,9 @@ pub fn execute(db: &Connection, request: &serde_json::Value) -> Result<serde_jso
     let operation = lc::text(request, "operation")?;
     lc::ensure_schema(db)?;
     ensure_schema(db)?;
+    if operation == "activation_fence_preview" {
+        return fence_preview(db);
+    }
     if operation == "activation_status" {
         let uuid = lc::text(request, "universe_uuid")?;
         lc::token(uuid)?;
@@ -689,6 +692,41 @@ fn perform(db: &Connection, request: &serde_json::Value) -> Result<serde_json::V
 /// A universe is fenced when it is under a policy and this host has no live lease for it --
 /// whether the lease lapsed, was never taken, or belongs to another host. A universe whose
 /// lease is live is left alone, and that is a refusal to act rather than an omission.
+/// What a fence would do now, read-only and unjournaled: the universes under a policy this host
+/// no longer holds a live lease for and that are running, the exclusive routes it no longer
+/// holds, and whether the network ledger carries anything incomplete. A timer asks this first
+/// and journals a fence only when there is something to fence (Codex, I2): the transition is
+/// evidence, the empty tick is not.
+pub(crate) fn fence_preview(db: &Connection) -> Result<serde_json::Value, Error> {
+    let now = crate::now() as i64;
+    let this_host = host_uuid(db)?;
+    let mut statement = db.prepare("SELECT universe_uuid FROM activation_policy ORDER BY universe_uuid")?;
+    let universes: Vec<String> = statement.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    let mut pending = Vec::new();
+    for uuid in universes {
+        let held = lease(db, &uuid)?;
+        let overtaken = match held.as_ref() { Some(l) => superseded(db, &uuid, l)?, None => None };
+        let entitled = held.as_ref().is_some_and(|l| l.holder_host_uuid == this_host && l.expires_at > now && overtaken.is_none());
+        if entitled {
+            continue;
+        }
+        let observed = lc::observe(&uuid)?;
+        if observed["present"] == serde_json::json!(true) && observed["running"] == serde_json::json!(true) {
+            pending.push(serde_json::json!({"universe_uuid": uuid, "what": "running without entitlement"}));
+        }
+        if crate::network::exclusive_route_held(db, &uuid)? {
+            pending.push(serde_json::json!({"resource": uuid, "what": "exclusive route without entitlement"}));
+        }
+    }
+    let incomplete = crate::network::incomplete_effects(db)?;
+    Ok(serde_json::json!({
+        "pending": pending,
+        "incomplete_network_effects": incomplete,
+        "nothing_to_fence": pending.is_empty() && incomplete == 0,
+        "scope": "read-only, not journaled: what activation_fence would act on now, from this host's journal and Podman; a fence must follow to act",
+    }))
+}
+
 fn fence(db: &Connection, id: &str, timeout: u64) -> Result<serde_json::Value, Error> {
     let now = crate::now() as i64;
     let this_host = host_uuid(db)?;

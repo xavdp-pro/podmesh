@@ -30,6 +30,12 @@ esac
 case "$timeout" in
   ''|*[!0-9]*) echo "podmesh-fence: the mandate's timeout_seconds is not a number; nothing is fenced" >&2; exit 3 ;;
 esac
+# Status first: a tick with nothing to fence journals nothing (the empty tick is not evidence,
+# the transition is). The preview is read-only and unjournaled; anything pending, anything the
+# network ledger holds incomplete, or a preview that cannot be read, leads to the journaled fence.
+if preview=$("$cli" activation_fence_preview 2>/dev/null) && printf '%s' "$preview" | grep -q '"nothing_to_fence": true'; then
+  exit 0
+fi
 request=$(mktemp)
 trap 'rm -f "$request"' EXIT
 printf '{"operation_id":"%s","authorization_ref":"%s","timeout_seconds":%s}\n' "$(cat /proc/sys/kernel/random/uuid)" "$ref" "$timeout" > "$request"

@@ -324,6 +324,11 @@ lease. `stop` is never gated.
   shortest lease, or a lapsed lease leaves a universe running. It also withdraws every exclusive route (below)
   published under a resource this host no longer holds a live, unsuperseded lease for, verified from the
   kernel, and reports them as `routes_withdrawn`; a withdrawal that does not take is reported, never claimed.
+  It reconciles the network ledger first (`network_reconciliation`).
+- `activation_fence_preview` (read-only, not journaled; no fields) says what a fence would act on now:
+  `pending` (universes running without entitlement, exclusive routes without entitlement),
+  `incomplete_network_effects`, and `nothing_to_fence`. A timer asks it first and journals a fence only when
+  there is something to fence, so an idle host's journal does not grow with empty ticks.
 
 **Epochs, from the fencing laboratory.** `experiments/manager-fencing` in the web tree models exclusion as an
 epoch issued by one external gate, rotated only by an explicit trusted action, with each maker keeping a durable
@@ -427,8 +432,12 @@ A manager universe runs the frozen manager resident behind one Unix socket at a 
 universe (`/run/podmesh-manager/control.sock`), reachable by nothing outside it. PodMesh offers the one door:
 two typed operations over the same root-only API, with `authorization_ref` as provenance, carried by a copy of
 the daemon entered into the universe's PID namespace (the resident checks the peer's credentials, and a peer
-whose PID is not visible from the universe is refused whatever its UID). The agent never sees the socket, and
-PodMesh adds nothing to the resident's protocol.
+whose PID is not visible from the universe is refused whatever its UID). The PID read from Podman is bound to
+the container it was read from — the process must sit in that container's cgroup, and its start time is
+recorded — and checked again right before the relay is spawned and after it returns: a universe restarted or
+replaced in between is refused ("changed between its inspection and the relay"), and an answer that came
+back after such a change is not trusted. The agent never sees the socket, and PodMesh adds nothing to the
+resident's protocol.
 
 - `manager_status` (read-only): the resident's bounded live diagnostic (replica identity, peer counters), never
   its facts, which are read from the store. Refused when the universe is not here, not running, or carries no

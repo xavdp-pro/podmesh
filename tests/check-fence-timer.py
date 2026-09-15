@@ -64,6 +64,11 @@ def announced():
 def timer_running():
     return A.ssh(f'systemctl is-active {TIMER}.timer', check=False).stdout.decode().strip() == 'active'
 
+def fence_operations():
+    """How many journaled fence operations the host's journal holds: the timer must add none while
+    there is nothing to fence (Codex, I2), and one when there is."""
+    return int(A.ssh(f'sudo -n python3 -c "import sqlite3;print(sqlite3.connect(\'file:{state_dir}/state.sqlite?mode=ro\',uri=True).execute(\\"select count(*) from operations where request like \'%activation_fence%\'\\").fetchone()[0])"').stdout.decode().strip())
+
 initial = {'routes': routes(), 'networks': networks()}
 u = str(uuid.uuid4())
 mandate = f'/run/podmesh-fence-lab-{uuid.uuid4()}'
@@ -95,12 +100,13 @@ try:
     A.ssh(f'sudo -n sh -c \'umask 077; printf "authorization_ref=mandate:lab-fence-timer\\ntimeout_seconds=5\\n" > {mandate}\'')
     A.ssh(f'sudo -n systemd-run --quiet --unit={TIMER} --on-active=1 --on-unit-active=2 --timer-property=AccuracySec=1s '
           f'--setenv=PODMESH_SOCKET={socket_path} --setenv=PODMESH_CLI={CLI} --setenv=PODMESH_FENCE_MANDATE={mandate} /usr/local/lib/podmesh-fence-lab/podmesh-fence')
+    journaled_before = fence_operations()
     time.sleep(6)
     assert timer_running(), 'the transient timer is not running'
     assert announced() and carries(u), 'a live lease was fenced'
-    ran = int(A.ssh(f'sudo -n journalctl -u {TIMER}.service --no-pager -o cat 2>/dev/null | grep -c routes_withdrawn', check=False).stdout.decode().strip() or 0)
-    assert ran >= 1, 'the timer has not run the fence yet'
-    checks.append(f'the timer ran the fence {ran} time(s) while the lease was live: nothing withdrawn, the universe still carrying the address')
+    ticks = int(A.ssh(f'sudo -n journalctl -u {TIMER}.service --no-pager -o short 2>/dev/null | grep -c "Finished\\|Deactivated"', check=False).stdout.decode().strip() or 0)
+    assert fence_operations() == journaled_before, 'a tick with nothing to fence journaled a fence'
+    checks.append(f'the timer ticked while the lease was live: nothing withdrawn, and nothing journaled (the preview answered nothing_to_fence), the universe still carrying the address')
 
     # 3. the lease lapses on the host's own clock, nobody renews it, nobody calls anything: within one
     #    interval after the lapse the route and the address are gone, the universe still runs
@@ -115,10 +121,11 @@ try:
         time.sleep(1)
     assert withdrawn_at is not None, f'the lapsed role is still announced ({announced()}) or carried ({carries(u)}) fifteen seconds after the lapse'
     assert running(u), 'the universe under no policy was stopped'
+    assert fence_operations() == journaled_before + 1, (fence_operations(), journaled_before)
     report = A.ssh(f'sudo -n journalctl -u {TIMER}.service --no-pager -o cat | grep -m1 "mandate:lab-fence-timer"', check=False).stdout.decode()
     status = A.ok(hostwide('network_status'))
     assert not any(r['ip'] == SERVICE for r in status['effective']['published_routes']), status['effective']['published_routes']
-    checks.append(f'lease lapsed at {deadline} on the host\'s clock; the route and the address withdrawn by the timer\'s fence by {withdrawn_at} ({withdrawn_at - deadline} s after the lapse), the universe still running, nothing called by the agent')
+    checks.append(f'lease lapsed at {deadline} on the host\'s clock; the route and the address withdrawn by the timer\'s fence by {withdrawn_at} ({withdrawn_at - deadline} s after the lapse), the universe still running, nothing called by the agent; exactly one fence journaled')
     print(json.dumps({'result': 'PASS', 'checks': checks, 'lease_seconds': LEASE, 'acquired_at': acquired_at, 'expires_at': deadline, 'withdrawn_at': withdrawn_at,
                       'not_proven': ['the packaged timer unit itself: the lab runs the packaged script under a transient timer with a 2-second interval, the package ships 5 seconds',
                                      'a host whose clock lies: the lapse is on the host\'s own clock, as the design states']}, indent=2))

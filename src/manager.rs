@@ -74,15 +74,36 @@ fn locate(uuid: &str) -> Result<(Door, Value), Error> {
     if !socket.exists() {
         return Err(format!("manager operation refused: the universe carries no control socket at the manager contract path /{CONTROL_SOCKET}; it is not a manager universe, or its resident has not created it").into());
     }
-    let facts = json!({"container_id": c["Id"], "pid": pid, "image": c["Image"],
+    let container_id = c["Id"].as_str().ok_or("the container reports no identity")?.to_string();
+    // The PID is bound to the container it was read from: the process must sit in that container's
+    // cgroup, and its start time is recorded so that the same PID reused by another process is told
+    // apart. Checked again right before the relay is spawned and after it returns (Codex, I3).
+    let started = identity(pid, &container_id).ok_or_else(|| format!("manager operation refused: PID {pid} is not a process of container {container_id}; the universe changed under the operation"))?;
+    let facts = json!({"container_id": container_id, "pid": pid, "process_started": started, "image": c["Image"],
                        "network_profile": c["Config"]["Labels"][crate::network::LABEL_PROFILE]});
-    Ok((Door { pid, socket }, facts))
+    Ok((Door { pid, socket, container_id, started }, facts))
 }
 
-/// The universe's PID and the socket path through its root: what the relay needs.
+/// The universe's PID, its container's identity and the process's start time, and the socket
+/// path through its root: what the relay needs and what binds it to one incarnation.
 struct Door {
     pid: i64,
     socket: std::path::PathBuf,
+    container_id: String,
+    started: String,
+}
+
+/// The start time of a PID that sits in the container's cgroup, from /proc; `None` when the PID
+/// is gone, belongs to another cgroup, or cannot be read -- every one a reason to refuse.
+fn identity(pid: i64, container_id: &str) -> Option<String> {
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    if !cgroup.contains(&format!("libpod-{container_id}")) {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 22 counts after the parenthesised command name, which may itself hold spaces.
+    let after = &stat[stat.rfind(')')? + 2..];
+    after.split_whitespace().nth(19).map(str::to_string)
 }
 
 fn observe(request: &Value, uuid: &str) -> Result<Value, Error> {
@@ -119,6 +140,10 @@ fn observe(request: &Value, uuid: &str) -> Result<Value, Error> {
 /// it can identify. The relay's stdout is the reply; a relay that fails says why on stderr.
 fn control(door: &Door, request: &Value) -> Result<Value, Error> {
     let exe = std::env::current_exe()?;
+    lc::fault("manager-before-relay")?;
+    if identity(door.pid, &door.container_id).as_deref() != Some(door.started.as_str()) {
+        return Err(format!("manager operation refused: the process of container {} changed between its inspection and the relay (PID {} gone, reused, or moved); nothing was sent", door.container_id, door.pid).into());
+    }
     let mut child = std::process::Command::new("nsenter")
         .args(["-t", &door.pid.to_string(), "-p", "--"])
         .arg(&exe)
@@ -133,6 +158,12 @@ fn control(door: &Door, request: &Value) -> Result<Value, Error> {
     let out = child.wait_with_output()?;
     if !out.status.success() {
         return Err(format!("the control relay failed: {}", String::from_utf8_lossy(&out.stderr).trim()).into());
+    }
+    // The same incarnation must still be there after the relay, or the answer came from something
+    // else and is not trusted; a journaled observation then fails and its retry replays the same
+    // operation ID against the resident, which appends nothing twice.
+    if identity(door.pid, &door.container_id).as_deref() != Some(door.started.as_str()) {
+        return Err(format!("manager operation refused: the process of container {} changed during the relay; its answer is not trusted", door.container_id).into());
     }
     if out.stdout.len() > REPLY_LIMIT {
         return Err("the resident's reply exceeded the protocol ceiling; refused rather than truncated".into());

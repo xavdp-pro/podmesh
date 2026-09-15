@@ -607,21 +607,7 @@ fn compensate(db: &Connection, effects: &[Effect]) -> Vec<Value> {
     report
 }
 
-/// Lab-only fault injection, read from `PODMESH_FAULT`: `<point>` makes the daemon fail at that
-/// point as a storage failure would; `<point>:crash` ends the process there, as a crash would.
-/// Nothing sets this variable in the packaged units; the crash-safety check sets it on the
-/// transient laboratory unit and restarts the daemon to watch reconciliation.
-fn fault(point: &str) -> Result<(), Error> {
-    let Ok(spec) = std::env::var("PODMESH_FAULT") else { return Ok(()) };
-    if spec == format!("{point}:crash") {
-        eprintln!("PodMesh fault injection: crashing at {point}");
-        std::process::exit(70);
-    }
-    if spec == point {
-        return Err(format!("simulated storage failure at {point}; nothing is recorded as effective").into());
-    }
-    Ok(())
-}
+use crate::lifecycle::fault;
 
 /// Undo every effect that is not effective, complete every declaration or route whose effects
 /// are gone, release every allocation whose container is gone, and report drift: an effective
@@ -1128,4 +1114,17 @@ fn alias_remove(carrier: &str, ip: &str) -> Result<(), Error> {
         Some(true) => Err(format!("{ip} is still carried by universe {carrier} after its removal").into()),
         None => Err(format!("the addresses of universe {carrier} could not be read after the removal; its state is unknown").into()),
     }
+}
+
+/// Whether an exclusive route is recorded here under this resource: what the fence preview asks.
+pub(crate) fn exclusive_route_held(db: &Connection, resource: &str) -> Result<bool, Error> {
+    ensure_schema(db)?;
+    let n: i64 = db.query_row("SELECT COUNT(*) FROM network_routes WHERE exclusive_resource=?1", [resource], |r| r.get(0))?;
+    Ok(n > 0)
+}
+
+/// How many effects are not effective: what the fence preview reports, read-only.
+pub(crate) fn incomplete_effects(db: &Connection) -> Result<usize, Error> {
+    ensure_schema(db)?;
+    Ok(effect_rows(db, None)?.iter().filter(|e| e.state != "effective").count())
 }

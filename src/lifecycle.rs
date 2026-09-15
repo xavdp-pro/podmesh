@@ -583,6 +583,28 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
 /// (flat, marked `replayed` and `historical`) and never executed again, a pending one -- an
 /// interrupted attempt -- re-evaluated by running again, and a durable attempt record either
 /// way. The canonical form compared is the request's own serialization, exactly as above.
+/// Lab-only fault injection, read from `PODMESH_FAULT`: `<point>` makes the daemon fail at that
+/// point as a storage failure would; `<point>:crash` ends the process there, as a crash would;
+/// `<point>:delay` holds it three seconds there, so that a race can be forced from outside.
+/// Nothing sets this variable in the packaged units; the laboratory sets it on the transient
+/// unit and restarts the daemon to watch what follows.
+pub(crate) fn fault(point: &str) -> Result<(), Error> {
+    let Ok(spec) = std::env::var("PODMESH_FAULT") else { return Ok(()) };
+    if spec == format!("{point}:crash") {
+        eprintln!("PodMesh fault injection: crashing at {point}");
+        std::process::exit(70);
+    }
+    if spec == format!("{point}:delay") {
+        eprintln!("PodMesh fault injection: holding three seconds at {point}");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        return Ok(());
+    }
+    if spec == point {
+        return Err(format!("simulated storage failure at {point}; nothing is recorded as effective").into());
+    }
+    Ok(())
+}
+
 pub(crate) fn journaled(
     db: &Connection,
     request: &Value,

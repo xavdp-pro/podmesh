@@ -177,9 +177,15 @@ an exclusive route (`network_route_publish` with `exclusive_resource`, the servi
 a logical manager whose replicas all keep running) is withdrawn, verified from the kernel, once
 this host's lease on that resource has lapsed or been superseded.
 
-**The timer, packaged and disabled (2026-09-15).** `packaging/podmesh-fence` is what a
-systemd timer runs so that a host fences *itself* once its leases lapse on its own clock — the
-one case no agent covers, a host the agent cannot reach. It refuses to run without the
+**The timer, packaged and disabled (2026-09-15) — lease-expiry self-withdrawal, not host
+fencing.** `packaging/podmesh-fence` is what a systemd timer runs so that a host withdraws
+*itself* — stops what it is no longer entitled to run, takes back the address it is no longer
+entitled to carry — once its leases lapse on its own clock: the one case no agent covers, a host
+the agent cannot reach. It depends on the daemon it runs through (`Requisite=podmesh.service`)
+and on the host being alive: a wedged daemon or a dead host is not fenced by it, which is why
+Codex names it lease-expiry self-withdrawal and why an out-of-band adapter remains a later lot.
+It asks `activation_fence_preview` first and journals a fence only when something is pending,
+so an idle host's journal does not grow with its ticks. It refuses to run without the
 operator's mandate file (`/etc/podmesh/fence-mandate`: `authorization_ref`, recorded as
 provenance in every fence, and `timeout_seconds`), builds one typed `activation_fence` request
 with a fresh operation ID, and hands it to the CLI; it decides nothing. `podmesh-fence.timer`
@@ -561,9 +567,29 @@ a 5-second margin; the self-fence; no timer. Signing stays open — there is no 
   makes that side runnable as a tool rather than a test; whether it may ever be a timer is a
   production mandate, exactly as for the collector.
 
-## What this document does not claim
+## What this document does not claim (reconciled on 2026-09-15)
 
-Nothing here is implemented. No lot has been opened. The G2 campaign proves fact replication
-and its accounting; it proves nothing about containers, failover, fencing or addresses, and
-its own output says so. The Backup Server has a design GO and no code. Level 2, the first
-level that deserves the name, is gated on the Backup Server existing.
+The paragraph that stood here until 2026-09-15 said that nothing was implemented and no lot had
+opened; it was true on 2026-09-13 and is kept only as that date's statement. Since then, lots
+H1–H10, M5 and M-U1/M-U2 were built and measured on the laboratory's three hosts, and
+Codex's review of 2026-09-15 gave GO for that laboratory result. What still is **not** claimed:
+
+- **Production HA.** Everything above is measured on three laboratory hosts with transient
+  daemons; nothing is deployed, and the packaged candidate that follows Codex's blockers is an
+  *experimental candidate qualified on the laboratory*, not production.
+- **Host fencing.** The self-fence, and the timer that runs it under a mandate, are lease-expiry
+  self-withdrawal: they need the daemon and the host alive. An out-of-band adapter and a real
+  power-loss test are their own lots.
+- **A movable replica.** A replica's address lives in its host's pool; recovery after a host
+  loss needs the address to move with the replica (`/32` and alias, as the service address
+  does), not built yet.
+- **Signed recovery points.** Manifests are unsigned and say so; Ed25519 over canonical bytes
+  is decided and not built.
+- **A production authority.** The laboratory's single SQLite gate is qualified for the
+  laboratory candidate only.
+- **The Backup Server.** A design GO, no code; the next control-service universe, separate
+  from the manager, with its own bootstrap and restore proof before any HA policy.
+
+The decisions listed under "What is the operator's to decide" were taken by Codex on the
+operator's behalf on 2026-09-15 (`CODEX-REVIEW-M-U2-AND-DIRECTION-2026-09-15.md`); the list
+stays as the record of what was open and recommended.
