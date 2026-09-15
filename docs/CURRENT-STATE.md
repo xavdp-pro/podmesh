@@ -532,7 +532,13 @@ operator's eight decisions applied, and a ten-step order. **B1 done** the same d
 effects ledger (every kernel mutation recorded and committed before it is made), compensation
 in every error path, reconciliation at startup, before every mutation and at every fence, lab
 fault injection, and `tests/check-network-crash-safety.py` (eight fault cases, each finished or
-undone by the restart). The rest follows in Codex's order.
+undone by the restart). **B2 done** the same day: one generic Alpine image with no
+configuration and no key; PodMesh secrets (`secret_declare` from a root-only inbox file into
+Podman's store, `create` with `secrets` mounted root-only at a target and labelled by name,
+`secret_remove` refused while carried, `secret_status` without content; restore reports the
+source's secrets by name, promote takes them again); `tests/check-secrets-image-free.py` (the
+image save and the container export scanned for every pair key and identity) and every manager
+suite rerun on the generic image with secrets. The rest follows in Codex's order.
 
 ## Next actions, in order
 

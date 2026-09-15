@@ -20,7 +20,8 @@ host's fence withdraws it before the new governor publishes, and that no replica
 import io, json, os, pathlib, subprocess, sys, tarfile, tempfile, time, uuid, hashlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from podmesh_two_hosts import Host, request  # noqa: E402
+from podmesh_two_hosts import Host, request
+from podmesh_manager_lab import declare_replica_config, remove_replica_config, replica_create, secrets_for  # noqa: E402  # noqa: E402
 
 TOOL = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools', 'ha-standby.py')
 socket_path = os.environ.get('PODMESH_SOCKET', '/run/podmesh/api.sock')
@@ -158,7 +159,8 @@ try:
         peers = [{'pool': POOLS[o], 'via': lab_hosts[o]} for o in hosts if o != a]
         h.ok(hostwide('network_declare', network_uuid=NET, prefix=PREFIX, pool=POOLS[a], peer_pools=peers)); declared.add(a)
     for a, h in hosts.items():
-        h.ok(request('create', universes[a], reference, image=image_on(h, a), command=['/usr/local/bin/manager-universe'], network_profile='managed', network_address=addresses[a]))
+        declare_replica_config(h, a, reference, state_dir)
+        replica_create(h, universes[a], a, reference, addresses[a], request)
         started = h.ok(request('start', universes[a], reference, observe_seconds=3))
         assert started['application_outcome'] == 'running_when_observed', (started['application_outcome'], h.call('podman_run', args=['logs', 'podmesh-' + universes[a]], check=False))
     converged(3)
@@ -207,7 +209,7 @@ try:
     checks.append('facts still converged after the takeover: replication was never interrupted')
 
     # 6a. duplicate address: a fourth universe asking for a replica's address is refused
-    refused(A, request('create', str(uuid.uuid4()), reference, image=image_on(A, 'lab-a'), command=['sleep', '60'], network_profile='managed', network_address=addresses['lab-a']),
+    refused(A, request('create', str(uuid.uuid4()), reference, image=image_on(A, 'generic'), command=['sleep', '60'], network_profile='managed', network_address=addresses['lab-a']),
             'allocated to another universe', 'a second universe at an allocated address')
     # 6b. peer loss and reconnection: lab-c's replica stops, the two others stay converged; it comes back with a new boot fact
     C.ok(request('stop', universes['lab-c'], reference, timeout_seconds=15, on_timeout='kill'))
@@ -227,6 +229,7 @@ finally:
         h.api(request('stop', universes[a], reference, timeout_seconds=15, on_timeout='kill'))
         h.api(request('delete', universes[a], reference))
         h.call('podman_run', args=['rm', '--force', '--time', '0', 'podmesh-' + universes[a]], check=False)
+        remove_replica_config(h, a, reference)
         if a in declared:
             r = h.api(hostwide('network_undeclare', network_uuid=NET))
             if not r.get('ok'):

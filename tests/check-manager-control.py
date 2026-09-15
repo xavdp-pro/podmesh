@@ -18,6 +18,7 @@ import io, json, os, sys, tarfile, tempfile, time, uuid, hashlib, subprocess
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from podmesh_two_hosts import Host, request  # noqa: E402
+from podmesh_manager_lab import declare_replica_config, remove_replica_config, replica_create  # noqa: E402
 
 socket_path = os.environ.get('PODMESH_SOCKET', '/run/podmesh/api.sock')
 state_dir = os.environ.get('PODMESH_STATE_DIR', '/var/lib/podmesh')
@@ -93,8 +94,8 @@ declared = False
 try:
     peers = [{'pool': POOLS['lab-b'], 'via': VIAS[0]}, {'pool': POOLS['lab-c'], 'via': VIAS[1]}]
     A.ok(hostwide('network_declare', network_uuid=NET, prefix=PREFIX, pool=POOLS['lab-a'], peer_pools=peers)); declared = True
-    A.ok(request('create', u, reference, image=image('localhost/podmesh-manager-universe:m-u2-lab-a'), command=['/usr/local/bin/manager-universe'],
-                 network_profile='managed', network_address=replica['address']))
+    declare_replica_config(A, 'lab-a', reference, state_dir)
+    replica_create(A, u, 'lab-a', reference, replica['address'], request)
     refused(request('manager_status', u, reference), 'not running', 'status of a manager universe that is not running')
     assert A.ok(request('start', u, reference, observe_seconds=3))['application_outcome'] == 'running_when_observed'
     status = A.ok(request('manager_status', u, reference))
@@ -145,6 +146,7 @@ finally:
         A.api(request('stop', x, reference, timeout_seconds=15, on_timeout='kill'))
         A.api(request('delete', x, reference))
         A.call('podman_run', args=['rm', '--force', '--time', '0', 'podmesh-' + x], check=False)
+    remove_replica_config(A, 'lab-a', reference)
     if declared:
         r = A.api(hostwide('network_undeclare', network_uuid=NET))
         if not r.get('ok'):

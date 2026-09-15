@@ -76,6 +76,8 @@ enum Params<'a> {
         command: Vec<&'a str>,
         profile: &'a str,
         address: Option<&'a str>,
+        /// Podman `--secret` arguments and the label naming them, from `secrets::mounts`.
+        secrets: (Vec<String>, Option<String>),
     },
     Clone {
         source: &'a str,
@@ -355,7 +357,7 @@ pub(crate) fn owned(db: &Connection, c: &Value, uuid: &str, role: &str) -> Resul
     }
     Ok(())
 }
-fn parse<'a>(operation: &str, uuid: &str, request: &'a Value) -> Result<Params<'a>, Error> {
+fn parse<'a>(db: &Connection, operation: &str, uuid: &str, request: &'a Value) -> Result<Params<'a>, Error> {
     Ok(match operation {
         "create" => {
             let image = text(request, "image")?;
@@ -381,7 +383,9 @@ fn parse<'a>(operation: &str, uuid: &str, request: &'a Value) -> Result<Params<'
             if address.is_some() && profile != crate::network::PROFILE_MANAGED {
                 return Err("network_address is only meaningful with the managed profile".into());
             }
-            Params::Create { image, command, profile, address }
+            // Secrets are mounted from Podman's store, never from an image: names and targets only.
+            let secrets = crate::secrets::mounts(db, request)?;
+            Params::Create { image, command, profile, address, secrets }
         }
         "clone" => {
             let source = text(request, "source_uuid")?;
@@ -525,7 +529,7 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
     if !OPERATIONS.contains(&operation) {
         return Err("Unsupported lifecycle operation".into());
     }
-    let params = parse(operation, uuid, request)?;
+    let params = parse(db, operation, uuid, request)?;
     ensure_schema(db)?;
     let canonical = request.to_string();
     let previous: Option<(String, String, Option<String>)> = db
@@ -728,7 +732,7 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
         migration::refuse_identity_reuse(db, uuid, params.name())?;
     }
     match params {
-        Params::Create { image, command, profile, address } => create(db, id, uuid, &name, existing, image, command, profile, *address),
+        Params::Create { image, command, profile, address, secrets } => create(db, id, uuid, &name, existing, image, command, profile, *address, secrets),
         Params::Clone { source } => clone(db, id, uuid, source, &name, existing),
         Params::Delete => delete(db, uuid, &name, existing),
         Params::Start { observe_seconds } => start(db, attempt, id, uuid, &name, existing, *observe_seconds),
@@ -764,7 +768,7 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
     }
 }
 #[allow(clippy::too_many_arguments)]
-fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Value>, image: &str, command: &[&str], profile: &str, address: Option<&str>) -> Result<Value, Error> {
+fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Value>, image: &str, command: &[&str], profile: &str, address: Option<&str>, secrets: &(Vec<String>, Option<String>)) -> Result<Value, Error> {
     if let Some(ref c) = existing {
         if label(c, CREATION) != Some(id) {
             return Err("Universe already exists under another creation operation".into());
@@ -792,7 +796,14 @@ fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Va
             }
             None => args.push("--network=none"),
         }
-        args.extend(["--name", name, "--label", &label, "--label", &provenance, "--label", &profile_label, image]);
+        args.extend(["--name", name, "--label", &label, "--label", &provenance, "--label", &profile_label]);
+        for a in &secrets.0 {
+            args.push(a.as_str());
+        }
+        if let Some(l) = &secrets.1 {
+            args.extend(["--label", l.as_str()]);
+        }
+        args.push(image);
         args.extend(command);
         if let Err(e) = podman(QUICK, &args) {
             // A managed create that did not produce a container releases its address; nothing is kept

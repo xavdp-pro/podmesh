@@ -18,6 +18,7 @@ import io, json, os, pathlib, subprocess, sys, tarfile, tempfile, time, uuid, ha
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from podmesh_two_hosts import Host, request, transfer  # noqa: E402
+from podmesh_manager_lab import declare_replica_config, remove_replica_config, replica_create, secrets_for  # noqa: E402
 
 TOOL = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools', 'ha-standby.py')
 socket_path = os.environ.get('PODMESH_SOCKET', '/run/podmesh/api.sock')
@@ -156,7 +157,8 @@ try:
         peers = [{'pool': POOLS[o], 'via': lab_hosts[o]} for o in hosts if o != a]
         h.ok(hostwide('network_declare', network_uuid=NET, prefix=PREFIX, pool=POOLS[a], peer_pools=peers)); declared.add(a)
     for a, h in hosts.items():
-        h.ok(request('create', universes[a], reference, image=image_on(h, a), command=['/usr/local/bin/manager-universe'], network_profile='managed', network_address=addresses[a]))
+        declare_replica_config(h, a, reference, state_dir)
+        replica_create(h, universes[a], a, reference, addresses[a], request)
         started = h.ok(request('start', universes[a], reference, observe_seconds=3))
         assert started['application_outcome'] == 'running_when_observed', (started['application_outcome'], h.call('podman_run', args=['logs', 'podmesh-' + universes[a]], check=False))
     converged(3)
@@ -196,8 +198,10 @@ try:
     C.ok(request('activation_acquire', universes['lab-c'], reference))
     refused(C, request('recovery_point_promote', universes['lab-c'], reference, restored_universe_uuid=quarantine, network_profile='managed', network_address=addresses['lab-a']),
             'outside', 'a promotion at an address outside this host\'s pool')
-    promoted = C.ok(request('recovery_point_promote', universes['lab-c'], reference, restored_universe_uuid=quarantine, network_profile='managed', network_address=restored['source_network']['ip']))
+    assert restored['source_secrets'] == secrets_for('lab-c'), restored['source_secrets']
+    promoted = C.ok(request('recovery_point_promote', universes['lab-c'], reference, restored_universe_uuid=quarantine, network_profile='managed', network_address=restored['source_network']['ip'], secrets=restored['source_secrets']))
     assert promoted['network'] == {'profile': 'managed', 'requested_address': addresses['lab-c']}, promoted['network']
+    assert promoted['secrets'] == secrets_for('lab-c'), promoted['secrets']
     insp = json.loads(C.call('podman_run', args=['inspect', 'podmesh-' + universes['lab-c']])['stdout'])[0]
     assert insp['Config']['Labels']['io.podmesh.universe-ip'] == addresses['lab-c'] and insp['Config']['Labels']['io.podmesh.network-profile'] == 'managed', insp['Config']['Labels']
     assert insp['State']['Status'] == 'created', insp['State']
@@ -221,6 +225,7 @@ finally:
         h.api(request('stop', universes[a], reference, timeout_seconds=15, on_timeout='kill'))
         h.api(request('delete', universes[a], reference))
         h.call('podman_run', args=['rm', '--force', '--time', '0', 'podmesh-' + universes[a]], check=False)
+        remove_replica_config(h, a, reference)
     C.api(request('delete', quarantine, reference))
     C.call('podman_run', args=['rm', '--force', '--time', '0', 'podmesh-' + quarantine], check=False)
     C.api(request('activation_release', universes['lab-c'], reference))

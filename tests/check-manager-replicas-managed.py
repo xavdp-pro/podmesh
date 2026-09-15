@@ -21,7 +21,8 @@ returns every host's routes and networks to their initial state.
 import io, json, os, sys, tarfile, tempfile, time, uuid, hashlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from podmesh_two_hosts import Host, request  # noqa: E402
+from podmesh_two_hosts import Host, request
+from podmesh_manager_lab import declare_replica_config, remove_replica_config, replica_create, secrets_for  # noqa: E402  # noqa: E402
 
 socket_path = os.environ.get('PODMESH_SOCKET', '/run/podmesh/api.sock')
 state_dir = os.environ.get('PODMESH_STATE_DIR', '/var/lib/podmesh')
@@ -120,7 +121,8 @@ try:
 
     # 2. three replicas created at the addresses their configurations name, and started together
     for a, h in hosts.items():
-        c = h.ok(request('create', universes[a], reference, image=image_on(h, a), command=['/usr/local/bin/manager-universe'], network_profile='managed', network_address=addresses[a]))
+        declare_replica_config(h, a, reference, state_dir)
+        c = replica_create(h, universes[a], a, reference, addresses[a], request)
         assert c['network']['requested']['ip'] == addresses[a], c['network']
     for a, h in hosts.items():
         s = h.ok(request('start', universes[a], reference, observe_seconds=3))
@@ -156,6 +158,7 @@ finally:
         h.api(request('stop', universes[a], reference, timeout_seconds=15, on_timeout='kill'))
         h.api(request('delete', universes[a], reference))
         h.call('podman_run', args=['rm', '--force', '--time', '0', 'podmesh-' + universes[a]], check=False)
+        remove_replica_config(h, a, reference)
         if a in declared:
             r = h.api(hostwide('network_undeclare', network_uuid=NET))
             if not r.get('ok'):

@@ -103,6 +103,7 @@ fn promotion_view(db: &Connection, id: &str, replayed: bool) -> Result<Option<Va
                 .flatten();
             let request: Value = created.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
             v["network"] = json!({"profile": request["network_profile"], "requested_address": request["network_address"]});
+            v["secrets"] = request.get("secrets").cloned().unwrap_or(json!([]));
             v
         }))
 }
@@ -515,6 +516,9 @@ fn restore(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error>
         "ip": labels[crate::network::LABEL_IP],
         "network_uuid": labels[crate::network::LABEL_NETWORK],
     });
+    // The secrets the source carried, by name and target only: a promotion that wants them back
+    // names them (`secrets`), after declaring them on this host; the quarantined copy carries none.
+    view["source_secrets"] = crate::secrets::from_label(labels);
     Ok(view)
 }
 
@@ -609,6 +613,11 @@ fn promote(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error>
     });
     if let Some(address) = request.get("network_address") {
         create_request["network_address"] = address.clone();
+    }
+    // Secrets are the caller's decision too, by name: the restore reported what the source carried,
+    // and each must be declared on this host (secret_declare) before the promotion asks for it.
+    if let Some(secrets) = request.get("secrets") {
+        create_request["secrets"] = secrets.clone();
     }
     let created = lc::execute(db, &create_request)?;
     let container_id = created_container(&created)?;

@@ -4,6 +4,7 @@ mod recovery_point;
 mod retention;
 mod network;
 mod manager;
+mod secrets;
 pub use manager::control_relay;
 pub use network::reconcile as reconcile_network;
 mod collector;
@@ -118,6 +119,7 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
             "garbage_collect_plan" | "garbage_collect_apply" => collector::execute(db, request)?,
             "collection_retention_declare" | "collection_hold_declare" | "collection_hold_release" | "collection_status" => retention::execute(db, request)?,
             "manager_status" | "manager_observe" => manager::execute(db, request)?,
+            "secret_declare" | "secret_remove" | "secret_status" => secrets::execute(db, request)?,
             "network_declare" | "network_undeclare" | "network_route_publish" | "network_route_withdraw" | "network_status" => network::execute(db, request)?,
             "activation_require" | "activation_acquire" | "activation_renew" | "activation_release"
             | "activation_supersede" | "activation_status" | "activation_fence" => activation::execute(db, request)?,
@@ -129,7 +131,7 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
                 "experimental_operations":["migration_preflight","migration_checkpoint","migration_status","migration_authorize_transfer",
                     "migration_complete_transfer","migration_retire_source","migration_release","migration_abandon","migration_restore_local",
                     "migration_destination_preflight","migration_restore","migration_restore_abort",
-                    "garbage_collect_plan","garbage_collect_apply","collection_retention_declare","collection_hold_declare","collection_hold_release","collection_status","network_declare","network_undeclare","network_route_publish","network_route_withdraw","network_status","manager_status","manager_observe"],
+                    "garbage_collect_plan","garbage_collect_apply","collection_retention_declare","collection_hold_declare","collection_hold_release","collection_status","network_declare","network_undeclare","network_route_publish","network_route_withdraw","network_status","manager_status","manager_observe","secret_declare","secret_remove","secret_status"],
                 "experimental_contracts":{
                     "migration_preflight":"read-only compatibility report bound to universe UUID, container ID, image ID, source and destination host UUIDs; no reservation, suspension or artifact",
                     "migration_checkpoint":"source: fresh checks before suspension, durable reservation, checkpoint with the packaged podmesh-vzcriu runtime in its own scope, archive/manifest/hashes under the state directory; never an authorization to restore",

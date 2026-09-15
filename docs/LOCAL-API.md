@@ -404,6 +404,21 @@ remains (`network_status`: `effects`, `incomplete_effects`).
   nothing runs at `via` here. `network_route_withdraw` (`universe_uuid`) removes the routes of a universe,
   and the alias with them.
 
+## Experimental: secrets a universe is given at creation (development tree, not packaged)
+
+A secret's bytes never enter an image layer, this journal, or the API line. The operator (or the agent, over
+root SSH) places the file under `inbox/secrets/<source>` of the state directory, root-owned with no group or
+other permission, and asks `secret_declare` (`name`, `source`, optional `replace`): the daemon hands the bytes
+to Podman's secret store under the name, records the name, digest and size, and removes the inbox copy; a
+second declaration with another content is refused without `replace`. `create` takes `secrets`
+`[{name, target}]`: each must be declared here and present in Podman's store; it is mounted at the target,
+root-only (0600), and the container is labelled with names and targets only. `recovery_point_restore` reports
+the source's `source_secrets` by name; `recovery_point_promote` takes `secrets` to attach them again, once
+declared on the promoting host. `secret_remove` (`name`) refuses while any container carries the name, running
+or stopped. `secret_status` (read-only) lists names, digests and presence in the store, never content. The
+durable copy of a secret is the operator's, outside PodMesh; Podman's store at rest is root-only files on the
+host, the laboratory's accepted boundary.
+
 ## Experimental: the agent's door to a manager universe (development tree, not packaged)
 
 A manager universe runs the frozen manager resident behind one Unix socket at a contract path inside the
