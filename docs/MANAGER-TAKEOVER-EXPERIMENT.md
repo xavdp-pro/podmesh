@@ -117,6 +117,13 @@ its managed address and started: it caught up the missed fact from both peers, a
 boot fact, and the three converged again, the governor's announcement never moving. The rescue is
 on the same host, since a replica's address lives in its host's pool; a host loss is not shown.
 
+**The agent's door (2026-09-15):** PodMesh now carries two typed operations to a manager
+universe's control socket, `manager_status` and `manager_observe`, through the universe's own
+namespaces on its host — the resident refuses a peer whose PID it cannot see, so the daemon
+relays the request from inside the universe's PID namespace. An observation named by the agent
+lands in the replica's owned scope beside the boot fact and is carried by replication; the only
+writer inside is no longer the entrypoint. The resident's protocol is unchanged.
+
 Three findings the candidate taught, each handled in the universe definition and recorded in
 its README: the resident handles no signal, so PID 1 must translate the stop; the overlay's
 copy-up changes a restored store's inode between the resident's preflight and its open, which
