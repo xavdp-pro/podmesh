@@ -568,6 +568,20 @@ stopped its transient fence timer and development daemon. The pre-existing obser
 and older proof containers were left untouched. The corrected suite arms and verifies its switch
 before applying the partition.
 
+## The manager laboratory hostname (2026-09-15, Codex verification)
+
+The operator authorized `manager.szde.fr` as the manager laboratory hostname. Codex verified the
+existing Cloudflare API token without exposing it, created a proxied CNAME to the existing locally
+managed `podmesh-lab` tunnel, and ran `tests/check-manager-publisher.py` on isolated development
+daemons on lab-b and lab-c. Exit 0: the public `/ready` response named lab-b and epoch 1, the fence
+withdrew that publisher, then the same hostname named lab-c and epoch 2. Cleanup restored both
+hosts' network state and left both connector units inactive; the retained hostname then returned
+Cloudflare 530 because no connector was running. The raw result is
+`evidence/manager-publisher/2026-09-15/manager-szde-fr-takeover.json`. This proves the current
+laboratory transition only; the unverified `previous` assertion and crash-finalization findings in
+`/tmp/podmesh-claude/CODEX-REVIEW-B1-B3-CLOUDFLARE-2026-09-15.md` still block signatures and
+packaging.
+
 ## Next actions, in order
 
 1. Done: independent read-only counter-review of the source-side milestone (Claude
