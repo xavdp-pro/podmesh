@@ -5,6 +5,15 @@ use std::{
     time::Duration,
 };
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `podmeshd control-relay <socket>`: one request from stdin to a Unix socket, its reply to
+    // stdout. The daemon runs this copy of itself inside a manager universe's PID namespace
+    // (`nsenter -p`), because the resident checks the connecting peer's credentials and a peer
+    // whose PID is not visible from the universe is refused. No state, no journal, no argument
+    // but the path: the relay carries bytes and decides nothing.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("control-relay") {
+        return podmesh::control_relay(args.get(2).ok_or("control-relay needs the socket path")?);
+    }
     let dir = PathBuf::from(std::env::var("PODMESH_STATE_DIR").unwrap_or("/var/lib/podmesh".into()));
     let socket = PathBuf::from(std::env::var("PODMESH_SOCKET").unwrap_or("/run/podmesh/api.sock".into()));
     let db = podmesh::open_state(&dir)?;

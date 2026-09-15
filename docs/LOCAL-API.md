@@ -393,6 +393,26 @@ The contract is `UNIVERSE-NETWORK-CONTRACT.md`; the operations are journaled lik
   elsewhere, expired, superseded). The route records the resource, and `activation_fence` withdraws it once
   the lease is gone. `network_route_withdraw` (`universe_uuid`) removes the routes of a universe.
 
+## Experimental: the agent's door to a manager universe (development tree, not packaged)
+
+A manager universe runs the frozen manager resident behind one Unix socket at a contract path inside the
+universe (`/run/podmesh-manager/control.sock`), reachable by nothing outside it. PodMesh offers the one door:
+two typed operations over the same root-only API, with `authorization_ref` as provenance, carried by a copy of
+the daemon entered into the universe's PID namespace (the resident checks the peer's credentials, and a peer
+whose PID is not visible from the universe is refused whatever its UID). The agent never sees the socket, and
+PodMesh adds nothing to the resident's protocol.
+
+- `manager_status` (read-only): the resident's bounded live diagnostic (replica identity, peer counters), never
+  its facts, which are read from the store. Refused when the universe is not here, not running, or carries no
+  control socket at the contract path (it is not a manager universe).
+- `manager_observe` (`scope`, `subject`, `value`; journaled): appends one observation in a scope this replica
+  owns, with the PodMesh operation ID as the resident's, so a re-evaluation after a crash between the append
+  and the record is a replay for the resident too. Bounds checked before any connection (safe tokens of at most
+  128 bytes, a hierarchical scope, a value of at most 4096 bytes; the API line limit of 4 KiB applies first);
+  the resident's own refusal (a scope it does not own, a writer it does not accept) is returned as the refusal.
+  Not an exclusive effect and not gated by the activation lease: every replica appends in its own scopes and
+  replication carries them.
+
 ## Facts for a watching agent
 
 The intended first consumer of these read-only facts is a watching agent that observes and reports: it has

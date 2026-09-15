@@ -489,9 +489,16 @@ address refused, and a replica stopped and restarted converging to a fourth fact
 blocks re-allocating the same universe; `tests/check-manager-recovery-managed.py`: a replica
 stopped, captured, deleted, the set moving on without it, then restored, promoted at its own
 address and started, catching up the fact it missed and converging on all three while the
-governor's announcement never moved. All seven steps of Codex's order are done. Not shown: a
-real partition, a host loss, the replica serving at the service address, an agent path to the
-control API, a signed manifest. Status: implemented, lab-tested on three hosts; not deployed, not
+governor's announcement never moved. All seven steps of Codex's order are done. Then, on the
+operator's "continue at all costs" (2026-09-15, night), the agent's door to the manager:
+`manager_status` and `manager_observe` (`src/manager.rs`, `LOCAL-API.md`), typed operations
+relayed by a copy of the daemon entered into the universe's PID namespace — the resident refuses
+a peer whose PID it cannot see, measured, not assumed; `tests/check-manager-control.py` on lab-a:
+an observation named by the agent in the store beside the boot fact, replay served from the
+journal, a second one appended, six refusals each for its own reason, the resident's refusal of
+a scope not owned returned as such (mutation: that check removed went red there). Not shown: a
+real partition, a host loss, the replica serving at the service address, a signed manifest.
+Status: implemented, lab-tested on three hosts; not deployed, not
 production-qualified; nothing published.
 
 ## Next actions, in order

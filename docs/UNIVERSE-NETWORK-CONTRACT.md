@@ -95,10 +95,10 @@ Not carried yet by the managed profile, and refused rather than assumed: `clone`
 
 ## What this contract does not decide
 
-WireGuard configuration, DNS publication, the agent's authenticated path to a manager's control
-API over the managed network (the resident exposes none today; until it does, the only writer
-inside a manager universe is its entrypoint), nested Podman and internal containers, and
-production fencing of a route. Each is its own contract.
+WireGuard configuration, DNS publication, nested Podman and internal containers, and
+production fencing of a route. Each is its own contract. The agent's path to a manager's
+control socket is not a network path: it is the typed door of `LOCAL-API.md` (`manager_status`,
+`manager_observe`), through the universe's own namespaces on its host.
 
 ## What is built
 
