@@ -560,8 +560,13 @@ its peer and the agent with its Internet kept, its own timer withdrew the connec
 the lease lapse and 30.5 s before the standby published; the hostname answered 530 in between,
 then the standby's replica at the new epoch. I1–I4 of Codex's review are done the same day
 (lease-expiry self-withdrawal named, the fence preview, the relay bound to the container's
-identity, the HA document reconciled). lab-a is out of reach since the first agent-cut run (an
-nftables table without its switch); the suites of the day ran on lab-b and lab-c.
+identity, the HA document reconciled). The suites of the day ran on lab-b and lab-c. Their first
+agent-cut run had left lab-a isolated by an nftables table whose dead man's switch had not been
+armed. Codex restored access on 2026-09-15 through the VM guest agent, then used the PodMesh API
+to stop and delete only that campaign's universe, remove its secret and network declaration, and
+stopped its transient fence timer and development daemon. The pre-existing observation service
+and older proof containers were left untouched. The corrected suite arms and verifies its switch
+before applying the partition.
 
 ## Next actions, in order
 
