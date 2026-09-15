@@ -208,7 +208,9 @@ fn nft_rules() -> Option<Vec<String>> {
     if !out.status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&out.stdout).lines().map(str::trim).filter(|l| l.contains("snat") || l.contains("notrack")).map(str::to_string).collect())
+    // Rules only: the chain's own line (`type nat hook postrouting priority srcnat - 1`) also says
+    // "snat" and must not be counted as one.
+    Some(String::from_utf8_lossy(&out.stdout).lines().map(str::trim).filter(|l| l.starts_with("ip saddr ")).map(str::to_string).collect())
 }
 
 /// The ways of keeping Podman's source NAT off traffic inside the prefix, chosen at declaration
@@ -223,6 +225,15 @@ fn nft_rules() -> Option<Vec<String>> {
 pub const NAT_NULL_SNAT: &str = "null-snat";
 pub const NAT_NOTRACK: &str = "notrack";
 pub const NAT_NONE: &str = "none";
+
+/// The rules `nft list table` prints for a backend, in its order: what verification compares.
+fn nat_expected_rules(backend: &str, prefix: &str, pool: &str) -> Vec<String> {
+    match backend {
+        NAT_NULL_SNAT => vec![format!("ip saddr {pool} ip daddr {prefix} snat ip to ip saddr")],
+        NAT_NOTRACK => vec![format!("ip saddr {prefix} ip daddr {prefix} notrack"), format!("ip saddr {prefix} ip daddr {prefix} notrack")],
+        _ => vec![],
+    }
+}
 
 fn nat_exemption_add(backend: &str, prefix: &str, pool: &str) -> Result<(), Error> {
     match backend {
@@ -540,7 +551,10 @@ fn effect_verify(e: &Effect) -> Option<bool> {
         "peer_route" | "route" => routes_for(&e.key).map(|h| h.iter().any(|l| l.contains(&format!("via {}", text_of(&e.intent, "via"))))),
         "nat_table" => match nat_exemption_present()? {
             false => Some(false),
-            true => Some(!nft_rules()?.is_empty()),
+            // The exact rules the backend asked for -- prefix and pool as declared -- and nothing
+            // else: a wrong address, a stale rule of the other backend or an unrelated rule is not
+            // this effect (Codex, P2).
+            true => Some(nft_rules()?.iter().map(|r| r.split_whitespace().collect::<Vec<_>>().join(" ")).collect::<Vec<_>>() == nat_expected_rules(&text_of(&e.intent, "backend"), &text_of(&e.intent, "prefix"), &text_of(&e.intent, "pool"))),
         },
         "alias" => match running_pid(&text_of(&e.intent, "universe")).ok()? {
             // A universe that no longer runs took the address down with its namespace.
@@ -725,7 +739,12 @@ pub fn reconcile(db: &Connection) -> Result<Value, Error> {
             released.push(json!({"universe_uuid": u, "ip": ip}));
         }
     }
-    Ok(json!({"undone": undone, "remaining": remaining, "drift": drift, "orphans": orphans, "routes_dropped": routes_dropped, "declarations": declarations, "allocations_released": released}))
+    // The publisher's own transitions and the secrets' own states follow the same rule: whatever
+    // is not verified effective is withdrawn or finished, and reported here.
+    let publishers = crate::publisher::reconcile(db)?;
+    let secrets = crate::secrets::reconcile(db)?;
+    Ok(json!({"undone": undone, "remaining": remaining, "drift": drift, "orphans": orphans, "routes_dropped": routes_dropped, "declarations": declarations,
+              "allocations_released": released, "publishers": publishers, "secrets": secrets}))
 }
 
 fn refuse_while_incomplete(db: &Connection) -> Result<Value, Error> {

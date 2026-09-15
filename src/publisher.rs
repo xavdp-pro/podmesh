@@ -57,10 +57,169 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             event TEXT NOT NULL,
             at INTEGER NOT NULL,
             operation_id TEXT NOT NULL,
-            detail TEXT);",
+            detail TEXT);
+         CREATE TABLE IF NOT EXISTS publisher_transitions(
+            resource TEXT PRIMARY KEY,
+            state TEXT NOT NULL,
+            epoch INTEGER NOT NULL,
+            operation_id TEXT NOT NULL,
+            changed_at INTEGER NOT NULL);",
     )?;
     Ok(())
 }
+
+/// The publisher's own durable transition (Codex, P1): `starting` written before any effect,
+/// `effective` only once the mark, the connector and its registration are verified, `stopping`
+/// before a withdrawal, gone after it. Reconciliation withdraws whatever is `starting` or
+/// `stopping` after a crash, and withdraws an `effective` publisher whose lease this host no
+/// longer holds; a publisher from an operation reported failed never stays active.
+fn transition(db: &Connection, resource: &str, state: &str, epoch: i64, id: &str) -> Result<(), Error> {
+    db.execute(
+        "INSERT INTO publisher_transitions(resource,state,epoch,operation_id,changed_at) VALUES(?1,?2,?3,?4,?5)
+         ON CONFLICT(resource) DO UPDATE SET state=excluded.state, epoch=excluded.epoch, operation_id=excluded.operation_id, changed_at=excluded.changed_at",
+        params![resource, state, epoch, id, crate::now() as i64],
+    )?;
+    Ok(())
+}
+
+fn transition_of(db: &Connection, resource: &str) -> Result<Option<(String, i64)>, Error> {
+    Ok(db.query_row("SELECT state,epoch FROM publisher_transitions WHERE resource=?1", [resource], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)
+}
+
+/// Called by the network reconciliation: every publisher not verified effective under a lease
+/// this host holds is withdrawn -- connector, mark, transition -- and reported.
+pub(crate) fn reconcile(db: &Connection) -> Result<Vec<Value>, Error> {
+    ensure_schema(db)?;
+    let mut s = db.prepare("SELECT resource,state,epoch FROM publisher_transitions")?;
+    let rows: Vec<(String, String, i64)> = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+    let mut report = vec![];
+    let this_host = crate::activation::host_uuid_public(db)?;
+    let now = crate::now() as i64;
+    for (resource, state, epoch) in rows {
+        let entitled = crate::activation::lease(db, &resource)?.is_some_and(|l| l.holder_host_uuid == this_host && l.expires_at > now && l.epoch == epoch)
+            && crate::activation::refuse_if_not_activated(db, &resource, "reconcile").is_ok();
+        let intact = connector_present(&resource) == Some(true) && connector_id(&resource).is_some();
+        let why = if state != "effective" { format!("transition {state}") } else if !entitled { "no longer entitled".into() } else if !intact { "connector not intact".into() } else { continue };
+        let r = withdraw(db, &resource, "reconcile", "reconciliation")?;
+        report.push(json!({"resource": resource, "was": state, "epoch": epoch, "why": why, "withdrawn": r["withdrawn"], "steps": r["steps"]}));
+    }
+    Ok(report)
+}
+
+/// The connector's registration with Cloudflare, waited for a bounded time from its journal: a
+/// unit that is active but never registers, or exits, is not a publication (Codex, P1).
+fn wait_registered(resource: &str, seconds: u64) -> Result<String, Error> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    loop {
+        let state = unit_state(resource).unwrap_or("unknown".into());
+        if state != "active" && state != "activating" {
+            return Err(format!("the connector unit is {state} before registering").into());
+        }
+        if let Some(id) = connector_id(resource) {
+            if state == "active" {
+                return Ok(id);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("the connector did not register with Cloudflare within {seconds} seconds (unit {state})").into());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// The takeover proof (Codex, P0): a typed document from the external authority that advanced
+/// the epoch, bound to the resource, both epochs, both holders and a method -- `first` (no
+/// publisher epoch ever existed), `same_holder` (this host held the previous epoch too),
+/// `fence_receipt` (the previous holder's fence, its receipt bound to the transition) or
+/// `lease_barrier` (an unreachable previous holder: the authority's `eligible_after`, the
+/// previous lease plus the margin, compared with this host's clock). Ed25519-signed by the
+/// authority and verified here when the policy names its key (`src/signing.rs`); a laboratory
+/// proof, unsigned and labelled so, only under a policy that names none. The agent's
+/// `previous` narrative is kept beside it and decides nothing.
+fn verify_takeover_proof(db: &Connection, resource: &str, proof: &Value, epoch: i64, this_host: &str) -> Result<Value, Error> {
+    let now = crate::now() as i64;
+    let policy = crate::activation::policy(db, resource)?.ok_or("no activation policy")?;
+    let text = |k: &str| proof[k].as_str().map(str::to_string).ok_or_else(|| format!("takeover_proof lacks {k}"));
+    // Origin first, then binding: under a policy that names the authority's key, the document
+    // must be the signed kind and its signature must verify over its canonical form (altered,
+    // unknown-key and unsigned documents are refused here, before any field is read); under a
+    // policy without a key, only the laboratory kind is accepted, on its binding alone.
+    let signed = !policy.authority_key.is_empty();
+    let kind = text("kind")?;
+    let origin = if signed {
+        if kind != crate::signing::SIGNED_PROOF_KIND {
+            return Err(format!("takeover_proof is {kind}; this resource's policy names the authority's key and requires {}", crate::signing::SIGNED_PROOF_KIND).into());
+        }
+        crate::signing::verify(proof, &policy.authority_key).map_err(|e| format!("takeover_proof: {e}"))?;
+        "signed by the authority's key named in the policy; the signature verified over the document's canonical form"
+    } else {
+        if kind != crate::signing::UNSIGNED_PROOF_KIND {
+            return Err(format!("takeover_proof is {kind}; this resource's policy names no authority key, and only a laboratory proof is accepted without one").into());
+        }
+        "laboratory proof, unsigned: its binding is checked, its origin is not"
+    };
+    if text("authority_id")? != policy.authority_id {
+        return Err("takeover_proof names another authority than this resource's policy".into());
+    }
+    if text("resource")? != resource {
+        return Err("takeover_proof is bound to another resource".into());
+    }
+    if text("new_holder")? != this_host {
+        return Err("takeover_proof names another host as the new holder".into());
+    }
+    let new_epoch = proof["new_epoch"].as_i64().ok_or("takeover_proof lacks new_epoch")?;
+    let previous_epoch = proof["previous_epoch"].as_i64().ok_or("takeover_proof lacks previous_epoch")?;
+    if new_epoch != epoch {
+        return Err(format!("takeover_proof is for epoch {new_epoch}, this host's lease is under epoch {epoch}").into());
+    }
+    if previous_epoch != epoch - 1 {
+        return Err(format!("takeover_proof names previous epoch {previous_epoch}, not the one before {epoch}").into());
+    }
+    let issued = proof["issued_at"].as_i64().ok_or("takeover_proof lacks issued_at")?;
+    let expires = proof["expires_at"].as_i64().ok_or("takeover_proof lacks expires_at")?;
+    if issued > now + 30 {
+        return Err("takeover_proof is issued in the future beyond the clock allowance".into());
+    }
+    if expires < now {
+        return Err(format!("takeover_proof expired {} seconds ago", now - expires).into());
+    }
+    let previous_holder = proof["previous_holder"].as_str();
+    match text("method")?.as_str() {
+        "first" => {
+            if previous_epoch != 0 || previous_holder.is_some() {
+                return Err("takeover_proof says first, but a previous epoch or holder exists".into());
+            }
+        }
+        "same_holder" => {
+            if previous_holder != Some(this_host) {
+                return Err("takeover_proof says same_holder, but the previous holder is not this host".into());
+            }
+        }
+        "fence_receipt" => {
+            let receipt = &proof["receipt"];
+            let host = receipt["host"].as_str().ok_or("the fence receipt names no host")?;
+            if Some(host) != previous_holder {
+                return Err("the fence receipt is from a host that is not the previous holder".into());
+            }
+            if receipt["withdrawn"] != json!(true) || receipt["operation_id"].as_str().is_none() {
+                return Err("the fence receipt does not record a verified withdrawal".into());
+            }
+            if receipt["resource"].as_str() != Some(resource) {
+                return Err("the fence receipt is for another resource".into());
+            }
+        }
+        "lease_barrier" => {
+            let eligible = proof["eligible_after"].as_i64().ok_or("takeover_proof lacks eligible_after")?;
+            if now < eligible {
+                return Err(format!("takeover_proof: the authority's barrier is at {eligible}, {} seconds from now on this clock; refusing before it", eligible - now).into());
+            }
+        }
+        other => return Err(format!("takeover_proof method {other} is unknown").into()),
+    }
+    Ok(json!({"method": proof["method"], "previous_epoch": previous_epoch, "new_epoch": new_epoch, "previous_holder": previous_holder,
+              "verified_at": now, "signed": signed, "note": origin}))
+}
+
 
 pub(crate) struct Publisher {
     resource: String,
@@ -317,6 +476,7 @@ fn view(db: &Connection, resource: &str) -> Result<Value, Error> {
         "carrier_replica_id": carrier_identity,
         "origin_readiness": readiness,
         "governor_mark": service.as_ref().and_then(|(_, carrier)| mark_present(carrier)),
+        "transition": transition_of(db, resource)?.map(|(s, e)| json!({"state": s, "epoch": e})),
         "publisher_eligible": eligible,
         "reasons": reasons,
         "last": {"start": last_event(db, resource, "start")?, "stop": last_event(db, resource, "stop")?, "fence": last_event(db, resource, "fence")?,
@@ -358,8 +518,8 @@ fn perform(db: &Connection, request: &Value, resource: &str) -> Result<Value, Er
         }
         "publisher_start" => {
             let Some(p) = declared(db, resource)? else { return Err("no publisher declared for this resource on this host".into()) };
-            if connector_present(resource) == Some(true) {
-                return Err("the connector is already active on this host".into());
+            if transition_of(db, resource)?.is_some() || connector_present(resource) == Some(true) {
+                return Err("a publisher is already recorded or active on this host; stop it first".into());
             }
             // 1. the epoch gate, 2. the service address effective here, 3. the credential
             let (eligible, reasons, service, epoch) = eligibility(db, &p)?;
@@ -368,17 +528,18 @@ fn perform(db: &Connection, request: &Value, resource: &str) -> Result<Value, Er
             }
             let (ip, carrier) = service.ok_or("no service address")?;
             let epoch = epoch.ok_or("no epoch on the lease")?;
-            // 4. the previous publisher accounted for: the agent's word, recorded, refused when absent
-            let previous = request.get("previous").ok_or("publisher_start requires `previous`: {fenced: true, operation_id} for a previous publisher fenced, or {waited_seconds: n} after an unreachable one, or {none: true} for the first")?;
-            let accounted = previous.get("fenced") == Some(&json!(true)) || previous.get("waited_seconds").and_then(Value::as_u64).is_some_and(|w| w > 0) || previous.get("none") == Some(&json!(true));
-            if !accounted {
-                return Err("publisher_start refused: the previous publisher is not accounted for (fenced, waited, or none)".into());
-            }
-            // 5. the governor mark inside the carrier, recorded first, verified; 6. readiness at the
-            //    service address with the expected identities and epoch; 7. the connector, recorded
-            //    first, verified active. Any failure undoes what was made, last first.
+            // 4. the takeover proof from the authority (the gate); the agent's `previous` is provenance only
+            let this_host = crate::activation::host_uuid_public(db)?;
+            let proof = request.get("takeover_proof").ok_or("publisher_start requires `takeover_proof`, the authority's document for this epoch (the tool's rotate prints it; attest-fence upgrades it)")?;
+            let proof_verified = verify_takeover_proof(db, resource, proof, epoch, &this_host)?;
+            let previous = request.get("previous").cloned().unwrap_or(Value::Null);
+            // 5. the transition recorded before any effect; 6. the mark, then readiness at the
+            //    service address; 7. the connector, then its registration; 8. effective last.
+            //    Any failure undoes what was made, last first, and leaves no transition.
+            transition(db, resource, "starting", epoch, id)?;
             let mut done = vec![];
             let mut failure: Option<String> = None;
+            let mut connector: Option<String> = None;
             for (kind, key, intent) in [
                 (KIND_MARK, format!("{resource}@{carrier}"), json!({"carrier": carrier, "resource": resource, "epoch": epoch})),
                 (KIND_PUBLISHER, unit_name(resource), json!({"resource": resource, "ip": ip, "port": p.origin_port})),
@@ -390,6 +551,7 @@ fn perform(db: &Connection, request: &Value, resource: &str) -> Result<Value, Er
                     break;
                 }
                 if kind == KIND_MARK {
+                    if let Err(err) = lc::fault("publisher-after-mark") { failure = Some(err.to_string()); break; }
                     match origin_ready(&ip, p.origin_port) {
                         Ok((200, body)) if body["logical_manager_id"] == json!(resource) && body["epoch"] == json!(epoch) && body["ready"] == json!(true) => {
                             let replica = crate::manager::execute(db, &json!({"operation": "manager_status", "universe_uuid": carrier}))?["resident_status"]["replica_id"].clone();
@@ -407,16 +569,35 @@ fn perform(db: &Connection, request: &Value, resource: &str) -> Result<Value, Er
                             break;
                         }
                     }
-                    lc::fault("publisher-after-readiness")?;
+                } else {
+                    if let Err(err) = lc::fault("publisher-after-connector") { failure = Some(err.to_string()); break; }
+                    match wait_registered(resource, 60) {
+                        Ok(idc) => connector = Some(idc),
+                        Err(err) => { failure = Some(err.to_string()); break; }
+                    }
+                }
+            }
+            if failure.is_none() {
+                if let Err(err) = lc::fault("publisher-before-effective") {
+                    failure = Some(err.to_string());
                 }
             }
             if let Some(err) = failure {
+                let _ = lc::fault("publisher-during-compensation");
                 let report = crate::network::compensate_public(db, &done);
+                let all_gone = report.iter().all(|r| r["gone"] == json!(true));
+                if all_gone {
+                    db.execute("DELETE FROM publisher_transitions WHERE resource=?1", [resource])?;
+                }
                 event(db, resource, "start_failed", id, Some(json!({"error": err, "compensation": report})))?;
-                return Err(format!("{err}; compensation: {}", json!(report)).into());
+                return Err(format!("{err}; compensation: {}{}", json!(report), if all_gone { "" } else { "; the transition is kept for reconciliation" }).into());
             }
-            event(db, resource, "start", id, Some(json!({"epoch": epoch, "ip": ip, "carrier": carrier, "previous": previous})))?;
-            view(db, resource)
+            transition(db, resource, "effective", epoch, id)?;
+            event(db, resource, "start", id, Some(json!({"epoch": epoch, "ip": ip, "carrier": carrier, "connector_id": connector, "takeover_proof": proof_verified, "previous": previous})))?;
+            let mut v = view(db, resource)?;
+            v["published"] = json!(true);
+            v["takeover_proof"] = proof_verified;
+            Ok(v)
         }
         "publisher_stop" => {
             let report = withdraw(db, resource, "stop", id)?;
@@ -438,6 +619,9 @@ fn perform(db: &Connection, request: &Value, resource: &str) -> Result<Value, Er
 /// what `publisher_stop` and the fence do. The effects of the resource whose kind is the
 /// publisher's or the mark's, last first (the connector before the mark).
 fn withdraw(db: &Connection, resource: &str, why: &str, id: &str) -> Result<Value, Error> {
+    if let Some((_, epoch)) = transition_of(db, resource)? {
+        transition(db, resource, "stopping", epoch, id)?;
+    }
     let effects: Vec<_> = crate::network::effect_rows_public(db, Some(resource))?
         .into_iter()
         .filter(|e| e.kind == KIND_PUBLISHER || e.kind == KIND_MARK)
@@ -457,6 +641,9 @@ fn withdraw(db: &Connection, resource: &str, why: &str, id: &str) -> Result<Valu
             Ok(()) => steps.push(json!({"kind": KIND_PUBLISHER, "unrecorded": true, "gone": connector_present(resource) == Some(false)})),
             Err(err) => { failed = true; steps.push(json!({"kind": KIND_PUBLISHER, "unrecorded": true, "gone": false, "error": err.to_string()})) }
         }
+    }
+    if !failed {
+        db.execute("DELETE FROM publisher_transitions WHERE resource=?1", [resource])?;
     }
     event(db, resource, why, id, Some(json!({"steps": steps})))?;
     Ok(json!({"resource": resource, "withdrawn": !failed, "steps": steps, "unit": unit_state(resource)}))

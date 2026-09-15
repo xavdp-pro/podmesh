@@ -47,18 +47,37 @@ with it (`UNIVERSE-NETWORK-CONTRACT.md`, "Failure and cleanup states"), all with
 - `publisher_declare` (`resource`, `hostname`, `tunnel_uuid`, `credential`, optional
   `origin_port`): recorded by reference; refused without an activation policy for the resource
   on this host, or without the credential declared.
-- `publisher_start` (`resource`, `previous`): refused, in this order, when the resource's lease
-  is not live and unsuperseded here (the lease gate's four reasons), when the exclusive route and
-  the alias are not effective on this host, when the credential is not in Podman's store, and
-  when the previous publisher is not accounted for — `previous` names `{fenced: true, …}`,
-  `{waited_seconds: n}` (the lease plus margin waited for an unreachable host) or `{none: true}`
-  (the first publisher): the agent's word, recorded, refused when absent. Then, each step
-  recorded first and verified: the governor mark written inside the carrier universe; the origin
-  asked at the service address and required to answer ready with the expected logical manager,
-  the carrier's replica (as its resident names it through the control door) and the lease's
-  epoch; the connector started as a transient unit from a root-only runtime copy of the
-  credential and an ingress from the hostname to the service address, and verified active. A
-  failure undoes what was made, last first, and reports the compensation.
+- `publisher_start` (`resource`, `takeover_proof`, optional `previous`): refused, in this
+  order, when the resource's lease is not live and unsuperseded here (the lease gate's four
+  reasons), when the exclusive route and the alias are not effective on this host, when the
+  credential is not in Podman's store, and when the **takeover proof** does not bind this
+  transition. The proof is the authority's document — the gate that advanced the epoch issues
+  it at the rotation (`tools/ha-standby.py rotate`) — bound to the resource, the previous and
+  new epochs, the previous and new holders, an issue and expiry time, and a method: `first`
+  (no epoch ever existed), `same_holder` (this host held the previous epoch), `fence_receipt`
+  (the previous holder's fence, its receipt attested into the proof by `attest-fence`, bound to
+  the resource the fence found that host not entitled to, with every withdrawal it made for it
+  verified) or `lease_barrier` (an unreachable previous holder: the authority's
+  `eligible_after`, the previous lease plus the margin from the rotation, compared with this
+  host's clock and refused before it). The host checks every binding — after the proof's
+  origin: under a policy that names the authority's Ed25519 key (every policy the tool declares
+  does), the proof must be the signed kind and its signature must verify over its canonical
+  form before any field is read, so an altered, unsigned or foreign-key document is refused as
+  such; under a policy without a key only the unsigned laboratory kind is accepted, on its
+  binding alone, and the answer says `signed: false`. The agent's `previous` narrative is
+  recorded beside it and decides nothing.
+  Then: the publisher's transition recorded `starting` before any effect; the governor mark
+  written inside the carrier universe and verified; the origin asked at the service address and
+  required to answer ready with the expected logical manager, the carrier's replica (as its
+  resident names it through the control door) and the lease's epoch; the connector started as a
+  transient unit from a root-only runtime copy of the credential with an ingress from the
+  hostname to the service address, verified active **and registered with Cloudflare** (its
+  connection identity from its journal, waited for a bounded time; a unit that exits or never
+  registers is not a publication); the transition recorded `effective` last. A failure at any
+  step undoes what was made, last first, and reports the compensation; a transition left
+  `starting` or `stopping` by a crash, and an `effective` one whose lease this host no longer
+  holds, are withdrawn by reconciliation at the next startup, before every network mutation and
+  at every fence: a publisher from an operation reported failed never stays active.
 - `publisher_stop` (`resource`): the connector stopped and the mark removed, verified.
 - `activation_fence`: for every resource this host no longer holds, the publisher is withdrawn
   first — connector stopped, mark removed — **before** the alias and the route go: one
@@ -80,7 +99,12 @@ with it (`UNIVERSE-NETWORK-CONTRACT.md`, "Failure and cleanup states"), all with
    clock — `packaging/podmesh-fence`).
 3. Observe on the previous governor, when reachable, the connector stopped and the address gone.
 4. Publish the service address on the new governor (`network_route_publish`, exclusive).
-5. `publisher_start` there: readiness at the new epoch, then the connector.
+   The barrier (the previous lease plus the margin, counted from the rotation, since the
+   previous holder may have renewed right up to it) can outlast the new holder's own lease:
+   after it, the new holder acquires again with the rotation's permit — idempotent for the
+   holder, the design's answer to a lapsed lease of one's own — before starting.
+5. `publisher_start` there: the proof's origin and binding, readiness at the new epoch, then
+   the connector.
 6. Verify the connector's identity and exercise the public hostname from outside; record it
    (`publisher_observed`).
 

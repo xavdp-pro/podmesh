@@ -589,18 +589,22 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
 /// Nothing sets this variable in the packaged units; the laboratory sets it on the transient
 /// unit and restarts the daemon to watch what follows.
 pub(crate) fn fault(point: &str) -> Result<(), Error> {
+    // One or several points, comma-separated: `PODMESH_FAULT=publisher-after-connector,publisher-during-compensation:crash`
+    // fails the first and crashes in the compensation the failure starts.
     let Ok(spec) = std::env::var("PODMESH_FAULT") else { return Ok(()) };
-    if spec == format!("{point}:crash") {
-        eprintln!("PodMesh fault injection: crashing at {point}");
-        std::process::exit(70);
-    }
-    if spec == format!("{point}:delay") {
-        eprintln!("PodMesh fault injection: holding three seconds at {point}");
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        return Ok(());
-    }
-    if spec == point {
-        return Err(format!("simulated storage failure at {point}; nothing is recorded as effective").into());
+    for one in spec.split(',').map(str::trim) {
+        if one == format!("{point}:crash") {
+            eprintln!("PodMesh fault injection: crashing at {point}");
+            std::process::exit(70);
+        }
+        if one == format!("{point}:delay") {
+            eprintln!("PodMesh fault injection: holding three seconds at {point}");
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            return Ok(());
+        }
+        if one == point {
+            return Err(format!("simulated storage failure at {point}; nothing is recorded as effective").into());
+        }
     }
     Ok(())
 }

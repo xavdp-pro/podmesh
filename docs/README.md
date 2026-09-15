@@ -34,26 +34,52 @@ The entire SHAPER corpus has NOT been audited in this sequence. No canon changed
 
 | ID | Capability / decision | Status and acceptance criterion |
 |---|---|---|
-| P01 | Join a host already carrying workloads; detach/rejoin or change groups without emptying it | DECIDED / OPEN; preserve workloads and identities across joins |
-| P02 | Stable host and universe UUIDs, human-readable names, local runtime IDs mapped separately | DECIDED / OPEN; detect cloned identity and name collisions |
-| P03 | Inventory, create, start, stop, remove, logs, state and errors | DECIDED / OPEN; real CLI/API operations and effects verified |
-| P04 | Whole-universe migration including nested Podman processes and memory | VERIFIED only for disposable network-free lab workload; general qualification OPEN |
-| P05 | Preflight, checksum, explicit handoff, source stopped before destination active, durable operation report | Partially VERIFIED in serial migration kit; concurrent controllers OPEN |
-| P06 | Intent-driven human/agent management through common API/CLI; UI optional later | DECIDED / OPEN |
-| P07 | Rust core service, Debian packages, reproducible installation/update/removal | DECIDED; Rust installed, core service OPEN |
-| P08 | Image availability across hosts using content digests; pre-stage before migration | DECIDED direction; redundancy count/policy OPEN; full registry per host not required |
-| P09 | Persistent data replication and coherent recovery points | Requested; general volume/database implementation OPEN |
-| P10 | Periodic memory checkpoints copied to another host | Bounded experiment VERIFIED; incremental continuous replication and HA OPEN |
-| P11 | Logical /16, disjoint /24 allocation pool per host, stable workload IP | DECIDED / OPEN; actual prefix not selected |
-| P12 | UUID-to-IP table, unique address per universe per network | Requested / OPEN; no SQL table or allocator created yet |
-| P13 | Existing IP connectivity or optional WireGuard, including bulk copies | DECIDED / OPEN; both transports require end-to-end tests |
-| P14 | Shared universe naming/DNS | DEFERRED implementation; latest proposed owner is the manager universe |
-| P15 | SaaS governor and one maker per host, compatible with existing authority contracts | DECIDED integration direction / OPEN |
-| P16 | Same logical manager replicated onto every host; local bootstrap independent of failed manager/DNS | Requested / OPEN; no manager HA implementation yet |
-| P17 | Continue bounded local management during partitions; merge on reconnect | Latest operator model / OPEN; safety conditions below |
-| P18 | Rebuild a host quickly with preserved or deliberately replaced identity | DECIDED / OPEN; installation and restore rehearsal needed |
-| P19 | Public APT repository and branded landing page | VERIFIED separately at deb.xavdp.pro; only validation package released |
-| P20 | Public product presentation, docs, sources and contribution path | DECIDED; podmesh.xavdp.pro proposed, not provisioned |
+| P01 | Join a host already carrying workloads; detach/rejoin or change groups without emptying it | DECIDED / OPEN; preserve workloads and identities across joins — no join/detach operation exists (2026-09-15) |
+| P02 | Stable host and universe UUIDs, human-readable names, local runtime IDs mapped separately | Host UUID and universe UUIDs stable, container names `podmesh-<uuid>`: coded, packaged, installed (experimental4→6); clone/name-collision detection OPEN |
+| P03 | Inventory, create, start, stop, remove, logs, state and errors | Coded, lab-tested, packaged, installed: create/start/stop/delete/status/logs, clone, deletion ownership (`check-lifecycle`, `check-start-stop`, `check-clone*`, `check-delete-ownership`) |
+| P04 | Whole-universe migration including nested Podman processes and memory | VERIFIED for disposable network-free lab workloads only, packaged since experimental5, installed (experimental6); general qualification OPEN |
+| P05 | Preflight, checksum, explicit handoff, source stopped before destination active, durable operation report | Serial migration between two hosts coded, lab-tested, packaged (experimental5), installed; release/abandon/local restore (M3) in experimental6; concurrent controllers OPEN |
+| P06 | Intent-driven human/agent management through common API/CLI; UI optional later | One local API and CLI for humans and agents: coded, packaged, installed; every later increment goes through it; UI OPEN |
+| P07 | Rust core service, Debian packages, reproducible installation/update/removal | Rust core service `podmeshd` packaged and installed (0.1.0~experimental6 on three hosts, signed APT); install/upgrade/rollback rehearsed on one host (experimental3↔4), not on a clean host |
+| P08 | Image availability across hosts using content digests; pre-stage before migration | DECIDED direction; OPEN — no digest-based image distribution; the manager image is built by hand on each host |
+| P09 | Persistent data replication and coherent recovery points | Recovery points (capture, restore, promote, retention) coded and lab-tested on two hosts, not packaged; general volume/database replication OPEN |
+| P10 | Periodic memory checkpoints copied to another host | Bounded checkpoint copy VERIFIED and packaged; continuous replication OPEN; the manager replicates its own store (M-U2) in the development tree |
+| P11 | Logical /16, disjoint /24 allocation pool per host, stable workload IP | Coded and lab-tested on three hosts (`check-network-*`: managed bridge, /24 pool per host, stable address, exclusive routes, NAT exemption, effects ledger); not packaged; the prefix is the operator's at declaration |
+| P12 | UUID-to-IP table, unique address per universe per network | The allocation table exists in the journal (`network_status`), unique address per universe per network: coded, lab-tested, not packaged |
+| P13 | Existing IP connectivity or optional WireGuard, including bulk copies | Existing IP connectivity only (peer routes via the hosts' addresses); WireGuard OPEN |
+| P14 | Shared universe naming/DNS | DEFERRED as DNS; the manager's public hostname is one CNAME to one tunnel (publisher, development tree, lab-tested with a real hostname) |
+| P15 | SaaS governor and one maker per host, compatible with existing authority contracts | OPEN as integration; the epoch gate (activation leases, permits, fence) is coded and lab-tested in the development tree, not packaged |
+| P16 | Same logical manager replicated onto every host; local bootstrap independent of failed manager/DNS | Manager universe replicated on three hosts with one governor, service address, takeover, partition, recovery: coded and lab-tested (M-U2), development tree, not packaged; the manager resident image is built on the hosts, not published |
+| P17 | Continue bounded local management during partitions; merge on reconnect | Partition behaviour lab-tested for the manager (real cut, agent cut); generic universes OPEN |
+| P18 | Rebuild a host quickly with preserved or deliberately replaced identity | OPEN; no rebuild rehearsal |
+| P19 | Public APT repository and branded landing page | Signed APT at deb.xavdp.pro carries 0.1.0~experimental6 (Codex's package of 2026-09-12); the development tree since then is not packaged |
+| P20 | Public product presentation, docs, sources and contribution path | OPEN; not provisioned |
+
+## Delivery inventory by state (reconciled 2026-09-15)
+
+The table above keeps the record's wording and its status column reconciled to 2026-09-15. The
+table below separates the five states Codex asked for. *Coded* means in the `main` development
+tree; *locally tested* means `cargo test` on the workstation; *lab-tested* names the suites under
+`tests/` and the number of hosts; *packaged* means carried by a `.deb` on the signed APT
+repository; *installed* means running as `podmesh.service` on the three laboratory hosts.
+Nothing coded after 2026-09-12 is packaged or installed: the development tree runs on the hosts
+only as an isolated transient service (`podmesh-dev-ha`), never as the installed package.
+
+| Increment | Coded | Locally tested | Lab-tested | Packaged | Installed |
+|---|---|---|---|---|---|
+| Lifecycle, clone, deletion ownership, journal, CLI | yes | yes | 1 host: `check-lifecycle`, `check-start-stop`, `check-clone`, `check-clone-interrupt`, `check-delete-ownership`, `check-installed` | experimental4→6 | experimental6, 3 hosts |
+| Source checkpoint and serial migration (M1, M2), recovery of an interrupted transfer | yes | yes | 2 hosts: `check-migration-source`, `-destination`, `-interrupt`, `-destination-interrupt`, `-recovery`, `check-package-rehearsal` | experimental5, 6 | experimental6 |
+| Release, abandonment, local restore, reclaim on proof (M3) | yes | yes | 2 hosts: `check-migration-cleanup` | experimental6 | experimental6 |
+| Garbage collector on proof (M4, `main`) | yes | yes | 2 hosts: `check-migration-collector` | **no** — experimental6 carries Codex's own collector completion (`codex/collector-completion`, commits `4d7310b`, `ea2104c`), which `main` does not contain; the two lines diverged on 2026-09-12 and nobody has decided which collector ships | that other line |
+| Activation leases, epochs, permits, fence, fence preview, self-fence timer (H1–H8, I1) | yes | yes | 2–3 hosts: `check-activation`, `-epoch`, `-fence`, `check-fence-timer`, `check-ha-three-hosts` | no (`packaging/podmesh-fence*` written, no package built since) | no |
+| Recovery points, retention, collector class 5 (M5) | yes | yes | 2 hosts: `check-recovery-point*`, `check-recovery-point-retention` | no | no |
+| The agent's side as a tool (`tools/ha-standby.py`, H9) | yes | — | 2–3 hosts: `check-ha-standby-tool`, every manager suite | no (a tool, not a package) | no |
+| Manager universe on three hosts: replicas, governor, service address, partition, recovery (M-U2) | yes (`main` + the web tree's resident) | yes | 3 hosts: `check-manager-replicas-managed`, `-governor-managed`, `-service-address`, `-partition`, `-partition-agent-cut`, `-recovery-managed`, `check-manager-universe-ha` | no; the resident's image is built by hand on each host from the web tree | no |
+| Universe network: managed bridge, pools, exclusive routes, alias, NAT exemption, effects ledger, crash safety (B1, B3, P2) | yes | yes | 2–3 hosts: `check-network-managed`, `-no-nat`, `-nat-matrix`, `-crash-safety`; each NAT rule mutated | no | no |
+| Secrets outside images, state machine, crash safety (B2, P1) | yes | yes | 1–3 hosts: `check-secrets-image-free`, `check-secrets-crash` | no | no |
+| The agent's door to the manager, bound to one incarnation (I3) | yes | yes | 1 host: `check-manager-control`, `-control-race` | no | no |
+| The publishing connector follows the governor; takeover proof; transitions; registration wait (operator's decision, P0, P1) | yes | yes | 3 hosts with a real tunnel and hostname: `check-manager-publisher`, `-readiness`, `-crash`, `-agent-cut`; `manager.szde.fr` by Codex | no | no |
+| The takeover document Ed25519-signed by the gate, verified by the host | yes | yes (`cargo test`, including a document signed by the tool's Python and verified in Rust) | 1 host: `check-takeover-proof-signature` (campaign of 2026-09-15, see CURRENT-STATE.md) | no | no |
 
 ## Manager, governor and makers
 

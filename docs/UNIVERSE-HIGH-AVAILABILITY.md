@@ -294,14 +294,16 @@ into an immutable, digested recovery point in this host's outbox, with a manifes
 every field the Backup Server design requires of one. It is B1's step 1 and the first half
 of step 2, and it is what level 2 restores from.
 
-**It is `prepared`, not `sealed`, and the manifest says so.** This code base carries no
-signing crate — serde_json and rusqlite are its entire dependency list, and the crate
-registry answers 403 from this build — so the Ed25519 signature the design's root of trust
-rests on cannot be produced here. Rather than pretend, the point sits in the `prepared` state
-of the design's own typed list with `signed: false`, `signature: null`, and a format string
-ending in `unsigned-unencrypted`. A verifier that treats it as sealed is wrong; one that
-refuses it is doing its job. Adding a signing dependency is a supply-chain decision, and it is
-the operator's.
+**It is `prepared`, not `sealed`, and the manifest says so.** When this was written the code
+base carried no signing crate and the registry answered 403, so the Ed25519 signature the
+design's root of trust rests on could not be produced here; the point sits in the `prepared`
+state of the design's own typed list with `signed: false`, `signature: null`, and a format
+string ending in `unsigned-unencrypted`. A verifier that treats it as sealed is wrong; one that
+refuses it is doing its job. Since 2026-09-15 the code base carries `ed25519-dalek` for
+**verification** of the authority's takeover documents (Codex's signature milestone,
+`LOCAL-API.md`, "The takeover document, signed"); it still signs nothing itself, holds no key,
+and the recovery point manifest is still unsigned. Signing manifests is a separate decision and
+remains the operator's.
 
 Three things in it were got right only because the design had already been wrong about them:
 
@@ -409,7 +411,12 @@ that is the lab's proof, not PodMesh's. What remains PodMesh's is the maker's di
 refuse what the screen says is stale — and the honest gap: PodMesh cannot verify a permit's
 origin (no signature, no gate call), so a permit is provenance from a root-only channel, and
 a forged **higher** epoch can stop a universe here but never start a second one. The margin
-stays, because the ungated start is exactly what the lab refuses to gate.
+stays, because the ungated start is exactly what the lab refuses to gate. What is verified
+since 2026-09-15 is the origin of the **takeover document** an exclusive publication needs:
+the gate signs it with an Ed25519 key whose public half every policy it declares names, and
+the host refuses an altered, unsigned, stale, wrong-resource or unknown-key document before
+reading it (`LOCAL-API.md`). The permit itself stays unsigned, and this paragraph stays true
+of it.
 
 ## Level 2 across two hosts, measured on 2026-09-14
 

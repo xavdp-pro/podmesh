@@ -17,12 +17,21 @@ precondition -- one current copy, never cloned or rolled back -- as the operator
 
 Environment: PODMESH_SOCKET, PODMESH_STATE_DIR, PODMESH_UNIT (the service on both hosts),
 PODMESH_FENCING_LAB (directory holding fencing_lab.py), PODMESH_GATE (the gate's SQLite file),
-PODMESH_HA_LEDGER (directory for this tool's per-universe ledger; default ~/.podmesh-ha).
+PODMESH_HA_LEDGER (directory for this tool's per-universe ledger; default ~/.podmesh-ha),
+PODMESH_HA_KEYS (directory for the authority's Ed25519 signing key, one file per authority,
+0600, generated at first use; default <ledger>/keys), PODMESH_HA_UNSIGNED=1 (laboratory
+proofs, unsigned, for a policy that names no key).
+
+The takeover proof is signed: every policy this tool declares names the authority's public key,
+and every proof it prints (rotate, attest-fence) carries the signature over the proof's canonical
+form (keys sorted, compact JSON); the host verifies the signature before the binding.
 
 Subcommands:
   gate init                      create the gate; prints its authority_id
   gate declare  --universe U     declare the universe as a gated resource (epoch 0, no owner)
   gate inspect  --universe U
+  attest-fence  --universe R --receipt FILE   bind the previous holder's fence answer to the current epoch's
+                                 takeover proof (method fence_receipt); FILE = {host, operation_id, fence}
   rotate        --universe R --host SSH [--lease S --margin S --standbys N]
                                  rotate the epoch of a resource (a universe, or a role such as a logical
                                  manager whose replicas all keep running) to a host and acquire it there;
@@ -103,6 +112,63 @@ def save_ledger(universe, ledger):
     os.replace(tmp, p)
 
 
+# ------------------------------------------------------------------ signing
+def _crypto():
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    return ed25519, serialization
+
+
+def key_path(authority_id):
+    root = pathlib.Path(os.environ.get('PODMESH_HA_KEYS') or (pathlib.Path(os.environ.get('PODMESH_HA_LEDGER', pathlib.Path.home() / '.podmesh-ha')) / 'keys'))
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return root / f'{authority_id}.ed25519'
+
+
+def signing_key(authority_id):
+    """The authority's Ed25519 private key: raw bytes as hex in a 0600 file named by the authority,
+    generated at first use and never printed; None under PODMESH_HA_UNSIGNED=1."""
+    if os.environ.get('PODMESH_HA_UNSIGNED') == '1':
+        return None
+    ed25519, serialization = _crypto()
+    p = key_path(authority_id)
+    if p.is_file():
+        return ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(p.read_text().strip()))
+    key = ed25519.Ed25519PrivateKey.generate()
+    raw = key.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(raw.hex() + '\n')
+    return key
+
+
+def public_hex(key):
+    _, serialization = _crypto()
+    return key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
+
+
+def canonical(document):
+    """What the signature covers: the document without `signature`, keys sorted, compact -- the
+    form `serde_json` gives a `Value` on the host."""
+    return json.dumps({k: v for k, v in document.items() if k != 'signature'}, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()
+
+
+def sign(document, key):
+    """The document as the authority signs it: kind ed25519, `signer` the public key, `signature`
+    over the canonical form. A document signed again is signed over its new content."""
+    doc = {k: v for k, v in document.items() if k != 'signature'}
+    doc.update(kind='podmesh-takeover-proof/ed25519', signer=public_hex(key),
+               note='signed by the authority: the host verifies the signature under the key its policy names, then the binding')
+    doc['signature'] = key.sign(canonical(doc)).hex()
+    return doc
+
+
+def key_fields(gate):
+    """What a policy declaration carries so that the host requires and verifies signed proofs."""
+    key = signing_key(gate.authority_id)
+    return {'authority_key': public_hex(key)} if key else {}
+
+
 def hosts(args, *roles):
     control = tempfile.mkdtemp(prefix='podmesh-ha-')
     socket_path = os.environ.get('PODMESH_SOCKET', '/run/podmesh/api.sock')
@@ -140,7 +206,9 @@ def ok(host, req, what):
 def cmd_gate(args):
     if args.gate_command == 'init':
         gate = gate_or_refuse(create=True)
+        key = signing_key(gate.authority_id)
         out({'gate': os.environ.get('PODMESH_GATE'), 'authority_id': gate.authority_id, 'created': True,
+             'authority_key': public_hex(key) if key else None,
              'precondition': 'one current copy of this file, never cloned or rolled back; that is the operator\'s obligation'})
     gate = gate_or_refuse()
     if args.gate_command == 'declare':
@@ -165,7 +233,7 @@ def cmd_activate(args):
     if status['requires_lease'] and status.get('authority_id') not in (None, gate.authority_id):
         raise Refusal(f'the universe is under another authority on {host.role}: {status.get("authority_id")}')
     ok(host, request('activation_require', u, args.reference, lease_seconds=args.lease, takeover_margin_seconds=args.margin,
-                     desired_standbys=args.standbys, authority_id=gate.authority_id), 'activation_require')
+                     desired_standbys=args.standbys, authority_id=gate.authority_id, **key_fields(gate)), 'activation_require')
     current = gate.inspect(u)
     permit = permit_for(gate, u, host, current['epoch'])
     lease = ok(host, request('activation_acquire', u, args.reference, permit=permit), 'activation_acquire')
@@ -191,16 +259,79 @@ def cmd_rotate(args):
     policy = ledger.get('policy') or {'lease_seconds': args.lease, 'takeover_margin_seconds': args.margin, 'desired_standbys': args.standbys,
                                       'authority_id': gate.authority_id}
     ok(host, request('activation_require', u, args.reference, lease_seconds=policy['lease_seconds'], takeover_margin_seconds=policy['takeover_margin_seconds'],
-                     desired_standbys=policy['desired_standbys'], authority_id=gate.authority_id), 'activation_require')
+                     desired_standbys=policy['desired_standbys'], authority_id=gate.authority_id, **key_fields(gate)), 'activation_require')
     current = gate.inspect(u)
     permit = permit_for(gate, u, host, current['epoch'])
     lease = ok(host, request('activation_acquire', u, args.reference, permit=permit), 'activation_acquire')
+    proof = takeover_proof(gate, u, current, host.identity, permit['epoch'], policy)
     ledger['policy'] = dict(policy, authority_id=gate.authority_id, declared_on=host.identity, declared_at=int(time.time()))
     ledger['rotations'].append({'epoch': permit['epoch'], 'to': host.identity, 'at': int(time.time()), 'by': 'rotate'})
+    ledger.setdefault('proofs', {})[str(permit['epoch'])] = proof
     save_ledger(u, ledger)
-    out({'resource': u, 'host': host.identity, 'epoch': permit['epoch'], 'permit': permit,
+    out({'resource': u, 'host': host.identity, 'epoch': permit['epoch'], 'permit': permit, 'takeover_proof': proof,
          'lease': {k: lease[k] for k in ('generation', 'expires_at', 'live')},
-         'note': 'the role moved; no universe was promoted or started, and the other hosts learn the epoch only when the permit is delivered to them'})
+         'note': 'the role moved; no universe was promoted or started, and the other hosts learn the epoch only when the permit is delivered to them; '
+                 'the takeover proof is what an exclusive publication needs, upgraded by attest-fence once the previous holder is fenced'})
+
+
+def takeover_proof(gate, universe, before, new_holder, new_epoch, policy):
+    """The authority's account of the transition, bound to the resource, both epochs and both
+    holders (Codex, P0). Its method says what makes the new holder eligible: `first` when no
+    epoch existed, `same_holder` when this host held the previous one, else `lease_barrier` --
+    the previous lease plus the margin from now, on this gate's clock, since the previous
+    holder may have renewed right up to this rotation. `attest-fence` turns it into a
+    `fence_receipt` once the previous holder's fence is in hand. Signed with the authority's
+    Ed25519 key over its canonical form; a laboratory proof, unsigned and labelled so, only under
+    PODMESH_HA_UNSIGNED=1 (the host then accepts it on its binding alone)."""
+    previous_epoch = before['epoch']
+    previous_holder = before.get('replica_id') or None
+    now = int(time.time())
+    if previous_epoch == 0 or previous_holder is None:
+        method, eligible = 'first', now
+        previous_holder = None
+    elif previous_holder == new_holder:
+        method, eligible = 'same_holder', now
+    else:
+        method, eligible = 'lease_barrier', now + int(policy['lease_seconds']) + int(policy['takeover_margin_seconds'])
+    proof = {'kind': 'podmesh-takeover-proof/lab-unsigned', 'authority_id': gate.authority_id, 'resource': universe,
+             'previous_epoch': previous_epoch, 'new_epoch': new_epoch, 'previous_holder': previous_holder, 'new_holder': new_holder,
+             'method': method, 'eligible_after': eligible, 'issued_at': now, 'expires_at': now + 3600,
+             'note': 'laboratory proof, unsigned: binding checked by the host, origin not verified'}
+    key = signing_key(gate.authority_id)
+    return sign(proof, key) if key else proof
+
+
+def cmd_attest_fence(args):
+    """Upgrade the current epoch's takeover proof with the previous holder's fence: the fence's
+    answer (as the host returned it, with the host's identity) is bound to the transition and the
+    method becomes `fence_receipt`, eligible at once."""
+    gate = gate_or_refuse()
+    u = args.universe
+    ledger = load_ledger(u)
+    current = gate.inspect(u)
+    proof = (ledger.get('proofs') or {}).get(str(current['epoch']))
+    if not proof:
+        raise Refusal(f'no takeover proof recorded for epoch {current["epoch"]}; rotate first')
+    receipt = json.loads(pathlib.Path(args.receipt).read_text())
+    host = receipt.get('host')
+    answer = receipt.get('fence') or {}
+    if host != proof['previous_holder']:
+        raise Refusal(f'the receipt is from {host}, not from the previous holder {proof["previous_holder"]}')
+    # The fence names every resource it found the host not entitled to; a withdrawal it made for this
+    # resource must have taken, and one it had nothing to withdraw for still binds: the host is fenced.
+    if u not in (answer.get('unentitled') or []):
+        raise Refusal('the fence answer does not name this resource among those the host is not entitled to')
+    attempted = [r for r in (answer.get('publishers_withdrawn') or []) if r.get('resource') == u] + \
+        [r for r in (answer.get('routes_withdrawn') or []) if r.get('exclusive_resource') == u]
+    if any(r.get('withdrawn') is not True for r in attempted):
+        raise Refusal('the fence answer records a withdrawal for this resource that did not take')
+    proof = dict(proof, method='fence_receipt', eligible_after=int(time.time()), issued_at=int(time.time()),
+                 receipt={'host': host, 'operation_id': receipt.get('operation_id'), 'resource': u, 'withdrawn': True})
+    key = signing_key(gate.authority_id)
+    proof = sign(proof, key) if key else {k: v for k, v in proof.items() if k not in ('signature', 'signer')}
+    ledger['proofs'][str(current['epoch'])] = proof
+    save_ledger(u, ledger)
+    out({'resource': u, 'epoch': current['epoch'], 'takeover_proof': proof})
 
 
 def cmd_cycle(args):
@@ -313,7 +444,7 @@ def cmd_takeover(args):
         while B.call('time')['time'] < until:
             time.sleep(.5)
     ok(B, request('activation_require', u, args.reference, lease_seconds=policy['lease_seconds'], takeover_margin_seconds=policy['takeover_margin_seconds'],
-                  desired_standbys=policy['desired_standbys'], authority_id=gate.authority_id), 'activation_require on the standby')
+                  desired_standbys=policy['desired_standbys'], authority_id=gate.authority_id, **key_fields(gate)), 'activation_require on the standby')
     current = gate.inspect(u)
     permit = permit_for(gate, u, B, current['epoch'])
     lease = ok(B, request('activation_acquire', u, args.reference, permit=permit), 'activation_acquire on the standby')
@@ -339,7 +470,7 @@ def cmd_takeover(args):
         if C is None:
             others.append({'target': 'unreachable'}); continue
         ok(C, request('activation_require', u, args.reference, lease_seconds=policy['lease_seconds'], takeover_margin_seconds=policy['takeover_margin_seconds'],
-                      desired_standbys=policy['desired_standbys'], authority_id=gate.authority_id), f'activation_require on {C.role}')
+                      desired_standbys=policy['desired_standbys'], authority_id=gate.authority_id, **key_fields(gate)), f'activation_require on {C.role}')
         r = C.api(request('activation_supersede', u, args.reference, permit=permit))
         others.append({'host': C.identity, 'delivered': bool(r.get('ok')), 'highest_epoch_seen': (r.get('data') or {}).get('highest_epoch_seen'), 'error': r.get('error')})
     out({'universe': u, 'standby': B.identity, 'active': A.identity if A else None, 'active_reachable': A is not None,
@@ -358,6 +489,7 @@ def main():
     sub = p.add_subparsers(dest='command', required=True)
     g = sub.add_parser('gate'); g.add_argument('gate_command', choices=['init', 'declare', 'inspect']); g.add_argument('--universe')
     a = sub.add_parser('activate'); a.add_argument('--universe', required=True); a.add_argument('--host', required=True)
+    af = sub.add_parser('attest-fence'); af.add_argument('--universe', required=True); af.add_argument('--receipt', required=True, help='JSON: {host, operation_id, fence: <the fence answer>}')
     ro = sub.add_parser('rotate'); ro.add_argument('--universe', required=True); ro.add_argument('--host', required=True)
     ro.add_argument('--lease', type=int, default=20); ro.add_argument('--margin', type=int, default=5); ro.add_argument('--standbys', type=int, default=2)
     c = sub.add_parser('cycle'); c.add_argument('--universe', required=True); c.add_argument('--active', required=True); c.add_argument('--standby', required=True)
@@ -375,7 +507,7 @@ def main():
         s.add_argument('--stop-timeout', type=int, default=10)
     args = p.parse_args()
     try:
-        {'gate': cmd_gate, 'activate': cmd_activate, 'rotate': cmd_rotate, 'cycle': cmd_cycle, 'takeover': cmd_takeover}[args.command](args)
+        {'gate': cmd_gate, 'activate': cmd_activate, 'rotate': cmd_rotate, 'attest-fence': cmd_attest_fence, 'cycle': cmd_cycle, 'takeover': cmd_takeover}[args.command](args)
     except Refusal as e:
         out({'refused': str(e)}, 2)
 

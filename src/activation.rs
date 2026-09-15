@@ -208,6 +208,7 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
         ("activation_policy", "eligible_hosts TEXT NOT NULL DEFAULT '[]'"),
         ("activation_policy", "authorization_ref TEXT NOT NULL DEFAULT ''"),
         ("activation_policy", "authority_id TEXT NOT NULL DEFAULT ''"),
+        ("activation_policy", "authority_key TEXT NOT NULL DEFAULT ''"),
         ("activation_leases", "epoch INTEGER NOT NULL DEFAULT 0"),
         ("activation_leases", "grant_id TEXT NOT NULL DEFAULT ''"),
     ] {
@@ -240,6 +241,11 @@ pub struct Policy {
     /// The external gate whose epochs bind activation here; empty means the universe is
     /// under leases alone, with no epoch screen.
     pub authority_id: String,
+    /// The authority's Ed25519 public key (32 bytes, lowercase hex); empty means the authority
+    /// signs nothing yet and its takeover documents are laboratory ones, accepted on their
+    /// binding alone and labelled so. Named, it makes every takeover document's signature
+    /// required and verified here -- PodMesh holds no key of its own.
+    pub authority_key: String,
 }
 
 impl Policy {
@@ -251,7 +257,7 @@ impl Policy {
 pub fn policy(db: &Connection, uuid: &str) -> Result<Option<Policy>, Error> {
     Ok(db
         .query_row(
-            "SELECT lease_seconds,takeover_margin_seconds,desired_standbys,eligible_hosts,authorization_ref,authority_id FROM activation_policy WHERE universe_uuid=?1",
+            "SELECT lease_seconds,takeover_margin_seconds,desired_standbys,eligible_hosts,authorization_ref,authority_id,authority_key FROM activation_policy WHERE universe_uuid=?1",
             [uuid],
             |r| {
                 let hosts: String = r.get(3)?;
@@ -262,6 +268,7 @@ pub fn policy(db: &Connection, uuid: &str) -> Result<Option<Policy>, Error> {
                     eligible_hosts: serde_json::from_str(&hosts).unwrap_or_default(),
                     authorization_ref: r.get(4)?,
                     authority_id: r.get(5)?,
+                    authority_key: r.get(6)?,
                 })
             },
         )
@@ -291,6 +298,10 @@ pub fn lease(db: &Connection, uuid: &str) -> Result<Option<Lease>, Error> {
 /// says a newer grant exists, so whatever this lease says, this host is no longer entitled.
 fn superseded(db: &Connection, uuid: &str, l: &Lease) -> Result<Option<i64>, Error> {
     Ok(highest_epoch_seen(db, uuid)?.filter(|&seen| seen > l.epoch))
+}
+
+pub(crate) fn host_uuid_public(db: &Connection) -> Result<String, Error> {
+    host_uuid(db)
 }
 
 fn host_uuid(db: &Connection) -> Result<String, Error> {
@@ -395,6 +406,12 @@ fn view(db: &Connection, uuid: &str) -> Result<serde_json::Value, Error> {
         // The epoch half. A lease under an authority carries the epoch and grant it was taken
         // under; the screen is the highest epoch this host has seen, whoever it was granted to.
         "authority_id": policy.as_ref().map(|p| p.authority_id.clone()).filter(|a| !a.is_empty()),
+        "authority_key": policy.as_ref().map(|p| p.authority_key.clone()).filter(|k| !k.is_empty()),
+        "takeover_proof_verification": if policy.as_ref().is_some_and(|p| !p.authority_key.is_empty()) {
+            "the authority's takeover documents must be Ed25519-signed by the policy's key; signature verified here before any binding"
+        } else {
+            "laboratory takeover documents, unsigned: their binding is checked, their origin is not"
+        },
         "epoch": held.as_ref().map(|l| l.epoch).filter(|&e| e > 0),
         "grant_id": held.as_ref().map(|l| l.grant_id.clone()).filter(|g| !g.is_empty()),
         "highest_epoch_seen": highest_epoch_seen(db, uuid)?,
@@ -507,15 +524,29 @@ fn perform(db: &Connection, request: &serde_json::Value) -> Result<serde_json::V
                     a.to_string()
                 }
             };
+            // Optional with it: the authority's public key, checked to be a valid Ed25519 key now
+            // so that a mistyped one is refused here and not at the first takeover.
+            let authority_key = match request.get("authority_key") {
+                None => String::new(),
+                Some(v) => {
+                    let k = v.as_str().ok_or("authority_key must be a string")?;
+                    if authority.is_empty() {
+                        return Err("authority_key without authority_id: a key belongs to a named authority".into());
+                    }
+                    crate::signing::verifying_key(k)?;
+                    k.to_string()
+                }
+            };
             db.execute(
-                "INSERT INTO activation_policy VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                "INSERT INTO activation_policy VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
                  ON CONFLICT(universe_uuid) DO UPDATE SET lease_seconds=excluded.lease_seconds,
                    takeover_margin_seconds=excluded.takeover_margin_seconds,
                    declared_at=excluded.declared_at, operation_id=excluded.operation_id,
                    desired_standbys=excluded.desired_standbys, eligible_hosts=excluded.eligible_hosts,
-                   authorization_ref=excluded.authorization_ref, authority_id=excluded.authority_id",
+                   authorization_ref=excluded.authorization_ref, authority_id=excluded.authority_id,
+                   authority_key=excluded.authority_key",
                 params![uuid, lease_seconds as i64, margin as i64, now, id, standbys as i64,
-                        serde_json::to_string(&hosts)?, reference, authority],
+                        serde_json::to_string(&hosts)?, reference, authority, authority_key],
             )?;
             record(db, uuid, &this_host, 0, "policy_declared", id)?;
         }
@@ -739,12 +770,18 @@ fn fence(db: &Connection, id: &str, timeout: u64) -> Result<serde_json::Value, E
         .collect::<Result<_, _>>()?;
     let mut fenced = Vec::new();
     let mut left = Vec::new();
+    // Every resource this fence found this host NOT entitled to, whether or not anything had to be
+    // withdrawn for it: what a fence receipt binds a takeover proof to (Codex, P0).
+    let mut unentitled = Vec::new();
     for uuid in universes {
         let held = lease(db, &uuid)?;
         let overtaken = match held.as_ref() { Some(l) => superseded(db, &uuid, l)?, None => None };
         let entitled = held
             .as_ref()
             .is_some_and(|l| l.holder_host_uuid == this_host && l.expires_at > now && overtaken.is_none());
+        if !entitled {
+            unentitled.push(uuid.clone());
+        }
         let observed = lc::observe(&uuid)?;
         let running = observed["present"] == serde_json::json!(true)
             && observed["running"] == serde_json::json!(true);
@@ -787,11 +824,28 @@ fn fence(db: &Connection, id: &str, timeout: u64) -> Result<serde_json::Value, E
     let network_reconciliation = crate::network::reconcile(db)?;
     // The publishing connector of a role this host no longer holds goes first -- stopped, its
     // governor mark removed -- so that nothing publishes an address about to be withdrawn.
-    let publishers_withdrawn = crate::publisher::withdraw_unentitled(db, &|resource: &str| {
+    let mut publishers_withdrawn = crate::publisher::withdraw_unentitled(db, &|resource: &str| {
         lease(db, resource).ok().flatten().is_some_and(|l| {
             l.holder_host_uuid == this_host && l.expires_at > now && superseded(db, resource, &l).ok().flatten().is_none()
         })
     }, id)?;
+    // The reconciliation just above withdraws a publisher of a resource this host no longer holds
+    // before this step reaches it (the supersession was delivered before the fence): that
+    // withdrawal is the fence's too, reported here, first, with the pass that made it named.
+    let by_reconciliation: Vec<serde_json::Value> = network_reconciliation["publishers"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter(|r| r["resource"].as_str().is_some_and(|res| unentitled.iter().any(|u| u == res)))
+                .map(|r| {
+                    let mut r = r.clone();
+                    r["by"] = serde_json::Value::from("reconciliation before the fence");
+                    r
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    publishers_withdrawn.splice(0..0, by_reconciliation);
     let routes_withdrawn = crate::network::withdraw_unentitled(db, &|resource: &str| {
         lease(db, resource).ok().flatten().is_some_and(|l| {
             l.holder_host_uuid == this_host && l.expires_at > now && superseded(db, resource, &l).ok().flatten().is_none()
@@ -800,6 +854,7 @@ fn fence(db: &Connection, id: &str, timeout: u64) -> Result<serde_json::Value, E
     Ok(serde_json::json!({
         "this_host_uuid": this_host,
         "fenced": fenced,
+        "unentitled": unentitled,
         "publishers_withdrawn": publishers_withdrawn,
         "routes_withdrawn": routes_withdrawn,
         "network_reconciliation": network_reconciliation,

@@ -582,6 +582,84 @@ laboratory transition only; the unverified `previous` assertion and crash-finali
 `/tmp/podmesh-claude/CODEX-REVIEW-B1-B3-CLOUDFLARE-2026-09-15.md` still block signatures and
 packaging.
 
+## Codex's second review applied (2026-09-15): P0, three P1, P2
+
+`/tmp/podmesh-claude/CODEX-REVIEW-B1-B3-CLOUDFLARE-2026-09-15.md` accepted the locally managed
+tunnel and the `previous` account as provenance only, and blocked signatures and packaging on
+five findings. All five are done and measured on the reference build `cdc980d3…` then
+`campaign 6` (below). **P0** — the unverified `previous` gate is replaced by the authority's
+typed takeover proof: the tool's `rotate` issues it (resource, both epochs, both holders,
+method `first`/`same_holder`/`lease_barrier` with `eligible_after` = the previous lease plus the
+margin from the rotation, issue and expiry), `attest-fence` upgrades it to `fence_receipt` from
+the previous holder's fence answer (the resource must be among the fence's `unentitled`, no
+withdrawal failed), and `publisher_start` checks every binding; a proof that is absent, waited
+before its barrier, for another resource, stale, for another holder or expired is refused, each
+at its own reason (`check-manager-publisher.py`, `check-manager-publisher-agent-cut.py`).
+**P1 transitions** — `publisher_transitions` records `starting` before any effect and
+`effective` last; seven lab faults (after the mark, after the connector, before the final
+state, each as a failure and as a crash, and a crash during the compensation itself — two fault
+points at once) leave nothing: a failure compensates and reports it, a crash is withdrawn by
+the restart's reconciliation, and an `effective` publisher whose lease is superseded is
+withdrawn at the next restart (`check-manager-publisher-crash.py`, eight cases). **P1
+secrets** — a state machine `declaring`/`effective`/`removing` with the store's digest verified
+against the intent, immutable names (same content idempotent, other content refused), upsert
+over a removed row, compensation of an uncommitted store, reconciliation at startup
+(`check-secrets-crash.py`). **P1 registration** — `publisher_start` waits, bounded, for the
+connector's registration identity in `cloudflared`'s journal; a unit that exits or never
+registers is withdrawn and reported. **P2** — the NAT exemption is verified as the exact rule
+set for the backend, prefix and pool (`nft list table` compared to the expected rules, chain
+lines excluded); three mutations (wrong pool, wrong prefix, an extra rule) each went red at the
+declaration. Also from the day's runs: the fence's own pre-mutation reconciliation withdraws a
+superseded publisher before the fence's step reaches it (the supersession having been delivered
+first); that withdrawal is now reported in the fence's `publishers_withdrawn`, labelled with the
+pass that made it, so the contract's field holds whichever pass did the work. Two suite
+corrections were the day's real findings about the suites, not the daemon: a crashed unit has no
+socket, so a state read after an injected crash must come from the journal itself; and the
+proof's barrier (25 s) outlasts a 20-second lease, so the new holder acquires again with the
+rotation's permit after the barrier — the design's own answer to a lapsed lease of one's own,
+idempotent for the holder.
+
+## The takeover document signed (2026-09-15, Codex's step 4)
+
+`src/signing.rs` verifies an Ed25519 signature (`ed25519-dalek` 2.2, verification only; the
+first dependency beyond `serde_json` and `rusqlite` — a supply-chain choice for the operator to
+confirm) over a document's canonical form: the document without `signature`, every object's
+keys sorted, compact JSON, no floating-point number; the tool's `sign` produces exactly that form
+(a document signed by the tool's Python and verified by the Rust unit test settles the
+canonicalisation: accents, escapes, nested objects, null and booleans). A policy names the
+authority's public key (`activation_require` `authority_key`, refused unless a valid point and
+unless an authority is named); the tool's gate generates its signing key at first use
+(`PODMESH_HA_KEYS`, one 0600 file per authority, never printed) and names its public half in
+every policy it declares; `rotate` and `attest-fence` sign every proof. Under a keyed policy
+`publisher_start` accepts only the signed kind, verifies the signature **before** reading a
+field, then checks the binding; under a policy without a key only the unsigned laboratory kind,
+labelled `signed: false`. `tests/check-takeover-proof-signature.py` on lab-a: a malformed key, a
+non-point key (y = 2) and a key without an authority refused at declaration with the policy
+unchanged; an unsigned proof, an altered one (a field no binding reads), one signed by an
+unknown key, a zero signature and a missing signature refused before binding; documents signed
+by the real key for another resource, expired, for another holder and for the next epoch refused
+at their binding; the genuine document accepted with the signature recorded as verified. The
+permit itself stays unsigned provenance, as `LOCAL-API.md` and the HA document say. Recovery
+point manifests stay unsigned.
+
+**Campaign 6 (2026-09-15, build `54ef30ed…`, reproduced byte-identical before and after the
+mutation, installed as the isolated transient service on lab-a, lab-b and lab-c):** secrets-crash,
+publisher-crash (eight cases), readiness, the signature suite (thirteen checks), agent-cut (the
+real cut with the signed barrier proof and the re-acquire) all PASS; the mutation removing the
+signature check went red at the altered-document case (the mutated daemon accepted an altered
+document; the suite's cleanup left no connector); the twelve-suite regression (no-nat,
+nat-matrix, network-managed, crash-safety, secrets-image-free, governor, service-address,
+recovery, partition, control, control-race, fence-timer) all PASS on the same build. The
+three-host publisher suite, whose binding cases alter proof fields and now re-sign them with the
+gate's key, ran last on that build: PASS — lab-a governor, lab-b standby, lab-c following; every binding refused at its own reason with a re-signed document, the fence's `publishers_withdrawn` carrying the reconciliation's withdrawal, the public hostname answering the new governor at the new epoch, the permit gate alone at the end.
+
+**Branch divergence found while reconciling the inventory (`docs/README.md`):** the package
+installed on the three hosts, `0.1.0~experimental6`, was built by Codex on 2026-09-12 from
+`codex/collector-completion` (`a804f0b` + `4d7310b` durable collector recovery and pidfd-bound
+reclaim signals + `ea2104c`), and `main` does not contain those two commits; `main`'s collector
+(M4 and its amendments) is another implementation. Which collector ships is Codex's decision
+before step 8.
+
 ## Next actions, in order
 
 1. Done: independent read-only counter-review of the source-side milestone (Claude
@@ -617,7 +695,13 @@ packaging.
    records that provenance; it does not replace the proof. PodMesh still refuses to signal
    anything it cannot prove belongs to the failed attempt, whatever the requester claims.
 4. Package and qualify each accepted increment through signed APT; publish sources,
-   tests and honest limitations together after review.
+   tests and honest limitations together after review. **Codex's order of 2026-09-15 governs
+   the way there** (`CODEX-REVIEW-B1-B3-CLOUDFLARE-2026-09-15.md`): steps 1–4 (P0, P1 ×3, P2,
+   the signed takeover document) and 6 (the inventory in `docs/README.md`) are done and
+   measured (sections above); step 5, movable replica recovery and an actual VM loss, needs the
+   operator to name the VM that may be destroyed; step 7 is Codex's final diff review
+   (`dff3e65..HEAD`); step 8, the Debian 13 package and the Alpine manager image, only after it,
+   and after Codex decides which collector ships (the branch divergence above).
 5. Control-services universe, per CONTROL-SERVICES-UNIVERSE.md (operator design
    direction and complete brief, 2026-09-12). Its own order: registry schema and an
    immutable event format, one local instance with export and import, restart and

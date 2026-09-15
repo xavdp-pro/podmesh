@@ -35,7 +35,69 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             authorization_ref TEXT NOT NULL,
             removed_at INTEGER);",
     )?;
+    let present: bool = db.query_row("SELECT COUNT(*) FROM pragma_table_info('secrets') WHERE name='state'", [], |r| Ok(r.get::<_, i64>(0)? > 0))?;
+    if !present {
+        db.execute_batch("ALTER TABLE secrets ADD COLUMN state TEXT NOT NULL DEFAULT 'effective';")?;
+    }
     Ok(())
+}
+
+/// The digest of what Podman's store holds under a name, read back through the store itself.
+fn store_digest(name: &str) -> Option<String> {
+    let out = std::process::Command::new("podman").args(["secret", "inspect", "--showsecret", "--format", "{{.SecretData}}", name]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // The template output ends with one newline Podman adds; the content itself may end with one too.
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let content = text.strip_suffix('\n').unwrap_or(&text);
+    crate::migration::sha256_bytes(content.as_bytes()).ok()
+}
+
+/// A secret's state (Codex, P1): `declaring` recorded with the intended digest before Podman's
+/// store is touched, `effective` once the store's content hashes to it, `removing` before the
+/// removal, gone after. Names are immutable: another content needs another name. Reconciliation
+/// finishes or undoes whatever is not effective: a `declaring` secret whose store content hashes
+/// to the intended digest becomes effective, one whose content differs or is absent is removed
+/// from the store with its row; a `removing` one is removed.
+pub(crate) fn reconcile(db: &Connection) -> Result<Vec<Value>, Error> {
+    ensure_schema(db)?;
+    let mut s = db.prepare("SELECT name,sha256,state FROM secrets WHERE removed_at IS NULL AND state!='effective'")?;
+    let rows: Vec<(String, String, String)> = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+    let mut report = vec![];
+    for (name, digest, state) in rows {
+        match state.as_str() {
+            "declaring" => {
+                if in_store(&name) == Some(true) && store_digest(&name).as_deref() == Some(digest.as_str()) {
+                    db.execute("UPDATE secrets SET state='effective' WHERE name=?1", [&name])?;
+                    report.push(json!({"name": name, "was": "declaring", "now": "effective", "why": "the store holds the intended content"}));
+                } else {
+                    if in_store(&name) == Some(true) {
+                        lc::podman(lc::QUICK, &["secret", "rm", &name])?;
+                    }
+                    if in_store(&name) != Some(false) {
+                        report.push(json!({"name": name, "was": "declaring", "now": "declaring", "error": "the store could not be cleared or asked"}));
+                        continue;
+                    }
+                    db.execute("DELETE FROM secrets WHERE name=?1", [&name])?;
+                    report.push(json!({"name": name, "was": "declaring", "now": "gone", "why": "the store did not hold the intended content"}));
+                }
+            }
+            "removing" => {
+                if in_store(&name) == Some(true) {
+                    lc::podman(lc::QUICK, &["secret", "rm", &name])?;
+                }
+                if in_store(&name) != Some(false) {
+                    report.push(json!({"name": name, "was": "removing", "now": "removing", "error": "the store could not be cleared or asked"}));
+                    continue;
+                }
+                db.execute("DELETE FROM secrets WHERE name=?1", [&name])?;
+                report.push(json!({"name": name, "was": "removing", "now": "gone"}));
+            }
+            other => report.push(json!({"name": name, "state": other, "error": "unknown state"})),
+        }
+    }
+    Ok(report)
 }
 
 fn inbox_dir() -> std::path::PathBuf {
@@ -52,7 +114,7 @@ fn in_store(name: &str) -> Option<bool> {
 pub(crate) fn declared(db: &Connection, name: &str) -> Result<(), Error> {
     ensure_schema(db)?;
     let row: Option<String> = db
-        .query_row("SELECT sha256 FROM secrets WHERE name=?1 AND removed_at IS NULL", [name], |r| r.get(0))
+        .query_row("SELECT sha256 FROM secrets WHERE name=?1 AND removed_at IS NULL AND state='effective'", [name], |r| r.get(0))
         .optional()?;
     if row.is_none() {
         return Err(format!("secret {name} is not declared on this host (secret_declare)").into());
@@ -111,12 +173,12 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
 }
 
 fn view(db: &Connection) -> Result<Value, Error> {
-    let mut s = db.prepare("SELECT name,sha256,bytes,declared_at,removed_at FROM secrets ORDER BY name")?;
+    let mut s = db.prepare("SELECT name,sha256,bytes,declared_at,state FROM secrets WHERE removed_at IS NULL ORDER BY name")?;
     let rows: Vec<Value> = s
         .query_map([], |r| {
             let name: String = r.get(0)?;
             Ok(json!({"name": name, "sha256": r.get::<_, String>(1)?, "bytes": r.get::<_, i64>(2)?, "declared_at": r.get::<_, i64>(3)?,
-                      "removed_at": r.get::<_, Option<i64>>(4)?, "in_store": in_store(&name)}))
+                      "state": r.get::<_, String>(4)?, "in_store": in_store(&name)}))
         })?
         .collect::<Result<_, _>>()?;
     Ok(json!({"secrets": rows, "inbox": inbox_dir(),
@@ -146,18 +208,29 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
             }
             let bytes = std::fs::read(&path)?;
             let digest = crate::migration::sha256_bytes(&bytes)?;
-            let existing: Option<String> = db
-                .query_row("SELECT sha256 FROM secrets WHERE name=?1 AND removed_at IS NULL", [name], |r| r.get(0))
+            let existing: Option<(String, String)> = db
+                .query_row("SELECT sha256,state FROM secrets WHERE name=?1 AND removed_at IS NULL", [name], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?;
-            if let Some(previous) = existing {
-                if previous != digest && request.get("replace") != Some(&json!(true)) {
-                    return Err(format!("secret {name} is already declared with another content; pass replace: true to replace it").into());
+            if let Some((previous, state)) = existing {
+                if state == "effective" && previous == digest && in_store(name) == Some(true) {
+                    std::fs::remove_file(&path)?;
+                    return Ok(json!({"name": name, "sha256": digest, "bytes": bytes.len(), "inbox_copy_removed": true, "in_store": true, "already_declared": true}));
                 }
+                if state == "effective" {
+                    return Err(format!("secret {name} is already declared with another content; names are immutable: declare the new content under a new name and switch the universe to it").into());
+                }
+                return Err(format!("secret {name} is in state {state}; reconciliation finishes it first").into());
             }
-            // Podman's store receives the bytes on stdin; nothing of them goes through an argument
-            // or a file Podman would keep beside its store.
+            // The intent first, durable: the name and the digest it must hold; then the store.
+            // A name removed earlier may be declared again (its row is history): the intent replaces it.
+            db.execute(
+                "INSERT INTO secrets(name,sha256,bytes,declared_at,operation_id,authorization_ref,state) VALUES(?1,?2,?3,?4,?5,?6,'declaring')
+                 ON CONFLICT(name) DO UPDATE SET sha256=excluded.sha256, bytes=excluded.bytes, declared_at=excluded.declared_at,
+                   operation_id=excluded.operation_id, authorization_ref=excluded.authorization_ref, state='declaring', removed_at=NULL",
+                params![name, digest, bytes.len() as i64, crate::now() as i64, id, reference],
+            )?;
             let mut child = std::process::Command::new("podman")
-                .args(["secret", "create", "--replace", name, "-"])
+                .args(["secret", "create", name, "-"])
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -168,17 +241,29 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
             }
             let out = child.wait_with_output()?;
             if !out.status.success() {
+                db.execute("DELETE FROM secrets WHERE name=?1 AND state='declaring'", [name])?;
                 return Err(format!("podman secret create: {}", String::from_utf8_lossy(&out.stderr).trim()).into());
             }
-            if in_store(name) != Some(true) {
-                return Err(format!("secret {name} is not in Podman's store after its creation; nothing is recorded").into());
+            // From here a failure compensates: the store entry goes and the intent with it. A crash
+            // leaves the intent `declaring`, and reconciliation finishes or undoes it from the store.
+            let settle = |db: &Connection| -> Result<(), Error> {
+                lc::fault("secret-after-store")?;
+                // Verified from the store itself: the bytes it holds hash to the intent.
+                if store_digest(name).as_deref() != Some(digest.as_str()) {
+                    return Err(format!("secret {name}: the store does not hold the intended content after its creation").into());
+                }
+                lc::fault("secret-before-effective")?;
+                db.execute("UPDATE secrets SET state='effective' WHERE name=?1", [name])?;
+                Ok(())
+            };
+            if let Err(err) = settle(db) {
+                let _ = lc::podman(lc::QUICK, &["secret", "rm", name]);
+                let gone = in_store(name) == Some(false);
+                if gone {
+                    db.execute("DELETE FROM secrets WHERE name=?1 AND state='declaring'", [name])?;
+                }
+                return Err(format!("{err}; compensation: store entry {}", if gone { "removed, nothing is declared" } else { "NOT removed; reconciliation will" }).into());
             }
-            db.execute(
-                "INSERT INTO secrets(name,sha256,bytes,declared_at,operation_id,authorization_ref) VALUES(?1,?2,?3,?4,?5,?6)
-                 ON CONFLICT(name) DO UPDATE SET sha256=excluded.sha256, bytes=excluded.bytes, declared_at=excluded.declared_at,
-                   operation_id=excluded.operation_id, authorization_ref=excluded.authorization_ref, removed_at=NULL",
-                params![name, digest, bytes.len() as i64, crate::now() as i64, id, reference],
-            )?;
             // The inbox copy has served; the durable copy is the operator's.
             std::fs::remove_file(&path)?;
             Ok(json!({"name": name, "sha256": digest, "bytes": bytes.len(), "inbox_copy_removed": true, "in_store": true,
@@ -203,13 +288,15 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
             if !users.is_empty() {
                 return Err(format!("secret {name} is carried by {}; delete those universes first", users.join(", ")).into());
             }
+            db.execute("UPDATE secrets SET state='removing' WHERE name=?1", [name])?;
             if in_store(name) == Some(true) {
                 lc::podman(lc::QUICK, &["secret", "rm", name])?;
             }
+            lc::fault("secret-remove-after-store")?;
             if in_store(name) != Some(false) {
-                return Err(format!("secret {name} is still in Podman's store after its removal, or the store could not be asked").into());
+                return Err(format!("secret {name} is still in Podman's store after its removal, or the store could not be asked; its removal is finished by reconciliation").into());
             }
-            db.execute("UPDATE secrets SET removed_at=?2 WHERE name=?1", params![name, crate::now() as i64])?;
+            db.execute("DELETE FROM secrets WHERE name=?1", [name])?;
             Ok(json!({"name": name, "removed": true, "in_store": false}))
         }
         _ => Err("Unsupported secret operation".into()),

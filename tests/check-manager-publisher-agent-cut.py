@@ -19,7 +19,7 @@ import io, json, os, pathlib, subprocess, sys, tarfile, tempfile, time, uuid, ha
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from podmesh_two_hosts import Host, request  # noqa: E402
-from podmesh_manager_lab import declare_replica_config, remove_replica_config, replica_create  # noqa: E402
+from podmesh_manager_lab import declare_replica_config, remove_replica_config, replica_create, prove_takeover  # noqa: E402
 
 TOOL = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools', 'ha-standby.py')
 FENCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'packaging', 'podmesh-fence')
@@ -222,7 +222,8 @@ try:
     for a in aliases:
         assert pub('publisher_declare', a, hostname=HOSTNAME, tunnel_uuid=TUNNEL_ID, credential=CREDENTIAL, origin_port=8080).get('ok')
     A.ok(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=addresses[G], exclusive_resource=LOGICAL))
-    assert pub('publisher_start', G, previous={'none': True}).get('ok')
+    proof1, how = prove_takeover(rot, hosts, tool, request, reference, LOGICAL)
+    assert pub('publisher_start', G, takeover_proof=proof1).get('ok')
     st = wait_connector(G)
     assert st['unit']['state'] == 'active' and st['connector_id'], st
     status, body = public_ready()
@@ -249,7 +250,17 @@ try:
     e2 = rot2['epoch']
     B.ok(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=addresses[S], exclusive_resource=LOGICAL))
     publish_at_s = B.call('time')['time']
-    assert pub('publisher_start', S, previous={'waited_seconds': wait}).get('ok')
+    # the previous holder is out of reach: the authority's barrier, waited on this clock
+    proof2 = rot2['takeover_proof']; assert proof2['method'] == 'lease_barrier', proof2
+    refused_early = pub('publisher_start', S, takeover_proof=proof2)
+    assert not refused_early.get('ok') and 'barrier' in refused_early['error'], refused_early
+    while time.time() < proof2['eligible_after']:
+        time.sleep(1)
+    # the barrier (the previous lease plus the margin, from the rotation) outlasts a 20-second
+    # lease: acquired again with the rotation's permit, idempotent for the holder, before starting
+    B.ok(request('activation_acquire', LOGICAL, reference, permit=rot2['permit']))
+    started_s = pub('publisher_start', S, takeover_proof=proof2, previous={'waited_seconds': wait})
+    assert started_s.get('ok'), started_s
     st = wait_connector(S)
     assert st['unit']['state'] == 'active' and st['connector_id'], st
     deadline = time.time() + 120

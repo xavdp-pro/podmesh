@@ -304,6 +304,9 @@ lease. `stop` is never gated.
   placement among the eligible hosts can satisfy is refused at declaration. The `authorization_ref` is kept
   verbatim as `allocation_decided_by`: the allowance is the operator's judgement and is never computed here.
   An `authority_id` names the external gate whose **epochs** bind activation (below); absent means leases alone.
+  With it, an optional `authority_key` (the gate's Ed25519 public key, 32 bytes as lowercase hex, refused unless it
+  is a valid point) makes every takeover document for the resource require that key's signature (below); a key
+  without an authority is refused. `activation_status` reports `authority_key` and `takeover_proof_verification`.
 - `activation_acquire` takes the lease for this host. It is idempotent while this host's lease is live, retakes
   this host's own lapsed lease with a new generation, and takes over another host's only once that lease has
   lapsed by **at least the takeover margin** — before that it is refused and says when it may be taken. Under an
@@ -338,6 +341,18 @@ role. A `permit` is the laboratory's exact form — `authority_id`, `resource`, 
 and is bound to the universe (`resource`), this host (`replica_id`) and **this boot** (`instance_id` is the
 kernel's `boot_id`, so a rebooted host must be authorised again). The screen, `highest_epoch_seen`, is reported
 by `activation_status` with `superseded`. The gate's fourth refusal is "superseded by epoch N".
+
+**The takeover document, signed.** The authority's account of a rotation (`takeover_proof`, consumed by
+`publisher_start`) comes in two kinds. Under a policy that names an `authority_key`, only
+`podmesh-takeover-proof/ed25519` is accepted: `signer` must be that key, and `signature` (64 bytes, hex) must
+verify under it over the document's canonical form — the document without `signature`, every object's keys
+sorted, compact JSON, no floating-point number — **before** any field of the document is read, so that an
+altered document, one signed by another key, or an unsigned one is refused as such. Under a policy without a
+key, only `podmesh-takeover-proof/lab-unsigned` is accepted, on its binding alone, and the answer says so
+(`signed: false`). PodMesh holds no key of its own; the tool's gate generates the authority's signing key at
+first use (`PODMESH_HA_KEYS`, one root-only file per authority) and names its public half in every policy it
+declares. A permit is still unsigned provenance (below): what the signature closes is the origin of the
+takeover document, not of the permit.
 
 **What a lease proves.** This host's own restraint: it will not start what it holds no lease for. It does
 **not** prove mutual exclusion — the lease lives in this host's journal, a host that never asks is not
@@ -415,9 +430,13 @@ remains (`network_status`: `effects`, `incomplete_effects`).
 
 A secret's bytes never enter an image layer, this journal, or the API line. The operator (or the agent, over
 root SSH) places the file under `inbox/secrets/<source>` of the state directory, root-owned with no group or
-other permission, and asks `secret_declare` (`name`, `source`, optional `replace`): the daemon hands the bytes
-to Podman's secret store under the name, records the name, digest and size, and removes the inbox copy; a
-second declaration with another content is refused without `replace`. `create` takes `secrets`
+other permission, and asks `secret_declare` (`name`, `source`): the daemon records the name and the intended
+digest first (`declaring`), hands the bytes to Podman's secret store, reads the store's content back and
+requires it to hash to the intent, records `effective`, and removes the inbox copy. Names are immutable: the
+same content under the same name is idempotent, another content is refused and needs another name (then the
+universe is switched to it). `secret_remove` records `removing` before clearing the store. Reconciliation
+(at startup, before every network mutation, at every fence) finishes a `declaring` secret whose store content
+hashes to the intent, removes one whose content differs or is absent, and finishes a `removing` one. `create` takes `secrets`
 `[{name, target}]`: each must be declared here and present in Podman's store; it is mounted at the target,
 root-only (0600), and the container is labelled with names and targets only. `recovery_point_restore` reports
 the source's `source_secrets` by name; `recovery_point_promote` takes `secrets` to attach them again, once
@@ -430,11 +449,15 @@ host, the laboratory's accepted boundary.
 
 The contract is `MANAGER-PUBLISHER-CONTRACT.md`. `publisher_declare` (`resource`, `hostname`, `tunnel_uuid`,
 `credential`, optional `origin_port`) records the connector by reference; `publisher_start` (`resource`,
-`previous`) is refused unless the resource's lease is live and unsuperseded here, the exclusive route and alias
-are effective, the credential is in Podman's store and the previous publisher is accounted for, then writes
+`takeover_proof`, optional `previous`) is refused unless the resource's lease is live and unsuperseded here,
+the exclusive route and alias are effective, the credential is in Podman's store and the authority's takeover
+proof is of the kind the policy requires, its signature verified when the policy names the authority's key, and
+binds this transition (resource, epochs, holders, expiry, and its method: first, same holder, fence
+receipt, or a lease barrier already reached on this clock); then records its transition `starting`, writes
 the governor mark inside the carrier universe, requires the origin to answer ready with the expected logical
-manager, replica and epoch, and runs `cloudflared` as a transient unit from a root-only runtime copy of the
-credential; `publisher_stop` stops it and removes the mark; `activation_fence` does the same first for every
+manager, replica and epoch, runs `cloudflared` as a transient unit from a root-only runtime copy of the
+credential, waits for its registration with Cloudflare, and records `effective`; the answer carries
+`published` and `connector_id`; `publisher_stop` stops it and removes the mark; `activation_fence` does the same first for every
 resource this host no longer holds (`publishers_withdrawn`); `publisher_observed` records an external request;
 `publisher_status` (read-only) reports the unit, the connector's identity, the lease, the origin's readiness and
 `publisher_eligible` with reasons. Every step is recorded in the network effects ledger before it is made.

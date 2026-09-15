@@ -39,13 +39,15 @@ def hostwide(operation, **extra):
     return dict(operation=operation, operation_id=str(uuid.uuid4()), authorization_ref=reference, **extra)
 
 def daemon(fault=None):
-    A.ssh(f'sudo -n systemctl stop {unit} 2>/dev/null; sudo -n systemctl reset-failed {unit} 2>/dev/null', check=False)
+    # The stop must be complete -- the unit gone and its runtime directory removed -- before the new
+    # unit of the same name starts, or the old unit's cleanup removes the new daemon's socket.
+    A.ssh(f'sudo -n systemctl stop {unit} 2>/dev/null; sudo -n systemctl reset-failed {unit} 2>/dev/null; for i in $(seq 1 100); do systemctl is-active --quiet {unit} || [ -d {os.path.dirname(socket_path)} ] || break; sleep 0.1; done', check=False)
     env = f'--setenv=PODMESH_FAULT={fault} ' if fault else ''
     A.ssh(f'sudo -n systemd-run --quiet --unit={unit} --property=RuntimeDirectory={os.path.basename(os.path.dirname(socket_path))} --property=RuntimeDirectoryMode=0700 '
           f'--property=StateDirectory={os.path.basename(state_dir)} --property=StateDirectoryMode=0700 --property=UMask=0077 '
           f'--setenv=PODMESH_STATE_DIR={state_dir} --setenv=PODMESH_SOCKET={socket_path} {env}{BINARY}')
     for _ in range(50):
-        if A.ssh(f'sudo -n test -S {socket_path}', check=False).returncode == 0:
+        if A.ssh(f'sudo -n test -S {socket_path}', check=False).returncode == 0 and A.call('ready', seconds=20).get('ready'):
             return
         time.sleep(0.2)
     raise AssertionError('the daemon did not come up')
