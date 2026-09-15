@@ -220,6 +220,22 @@ with the route. Mutations: no alias on publication, and no alias removal by the 
 at its own check. Not shown: an authenticated exchange at the service address (the listener
 accepts; the protocol then needs a peer key), a real partition, a host loss.
 
+**A real partition (2026-09-15):** `tests/check-manager-partition.py` cuts the governor's host
+from the two others with an nftables table of its own (every packet dropped at prerouting and
+output, both directions; a dead man's switch on the host removes it after ten minutes whatever
+happens to the suite) while the agent still reaches every host. Measured on the three hosts:
+the two connected replicas converged on a fourth fact the cut replica never saw (it kept
+running with three facts and kept carrying the service address); the service address was
+unreachable from the connected side; the agent moved the role to lab-b — rotation, supersession
+delivered to the cut host, its fence withdrawing route and alias on request — and lab-c reached
+the service address on lab-b; on reconnection the cut replica converged as a simple replica and
+reached the service address through the follow route. What it does not show, and says: a
+partition that also cuts the agent from the governor's host — that host keeps its alias until an
+agent reaches it, since the self-fence is an operation and PodMesh runs no timer; whether a
+timer may run it is the operator's decision (`UNIVERSE-HIGH-AVAILABILITY.md`). The first
+attempt hooked `input` only and the forwarded connections crossed the "cut"; the suite records
+that.
+
 **Known deviation, stated:** Podman's network firewall source-NATs traffic leaving the bridge's
 subnet, so a universe reaching another host's universe is seen there with the host's address.
 Identity between manager replicas is the HMAC pair key, never the address; removing the NAT

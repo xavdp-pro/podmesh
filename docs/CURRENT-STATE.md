@@ -502,8 +502,14 @@ address as an alias inside its network namespace, withdrawn with the route; the 
 on every address; `tests/check-manager-service-address.py` on the three hosts: a TCP connection
 to the service address from the other hosts is accepted by the governor's replica only, before
 and after the role moves with all three running, and fails at once when nothing is announced
-(two mutations red at their own checks). Not shown: a real partition, a host loss, an
-authenticated exchange at the service address, a signed manifest.
+(two mutations red at their own checks). Then a real partition
+(`tests/check-manager-partition.py`): the governor's host cut from the two others by an nftables
+table with a dead man's switch, the agent still reaching every host — the connected replicas
+diverged from the cut one, the service address was unreachable across the cut, the role moved
+with the cut host fenced on request, and on reconnection the cut replica converged as a simple
+replica. Not shown: a partition that also cuts the agent from the governor's host (that host
+keeps its alias until an agent reaches it: no timer), a host loss, an authenticated exchange at
+the service address, a signed manifest.
 Status: implemented, lab-tested on three hosts; not deployed, not
 production-qualified; nothing published.
 
