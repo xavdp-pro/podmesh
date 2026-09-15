@@ -124,6 +124,15 @@ relays the request from inside the universe's PID namespace. An observation name
 lands in the replica's owned scope beside the boot fact and is carried by replication; the only
 writer inside is no longer the entrypoint. The resident's protocol is unchanged.
 
+**The service address answers (2026-09-15):** the exclusive route now gives the governor's
+replica the logical manager's service address as an alias inside its network namespace, and
+the replicas listen on every address of their universe (the replica set's generator writes
+`bind` 0.0.0.0). Measured on the three hosts: a TCP connection to the service address from the
+other hosts is accepted by the governor's replica only — before and after the role moves with
+all three running — and fails at once when nothing is announced; the fence withdraws the alias
+with the route. An authenticated exchange at that address is the next thing to show; the
+listener accepts, the protocol then needs a peer key.
+
 Three findings the candidate taught, each handled in the universe definition and recorded in
 its README: the resident handles no signal, so PID 1 must translate the stop; the overlay's
 copy-up changes a restored store's inode between the resident's preflight and its open, which
