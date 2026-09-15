@@ -496,8 +496,14 @@ relayed by a copy of the daemon entered into the universe's PID namespace — th
 a peer whose PID it cannot see, measured, not assumed; `tests/check-manager-control.py` on lab-a:
 an observation named by the agent in the store beside the boot fact, replay served from the
 journal, a second one appended, six refusals each for its own reason, the resident's refusal of
-a scope not owned returned as such (mutation: that check removed went red there). Not shown: a
-real partition, a host loss, the replica serving at the service address, a signed manifest.
+a scope not owned returned as such (mutation: that check removed went red there). Then the
+replica answering at the service address: the exclusive route gives the governor's replica the
+address as an alias inside its network namespace, withdrawn with the route; the replicas listen
+on every address; `tests/check-manager-service-address.py` on the three hosts: a TCP connection
+to the service address from the other hosts is accepted by the governor's replica only, before
+and after the role moves with all three running, and fails at once when nothing is announced
+(two mutations red at their own checks). Not shown: a real partition, a host loss, an
+authenticated exchange at the service address, a signed manifest.
 Status: implemented, lab-tested on three hosts; not deployed, not
 production-qualified; nothing published.
 

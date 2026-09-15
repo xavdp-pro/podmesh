@@ -159,7 +159,8 @@ try:
         h.ok(hostwide('network_declare', network_uuid=NET, prefix=PREFIX, pool=POOLS[a], peer_pools=peers)); declared.add(a)
     for a, h in hosts.items():
         h.ok(request('create', universes[a], reference, image=image_on(h, a), command=['/usr/local/bin/manager-universe'], network_profile='managed', network_address=addresses[a]))
-        assert h.ok(request('start', universes[a], reference, observe_seconds=3))['application_outcome'] == 'running_when_observed'
+        started = h.ok(request('start', universes[a], reference, observe_seconds=3))
+        assert started['application_outcome'] == 'running_when_observed', (started['application_outcome'], h.call('podman_run', args=['logs', 'podmesh-' + universes[a]], check=False))
     converged(3)
     checks.append('three replicas running and converged on the managed network (step 4 reproduced)')
 
@@ -212,7 +213,8 @@ try:
     C.ok(request('stop', universes['lab-c'], reference, timeout_seconds=15, on_timeout='kill'))
     assert not running(C, universes['lab-c'])
     converged(3)
-    assert C.ok(request('start', universes['lab-c'], reference, observe_seconds=3))['application_outcome'] == 'running_when_observed'
+    started = C.ok(request('start', universes['lab-c'], reference, observe_seconds=3))
+    assert started['application_outcome'] == 'running_when_observed', (started['application_outcome'], C.call('podman_run', args=['logs', 'podmesh-' + universes['lab-c']], check=False))
     views = converged(4)
     checks.append('peer loss and reconnection: with lab-c stopped the two others stayed converged; back, it appended a fourth boot fact that reached all three')
     print(json.dumps({'result': 'PASS', 'checks': checks, 'service_address': SERVICE, 'announced_at_end': service_announced(), 'facts': views,

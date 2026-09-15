@@ -57,15 +57,18 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             via TEXT NOT NULL,
             published_at INTEGER NOT NULL,
             operation_id TEXT NOT NULL,
-            exclusive_resource TEXT);",
+            exclusive_resource TEXT,
+            alias_universe_uuid TEXT);",
     )?;
-    let has_resource: bool = db.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('network_routes') WHERE name='exclusive_resource'",
-        [],
-        |r| Ok(r.get::<_, i64>(0)? > 0),
-    )?;
-    if !has_resource {
-        db.execute_batch("ALTER TABLE network_routes ADD COLUMN exclusive_resource TEXT;")?;
+    for column in ["exclusive_resource", "alias_universe_uuid"] {
+        let present: bool = db.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('network_routes') WHERE name=?1",
+            [column],
+            |r| Ok(r.get::<_, i64>(0)? > 0),
+        )?;
+        if !present {
+            db.execute_batch(&format!("ALTER TABLE network_routes ADD COLUMN {column} TEXT;"))?;
+        }
     }
     // A table created by the first version made every address unique across released rows too, so
     // a released address could never be allocated again; the second keyed the table by universe,
@@ -206,13 +209,16 @@ fn effective(db: &Connection) -> Result<Value, Error> {
                    "routes": held})
         })
         .collect();
-    let mut routes = db.prepare("SELECT ip,universe_uuid,via,exclusive_resource FROM network_routes ORDER BY ip")?;
-    let route_rows: Vec<(String, String, String, Option<String>)> = routes.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
+    let mut routes = db.prepare("SELECT ip,universe_uuid,via,exclusive_resource,alias_universe_uuid FROM network_routes ORDER BY ip")?;
+    type RouteRow = (String, String, String, Option<String>, Option<String>);
+    let route_rows: Vec<RouteRow> =
+        routes.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<_, _>>()?;
     let published: Vec<Value> = route_rows
         .iter()
-        .map(|(ip, u, via, resource)| {
+        .map(|(ip, u, via, resource, alias)| {
             let held = routes_for(&format!("{ip}/32"));
-            json!({"ip": ip, "universe_uuid": u, "via": via, "exclusive_resource": resource,
+            let alias_effective = alias.as_ref().and_then(|a| running_pid(a).ok().flatten()).and_then(|pid| alias_present(pid, ip));
+            json!({"ip": ip, "universe_uuid": u, "via": via, "exclusive_resource": resource, "alias_universe_uuid": alias, "alias_effective": alias_effective,
                    "effective": held.as_ref().map(|h| h.iter().any(|l| l.contains(&format!("via {via}")))), "routes": held})
         })
         .collect();
@@ -476,23 +482,44 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
                 Some(r) if !r.is_empty() => return Err(format!("a route for {ip} is already effective: {}; withdraw it first", r.join("; ")).into()),
                 _ => {}
             }
-            ip_route(&["-4", "route", "replace", &dst, "via", &via.to_string()])?;
+            // An exclusive route announces a role's address; the replica it points at must carry
+            // that address to answer there. So the route must point at a running universe of this
+            // host, which receives the address as an alias inside its own network namespace, added
+            // before the route and verified from inside; the route follows, and a route that does
+            // not take removes the alias again. The alias goes with the route on withdrawal.
+            let mut alias_universe: Option<String> = None;
+            if resource.is_some() {
+                let Some((carrier, pid)) = universe_at(db, &via.to_string())? else {
+                    return Err(format!("an exclusive route must point at a running universe of this host, which then carries {ip}; nothing runs at {via} here").into());
+                };
+                alias_add(pid, &ip.to_string())?;
+                if alias_present(pid, &ip.to_string()) != Some(true) {
+                    return Err(format!("{ip} could not be verified inside universe {carrier} after being added; nothing was published").into());
+                }
+                alias_universe = Some(carrier);
+            }
+            if let Err(e) = ip_route(&["-4", "route", "replace", &dst, "via", &via.to_string()]) {
+                if let Some(u) = &alias_universe {
+                    if let Ok(Some(pid)) = running_pid(u) { let _ = alias_del(pid, &ip.to_string()); }
+                }
+                return Err(e);
+            }
             let held = routes_for(&dst).ok_or("routes could not be read after publication")?;
             if !held.iter().any(|l| l.contains(&format!("via {via}"))) {
                 return Err(format!("the route for {ip} via {via} is not effective: {held:?}").into());
             }
             db.execute(
-                "INSERT INTO network_routes VALUES(?1,?2,?3,?4,?5,?6)",
-                params![ip.to_string(), uuid, via.to_string(), now, id, resource],
+                "INSERT INTO network_routes VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![ip.to_string(), uuid, via.to_string(), now, id, resource, alias_universe],
             )?;
         }
         "network_route_withdraw" => {
             let uuid = lc::text(request, "universe_uuid")?;
             lc::token(uuid)?;
-            let row: Option<(String, String)> = db
-                .query_row("SELECT ip,via FROM network_routes WHERE universe_uuid=?1", [uuid], |r| Ok((r.get(0)?, r.get(1)?)))
+            let row: Option<(String, String, Option<String>)> = db
+                .query_row("SELECT ip,via,alias_universe_uuid FROM network_routes WHERE universe_uuid=?1", [uuid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
                 .optional()?;
-            let Some((ip, via)) = row else { return Err("No route is published here for this universe".into()) };
+            let Some((ip, via, alias)) = row else { return Err("No route is published here for this universe".into()) };
             let dst = format!("{ip}/32");
             if routes_for(&dst).is_some_and(|h| h.iter().any(|l| l.contains(&format!("via {via}")))) {
                 ip_route(&["-4", "route", "del", &dst, "via", &via])?;
@@ -501,6 +528,9 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
                 None => return Err("routes could not be read after the withdrawal; the route's state is unknown".into()),
                 Some(r) if !r.is_empty() => return Err(format!("a route for {ip} is still effective after the withdrawal: {}", r.join("; ")).into()),
                 _ => {}
+            }
+            if let Some(carrier) = alias {
+                alias_remove(&carrier, &ip)?;
             }
             db.execute("DELETE FROM network_routes WHERE universe_uuid=?1", [uuid])?;
         }
@@ -515,10 +545,11 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
 /// reported as done.
 pub(crate) fn withdraw_unentitled(db: &Connection, entitled: &dyn Fn(&str) -> bool) -> Result<Vec<Value>, Error> {
     ensure_schema(db)?;
-    let mut s = db.prepare("SELECT ip,universe_uuid,via,exclusive_resource FROM network_routes WHERE exclusive_resource IS NOT NULL")?;
-    let rows: Vec<(String, String, String, String)> = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
+    let mut s = db.prepare("SELECT ip,universe_uuid,via,exclusive_resource,alias_universe_uuid FROM network_routes WHERE exclusive_resource IS NOT NULL")?;
+    type ExclusiveRow = (String, String, String, String, Option<String>);
+    let rows: Vec<ExclusiveRow> = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<_, _>>()?;
     let mut report = vec![];
-    for (ip, u, via, resource) in rows {
+    for (ip, u, via, resource, alias) in rows {
         if entitled(&resource) {
             continue;
         }
@@ -530,11 +561,93 @@ pub(crate) fn withdraw_unentitled(db: &Connection, entitled: &dyn Fn(&str) -> bo
             }
         }
         let still = routes_for(&dst);
-        let gone = still.as_ref().is_some_and(|h| h.is_empty());
+        let route_gone = still.as_ref().is_some_and(|h| h.is_empty());
+        // The address the replica carried goes with the route: removed from inside its namespace
+        // and verified gone; a replica that no longer runs took the address down with its namespace.
+        let alias_gone = match &alias {
+            None => true,
+            Some(carrier) => alias_remove(carrier, &ip).is_ok(),
+        };
+        let gone = route_gone && alias_gone;
         if gone {
             db.execute("DELETE FROM network_routes WHERE ip=?1", [&ip])?;
         }
-        report.push(json!({"ip": ip, "universe_uuid": u, "exclusive_resource": resource, "withdrawn": gone, "routes_now": still}));
+        report.push(json!({"ip": ip, "universe_uuid": u, "exclusive_resource": resource, "withdrawn": gone, "routes_now": still,
+                           "alias_universe_uuid": alias, "alias_withdrawn": alias_gone}));
     }
     Ok(report)
+}
+
+/// The running universe allocated at `ip` on this host, with its PID: the replica an exclusive
+/// route points at, which will carry the announced address.
+fn universe_at(db: &Connection, ip: &str) -> Result<Option<(String, i64)>, Error> {
+    let uuid: Option<String> = db
+        .query_row("SELECT universe_uuid FROM network_allocations WHERE ip=?1 AND released_at IS NULL", [ip], |r| r.get(0))
+        .optional()?;
+    let Some(uuid) = uuid else { return Ok(None) };
+    Ok(running_pid(&uuid)?.map(|pid| (uuid, pid)))
+}
+
+fn running_pid(uuid: &str) -> Result<Option<i64>, Error> {
+    let Some(c) = lc::inspect(&format!("podmesh-{uuid}"))? else { return Ok(None) };
+    if c["State"]["Running"] != json!(true) {
+        return Ok(None);
+    }
+    Ok(c["State"]["Pid"].as_i64().filter(|p| *p > 0))
+}
+
+/// `ip` run inside a universe's network namespace, through util-linux's nsenter on the host's own
+/// binary: nothing is required inside the universe.
+fn in_netns(pid: i64, args: &[&str]) -> Result<String, Error> {
+    let out = std::process::Command::new("nsenter").args(["-t", &pid.to_string(), "-n", "--", "ip"]).args(args).output()?;
+    if !out.status.success() {
+        return Err(format!("ip {} inside the universe: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()).into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// The interface inside the universe that carries an address of the managed bridge, and whether
+/// `ip` is already on it. `None` when the namespace could not be read.
+fn alias_present(pid: i64, ip: &str) -> Option<bool> {
+    let listing = in_netns(pid, &["-4", "-o", "addr", "show"]).ok()?;
+    Some(listing.lines().any(|l| l.split_whitespace().any(|w| w == format!("{ip}/32"))))
+}
+
+fn bridge_interface(pid: i64) -> Result<String, Error> {
+    let listing = in_netns(pid, &["-4", "-o", "addr", "show"])?;
+    listing
+        .lines()
+        .filter(|l| !l.contains(" lo "))
+        .find_map(|l| l.split_whitespace().nth(1).map(str::to_string))
+        .ok_or_else(|| "the universe has no interface but lo; nothing can carry the address".into())
+}
+
+fn alias_add(pid: i64, ip: &str) -> Result<(), Error> {
+    if alias_present(pid, ip) == Some(true) {
+        return Ok(());
+    }
+    let dev = bridge_interface(pid)?;
+    in_netns(pid, &["-4", "addr", "add", &format!("{ip}/32"), "dev", &dev])?;
+    Ok(())
+}
+
+fn alias_del(pid: i64, ip: &str) -> Result<(), Error> {
+    if alias_present(pid, ip) != Some(true) {
+        return Ok(());
+    }
+    let dev = bridge_interface(pid)?;
+    in_netns(pid, &["-4", "addr", "del", &format!("{ip}/32"), "dev", &dev])?;
+    Ok(())
+}
+
+/// Remove the address from the universe that carried it, verified gone from inside; a universe
+/// that no longer runs took it down with its namespace, and that is reported as gone too.
+fn alias_remove(carrier: &str, ip: &str) -> Result<(), Error> {
+    let Some(pid) = running_pid(carrier)? else { return Ok(()) };
+    alias_del(pid, ip)?;
+    match alias_present(pid, ip) {
+        Some(false) => Ok(()),
+        Some(true) => Err(format!("{ip} is still carried by universe {carrier} after its removal").into()),
+        None => Err(format!("the addresses of universe {carrier} could not be read after the removal; its state is unknown").into()),
+    }
 }

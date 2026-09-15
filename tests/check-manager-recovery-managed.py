@@ -157,7 +157,8 @@ try:
         h.ok(hostwide('network_declare', network_uuid=NET, prefix=PREFIX, pool=POOLS[a], peer_pools=peers)); declared.add(a)
     for a, h in hosts.items():
         h.ok(request('create', universes[a], reference, image=image_on(h, a), command=['/usr/local/bin/manager-universe'], network_profile='managed', network_address=addresses[a]))
-        assert h.ok(request('start', universes[a], reference, observe_seconds=3))['application_outcome'] == 'running_when_observed'
+        started = h.ok(request('start', universes[a], reference, observe_seconds=3))
+        assert started['application_outcome'] == 'running_when_observed', (started['application_outcome'], h.call('podman_run', args=['logs', 'podmesh-' + universes[a]], check=False))
     converged(3)
     rot = tool('rotate', '--universe', LOGICAL, '--host', targets['lab-a'], '--lease', '120', '--margin', '5')
     A.ok(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=addresses['lab-a'], exclusive_resource=LOGICAL))
@@ -178,7 +179,8 @@ try:
 
     # 2. the set moves on without it: lab-b's replica restarts and appends a fact the lost replica never saw
     B.ok(request('stop', universes['lab-b'], reference, timeout_seconds=20, on_timeout='kill'))
-    assert B.ok(request('start', universes['lab-b'], reference, observe_seconds=3))['application_outcome'] == 'running_when_observed'
+    started = B.ok(request('start', universes['lab-b'], reference, observe_seconds=3))
+    assert started['application_outcome'] == 'running_when_observed', (started['application_outcome'], B.call('podman_run', args=['logs', 'podmesh-' + universes['lab-b']], check=False))
     before = converged(4)
     assert set(before) == {'lab-a', 'lab-b'}, before
     assert service_announced() == ['lab-a']
@@ -202,7 +204,8 @@ try:
     checks.append('the point restored into quarantine (isolated, the source\'s managed address reported), and promoted into the replica\'s identity at that address under a lease; an address outside the pool refused')
 
     # 4. started, it rejoins: the facts of the point, the one it missed, and its own new boot fact, on all three
-    assert C.ok(request('start', universes['lab-c'], reference, observe_seconds=3))['application_outcome'] == 'running_when_observed'
+    started = C.ok(request('start', universes['lab-c'], reference, observe_seconds=3))
+    assert started['application_outcome'] == 'running_when_observed', (started['application_outcome'], C.call('podman_run', args=['logs', 'podmesh-' + universes['lab-c']], check=False))
     insp = json.loads(C.call('podman_run', args=['inspect', 'podmesh-' + universes['lab-c']])['stdout'])[0]
     assert insp['NetworkSettings']['Networks']['podmesh-managed']['IPAddress'] == addresses['lab-c'], insp['NetworkSettings']['Networks']
     after = converged(5)

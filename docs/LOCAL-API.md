@@ -391,7 +391,11 @@ The contract is `UNIVERSE-NETWORK-CONTRACT.md`; the operations are journaled lik
   unsuperseded activation lease on that resource under the epoch gate: refused, in this order, when the
   resource is under no activation policy here, then for the lease gate's four reasons (none held, held
   elsewhere, expired, superseded). The route records the resource, and `activation_fence` withdraws it once
-  the lease is gone. `network_route_withdraw` (`universe_uuid`) removes the routes of a universe.
+  the lease is gone. An exclusive route must point at a running universe of this host, which then carries
+  the address as an alias inside its network namespace (added before the route, verified from inside,
+  withdrawn with the route; `alias_universe_uuid` and `alias_effective` in `network_status`); refused when
+  nothing runs at `via` here. `network_route_withdraw` (`universe_uuid`) removes the routes of a universe,
+  and the alias with them.
 
 ## Experimental: the agent's door to a manager universe (development tree, not packaged)
 

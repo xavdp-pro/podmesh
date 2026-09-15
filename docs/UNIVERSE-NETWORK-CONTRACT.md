@@ -67,7 +67,13 @@ ID, verified replays as history, interrupted attempts re-evaluated) and all carr
   of a logical manager, whose three replicas all run — and is published only by the host holding
   a live, unsuperseded activation lease on that resource under the epoch gate
   (`UNIVERSE-HIGH-AVAILABILITY.md`); the self-fence withdraws it once the lease is gone, so the
-  old governor's withdrawal precedes any new publication the agent asks for.
+  old governor's withdrawal precedes any new publication the agent asks for. An exclusive route
+  must point at a running universe of this host — the governor's replica — which then **carries
+  the address** as an alias inside its own network namespace, added before the route and
+  verified from inside, withdrawn with the route (by the fence or by `network_route_withdraw`);
+  the replica listens on every address of its universe (bind `0.0.0.0`) so that it answers there.
+  On the other hosts the agent publishes the plain route that follows the role (the address via
+  the governor's host), and withdraws it before the role moves.
 - `network_status` (read-only): declaration, allocations, published routes, and the effective
   state read from Podman and the kernel; an observation that cannot be made is `unknown`.
 - `inspect`/`observe` report the requested profile from the labels and the effective network from
@@ -195,6 +201,24 @@ defect of the two-host test helper surfaced on the way: each refusal snapshot ha
 archive both delivery directories held, so a suite under a 20-second lease lapsed on its own
 bookkeeping once other suites' leftovers reached gigabytes; snapshots now compare a stat
 fingerprint and transfers hash only their own documents.
+
+**The replica answers at the service address (2026-09-15):** the exclusive route gives the
+governor's replica the service address as an alias inside its network namespace (`nsenter -n`
+with the host's `ip`, nothing required inside the universe), verified from inside, withdrawn
+with the route by the fence and by `network_route_withdraw`; refused when nothing runs at `via`
+on this host. The replicas' configurations now listen on every address (the generator's
+default; a replica bound to its own address alone did not answer at the alias, which the first
+attempt found). `tests/check-manager-service-address.py` on the three hosts: with nothing
+announced, no replica carries the address and a connection to it fails at once; the governor
+on lab-a carries it — read inside each universe's namespace, on lab-a's only — and a TCP
+connection to the service address and port from lab-b and from lab-c is accepted, the
+resident's `peak_incoming` counting it; the role moves to lab-b with all three running: lab-a's
+fence withdraws the route and the alias, the follow routes are withdrawn, a connection fails
+everywhere, lab-b publishes and its replica carries the address, the connection from lab-a and
+lab-c is accepted there, lab-a's replica carries nothing; a plain withdrawal takes the alias
+with the route. Mutations: no alias on publication, and no alias removal by the fence, each red
+at its own check. Not shown: an authenticated exchange at the service address (the listener
+accepts; the protocol then needs a peer key), a real partition, a host loss.
 
 **Known deviation, stated:** Podman's network firewall source-NATs traffic leaving the bridge's
 subnet, so a universe reaching another host's universe is seen there with the host's address.
