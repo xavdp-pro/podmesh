@@ -380,8 +380,11 @@ How the two files reach the inbox is the transport controller's, as for migratio
 The contract is `UNIVERSE-NETWORK-CONTRACT.md`; the operations are journaled like every other and verified from
 `podman network inspect` and `ip route`, never from the tables alone.
 
-- `network_declare` (host-wide; `network_uuid`, `prefix`, `pool`, optional `peer_pools` `[{pool, via}]`),
-  `network_undeclare` (host-wide; `network_uuid`), `network_status` (read-only).
+- `network_declare` (host-wide; `network_uuid`, `prefix`, `pool`, optional `peer_pools` `[{pool, via}]`): the
+  bridge, the peer routes, and the nftables table `inet podmesh-managed` that keeps Podman's source NAT off
+  traffic inside the prefix (prefix-to-prefix `notrack`), each verified from outside; `network_undeclare`
+  (host-wide; `network_uuid`) removes all three and verifies their absence; `network_status` (read-only)
+  reports them, the exemption as `nat_exemption`.
 - `create` with `network_profile` `managed` allocates the next free address of the host's pool to the universe
   UUID, or the one named by `network_address` inside that pool; `delete` releases it.
 - `network_route_publish` (host-wide; `universe_uuid`, `ip`, `via`, optional `exclusive_resource`) publishes the

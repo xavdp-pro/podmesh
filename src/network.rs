@@ -24,6 +24,8 @@ pub const LABEL_IP: &str = "io.podmesh.universe-ip";
 pub const LABEL_NETWORK: &str = "io.podmesh.network-uuid";
 /// The one bridge a host carries for its pool; the name says what it is and nothing about a prefix.
 pub const BRIDGE: &str = "podmesh-managed";
+/// The nftables table that keeps Podman's source NAT off traffic inside the logical prefix.
+pub const NFT_TABLE: &str = "podmesh-managed";
 
 pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
     db.execute_batch(
@@ -179,6 +181,46 @@ fn ip_route(args: &[&str]) -> Result<(), Error> {
     Ok(())
 }
 
+fn nft(args: &[&str]) -> Result<(), Error> {
+    let out = std::process::Command::new("nft").args(args).output()?;
+    if !out.status.success() {
+        return Err(format!("nft {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()).into());
+    }
+    Ok(())
+}
+
+/// Whether PodMesh's table exists, from `nft list tables`; `None` when nft cannot be asked.
+fn nat_exemption_present() -> Option<bool> {
+    let out = std::process::Command::new("nft").args(["list", "tables"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).lines().any(|l| l.trim() == format!("table inet {NFT_TABLE}")))
+}
+
+fn nft_rules() -> Option<Vec<String>> {
+    if nat_exemption_present() != Some(true) {
+        return Some(vec![]);
+    }
+    let out = std::process::Command::new("nft").args(["list", "table", "inet", NFT_TABLE]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).lines().map(str::trim).filter(|l| l.contains("notrack")).map(str::to_string).collect())
+}
+
+/// Two raw-hook chains, prerouting and output, leaving prefix-to-prefix traffic untracked in
+/// both directions; the table is PodMesh's own and holds nothing else.
+fn nat_exemption_add(prefix: &str) -> Result<(), Error> {
+    nft(&["add", "table", "inet", NFT_TABLE])?;
+    let rule = format!("ip saddr {prefix} ip daddr {prefix} notrack");
+    for (chain, hook) in [("prerouting", "prerouting"), ("output", "output")] {
+        nft(&["add", "chain", "inet", NFT_TABLE, chain, &format!("{{ type filter hook {hook} priority raw; }}")])?;
+        nft(&["add", "rule", "inet", NFT_TABLE, chain, &rule])?;
+    }
+    Ok(())
+}
+
 fn bridge_subnets(bridge: &str) -> Option<Vec<String>> {
     let out = std::process::Command::new("podman")
         .args(["network", "inspect", bridge, "--format", "{{range .Subnets}}{{.Subnet}} {{end}}"])
@@ -240,6 +282,7 @@ fn view(db: &Connection) -> Result<Value, Error> {
         "declaration": d.as_ref().map(|d| json!({"network_uuid": d.network_uuid, "prefix": d.prefix, "pool": d.pool, "gateway": d.gateway, "bridge": d.bridge, "state": d.state})),
         "allocations": allocations,
         "effective": effective(db)?,
+        "nat_exemption": {"table": NFT_TABLE, "present": nat_exemption_present(), "rules": nft_rules()},
         "scope": "this host's declaration, allocations and routes; the effective state is read from Podman and the kernel now, and an observation that could not be made is null (unknown), never zero",
     }))
 }
@@ -393,6 +436,9 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
             if bridge_exists(BRIDGE) != Some(false) {
                 return Err(format!("the Podman network {BRIDGE} already exists or could not be checked; refusing to declare over it").into());
             }
+            if nat_exemption_present() != Some(false) {
+                return Err(format!("the nftables table {NFT_TABLE} already exists or could not be checked; refusing to declare over it").into());
+            }
             let gateway = Ipv4Addr::from(pool.first() + 1).to_string();
             db.execute(
                 "INSERT INTO network_declaration VALUES(?1,?2,?3,?4,?5,'declaring',?6,?7,?8)",
@@ -403,7 +449,18 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
                 ip_route(&["-4", "route", "replace", p, "via", via])?;
                 db.execute("INSERT INTO network_peer_pools VALUES(?1,?2,?3)", params![p, via, network_uuid])?;
             }
+            // Podman's firewall source-NATs what leaves the bridge's subnet, so a universe reaching a
+            // universe of another host would be seen there with the host's address. Traffic that stays
+            // inside the logical prefix is left untracked, on both directions of the raw hook, which
+            // keeps the NAT off it: identity on the managed network is the address the universe was
+            // allocated. Measured before it was built (2026-09-15): the peer seen as the host, then as
+            // the universe, on two hosts, in both directions.
+            nat_exemption_add(&prefix.text())?;
             // Verified from outside before it is called effective.
+            if nat_exemption_present() != Some(true) {
+                db.execute("UPDATE network_declaration SET state='failed' WHERE network_uuid=?1", [network_uuid])?;
+                return Err(format!("the nftables table {NFT_TABLE} is absent or unreadable after its creation").into());
+            }
             let subnets = bridge_subnets(BRIDGE).ok_or("the bridge could not be inspected after creation")?;
             if subnets != vec![pool.text()] {
                 db.execute("UPDATE network_declaration SET state='failed' WHERE network_uuid=?1", [network_uuid])?;
@@ -444,6 +501,12 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
             }
             if bridge_exists(&d.bridge) != Some(false) {
                 return Err("the bridge still exists or could not be checked after its removal".into());
+            }
+            if nat_exemption_present() == Some(true) {
+                nft(&["delete", "table", "inet", NFT_TABLE])?;
+            }
+            if nat_exemption_present() != Some(false) {
+                return Err(format!("the nftables table {NFT_TABLE} still exists or could not be checked after its removal").into());
             }
             db.execute("DELETE FROM network_peer_pools WHERE network_uuid=?1", [network_uuid])?;
             db.execute("DELETE FROM network_declaration WHERE network_uuid=?1", [network_uuid])?;

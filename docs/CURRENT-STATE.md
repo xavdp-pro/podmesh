@@ -507,7 +507,10 @@ and after the role moves with all three running, and fails at once when nothing 
 table with a dead man's switch, the agent still reaching every host — the connected replicas
 diverged from the cut one, the service address was unreachable across the cut, the role moved
 with the cut host fenced on request, and on reconnection the cut replica converged as a simple
-replica. Not shown: a partition that also cuts the agent from the governor's host (that host
+replica. Then the source NAT removed inside the prefix: the declaration creates an nftables
+table (`notrack` for prefix-to-prefix traffic) and the undeclaration removes it, both verified;
+`tests/check-network-no-nat.py` on two hosts saw each universe with its own address at the
+other's. Not shown: a partition that also cuts the agent from the governor's host (that host
 keeps its alias until an agent reaches it: no timer), a host loss, an authenticated exchange at
 the service address, a signed manifest.
 Status: implemented, lab-tested on three hosts; not deployed, not

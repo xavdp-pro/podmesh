@@ -50,9 +50,10 @@ ID, verified replays as history, interrupted attempts re-evaluated) and all carr
 
 - `network_declare` (host-wide; `network_uuid`, `prefix`, `pool`, optional `peer_pools`
   `[{pool, via}]`) records the declaration and makes it effective: the bridge network with the
-  local pool as its subnet and DNS disabled, and one route per peer pool. It verifies from outside
-  (`podman network inspect`, `ip route`) and refuses on any overlap with an existing route. A host
-  carries at most one declaration.
+  local pool as its subnet and DNS disabled, one route per peer pool, and the nftables table that
+  keeps Podman's source NAT off traffic inside the prefix. It verifies from outside
+  (`podman network inspect`, `ip route`, `nft list tables`) and refuses on any overlap with an
+  existing route, over an existing bridge or table. A host carries at most one declaration.
 - `network_undeclare` (host-wide; `network_uuid`) refuses while any allocation or published route
   remains, removes the peer routes and the bridge, and verifies their absence.
 - `create` (`network_profile`: **required**, `isolated` or `managed`). Managed allocates the next
@@ -236,7 +237,15 @@ timer may run it is the operator's decision (`UNIVERSE-HIGH-AVAILABILITY.md`). T
 attempt hooked `input` only and the forwarded connections crossed the "cut"; the suite records
 that.
 
-**Known deviation, stated:** Podman's network firewall source-NATs traffic leaving the bridge's
-subnet, so a universe reaching another host's universe is seen there with the host's address.
-Identity between manager replicas is the HMAC pair key, never the address; removing the NAT
-for the logical prefix is a later step of this contract.
+**The source NAT, removed inside the prefix (2026-09-15):** Podman's network firewall
+source-NATs traffic leaving the bridge's subnet, so a universe reaching another host's universe
+was seen there with the host's address (measured on 2026-09-14). The declaration now creates an
+nftables table of PodMesh's own (`inet podmesh-managed`: raw prerouting and output, prefix-to-
+prefix traffic `notrack`, both directions), verified from `nft list tables` and reported by
+`network_status` as `nat_exemption`; refused over an existing table; removed and verified gone
+by the undeclaration. `tests/check-network-no-nat.py` on two hosts: a listener inside the
+destination universe's namespace (the host's python through `nsenter -n`) saw the source
+universe's own allocated address, in both directions; the table present after the declaration
+and absent after cleanup. Measured before it was built: the peer seen as the host, then as the
+universe with the rules on. Traffic between a universe and a host address, or leaving the
+prefix, keeps Podman's NAT by design. Identity between manager replicas stays the HMAC pair key.
