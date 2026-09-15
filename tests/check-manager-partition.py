@@ -155,8 +155,10 @@ def converged(expected_facts, among, seconds=240):
     raise AssertionError(f'not converged to {expected_facts} facts among {among}: {views}')
 
 def cut(h, others):
-    """Drop every packet between this host and the others, both directions, in a table of its own;
-    a dead man's switch removes the table after ten minutes whatever happens to this suite."""
+    """Drop every packet between this host and the others -- their host addresses and their pools,
+    since universe-to-universe traffic keeps its own addresses inside the prefix -- both directions,
+    in a table of its own; a dead man's switch removes the table after ten minutes whatever happens
+    to this suite."""
     peers = ', '.join(others)
     # Dropped at prerouting, so that packets forwarded into the bridge (a connection to the service
     # address the replica carries) are cut as well as those delivered to the host; and at output for
@@ -198,7 +200,10 @@ try:
     checks.append('three replicas converged, the governor on lab-a carrying the service address, reachable from lab-b')
 
     # the cut: lab-a's host from the two others, both directions; the agent still reaches lab-a
-    cut(A, [lab_hosts['lab-b'], lab_hosts['lab-c']])
+    # The other hosts' addresses AND their pools: with the source NAT off inside the prefix, the
+    # replicas' traffic arrives with the universes' own addresses, which a cut by host address alone
+    # let through (found when the NAT exemption landed; the suite then saw the cut side converge).
+    cut(A, [lab_hosts['lab-b'], lab_hosts['lab-c'], POOLS['lab-b'], POOLS['lab-c']])
     assert is_cut(A)
     assert connect_from(B).startswith('failed') and connect_from(C).startswith('failed'), 'the service address is still reachable across the cut'
     B.ok(request('stop', universes['lab-b'], reference, timeout_seconds=20, on_timeout='kill'))
