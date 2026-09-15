@@ -112,3 +112,26 @@ three, on that day (the third was out of reach). The laboratory tunnel and hostn
 operator's private fixtures, disposable; the credential reaches a host only as a PodMesh secret.
 Cloudflare's edge answered 403 (error 1010) to a bare python User-Agent; the external request
 carries a browser-like one — the edge's own gate, not the manager's.
+
+**2026-09-15, each gate mutated (item 8):** the permit check, the readiness epoch check
+(`tests/check-manager-publisher-readiness.py`, with a lab fault writing the governor mark one
+epoch behind: the start refused, the mark compensated, the origin back to 503, no unit; the
+fault-free start then succeeding), the connector stop in the fence, and the account of the
+previous publisher — each removed in turn went red at its own check, the reference build green
+on both suites. The main suite ends with the permit gate alone: the connector stopped, the lease
+left to lapse, the route and the alias still effective, a start refused by the lease gate and by
+nothing else.
+
+**2026-09-15, the hard test (item 6, the operator's decision 4):**
+`tests/check-manager-publisher-agent-cut.py` on lab-b (governor) and lab-c: lab-b cut from
+lab-c, its pool and the agent for 120 seconds by an nftables table with the dead man's switch
+armed and verified first, **its Internet egress kept** so that Cloudflare could still reach its
+connector; its lease (20 s) lapsed on its own clock and its self-withdrawal timer, under a
+mandate, stopped the connector and removed the mark 5.8 s after the lapse — the public hostname
+answered 530 (no connector) 26 s after the cut, nobody having reached lab-b; the agent, after
+waiting lease + margin + 1 on its own clock, rotated the role to lab-c, which published and
+started its connector: the public hostname answered with lab-c's replica and the new epoch; the
+withdrawal on lab-b came 30.5 s before lab-c's publication (both hosts' clocks recorded); once
+the switch reconnected lab-b, it was superseded, followed the role, converged as a standby and
+its connector stayed stopped. Not shown: clocks that lie (a one-second allowance), a wedged
+daemon on the cut side (self-withdrawal runs through the daemon).

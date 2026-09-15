@@ -554,9 +554,14 @@ the live unsuperseded lease with the service address effective, the previous pub
 for, the governor mark written inside the carrier and the origin answering ready at the epoch;
 stopped by the fence before the address goes. Measured on lab-b and lab-c with a real laboratory
 tunnel: an external request through the public hostname answered with the governor's replica and
-epoch, then, after the rotation and the old governor's fence, with the new governor's. I1–I4 of
-Codex's review are done the same day (lease-expiry self-withdrawal named, the fence preview,
-the relay bound to the container's identity, the HA document reconciled).
+epoch, then, after the rotation and the old governor's fence, with the new governor's. Each gate
+mutated in turn went red at its own check. The hard test passed: the governor's host cut from
+its peer and the agent with its Internet kept, its own timer withdrew the connector 5.8 s after
+the lease lapse and 30.5 s before the standby published; the hostname answered 530 in between,
+then the standby's replica at the new epoch. I1–I4 of Codex's review are done the same day
+(lease-expiry self-withdrawal named, the fence preview, the relay bound to the container's
+identity, the HA document reconciled). lab-a is out of reach since the first agent-cut run (an
+nftables table without its switch); the suites of the day ran on lab-b and lab-c.
 
 ## Next actions, in order
 
