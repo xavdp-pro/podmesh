@@ -54,11 +54,28 @@ opid=$(cat /proc/sys/kernel/random/uuid)
 # The scope this replica owns, read from its own configuration: a fact appended outside an owned
 # scope is refused by the resident, and rightly so.
 scope=$(python3 -c 'import json,sys; c=json.load(open("/etc/podmesh-manager/config.json")); r=c["network"]["replica_id"]; print([g["scope"] for g in c["network"]["manager"]["grants"] if g["owner_replica_id"]==r][0])')
-if reply=$(control "$boot_socket" "{\"operation\":\"append_observation\",\"operation_id\":\"$opid\",\"scope\":\"$scope\",\"subject\":\"boot\",\"value\":\"boot-$boot\"}" 2>&1) \
-   && printf '%s' "$reply" | grep -q '"result":"observed"'; then
-  echo "manager-universe: boot fact observed: $(printf '%s' "$reply" | cut -c1-120)"
+# The same operation ID is retried, bounded, when the resident answers `uncertain` or `busy`: an
+# uncertain append is one whose outcome the resident could not tell (a store still opening after
+# the previous incarnation's shutdown, a worker past its deadline), and the resident replays an
+# operation ID it has already appended rather than appending it twice, so the retry is safe and
+# the fact ends up observed once. Any other answer is terminal. Measured on 2026-09-15: a replica
+# restarted right after its typed stop answered `append_observation_uncertain` once, and this
+# entrypoint refused to run -- correctly, on that contract, and needlessly.
+observed=no; attempt=0
+while [ $attempt -lt 10 ]; do
+  attempt=$((attempt + 1))
+  reply=$(control "$boot_socket" "{\"operation\":\"append_observation\",\"operation_id\":\"$opid\",\"scope\":\"$scope\",\"subject\":\"boot\",\"value\":\"boot-$boot\"}" 2>&1) || true
+  if printf '%s' "$reply" | grep -q '"result":"observed"'; then observed=yes; break; fi
+  if printf '%s' "$reply" | grep -q 'append_observation_uncertain\|append_observation_busy'; then
+    echo "manager-universe: boot fact attempt $attempt: $(printf '%s' "$reply" | tail -1 | cut -c1-80); retrying the same operation"
+    sleep 1; continue
+  fi
+  break
+done
+if [ "$observed" = yes ]; then
+  echo "manager-universe: boot fact observed (attempt $attempt): $(printf '%s' "$reply" | cut -c1-120)"
 else
-  echo "manager-universe: BOOT FACT NOT OBSERVED; refusing to run: $(printf '%s' "$reply" | tail -1 | cut -c1-200)"
+  echo "manager-universe: BOOT FACT NOT OBSERVED after $attempt attempt(s); refusing to run: $(printf '%s' "$reply" | tail -1 | cut -c1-200)"
   kill -KILL "$child" 2>/dev/null || true
   exit 2
 fi

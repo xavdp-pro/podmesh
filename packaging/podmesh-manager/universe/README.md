@@ -41,7 +41,13 @@ there runs the HA-10 shape on three hosts and proves, by the frozen candidate's 
   window closes, so the start is "not running when observed"; a typed shutdown that is not
   acknowledged ends it with exit 3 within the stop timeout, so PodMesh reports an honest failed
   stop with no escalation, and the capture cycle refuses to take a point after it. The check
-  injects both (`--fault boot`, `--fault shutdown`).
+  injects both (`--fault boot`, `--fault shutdown`). One bounded exception, added on 2026-09-15
+  after a replica restarted right after its typed stop answered `append_observation_uncertain`
+  once and was refused a start it could have had: an `uncertain` or `busy` answer is retried
+  with the **same** operation ID, at most ten times a second apart — the resident replays an
+  operation ID it has already appended rather than appending it twice, so the fact is observed
+  once or the start fails as before. Any other answer stays terminal, and the injected boot
+  fault (a socket that does not exist) still exits 2 at once.
 - **Attested binary.** The check exports `/usr/lib/podmesh-manager/podmesh-managerd` from the
   universe and refuses any inspection unless its SHA-256 equals the inspector's on the
   workstation; both digests are recorded in the result.
