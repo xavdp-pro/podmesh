@@ -86,9 +86,17 @@ agent can operate the manager inside the universe.
 replicated as three universes on the managed network: one logical manager UUID, three replica
 UUIDs bound to the three PodMesh host UUIDs, three owned scopes `m-u2/<alias>/observations`,
 one distinct pair key per pair, and explicit authenticated endpoints at each replica's managed
-address — no name is ever resolved. Its output holds keys and stays out of Git; each host builds
-its own image from its own configuration with the Alpine Containerfile. The entrypoint reads the
-scope its replica owns from the configuration before appending the boot fact.
+address — no name is ever resolved. Its output splits public topology (`replica-set.json`) from
+private material (each `<alias>/config.json`, with the pair keys), which stays out of Git and
+**out of every image**: since 2026-09-15 (Codex's finding B2) the Alpine image is generic — one
+image, no configuration, no key, built once per host as
+`localhost/podmesh-manager-universe:m-u2-generic` — and a replica's configuration reaches its
+host as a PodMesh secret (`secret_declare` from a root-only inbox copy) mounted into the universe
+at `/etc/podmesh-manager/config.json`, root-only, at creation. Per-host images with a baked
+configuration were the first M-U2 build and are no longer used by any suite. The entrypoint reads
+the scope its replica owns from the configuration before appending the boot fact.
+`tests/check-secrets-image-free.py` (main tree) scans the image save and the container export for
+every pair key and identity.
 
 Measured on 2026-09-14 (`tests/check-manager-replicas-managed.py`, main tree): three replicas
 running concurrently across three hosts converged their facts — three boot facts, byte-identical

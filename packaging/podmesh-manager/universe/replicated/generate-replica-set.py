@@ -2,8 +2,11 @@
 """Generate the configurations of one logical manager replicated as three universes on the managed
 network: one logical manager UUID, three replica UUIDs bound to three host UUIDs, three owned
 scopes, three pair keys (one per pair, distinct, 32 random bytes each) and explicit authenticated
-endpoints -- nothing resolves a name. The output is PRIVATE material (keys) and stays out of Git:
-one directory per replica, each holding the config.json its image bakes.
+endpoints -- nothing resolves a name. The output splits public topology from private material:
+`replica-set.json` names the logical manager, the replicas, their hosts, addresses and scopes and
+may be shared; each `<alias>/config.json` holds that replica's pair keys, stays out of Git and out
+of every image, and reaches its host only as a PodMesh secret (`secret_declare`, from a root-only
+inbox copy) mounted into the universe at creation -- never baked into a layer (Codex, B2).
 
     generate-replica-set.py --out <dir> \
       --replica lab-a:<host-uuid>:10.86.1.10 --replica lab-b:<host-uuid>:10.86.2.10 --replica lab-c:<host-uuid>:10.86.3.10
