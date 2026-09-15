@@ -17,6 +17,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = PathBuf::from(std::env::var("PODMESH_STATE_DIR").unwrap_or("/var/lib/podmesh".into()));
     let socket = PathBuf::from(std::env::var("PODMESH_SOCKET").unwrap_or("/run/podmesh/api.sock".into()));
     let db = podmesh::open_state(&dir)?;
+    // Whatever a crash left half-made on the network is undone before anything is served: an
+    // effect that never became effective is never assumed. The report goes to the journal.
+    match podmesh::reconcile_network(&db) {
+        Ok(report) => eprintln!("PodMesh network reconciliation at startup: {report}"),
+        Err(e) => eprintln!("PodMesh network reconciliation at startup FAILED: {e}; network mutations will refuse until it succeeds"),
+    }
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     std::fs::create_dir_all(socket.parent().ok_or("Invalid socket path")?)?;
     // Refuse an existing endpoint rather than unlink another service's socket.

@@ -521,6 +521,19 @@ manifest, the packaged units themselves under a real installation.
 Status: implemented, lab-tested on three hosts; not deployed, not
 production-qualified; nothing published.
 
+## Codex's review of M-U2 (2026-09-15): GO for the lab result, NO-GO for packaging until B1–B3
+
+`/tmp/podmesh-claude/CODEX-REVIEW-M-U2-AND-DIRECTION-2026-09-15.md`: three blockers (B1 kernel
+effects surviving without a durable record; B2 replica keys baked into image layers; B3
+`notrack` wider than "no source NAT"), four important findings (I1 the timer depends on the
+daemon — name it lease-expiry self-withdrawal; I2 a journalled fence every five seconds grows
+without bound; I3 the control relay's PID reuse window; I4 stale HA doc closure text), the
+operator's eight decisions applied, and a ten-step order. **B1 done** the same day: the
+effects ledger (every kernel mutation recorded and committed before it is made), compensation
+in every error path, reconciliation at startup, before every mutation and at every fence, lab
+fault injection, and `tests/check-network-crash-safety.py` (eight fault cases, each finished or
+undone by the restart). The rest follows in Codex's order.
+
 ## Next actions, in order
 
 1. Done: independent read-only counter-review of the source-side milestone (Claude

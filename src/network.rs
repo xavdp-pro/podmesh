@@ -98,7 +98,7 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
              CREATE UNIQUE INDEX IF NOT EXISTS network_allocations_live_universe ON network_allocations(universe_uuid) WHERE released_at IS NULL;",
         )?;
     }
-    Ok(())
+    ensure_ledger(db)
 }
 
 /// `a.b.c.d/n` with the network bits only, refused otherwise.
@@ -251,16 +251,17 @@ fn effective(db: &Connection) -> Result<Value, Error> {
                    "routes": held})
         })
         .collect();
-    let mut routes = db.prepare("SELECT ip,universe_uuid,via,exclusive_resource,alias_universe_uuid FROM network_routes ORDER BY ip")?;
-    type RouteRow = (String, String, String, Option<String>, Option<String>);
+    let mut routes = db.prepare("SELECT ip,universe_uuid,via,exclusive_resource,alias_universe_uuid,state FROM network_routes ORDER BY ip")?;
+    type RouteRow = (String, String, String, Option<String>, Option<String>, Option<String>);
     let route_rows: Vec<RouteRow> =
-        routes.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<_, _>>()?;
+        routes.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?.collect::<Result<_, _>>()?;
     let published: Vec<Value> = route_rows
         .iter()
-        .map(|(ip, u, via, resource, alias)| {
+        .map(|(ip, u, via, resource, alias, state)| {
             let held = routes_for(&format!("{ip}/32"));
             let alias_effective = alias.as_ref().and_then(|a| running_pid(a).ok().flatten()).and_then(|pid| alias_present(pid, ip));
             json!({"ip": ip, "universe_uuid": u, "via": via, "exclusive_resource": resource, "alias_universe_uuid": alias, "alias_effective": alias_effective,
+                   "state": state.clone().unwrap_or_else(|| "effective".into()),
                    "effective": held.as_ref().map(|h| h.iter().any(|l| l.contains(&format!("via {via}")))), "routes": held})
         })
         .collect();
@@ -279,10 +280,13 @@ fn view(db: &Connection) -> Result<Value, Error> {
         .query_map([], |r| Ok(json!({"universe_uuid": r.get::<_, String>(0)?, "ip": r.get::<_, String>(1)?, "released_at": r.get::<_, Option<i64>>(2)?})))?
         .collect::<Result<_, _>>()?;
     Ok(json!({
-        "declaration": d.as_ref().map(|d| json!({"network_uuid": d.network_uuid, "prefix": d.prefix, "pool": d.pool, "gateway": d.gateway, "bridge": d.bridge, "state": d.state})),
+        "declaration": d.as_ref().map(|d| json!({"network_uuid": d.network_uuid, "prefix": d.prefix, "pool": d.pool, "gateway": d.gateway, "bridge": d.bridge, "state": d.state,
+                                                  "observed": db.query_row("SELECT observed FROM network_declaration WHERE network_uuid=?1", [&d.network_uuid], |r| r.get::<_, Option<String>>(0)).ok().flatten().and_then(|s| serde_json::from_str::<Value>(&s).ok())})),
         "allocations": allocations,
         "effective": effective(db)?,
         "nat_exemption": {"table": NFT_TABLE, "present": nat_exemption_present(), "rules": nft_rules()},
+        "effects": effect_rows(db, None)?.iter().map(|e| json!({"kind": e.kind, "key": e.key, "owner": e.owner, "state": e.state, "present": effect_verify(e)})).collect::<Vec<_>>(),
+        "incomplete_effects": effect_rows(db, None)?.iter().filter(|e| e.state != "effective").count(),
         "scope": "this host's declaration, allocations and routes; the effective state is read from Podman and the kernel now, and an observation that could not be made is null (unknown), never zero",
     }))
 }
@@ -379,6 +383,326 @@ pub(crate) fn of_container(c: &Value) -> Value {
     })
 }
 
+// ---------------------------------------------------------------- the effects ledger
+//
+// Every kernel or Podman mutation this module makes is recorded here BEFORE it is made, with what
+// is needed to verify it and to undo it. The daemon runs operations in autocommit, so the row is
+// durable before `ip`, `podman` or `nft` run. Its state follows the mutation: `applying` until the
+// effect is verified from outside, `effective` afterwards, `removing` while it is undone, gone
+// when the removal is verified. `reconcile` undoes every row that is not `effective` -- after a
+// crash, a storage failure, or an operation that could not compensate -- and reports what it did;
+// it runs at daemon startup, before every network operation and before every fence. What this
+// buys: no route, address, bridge or nftables table this module created can outlive its record,
+// so the fence always has something durable to find. What it does not buy: an effect somebody
+// else made, which is reported as drift and never touched.
+
+fn ensure_ledger(db: &Connection) -> Result<(), Error> {
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS network_effects(
+            id INTEGER PRIMARY KEY,
+            kind TEXT NOT NULL,
+            key TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            intent TEXT NOT NULL,
+            state TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            changed_at INTEGER NOT NULL,
+            observed TEXT);",
+    )?;
+    for (table, column) in [("network_routes", "state"), ("network_declaration", "observed")] {
+        let present: bool = db.query_row(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?1"),
+            [column],
+            |r| Ok(r.get::<_, i64>(0)? > 0),
+        )?;
+        if !present {
+            db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT;"))?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct Effect {
+    id: i64,
+    kind: String,
+    key: String,
+    owner: String,
+    intent: Value,
+    state: String,
+}
+
+fn effect_begin(db: &Connection, kind: &str, key: &str, owner: &str, intent: Value, id: &str) -> Result<Effect, Error> {
+    db.execute(
+        "INSERT INTO network_effects(kind,key,owner,intent,state,operation_id,changed_at) VALUES(?1,?2,?3,?4,'applying',?5,?6)",
+        params![kind, key, owner, intent.to_string(), id, crate::now() as i64],
+    )?;
+    Ok(Effect { id: db.last_insert_rowid(), kind: kind.into(), key: key.into(), owner: owner.into(), intent, state: "applying".into() })
+}
+
+fn effect_state(db: &Connection, e: &Effect, state: &str, observed: Option<&Value>) -> Result<(), Error> {
+    db.execute(
+        "UPDATE network_effects SET state=?2, changed_at=?3, observed=?4 WHERE id=?1",
+        params![e.id, state, crate::now() as i64, observed.map(Value::to_string)],
+    )?;
+    Ok(())
+}
+
+fn effect_rows(db: &Connection, owner: Option<&str>) -> Result<Vec<Effect>, Error> {
+    let mut s = db.prepare("SELECT id,kind,key,owner,intent,state FROM network_effects WHERE (?1 IS NULL OR owner=?1) ORDER BY id")?;
+    let rows = s
+        .query_map([owner], |r| {
+            Ok(Effect {
+                id: r.get(0)?,
+                kind: r.get(1)?,
+                key: r.get(2)?,
+                owner: r.get(3)?,
+                intent: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or(Value::Null),
+                state: r.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn text_of(v: &Value, key: &str) -> String {
+    v[key].as_str().unwrap_or("").to_string()
+}
+
+/// The kernel or Podman mutation of one effect.
+fn effect_apply(e: &Effect) -> Result<(), Error> {
+    match e.kind.as_str() {
+        "bridge" => lc::podman(
+            lc::QUICK,
+            &["network", "create", "--driver", "bridge", "--disable-dns", "--subnet", &text_of(&e.intent, "subnet"), "--gateway", &text_of(&e.intent, "gateway"), &e.key],
+        )
+        .map(|_| ()),
+        "peer_route" | "route" => ip_route(&["-4", "route", "replace", &e.key, "via", &text_of(&e.intent, "via")]),
+        "nat_table" => nat_exemption_add(&text_of(&e.intent, "prefix")),
+        "alias" => {
+            let pid = running_pid(&text_of(&e.intent, "universe"))?.ok_or("the universe that is to carry the address is not running")?;
+            alias_add(pid, &text_of(&e.intent, "ip"))
+        }
+        other => Err(format!("unknown effect kind {other}").into()),
+    }
+}
+
+/// Whether the effect is present, read from outside; `None` when that could not be read.
+fn effect_verify(e: &Effect) -> Option<bool> {
+    match e.kind.as_str() {
+        "bridge" => match bridge_exists(&e.key)? {
+            false => Some(false),
+            true => Some(bridge_subnets(&e.key)? == vec![text_of(&e.intent, "subnet")]),
+        },
+        "peer_route" | "route" => routes_for(&e.key).map(|h| h.iter().any(|l| l.contains(&format!("via {}", text_of(&e.intent, "via"))))),
+        "nat_table" => match nat_exemption_present()? {
+            false => Some(false),
+            true => Some(!nft_rules()?.is_empty()),
+        },
+        "alias" => match running_pid(&text_of(&e.intent, "universe")).ok()? {
+            // A universe that no longer runs took the address down with its namespace.
+            None => Some(false),
+            Some(pid) => alias_present(pid, &text_of(&e.intent, "ip")),
+        },
+        _ => None,
+    }
+}
+
+/// The removal of one effect; idempotent, and a no-op for what is already gone.
+fn effect_undo(e: &Effect) -> Result<(), Error> {
+    match e.kind.as_str() {
+        "bridge" => {
+            if bridge_exists(&e.key) == Some(true) {
+                lc::podman(lc::QUICK, &["network", "rm", &e.key])?;
+            }
+            Ok(())
+        }
+        "peer_route" | "route" => {
+            let via = text_of(&e.intent, "via");
+            if routes_for(&e.key).is_some_and(|h| h.iter().any(|l| l.contains(&format!("via {via}")))) {
+                ip_route(&["-4", "route", "del", &e.key, "via", &via])?;
+            }
+            Ok(())
+        }
+        "nat_table" => {
+            if nat_exemption_present() == Some(true) {
+                nft(&["delete", "table", "inet", NFT_TABLE])?;
+            }
+            Ok(())
+        }
+        "alias" => alias_remove(&text_of(&e.intent, "universe"), &text_of(&e.intent, "ip")),
+        other => Err(format!("unknown effect kind {other}").into()),
+    }
+}
+
+/// Apply, then verify from outside, then record effective. An error leaves the row `applying`
+/// for the caller's compensation, or for reconciliation if the caller cannot.
+fn effect_do(db: &Connection, e: &Effect) -> Result<(), Error> {
+    effect_apply(e)?;
+    fault(&format!("after-{}", e.kind))?;
+    match effect_verify(e) {
+        Some(true) => effect_state(db, e, "effective", None),
+        Some(false) => Err(format!("{} {} is not effective after being applied", e.kind, e.key).into()),
+        None => Err(format!("{} {} could not be verified after being applied; its state is unknown", e.kind, e.key).into()),
+    }
+}
+
+/// Record removing, undo, verify gone, drop the row. An error leaves the row `removing` with
+/// what was observed, for reconciliation.
+fn effect_remove(db: &Connection, e: &Effect) -> Result<(), Error> {
+    effect_state(db, e, "removing", None)?;
+    if let Err(err) = effect_undo(e) {
+        effect_state(db, e, "removing", Some(&json!({"error": err.to_string()})))?;
+        return Err(err);
+    }
+    match effect_verify(e) {
+        Some(false) => {
+            db.execute("DELETE FROM network_effects WHERE id=?1", [e.id])?;
+            Ok(())
+        }
+        Some(true) => {
+            effect_state(db, e, "removing", Some(&json!({"still_present": true})))?;
+            Err(format!("{} {} is still present after its removal", e.kind, e.key).into())
+        }
+        None => {
+            effect_state(db, e, "removing", Some(&json!({"unknown": true})))?;
+            Err(format!("{} {} could not be verified after its removal; its state is unknown", e.kind, e.key).into())
+        }
+    }
+}
+
+/// Undo a list of effects, last first, and say for each whether it is gone.
+fn compensate(db: &Connection, effects: &[Effect]) -> Vec<Value> {
+    let mut report = vec![];
+    for e in effects.iter().rev() {
+        match effect_remove(db, e) {
+            Ok(()) => report.push(json!({"kind": e.kind, "key": e.key, "gone": true})),
+            Err(err) => report.push(json!({"kind": e.kind, "key": e.key, "gone": false, "error": err.to_string()})),
+        }
+    }
+    report
+}
+
+/// Lab-only fault injection, read from `PODMESH_FAULT`: `<point>` makes the daemon fail at that
+/// point as a storage failure would; `<point>:crash` ends the process there, as a crash would.
+/// Nothing sets this variable in the packaged units; the crash-safety check sets it on the
+/// transient laboratory unit and restarts the daemon to watch reconciliation.
+fn fault(point: &str) -> Result<(), Error> {
+    let Ok(spec) = std::env::var("PODMESH_FAULT") else { return Ok(()) };
+    if spec == format!("{point}:crash") {
+        eprintln!("PodMesh fault injection: crashing at {point}");
+        std::process::exit(70);
+    }
+    if spec == point {
+        return Err(format!("simulated storage failure at {point}; nothing is recorded as effective").into());
+    }
+    Ok(())
+}
+
+/// Undo every effect that is not effective, complete every declaration or route whose effects
+/// are gone, release every allocation whose container is gone, and report drift: an effective
+/// effect the kernel no longer shows. Deterministic: an incomplete effect is always undone, never
+/// finished, so the agent re-asks and exclusivity is never assumed. Anything that could not be
+/// undone stays in the ledger and is reported as remaining; every network mutation refuses while
+/// something remains, and `network_status` shows it.
+pub fn reconcile(db: &Connection) -> Result<Value, Error> {
+    lc::ensure_schema(db)?;
+    ensure_schema(db)?;
+    let mut undone = vec![];
+    let mut remaining = vec![];
+    let mut drift = vec![];
+    let mut undo_all = |owner: &str, why: &str| -> Result<bool, Error> {
+        // Every effect of an owner whose making or unmaking was interrupted, last first, whatever
+        // its own state: a half-made route or declaration is undone whole, never finished.
+        let mut all_gone = true;
+        for e in effect_rows(db, Some(owner))?.iter().rev() {
+            match effect_remove(db, e) {
+                Ok(()) => undone.push(json!({"kind": e.kind, "key": e.key, "owner": owner, "was": e.state, "why": why})),
+                Err(err) => {
+                    all_gone = false;
+                    remaining.push(json!({"kind": e.kind, "key": e.key, "owner": owner, "was": e.state, "why": why, "error": err.to_string()}));
+                }
+            }
+        }
+        Ok(all_gone)
+    };
+    // Routes whose making or withdrawal was interrupted.
+    let mut s = db.prepare("SELECT ip,state FROM network_routes WHERE state IS NOT NULL AND state!='effective'")?;
+    let interrupted: Vec<(String, String)> = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let mut routes_dropped = vec![];
+    for (ip, state) in interrupted {
+        if undo_all(&ip, &format!("route {state}"))? {
+            db.execute("DELETE FROM network_routes WHERE ip=?1", [&ip])?;
+            routes_dropped.push(ip);
+        }
+    }
+    // A declaration whose making or unmaking was interrupted: undone whole; gone when nothing of
+    // it remains, failed with what remains otherwise.
+    let mut declarations = vec![];
+    if let Some(d) = declared(db)? {
+        if d.state == "declaring" || d.state == "undeclaring" || d.state == "failed" {
+            let all_gone = undo_all(&d.network_uuid, &format!("declaration {}", d.state))?;
+            if all_gone {
+                db.execute("DELETE FROM network_peer_pools WHERE network_uuid=?1", [&d.network_uuid])?;
+                db.execute("DELETE FROM network_declaration WHERE network_uuid=?1", [&d.network_uuid])?;
+                declarations.push(json!({"network_uuid": d.network_uuid, "was": d.state, "now": "gone"}));
+            } else {
+                let observed = json!({"reconciled": true, "remaining": remaining.clone()});
+                db.execute("UPDATE network_declaration SET state='failed', observed=?2 WHERE network_uuid=?1", params![d.network_uuid, observed.to_string()])?;
+                declarations.push(json!({"network_uuid": d.network_uuid, "was": d.state, "now": "failed"}));
+            }
+        }
+    }
+    // Any other effect that is not effective; an orphan -- an effect whose owner (route or
+    // declaration) no longer has a record, left by an interrupted cleanup -- is PodMesh's own and
+    // is undone and dropped; and the drift of effective effects with an owner: reported, never
+    // touched, since the kernel may have been changed by somebody else.
+    let mut orphans = vec![];
+    for e in effect_rows(db, None)? {
+        if e.state == "effective" {
+            let owned: i64 = db.query_row(
+                "SELECT (SELECT COUNT(*) FROM network_routes WHERE ip=?1) + (SELECT COUNT(*) FROM network_declaration WHERE network_uuid=?1)",
+                [&e.owner],
+                |r| r.get(0),
+            )?;
+            if owned == 0 {
+                match effect_remove(db, &e) {
+                    Ok(()) => orphans.push(json!({"kind": e.kind, "key": e.key, "owner": e.owner, "gone": true})),
+                    Err(err) => remaining.push(json!({"kind": e.kind, "key": e.key, "owner": e.owner, "was": "effective orphan", "error": err.to_string()})),
+                }
+                continue;
+            }
+            if effect_verify(&e) != Some(true) {
+                drift.push(json!({"kind": e.kind, "key": e.key, "owner": e.owner, "observed": effect_verify(&e)}));
+            }
+            continue;
+        }
+        match effect_remove(db, &e) {
+            Ok(()) => undone.push(json!({"kind": e.kind, "key": e.key, "owner": e.owner, "was": e.state, "why": "effect alone"})),
+            Err(err) => remaining.push(json!({"kind": e.kind, "key": e.key, "owner": e.owner, "was": e.state, "why": "effect alone", "error": err.to_string()})),
+        }
+    }
+    // An allocation whose container never came to be, or is gone without its delete.
+    let mut a = db.prepare("SELECT universe_uuid,ip FROM network_allocations WHERE released_at IS NULL")?;
+    let live: Vec<(String, String)> = a.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let mut released = vec![];
+    for (u, ip) in live {
+        if lc::inspect(&format!("podmesh-{u}"))?.is_none() {
+            release(db, &u, "reconciliation")?;
+            released.push(json!({"universe_uuid": u, "ip": ip}));
+        }
+    }
+    Ok(json!({"undone": undone, "remaining": remaining, "drift": drift, "orphans": orphans, "routes_dropped": routes_dropped, "declarations": declarations, "allocations_released": released}))
+}
+
+fn refuse_while_incomplete(db: &Connection) -> Result<Value, Error> {
+    let report = reconcile(db)?;
+    if report["remaining"].as_array().is_some_and(|r| !r.is_empty()) {
+        return Err(format!("incomplete network effects remain after reconciliation; refusing every network mutation until they are gone: {}", report["remaining"]).into());
+    }
+    Ok(report)
+}
+
 pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
     let operation = lc::text(request, "operation")?;
     lc::ensure_schema(db)?;
@@ -389,7 +713,12 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
     if request.get("universe_uuid").is_some() && !operation.starts_with("network_route_") {
         return Err(format!("{operation} is host-wide and takes no universe_uuid").into());
     }
-    lc::journaled(db, request, |db| perform(db, request))
+    lc::journaled(db, request, |db| {
+        let reconciliation = refuse_while_incomplete(db)?;
+        let mut answer = perform(db, request)?;
+        answer["reconciliation_before"] = reconciliation;
+        Ok(answer)
+    })
 }
 
 fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
@@ -407,7 +736,7 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
                 return Err("pool must lie inside prefix".into());
             }
             if let Some(d) = declared(db)? {
-                return Err(format!("This host already carries the declaration of network {}; undeclare it first", d.network_uuid).into());
+                return Err(format!("This host already carries the declaration of network {} (state {}); undeclare it first", d.network_uuid, d.state).into());
             }
             let peer_pools: Vec<(String, String)> = match request.get("peer_pools") {
                 None => vec![],
@@ -441,37 +770,42 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
             }
             let gateway = Ipv4Addr::from(pool.first() + 1).to_string();
             db.execute(
-                "INSERT INTO network_declaration VALUES(?1,?2,?3,?4,?5,'declaring',?6,?7,?8)",
+                "INSERT INTO network_declaration(network_uuid,prefix,pool,gateway,bridge,state,declared_at,operation_id,authorization_ref) VALUES(?1,?2,?3,?4,?5,'declaring',?6,?7,?8)",
                 params![network_uuid, prefix.text(), pool.text(), gateway, BRIDGE, now, id, reference],
             )?;
-            lc::podman(lc::QUICK, &["network", "create", "--driver", "bridge", "--disable-dns", "--subnet", &pool.text(), "--gateway", &gateway, BRIDGE])?;
+            // The plan, each step recorded before it is made: the bridge, one route per peer pool,
+            // and the table that keeps Podman's source NAT off the prefix (see nat_exemption_add).
+            let mut plan: Vec<(&str, String, Value)> = vec![("bridge", BRIDGE.to_string(), json!({"subnet": pool.text(), "gateway": gateway}))];
             for (p, via) in &peer_pools {
-                ip_route(&["-4", "route", "replace", p, "via", via])?;
-                db.execute("INSERT INTO network_peer_pools VALUES(?1,?2,?3)", params![p, via, network_uuid])?;
+                plan.push(("peer_route", p.clone(), json!({"via": via})));
             }
-            // Podman's firewall source-NATs what leaves the bridge's subnet, so a universe reaching a
-            // universe of another host would be seen there with the host's address. Traffic that stays
-            // inside the logical prefix is left untracked, on both directions of the raw hook, which
-            // keeps the NAT off it: identity on the managed network is the address the universe was
-            // allocated. Measured before it was built (2026-09-15): the peer seen as the host, then as
-            // the universe, on two hosts, in both directions.
-            nat_exemption_add(&prefix.text())?;
-            // Verified from outside before it is called effective.
-            if nat_exemption_present() != Some(true) {
-                db.execute("UPDATE network_declaration SET state='failed' WHERE network_uuid=?1", [network_uuid])?;
-                return Err(format!("the nftables table {NFT_TABLE} is absent or unreadable after its creation").into());
-            }
-            let subnets = bridge_subnets(BRIDGE).ok_or("the bridge could not be inspected after creation")?;
-            if subnets != vec![pool.text()] {
-                db.execute("UPDATE network_declaration SET state='failed' WHERE network_uuid=?1", [network_uuid])?;
-                return Err(format!("the bridge carries subnets {subnets:?}, not {}", pool.text()).into());
-            }
-            for (p, via) in &peer_pools {
-                let held = routes_for(p).ok_or("routes could not be read after publication")?;
-                if !held.iter().any(|l| l.contains(&format!("via {via}"))) {
-                    db.execute("UPDATE network_declaration SET state='failed' WHERE network_uuid=?1", [network_uuid])?;
-                    return Err(format!("the route for {p} via {via} is not effective: {held:?}").into());
+            plan.push(("nat_table", NFT_TABLE.to_string(), json!({"prefix": prefix.text()})));
+            let mut done: Vec<Effect> = vec![];
+            let mut failure: Option<String> = None;
+            for (kind, key, intent) in plan {
+                let e = effect_begin(db, kind, &key, network_uuid, intent, id)?;
+                done.push(e.clone());
+                if let Err(err) = effect_do(db, &e) {
+                    failure = Some(err.to_string());
+                    break;
                 }
+            }
+            if failure.is_none() {
+                if let Err(err) = fault("before-declaration-effective") {
+                    failure = Some(err.to_string());
+                }
+            }
+            if let Some(err) = failure {
+                // Compensation: everything made so far is undone, last first, and what is observed
+                // afterwards is recorded with the failed declaration -- which `network_undeclare`
+                // then removes, or reconciliation finishes.
+                let report = compensate(db, &done);
+                let observed = json!({"error": err, "compensation": report});
+                db.execute("UPDATE network_declaration SET state='failed', observed=?2 WHERE network_uuid=?1", params![network_uuid, observed.to_string()])?;
+                return Err(format!("{err}; compensation: {}", json!(report)).into());
+            }
+            for (p, via) in &peer_pools {
+                db.execute("INSERT INTO network_peer_pools VALUES(?1,?2,?3)", params![p, via, network_uuid])?;
             }
             db.execute("UPDATE network_declaration SET state='effective' WHERE network_uuid=?1", [network_uuid])?;
         }
@@ -486,6 +820,16 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
             if live > 0 || routes > 0 {
                 return Err(format!("{live} live allocation(s) and {routes} published route(s) remain; nothing is undeclared").into());
             }
+            db.execute("UPDATE network_declaration SET state='undeclaring' WHERE network_uuid=?1", [network_uuid])?;
+            // Every recorded effect of this network, last first; a failed or interrupted declaration
+            // is cleaned the same way, and an effect already gone is a no-op.
+            let effects = effect_rows(db, Some(network_uuid))?;
+            for e in effects.iter().rev() {
+                effect_remove(db, e)?;
+                fault(&format!("undeclare-after-{}", e.kind))?;
+            }
+            // Declarations made before the ledger existed have no effect rows: their pieces are
+            // removed from the tables that named them, and verified the same way.
             let mut peers = db.prepare("SELECT pool,via FROM network_peer_pools")?;
             let peer_rows: Vec<(String, String)> = peers.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
             for (p, via) in &peer_rows {
@@ -517,6 +861,9 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
             let ip = identifier_ip(lc::text(request, "ip")?, "ip")?;
             let via = identifier_ip(lc::text(request, "via")?, "via")?;
             let d = declared(db)?.ok_or("No network is declared on this host")?;
+            if d.state != "effective" {
+                return Err(format!("the network declaration on this host is in state {}, not effective", d.state).into());
+            }
             if !Cidr::parse(&d.prefix, "prefix")?.contains(ip) {
                 return Err(format!("{ip} is outside the declared prefix {}", d.prefix)).map_err(|e| e.into());
             }
@@ -545,98 +892,131 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
                 Some(r) if !r.is_empty() => return Err(format!("a route for {ip} is already effective: {}; withdraw it first", r.join("; ")).into()),
                 _ => {}
             }
+            let existing: i64 = db.query_row("SELECT COUNT(*) FROM network_routes WHERE ip=?1", [ip.to_string()], |r| r.get(0))?;
+            if existing > 0 {
+                return Err(format!("a route for {ip} is already recorded here; withdraw it first").into());
+            }
             // An exclusive route announces a role's address; the replica it points at must carry
             // that address to answer there. So the route must point at a running universe of this
             // host, which receives the address as an alias inside its own network namespace, added
-            // before the route and verified from inside; the route follows, and a route that does
-            // not take removes the alias again. The alias goes with the route on withdrawal.
+            // before the route and verified from inside; the route follows. Both are recorded before
+            // they are made, under the route's address, and the route's own row is written first,
+            // `applying`, so that the fence has a durable target from the first moment.
             let mut alias_universe: Option<String> = None;
             if resource.is_some() {
-                let Some((carrier, pid)) = universe_at(db, &via.to_string())? else {
+                let Some((carrier, _pid)) = universe_at(db, &via.to_string())? else {
                     return Err(format!("an exclusive route must point at a running universe of this host, which then carries {ip}; nothing runs at {via} here").into());
                 };
-                alias_add(pid, &ip.to_string())?;
-                if alias_present(pid, &ip.to_string()) != Some(true) {
-                    return Err(format!("{ip} could not be verified inside universe {carrier} after being added; nothing was published").into());
-                }
                 alias_universe = Some(carrier);
             }
-            if let Err(e) = ip_route(&["-4", "route", "replace", &dst, "via", &via.to_string()]) {
-                if let Some(u) = &alias_universe {
-                    if let Ok(Some(pid)) = running_pid(u) { let _ = alias_del(pid, &ip.to_string()); }
-                }
-                return Err(e);
-            }
-            let held = routes_for(&dst).ok_or("routes could not be read after publication")?;
-            if !held.iter().any(|l| l.contains(&format!("via {via}"))) {
-                return Err(format!("the route for {ip} via {via} is not effective: {held:?}").into());
-            }
             db.execute(
-                "INSERT INTO network_routes VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                "INSERT INTO network_routes(ip,universe_uuid,via,published_at,operation_id,exclusive_resource,alias_universe_uuid,state) VALUES(?1,?2,?3,?4,?5,?6,?7,'applying')",
                 params![ip.to_string(), uuid, via.to_string(), now, id, resource, alias_universe],
             )?;
+            let mut plan: Vec<(&str, String, Value)> = vec![];
+            if let Some(carrier) = &alias_universe {
+                plan.push(("alias", format!("{ip}@{carrier}"), json!({"ip": ip.to_string(), "universe": carrier})));
+            }
+            plan.push(("route", dst.clone(), json!({"via": via.to_string()})));
+            let mut done: Vec<Effect> = vec![];
+            let mut failure: Option<String> = None;
+            for (kind, key, intent) in plan {
+                let e = effect_begin(db, kind, &key, &ip.to_string(), intent, id)?;
+                done.push(e.clone());
+                if let Err(err) = effect_do(db, &e) {
+                    failure = Some(err.to_string());
+                    break;
+                }
+            }
+            if failure.is_none() {
+                if let Err(err) = fault("before-route-effective") {
+                    failure = Some(err.to_string());
+                }
+            }
+            if let Some(err) = failure {
+                let report = compensate(db, &done);
+                let all_gone = report.iter().all(|r| r["gone"] == json!(true));
+                if all_gone {
+                    db.execute("DELETE FROM network_routes WHERE ip=?1", [ip.to_string()])?;
+                }
+                return Err(format!("{err}; compensation: {}{}", json!(report), if all_gone { "" } else { "; the route's record is kept for reconciliation" }).into());
+            }
+            db.execute("UPDATE network_routes SET state='effective' WHERE ip=?1", [ip.to_string()])?;
         }
         "network_route_withdraw" => {
             let uuid = lc::text(request, "universe_uuid")?;
             lc::token(uuid)?;
-            let row: Option<(String, String, Option<String>)> = db
-                .query_row("SELECT ip,via,alias_universe_uuid FROM network_routes WHERE universe_uuid=?1", [uuid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .optional()?;
-            let Some((ip, via, alias)) = row else { return Err("No route is published here for this universe".into()) };
-            let dst = format!("{ip}/32");
-            if routes_for(&dst).is_some_and(|h| h.iter().any(|l| l.contains(&format!("via {via}")))) {
-                ip_route(&["-4", "route", "del", &dst, "via", &via])?;
+            let ip: Option<String> = db.query_row("SELECT ip FROM network_routes WHERE universe_uuid=?1", [uuid], |r| r.get(0)).optional()?;
+            let Some(ip) = ip else { return Err("No route is published here for this universe".into()) };
+            let report = withdraw_route(db, &ip)?;
+            if report["withdrawn"] != json!(true) {
+                return Err(format!("the withdrawal of the route for {ip} did not complete: {report}").into());
             }
-            match routes_for(&dst) {
-                None => return Err("routes could not be read after the withdrawal; the route's state is unknown".into()),
-                Some(r) if !r.is_empty() => return Err(format!("a route for {ip} is still effective after the withdrawal: {}", r.join("; ")).into()),
-                _ => {}
-            }
-            if let Some(carrier) = alias {
-                alias_remove(&carrier, &ip)?;
-            }
-            db.execute("DELETE FROM network_routes WHERE universe_uuid=?1", [uuid])?;
         }
         _ => return Err("Unsupported network operation".into()),
     }
     view(db)
 }
 
+/// Withdraw one recorded route with everything it carried: the row marked `removing` first, each
+/// effect undone last first and verified gone, then the row dropped. Routes recorded before the
+/// ledger existed are undone from the row's own fields. Used by the withdrawal and by the fence.
+fn withdraw_route(db: &Connection, ip: &str) -> Result<Value, Error> {
+    let row: Option<(String, String, Option<String>, Option<String>)> = db
+        .query_row("SELECT universe_uuid,via,exclusive_resource,alias_universe_uuid FROM network_routes WHERE ip=?1", [ip], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .optional()?;
+    let Some((universe, via, resource, alias)) = row else { return Ok(json!({"ip": ip, "withdrawn": false, "error": "no such route recorded"})) };
+    db.execute("UPDATE network_routes SET state='removing' WHERE ip=?1", [ip])?;
+    let effects = effect_rows(db, Some(ip))?;
+    let mut steps = vec![];
+    let mut failed = false;
+    if effects.is_empty() {
+        // Before the ledger: the route and the alias from the row itself.
+        let dst = format!("{ip}/32");
+        let route = Effect { id: 0, kind: "route".into(), key: dst, owner: ip.into(), intent: json!({"via": via}), state: "effective".into() };
+        match effect_undo(&route).and_then(|_| match effect_verify(&route) { Some(false) => Ok(()), _ => Err("still present or unknown".into()) }) {
+            Ok(()) => steps.push(json!({"kind": "route", "gone": true})),
+            Err(e) => { failed = true; steps.push(json!({"kind": "route", "gone": false, "error": e.to_string()})) }
+        }
+        if let Some(carrier) = &alias {
+            match alias_remove(carrier, ip) {
+                Ok(()) => steps.push(json!({"kind": "alias", "gone": true})),
+                Err(e) => { failed = true; steps.push(json!({"kind": "alias", "gone": false, "error": e.to_string()})) }
+            }
+        }
+    } else {
+        for e in effects.iter().rev() {
+            match effect_remove(db, e) {
+                Ok(()) => steps.push(json!({"kind": e.kind, "key": e.key, "gone": true})),
+                Err(err) => { failed = true; steps.push(json!({"kind": e.kind, "key": e.key, "gone": false, "error": err.to_string()})) }
+            }
+            if !failed {
+                fault(&format!("withdraw-after-{}", e.kind))?;
+            }
+        }
+    }
+    if !failed {
+        db.execute("DELETE FROM network_routes WHERE ip=?1", [ip])?;
+    }
+    let still = routes_for(&format!("{ip}/32"));
+    Ok(json!({"ip": ip, "universe_uuid": universe, "exclusive_resource": resource, "alias_universe_uuid": alias, "withdrawn": !failed,
+              "alias_withdrawn": steps.iter().filter(|s| s["kind"] == "alias").all(|s| s["gone"] == json!(true)), "steps": steps, "routes_now": still}))
+}
+
 /// Withdraw every published route bound to an exclusive resource this host no longer holds --
 /// called by the self-fence, which is the one operation that acts on what a host is not entitled
-/// to. Each withdrawal is verified from the kernel; one that does not take is reported, never
-/// reported as done.
+/// to, after reconciliation has undone every effect that never became effective. Each withdrawal
+/// is verified from the kernel; one that does not take is reported, never reported as done.
 pub(crate) fn withdraw_unentitled(db: &Connection, entitled: &dyn Fn(&str) -> bool) -> Result<Vec<Value>, Error> {
     ensure_schema(db)?;
-    let mut s = db.prepare("SELECT ip,universe_uuid,via,exclusive_resource,alias_universe_uuid FROM network_routes WHERE exclusive_resource IS NOT NULL")?;
-    type ExclusiveRow = (String, String, String, String, Option<String>);
-    let rows: Vec<ExclusiveRow> = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<_, _>>()?;
+    let mut s = db.prepare("SELECT ip,exclusive_resource FROM network_routes WHERE exclusive_resource IS NOT NULL")?;
+    let rows: Vec<(String, String)> = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
     let mut report = vec![];
-    for (ip, u, via, resource, alias) in rows {
+    for (ip, resource) in rows {
         if entitled(&resource) {
             continue;
         }
-        let dst = format!("{ip}/32");
-        if routes_for(&dst).is_some_and(|h| h.iter().any(|l| l.contains(&format!("via {via}")))) {
-            if let Err(e) = ip_route(&["-4", "route", "del", &dst, "via", &via]) {
-                report.push(json!({"ip": ip, "universe_uuid": u, "exclusive_resource": resource, "withdrawn": false, "error": e.to_string()}));
-                continue;
-            }
-        }
-        let still = routes_for(&dst);
-        let route_gone = still.as_ref().is_some_and(|h| h.is_empty());
-        // The address the replica carried goes with the route: removed from inside its namespace
-        // and verified gone; a replica that no longer runs took the address down with its namespace.
-        let alias_gone = match &alias {
-            None => true,
-            Some(carrier) => alias_remove(carrier, &ip).is_ok(),
-        };
-        let gone = route_gone && alias_gone;
-        if gone {
-            db.execute("DELETE FROM network_routes WHERE ip=?1", [&ip])?;
-        }
-        report.push(json!({"ip": ip, "universe_uuid": u, "exclusive_resource": resource, "withdrawn": gone, "routes_now": still,
-                           "alias_universe_uuid": alias, "alias_withdrawn": alias_gone}));
+        report.push(withdraw_route(db, &ip)?);
     }
     Ok(report)
 }

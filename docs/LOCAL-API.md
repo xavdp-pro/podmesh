@@ -378,7 +378,11 @@ How the two files reach the inbox is the transport controller's, as for migratio
 ## Experimental: the universe network (development tree, not packaged)
 
 The contract is `UNIVERSE-NETWORK-CONTRACT.md`; the operations are journaled like every other and verified from
-`podman network inspect` and `ip route`, never from the tables alone.
+`podman network inspect`, `ip route` and `nft`, never from the tables alone. Every kernel or Podman mutation is
+recorded in an effects ledger before it is made; a failure after an effect compensates what was made and says
+so; reconciliation runs at daemon startup, before every network mutation (`reconciliation_before` in the
+answer) and at every fence, undoing whatever was left half-made and refusing every mutation while anything
+remains (`network_status`: `effects`, `incomplete_effects`).
 
 - `network_declare` (host-wide; `network_uuid`, `prefix`, `pool`, optional `peer_pools` `[{pool, via}]`): the
   bridge, the peer routes, and the nftables table `inet podmesh-managed` that keeps Podman's source NAT off

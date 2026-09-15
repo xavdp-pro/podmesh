@@ -5,6 +5,7 @@ mod retention;
 mod network;
 mod manager;
 pub use manager::control_relay;
+pub use network::reconcile as reconcile_network;
 mod collector;
 mod lifecycle;
 mod migration;

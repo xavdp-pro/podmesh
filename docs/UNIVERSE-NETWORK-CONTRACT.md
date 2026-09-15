@@ -91,14 +91,31 @@ Not carried yet by the managed profile, and refused rather than assumed: `clone`
 
 ## Failure and cleanup states
 
-- A declaration whose bridge or routes cannot be verified is recorded `failed` with what was
-  observed; nothing is retried on its own, and `network_undeclare` cleans what exists.
+- **No effect outlives its record.** Every kernel or Podman mutation this contract makes —
+  bridge, peer route, nftables table, /32 route, address alias — is recorded in the effects
+  ledger, with what verifies and undoes it, and committed before `ip`, `podman` or `nft` run;
+  its state follows the mutation: `applying` until verified from outside, `effective`, then
+  `removing` until the removal is verified. A route's own record is written first, `applying`,
+  so the fence has a durable target from the first moment.
+- **Compensation.** A declaration or publication that fails after an effect undoes everything
+  made so far, last first, verifies each removal, and reports the original error beside the
+  compensation. A route fully compensated loses its record; a declaration that failed keeps its
+  row `failed` with the evidence until nothing of it remains.
+- **Reconciliation** runs at daemon startup (its report in the journal), before every network
+  mutation (returned as `reconciliation_before`) and at the start of every fence: it undoes,
+  whole and never finishes, every route or declaration whose making or unmaking was
+  interrupted and every lone effect that is not effective; releases allocations whose container
+  is gone; reports drift — an effective effect the kernel no longer shows — and never touches
+  it. While anything remains after reconciliation, every network mutation refuses and says
+  what remains; `network_status` shows the ledger and `incomplete_effects`.
 - A managed `create` whose container could not be observed on the bridge with the allocated
   address releases the allocation and refuses; a partial container is removed.
-- A published route that is not effective after `ip route` is reported `unverified`, and a
-  withdrawal that leaves a route effective is a failure, never a success.
-- Unknown is unknown: an `ip route` or `podman network inspect` that cannot be run makes the
-  effective state `unknown`, and any operation that needs it refuses.
+- Unknown is unknown: an `ip route`, `podman network inspect` or `nft` that cannot be run makes
+  the effective state `unknown`, and any operation that needs it refuses; a removal that cannot
+  be verified leaves its record `removing` with what was observed.
+- The laboratory injects faults at these points (`PODMESH_FAULT`, never set by the packaged
+  units): a storage failure at the point, or a crash there; `tests/check-network-crash-safety.py`
+  is the contract's proof.
 
 ## What this contract does not decide
 
@@ -236,6 +253,18 @@ agent reaches it, since the self-fence is an operation and PodMesh runs no timer
 timer may run it is the operator's decision (`UNIVERSE-HIGH-AVAILABILITY.md`). The first
 attempt hooked `input` only and the forwarded connections crossed the "cut"; the suite records
 that.
+
+**Crash and storage-failure safety (2026-09-15, Codex's finding B1):** the effects ledger,
+compensation and reconciliation above, built after the review found that a route, an address,
+a bridge or a table could survive a crash or a storage failure without a record for the fence
+to find. `tests/check-network-crash-safety.py` on lab-a, restarting the transient daemon with
+each injected fault: a publication failing after the alias, after the route and at the final
+record — refused, compensated, nothing left; a publication crashing after the route — the
+route and the address survived the crash unowned, the restart's reconciliation undid both and
+the fence then had nothing to find; a withdrawal crashing after the route; a declaration
+crashing after the bridge; a declaration failing after a peer route (recorded `failed` with
+its evidence, cleared once nothing remained, a new declaration effective); an undeclaration
+crashing after the table — each finished or undone by the restart, the host as before.
 
 **The source NAT, removed inside the prefix (2026-09-15):** Podman's network firewall
 source-NATs traffic leaving the bridge's subnet, so a universe reaching another host's universe
