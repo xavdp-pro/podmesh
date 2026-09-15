@@ -133,6 +133,16 @@ all three running — and fails at once when nothing is announced; the fence wit
 with the route. An authenticated exchange at that address is the next thing to show; the
 listener accepts, the protocol then needs a peer key.
 
+**A real partition (2026-09-15):** the governor's host cut from the two others by an nftables
+table (prerouting and output, both directions, with a dead man's switch), the agent still
+reaching every host. The connected replicas converged on a fact the cut one never saw; the
+service address was unreachable across the cut; the agent moved the role, the cut host fenced
+on request, the connected hosts reached the new governor; on reconnection the cut replica
+converged as a simple replica. Not shown: the partition that also cuts the agent from the
+governor's host — that host keeps its alias until an agent reaches it, because the self-fence
+is an operation and nothing in PodMesh runs on a timer; that is decision 4 of the operator's
+list.
+
 Three findings the candidate taught, each handled in the universe definition and recorded in
 its README: the resident handles no signal, so PID 1 must translate the stop; the overlay's
 copy-up changes a restored store's inode between the resident's preflight and its open, which
