@@ -447,13 +447,30 @@ fn ensure_ledger(db: &Connection) -> Result<(), Error> {
 }
 
 #[derive(Clone, Debug)]
-struct Effect {
-    id: i64,
-    kind: String,
-    key: String,
-    owner: String,
-    intent: Value,
-    state: String,
+pub(crate) struct Effect {
+    pub(crate) id: i64,
+    pub(crate) kind: String,
+    pub(crate) key: String,
+    pub(crate) owner: String,
+    pub(crate) intent: Value,
+    pub(crate) state: String,
+}
+
+// The ledger, shared with the publisher module: the same rows, the same states, the same reconciliation.
+pub(crate) fn effect_begin_public(db: &Connection, kind: &str, key: &str, owner: &str, intent: Value, id: &str) -> Result<Effect, Error> {
+    effect_begin(db, kind, key, owner, intent, id)
+}
+pub(crate) fn effect_do_public(db: &Connection, e: &Effect) -> Result<(), Error> {
+    effect_do(db, e)
+}
+pub(crate) fn effect_remove_public(db: &Connection, e: &Effect) -> Result<(), Error> {
+    effect_remove(db, e)
+}
+pub(crate) fn effect_rows_public(db: &Connection, owner: Option<&str>) -> Result<Vec<Effect>, Error> {
+    effect_rows(db, owner)
+}
+pub(crate) fn compensate_public(db: &Connection, effects: &[Effect]) -> Vec<Value> {
+    compensate(db, effects)
 }
 
 fn effect_begin(db: &Connection, kind: &str, key: &str, owner: &str, intent: Value, id: &str) -> Result<Effect, Error> {
@@ -507,6 +524,8 @@ fn effect_apply(e: &Effect) -> Result<(), Error> {
             let pid = running_pid(&text_of(&e.intent, "universe"))?.ok_or("the universe that is to carry the address is not running")?;
             alias_add(pid, &text_of(&e.intent, "ip"))
         }
+        crate::publisher::KIND_MARK => crate::publisher::mark_write(&text_of(&e.intent, "carrier"), &text_of(&e.intent, "resource"), e.intent["epoch"].as_i64().unwrap_or(0)),
+        crate::publisher::KIND_PUBLISHER => crate::publisher::connector_start_by_intent(&e.intent),
         other => Err(format!("unknown effect kind {other}").into()),
     }
 }
@@ -528,6 +547,8 @@ fn effect_verify(e: &Effect) -> Option<bool> {
             None => Some(false),
             Some(pid) => alias_present(pid, &text_of(&e.intent, "ip")),
         },
+        crate::publisher::KIND_MARK => crate::publisher::mark_present(&text_of(&e.intent, "carrier")),
+        crate::publisher::KIND_PUBLISHER => crate::publisher::connector_present(&text_of(&e.intent, "resource")),
         _ => None,
     }
 }
@@ -555,6 +576,8 @@ fn effect_undo(e: &Effect) -> Result<(), Error> {
             Ok(())
         }
         "alias" => alias_remove(&text_of(&e.intent, "universe"), &text_of(&e.intent, "ip")),
+        crate::publisher::KIND_MARK => crate::publisher::mark_remove(&text_of(&e.intent, "carrier")),
+        crate::publisher::KIND_PUBLISHER => crate::publisher::connector_stop(&text_of(&e.intent, "resource")),
         other => Err(format!("unknown effect kind {other}").into()),
     }
 }
@@ -671,7 +694,7 @@ pub fn reconcile(db: &Connection) -> Result<Value, Error> {
     for e in effect_rows(db, None)? {
         if e.state == "effective" {
             let owned: i64 = db.query_row(
-                "SELECT (SELECT COUNT(*) FROM network_routes WHERE ip=?1) + (SELECT COUNT(*) FROM network_declaration WHERE network_uuid=?1)",
+                "SELECT (SELECT COUNT(*) FROM network_routes WHERE ip=?1) + (SELECT COUNT(*) FROM network_declaration WHERE network_uuid=?1) + (SELECT COUNT(*) FROM publishers WHERE resource=?1)",
                 [&e.owner],
                 |r| r.get(0),
             )?;

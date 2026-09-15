@@ -717,6 +717,9 @@ pub(crate) fn fence_preview(db: &Connection) -> Result<serde_json::Value, Error>
         if crate::network::exclusive_route_held(db, &uuid)? {
             pending.push(serde_json::json!({"resource": uuid, "what": "exclusive route without entitlement"}));
         }
+        if crate::publisher::connector_present(&uuid) == Some(true) {
+            pending.push(serde_json::json!({"resource": uuid, "what": "publishing connector without entitlement"}));
+        }
     }
     let incomplete = crate::network::incomplete_effects(db)?;
     Ok(serde_json::json!({
@@ -782,6 +785,13 @@ fn fence(db: &Connection, id: &str, timeout: u64) -> Result<serde_json::Value, E
     // no longer holds a live, unsuperseded lease for is withdrawn, verified from the kernel -- after
     // reconciliation has undone whatever a crash left half-made, so that nothing is unowned.
     let network_reconciliation = crate::network::reconcile(db)?;
+    // The publishing connector of a role this host no longer holds goes first -- stopped, its
+    // governor mark removed -- so that nothing publishes an address about to be withdrawn.
+    let publishers_withdrawn = crate::publisher::withdraw_unentitled(db, &|resource: &str| {
+        lease(db, resource).ok().flatten().is_some_and(|l| {
+            l.holder_host_uuid == this_host && l.expires_at > now && superseded(db, resource, &l).ok().flatten().is_none()
+        })
+    }, id)?;
     let routes_withdrawn = crate::network::withdraw_unentitled(db, &|resource: &str| {
         lease(db, resource).ok().flatten().is_some_and(|l| {
             l.holder_host_uuid == this_host && l.expires_at > now && superseded(db, resource, &l).ok().flatten().is_none()
@@ -790,6 +800,7 @@ fn fence(db: &Connection, id: &str, timeout: u64) -> Result<serde_json::Value, E
     Ok(serde_json::json!({
         "this_host_uuid": this_host,
         "fenced": fenced,
+        "publishers_withdrawn": publishers_withdrawn,
         "routes_withdrawn": routes_withdrawn,
         "network_reconciliation": network_reconciliation,
         "left_running_or_absent": left,
