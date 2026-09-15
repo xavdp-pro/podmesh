@@ -1,6 +1,6 @@
 # PodMesh intent
 
-Status: design intent, 2026-09-11. Not implemented SHAPER canon.
+Status: design intent, 2026-09-11; delivery discipline added 2026-09-15. Not SHAPER canon.
 Owner: Xavier de Poorter. Prepared with OpenAI Codex — GPT-6 Astra.
 
 ## Purpose
@@ -59,7 +59,9 @@ the declared partition policy. Exclusivity and data-loss limits remain explicit.
 The experimental service and local lifecycle API exist. Full migration, the
 UUID/IP allocator and HA coordination remain incomplete. See
 [the experimental scope](docs/EXPERIMENTAL-SCOPE.md) for the boundary between
-current SHAPER conformance and the authorized Podman research.
+current SHAPER conformance and the authorized Podman research, and
+[experimental7 scope](docs/EXPERIMENTAL7-SCOPE.md) for the current packaging
+target and open gates.
 Public instructions describe generic hosts. The laboratory is an example, not a
 runtime dependency. See README.md for the complete inventory, decisions, candidate
 mechanisms, deferred DNS work and qualified evidence. Existing SHAPER governing
@@ -73,6 +75,46 @@ interface must allow inspection, control and action through those same contracts
 Its absence must not block the initial tandem experiment, and its later addition
 must not create a second implementation of operations or authority. Design for
 reusable public delivery while validating our own operational needs first.
+
+## Delivery discipline (keep the cap, stay efficient)
+
+PodMesh stays efficient when **one demonstrable artifact** advances at a time.
+Lab JSON, transient services and installed packages are different claims; do not
+merge them in conversation or in marketing.
+
+**Ladder of truth** — each step is explicit in `docs/README.md`; agents separate
+facts instead of inferring “done” from the previous step:
+
+1. *Coded* on `main`
+2. *Lab-tested* (`tests/` suites, named host count, evidence path)
+3. *Frozen* — a versioned scope file (`docs/EXPERIMENTAL*-SCOPE.md`) lists what
+   that Debian increment may claim and what it must not claim
+4. *Packaged* — signed `.deb` on the public APT repository
+5. *Installed* — `podmesh.service` (or a named, documented unit) on lab hosts
+6. *Demonstrable* — a 15-minute script a third party can follow with honest limits
+
+A transient lab unit (for example `podmesh-dev-ha.service`) may reach step 2 and
+support step 3; it does **not** satisfy steps 4–6. Competence proofs for funding
+or clients use the highest step reached **with evidence**, not the richest lab run
+on a side channel.
+
+**Widen vs ship** — after step 2 passes for an increment, default work is step 3
+then 4, not a new feature line. New coding on `main` is allowed when it serves
+the frozen increment or an entry in `docs/README.md` marked OPEN with acceptance
+criteria; otherwise defer. Re-run suites on the **delta** (changed binary or
+changed harness), not the full regression, unless the delta touches shared core,
+network effects, or signing.
+
+**Operator gates** — supply-chain choices, collector branch resolution, destructive
+VM tests and production hostname policy block packaging (step 4), not further
+unbounded lab repetition. Agents record OPEN gates and the default assumption;
+they do not invent decisions.
+
+**SHAPER canon** — `software/RULES.md` and related texts stay authoritative for
+Shaper OS conformance. This section governs PodMesh product rhythm only. Do not
+amend Rule 11 or other canon rules to excuse an unpackaged lab result; use
+`docs/EXPERIMENTAL-SCOPE.md` for the boundary between SHAPER standard and PodMesh
+research.
 
 ## Two supported deployment modes to build and validate
 

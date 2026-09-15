@@ -64,6 +64,8 @@ tree; *locally tested* means `cargo test` on the workstation; *lab-tested* names
 repository; *installed* means running as `podmesh.service` on the three laboratory hosts.
 Nothing coded after 2026-09-12 is packaged or installed: the development tree runs on the hosts
 only as an isolated transient service (`podmesh-dev-ha`), never as the installed package.
+The next packaging target is **`0.1.0~experimental7`** — scope and gates in
+[`EXPERIMENTAL7-SCOPE.md`](EXPERIMENTAL7-SCOPE.md) (frozen 2026-09-15).
 
 | Increment | Coded | Locally tested | Lab-tested | Packaged | Installed |
 |---|---|---|---|---|---|

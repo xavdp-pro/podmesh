@@ -3,7 +3,7 @@ set -euo pipefail
 # Package directories must not inherit a group-writable build umask.
 umask 022
 cd "$(dirname "$0")/.."
-version=0.1.0~experimental5
+version=0.1.0~experimental7
 # Reported by the capabilities operation, so an installed binary identifies its package.
 PODMESH_PACKAGE_VERSION=$version cargo build --release --locked -j2
 work=$(mktemp -d)
@@ -21,23 +21,20 @@ Section: admin
 Priority: optional
 Maintainer: Xavier de Poorter <xavier@xavdp.pro>
 Depends: libc6 (>= 2.39), libgcc-s1, podman, systemd, coreutils
-Description: Experimental local Podman lifecycle service
+Description: Experimental local Podman lifecycle and manager engine
  Local root-only API and CLI with persistent host identity, observation
  journal and operation attempt history, operating on the default rootful
- Podman store. Experimental managed operations on network-disabled containers
- recorded by this host's journal: create from a local image ID; explicit start
- with an observed outcome; stop with a declared graceful timeout and declared
- escalation; delete of a stopped container; clone of a stopped container
- without volumes or bind mounts through a committed snapshot image.
- This version also carries the experimental migration operations, qualified in
- the laboratory for one workload shape between two identical hosts: source
- preflight and checkpoint with a durable reservation, transfer authorization,
- destination preflight and restore with imported ownership, completion, source
- retirement, and the recovery of a reservation that never left its host. They
- require the separately packaged podmesh-vzcriu runtime and its helper shim.
- Networking, volumes and high availability are not implemented in this version,
- and a reservation is not fencing. The self-fence timer (podmesh-fence.timer) is
+ Podman store. Carries lifecycle, clone, migration (M1–M3), garbage collection
+ and recovery points (M4–M5 on main), managed universe networking with an
+ effects ledger, secrets outside images, activation leases with fence and
+ preview, and Ed25519-verified takeover proofs for publisher binding.
+ Manager-universe high availability is lab-qualified on an isolated transient
+ service only; this package does not by itself install or qualify production HA.
+ Migration still requires the separately packaged podmesh-vzcriu runtime.
+ Volumes, join/leave occupied hosts, Backup Server and control-services
+ universe are out of scope. The self-fence timer (podmesh-fence.timer) is
  shipped disabled and runs nothing without the operator's mandate file.
+ See docs/EXPERIMENTAL7-SCOPE.md for allowed claims and open gates.
 CONTROL
 cat > "$work/DEBIAN/postinst" <<'SCRIPT'
 #!/bin/sh

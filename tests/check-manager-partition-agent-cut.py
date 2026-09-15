@@ -159,16 +159,30 @@ def cut(h, others, seconds):
     h.ssh(f'sudo -n systemd-run --quiet --on-active={seconds} --unit=podmesh-lab-partition-deadman /usr/sbin/nft delete table inet {TABLE}')
     armed = h.ssh('systemctl is-active podmesh-lab-partition-deadman.timer', check=False).stdout.decode().strip()
     assert armed == 'active', f'the dead man\'s switch is not armed ({armed}); refusing to cut'
-    ruleset = (f'table inet {TABLE} {{\n chain prerouting {{ type filter hook prerouting priority -300; ip saddr {{ {peers} }} drop }}\n'
-               f' chain output {{ type filter hook output priority -300; ip daddr {{ {peers} }} drop }}\n}}\n')
+    # One-line chain bodies parse `} drop }` as a set closer (nftables on this lab rejects them).
+    ruleset = (
+        f'table inet {TABLE} {{\n'
+        f'  chain prerouting {{\n'
+        f'    type filter hook prerouting priority -300;\n'
+        f'    ip saddr {{ {peers} }} drop\n'
+        f'  }}\n'
+        f'  chain output {{\n'
+        f'    type filter hook output priority -300;\n'
+        f'    ip daddr {{ {peers} }} drop\n'
+        f'  }}\n'
+        f'}}\n'
+    )
     h.ssh(f'sudo -n install -m 0600 /dev/stdin /run/podmesh-lab-partition.nft', input_bytes=ruleset.encode())
-    # Applied in one transaction; the session dies with the cut and that failure is the expected one.
-    h.ssh(f'sudo -n sh -c "nohup nft -f /run/podmesh-lab-partition.nft >/dev/null 2>&1 &"', check=False)
+    parsed = h.ssh('sudo -n /usr/sbin/nft -c -f /run/podmesh-lab-partition.nft', check=False)
+    assert parsed.returncode == 0, f'the partition ruleset does not parse: {parsed.stderr.decode()}'
+    # Apply from a systemd unit: the session dies under the cut; nft must not die with it.
+    h.ssh('sudo -n systemctl reset-failed podmesh-lab-partition-apply.service 2>/dev/null', check=False)
+    h.ssh('sudo -n systemd-run --quiet --collect --unit=podmesh-lab-partition-apply /usr/sbin/nft -f /run/podmesh-lab-partition.nft', check=False)
     time.sleep(2)
 
 def reconnect_cleanup(h):
     h.ssh(f'sudo -n nft delete table inet {TABLE}', check=False)
-    h.ssh('sudo -n systemctl stop podmesh-lab-partition-deadman.timer podmesh-lab-partition-deadman.service 2>/dev/null; sudo -n systemctl reset-failed podmesh-lab-partition-deadman.service 2>/dev/null', check=False)
+    h.ssh('sudo -n systemctl stop podmesh-lab-partition-deadman.timer podmesh-lab-partition-deadman.service podmesh-lab-partition-apply.service 2>/dev/null; sudo -n systemctl reset-failed podmesh-lab-partition-deadman.service podmesh-lab-partition-apply.service 2>/dev/null', check=False)
 
 def is_cut(h):
     return TABLE in h.ssh('sudo -n nft list tables', check=False).stdout.decode()
@@ -224,7 +238,8 @@ try:
     # the agent's side: wait lease + margin + 1 on its own clock, as the takeover tool does for an unreachable host
     wait = LEASE + MARGIN + 1
     time.sleep(wait)
-    assert connect_from(B).startswith('failed'), 'the service address still reachable from lab-b across the cut'
+    seen = connect_from(B)
+    assert seen.startswith('failed'), f'the service address still reachable from lab-b across the cut: {seen!r}'
     rot2 = tool('rotate', '--universe', LOGICAL, '--host', targets['lab-b'], '--lease', str(LEASE), '--margin', str(MARGIN))
     C.ok(request('activation_supersede', LOGICAL, reference, permit=rot2['permit']))
     B.ok(hostwide('network_route_withdraw', universe_uuid=LOGICAL)); C.ok(hostwide('network_route_withdraw', universe_uuid=LOGICAL))

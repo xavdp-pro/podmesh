@@ -1,10 +1,15 @@
 # PodMesh — current state and resumption guide
 
-Updated: 2026-09-14. Owner: Xavier de Poorter, collaborating with OpenAI Codex and Claude.
+Updated: 2026-09-15. Owner: Xavier de Poorter, collaborating with OpenAI Codex, Claude, and Cursor.
 
 This is a handoff, not a replacement for INTENT.md or the detailed contracts.
 Read this file first, then the relevant checklist item and its evidence. Do not
 re-read the entire conversation or repeat passed tests without a reason.
+
+**Do not keep PodMesh work only under `/tmp`.** A reboot on this workstation
+wipes `/tmp`. Durable store: `/home/zaza/Bureau/REMOTE3/podmesh-lab/`
+(see `/home/zaza/Bureau/REMOTE3/WORKSTATION-STORE.md`). Old `/tmp/podmesh-web`
+and `/tmp/podmesh-claude` names are archive or reboot-volatile aliases.
 
 ## Product direction and decisions
 
@@ -652,6 +657,8 @@ nat-matrix, network-managed, crash-safety, secrets-image-free, governor, service
 recovery, partition, control, control-race, fence-timer) all PASS on the same build. The
 three-host publisher suite, whose binding cases alter proof fields and now re-sign them with the
 gate's key, ran last on that build: PASS — lab-a governor, lab-b standby, lab-c following; every binding refused at its own reason with a re-signed document, the fence's `publishers_withdrawn` carrying the reconciliation's withdrawal, the public hostname answering the new governor at the new epoch, the permit gate alone at the end.
+
+**Cursor reproduction (2026-09-15 night, same isolated `podmesh-dev-ha.service`, same replica kit, same build `54ef30ed…`):** kit suites from secrets through publisher-crash, partition, signature, publisher, publisher-agent-cut and partition-agent-cut all PASS live. Evidence: `podmesh-lab/cursor/campaign-cursor-2026-09-15T1905Z/` and `…T2138Z/`; handoff `podmesh-lab/cursor/CURSOR-HANDOFF-2026-09-15T2210Z.md`. Partition-agent-cut failed three times because the one-line nftables chain body does not parse on the lab; the harness now writes a multiline ruleset, checks it with `nft -c`, and applies it from `systemd-run` (uncommitted). This is a second live run of Campaign 6's lab claims, not a packaging or production-HA claim. Local `agy` produced T1–T4 reading notes only.
 
 **Branch divergence found while reconciling the inventory (`docs/README.md`):** the package
 installed on the three hosts, `0.1.0~experimental6`, was built by Codex on 2026-09-12 from

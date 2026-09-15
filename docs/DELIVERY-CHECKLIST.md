@@ -79,6 +79,10 @@ Section 4 is the Backup Server's lot B0 and its snapshot adapters are a prerequi
 
 ## Work allocation and completion discipline
 
+PodMesh rhythm is defined in **INTENT.md § Delivery discipline**: freeze an
+increment (`docs/EXPERIMENTAL*-SCOPE.md`), package it, then widen scope. Do not
+treat a passing suite on a transient lab unit as a product or funding claim.
+
 Before delegating, choose model and effort based on task difficulty, risk and cost: Luna for bounded routine tasks, Terra for ordinary implementation/testing, Sol for more involved changes, Astra for difficult architecture or recovery decisions. These are selection heuristics, not quality guarantees. To preserve the operator's GPT budget, Claude Code is preferred for bounded implementation and execution of tests, with the relevant full context. Codex is used at requested review checkpoints and for difficult architecture or recovery problems. A reviewer must be independent of the implementation being reviewed; Claude reviewing its own change is not an independent counter-view. Record the actual model and effort when known, and verify findings before applying corrections.
 
 Continue authorized work without waiting for status prompts. Update this tracker as evidence is obtained. At each coherent delivery, apply governance, human/organizational and technical/adversarial review; record whether independent counter-review was actually available. Never mark the complete product proven based on an isolated test.
