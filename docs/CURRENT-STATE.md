@@ -538,7 +538,13 @@ Podman's store, `create` with `secrets` mounted root-only at a target and labell
 `secret_remove` refused while carried, `secret_status` without content; restore reports the
 source's secrets by name, promote takes them again); `tests/check-secrets-image-free.py` (the
 image save and the container export scanned for every pair key and identity) and every manager
-suite rerun on the generic image with secrets. The rest follows in Codex's order.
+suite rerun on the generic image with secrets. **B3 done** the same day: the source-NAT
+exemption's default is a null source NAT of the local pool's traffic to the prefix (connection
+tracking kept), `notrack` selectable with its consequence stated, `none` explicit;
+`tests/check-network-nat-matrix.py` on two hosts measured both backends — TCP and UDP both
+directions, a stateful firewall passing under `null-snat` and blocking under `notrack`,
+Podman's NAT kept outside the prefix and for host-address traffic, the table intact after a
+fence's reconciliation, removed by the undeclaration. The rest follows in Codex's order.
 
 ## Next actions, in order
 

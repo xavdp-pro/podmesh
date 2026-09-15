@@ -49,11 +49,19 @@ ID, verified replays as history, interrupted attempts re-evaluated) and all carr
 `authorization_ref` as provenance.
 
 - `network_declare` (host-wide; `network_uuid`, `prefix`, `pool`, optional `peer_pools`
-  `[{pool, via}]`) records the declaration and makes it effective: the bridge network with the
-  local pool as its subnet and DNS disabled, one route per peer pool, and the nftables table that
-  keeps Podman's source NAT off traffic inside the prefix. It verifies from outside
-  (`podman network inspect`, `ip route`, `nft list tables`) and refuses on any overlap with an
-  existing route, over an existing bridge or table. A host carries at most one declaration.
+  `[{pool, via}]`, optional `nat_exemption`) records the declaration and makes it effective: the
+  bridge network with the local pool as its subnet and DNS disabled, one route per peer pool, and
+  the nftables table that keeps Podman's source NAT off traffic inside the prefix. It verifies
+  from outside (`podman network inspect`, `ip route`, `nft list tables`) and refuses on any
+  overlap with an existing route, over an existing bridge or table. A host carries at most one
+  declaration. `nat_exemption` chooses how the source NAT is kept off: **`null-snat`** (the
+  default) — a null source NAT of the local pool's traffic to the prefix, each address to itself,
+  in a nat chain evaluated before netavark's, so the kernel holds a binding and netavark's
+  masquerade does nothing; connection tracking is kept; **`notrack`** — prefix-to-prefix traffic
+  left untracked in both directions, which keeps the NAT off but removes connection tracking
+  from that traffic (a stateful firewall dropping untracked traffic then blocks it: measured);
+  **`none`** — Podman's NAT left in place, a universe seen elsewhere as its host. Traffic between
+  a universe and a host address, or leaving the prefix, keeps Podman's NAT under every backend.
 - `network_undeclare` (host-wide; `network_uuid`) refuses while any allocation or published route
   remains, removes the peer routes and the bridge, and verifies their absence.
 - `create` (`network_profile`: **required**, `isolated` or `managed`). Managed allocates the next
@@ -268,13 +276,19 @@ crashing after the table — each finished or undone by the restart, the host as
 
 **The source NAT, removed inside the prefix (2026-09-15):** Podman's network firewall
 source-NATs traffic leaving the bridge's subnet, so a universe reaching another host's universe
-was seen there with the host's address (measured on 2026-09-14). The declaration now creates an
-nftables table of PodMesh's own (`inet podmesh-managed`: raw prerouting and output, prefix-to-
-prefix traffic `notrack`, both directions), verified from `nft list tables` and reported by
-`network_status` as `nat_exemption`; refused over an existing table; removed and verified gone
-by the undeclaration. `tests/check-network-no-nat.py` on two hosts: a listener inside the
-destination universe's namespace (the host's python through `nsenter -n`) saw the source
-universe's own allocated address, in both directions; the table present after the declaration
-and absent after cleanup. Measured before it was built: the peer seen as the host, then as the
-universe with the rules on. Traffic between a universe and a host address, or leaving the
-prefix, keeps Podman's NAT by design. Identity between manager replicas stays the HMAC pair key.
+was seen there with the host's address (measured on 2026-09-14). The declaration creates an
+nftables table of PodMesh's own (`inet podmesh-managed`), verified from `nft list tables`,
+reported by `network_status` as `nat_exemption` (with its backend), refused over an existing
+table, removed and verified gone by the undeclaration. The first build used `notrack`; Codex's
+review (finding B3) named its consequence — no connection tracking on that traffic — and the
+default is now the narrowest rule netavark leaves room for, the null source NAT above, with
+`notrack` selectable and `none` explicit. `tests/check-network-no-nat.py` (two hosts): the
+source universe's own address seen at the destination, both directions.
+`tests/check-network-nat-matrix.py` (two hosts, both backends): TCP and UDP exchanges inside
+the prefix, both directions, each universe seen with its own address and answered; a stateful
+firewall on the destination host dropping untracked and invalid forwarded traffic **lets the
+exchange through under `null-snat` and blocks it under `notrack`**; a universe reaching the
+other host's address is seen as its host (Podman's NAT outside the prefix kept); a host reaching
+the other host's universe is seen as the host; after a fence's reconciliation the table and its
+rules are intact with nothing drifted; the undeclaration removes the table for both backends.
+Identity between manager replicas stays the HMAC pair key.

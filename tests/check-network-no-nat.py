@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """On the managed network, a universe reaching a universe of another host is seen there with its
 own allocated address, not the host's: the declaration keeps Podman's source NAT off traffic
-inside the logical prefix (an nftables table of PodMesh's own, raw prerouting and output,
-`notrack` for prefix-to-prefix traffic), and the undeclaration removes it. Two hosts,
+inside the logical prefix (an nftables table of PodMesh's own; by default a null source NAT of the
+local pool's traffic to the prefix, connection tracking kept), and the undeclaration removes it. Two hosts,
 PODMESH_SOURCE_SSH and PODMESH_DESTINATION_SSH, with PODMESH_LAB_HOSTS naming their on-link
 addresses (lab-a=…,lab-b=…). Verified from outside: the table present after the declaration and
 absent after the undeclaration (`nft list tables`); a listener inside the destination universe's
@@ -70,10 +70,10 @@ ua, ub = str(uuid.uuid4()), str(uuid.uuid4())
 declared = set()
 try:
     d = A.ok(hostwide('network_declare', network_uuid=NET, prefix=PREFIX, pool=POOLS['lab-a'], peer_pools=[{'pool': POOLS['lab-b'], 'via': lab_hosts['lab-b']}])); declared.add(A)
-    assert d['nat_exemption']['present'] is True and any('notrack' in r for r in d['nat_exemption']['rules']), d['nat_exemption']
+    assert d['nat_exemption']['present'] is True and d['nat_exemption']['backend'] == 'null-snat' and any('snat' in r for r in d['nat_exemption']['rules']), d['nat_exemption']
     assert f'table inet {TABLE}' in tables(A)
     B.ok(hostwide('network_declare', network_uuid=NET, prefix=PREFIX, pool=POOLS['lab-b'], peer_pools=[{'pool': POOLS['lab-a'], 'via': lab_hosts['lab-a']}])); declared.add(B)
-    checks.append('the declaration creates the exemption table on each host, verified from nft, and reports its notrack rules')
+    checks.append('the declaration creates the exemption table on each host, verified from nft, and reports its null-SNAT rule')
     for h, u in ((A, ua), (B, ub)):
         h.ok(request('create', u, reference, image=image(h), command=['sleep', '600'], network_profile='managed'))
         h.ok(request('start', u, reference, observe_seconds=1))

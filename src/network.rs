@@ -151,14 +151,16 @@ pub struct Declaration {
     pub gateway: String,
     pub bridge: String,
     pub state: String,
+    pub nat_backend: String,
 }
 
 pub fn declared(db: &Connection) -> Result<Option<Declaration>, Error> {
     Ok(db
         .query_row(
-            "SELECT network_uuid,prefix,pool,gateway,bridge,state FROM network_declaration LIMIT 1",
+            "SELECT network_uuid,prefix,pool,gateway,bridge,state,nat_backend FROM network_declaration LIMIT 1",
             [],
-            |r| Ok(Declaration { network_uuid: r.get(0)?, prefix: r.get(1)?, pool: r.get(2)?, gateway: r.get(3)?, bridge: r.get(4)?, state: r.get(5)? }),
+            |r| Ok(Declaration { network_uuid: r.get(0)?, prefix: r.get(1)?, pool: r.get(2)?, gateway: r.get(3)?, bridge: r.get(4)?, state: r.get(5)?,
+                                 nat_backend: r.get::<_, Option<String>>(6)?.unwrap_or_else(|| NAT_NOTRACK.into()) }),
         )
         .optional()?)
 }
@@ -206,19 +208,41 @@ fn nft_rules() -> Option<Vec<String>> {
     if !out.status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&out.stdout).lines().map(str::trim).filter(|l| l.contains("notrack")).map(str::to_string).collect())
+    Some(String::from_utf8_lossy(&out.stdout).lines().map(str::trim).filter(|l| l.contains("snat") || l.contains("notrack")).map(str::to_string).collect())
 }
 
-/// Two raw-hook chains, prerouting and output, leaving prefix-to-prefix traffic untracked in
-/// both directions; the table is PodMesh's own and holds nothing else.
-fn nat_exemption_add(prefix: &str) -> Result<(), Error> {
-    nft(&["add", "table", "inet", NFT_TABLE])?;
-    let rule = format!("ip saddr {prefix} ip daddr {prefix} notrack");
-    for (chain, hook) in [("prerouting", "prerouting"), ("output", "output")] {
-        nft(&["add", "chain", "inet", NFT_TABLE, chain, &format!("{{ type filter hook {hook} priority raw; }}")])?;
-        nft(&["add", "rule", "inet", NFT_TABLE, chain, &rule])?;
+/// The ways of keeping Podman's source NAT off traffic inside the prefix, chosen at declaration
+/// (`nat_exemption`) and recorded with it. Codex's finding B3: `notrack` does more than "do not
+/// source-NAT" -- it removes connection tracking from that traffic, and a stateful firewall then
+/// sees it as untracked. So the default is the narrowest rule netavark leaves room for:
+/// a null source NAT (each address to itself) on the local pool's traffic to the prefix, in a
+/// nat chain evaluated before netavark's; the kernel then holds a NAT binding for the connection
+/// and netavark's masquerade, which applies only to a connection not yet bound, does nothing.
+/// Conntrack stays. `notrack` remains selectable, with its consequence stated; `none` leaves
+/// Podman's NAT in place.
+pub const NAT_NULL_SNAT: &str = "null-snat";
+pub const NAT_NOTRACK: &str = "notrack";
+pub const NAT_NONE: &str = "none";
+
+fn nat_exemption_add(backend: &str, prefix: &str, pool: &str) -> Result<(), Error> {
+    match backend {
+        NAT_NULL_SNAT => {
+            nft(&["add", "table", "inet", NFT_TABLE])?;
+            nft(&["add", "chain", "inet", NFT_TABLE, "postrouting", "{ type nat hook postrouting priority srcnat - 1; }"])?;
+            nft(&["add", "rule", "inet", NFT_TABLE, "postrouting", &format!("ip saddr {pool} ip daddr {prefix} snat to ip saddr")])?;
+            Ok(())
+        }
+        NAT_NOTRACK => {
+            nft(&["add", "table", "inet", NFT_TABLE])?;
+            let rule = format!("ip saddr {prefix} ip daddr {prefix} notrack");
+            for (chain, hook) in [("prerouting", "prerouting"), ("output", "output")] {
+                nft(&["add", "chain", "inet", NFT_TABLE, chain, &format!("{{ type filter hook {hook} priority raw; }}")])?;
+                nft(&["add", "rule", "inet", NFT_TABLE, chain, &rule])?;
+            }
+            Ok(())
+        }
+        other => Err(format!("unknown NAT exemption backend {other}").into()),
     }
-    Ok(())
 }
 
 fn bridge_subnets(bridge: &str) -> Option<Vec<String>> {
@@ -284,7 +308,7 @@ fn view(db: &Connection) -> Result<Value, Error> {
                                                   "observed": db.query_row("SELECT observed FROM network_declaration WHERE network_uuid=?1", [&d.network_uuid], |r| r.get::<_, Option<String>>(0)).ok().flatten().and_then(|s| serde_json::from_str::<Value>(&s).ok())})),
         "allocations": allocations,
         "effective": effective(db)?,
-        "nat_exemption": {"table": NFT_TABLE, "present": nat_exemption_present(), "rules": nft_rules()},
+        "nat_exemption": {"table": NFT_TABLE, "backend": d.as_ref().map(|d| d.nat_backend.clone()), "present": nat_exemption_present(), "rules": nft_rules()},
         "effects": effect_rows(db, None)?.iter().map(|e| json!({"kind": e.kind, "key": e.key, "owner": e.owner, "state": e.state, "present": effect_verify(e)})).collect::<Vec<_>>(),
         "incomplete_effects": effect_rows(db, None)?.iter().filter(|e| e.state != "effective").count(),
         "scope": "this host's declaration, allocations and routes; the effective state is read from Podman and the kernel now, and an observation that could not be made is null (unknown), never zero",
@@ -409,7 +433,7 @@ fn ensure_ledger(db: &Connection) -> Result<(), Error> {
             changed_at INTEGER NOT NULL,
             observed TEXT);",
     )?;
-    for (table, column) in [("network_routes", "state"), ("network_declaration", "observed")] {
+    for (table, column) in [("network_routes", "state"), ("network_declaration", "observed"), ("network_declaration", "nat_backend")] {
         let present: bool = db.query_row(
             &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?1"),
             [column],
@@ -478,7 +502,7 @@ fn effect_apply(e: &Effect) -> Result<(), Error> {
         )
         .map(|_| ()),
         "peer_route" | "route" => ip_route(&["-4", "route", "replace", &e.key, "via", &text_of(&e.intent, "via")]),
-        "nat_table" => nat_exemption_add(&text_of(&e.intent, "prefix")),
+        "nat_table" => nat_exemption_add(&text_of(&e.intent, "backend"), &text_of(&e.intent, "prefix"), &text_of(&e.intent, "pool")),
         "alias" => {
             let pid = running_pid(&text_of(&e.intent, "universe"))?.ok_or("the universe that is to carry the address is not running")?;
             alias_add(pid, &text_of(&e.intent, "ip"))
@@ -768,10 +792,19 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
             if nat_exemption_present() != Some(false) {
                 return Err(format!("the nftables table {NFT_TABLE} already exists or could not be checked; refusing to declare over it").into());
             }
+            let backend = match request.get("nat_exemption") {
+                None => NAT_NULL_SNAT,
+                Some(v) => match v.as_str() {
+                    Some(NAT_NULL_SNAT) => NAT_NULL_SNAT,
+                    Some(NAT_NOTRACK) => NAT_NOTRACK,
+                    Some(NAT_NONE) => NAT_NONE,
+                    _ => return Err(format!("nat_exemption must be {NAT_NULL_SNAT} (default), {NAT_NOTRACK} or {NAT_NONE}").into()),
+                },
+            };
             let gateway = Ipv4Addr::from(pool.first() + 1).to_string();
             db.execute(
-                "INSERT INTO network_declaration(network_uuid,prefix,pool,gateway,bridge,state,declared_at,operation_id,authorization_ref) VALUES(?1,?2,?3,?4,?5,'declaring',?6,?7,?8)",
-                params![network_uuid, prefix.text(), pool.text(), gateway, BRIDGE, now, id, reference],
+                "INSERT INTO network_declaration(network_uuid,prefix,pool,gateway,bridge,state,declared_at,operation_id,authorization_ref,nat_backend) VALUES(?1,?2,?3,?4,?5,'declaring',?6,?7,?8,?9)",
+                params![network_uuid, prefix.text(), pool.text(), gateway, BRIDGE, now, id, reference, backend],
             )?;
             // The plan, each step recorded before it is made: the bridge, one route per peer pool,
             // and the table that keeps Podman's source NAT off the prefix (see nat_exemption_add).
@@ -779,7 +812,9 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
             for (p, via) in &peer_pools {
                 plan.push(("peer_route", p.clone(), json!({"via": via})));
             }
-            plan.push(("nat_table", NFT_TABLE.to_string(), json!({"prefix": prefix.text()})));
+            if backend != NAT_NONE {
+                plan.push(("nat_table", NFT_TABLE.to_string(), json!({"backend": backend, "prefix": prefix.text(), "pool": pool.text()})));
+            }
             let mut done: Vec<Effect> = vec![];
             let mut failure: Option<String> = None;
             for (kind, key, intent) in plan {

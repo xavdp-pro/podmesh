@@ -384,11 +384,13 @@ so; reconciliation runs at daemon startup, before every network mutation (`recon
 answer) and at every fence, undoing whatever was left half-made and refusing every mutation while anything
 remains (`network_status`: `effects`, `incomplete_effects`).
 
-- `network_declare` (host-wide; `network_uuid`, `prefix`, `pool`, optional `peer_pools` `[{pool, via}]`): the
-  bridge, the peer routes, and the nftables table `inet podmesh-managed` that keeps Podman's source NAT off
-  traffic inside the prefix (prefix-to-prefix `notrack`), each verified from outside; `network_undeclare`
+- `network_declare` (host-wide; `network_uuid`, `prefix`, `pool`, optional `peer_pools` `[{pool, via}]`, optional
+  `nat_exemption`: `null-snat` by default, `notrack`, or `none`): the bridge, the peer routes, and the nftables
+  table `inet podmesh-managed` that keeps Podman's source NAT off traffic inside the prefix — by default a null
+  source NAT of the local pool's traffic to the prefix that keeps connection tracking; `notrack` removes it, and
+  a stateful firewall then blocks that traffic (measured) — each verified from outside; `network_undeclare`
   (host-wide; `network_uuid`) removes all three and verifies their absence; `network_status` (read-only)
-  reports them, the exemption as `nat_exemption`.
+  reports them, the exemption as `nat_exemption` with its backend and rules.
 - `create` with `network_profile` `managed` allocates the next free address of the host's pool to the universe
   UUID, or the one named by `network_address` inside that pool; `delete` releases it.
 - `network_route_publish` (host-wide; `universe_uuid`, `ip`, `via`, optional `exclusive_resource`) publishes the
