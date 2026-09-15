@@ -26,6 +26,37 @@ export PODMESH_MANAGER_NETWORK_MODE=authenticated-static-peers
 child=$!
 echo "manager-universe: resident started pid=$child"
 
+# The origin a publishing connector proxies to: a small HTTP responder on port 8080, fail-closed.
+# It answers /ready with this replica's logical and replica identities and, ONLY while PodMesh has
+# marked this replica governor (a root-only file it writes at the exclusive publication and removes
+# at the withdrawal or the fence), the epoch it was marked with; without the mark, or on any other
+# path, it answers 503 -- a connector that reaches a replica that is not the governor gets nothing.
+# It decides nothing: the mark is PodMesh's, under the epoch gate. The manager's web interface is
+# not served here yet; this is the epoch-qualified origin the publisher contract requires.
+python3 - <<'EOF' >/dev/null 2>&1 &
+import http.server, json, os
+cfg = json.load(open('/etc/podmesh-manager/config.json'))
+identity = {'logical_manager_id': cfg['network']['manager']['logical_manager_id'], 'replica_id': cfg['network']['replica_id']}
+MARK = '/run/podmesh-manager/governor.json'
+class Origin(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        try:
+            mark = json.load(open(MARK))
+        except Exception:
+            mark = None
+        if self.path != '/ready' or not mark:
+            body = json.dumps({'ready': False, 'reason': 'not the governor' if self.path == '/ready' else 'no such path', **identity}).encode()
+            self.send_response(503); self.send_header('Content-Type', 'application/json'); self.send_header('Content-Length', str(len(body))); self.end_headers()
+            self.wfile.write(body); return
+        body = json.dumps({'ready': True, **identity, 'epoch': mark.get('epoch'), 'marked_at': mark.get('marked_at')}).encode()
+        self.send_response(200); self.send_header('Content-Type', 'application/json'); self.send_header('Content-Length', str(len(body))); self.end_headers()
+        self.wfile.write(body)
+http.server.ThreadingHTTPServer(('0.0.0.0', 8080), Origin).serve_forever()
+EOF
+origin=$!
+echo "manager-universe: origin responder started pid=$origin (fail-closed until PodMesh marks this replica governor)"
+
 control() { # control <socket> <json>: one typed request, read to end of stream, reply on stdout
   python3 - "$1" "$2" <<'EOF'
 import socket, sys, os, time
@@ -97,6 +128,7 @@ while :; do
   set +e; wait "$child"; rc=$?; set -e
   kill -0 "$child" 2>/dev/null || break
 done
+kill "$origin" 2>/dev/null || true
 if [ "$shutdown_rc" -ne 0 ]; then echo "manager-universe: resident ended after a failed typed shutdown"; exit "$shutdown_rc"; fi
 echo "manager-universe: resident exited rc=$rc"
 exit "$rc"
