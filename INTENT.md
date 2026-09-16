@@ -116,6 +116,21 @@ amend Rule 11 or other canon rules to excuse an unpackaged lab result; use
 `docs/EXPERIMENTAL-SCOPE.md` for the boundary between SHAPER standard and PodMesh
 research.
 
+## Web surfaces: no form posts
+
+Operator rule, 2026-09-16, permanent. **No native form post, ever.** No web surface of PodMesh
+submits an HTML `<form method="post">` that reloads the page and renders the server's answer in
+its place. Every action goes through an API call made from script (`fetch`, JSON body): the page
+stays where it is, the fields keep what was typed, and the answer -- success or the precise
+refusal -- appears where the person is looking. Credentials travel in the request body, never in
+a URL. A `<form>` element may remain as a semantic container when script intercepts its
+submission (`preventDefault`, then `fetch`), as the web console already does.
+
+Why it is written here: a sign-in to the manager's administration page failed in a browser while
+the same credentials succeeded from the command line, and the form post had reloaded the page,
+emptied the fields and left nothing to see but a generic refusal. A counter-review treats a native
+form post as a finding.
+
 ## Two supported deployment modes to build and validate
 
 PodMesh must support standalone operation on a Linux host without SHAPER OS,
