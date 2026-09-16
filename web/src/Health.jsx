@@ -10,7 +10,7 @@ function ReplicationCell({universe,replication:r}){
  if(!r)return <span className="badge muted">none</span>;
  const failed=r.last_run&&!r.last_run.ok;
  return <><span className={'badge '+(failed?'red':r.armed?'green':'amber')}>{failed?'last run failed':r.armed?'scheduled':'manual'}</span>
-  <small>{r.mode==='all'?'all':r.standbys} standby{r.standbys>1?'s':''}{r.armed&&r.interval_seconds?` · every ${r.interval_seconds>=3600?`${r.interval_seconds/3600} h`:`${Math.round(r.interval_seconds/60)} min`}`:''} · last copy {age(r.last_copy_age_seconds==null?null:r.last_copy_age_seconds*1000)}{r.last_run?.stopped_for_seconds!=null?` · stopped ${r.last_run.stopped_for_seconds} s`:''}</small>{failed&&<small className="op-error">{r.last_run.error}</small>}</>;
+  <small>{r.mode==='all'?'all':r.standbys} standby{r.standbys>1?'s':''}{r.armed&&r.interval_seconds?` · every ${r.interval_seconds>=3600?`${r.interval_seconds/3600} h`:`${Math.round(r.interval_seconds/60)} min`}`:''} · last copy {age(r.last_copy_age_seconds==null?null:r.last_copy_age_seconds*1000)}{r.capture==='live'?' · live':''}{r.last_run?.stopped_for_seconds!=null?` · ${r.last_run.capture==='live'?'interrupted':'stopped'} ${r.last_run.stopped_for_seconds} s`:''}</small>{failed&&<small className="op-error">{r.last_run.error}</small>}</>;
 }
 export default function Health({session,renewSession}){
  const[data,D]=useState(null),[error,E]=useState(''),[busy,B]=useState(false);

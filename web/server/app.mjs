@@ -147,7 +147,7 @@ export function createApp(config,{call=request,origin='http://127.0.0.1:4175',re
   const p=req.body||{};const host=hosts.find(h=>h.id===p.host);
   if(!host)return res.status(404).json({error:'Unknown host'});
   if(!['configure','run','start','stop'].includes(p.action)||!uuid.test(p.universe_uuid)||typeof p.authorization_ref!=='string'||!p.authorization_ref.trim()||p.authorization_ref.length>256)return res.status(400).json({error:'Invalid replication request'});
-  if(Object.keys(p).some(k=>!['action','host','universe_uuid','authorization_ref','standbys','interval_seconds'].includes(k)))return res.status(400).json({error:'Unexpected replication field'});
+  if(Object.keys(p).some(k=>!['action','host','universe_uuid','authorization_ref','standbys','interval_seconds','capture'].includes(k)))return res.status(400).json({error:'Unexpected replication field'});
   if(!host.allowActions)return res.status(403).json({error:'Actions disabled by operator configuration'});
   if(!host.ssh)return res.status(409).json({error:'A replication needs the active host reached over SSH from this console'});
   const others=hosts.filter(h=>h.ssh&&h.id!==host.id);
@@ -157,9 +157,12 @@ export function createApp(config,{call=request,origin='http://127.0.0.1:4175',re
    const standbys=p.standbys==='all'?'all':Number.isInteger(p.standbys)&&p.standbys>=1&&p.standbys<=others.length?String(p.standbys):null;
    if(!standbys)return res.status(400).json({error:`standbys must be "all" or 1 to ${others.length}`});
    if(!Number.isInteger(p.interval_seconds)||p.interval_seconds<60||p.interval_seconds>86400)return res.status(400).json({error:'interval_seconds must be from 60 to 86400'});
-   args.push('configure','--universe',p.universe_uuid,'--active',host.ssh,'--hosts',[host.ssh,...others.map(h=>h.ssh)].join(','),'--standbys',standbys,'--interval',String(p.interval_seconds));
+   // live: the universe is checkpointed with its memory and resumed in place, never stopped; stopped: a quiescent copy.
+   const capture=p.capture===undefined?'stopped':p.capture;
+   if(!['stopped','live'].includes(capture))return res.status(400).json({error:'capture must be "stopped" or "live"'});
+   args.push('configure','--universe',p.universe_uuid,'--active',host.ssh,'--hosts',[host.ssh,...others.map(h=>h.ssh)].join(','),'--standbys',standbys,'--interval',String(p.interval_seconds),'--capture',capture);
   }else{
-   if(p.standbys!==undefined||p.interval_seconds!==undefined)return res.status(400).json({error:'standbys and interval_seconds belong to configure'});
+   if(p.standbys!==undefined||p.interval_seconds!==undefined||p.capture!==undefined)return res.status(400).json({error:'standbys, interval_seconds and capture belong to configure'});
    args.push(p.action,'--universe',p.universe_uuid);
   }
   const report=await runReplication({args,host,toolsDir:replicationToolsDir()});

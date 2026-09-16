@@ -201,15 +201,16 @@ test('replication runs the tool for the active host with every other SSH host as
  assert.equal(st.result,'status');assert.deepEqual(st.candidates.map(c=>c.id),['b','c','r']);
  const base={host:'a',universe_uuid:U,authorization_ref:'fixture'};
  assert.equal((await post({...base,action:'configure',standbys:'all',interval_seconds:900})).status,200);
- assert.deepEqual(runs.at(-1),['--reference','fixture','configure','--universe',U,'--active','lab@a','--hosts','lab@a,lab@b,lab@c,lab@r','--standbys','all','--interval','900']);
+ assert.deepEqual(runs.at(-1),['--reference','fixture','configure','--universe',U,'--active','lab@a','--hosts','lab@a,lab@b,lab@c,lab@r','--standbys','all','--interval','900','--capture','stopped']);
  assert.equal((await post({...base,action:'configure',standbys:2,interval_seconds:60})).status,200);assert.equal(runs.at(-1)[runs.at(-1).indexOf('--standbys')+1],'2');
- for(const bad of [{...base,action:'configure',standbys:4,interval_seconds:900},{...base,action:'configure',standbys:'all',interval_seconds:30},{...base,action:'run',standbys:'all'},{...base,action:'explode'},{...base,action:'run',extra:1},{...base,action:'run',authorization_ref:''}])
+ assert.equal((await post({...base,action:'configure',standbys:1,interval_seconds:300,capture:'live'})).status,200);assert.deepEqual(runs.at(-1).slice(-2),['--capture','live']);
+ for(const bad of [{...base,action:'configure',standbys:4,interval_seconds:900},{...base,action:'configure',standbys:'all',interval_seconds:30},{...base,action:'run',standbys:'all'},{...base,action:'explode'},{...base,action:'run',extra:1},{...base,action:'run',authorization_ref:''},{...base,action:'configure',standbys:'all',interval_seconds:900,capture:'hot'},{...base,action:'run',capture:'live'}])
   assert.equal((await post(bad)).status,400,JSON.stringify(bad));
  assert.equal((await post({...base,host:'r',action:'run'})).status,403);
  assert.equal((await post({...base,host:'l',action:'run'})).status,409);
  assert.equal((await post({...base,action:'run'},{'X-Podmesh-Token':''})).status,401);
  for(const action of ['run','start','stop']){assert.equal((await post({...base,action})).status,200);assert.deepEqual(runs.at(-1),['--reference','fixture',action,'--universe',U]);}
- assert.equal(runs.filter(a=>a.includes('configure')).length,2);});
+ assert.equal(runs.filter(a=>a.includes('configure')).length,3);});
 test('health carries the replication summary from the ledger, and says when it cannot be read',async t=>{
  let app,answer;const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
  const U='00000000-0000-4000-8000-00000000000b',seen=[];
