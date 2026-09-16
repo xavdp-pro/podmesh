@@ -69,30 +69,38 @@ property of this surface.
 
 ## What is built
 
-`packaging/podmesh-manager/universe/origin.py` in the web tree (the origin responder, which now
-carries `/admin`), `tools/manager-admin.py` (bootstrap, create, list, revoke through the control
-door), and the bootstrap call in `tools/arm-publisher-follow.py`.
+**The operator's stack, 2026-09-16.** The origin is `packaging/podmesh-manager/universe/origin` in
+the web tree: an Express server (`server/`, with helmet, express-rate-limit and jsonwebtoken) that
+answers `/ready`, the human page and the administration API under `/admin/api`, and serves the
+administration app built by Vite from `src/` — React 19, Tailwind 4, lucide-react, framer-motion,
+react-router-dom, zustand, axios, react-hot-toast, trilingual (fr, en, es). The same stack as the
+operator's other applications, with three differences chosen on purpose: the session is a JWT in an
+HttpOnly, Secure, SameSite=Strict cookie, never in browser storage; helmet's content security policy
+is on (`script-src 'self'`, `form-action 'none'`); and the production files are served by the origin
+itself, not by a development server. Passwords stay scrypt through node's own crypto: the store
+already holds that format, and a bcrypt string does not fit the resident's token alphabet. The
+image adds Alpine's nodejs; `build-origin.sh` stages the built files, the server and its production
+dependencies from the lockfile, so the image build needs no network.
 
-Measured on 2026-09-16: the resident answers `append_observation_uncertain` on an append that
-in fact lands. The tool therefore reads the store back for that exact subject and value rather
-than trusting the answer, and repeats only while the fact is genuinely absent, so an
-administrator is never written twice nor silently missing.
+The four web rules of `INTENT.md` are built in: every action is a JSON call from script and the
+API refuses anything else (415 for a form body, 405 for a post outside the API); refusals and
+confirmations are the page's own notices, a modal (`ConfirmModal`) for a revocation, never a browser
+dialog; every list is the styled `Select`, searchable with a clearing cross past four entries; the
+password fields carry the eye.
 
-`tests/check-manager-admin-origin.py` in the web tree runs the responder against a stub resident
-and a stub control socket and exercises fifteen gates: everything 503 without the mark; `/ready`
-unchanged; the no-administrator refusal and that a creation without a session appends nothing;
-the sign-in page naming nobody; a wrong password refused; the cookie's three flags; the
-administration page; a bad login, a short password, a password equal to its login and a login
-already taken, each refused with nothing appended; the created administrator written as one
-observation in the replica's own scope with the password absent from it; the deployment account
-opening only the change page and naming nobody; a wrong current password, two differing entries,
-a short one and the old one again, each refused; the change writing the new hash and clearing
-the flag; a login in two scopes shown as a conflict; signing out; and the mark removed closing
-everything again.
+`tests/app.test.mjs` (vitest, supertest) exercises twenty-one gates against stubs: everything 503
+without the mark, `/ready` unchanged, the policy, the form refusals, the no-administrator state, sign-in
+and its cookie, the lockout after five failures, a forged or revoked session, sign-out, the rules of
+creation, the observation written with the password absent, the two-scope conflict, revocation (never
+the signed-in account, never the last one), and the deployment password's forced change.
+`tests/check-manager-admin-browser.py` drives the built app in a headless browser: rendered from the
+API, a wrong password refused in place with the fields kept, the eye, Enter signing in, the change
+view forced, forms without method or action, a session ended mid-way sent back to sign-in with the
+reason, no navigation, every post a JSON call, and words when JavaScript is off.
+`web/tests/ui-rules.test.mjs` fails when any web source of the manager posts a form, opens a browser
+dialog or draws a system select.
 
-On the laboratory, 2026-09-16: the image rebuilt on the three hosts, the three replicas
-recreated, the role held by lab-a at epoch 149, the deployment administrator created through the
-root door, and a sign-in through the **public hostname** answering 303 with a session cookie and
-then the forced change page. The replicas were recreated one host at a time and the fact set
-survived through replication, which is why the administrator created before the rebuild was
-still there afterwards.
+On the laboratory, 2026-09-16: the image rebuilt on the three hosts, the three replicas recreated
+one host at a time (the fact set, administrators included, surviving through replication), the role
+held by lab-a, the deployment administrator created through the root door, and the app driven
+from the public hostname by the same browser check.
