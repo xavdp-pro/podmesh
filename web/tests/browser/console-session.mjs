@@ -32,7 +32,11 @@ const make = (broken = false) => createApp({hosts: [{id: 'a', name: 'lab-a', ssh
     calls.push(p);
     const data = {
       identity: {host_uuid: '00000000-0000-4000-8000-00000000000a'},
-      capabilities: {version: 'fixture', operations: ['create', 'start', 'stop', 'pause', 'resume', 'resources', 'delete', 'clone']},
+      capabilities: {version: 'fixture', operations: ['create', 'start', 'stop', 'pause', 'resume', 'resources', 'delete', 'clone', 'storage_status'], schemas: {
+        stop: {kind: 'universe', gate: 'none', description: 'sends the stop signal and waits', fields: [{name: 'timeout_seconds', type: 'integer', required: true, min: 0, max: 300, description: 'the graceful wait'}, {name: 'on_timeout', type: 'enum', required: true, values: ['kill', 'leave_running'], description: 'escalate or leave running'}]},
+        storage_status: {kind: 'read', gate: 'none', description: 'what carries the storage', fields: []},
+        migration_checkpoint: {kind: 'tool', gate: 'reservation', description: 'a step of the chain', fields: null},
+      }},
       inventory: {containers: broken || _h.id !== 'a' ? [] : [{Id: 'c'.repeat(64), Names: ['podmesh-11111111-1111-4111-8111-111111111111'], State: 'running', Image: 'localhost/fixture', Labels: {'io.podmesh.universe': '11111111-1111-4111-8111-111111111111'}}]},
       observations: {observations: broken ? 'not a list' : []},
     }[p.operation] || {};
@@ -50,6 +54,7 @@ try {
   page.on('framenavigated', f => { if (f === page.mainFrame()) navigations.push(f.url()); });
   const errors = [];
   page.on('pageerror', e => errors.push(String(e)));
+  page.on('console', m => { if (m.type() === 'error' && m.text().includes('drawing error')) console.error('CONSOLE:', m.text().slice(0, 1200)); });
   let dialogs = 0;
   page.on('dialog', d => { dialogs++; d.dismiss(); });
 
@@ -131,6 +136,46 @@ try {
   if (moves.length !== 1 || moves[0].source.id !== 'a' || moves[0].destination.id !== 'b' || moves[0].universe_uuid !== '11111111-1111-4111-8111-111111111111') throw new Error('the move request is not what was chosen: ' + JSON.stringify(moves));
   checks.push('move offers the other SSH host as destination, sends the chosen universe and hosts to the move tool, and shows the report\'s steps');
   await page.getByRole('button', {name: 'Close action'}).click();
+
+  // the generic engine: any operation, its form drawn from the host's schema, validated, sent as JSON
+  await page.getByRole('button', {name: 'Close details'}).click();
+  await page.getByRole('button', {name: 'Run'}).click();
+  const form4 = page.locator('section.op-form');
+  try {
+    await form4.waitFor({timeout: 10000});
+  } catch (e) {
+    console.error('PAGE ERRORS:', errors.join(' | '));
+    console.error('PAGE TEXT:', (await page.locator('body').innerText()).slice(0, 800));
+    throw e;
+  }
+  await form4.getByRole('button', {name: 'Operation'}).click();
+  await page.getByLabel('Search an operation…').fill('sto');
+  await page.getByRole('option', {name: /^stop/}).click();
+  await form4.getByLabel('timeout_seconds').waitFor({timeout: 5000});
+  checks.push('the Run view lists the host\'s operations in a searchable styled list and draws stop\'s fields from its schema');
+  await form4.getByLabel('timeout_seconds').fill('900');
+  await form4.getByRole('button', {name: 'on_timeout'}).click();
+  await page.getByRole('option', {name: 'leave_running'}).click();
+  await form4.getByRole('button', {name: 'Universe'}).click();
+  await page.getByRole('option', {name: /podmesh-11111111/}).click();
+  await form4.getByPlaceholder('Approved task or mandate').fill('browser-check');
+  const beforeStop = calls.filter(c => c.operation === 'stop').length;
+  await form4.getByRole('button', {name: 'Send stop'}).click();
+  await form4.getByRole('alert').filter({hasText: 'timeout_seconds is at most 300'}).waitFor({timeout: 5000});
+  if (calls.filter(c => c.operation === 'stop').length !== beforeStop) throw new Error('an out-of-bound value reached the runtime');
+  checks.push('a value outside the schema\'s bound is refused in place before anything is sent');
+  await form4.getByLabel('timeout_seconds').fill('15');
+  await form4.getByRole('button', {name: 'Send stop'}).click();
+  await page.getByText('The host answered ok').waitFor({timeout: 10000});
+  const stopSent = calls.filter(c => c.operation === 'stop').slice(-1)[0];
+  if (!stopSent || stopSent.timeout_seconds !== 15 || stopSent.on_timeout !== 'leave_running' || stopSent.universe_uuid !== '11111111-1111-4111-8111-111111111111' || stopSent.authorization_ref !== 'browser-check') throw new Error('the generic request is not what was typed: ' + JSON.stringify(stopSent));
+  checks.push('the generic form sends stop with timeout_seconds as an integer, the chosen enum, the chosen universe and the mandate');
+  await form4.getByRole('button', {name: 'Operation'}).click();
+  await page.getByLabel('Search an operation…').fill('migration');
+  await page.getByRole('option', {name: /migration checkpoint/}).click();
+  await form4.getByText('driven by a tool from this workstation').waitFor({timeout: 5000});
+  if (await form4.getByRole('button', {name: /^Send/}).count()) throw new Error('a tool step is offered for sending');
+  checks.push('a step of a cross-host chain is shown as the tool\'s, with nothing to send');
 
   if (navigations.length !== 1) throw new Error('the console navigated: ' + JSON.stringify(navigations));
   if (dialogs) throw new Error(`${dialogs} browser dialog(s) opened`);

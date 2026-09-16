@@ -145,3 +145,31 @@ test('stale relationship data remains explicit and leaves observed universes una
 test('manager relationship failure is isolated from host snapshot collection',async t=>{
  const g=await relationshipGateway(t,async()=>{throw Error('fixture manager unavailable');});const relationships=await g.read();const snapshot=await fetch(g.url+'/api/snapshot').then(r=>r.json());assert.equal(relationships.status,'unavailable');assert.match(relationships.error,/fixture manager unavailable/);assert.equal(snapshot.hosts[0].responses.inventory.data.containers[0].Id,'kept');
 });
+test('the generic operation route validates against the schema the host publishes',async t=>{
+ const calls=[];let app;const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ const schemas={stop:{kind:'universe',gate:'none',description:'stop',fields:[{name:'timeout_seconds',type:'integer',required:true,min:0,max:300},{name:'on_timeout',type:'enum',required:true,values:['kill','leave_running']}]},
+  storage_status:{kind:'read',gate:'none',description:'storage',fields:[]},activation_require:{kind:'universe',gate:'none',description:'policy',fields:[{name:'lease_seconds',type:'integer',required:true,min:5,max:3600},{name:'eligible_hosts',type:'uuid[]',required:false}]},
+  migration_checkpoint:{kind:'tool',gate:'reservation',description:'step',fields:null}};
+ app=createApp({hosts:[{id:'a',name:'A',socket:'/fixture.sock',allowActions:true},{id:'r',name:'R',socket:'/fixture.sock',allowActions:false}]},{origin:url,call:async(h,p)=>{calls.push([h.id,p]);return p.operation==='capabilities'?{ok:true,data:{operations:Object.keys(schemas),schemas}}:{ok:true,data:{echo:p.operation}};}});
+ const session=await fetch(url+'/api/session').then(r=>r.json());
+ const post=(host,body,extra={})=>fetch(url+`/api/hosts/${host}/operations`,{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Podmesh-Token':session.token,...extra},body:JSON.stringify(body)});
+ const id=()=>'00000000-0000-4000-8000-00000000000'+(Math.floor(Math.random()*9)+1);
+ const U='00000000-0000-4000-8000-000000000001';
+ const good={operation:'stop',operation_id:id(),universe_uuid:U,authorization_ref:'fixture',timeout_seconds:10,on_timeout:'kill'};
+ assert.equal((await post('a',good)).status,200);
+ assert.equal((await post('a',{...good,operation_id:id(),timeout_seconds:301})).status,400);
+ assert.equal((await post('a',{...good,operation_id:id(),timeout_seconds:'10'})).status,400);
+ assert.equal((await post('a',{...good,operation_id:id(),on_timeout:'maybe'})).status,400);
+ assert.equal((await post('a',{...good,operation_id:id(),extra:1})).status,400);
+ assert.equal((await post('a',{...good,operation_id:id(),universe_uuid:'nope'})).status,400);
+ assert.equal((await post('a',{operation:'stop',operation_id:id(),universe_uuid:U,authorization_ref:'fixture',timeout_seconds:10})).status,400);
+ assert.equal((await post('a',{operation:'activation_require',operation_id:id(),universe_uuid:U,authorization_ref:'fixture',lease_seconds:30,eligible_hosts:[U]})).status,200);
+ assert.equal((await post('a',{operation:'activation_require',operation_id:id(),universe_uuid:U,authorization_ref:'fixture',lease_seconds:30,eligible_hosts:['x']})).status,400);
+ assert.equal((await post('a',{operation:'migration_checkpoint',operation_id:id(),universe_uuid:U,authorization_ref:'fixture'})).status,409);
+ assert.equal((await post('a',{operation:'unknown_op',operation_id:id(),authorization_ref:'fixture'})).status,409);
+ assert.equal((await post('r',good)).status,403);
+ const read=await fetch(url+'/api/hosts/r/operations',{method:'POST',headers:{'Content-Type':'application/json','X-Podmesh-Token':session.token},body:JSON.stringify({operation:'storage_status',operation_id:id(),authorization_ref:'fixture'})});
+ assert.equal(read.status,200);
+ assert.equal((await post('a',good,{Origin:'https://foreign.test'})).status,403);
+ const sent=calls.filter(([,p])=>p.operation!=='capabilities').map(([h,p])=>h+':'+p.operation);
+ assert.deepEqual(sent,['a:stop','a:activation_require','r:storage_status']);});

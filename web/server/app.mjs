@@ -52,6 +52,45 @@ export function createApp(config,{call=request,origin='http://127.0.0.1:4175',re
  app.use((req,res,next)=>{res.set('Cache-Control','no-store');res.set('X-Content-Type-Options','nosniff');res.set('Referrer-Policy','no-referrer');res.set('X-Frame-Options','DENY');res.set('Content-Security-Policy',"default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");if(req.headers.host!==new URL(origin).host)return res.status(403).json({error:'Unexpected host'});next();});
  app.use(express.json({limit:'4kb'}));
  app.get('/api/session',(_req,res)=>res.json({token,mode:'local-operator',hosts:hosts.map(({id,name,allowActions,ssh})=>({id,name,allowActions:!!allowActions,canMove:!!(allowActions&&ssh)}))}));
+ // The generic engine: any operation the host advertises with a schema, validated here against that schema -- the same
+ // bounds the daemon enforces -- and sent as it was built. Reads need the read session; mutations the mutating one and a
+ // host that allows actions; a 'tool' step is refused here (a workstation tool drives it across hosts).
+ const UUID_RE=uuid;
+ function validateAgainst(schema,p){
+  const known=new Set(['operation','operation_id','authorization_ref',...(schema.fields||[]).map(f=>f.name)]);
+  const needsUniverse=schema.kind==='universe'||(schema.fields||[]).some(f=>f.name==='universe_uuid');
+  if(needsUniverse){known.add('universe_uuid');if(!UUID_RE.test(p.universe_uuid))return 'universe_uuid must be a UUID';}
+  for(const k of Object.keys(p))if(!known.has(k))return `Unexpected field ${k}`;
+  for(const f of schema.fields||[]){const v=p[f.name];if(v===undefined){if(f.required)return `${f.name} is required`;continue;}
+   switch(f.type){
+    case 'integer':if(!Number.isInteger(v)||(f.min!==undefined&&v<f.min)||(f.max!==undefined&&v>f.max))return `${f.name} must be an integer${f.min!==undefined?` from ${f.min}`:''}${f.max!==undefined?` to ${f.max}`:''}`;break;
+    case 'number':if(typeof v!=='number'||!Number.isFinite(v)||(f.min!==undefined&&v<f.min)||(f.max!==undefined&&v>f.max))return `${f.name} must be a number${f.min!==undefined?` from ${f.min}`:''}${f.max!==undefined?` to ${f.max}`:''}`;break;
+    case 'boolean':if(typeof v!=='boolean')return `${f.name} must be true or false`;break;
+    case 'enum':if(!f.values?.includes(v))return `${f.name} must be one of ${(f.values||[]).join(', ')}`;break;
+    case 'uuid':if(!UUID_RE.test(v))return `${f.name} must be a UUID`;break;
+    case 'string':if(typeof v!=='string'||v.length>4096)return `${f.name} must be a string`;break;
+    case 'string[]':if(!Array.isArray(v)||!v.every(x=>typeof x==='string')||v.length>256)return `${f.name} must be an array of strings`;break;
+    case 'uuid[]':if(!Array.isArray(v)||!v.every(x=>UUID_RE.test(x)))return `${f.name} must be an array of UUIDs`;break;
+    case 'object[]':if(!Array.isArray(v)||!v.every(x=>x&&typeof x==='object'&&!Array.isArray(x)))return `${f.name} must be an array of objects`;break;
+    case 'object':if(!v||typeof v!=='object'||Array.isArray(v))return `${f.name} must be an object`;break;
+    default:return `${f.name} has a type this console does not know (${f.type})`;
+   }}
+  return null;
+ }
+ app.post('/api/hosts/:id/operations',express.json({limit:'64kb'}),async(req,res)=>{
+  const host=hosts.find(h=>h.id===req.params.id);if(!host)return res.status(404).json({error:'Unknown host'});
+  const p=req.body;if(!p||typeof p.operation!=='string'||!/^[a-z_]{1,64}$/.test(p.operation)||!uuid.test(p.operation_id)||typeof p.authorization_ref!=='string'||!p.authorization_ref.trim()||p.authorization_ref.length>256)return res.status(400).json({error:'Invalid operation or identity'});
+  if(JSON.stringify(p).length>32768)return res.status(413).json({error:'Request too large'});
+  let caps;try{caps=await call(host,{operation:'capabilities'},{timeout:15000});}catch(e){return res.status(502).json({error:e.message});}
+  const schema=caps?.ok&&caps.data.schemas?.[p.operation];
+  if(!schema)return res.status(409).json({error:caps?.data?.schemas?'Operation not advertised by this host':'This host publishes no operation schemas (older runtime); use the dedicated actions'});
+  if(schema.kind==='tool')return res.status(409).json({error:'This operation is one step of a chain a workstation tool drives across hosts; it is not sent alone from here'});
+  if(schema.kind==='read'){if(!requireReadSession(req,res,origin,token))return;}
+  else{if(!requireMutatingSession(req,res,origin,token))return;if(!host.allowActions)return res.status(403).json({error:'Actions disabled by operator configuration'});}
+  const problem=validateAgainst(schema,p);if(problem)return res.status(400).json({error:problem});
+  try{const result=await call(host,p,{timeout:schema.kind==='read'?30000:330000});if(schema.kind!=='read'){cached=null;generation++;}res.json(result);}
+  catch(e){if(schema.kind!=='read'){cached=null;generation++;}res.status(502).json({error:e.message,operation_id:p.operation_id,outcome:'unknown'});}
+ });
  // A move: one universe, two hosts of this configuration, both reached over SSH and both allowing actions, on the same runtime paths.
  app.post('/api/moves',express.json({limit:'8kb'}),async(req,res)=>{
   if(!requireMutatingSession(req,res,origin,token))return;
