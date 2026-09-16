@@ -7,6 +7,8 @@ mod manager;
 mod secrets;
 mod publisher;
 mod signing;
+mod schema;
+mod storage;
 pub use manager::control_relay;
 pub use network::reconcile as reconcile_network;
 mod collector;
@@ -131,9 +133,12 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
             | "activation_supersede" | "activation_status" | "activation_fence" | "activation_fence_preview" => activation::execute(db, request)?,
             "recovery_point_prepare" | "recovery_point_status" | "recovery_point_restore" | "recovery_point_promote" => recovery_point::execute(db, request)?,
             "migration_status" => migration::status(db, request)?,
+            "storage_status" => storage::status()?,
             "capabilities" => json!({
+                "schemas": schema::all(),
+                "schema_version": "podmesh-operation-schema/1",
                 "version":option_env!("PODMESH_PACKAGE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
-                "operations":["capabilities","identity","inventory","observations","activation_require","activation_acquire","activation_renew","activation_release","activation_supersede","activation_status","activation_fence","activation_fence_preview","recovery_point_prepare","recovery_point_status","recovery_point_restore","recovery_point_promote","create","delete","clone","start","stop","pause","resume","resources"],
+                "operations":["capabilities","identity","inventory","observations","activation_require","activation_acquire","activation_renew","activation_release","activation_supersede","activation_status","activation_fence","activation_fence_preview","recovery_point_prepare","recovery_point_status","recovery_point_restore","recovery_point_promote","create","delete","clone","start","stop","pause","resume","resources","storage_status"],
                 "experimental_operations":["migration_preflight","migration_checkpoint","migration_status","migration_authorize_transfer",
                     "migration_complete_transfer","migration_retire_source","migration_release","migration_abandon","migration_restore_local",
                     "migration_destination_preflight","migration_restore","migration_restore_abort",

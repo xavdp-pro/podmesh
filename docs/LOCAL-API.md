@@ -13,6 +13,17 @@ sudo podmesh observations
 
 Capabilities describe the installed build. Do not infer that planned operations are available from the roadmap.
 
+**The schemas.** `capabilities` also carries `schemas` (`schema_version`
+`podmesh-operation-schema/1`): for every advertised operation, its `kind` — `read` (no journal row,
+no effect), `universe` (a journaled mutation naming one universe), `host` (a journaled mutation of
+this host), `tool` (one step of a chain a workstation tool drives across hosts) — its `gate` (`none`,
+`lease`, `reservation`, or both), a description, and its `fields`, each with a `type` (`string`,
+`integer`, `number`, `boolean`, `enum` with `values`, `uuid`, `string[]`, `uuid[]`, `object[]`,
+`object`), `required`, and the `min`/`max` the daemon enforces. An operation whose fields are not
+described yet says `fields: null`. This is what the console draws its forms from and what an agent
+reads before asking; `tests/check-capabilities-schema.py` holds the stated bounds to the daemon's
+refusals.
+
 ## Typed mutation requests
 
 Pass a JSON request file as the second CLI argument:
@@ -63,6 +74,21 @@ Both fields are required; there is no default escalation.
 - `on_timeout: "leave_running"` sends only the container's stop signal and waits `timeout_seconds`. If the application is still running, the result is `ok: false`, the container is left running, and no SIGKILL is sent.
 
 A universe that is already stopped returns `action: none_already_stopped` without sending a signal. Stop never removes the container, its filesystem or volumes.
+
+## Storage
+
+```json
+{"operation": "storage_status", "operation_id": "...", "authorization_ref": "..."}
+```
+
+Read-only and host-wide: what carries Podman's storage (`graph_root`, its `mount` from findmnt,
+the `backend` — `zfs`, `btrfs`, `lvm-thin`, `lvm`, `plain` — and whether it is `dedicated`, that is
+not the system's root filesystem), the filesystem's sizes from df, and the operator's rule applied
+(2026-09-16): a universe's space may `growth: possible` only on a dedicated LVM, ZFS or Btrfs
+volume; on a filesystem shared with the system, or a dedicated one that does not know how to grow,
+it is `refused` with the reason. Universe volumes, `volume_declare` and `volume_grow` come with the
+dedicated storage; today a universe keeps its data in its container's layer, and the result says so.
+On the laboratory hosts, whose storage sits on the ext4 root, the answer is `refused`.
 
 ## Pause and resume
 
