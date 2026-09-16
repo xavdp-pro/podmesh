@@ -3,7 +3,11 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import request from 'supertest'
 import { createApp, administrators } from '../server/app.mjs'
-import { hashPassword } from '../server/resident.mjs'
+import { hashPassword, observer } from '../server/resident.mjs'
+import net from 'node:net'
+import os from 'node:os'
+import path from 'node:path'
+import fs from 'node:fs'
 
 const identity = { logical_manager_id: 'logical', replica_id: 'replica-one' }
 const SCOPE = 'm-u2/lab-a/observations'
@@ -198,4 +202,32 @@ describe('the deployment password', () => {
     expect(appended[1].value).toBe('changed')
     expect(JSON.stringify(appended)).not.toContain('a-good-new-password')
   })
+})
+
+
+describe('an uncertain answer from the resident', () => {
+  async function control(answer, seen) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'podmesh-origin-'))
+    const sock = path.join(dir, 'control.sock')
+    const server = net.createServer(s => { let buf = ''; s.on('data', d => { buf += d }); s.on('end', () => { seen.push(JSON.parse(buf)); s.end(answer) }) })
+    await new Promise(r => server.listen(sock, r))
+    return { sock, close: () => server.close() }
+  }
+  it('is read back from the store, and a fact that landed is a success written once', async () => {
+    const seen = []
+    const { sock, close } = await control('{"error":"append_observation_uncertain"}', seen)
+    const store = []
+    const append = observer({ control: sock, scope: SCOPE, facts: async () => { if (seen.length >= 2 && !store.length) store.push({ subject: 'admin.user.x', value: 'v' }); return store } })
+    const answer = await append('admin.user.x', 'v')
+    expect(answer).toContain('read back')
+    expect(new Set(seen.map(s => s.operation_id)).size).toBe(1)
+    close()
+  }, 20000)
+  it('is a refusal when the fact never lands', async () => {
+    const seen = []
+    const { sock, close } = await control('{"error":"append_observation_uncertain"}', seen)
+    const append = observer({ control: sock, scope: SCOPE, facts: async () => [] })
+    await expect(append('admin.user.y', 'v')).rejects.toThrow(/did not observe/)
+    close()
+  }, 20000)
 })

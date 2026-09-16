@@ -8,11 +8,12 @@ const MARK = process.env.PODMESH_GOVERNOR_MARK || '/run/podmesh-manager/governor
 const PORT = Number(process.env.PODMESH_ORIGIN_PORT || 8080)
 
 const { identity, scope, control } = readConfig(CONFIG)
+const facts = factsReader({ binary: BINARY, config: CONFIG, state: STATE })
 const app = createApp({
   identity, scope,
   governor: markReader(MARK),
-  facts: factsReader({ binary: BINARY, config: CONFIG, state: STATE }),
-  append: observer({ control, scope }),
+  facts,
+  append: observer({ control, scope, facts }),
   secure: process.env.PODMESH_ORIGIN_INSECURE_COOKIE !== '1',
 })
 app.listen(PORT, '0.0.0.0', () => console.log(`manager origin listening on ${PORT} (fail-closed until PodMesh marks this replica governor)`))

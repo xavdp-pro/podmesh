@@ -49,19 +49,30 @@ function once(control, request) {
   })
 }
 
-// One typed observation in this replica's scope. The resident answers `observed`, or
-// `append_observation_uncertain` / `_busy` when it cannot say whether the fact landed; the same
-// operation ID is retried then, exactly as the entrypoint does for the boot fact: the resident
-// refuses an ID it already has, so the retry is safe and the fact is recorded once.
-export const observer = ({ control, scope }) => async (subject, value) => {
+// One typed observation in this replica's scope. The resident answers within a 250 ms control
+// deadline (its design): `observed` when the store committed in time, `append_observation_uncertain`
+// or `_busy` when it could not say -- and measured on 2026-09-16 the store then holds the fact
+// anyway, more often than not. Uncertain is therefore not failed: the same operation ID is retried
+// (the resident refuses an ID it already has, so the fact lands once), and when every answer stays
+// uncertain the store itself is read back for that exact subject and value. Only a fact absent from
+// the store after that is a refusal.
+export const observer = ({ control, scope, facts }) => async (subject, value) => {
   const operation_id = randomBytes(16).toString('hex')
   const request = JSON.stringify({ operation: 'append_observation', operation_id, scope, subject, value })
   let last = ''
-  for (let attempt = 0; attempt < 5; attempt++) {
+  for (let attempt = 0; attempt < 4; attempt++) {
     last = await once(control, request)
-    if (last.replace(/\s/g, '').includes('"result":"observed"')) return last
+    if (last.replace(/\s/g, '').includes('"result":"observed"')) return 'observed'
     if (!/append_observation_(uncertain|busy)/.test(last)) break
-    await new Promise(r => setTimeout(r, 1000))
+    await new Promise(r => setTimeout(r, 400))
+  }
+  if (facts && /append_observation_(uncertain|busy)/.test(last)) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await new Promise(r => setTimeout(r, 300))
+      try {
+        if ((await facts()).some(f => f.subject === subject && f.value === value)) return 'observed after an uncertain answer, read back from the store'
+      } catch { /* the store not readable this instant; try again */ }
+    }
   }
   throw new Error(`the resident did not observe it: ${last.slice(0, 200)}`)
 }
