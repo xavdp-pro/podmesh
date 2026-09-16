@@ -51,9 +51,29 @@ await page.getByRole('alert').filter({ hasText: 'The two new entries differ.' })
 if (await page.locator('#next').inputValue() !== 'a-good-new-password') throw new Error('the new password field was emptied');
 checks.push('two differing entries are refused in place, the fields kept');
 
+// the forms are containers only: no method, no action, and Enter went through script above
+const forms = await page.evaluate(() => [...document.querySelectorAll('form')].map(f => ({ method: f.getAttribute('method'), action: f.getAttribute('action') })));
+if (!forms.length || forms.some(f => f.method || f.action)) throw new Error('a form that could post natively: ' + JSON.stringify(forms));
+checks.push(`the fields sit in ${forms.length} form(s) with neither method nor action, so a password manager pairs them and nothing can post natively`);
+
+// a session that ends mid-way sends the page back to sign-in, saying why
+await context.clearCookies();
+await page.locator('#again').fill('a-good-new-password');
+await page.getByRole('button', { name: 'Change it' }).click();
+await page.getByRole('heading', { name: 'Sign in' }).waitFor({ timeout: 10000 });
+await page.getByRole('alert').filter({ hasText: 'Your session ended. Sign in again.' }).waitFor({ timeout: 10000 });
+checks.push('a session that ended mid-way sends the page back to sign-in with the reason, not a refusal nobody can act on');
+
 if (navigations.length !== 1) throw new Error('the page navigated: ' + JSON.stringify(navigations));
 if (posts.some(p => !p.type.startsWith('application/json') || !p.url.includes('/admin/api/'))) throw new Error('a post that is not a JSON API call: ' + JSON.stringify(posts));
 if (errors.length) throw new Error('script errors: ' + errors.join(' | '));
 checks.push(`no navigation after the first load, and every one of ${posts.length} posts a JSON call to the API -- no form post`);
+// without JavaScript the page says what it needs instead of staying blank
+const bare = await browser.newContext({ javaScriptEnabled: false, userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36' });
+const still = await bare.newPage();
+await still.goto(base + '/admin');
+const words = await still.locator('main').innerText();
+if (!words.includes('This page needs JavaScript')) throw new Error('no words without JavaScript: ' + words.slice(0, 200));
+checks.push('with JavaScript off the page says it needs it, instead of a blank page');
 await browser.close();
 console.log(JSON.stringify({ result: 'PASS', checks }, null, 2));

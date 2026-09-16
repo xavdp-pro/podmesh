@@ -112,10 +112,12 @@ try:
 
     # the operator's rule: no form posts, enforced by the server and by the browser's policy
     status, text, _, csp = ask('GET', '/admin')
-    assert status == 200 and '<form' not in text and 'method="post"' not in text.lower(), text[:300]
+    import re
+    assert status == 200 and not re.search(r'method\s*=\s*["\']?post', text, re.I) and not re.search(r'<form[^>]*\saction\s*=', text, re.I), text[:300]
     assert "form-action 'none'" in csp and "script-src 'nonce-" in csp, csp
-    assert 'Show the password' in text, 'the eye is missing from the password fields'
-    checks.append("the administration page carries no form at all, its policy sets form-action 'none', and its password fields carry the eye")
+    assert 'Show the password' in text and 'preventDefault' in text, 'the eye or the interception is missing'
+    assert '<noscript>' in text and 'could not run' in text, 'no words for a page whose script does not run'
+    checks.append("the page can post no form -- no method, no action, submissions intercepted, form-action 'none' -- carries the eye, and says so when its script cannot run")
     status, text, _, _ = ask('POST', '/admin/api/login', 'login=admin&password=podmesh', kind='application/x-www-form-urlencoded')
     assert status == 415, (status, text[:200])
     status, text, _, _ = ask('POST', '/admin/login', 'login=admin&password=podmesh', kind='application/x-www-form-urlencoded')

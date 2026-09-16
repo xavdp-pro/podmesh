@@ -22,8 +22,12 @@ async function boundedJson(response){
  const reader=response.body.getReader();for(;;){const {done,value}=await reader.read();if(done)break;bytes+=value.byteLength;if(bytes>MAX_RELATIONSHIP_RESPONSE_BYTES){await reader.cancel();throw Error('Manager relationship response exceeds the 1 MiB safety limit');}parts.push(value);}
  try{return JSON.parse(new TextDecoder().decode(Buffer.concat(parts)));}catch{throw Error('Manager relationship response is malformed');}
 }
-function requireReadSession(req,res,origin,token){if(req.headers.origin&&req.headers.origin!==origin||req.headers['x-podmesh-token']!==token){res.status(403).json({error:'Same-origin session required'});return false;}return true;}
-function requireMutatingSession(req,res,origin,token){if(req.headers.origin!==origin||req.headers['x-podmesh-token']!==token){res.status(403).json({error:'Same-origin session required'});return false;}return true;}
+// A foreign origin is forbidden (403); a missing or stale token is a session that has ended (401) --
+// the console restarted, for instance -- and the page renews it instead of showing a refusal the
+// operator cannot act on (INTENT.md, "Web surfaces").
+function sessionEnded(res){res.status(401).json({error:'The console session has ended; it is renewed from /api/session',session:'renew'});return false;}
+function requireReadSession(req,res,origin,token){if(req.headers.origin&&req.headers.origin!==origin){res.status(403).json({error:'Same-origin session required'});return false;}if(req.headers['x-podmesh-token']!==token)return sessionEnded(res);return true;}
+function requireMutatingSession(req,res,origin,token){if(req.headers.origin!==origin){res.status(403).json({error:'Same-origin session required'});return false;}if(req.headers['x-podmesh-token']!==token)return sessionEnded(res);return true;}
 export function createApp(config,{call=request,origin='http://127.0.0.1:4175',relationshipFetch=fetch,now=()=>Date.now()}={}){
  const app=express();const token=randomBytes(32).toString('hex');
  const hosts=config.hosts||[];if(hosts.length>16)throw Error('Maximum16 hosts');

@@ -189,7 +189,7 @@ STYLE = ('body{margin:0;background:#f4efe4;color:#1c1916;font-family:ui-sans-ser
          '.note{background:#efe7d6;border-left:3px solid #215547;padding:.8rem 1rem;border-radius:.2rem}'
          '.bad{border-left-color:#8c3b2e}code{font-size:.92em}[hidden]{display:none!important}'
          '.secret{position:relative}.secret input{padding-right:3.6rem}'
-         '.secret button{position:absolute;right:.35rem;top:50%;transform:translateY(-50%);margin:0;padding:.25rem .55rem;background:transparent;'
+         '.secret button{position:absolute;right:.35rem;top:50%;transform:translateY(-50%);margin:0;padding:.3rem .45rem;line-height:0;background:transparent;'
          'color:#7a7268;border:1px solid #d8cfbe;border-radius:.3rem;font-size:.8rem;cursor:pointer}'
          '.secret button:hover{color:#215547;border-color:#215547}')
 
@@ -200,50 +200,69 @@ STYLE = ('body{margin:0;background:#f4efe4;color:#1c1916;font-family:ui-sans-ser
 APP = r"""
 (function(){
 var root=document.getElementById('app');
+var SVG='http://www.w3.org/2000/svg';
 function el(tag,attrs){var e=document.createElement(tag);attrs=attrs||{};
  Object.keys(attrs).forEach(function(k){if(k==='text')e.textContent=attrs[k];else if(k==='cls')e.className=attrs[k];else e.setAttribute(k,attrs[k]);});
  for(var i=2;i<arguments.length;i++){var c=arguments[i];if(c)e.appendChild(typeof c==='string'?document.createTextNode(c):c);}return e;}
-function field(id,label,type,auto){var input=el('input',{id:id,type:type,autocomplete:auto,spellcheck:'false',autocapitalize:'off'});
+// The eye: an open eye while the password is hidden, a struck-through one while it shows.
+function icon(open){var s=document.createElementNS(SVG,'svg');['viewBox','0 0 24 24','width','18','height','18','fill','none','stroke','currentColor','stroke-width','2','stroke-linecap','round','stroke-linejoin','round','aria-hidden','true']
+ .reduce(function(a,v,i,l){if(i%2===0)s.setAttribute(v,l[i+1]);return a;},0);
+ function add(tag,attrs){var n=document.createElementNS(SVG,tag);Object.keys(attrs).forEach(function(k){n.setAttribute(k,attrs[k]);});s.appendChild(n);}
+ if(open){add('path',{d:'M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z'});add('circle',{cx:'12',cy:'12',r:'3'});}
+ else{add('path',{d:'M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24'});add('line',{x1:'1',y1:'1',x2:'23',y2:'23'});}
+ return s;}
+function field(id,label,type,auto){var input=el('input',{id:id,name:id,type:type,autocomplete:auto,spellcheck:'false',autocapitalize:'off'});
  var box=el('div',{cls:type==='password'?'secret':''},input);
- if(type==='password'){var b=el('button',{type:'button','aria-label':'Show the password',text:'show'});
+ if(type==='password'){var b=el('button',{type:'button','aria-label':'Show the password',title:'Show the password'});b.appendChild(icon(true));
   b.addEventListener('click',function(){var shown=input.type==='text';input.type=shown?'password':'text';
-   b.textContent=shown?'show':'hide';b.setAttribute('aria-label',shown?'Show the password':'Hide the password');input.focus();});
+   b.textContent='';b.appendChild(icon(shown));var label=shown?'Show the password':'Hide the password';
+   b.setAttribute('aria-label',label);b.setAttribute('title',label);input.focus();});
   box.appendChild(b);}
  return {node:el('div',{},el('label',{for:id,text:label}),box),input:input};}
 function note(){return el('p',{cls:'note bad',hidden:'hidden',role:'alert'});}
 function show(n,text,good){n.textContent=text;n.className='note'+(good?'':' bad');n.hidden=!text;}
+// Every action is a JSON call; the page never submits a form and never navigates.
 function call(path,body){return fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})})
  .then(function(r){return r.json().catch(function(){return {error:'The manager answered '+r.status+' without a readable reason.'};}).then(function(j){j._status=r.status;return j;});})
  .catch(function(){return {error:'The manager could not be reached.',_status:0};});}
-function action(button,run){button.addEventListener('click',function(ev){ev.preventDefault();button.disabled=true;
- run().then(function(){button.disabled=false;});});}
+// A session that ended -- expired, or the replica restarted -- sends the page back to sign-in,
+// saying why, instead of showing a refusal the person cannot act on.
+function expired(j,path){if(j._status===401&&path!=='/admin/api/login'){load('Your session ended. Sign in again.');return true;}return false;}
+// A <form> kept as the container, so a password manager pairs the login with its password and
+// Enter submits; the submission is intercepted and becomes one JSON call. It has no method and no
+// action, and the page's policy (form-action 'none') would refuse a native submission anyway.
+function form(label,fields,run){var f=el('form',{novalidate:'novalidate'});fields.forEach(function(x){f.appendChild(x.node);});
+ var go=el('button',{cls:'act',type:'submit',text:label});f.appendChild(go);
+ f.addEventListener('submit',function(ev){ev.preventDefault();if(go.disabled)return;go.disabled=true;
+  Promise.resolve(run()).then(function(){go.disabled=false;},function(){go.disabled=false;});});
+ return f;}
 function page(title){root.textContent='';root.appendChild(el('p',{text:'PODMESH / MANAGER'}));root.appendChild(el('h1',{text:title}));}
-function load(){return fetch('/admin/api/state',{credentials:'same-origin'}).then(function(r){return r.json();})
- .then(render).catch(function(){page('Unavailable');root.appendChild(el('p',{cls:'note bad',text:'The manager could not be reached.'}));});}
-function render(s){
+function load(flash){return fetch('/admin/api/state',{credentials:'same-origin'}).then(function(r){return r.json();})
+ .then(function(s){try{render(s,flash);}catch(e){page('Unavailable');root.appendChild(el('p',{cls:'note bad',text:'The page could not be drawn: '+e.message}));}})
+ .catch(function(){page('Unavailable');root.appendChild(el('p',{cls:'note bad',text:'The manager could not be reached.'}));});}
+function render(s,flash){
  if(s.view==='closed'){page('Not the governor');root.appendChild(el('p',{cls:'note bad',text:'This replica does not hold the role; it administers nothing.'}));return;}
  if(s.view==='none'){page('No administrator exists yet.');
   root.appendChild(el('p',{cls:'note',text:'The first administrator is written from the host that carries the governor, as root, through PodMesh’s control door; a deployment does it (tools/manager-admin.py bootstrap).'}));return;}
- if(s.view==='login'){page('Sign in');var n=note();root.appendChild(n);
+ if(s.view==='login'){page('Sign in');var n=note();root.appendChild(n);if(flash)show(n,flash);
   var l=field('login','Administrator','text','username'),p=field('password','Password','password','current-password');
-  var go=el('button',{cls:'act',type:'button',text:'Sign in'});root.appendChild(l.node);root.appendChild(p.node);root.appendChild(go);
-  [l.input,p.input].forEach(function(i){i.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();go.click();}});});
-  action(go,function(){show(n,'');return call('/admin/api/login',{login:l.input.value,password:p.input.value}).then(function(j){
-   if(j.ok)return load();show(n,j.error||'Refused.');p.input.focus();});});l.input.focus();return;}
+  root.appendChild(form('Sign in',[l,p],function(){show(n,'');return call('/admin/api/login',{login:l.input.value,password:p.input.value}).then(function(j){
+   if(j.ok)return load();show(n,j.error||'Refused.');p.input.focus();});}));
+  (l.input.value?p.input:l.input).focus();return;}
  if(s.view==='change'){page('Change the password.');
   root.appendChild(el('p',{cls:'note',text:'This account still carries the password it was given when the manager was deployed. Nothing else opens until it is replaced.'}));
   var n2=note();root.appendChild(n2);
+  var u=el('input',{type:'text',name:'username',autocomplete:'username',value:s.login,hidden:'hidden','aria-hidden':'true'});
   var c=field('current','Current password','password','current-password'),x=field('next','New password','password','new-password'),a=field('again','New password again','password','new-password');
-  var ch=el('button',{cls:'act',type:'button',text:'Change it'});[c,x,a].forEach(function(f){root.appendChild(f.node);});root.appendChild(ch);
-  root.appendChild(el('p',{},'Signed in as ',el('code',{text:s.login}),'.'));
-  action(ch,function(){show(n2,'');return call('/admin/api/password',{current:c.input.value,next:x.input.value,again:a.input.value}).then(function(j){
-   if(j.ok)return load();show(n2,j.error||'Refused.');});});c.input.focus();return;}
+  var fc=form('Change it',[c,x,a],function(){show(n2,'');return call('/admin/api/password',{current:c.input.value,next:x.input.value,again:a.input.value}).then(function(j){
+   if(expired(j,'/admin/api/password'))return;if(j.ok)return load();show(n2,j.error||'Refused.');});});
+  fc.insertBefore(u,fc.firstChild);root.appendChild(fc);
+  root.appendChild(el('p',{},'Signed in as ',el('code',{text:s.login}),'.'));c.input.focus();return;}
  page('Administration');
  var who=el('p',{},'Signed in as ',el('code',{text:s.login}),' on the governor at epoch ',el('code',{text:String(s.epoch)}),'.');
  var out=el('button',{cls:'quiet',type:'button',text:'Sign out'});who.appendChild(out);root.appendChild(who);
- action(out,function(){return call('/admin/api/logout').then(load);});
- var msg=note();root.appendChild(msg);
- if(s.message){show(msg,s.message,true);}
+ out.addEventListener('click',function(){out.disabled=true;call('/admin/api/logout').then(function(){load();});});
+ var msg=note();root.appendChild(msg);if(flash)show(msg,flash,true);
  root.appendChild(el('h2',{text:'Administrators'}));
  var table=el('table',{},el('tr',{},el('th',{text:'login'}),el('th',{text:'scope'})));
  (s.administrators||[]).forEach(function(r){table.appendChild(el('tr',{},el('td',{},el('code',{text:r.login})),
@@ -252,10 +271,8 @@ function render(s){
  root.appendChild(el('h2',{text:'Create an administrator'}));
  root.appendChild(el('p',{},'Written as a replicated fact in this replica’s own scope ',el('code',{text:s.scope}),'. The password is hashed on the replica and never stored, logged or replicated.'));
  var nl=field('new-login','Login','text','off'),np=field('new-password','Password','password','new-password');
- var mk=el('button',{cls:'act',type:'button',text:'Create'});root.appendChild(nl.node);root.appendChild(np.node);root.appendChild(mk);
- action(mk,function(){show(msg,'');return call('/admin/api/users',{login:nl.input.value,password:np.input.value}).then(function(j){
-  if(j.ok){nl.input.value='';np.input.value='';return load().then(function(){var m=document.querySelector('[role=alert]');if(m)show(m,j.message,true);});}
-  show(msg,j.error||'Refused.');});});
+ root.appendChild(form('Create',[nl,np],function(){show(msg,'');return call('/admin/api/users',{login:nl.input.value,password:np.input.value}).then(function(j){
+  if(expired(j,'/admin/api/users'))return;if(j.ok)return load(j.message);show(msg,j.error||'Refused.');});}));
 }
 load();
 })();
@@ -274,9 +291,14 @@ def page_home(mark):
 
 
 def page_app(nonce):
+    # What shows before the script draws the page is itself the failure message: a script that is
+    # blocked, fails to parse or never arrives leaves words that say so, never a blank page.
     return (f'<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
             f'<title>Administration — PodMesh manager</title><style>{STYLE}</style>'
-            f'<main id="app"><p>PODMESH / MANAGER</p><p>Loading…</p></main>'
+            f'<main id="app"><p>PODMESH / MANAGER</p><h1>Administration</h1>'
+            f'<noscript><p class="note bad">This page needs JavaScript: every action is a call to the manager\'s API, and nothing is submitted as a form.</p></noscript>'
+            f'<p class="note" id="starting">Loading… If this message stays, the page\'s script could not run in this browser; '
+            f'reload it, or check that nothing blocks scripts on this site.</p></main>'
             f'<script nonce="{nonce}">{APP}</script></html>').encode()
 
 

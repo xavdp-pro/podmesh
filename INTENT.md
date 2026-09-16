@@ -74,20 +74,30 @@ Its absence must not block the initial tandem experiment, and its later addition
 must not create a second implementation of operations or authority. Design for
 reusable public delivery while validating our own operational needs first.
 
-## Web surfaces: no form posts
+## Web surfaces
 
-Operator rule, 2026-09-16, permanent. **No native form post, ever.** No web surface of PodMesh
-submits an HTML `<form method="post">` that reloads the page and renders the server's answer in
-its place. Every action goes through an API call made from script (`fetch`, JSON body): the page
-stays where it is, the fields keep what was typed, and the answer -- success or the precise
-refusal -- appears where the person is looking. Credentials travel in the request body, never in
-a URL. A `<form>` element may remain as a semantic container when script intercepts its
-submission (`preventDefault`, then `fetch`), as the web console already does.
+Operator rules, 2026-09-16, permanent. A counter-review treats each breach as a finding, and
+`web/tests/ui-rules.test.mjs` in the web tree fails when one appears in a web source.
 
-Why it is written here: a sign-in to the manager's administration page failed in a browser while
-the same credentials succeeded from the command line, and the form post had reloaded the page,
-emptied the fields and left nothing to see but a generic refusal. A counter-review treats a native
-form post as a finding.
+1. **Pure AJAX: no native form post, ever.** No web surface submits an HTML
+   `<form method="post">` that reloads the page and renders the server's answer in its place.
+   Every action goes through an API call made from script (`fetch`, JSON body): the page stays
+   where it is, the fields keep what was typed, and the answer -- success or the precise refusal
+   -- appears where the person is looking. Credentials travel in the request body, never in a URL.
+   A `<form>` element may remain as a container when script intercepts its submission
+   (`preventDefault`, then `fetch`): it lets a password manager pair a login with its password,
+   and Enter submits. Two conditions come with it: a page whose script does not run says so in
+   words, never a blank page; and a session that has ended sends the person back to sign in with
+   the reason, never a refusal they cannot act on.
+2. **No JavaScript `alert`, `confirm` or `prompt`.** A modal instead.
+3. **No system `select` left as the browser draws it.** A styled list.
+4. **A list with many entries is a searchable picker** in the manner of select2: a text field that
+   filters, and a cross that empties it.
+
+Why these are written here: a sign-in to the manager's administration page failed in a browser
+while the same credentials succeeded from the command line; the form post had reloaded the page,
+emptied the fields and left nothing to see but a generic refusal. The other three rules came with
+it and share its point: a person using PodMesh is never left facing a raw browser mechanism.
 
 ## Two supported deployment modes to build and validate
 
