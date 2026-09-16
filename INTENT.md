@@ -111,8 +111,9 @@ unbounded lab repetition. Agents record OPEN gates and the default assumption;
 they do not invent decisions.
 
 **SHAPER canon** — `software/RULES.md` and related texts stay authoritative for
-Shaper OS conformance. This section governs PodMesh product rhythm only. Do not
-amend Rule 11 or other canon rules to excuse an unpackaged lab result; use
+Shaper OS conformance. This section governs PodMesh product rhythm only. Rule 11 was amended on 16 September 2026 by operator decision to admit
+`nested` universes and to name PodMesh as optional; no other canon rule is
+amended to excuse an unpackaged lab result; use
 `docs/EXPERIMENTAL-SCOPE.md` for the boundary between SHAPER standard and PodMesh
 research.
 

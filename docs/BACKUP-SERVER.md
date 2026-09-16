@@ -145,7 +145,7 @@ is enough. Missing a level is a hole."
   ever copied off-site it carries the image store with it, which is Rule 16's choice
   and not this service's. This service still never builds a recovery point containing
   an image layer.
-- Level 1 is a **host snapshot of the enclosing LXC**, and it therefore necessarily
+- Level 1 is a **host snapshot of the enclosing universe container** (an LXC, or the outer Podman container of a `nested` universe), and it therefore necessarily
   contains the Podman image store. That does not contradict "images are never backed
   up": level 1 is a machine-recovery net taken by the hypervisor or the host's storage,
   not a universe recovery point produced by this service. This service never places an
@@ -235,7 +235,7 @@ image identity to "level 4 / 5". That was wrong: level 4 is git code and archite
 level 5 is the off-site copy of protected levels, and neither is an image registry.
 
 Revision 2 then said the manifest could "declare explicitly whether this recovery point
-carries the content itself". **That is forbidden.** Rule 11 at `RULES.md:677-683` is
+carries the content itself". **That is forbidden.** Rule 11 at `RULES.md:740-746` (16 September 2026 numbering; `:677-683` before the amendment) is
 explicit:
 
 > A universe's restorable identity is its `manifest.json`, its `cfg-image-lock.json`
@@ -263,11 +263,12 @@ commit or pulled by its locked digest is a **reproducibility defect that must su
 and the manifest's job is to make it visible — not to paper over it with a copy.
 
 The same rule fixes the unit: the **universe** is what can be snapshotted, exported and
-restored as one thing (`RULES.md:568-570`). A brick is an application container built
+restored as one thing (`RULES.md:570-572`). A brick is an application container built
 from an immutable image, and is not a backup unit.
 
 **The word means two things, and this document must not equivocate.** In the Shaper OS
-canon a *universe* is the **LXC system container** — its own init, its own package set,
+canon a *universe* is a **system container** — an LXC or, since Rule 11's amendment of
+16 September 2026, a `nested` Podman container — with its own init, its own package set,
 its own nftables. In PodMesh today a *universe* is a **Podman container** with a UUID
 (`DELIVERY-CHECKLIST.md:42`, `:44` — no single line states it; the two together do). Read naively, the sentence above would say PodMesh has
 no backup units at all, which is not what Rule 11 means and not what this service is for.

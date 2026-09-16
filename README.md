@@ -14,7 +14,7 @@ Xavier and OpenAI Codex (GPT-6 Astra) began by experimenting with memory-preserv
 
 These experiments demonstrated selected workload recovery and migration cases; they do not establish general fault tolerance or uninterrupted application availability. The analogy with live VM migration motivated the work, but this is not an implementation of VMware vMotion.
 
-PodMesh is an independent Podman project for Linux hosts, not a Proxmox extension or compatibility layer. Physical servers, virtual machines and VPS are deployment targets. ShaperOS is our preferred integration environment, while standalone operation remains a requirement.
+PodMesh is an independent Podman project for Linux hosts, not a Proxmox extension or compatibility layer. Physical servers, virtual machines and VPS are deployment targets. ShaperOS is our preferred integration environment — since 16 September 2026 its Rule 11 names PodMesh as the optional manager of `nested` universes — while standalone operation remains a requirement.
 
 See [the experimental scope and review contract](docs/EXPERIMENTAL-SCOPE.md) for
 what we are exploring, what the evidence establishes, and how this relates to the

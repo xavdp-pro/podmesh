@@ -273,7 +273,7 @@ uncoordinated live capture "crash-consistent" (a false guarantee headed for a ma
 describing the host surface as read-only while requiring dumps and snapshots that write,
 and giving restore no exclusion contract at all though it can mint a second active copy.
 All corrected. A delegated read-only sweep of the whole canon then found clauses the
-design never accounted for, one of which **contradicted it**: Rule 11 `:677-683` forbids
+design never accounted for, one of which **contradicted it**: Rule 11 (`RULES.md:740-746` since the 16 September amendment; `:677-683` before it) forbids
 backing up images, because a backup containing them hides that the original may no longer
 be reproducible. Rule 10 forbids stating any restore duration anywhere, even to dismiss
 one. Rule 31 was missing entirely and creates a structural conflict — fractal erasure

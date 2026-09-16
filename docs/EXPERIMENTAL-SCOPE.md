@@ -20,23 +20,27 @@ planning or a return to another runtime merely because it is already documented.
 
 ## Current standard versus candidate mechanism
 
-SHAPER V1.14 Rule 11 currently specifies LXC universes and Podman bricks and excludes
-the additional nesting being explored here. That is a real boundary for a claim
-of conformance to the current SHAPER runtime standard. It is not proof that nested
-Podman is technically impossible, nor a reason to stop the independently authorized
-PodMesh laboratory research.
+SHAPER V1.14 Rule 11, amended on 16 September 2026 by operator decision, admits
+two universe shapes — `lxc` and `nested` (a rootful Podman container carrying
+its own Podman) — and a fourth host family `nested`. Docker is never a runtime.
+PodMesh is named there as the optional manager of `nested` universes, never as a
+source of authority. The amendment adopts the shape; it does not qualify PodMesh.
+Every limit in the evidence ladder below still holds, and the canon repeats the
+migration bounds rather than extending them. PodMesh's active manager replica is
+not a SHAPER governor (Rule 37).
 
 Keep three statements distinct:
 
-1. **Current SHAPER standard:** what a conforming deployment must implement today.
+1. **Current SHAPER standard:** what a conforming deployment must implement today, in either shape.
 2. **PodMesh experiment:** an explicitly identified candidate mechanism tested in
    isolated fixtures under the operator's instructions.
 3. **Future integration:** requires a reviewed proposal explaining which runtime
    requirements change and which guarantees are retained, followed by qualification.
 
-Do not silently change Rule 11, claim an exception for production, or declare
-PodMesh a fourth host family. Host provisioning and the workload runtime are
-different dimensions; their eventual relationship needs an explicit adapter design.
+Do not claim an exception for production. The `nested` host family is a Rule 11
+token since 16 September 2026; PodMesh itself is a tool, not a family. Host
+provisioning and the workload runtime are different dimensions; their eventual
+relationship needs an explicit adapter design.
 
 ## Responsibilities and invariants
 
