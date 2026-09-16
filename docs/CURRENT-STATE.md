@@ -981,5 +981,35 @@ because this memory compresses to 0.1 MiB; a universe with incompressible memory
 stopped. What remains is the dump and the restore, both proportional to the memory: an iterative pre-copy would
 shorten the dump for large universes, not the restore, and is not built.
 
-Not done: pruning policy exposed in the console; the Explorer and fractal views in the new front; pre-copy.
+**A host really lost (2026-09-16, 23:34-23:47, the operator's request).** A counter universe active on lab-c,
+replicated live every minute to lab-a and lab-b; lab-c's VM (9102 `podmesh-node3`, checked by name and MAC before
+any action) powered off hard through Proxmox, like a power cut. Campaign script and evidence in the laboratory
+store (`podmesh-lab/claude/scripts/resilience-lab-c.py`, `podmesh-lab/claude/evidence/resilience-2026-09-16/`).
+
+| Moment | What was observed |
+| --- | --- |
+| before | counter 88 on lab-c; live copies of generation 2 on lab-a and lab-b, 7 s old; last run interrupted 0.86 s |
+| power off | last value read on lab-c 106 |
+| +105 s | nothing took over: no standby started the universe; the ledger still names lab-c; the schedule kept firing and recorded no run |
+| lost-host takeover to lab-a (next VM by number), by the tool | lab-c unreachable; waited lease 180 s + margin 30 s on lab-a's clock (211 s); promotion 1.21 s; 216 s in all |
+| on lab-a | same memory token, counter resumed at 82: the 24 s of work after the last copy were lost |
+| power on, +388 s | the development service relaunched (a transient unit does not survive a reboot); the universe's container on lab-c exited, not restarted |
+| on lab-c's disk | the counter file reads 112: the dead host had gone further than the copy, so 82 to 112 exist twice, differently |
+| typed start on lab-c | refused: "this host's activation lease expired 241 seconds ago" |
+| reintegration | stale container deleted on lab-c; a run from lab-a staged fresh copies on lab-b and lab-c; lab-c is a standby again |
+
+What this proves and does not. No failover is automatic: PodMesh and its tools act only when invoked, and the
+takeover of a lost host is the operator's (or a mandated agent's) decision; the lease wait is what keeps it from
+racing a host that may still be alive. The recovery point objective is the replication interval plus the time to
+notice; the recovery time is the lease plus the margin plus about a second. The returning host does not restart
+its stale copy through the API, but nothing in PodMesh stops it by itself while it is up and isolated: had the
+network been cut instead of the power, the universe would have kept running on lab-c beside its promoted copy
+on lab-a until something fenced it (the fence timer is packaged and disabled). The divergent history is not
+merged: PodMesh restores images, and reconciling two histories of the same application is the application's.
+The VM carried two other containers that stopped with it (a manager replica and the console's demo universe);
+both were started again afterwards. The manager's links were already failing for about eight hours before the
+campaign (the resident's audit-table issue reported to Codex).
+
+Not done: pruning policy exposed in the console; the Explorer and fractal views in the new front; pre-copy;
+automatic failover; a lost-host takeover with a network cut instead of a power cut.
 
