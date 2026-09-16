@@ -927,5 +927,16 @@ takeover while lab-b held its lease was refused (409). Lab-a is read-only in the
 console's configuration and a takeover onto it is refused there (403). **Not proven:** the
 unplanned path against a host really lost, which needs the network cut procedure.
 
-Not done: pruning policy exposed in the console.
+**The console's new front** (web tree, `web/next`, served at `/next/` by the same console server)
+is the console rebuilt in the operator's stack, the administration app's: universes per host, a
+drawer with observed resources, lifecycle actions behind modals, the replication panel (live or
+stopped, target, schedule) and a takeover action per standby; Health and the generic Run form,
+English and French. The takeover modal states the copy's age and whether it comes back with its
+memory; a lost-host takeover needs a copy already on the standby, a planned one takes it first;
+a standby the console keeps read-only is refused before any request. Driven in a browser on the
+development console: a planned takeover clicked lab-c to lab-b and back, 9.9 s for the return,
+memory kept; no horizontal scroll at phone width. The first front stays at `/` until the new one
+has replaced every view (the Explorer and the fractal views are not ported yet).
+
+Not done: pruning policy exposed in the console; the Explorer and fractal views in the new front.
 
