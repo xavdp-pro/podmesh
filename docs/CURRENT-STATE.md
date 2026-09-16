@@ -688,9 +688,21 @@ The manager's administration surface was rebuilt in the operator's stack the sam
 (`MANAGER-ADMINISTRATION.md`): Express API, React app, the four web rules of `INTENT.md` built in
 and guarded, deployed on the three replicas and driven from the public hostname by a browser.
 
-Not done: moving a universe from the interface (the migration chain exists as operations and suites;
-no console path yet), and the storage comparison (LVM thin, ZFS, Btrfs), whose 60 GB disks have not
-been added to the laboratory VMs.
+**Moving a universe from the interface** is built the same day: `tools/move-universe.py` runs the
+migration chain from the workstation (the protocol's transport controller) and reports each step;
+the console's drawer offers `move` on a running universe, the destination chosen among the other
+hosts reached over SSH, and shows the report. Measured lab-c to lab-b on the development service:
+checkpoint 1.8 s, restore 1.9 s, the universe running on the destination, the source retired. Only a
+network-disabled, mount-free universe moves today — the shape the destination restore is qualified
+for; a managed-network universe is refused before anything is touched, and moving one is the next
+lot. Also measured: a universe whose only process is `sleep` exits the instant it is restored on a
+host whose monotonic clock is further along, and the destination refuses to verify a restore that
+left nothing running — the protocol's honesty about the workload, followed to its end with the
+recovery operations `migration_status` names (`migration_restore_abort` on the destination, the
+outcome carried back, `migration_complete_transfer`, `migration_release`, `delete`).
+
+Not done: moving a managed-network universe, and the storage comparison (LVM thin, ZFS, Btrfs),
+whose 60 GB disks have not been added to the laboratory VMs.
 
 ## Next actions, in order
 
