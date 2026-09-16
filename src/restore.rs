@@ -283,6 +283,132 @@ fn bounded_output(command: &mut Command, limit: u64) -> Result<(bool, Vec<u8>), 
     }
     Ok((child.wait()?.success(), bytes))
 }
+/// Podman's configuration, the entry list and the uncompressed size of a zstd tar archive, in ONE decompression:
+/// the stream is read through a bounded tar reader (ustar names and prefixes, GNU long names, PAX paths) that keeps
+/// only config.dump, at most 4 MiB, and at most 100 000 entry names. Nothing is extracted to disk.
+pub(crate) fn archive_scan(archive: &Path) -> Result<(Value, Vec<String>, u64), Error> {
+    use std::io::Read;
+    const CONFIG_LIMIT: u64 = 4 * 1024 * 1024;
+    const LONG_NAME_LIMIT: u64 = 64 * 1024;
+    const MAX_ENTRIES: usize = 100_000;
+    struct Counting<R> {
+        inner: R,
+        bytes: u64,
+    }
+    impl<R: Read> Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.bytes += n as u64;
+            Ok(n)
+        }
+    }
+    fn octal(field: &[u8]) -> Result<u64, Error> {
+        let text = String::from_utf8_lossy(field);
+        let digits = text.trim_matches(|c: char| c == '\0' || c == ' ');
+        if digits.is_empty() {
+            return Ok(0);
+        }
+        u64::from_str_radix(digits, 8).map_err(|_| "a tar header carries a size that is not octal".into())
+    }
+    fn cstr(field: &[u8]) -> String {
+        let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+        String::from_utf8_lossy(&field[..end]).to_string()
+    }
+    fn skip<R: Read>(r: &mut R, n: u64) -> Result<(), Error> {
+        let copied = std::io::copy(&mut r.take(n), &mut std::io::sink())?;
+        if copied != n {
+            return Err("the archive ends inside an entry".into());
+        }
+        Ok(())
+    }
+    let mut child = Command::new("/usr/bin/timeout")
+        .args(["--signal=KILL", "300", "/usr/bin/zstd", "-dcq", "--"])
+        .arg(archive)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let stdout = child.stdout.take().ok_or("zstd output unavailable")?;
+    let mut r = Counting { inner: std::io::BufReader::with_capacity(1 << 20, stdout), bytes: 0 };
+    let mut entries = Vec::new();
+    let mut config: Option<Vec<u8>> = None;
+    let mut pending_name: Option<String> = None;
+    let mut header = [0u8; 512];
+    let outcome: Result<(), Error> = (|| {
+        loop {
+            if let Err(e) = r.read_exact(&mut header) {
+                return Err(format!("the archive ends without its end-of-archive blocks: {e}").into());
+            }
+            if header.iter().all(|&b| b == 0) {
+                // The end of the archive; whatever padding follows is counted, not interpreted.
+                std::io::copy(&mut r, &mut std::io::sink())?;
+                return Ok(());
+            }
+            let size = octal(&header[124..136])?;
+            let padded = size.div_ceil(512) * 512;
+            let kind = header[156];
+            match kind {
+                b'L' | b'x' => {
+                    if size > LONG_NAME_LIMIT {
+                        return Err("a tar extended header is larger than this reader accepts".into());
+                    }
+                    let mut data = vec![0u8; size as usize];
+                    r.read_exact(&mut data)?;
+                    skip(&mut r, padded - size)?;
+                    if kind == b'L' {
+                        pending_name = Some(cstr(&data));
+                    } else {
+                        let text = String::from_utf8_lossy(&data);
+                        for record in text.lines() {
+                            if let Some((_, rest)) = record.split_once(' ') {
+                                if let Some(path) = rest.strip_prefix("path=") {
+                                    pending_name = Some(path.to_string());
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                b'g' => {
+                    skip(&mut r, padded)?;
+                    continue;
+                }
+                _ => {}
+            }
+            let name = pending_name.take().unwrap_or_else(|| {
+                let base = cstr(&header[0..100]);
+                let prefix = if &header[257..262] == b"ustar" { cstr(&header[345..500]) } else { String::new() };
+                if prefix.is_empty() { base } else { format!("{prefix}/{base}") }
+            });
+            let name = name.trim_start_matches("./").trim_end_matches('/').to_string();
+            if name == "config.dump" && (kind == b'0' || kind == 0) {
+                if size > CONFIG_LIMIT {
+                    return Err("config.dump is larger than this reader accepts".into());
+                }
+                let mut data = vec![0u8; size as usize];
+                r.read_exact(&mut data)?;
+                skip(&mut r, padded - size)?;
+                config = Some(data);
+            } else {
+                skip(&mut r, padded)?;
+            }
+            if entries.len() >= MAX_ENTRIES {
+                return Err("the archive holds more entries than this reader accepts".into());
+            }
+            entries.push(name);
+        }
+    })();
+    if outcome.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    outcome?;
+    if !status.success() {
+        return Err("zstd could not decompress the archive".into());
+    }
+    let config = config.ok_or("the archive has no readable config.dump")?;
+    Ok((serde_json::from_slice(&config)?, entries, r.bytes))
+}
+
 /// Podman's container configuration and the entry list of the archive, read without extracting to disk.
 pub(crate) fn archive_contents(archive: &Path) -> Result<(Value, Vec<String>), Error> {
     const LIMIT: u64 = 4 * 1024 * 1024;
@@ -1183,4 +1309,54 @@ pub(crate) fn verify_outcome(original: &Value) -> Result<Value, Error> {
         json!({"observed_at": crate::now(), "file": path, "present": now.is_some(), "sha256": now,
         "matches": now.is_some() && now.as_deref() == expected}),
     )
+}
+
+#[cfg(test)]
+mod archive_scan_tests {
+    use super::*;
+
+    fn build(format: &str, dir: &Path) -> std::path::PathBuf {
+        let src = dir.join(format!("src-{format}"));
+        fs::create_dir_all(src.join("checkpoint")).unwrap();
+        fs::write(src.join("config.dump"), br#"{"id":"abc","rootfsImageID":"img","labels":{"io.podmesh.universe":"u"}}"#).unwrap();
+        fs::write(src.join("spec.dump"), b"{}").unwrap();
+        fs::write(src.join("checkpoint/inventory.img"), vec![7u8; 1000]).unwrap();
+        let long = "l".repeat(150);
+        fs::write(src.join("checkpoint").join(&long), b"long name").unwrap();
+        let noise: Vec<u8> = (0..3_000_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        fs::write(src.join("checkpoint/pages-1.img"), noise).unwrap();
+        let tar = dir.join(format!("{format}.tar"));
+        assert!(Command::new("/usr/bin/tar").arg(format!("--format={format}")).arg("-C").arg(&src).args(["-cf"]).arg(&tar).args(["config.dump", "spec.dump", "checkpoint"]).status().unwrap().success());
+        let zst = dir.join(format!("{format}.tar.zst"));
+        assert!(Command::new("/usr/bin/zstd").args(["-q", "-f", "-o"]).arg(&zst).arg(&tar).status().unwrap().success());
+        zst
+    }
+
+    #[test]
+    fn one_pass_scan_agrees_with_tar_and_zstd() {
+        let dir = std::env::temp_dir().join(format!("podmesh-archive-scan-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for format in ["pax", "gnu"] {
+            let archive = build(format, &dir);
+            let (config, entries, size) = archive_scan(&archive).unwrap();
+            let (config_tar, listing) = archive_contents(&archive).unwrap();
+            assert_eq!(config, config_tar, "{format}");
+            let normalize = |names: &[String]| {
+                let mut v: Vec<String> = names.iter().map(|n| n.trim_start_matches("./").trim_end_matches('/').to_string()).filter(|n| !n.is_empty() && n != ".").collect();
+                v.sort();
+                v
+            };
+            assert_eq!(normalize(&entries), normalize(&listing), "{format}");
+            assert!(entries.iter().any(|e| e == &format!("checkpoint/{}", "l".repeat(150))), "{format}: the long name");
+            assert_eq!(size, uncompressed_bytes(&archive).unwrap(), "{format}");
+        }
+        // A truncated stream is refused, never read as a shorter archive.
+        let whole = fs::read(dir.join("pax.tar")).unwrap();
+        let cut = dir.join("cut.tar");
+        fs::write(&cut, &whole[..whole.len() / 2]).unwrap();
+        let cut_zst = dir.join("cut.tar.zst");
+        assert!(Command::new("/usr/bin/zstd").args(["-q", "-f", "-o"]).arg(&cut_zst).arg(&cut).status().unwrap().success());
+        assert!(archive_scan(&cut_zst).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

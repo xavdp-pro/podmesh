@@ -962,8 +962,24 @@ and starts the universe again on a failure. Proofs:
 | lab-b to lab-c | 3.95 s | 5.8 s | nothing |
 
 The interruption is the final dump (0.5 s), the carriage through the workstation, the staging and the promotion
-(1.3 to 1.5 s). It grows with the universe's memory, since the whole image is carried while the universe is
-stopped; an iterative pre-copy would shorten it for large universes and is not built.
+(1.3 to 1.5 s). It grows with the universe's memory, measured step by step on lab-b to lab-a with a universe
+holding a repeated string (`podmesh-lab/claude/scripts/measure-switchover-memory.py`):
+
+| Memory | Dump | Final capture call | Carriage | Staging | Lease move | Promotion | Interrupted |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 MiB | 0.50 s | 1.47 s | 0.30 s | 0.70 s | 0.44 s | 1.31 s | 4.23 s |
+| 129 MiB | 1.76 s | 3.10 s | 0.28 s | 0.76 s | 0.43 s | 2.05 s | 6.61 s |
+| 257 MiB | 2.75 s | 3.90 s | 0.29 s | 0.83 s | 0.44 s | 2.48 s | 7.93 s |
+| 514 MiB | 5.09 s | 6.71 s | 0.31 s | 1.15 s | 0.91 s | 4.66 s | 13.75 s |
+
+Before this table the staging decompressed the archive three times (configuration, entry list, size) and the
+promotion a fourth time for its space check: 514 MiB took 2.30 s to stage and 6.82 s to promote, 17.37 s in all.
+The staging now reads configuration, entries and size in one pass through a bounded tar reader (`archive_scan`,
+cross-checked against GNU tar and zstd for PAX and GNU archives, long names, and a truncated stream refused),
+and the promotion reuses the size the staging measured on the same verified bytes. The carriage stays small only
+because this memory compresses to 0.1 MiB; a universe with incompressible memory carries its whole image while
+stopped. What remains is the dump and the restore, both proportional to the memory: an iterative pre-copy would
+shorten the dump for large universes, not the restore, and is not built.
 
 Not done: pruning policy exposed in the console; the Explorer and fractal views in the new front; pre-copy.
 

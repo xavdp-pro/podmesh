@@ -143,6 +143,15 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
     if !has_capture {
         db.execute("ALTER TABLE recovery_points ADD COLUMN capture TEXT NOT NULL DEFAULT 'stopped'", [])?;
     }
+    // The uncompressed size a staging measured, reused by the promotion of the same verified bytes.
+    let staged_has_size: bool = db.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('recovery_point_staged') WHERE name='uncompressed_bytes'",
+        [],
+        |r| Ok(r.get::<_, i64>(0)? > 0),
+    )?;
+    if !staged_has_size {
+        db.execute("ALTER TABLE recovery_point_staged ADD COLUMN uncompressed_bytes INTEGER", [])?;
+    }
     Ok(())
 }
 
@@ -1360,8 +1369,11 @@ fn stage(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error> {
         blockers.push(format!("the local kernel release {kernel} differs from the source kernel {}", source["kernel_release"].as_str().unwrap_or("unrecorded")));
     }
     let mut archive_facts = json!({});
-    match crate::restore::archive_contents(&archive) {
-        Ok((config, entries)) => {
+    let mut measured_uncompressed: Option<u64> = None;
+    // One decompression reads the configuration, the entry list and the uncompressed size together.
+    match crate::restore::archive_scan(&archive) {
+        Ok((config, entries, uncompressed)) => {
+            measured_uncompressed = Some(uncompressed);
             if config["rootfsImageID"].as_str() != Some(image.as_str()) || config["labels"]["io.podmesh.universe"].as_str() != Some(uuid) {
                 blockers.push("the archive configuration does not name the manifest's image and this universe's label".into());
             }
@@ -1382,29 +1394,25 @@ fn stage(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error> {
             if !missing.is_empty() {
                 blockers.push(format!("the archive lacks expected entries: {}", missing.join(", ")));
             }
-            archive_facts = json!({"image_id": config["rootfsImageID"], "image_name": config["rootfsImageName"], "universe_label": config["labels"]["io.podmesh.universe"], "entries": entries.len()});
-        }
-        Err(e) => blockers.push(format!("the archive cannot be read: {e}")),
-    }
-    match crate::restore::uncompressed_bytes(&archive) {
-        Ok(b) => {
-            let required = b.saturating_mul(2).saturating_add(mg::SPACE_MARGIN_BYTES);
+            archive_facts = json!({"image_id": config["rootfsImageID"], "image_name": config["rootfsImageName"], "universe_label": config["labels"]["io.podmesh.universe"],
+                "entries": entries.len(), "uncompressed_bytes": uncompressed});
+            let required = uncompressed.saturating_mul(2).saturating_add(mg::SPACE_MARGIN_BYTES);
             let available = mg::available_bytes(Path::new(mg::CONTAINER_STORAGE));
-            archive_facts["uncompressed_bytes"] = json!(b);
             if available < required {
                 blockers.push(format!("{available} bytes available under {}, {required} required to promote this point", mg::CONTAINER_STORAGE));
             }
         }
-        Err(e) => blockers.push(format!("the archive cannot be decompressed: {e}")),
+        Err(e) => blockers.push(format!("the archive cannot be read: {e}")),
     }
     if !blockers.is_empty() {
         return Err(failure("This point could not be promoted on this host; nothing was staged", json!({"blockers": blockers, "archive": archive_facts, "runtime": runtime})));
     }
     let generation = manifest["generation"].as_i64().ok_or("The manifest carries no generation")?;
     db.execute(
-        "INSERT INTO recovery_point_staged(recovery_point_uuid,universe_uuid,operation_id,generation,archive_sha256,archive_bytes,manifest_sha256,image_id,inbox,staged_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-        params![point, uuid, id, generation, expected_sha, size as i64, manifest_sha256, image, inbox.to_string_lossy().to_string(), crate::now() as i64],
+        "INSERT INTO recovery_point_staged(recovery_point_uuid,universe_uuid,operation_id,generation,archive_sha256,archive_bytes,manifest_sha256,image_id,inbox,staged_at,uncompressed_bytes)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        params![point, uuid, id, generation, expected_sha, size as i64, manifest_sha256, image, inbox.to_string_lossy().to_string(), crate::now() as i64,
+            measured_uncompressed.map(|b| b as i64)],
     )?;
     staged_view(db, id, false)?.ok_or_else(|| "The staging was recorded but cannot be read back".into())
 }
@@ -1606,7 +1614,14 @@ fn promote_live(db: &Connection, request: &Value, uuid: &str) -> Result<Value, E
     if graph_root != mg::CONTAINER_STORAGE {
         return Err(format!("Podman graph root {graph_root} is not the qualified default store {}", mg::CONTAINER_STORAGE).into());
     }
-    let required = crate::restore::uncompressed_bytes(&archive)?.saturating_mul(2).saturating_add(mg::SPACE_MARGIN_BYTES);
+    // The copy hashes to the staged bytes, so the size the staging measured holds; a point staged by an older build
+    // has none recorded and is measured now.
+    let staged_size: Option<i64> = db.query_row("SELECT uncompressed_bytes FROM recovery_point_staged WHERE recovery_point_uuid=?1", [point], |r| r.get(0))?;
+    let uncompressed = match staged_size {
+        Some(b) if b >= 0 => b as u64,
+        _ => crate::restore::uncompressed_bytes(&archive)?,
+    };
+    let required = uncompressed.saturating_mul(2).saturating_add(mg::SPACE_MARGIN_BYTES);
     let available = mg::available_bytes(Path::new(&graph_root));
     if available < required {
         return Err(format!("{available} bytes available under {graph_root}, {required} required; nothing was promoted").into());
