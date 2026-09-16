@@ -45,6 +45,8 @@ pub fn all() -> Value {
     put("identity", op("read", "none", "this host's UUID", Some(vec![])));
     put("inventory", op("read", "none", "the containers Podman holds, PodMesh's and others'", Some(vec![])));
     put("observations", op("read", "none", "the last twenty journaled operations", Some(vec![])));
+    put("host_status", op("read", "none", "this host's CPU count, load averages, memory, swap, uptime and storage, read now", Some(vec![])));
+    put("universe_stats", op("read", "none", "every PodMesh universe on this host: CPU over a short sample, memory and its limit, CPU allowance, processes, disk written", Some(vec![])));
     put("storage_status", op("read", "none", "what carries Podman's storage on this host and whether a universe's space can grow there", Some(vec![])));
 
     put("create", op("universe", "reservation", "a stopped container for a new universe, from a local image, on the isolated or the managed network", Some(vec![

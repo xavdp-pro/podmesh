@@ -51,7 +51,10 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
         "manager_status" => {
             let (door, facts) = locate(uuid)?;
             let reply = control(&door, &json!({"operation": "status"}))?;
-            Ok(json!({"universe_uuid": uuid, "container": facts, "resident_status": reply,
+            // The store's size on disk, read through the resident's root: the exchange audit table is never
+            // compacted, so this is the leading indicator that replication will degrade (2026-09-16).
+            let store_bytes = facts["pid"].as_i64().and_then(|pid| std::fs::metadata(format!("/proc/{pid}/root/var/lib/podmesh-manager/manager.sqlite")).ok()).map(|m| m.len());
+            Ok(json!({"universe_uuid": uuid, "container": facts, "resident_status": reply, "store_bytes": store_bytes,
                       "scope": "the resident's bounded live diagnostic, read through the universe's own mount namespace; never its facts, which are read from the store"}))
         }
         "manager_observe" => lc::journaled(db, request, |_| observe(request, uuid)),
