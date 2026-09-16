@@ -176,13 +176,36 @@ STYLE = ('body{margin:0;background:#f4efe4;color:#1c1916;font-family:ui-sans-ser
          'button{margin-top:1.1rem;padding:.55rem 1.1rem;border:0;border-radius:.4rem;background:#215547;color:#f4efe4;font:inherit;cursor:pointer}'
          'table{border-collapse:collapse;width:100%;margin-top:1rem}td,th{text-align:left;padding:.4rem .6rem;border-bottom:1px solid #e4dccb}'
          '.note{background:#efe7d6;border-left:3px solid #215547;padding:.8rem 1rem;border-radius:.2rem}'
-         '.bad{border-left-color:#8c3b2e}code{font-size:.92em}')
+         '.bad{border-left-color:#8c3b2e}code{font-size:.92em}'
+         '.secret{position:relative}.secret input{padding-right:3.4rem}'
+         '.secret button{position:absolute;right:.35rem;top:.3rem;margin:0;padding:.3rem .55rem;background:transparent;'
+         'color:#7a7268;border:1px solid #d8cfbe;border-radius:.3rem;font-size:.8rem;cursor:pointer}'
+         '.secret button:hover{color:#215547;border-color:#215547}')
+
+# A password typed into a field nobody can read is a password nobody can check. The eye shows what
+# is actually in the field -- a capital the keyboard added, a space a password manager left --
+# which is most of what makes a sign-in fail. It is the only script on the page, and the policy
+# admits it by nonce and nothing else.
+EYE = ("document.querySelectorAll('.secret').forEach(function(box){"
+       "var i=box.querySelector('input'),b=box.querySelector('button');"
+       "b.addEventListener('click',function(){"
+       "var shown=i.type==='text';i.type=shown?'password':'text';"
+       "b.textContent=shown?'\\u25cf\\u25cf\\u25cf':'\\u25c9';"
+       "b.setAttribute('aria-label',shown?'Show the password':'Hide the password');"
+       "i.focus();});});")
 
 
-def shell(title, body):
+def secret_field(field_id, name, label, autocomplete):
+    return (f'<label for="{field_id}">{label}</label><div class="secret">'
+            f'<input id="{field_id}" name="{name}" type="password" autocomplete="{autocomplete}">'
+            f'<button type="button" aria-label="Show the password" title="Show the password">&#128065;</button></div>')
+
+
+def shell(title, body, nonce=''):
+    script = f'<script nonce="{nonce}">{EYE}</script>' if nonce else ''
     return (f'<!doctype html><html lang="en"><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width, initial-scale=1">'
-            f'<title>{html.escape(title)}</title><style>{STYLE}</style><main>{body}</main></html>').encode()
+            f'<title>{html.escape(title)}</title><style>{STYLE}</style><main>{body}</main>{script}</html>').encode()
 
 
 def page_home(mark):
@@ -197,14 +220,14 @@ def page_home(mark):
                  f'<dt>logical</dt><dd><code>{lid}</code></dd></dl>')
 
 
-def page_login(message=''):
+def page_login(message='', nonce=''):
     warning = f'<p class="note bad">{html.escape(message)}</p>' if message else ''
     return shell('Sign in — PodMesh manager',
                  f'<p>PODMESH / MANAGER</p><h1>Sign in</h1>{warning}'
                  f'<form method="post" action="/admin/login">'
                  f'<label for="login">Administrator</label><input id="login" name="login" autocomplete="username" autofocus>'
-                 f'<label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password">'
-                 f'<button type="submit">Sign in</button></form>')
+                 + secret_field('password', 'password', 'Password', 'current-password') +
+                 f'<button type="submit">Sign in</button></form>', nonce)
 
 
 def page_no_admin():
@@ -217,21 +240,21 @@ def page_no_admin():
                  'names the next ones here.</p>')
 
 
-def page_change(login, message='', bad=False):
+def page_change(login, message='', bad=False, nonce=''):
     note = f'<p class="note{" bad" if bad else ""}">{html.escape(message)}</p>' if message else ''
     return shell('Change the password — PodMesh manager',
                  f'<p>PODMESH / MANAGER</p><h1>Change the password.</h1>'
                  f'<p class="note">This account still carries the password it was given when the manager was '
                  f'deployed. Nothing else opens until it is replaced.</p>{note}'
                  f'<form method="post" action="/admin/password">'
-                 f'<label for="current">Current password</label><input id="current" name="current" type="password" autocomplete="current-password">'
-                 f'<label for="next">New password</label><input id="next" name="next" type="password" autocomplete="new-password">'
-                 f'<label for="again">New password again</label><input id="again" name="again" type="password" autocomplete="new-password">'
+                 + secret_field('current', 'current', 'Current password', 'current-password')
+                 + secret_field('next', 'next', 'New password', 'new-password')
+                 + secret_field('again', 'again', 'New password again', 'new-password') +
                  f'<button type="submit">Change it</button></form>'
-                 f'<p>Signed in as <code>{html.escape(login)}</code>.</p>')
+                 f'<p>Signed in as <code>{html.escape(login)}</code>.</p>', nonce)
 
 
-def page_admin(mark, login, admins, message='', bad=False):
+def page_admin(mark, login, admins, message='', bad=False, nonce=''):
     rows = ''
     for name, entry in sorted(admins.items()):
         conflict = ' <em>(written in more than one scope)</em>' if len(entry['scopes']) > 1 else ''
@@ -250,8 +273,8 @@ def page_admin(mark, login, admins, message='', bad=False):
                  f'The password is hashed here and never stored, logged or replicated.</p>'
                  f'<form method="post" action="/admin/users">'
                  f'<label for="new-login">Login</label><input id="new-login" name="login" autocomplete="off">'
-                 f'<label for="new-password">Password</label><input id="new-password" name="password" type="password" autocomplete="new-password">'
-                 f'<button type="submit">Create</button></form>')
+                 + secret_field('new-password', 'password', 'Password', 'new-password') +
+                 f'<button type="submit">Create</button></form>', nonce)
 
 
 class Origin(http.server.BaseHTTPRequestHandler):
@@ -260,18 +283,25 @@ class Origin(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def reply(self, code, body, kind='text/html; charset=utf-8', cookie=None):
+    def reply(self, code, body, kind='text/html; charset=utf-8', cookie=None, nonce=None):
         self.send_response(code)
         self.send_header('Content-Type', kind)
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Referrer-Policy', 'no-referrer')
-        self.send_header('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
+        csp = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'"
+        if nonce:
+            csp += f"; script-src 'nonce-{nonce}'"
+        self.send_header('Content-Security-Policy', csp)
         if cookie:
             self.send_header('Set-Cookie', cookie)
         self.end_headers()
         self.wfile.write(body)
+
+    def page(self, code, maker, cookie=None):
+        nonce = secrets.token_urlsafe(16)
+        return self.reply(code, maker(nonce), cookie=cookie, nonce=nonce)
 
     def closed(self, path):
         reason = 'not the governor' if path in ('/', '/index.html', '/ready') or path.startswith('/admin') else 'no such path'
@@ -311,10 +341,10 @@ class Origin(http.server.BaseHTTPRequestHandler):
                 return self.reply(200, page_no_admin())
             _, entry = session_of(self.headers)
             if not entry:
-                return self.reply(200, page_login())
+                return self.page(200, lambda n: page_login(nonce=n))
             if flags().get(entry['login']) == MUST_CHANGE:
-                return self.reply(200, page_change(entry['login']))
-            return self.reply(200, page_admin(mark, entry['login'], admins))
+                return self.page(200, lambda n: page_change(entry['login'], nonce=n))
+            return self.page(200, lambda n: page_admin(mark, entry['login'], admins, nonce=n))
         return self.closed(path)
 
     def do_POST(self):
@@ -332,7 +362,7 @@ class Origin(http.server.BaseHTTPRequestHandler):
             password = fields.get('password') or ''
             until = failures.get(login, {}).get('until', 0)
             if until > time.time():
-                return self.reply(429, page_login('Too many attempts for that administrator. Wait a minute.'))
+                return self.page(429, lambda n: page_login('Too many attempts for that administrator. Wait a minute.', nonce=n))
             try:
                 admins = administrators()
             except Exception:
@@ -341,7 +371,7 @@ class Origin(http.server.BaseHTTPRequestHandler):
             if not entry or not verify_password(password, entry['value']):
                 count = failures.get(login, {}).get('count', 0) + 1
                 failures[login] = {'count': count, 'until': time.time() + 60 if count >= 5 else 0}
-                return self.reply(401, page_login('Wrong administrator or password.'))
+                return self.page(401, lambda n: page_login('Wrong administrator or password.', nonce=n))
             failures.pop(login, None)
             token = secrets.token_urlsafe(32)
             sessions[token] = {'login': login, 'until': time.time() + SESSION_SECONDS}
@@ -349,7 +379,7 @@ class Origin(http.server.BaseHTTPRequestHandler):
         if path == '/admin/password':
             _, entry = session_of(self.headers)
             if not entry:
-                return self.reply(401, page_login('Sign in first.'))
+                return self.page(401, lambda n: page_login('Sign in first.', nonce=n))
             fields = self.form()
             login = entry['login']
             try:
@@ -370,23 +400,23 @@ class Origin(http.server.BaseHTTPRequestHandler):
             elif nxt.lower() == login:
                 problem = 'A password that is the login is not a password.'
             if problem:
-                return self.reply(400, page_change(login, problem, bad=True))
+                return self.page(400, lambda n: page_change(login, problem, bad=True, nonce=n))
             try:
                 append_observation(SUBJECT_PREFIX + login, hash_password(nxt))
                 append_observation(FLAG_PREFIX + login, 'changed')
             except Exception as e:
-                return self.reply(503, page_change(login, f'The resident refused: {e}', bad=True))
+                return self.page(503, lambda n: page_change(login, f'The resident refused: {e}', bad=True, nonce=n))
             try:
                 admins = administrators()
             except Exception:
                 pass
-            return self.reply(200, page_admin(mark, login, admins, 'The password was changed.'))
+            return self.page(200, lambda n: page_admin(mark, login, admins, 'The password was changed.', nonce=n))
         if path == '/admin/users':
             _, entry = session_of(self.headers)
             if not entry:
-                return self.reply(401, page_login('Sign in first. An administrator is named by an administrator.'))
+                return self.page(401, lambda n: page_login('Sign in first. An administrator is named by an administrator.', nonce=n))
             if flags().get(entry['login']) == MUST_CHANGE:
-                return self.reply(403, page_change(entry['login'], 'Replace the deployment password before naming anyone.', bad=True))
+                return self.page(403, lambda n: page_change(entry['login'], 'Replace the deployment password before naming anyone.', bad=True, nonce=n))
             fields = self.form()
             login = (fields.get('login') or '').strip().lower()
             password = fields.get('password') or ''
@@ -404,17 +434,17 @@ class Origin(http.server.BaseHTTPRequestHandler):
             elif password.lower() == login:
                 problem = 'A password that is the login is not a password.'
             if problem:
-                return self.reply(400, page_admin(mark, entry['login'], admins, problem, bad=True))
+                return self.page(400, lambda n: page_admin(mark, entry['login'], admins, problem, bad=True, nonce=n))
             try:
                 append_observation(SUBJECT_PREFIX + login, hash_password(password))
             except Exception as e:
-                return self.reply(503, page_admin(mark, entry['login'], admins, f'The resident refused: {e}', bad=True))
+                return self.page(503, lambda n: page_admin(mark, entry['login'], admins, f'The resident refused: {e}', bad=True, nonce=n))
             try:
                 admins = administrators()
             except Exception:
                 pass
-            return self.reply(200, page_admin(mark, entry['login'], admins,
-                                              f'Administrator {login} created in {SCOPE}; it replicates to the other replicas.'))
+            return self.page(200, lambda n: page_admin(mark, entry['login'], admins,
+                                              f'Administrator {login} created in {SCOPE}; it replicates to the other replicas.', nonce=n))
         return self.closed(path)
 
 
