@@ -14,6 +14,12 @@ then `migration_restore` on the destination (the universe runs there from where 
 the outcome carried back; `migration_complete_transfer` on the source (its entitlement surrendered);
 `migration_retire_source` (the stopped checkpointed container removed) unless --keep-source.
 
+Measured on 2026-09-16: a universe whose only process is `sleep` may exit the instant it is
+restored on a host whose monotonic clock is further along than the source's -- the sleep's deadline
+is already past -- and the destination then refuses to verify a restore that left nothing running.
+That is the protocol being honest about the workload, not a fault in the chain; a universe with a
+process that does work (the suites' counters) moves and continues.
+
 One JSON report on stdout, exit 0 on a completed move, 1 with the step that refused. A step that
 fails leaves the universe where the protocol leaves it -- stopped and checkpointed on the source
 until the destination has verified its restore -- and the report says which. Environment: the
