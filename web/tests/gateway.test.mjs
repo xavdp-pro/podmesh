@@ -2,7 +2,7 @@ import http from 'node:http';import test from 'node:test';import assert from 'no
 const payload={operation:'start',universe_uuid:'00000000-0000-4000-8000-000000000001',operation_id:'00000000-0000-4000-8000-000000000002',authorization_ref:'fixture'};
 async function gateway(t,actions=true){
  const calls=[];let app;const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
- app=createApp({hosts:[{id:'a',name:'A',socket:'/fixture.sock',allowActions:actions}]},{origin:url,call:async(_h,p)=>{calls.push(p);return {ok:true,data:p.operation==='capabilities'?{operations:['start']}:{}};}});
+ app=createApp({hosts:[{id:'a',name:'A',socket:'/fixture.sock',allowActions:actions}]},{origin:url,call:async(_h,p)=>{calls.push(p);return {ok:true,data:p.operation==='capabilities'?{operations:['start','pause','resume','resources']}:{}};}});
  const session=await fetch(url+'/api/session').then(r=>r.json());return{calls,url,session,post:(body=payload,extra={})=>fetch(url+'/api/hosts/a/actions',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Podmesh-Token':session.token,...extra},body:JSON.stringify(body)})};
 }
 test('action forwards exact identity through capability check',async t=>{const g=await gateway(t);assert.equal((await g.post()).status,200);assert.deepEqual(g.calls,[{operation:'capabilities'},payload]);});
@@ -12,6 +12,14 @@ test('read-only and unadvertised capabilities refuse writes',async t=>{const a=a
 test('DNS rebinding host refused',async t=>{const g=await gateway(t);const status=await new Promise((resolve,reject)=>{http.get(g.url+'/api/session',{headers:{Host:'foreign.test'}},r=>{r.resume();resolve(r.statusCode);}).on('error',reject);});assert.equal(status,403);});
 test('Unix transport forwards newline JSON and bounds response',async t=>{const dir=await fs.mkdtemp(path.join(os.tmpdir(),'podmesh-web-'));const socket=path.join(dir,'api.sock');const server=net.createServer({allowHalfOpen:true},c=>{let b='';c.on('data',x=>{b+=x;if(b.endsWith('\n')){assert.deepEqual(JSON.parse(b),{operation:'identity'});c.end('{"ok":true,"data":{"host_uuid":"fixture"}}\n');}});});await new Promise(r=>server.listen(socket,r));t.after(async()=>{server.close();await fs.rm(dir,{recursive:true,force:true});});assert.deepEqual(await request({socket},{operation:'identity'}),{ok:true,data:{host_uuid:'fixture'}});await assert.rejects(request({socket},{operation:'x',value:'x'.repeat(4096)}),/limit/);});
 
+test('pause and resume forward as they are; resources is bounded at the gateway',async t=>{const g=await gateway(t);
+ for(const operation of ['pause','resume'])assert.equal((await g.post({...payload,operation})).status,200);
+ assert.equal((await g.post({...payload,operation:'resources',memory_bytes:512*1024*1024,cpus:1.5})).status,200);
+ assert.equal((await g.post({...payload,operation:'resources',memory_bytes:16*1024*1024})).status,400);
+ assert.equal((await g.post({...payload,operation:'resources',cpus:0})).status,400);
+ assert.equal((await g.post({...payload,operation:'resources'})).status,400);
+ assert.equal((await g.post({...payload,operation:'resources',memory_bytes:'512m'})).status,400);
+ assert.deepEqual(g.calls.filter(c=>c.operation!=='capabilities').map(c=>c.operation),['pause','resume','resources']);});
 test('unexpected action fields refused',async t=>{const g=await gateway(t);assert.equal((await g.post({...payload,on_timeout:'kill'})).status,400);assert.deepEqual(g.calls,[]);});
 test('missing host transport refused',()=>assert.throws(()=>createApp({hosts:[{id:'a',name:'A'}]}),/transport/));
 test('UTF-8 survives split socket chunks',async t=>{
@@ -58,7 +66,7 @@ test('dedicated observer capability state is truthful when metrics are unsupport
 
 test('details socket never redirects lifecycle actions',async t=>{
  let app;const calls=[];const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
- app=createApp({hosts:[{id:'a',name:'A',ssh:'lab@example.test',detailsSocket:'/run/observer.sock',allowActions:true}]},{origin:url,call:async(h,p)=>{calls.push([h.remoteSocket,p.operation]);return{ok:true,data:p.operation==='capabilities'?{operations:['start']}:{}};}});
+ app=createApp({hosts:[{id:'a',name:'A',ssh:'lab@example.test',detailsSocket:'/run/observer.sock',allowActions:true}]},{origin:url,call:async(h,p)=>{calls.push([h.remoteSocket,p.operation]);return{ok:true,data:p.operation==='capabilities'?{operations:['start','pause','resume','resources']}:{}};}});
  const session=await fetch(url+'/api/session').then(r=>r.json());const response=await fetch(url+'/api/hosts/a/actions',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Podmesh-Token':session.token},body:JSON.stringify(payload)});
  assert.equal(response.status,200);assert.deepEqual(calls,[[undefined,'capabilities'],[undefined,'start']]);
 });

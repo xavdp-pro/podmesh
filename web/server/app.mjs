@@ -2,7 +2,9 @@ import express from 'express';
 import {randomBytes} from 'node:crypto';
 import {request} from './transport.mjs';
 const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const actions=new Set(['create','clone','start','stop','delete']);
+const actions=new Set(['create','clone','start','stop','pause','resume','resources','delete']);
+// resources: the daemon holds the real bounds (32 MiB to the host's memory, 0.1 core to its cores); the gateway only refuses what is not a limit at all.
+const MIN_MEMORY=32*1024*1024;
 const MAX_RELATIONSHIP_RESPONSE_BYTES=1024*1024,MAX_RELATIONSHIP_RECORDS=5000,CLOCK_SKEW_SECONDS=5;
 function relationshipSource(value){
  if(value===undefined)return null;
@@ -93,10 +95,11 @@ export function createApp(config,{call=request,origin='http://127.0.0.1:4175',re
   if(!host.allowActions)return res.status(403).json({error:'Actions disabled by operator configuration'});
   const p=req.body;if(!p||!actions.has(p.operation)||!uuid.test(p.universe_uuid)||!uuid.test(p.operation_id)||typeof p.authorization_ref!=='string'||!p.authorization_ref.trim()||p.authorization_ref.length>256)return res.status(400).json({error:'Invalid action or identity'});
   if(p.operation==='clone'&&!uuid.test(p.source_uuid))return res.status(400).json({error:'Invalid clone source'});
-  const fields=['operation','universe_uuid','operation_id','authorization_ref',...({create:['image','command'],clone:['source_uuid'],start:[],stop:['timeout_seconds','on_timeout'],delete:[]}[p.operation])];
+  const fields=['operation','universe_uuid','operation_id','authorization_ref',...({create:['image','command'],clone:['source_uuid'],start:[],stop:['timeout_seconds','on_timeout'],pause:[],resume:[],resources:['memory_bytes','cpus'],delete:[]}[p.operation])];
   if(Object.keys(p).some(k=>!fields.includes(k)))return res.status(400).json({error:'Unexpected action field'});
   if(p.operation==='create'&&(!/^sha256:[a-f0-9]{64}$/.test(p.image)||!Array.isArray(p.command)||p.command.length>64||!p.command.every(v=>typeof v==='string')))return res.status(400).json({error:'Invalid image or command'});
   if(p.operation==='stop'&&(p.timeout_seconds!==10||p.on_timeout!=='leave_running'))return res.status(400).json({error:'Only a 10-second non-escalating stop is supported'});
+  if(p.operation==='resources'){const m=p.memory_bytes,c=p.cpus;const mOk=m===undefined||(Number.isInteger(m)&&m>=MIN_MEMORY);const cOk=c===undefined||(typeof c==='number'&&Number.isFinite(c)&&c>=0.1&&c<=1024);if(!mOk||!cOk||(m===undefined&&c===undefined))return res.status(400).json({error:'resources takes memory_bytes (an integer, at least 32 MiB), cpus (a number from 0.1), or both'});}
   try{const caps=await call(host,{operation:'capabilities'},{timeout:15000});if(!caps.ok||!caps.data.operations?.includes(p.operation))return res.status(409).json({error:'Operation not advertised'});const result=await call(host,p);cached=null;res.json(result);}catch(e){res.status(502).json({error:e.message,operation_id:p.operation_id,outcome:'unknown'});}finally{generation++;cached=null;}
  });
  app.use((err,_req,res,_next)=>res.status(400).json({error:'Invalid request'}));

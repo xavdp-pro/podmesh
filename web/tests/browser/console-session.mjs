@@ -27,11 +27,11 @@ const url = 'http://127.0.0.1:' + server.address().port;
 const make = (broken = false) => createApp({hosts: [{id: 'a', name: 'lab-a', socket: '/fixture.sock', allowActions: true}]}, {
   origin: url,
   call: async (_h, p) => {
-    calls.push(p.operation);
+    calls.push(p);
     const data = {
       identity: {host_uuid: '00000000-0000-4000-8000-00000000000a'},
-      capabilities: {version: 'fixture', operations: ['create', 'start', 'stop', 'delete', 'clone']},
-      inventory: {containers: []},
+      capabilities: {version: 'fixture', operations: ['create', 'start', 'stop', 'pause', 'resume', 'resources', 'delete', 'clone']},
+      inventory: {containers: broken ? [] : [{Id: 'c'.repeat(64), Names: ['podmesh-11111111-1111-4111-8111-111111111111'], State: 'running', Image: 'localhost/fixture', Labels: {'io.podmesh.universe': '11111111-1111-4111-8111-111111111111'}}]},
       observations: {observations: broken ? 'not a list' : []},
     }[p.operation] || {};
     return {ok: true, data};
@@ -77,16 +77,40 @@ try {
   await page.getByRole('dialog').getByRole('button', {name: 'lab-a'}).click();
   await page.getByPlaceholder('sha256:…').fill('sha256:' + 'a'.repeat(64));
   await page.getByPlaceholder('Approved task or mandate').fill('browser-check');
-  const before = calls.filter(c => c === 'create').length;
+  const before = calls.filter(c => c.operation === 'create').length;
   await page.getByRole('button', {name: 'Confirm create'}).click();
   await page.getByText('Session renewed — retry the same request').waitFor({timeout: 15000});
-  if (calls.filter(c => c === 'create').length !== before) throw new Error('the stale-token request reached the runtime');
+  if (calls.filter(c => c.operation === 'create').length !== before) throw new Error('the stale-token request reached the runtime');
   checks.push('an action sent after the console restarted comes back as a renewed session to retry, and never reached the runtime');
 
   await page.getByRole('button', {name: 'Retry same request'}).click();
   await page.getByText('API success — inspect the observed result').waitFor({timeout: 15000});
-  if (calls.filter(c => c === 'create').length !== before + 1) throw new Error('the retry did not reach the runtime exactly once');
+  if (calls.filter(c => c.operation === 'create').length !== before + 1) throw new Error('the retry did not reach the runtime exactly once');
   checks.push('the retry, keeping its operation identity, succeeds with the renewed session and reaches the runtime once');
+
+  // a running universe: pause offered, resume not; resources asks memory and cpus and sends them as bytes and cores
+  await page.getByRole('button', {name: 'Close action'}).click();
+  await page.getByRole('button', {name: 'podmesh-11111111-1111-4111-8111-111111111111', exact: true}).click();
+  const drawer = page.getByRole('dialog', {name: 'Container details'});
+  await drawer.waitFor({timeout: 10000});
+  if (await drawer.getByRole('button', {name: 'pause', exact: true}).isDisabled()) throw new Error('pause is not offered on a running universe');
+  if (!await drawer.getByRole('button', {name: 'resume', exact: true}).isDisabled()) throw new Error('resume is offered on a running universe');
+  if (!await drawer.getByRole('button', {name: 'start', exact: true}).isDisabled()) throw new Error('start is offered on a running universe');
+  checks.push('on a running universe the drawer offers pause, and neither resume nor start');
+  await drawer.getByRole('button', {name: 'resources', exact: true}).click();
+  const form2 = page.getByRole('dialog', {name: 'resources universe'});
+  await form2.waitFor({timeout: 10000});
+  await form2.getByLabel('Memory limit (MiB, at least 32)').fill('512');
+  await form2.getByLabel('CPU allowance (cores, from 0.1)').fill('1.5');
+  await form2.getByPlaceholder('Approved task or mandate').fill('browser-check');
+  const sent = calls.length;
+  await form2.getByRole('button', {name: 'Confirm resources'}).click();
+  await page.getByText('API success — inspect the observed result').waitFor({timeout: 15000});
+  const last = calls.slice(sent).find(c => c.operation === 'resources');
+  if (!last) throw new Error('no resources call reached the runtime: ' + JSON.stringify(calls.slice(sent)));
+  if (last.memory_bytes !== 512 * 1024 * 1024 || last.cpus !== 1.5 || 'memory_mib' in last) throw new Error('the resources request is not what was typed: ' + JSON.stringify(last));
+  checks.push('resources typed as 512 MiB and 1.5 cores reaches the runtime as memory_bytes 536870912 and cpus 1.5, nothing else');
+  await page.getByRole('button', {name: 'Close action'}).click();
 
   if (navigations.length !== 1) throw new Error('the console navigated: ' + JSON.stringify(navigations));
   if (dialogs) throw new Error(`${dialogs} browser dialog(s) opened`);
