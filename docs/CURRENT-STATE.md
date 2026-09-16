@@ -667,6 +667,31 @@ reclaim signals + `ea2104c`), and `main` does not contain those two commits; `ma
 (M4 and its amendments) is another implementation. Which collector ships is Codex's decision
 before step 8.
 
+## Operating a universe from the interface (2026-09-16, the operator's ask)
+
+Three typed operations joined the daemon (`LOCAL-API.md`, "Pause and resume", "Resources"): `pause`
+freezes a running universe (never gated: a frozen universe is no second writer), `resume` thaws it
+under the same gate as `start`, `resources` sets the memory limit and the CPU allowance and, on a
+running universe, reads them back from the kernel's cgroup. Measured on Podman 5.4.2 and encoded: an
+exited universe accepts the update and applies it at its next start while inspect keeps the previous
+values until then, so that result says `verification: deferred`. `tests/check-pause-resources.py`,
+fifteen checks on lab-c; lifecycle, clone and deletion suites rerun on the same build, installed as
+the development service on the three hosts.
+
+The operator console offers them in the universe drawer, only where the observed state admits
+them, with a resources form in MiB and cores; the gateway advertises the three and refuses what is
+not a limit. Measured end to end from the console's gateway over SSH to lab-c's development daemon:
+pause (Podman `paused`), resume, resources 200 MiB and 0.7 core (the kernel's `memory.max` and
+`cpu.max` read back as asked), a 16 MiB request refused at the gateway.
+
+The manager's administration surface was rebuilt in the operator's stack the same day
+(`MANAGER-ADMINISTRATION.md`): Express API, React app, the four web rules of `INTENT.md` built in
+and guarded, deployed on the three replicas and driven from the public hostname by a browser.
+
+Not done: moving a universe from the interface (the migration chain exists as operations and suites;
+no console path yet), and the storage comparison (LVM thin, ZFS, Btrfs), whose 60 GB disks have not
+been added to the laboratory VMs.
+
 ## Next actions, in order
 
 1. Done: independent read-only counter-review of the source-side milestone (Claude

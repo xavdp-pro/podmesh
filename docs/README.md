@@ -82,6 +82,8 @@ The next packaging target is **`0.1.0~experimental7`** — scope and gates in
 | The agent's door to the manager, bound to one incarnation (I3) | yes | yes | 1 host: `check-manager-control`, `-control-race` | no | no |
 | The publishing connector follows the governor; takeover proof; transitions; registration wait (operator's decision, P0, P1) | yes | yes | 3 hosts with a real tunnel and hostname: `check-manager-publisher`, `-readiness`, `-crash`, `-agent-cut`; `manager.szde.fr` by Codex | no | no |
 | The takeover document Ed25519-signed by the gate, verified by the host | yes | yes (`cargo test`, including a document signed by the tool's Python and verified in Rust) | 1 host: `check-takeover-proof-signature` (campaign of 2026-09-15, see CURRENT-STATE.md) | no | no |
+| `pause`, `resume`, `resources` (memory and CPU, live) and their console actions | yes | yes | 1 host: `check-pause-resources.py`; the console path measured to lab-c | no | no |
+| The manager's administration app (Express API, React) | yes (web tree) | yes (`tests/app.test.mjs`, browser) | 3 replicas, driven from the public hostname | no (image built on the hosts) | no |
 
 ## Manager, governor and makers
 
