@@ -184,12 +184,12 @@
     "title": "Take over on {{host}}",
     "lead": "{{name}} stops being active on {{from}} and runs on {{to}} from its copy there.",
     "age": "Copy taken {{age}}.",
-    "ageLost": "What the universe did since then is lost, unless the switchover is planned: a fresh copy is taken first.",
+    "ageLost": "If the active host is lost, what the universe did since then is lost. A planned switchover loses nothing: it captures the universe one last time and carries that capture.",
     "withMemory": "A live copy: the universe comes back running, with its memory.",
     "afresh": "A stopped copy: the universe is started afresh, without its memory.",
     "situation": "Situation",
     "planned": "Planned switchover",
-    "plannedHint": "the active host is fine: fresh copy, stop, promote, old copy deleted",
+    "plannedHint": "the active host is fine: one last capture, nothing lost, the old copy deleted; interrupted a few seconds",
     "lost": "Active host lost",
     "lostHint": "refused while it holds a live lease; otherwise fenced, the lease waited out, then promoted",
     "confirm": "Take over",
@@ -203,7 +203,9 @@
     "inPlace": "Taken over: the universe runs on {{to}}, {{capture}}.",
     "readOnlyStandby": "Actions are disabled on this standby in the console’s configuration",
     "noCopy": "This host holds no copy of the universe yet: a planned switchover takes one first; the takeover of a lost host needs one already there.",
-    "lostNeedsCopy": "needs a copy already on this host"
+    "lostNeedsCopy": "needs a copy already on this host",
+    "nothingLost": "nothing lost",
+    "interrupted": "interrupted {{s}} s"
   },
   "health": {
     "title": "Manager replication",

@@ -68,7 +68,8 @@ export default function TakeoverModal({ open, row, standby, copy, onClose, onDon
         <Notice>
           <p className="font-medium">{t('takeover.done', { to: standby?.name || result.to })}</p>
           <p className="mt-1 text-xs">
-            {result.capture === 'live' ? t('takeover.doneMemory') : t('takeover.doneAfresh')} · {t('replication.generation', { n: result.generation })} · {t('takeover.copyAge', { age: duration(result.copy_age_seconds, t) })}
+            {result.capture === 'live' ? t('takeover.doneMemory') : t('takeover.doneAfresh')} · {t('replication.generation', { n: result.generation })} · {result.planned ? t('takeover.nothingLost') : t('takeover.copyAge', { age: duration(result.copy_age_seconds, t) })}
+            {result.interruption_seconds != null ? ` · ${t('takeover.interrupted', { s: result.interruption_seconds })}` : ''}
             {result.waited_seconds ? ` · ${t('takeover.waited', { s: duration(result.waited_seconds, t) })}` : ''} · {t('takeover.promotion', { s: duration(result.promotion_seconds, t) })}
           </p>
         </Notice>

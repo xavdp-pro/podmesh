@@ -184,12 +184,12 @@
     "title": "Basculer sur {{host}}",
     "lead": "{{name}} cesse d’être actif sur {{from}} et tourne sur {{to}} à partir de la copie qui s’y trouve.",
     "age": "Copie prise {{age}}.",
-    "ageLost": "Ce que l’univers a fait depuis est perdu, sauf en bascule planifiée : une copie fraîche est prise d’abord.",
+    "ageLost": "Si l'hôte actif est perdu, ce que l'univers a fait depuis est perdu. Une bascule planifiée ne perd rien : elle capture l'univers une dernière fois et transporte cette capture.",
     "withMemory": "Une copie live : l’univers revient en marche, avec sa mémoire.",
     "afresh": "Une copie arrêtée : l’univers redémarre à neuf, sans sa mémoire.",
     "situation": "Situation",
     "planned": "Bascule planifiée",
-    "plannedHint": "l’hôte actif va bien : copie fraîche, arrêt, promotion, ancienne copie supprimée",
+    "plannedHint": "l'hôte actif va bien : une dernière capture, rien de perdu, l'ancienne copie supprimée ; quelques secondes d'interruption",
     "lost": "Hôte actif perdu",
     "lostHint": "refusé tant qu’il tient un bail vivant ; sinon isolé, fin du bail attendue, puis promotion",
     "confirm": "Basculer",
@@ -203,7 +203,9 @@
     "inPlace": "Bascule faite : l’univers tourne sur {{to}}, {{capture}}.",
     "readOnlyStandby": "Les actions sont désactivées sur ce standby dans la configuration de la console",
     "noCopy": "Cet hôte n'a pas encore de copie de l'univers : une bascule planifiée en prend une d'abord ; la bascule d'un hôte perdu en exige une déjà présente.",
-    "lostNeedsCopy": "exige une copie déjà sur cet hôte"
+    "lostNeedsCopy": "exige une copie déjà sur cet hôte",
+    "nothingLost": "rien de perdu",
+    "interrupted": "interrompu {{s}} s"
   },
   "health": {
     "title": "Réplication du manager",

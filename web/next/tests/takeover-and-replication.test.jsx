@@ -23,7 +23,7 @@ const typeAuth = value => fireEvent.change(screen.getByLabelText('Authorization 
 
 describe('takeover', () => {
   it('sends the planned switchover exactly as the contract says', async () => {
-    api.postReplication.mockResolvedValue({ result: 'taken_over', to: 'lab@b', capture: 'live', generation: 8, copy_age_seconds: 1, waited_seconds: 0, promotion_seconds: 1.1 })
+    api.postReplication.mockResolvedValue({ result: 'taken_over', to: 'lab@b', planned: true, capture: 'live', generation: 8, copy_age_seconds: 0, interruption_seconds: 4.16, waited_seconds: 0, promotion_seconds: 1.1 })
     const onDone = vi.fn()
     render(<TakeoverModal open row={row} standby={standby} copy={copy} onClose={() => {}} onDone={onDone} />)
     expect(screen.getByText(/comes back running, with its memory/)).toBeTruthy()
@@ -33,6 +33,7 @@ describe('takeover', () => {
     expect(api.postReplication.mock.calls[0][0]).toEqual({ action: 'takeover', host: 'lab-c', universe_uuid: U, authorization_ref: 'mandate-1', standby: 'lab-b', planned: true })
     await waitFor(() => expect(onDone).toHaveBeenCalled())
     expect(screen.getByText('The universe runs on Lab B.')).toBeTruthy()
+    expect(screen.getByText(/nothing lost · interrupted 4.16 s/)).toBeTruthy()
   })
 
   it('sends a lost-host takeover with planned false, and shows the refusal in place', async () => {
