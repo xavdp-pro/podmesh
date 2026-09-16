@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Host-side publisher follow, under a written mandate -- and under nothing else.
+
+The daemon still does not elect a governor or mint a takeover proof. This tick reads
+publisher_status, starts the connector only with the installed proof when this host is
+eligible at that epoch, and stops it when this host is not eligible. See
+docs/PUBLISHER-FOLLOW-LAB.md.
+"""
+import json, os, subprocess, sys, tempfile, uuid
+
+MANDATE = os.environ.get("PODMESH_PUBLISHER_FOLLOW_MANDATE", "/etc/podmesh/publisher-follow-mandate")
+CLI = os.environ.get("PODMESH_CLI", "/usr/bin/podmesh")
+SOCKET = os.environ.get("PODMESH_SOCKET", "/run/podmesh/api.sock")
+
+
+def fail(msg, code=3):
+    print(f"podmesh-publisher-follow: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_mandate(path):
+    if not os.path.isfile(path):
+        fail(f"no mandate at {path}; nothing is published without one")
+    vals = {}
+    for line in open(path, encoding="utf-8"):
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        vals[k.strip()] = v.strip()
+    ref = vals.get("authorization_ref", "")
+    resource = vals.get("resource", "")
+    proof_path = vals.get("proof", "")
+    renew = vals.get("renew", "0")
+    if not ref or any(c for c in ref if c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:-"):
+        fail("the mandate names no usable authorization_ref")
+    if not resource or any(c for c in resource if c not in "abcdefABCDEF0123456789-"):
+        fail("the mandate names no usable resource UUID")
+    if not proof_path or ".." in proof_path.split("/") or not proof_path.startswith("/"):
+        fail("the mandate names no usable absolute proof path")
+    if renew not in ("0", "1"):
+        fail("the mandate's renew must be 0 or 1")
+    return ref, resource, proof_path, renew == "1"
+
+
+def cli(operation, payload):
+    env = dict(os.environ, PODMESH_SOCKET=SOCKET)
+    request = dict(payload)
+    fd, path = tempfile.mkstemp(prefix="podmesh-publisher-follow-")
+    try:
+        os.chmod(path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(request, f)
+        p = subprocess.run([CLI, operation, path], env=env, capture_output=True, text=True)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if p.returncode:
+        try:
+            return json.loads(p.stdout or p.stderr or "{}"), p.returncode
+        except json.JSONDecodeError:
+            fail(f"{operation} failed ({p.returncode}): {(p.stderr or p.stdout)[-800:]}", 1)
+    return json.loads(p.stdout), 0
+
+
+def maybe_renew(ref, resource):
+    renewed, rc = cli(
+        "activation_renew",
+        {"universe_uuid": resource, "operation_id": str(uuid.uuid4()), "authorization_ref": ref},
+    )
+    if rc or not renewed.get("ok"):
+        fail(f"activation_renew refused: {renewed.get('error') or renewed}", 1)
+
+
+def main():
+    ref, resource, proof_path, renew = load_mandate(MANDATE)
+    status, code = cli("publisher_status", {"resource": resource, "operation_id": str(uuid.uuid4()), "authorization_ref": ref})
+    if code or not status.get("ok"):
+        fail(f"publisher_status refused: {status.get('error') or status}", 1)
+    data = status.get("data") or {}
+    if not data.get("declared"):
+        sys.exit(0)
+    unit_state = ((data.get("unit") or {}).get("state") or "")
+    active = unit_state in ("active", "activating")
+    eligible = data.get("publisher_eligible") is True
+    if eligible and renew:
+        maybe_renew(ref, resource)
+    if eligible and active:
+        sys.exit(0)
+    if not eligible:
+        if active or data.get("transition"):
+            stop, sc = cli("publisher_stop", {"resource": resource, "operation_id": str(uuid.uuid4()), "authorization_ref": ref})
+            if sc or not stop.get("ok"):
+                fail(f"publisher_stop refused: {stop.get('error') or stop}", 1)
+        sys.exit(0)
+    if not os.path.isfile(proof_path):
+        fail(f"eligible but no proof at {proof_path}; the agent must install the gate's document", 0)
+    proof = json.loads(open(proof_path, encoding="utf-8").read())
+    epoch = data.get("epoch")
+    if proof.get("new_epoch") != epoch:
+        fail(f"installed proof is for epoch {proof.get('new_epoch')}, lease epoch is {epoch}; waiting for a current proof", 0)
+    start, sc = cli(
+        "publisher_start",
+        {
+            "resource": resource,
+            "operation_id": str(uuid.uuid4()),
+            "authorization_ref": ref,
+            "takeover_proof": proof,
+            "previous": {"source": "publisher-follow"},
+        },
+    )
+    if sc or not start.get("ok"):
+        err = start.get("error") or ""
+        if "already recorded or active" in err:
+            sys.exit(0)
+        fail(f"publisher_start refused: {err or start}", 1)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

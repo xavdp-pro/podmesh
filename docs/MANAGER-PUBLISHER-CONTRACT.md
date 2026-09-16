@@ -112,6 +112,12 @@ No DNS mutation is part of a takeover: the hostname is a CNAME to the tunnel, an
 the same. A connector whose local origin is absent, stale, wrong-epoch or unauthenticated stops
 or refuses rather than proxying elsewhere.
 
+**Laboratory follow (2026-09-16):** a host-side tick under a written mandate
+(`docs/PUBLISHER-FOLLOW-LAB.md`, `packaging/podmesh-publisher-follow`) may start the connector
+when this host is eligible **and** the gate's current takeover proof is installed on the host.
+It does not rotate, publish the exclusive route, or mint a proof. `tools/arm-publisher-follow.py`
+arms the laboratory path on `podmesh-dev-ha`.
+
 ## What this contract does not decide
 
 The manager's web interface behind the origin; Cloudflare's own availability; several active

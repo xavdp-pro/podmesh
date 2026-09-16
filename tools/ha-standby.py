@@ -112,6 +112,18 @@ def save_ledger(universe, ledger):
     os.replace(tmp, p)
 
 
+def save_current_proof(universe, proof):
+    """The follow tick on a host reads this file after the agent copies it; rotate never starts the connector."""
+    root = pathlib.Path(os.environ.get('PODMESH_HA_LEDGER', pathlib.Path.home() / '.podmesh-ha'))
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = root / f'{universe}.current-proof.json'
+    tmp = path.with_suffix('.json.partial')
+    tmp.write_text(json.dumps(proof, indent=2, sort_keys=True))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    return str(path)
+
+
 # ------------------------------------------------------------------ signing
 def _crypto():
     from cryptography.hazmat.primitives import serialization
@@ -256,8 +268,17 @@ def cmd_rotate(args):
     (host,) = hosts(args, ('host', args.host))
     u = args.universe
     ledger = load_ledger(u)
-    policy = ledger.get('policy') or {'lease_seconds': args.lease, 'takeover_margin_seconds': args.margin, 'desired_standbys': args.standbys,
-                                      'authority_id': gate.authority_id}
+    policy = dict(ledger.get('policy') or {})
+    if args.lease is not None:
+        policy['lease_seconds'] = args.lease
+    if args.margin is not None:
+        policy['takeover_margin_seconds'] = args.margin
+    if args.standbys is not None:
+        policy['desired_standbys'] = args.standbys
+    policy.setdefault('lease_seconds', 20)
+    policy.setdefault('takeover_margin_seconds', 5)
+    policy.setdefault('desired_standbys', 2)
+    policy['authority_id'] = gate.authority_id
     ok(host, request('activation_require', u, args.reference, lease_seconds=policy['lease_seconds'], takeover_margin_seconds=policy['takeover_margin_seconds'],
                      desired_standbys=policy['desired_standbys'], authority_id=gate.authority_id, **key_fields(gate)), 'activation_require')
     current = gate.inspect(u)
@@ -268,7 +289,9 @@ def cmd_rotate(args):
     ledger['rotations'].append({'epoch': permit['epoch'], 'to': host.identity, 'at': int(time.time()), 'by': 'rotate'})
     ledger.setdefault('proofs', {})[str(permit['epoch'])] = proof
     save_ledger(u, ledger)
+    proof_path = save_current_proof(u, proof)
     out({'resource': u, 'host': host.identity, 'epoch': permit['epoch'], 'permit': permit, 'takeover_proof': proof,
+         'current_proof_path': proof_path,
          'lease': {k: lease[k] for k in ('generation', 'expires_at', 'live')},
          'note': 'the role moved; no universe was promoted or started, and the other hosts learn the epoch only when the permit is delivered to them; '
                  'the takeover proof is what an exclusive publication needs, upgraded by attest-fence once the previous holder is fenced'})
@@ -331,7 +354,8 @@ def cmd_attest_fence(args):
     proof = sign(proof, key) if key else {k: v for k, v in proof.items() if k not in ('signature', 'signer')}
     ledger['proofs'][str(current['epoch'])] = proof
     save_ledger(u, ledger)
-    out({'resource': u, 'epoch': current['epoch'], 'takeover_proof': proof})
+    proof_path = save_current_proof(u, proof)
+    out({'resource': u, 'epoch': current['epoch'], 'takeover_proof': proof, 'current_proof_path': proof_path})
 
 
 def cmd_cycle(args):
@@ -491,7 +515,8 @@ def main():
     a = sub.add_parser('activate'); a.add_argument('--universe', required=True); a.add_argument('--host', required=True)
     af = sub.add_parser('attest-fence'); af.add_argument('--universe', required=True); af.add_argument('--receipt', required=True, help='JSON: {host, operation_id, fence: <the fence answer>}')
     ro = sub.add_parser('rotate'); ro.add_argument('--universe', required=True); ro.add_argument('--host', required=True)
-    ro.add_argument('--lease', type=int, default=20); ro.add_argument('--margin', type=int, default=5); ro.add_argument('--standbys', type=int, default=2)
+    ro.add_argument('--lease', type=int, default=None, help='seconds; when omitted, the ledger policy is kept (else 20)')
+    ro.add_argument('--margin', type=int, default=None); ro.add_argument('--standbys', type=int, default=None)
     c = sub.add_parser('cycle'); c.add_argument('--universe', required=True); c.add_argument('--active', required=True); c.add_argument('--standby', required=True)
     c.add_argument('--also', action='append', help='a further standby (repeatable): one capture, restored on each')
     c.add_argument('--keep', type=int, default=3, help='quarantined copies kept on each standby')
