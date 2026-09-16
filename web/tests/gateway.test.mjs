@@ -20,6 +20,27 @@ test('pause and resume forward as they are; resources is bounded at the gateway'
  assert.equal((await g.post({...payload,operation:'resources'})).status,400);
  assert.equal((await g.post({...payload,operation:'resources',memory_bytes:'512m'})).status,400);
  assert.deepEqual(g.calls.filter(c=>c.operation!=='capabilities').map(c=>c.operation),['pause','resume','resources']);});
+test('a move runs the tool between two SSH hosts of the configuration, and refuses what is not a move',async t=>{
+ const calls=[];const moves=[];let app;const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'a',name:'A',ssh:'lab@a',remoteSocket:'/run/x/api.sock',remoteStateDir:'/var/lib/x',allowActions:true},{id:'b',name:'B',ssh:'lab@b',remoteSocket:'/run/x/api.sock',remoteStateDir:'/var/lib/x',allowActions:true},{id:'c',name:'C',socket:'/fixture.sock',allowActions:true},{id:'d',name:'D',ssh:'lab@d',remoteSocket:'/run/other/api.sock',allowActions:true}]},{origin:url,call:async(_h,p)=>{calls.push(p);return {ok:true,data:{}};},runMove:async m=>{moves.push(m);return {result:'moved',message:'ok',steps:[{step:'restore',host:'destination',ok:true}]};}});
+ const session=await fetch(url+'/api/session').then(r=>r.json());
+ assert.deepEqual(session.hosts.map(h=>h.canMove),[true,true,false,true]);
+ const post=(body,extra={})=>fetch(url+'/api/moves',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Podmesh-Token':session.token,...extra},body:JSON.stringify(body)});
+ const good={universe_uuid:'00000000-0000-4000-8000-000000000001',source:'a',destination:'b',authorization_ref:'fixture'};
+ assert.equal((await post(good,{'X-Podmesh-Token':''})).status,401);
+ assert.equal((await post({...good,destination:'a'})).status,400);
+ assert.equal((await post({...good,destination:'zz'})).status,404);
+ assert.equal((await post({...good,authorization_ref:''})).status,400);
+ assert.equal((await post({...good,extra:1})).status,400);
+ assert.equal((await post({...good,destination:'c'})).status,409);
+ assert.equal((await post({...good,destination:'d'})).status,409);
+ assert.deepEqual(moves,[]);
+ const ok=await post({...good,keep_source:true});assert.equal(ok.status,200);assert.equal((await ok.json()).result,'moved');
+ assert.equal(moves.length,1);assert.equal(moves[0].source.id,'a');assert.equal(moves[0].destination.id,'b');assert.equal(moves[0].keep_source,true);assert.equal(moves[0].authorization_ref,'fixture');
+ app=createApp({hosts:[{id:'a',name:'A',ssh:'lab@a',allowActions:true},{id:'b',name:'B',ssh:'lab@b',allowActions:true}]},{origin:url,call:async()=>({ok:true,data:{}}),runMove:async()=>({result:'refused',message:'inspect: only a network-disabled universe is moved today',steps:[]})});
+ const s2=await fetch(url+'/api/session').then(r=>r.json());
+ const refused=await fetch(url+'/api/moves',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Podmesh-Token':s2.token},body:JSON.stringify(good)});
+ assert.equal(refused.status,409);assert.equal((await refused.json()).result,'refused');});
 test('unexpected action fields refused',async t=>{const g=await gateway(t);assert.equal((await g.post({...payload,on_timeout:'kill'})).status,400);assert.deepEqual(g.calls,[]);});
 test('missing host transport refused',()=>assert.throws(()=>createApp({hosts:[{id:'a',name:'A'}]}),/transport/));
 test('UTF-8 survives split socket chunks',async t=>{

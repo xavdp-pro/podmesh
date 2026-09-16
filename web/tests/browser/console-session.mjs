@@ -24,14 +24,16 @@ const server = http.createServer((req, res) => {
 });
 await new Promise(r => server.listen(0, '127.0.0.1', r));
 const url = 'http://127.0.0.1:' + server.address().port;
-const make = (broken = false) => createApp({hosts: [{id: 'a', name: 'lab-a', socket: '/fixture.sock', allowActions: true}]}, {
+const moves = [];
+const make = (broken = false) => createApp({hosts: [{id: 'a', name: 'lab-a', ssh: 'lab@a', remoteSocket: '/run/x/api.sock', allowActions: true}, {id: 'b', name: 'lab-b', ssh: 'lab@b', remoteSocket: '/run/x/api.sock', allowActions: true}]}, {
   origin: url,
+  runMove: async m => { moves.push(m); return {result: 'moved', message: 'the universe runs on the destination', steps: [{step: 'checkpoint', host: 'source', ok: true, seconds: 1.8}, {step: 'restore', host: 'destination', ok: true, seconds: 1.9}]}; },
   call: async (_h, p) => {
     calls.push(p);
     const data = {
       identity: {host_uuid: '00000000-0000-4000-8000-00000000000a'},
       capabilities: {version: 'fixture', operations: ['create', 'start', 'stop', 'pause', 'resume', 'resources', 'delete', 'clone']},
-      inventory: {containers: broken ? [] : [{Id: 'c'.repeat(64), Names: ['podmesh-11111111-1111-4111-8111-111111111111'], State: 'running', Image: 'localhost/fixture', Labels: {'io.podmesh.universe': '11111111-1111-4111-8111-111111111111'}}]},
+      inventory: {containers: broken || _h.id !== 'a' ? [] : [{Id: 'c'.repeat(64), Names: ['podmesh-11111111-1111-4111-8111-111111111111'], State: 'running', Image: 'localhost/fixture', Labels: {'io.podmesh.universe': '11111111-1111-4111-8111-111111111111'}}]},
       observations: {observations: broken ? 'not a list' : []},
     }[p.operation] || {};
     return {ok: true, data};
@@ -84,7 +86,12 @@ try {
   checks.push('an action sent after the console restarted comes back as a renewed session to retry, and never reached the runtime');
 
   await page.getByRole('button', {name: 'Retry same request'}).click();
-  await page.getByText('API success — inspect the observed result').waitFor({timeout: 15000});
+  try {
+    await page.getByText('API success — inspect the observed result').waitFor({timeout: 15000});
+  } catch (e) {
+    console.error('DIALOG TEXT:', (await page.getByRole('dialog').innerText()).slice(0, 1500));
+    throw e;
+  }
   if (calls.filter(c => c.operation === 'create').length !== before + 1) throw new Error('the retry did not reach the runtime exactly once');
   checks.push('the retry, keeping its operation identity, succeeds with the renewed session and reaches the runtime once');
 
@@ -110,6 +117,19 @@ try {
   if (!last) throw new Error('no resources call reached the runtime: ' + JSON.stringify(calls.slice(sent)));
   if (last.memory_bytes !== 512 * 1024 * 1024 || last.cpus !== 1.5 || 'memory_mib' in last) throw new Error('the resources request is not what was typed: ' + JSON.stringify(last));
   checks.push('resources typed as 512 MiB and 1.5 cores reaches the runtime as memory_bytes 536870912 and cpus 1.5, nothing else');
+  await page.getByRole('button', {name: 'Close action'}).click();
+
+  // move: the destination chosen among the other SSH hosts, the report's steps shown
+  await drawer.getByRole('button', {name: 'move', exact: true}).click();
+  const form3 = page.getByRole('dialog', {name: 'move universe'});
+  await form3.waitFor({timeout: 10000});
+  await form3.getByRole('button', {name: 'lab-b'}).click();
+  await form3.getByPlaceholder('Approved task or mandate').fill('browser-check');
+  await form3.getByRole('button', {name: 'Confirm move'}).click();
+  await page.getByText('Moved — the universe runs on the destination').waitFor({timeout: 15000});
+  await page.getByText('restore · destination · ok · 1.9s').waitFor({timeout: 5000});
+  if (moves.length !== 1 || moves[0].source.id !== 'a' || moves[0].destination.id !== 'b' || moves[0].universe_uuid !== '11111111-1111-4111-8111-111111111111') throw new Error('the move request is not what was chosen: ' + JSON.stringify(moves));
+  checks.push('move offers the other SSH host as destination, sends the chosen universe and hosts to the move tool, and shows the report\'s steps');
   await page.getByRole('button', {name: 'Close action'}).click();
 
   if (navigations.length !== 1) throw new Error('the console navigated: ' + JSON.stringify(navigations));

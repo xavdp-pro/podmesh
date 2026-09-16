@@ -30,14 +30,43 @@ async function boundedJson(response){
 function sessionEnded(res){res.status(401).json({error:'The console session has ended; it is renewed from /api/session',session:'renew'});return false;}
 function requireReadSession(req,res,origin,token){if(req.headers.origin&&req.headers.origin!==origin){res.status(403).json({error:'Same-origin session required'});return false;}if(req.headers['x-podmesh-token']!==token)return sessionEnded(res);return true;}
 function requireMutatingSession(req,res,origin,token){if(req.headers.origin!==origin){res.status(403).json({error:'Same-origin session required'});return false;}if(req.headers['x-podmesh-token']!==token)return sessionEnded(res);return true;}
-export function createApp(config,{call=request,origin='http://127.0.0.1:4175',relationshipFetch=fetch,now=()=>Date.now()}={}){
+// A move runs tools/move-universe.py from the PodMesh tree (the workstation is the protocol's transport controller); the tree is named by config.toolsDir or PODMESH_TOOLS_DIR.
+import {spawn} from 'node:child_process';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+function defaultRunMove({source,destination,universe_uuid,authorization_ref,keep_source,toolsDir}){
+ const tool=path.join(toolsDir,'move-universe.py');
+ const env={...process.env,PODMESH_SOCKET:source.remoteSocket||'/run/podmesh/api.sock',PODMESH_STATE_DIR:source.remoteStateDir||'/var/lib/podmesh',PODMESH_UNIT:source.remoteUnit||'podmesh.service'};
+ const args=['-B',tool,'--source',source.ssh,'--destination',destination.ssh,'--universe',universe_uuid,'--reference',authorization_ref,...(keep_source?['--keep-source']:[])];
+ return new Promise((resolve)=>{const out=[];let done=false;const p=spawn('python3',args,{env,stdio:['ignore','pipe','pipe']});
+  const timer=setTimeout(()=>{if(!done){done=true;p.kill();resolve({result:'unknown',message:'the move tool did not finish within ten minutes; the universe stays where the protocol leaves it -- inspect both hosts',steps:[]});}},600000);
+  p.stdout.on('data',d=>out.push(d));p.stderr.resume();
+  p.on('error',e=>{if(!done){done=true;clearTimeout(timer);resolve({result:'unknown',message:'the move tool could not be started: '+e.message,steps:[]});}});
+  p.on('close',()=>{if(done)return;done=true;clearTimeout(timer);const text=Buffer.concat(out).toString('utf8');try{resolve(JSON.parse(text.slice(text.indexOf('{'))));}catch{resolve({result:'unknown',message:'the move tool answered nothing readable; inspect both hosts',steps:[],raw:text.slice(-800)});}});});
+}
+export function createApp(config,{call=request,origin='http://127.0.0.1:4175',relationshipFetch=fetch,now=()=>Date.now(),runMove=defaultRunMove}={}){
  const app=express();const token=randomBytes(32).toString('hex');
  const hosts=config.hosts||[];if(hosts.length>16)throw Error('Maximum16 hosts');
  const relationships=relationshipSource(config.relationships);
  const ids=new Set();for(const h of hosts){if(!/^[a-z0-9-]+$/.test(h.id)||ids.has(h.id)||h.ssh&&!/^[a-zA-Z0-9_.@-]+$/.test(h.ssh)||h.ssh?.startsWith('-'))throw Error('Invalid host configuration');if(!!h.ssh===!!h.socket||typeof h.name!=='string'||!h.name.trim())throw Error('Explicit host transport and name required');ids.add(h.id);}
  app.use((req,res,next)=>{res.set('Cache-Control','no-store');res.set('X-Content-Type-Options','nosniff');res.set('Referrer-Policy','no-referrer');res.set('X-Frame-Options','DENY');res.set('Content-Security-Policy',"default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");if(req.headers.host!==new URL(origin).host)return res.status(403).json({error:'Unexpected host'});next();});
  app.use(express.json({limit:'4kb'}));
- app.get('/api/session',(_req,res)=>res.json({token,mode:'local-operator',hosts:hosts.map(({id,name,allowActions})=>({id,name,allowActions:!!allowActions}))}));
+ app.get('/api/session',(_req,res)=>res.json({token,mode:'local-operator',hosts:hosts.map(({id,name,allowActions,ssh})=>({id,name,allowActions:!!allowActions,canMove:!!(allowActions&&ssh)}))}));
+ // A move: one universe, two hosts of this configuration, both reached over SSH and both allowing actions, on the same runtime paths.
+ app.post('/api/moves',express.json({limit:'8kb'}),async(req,res)=>{
+  if(!requireMutatingSession(req,res,origin,token))return;
+  const p=req.body||{};const source=hosts.find(h=>h.id===p.source),destination=hosts.find(h=>h.id===p.destination);
+  if(!source||!destination)return res.status(404).json({error:'Unknown host'});
+  if(source.id===destination.id)return res.status(400).json({error:'The source and the destination are the same host'});
+  if(!uuid.test(p.universe_uuid)||typeof p.authorization_ref!=='string'||!p.authorization_ref.trim()||p.authorization_ref.length>256||(p.keep_source!==undefined&&typeof p.keep_source!=='boolean'))return res.status(400).json({error:'Invalid move or identity'});
+  if(Object.keys(p).some(k=>!['universe_uuid','source','destination','authorization_ref','keep_source'].includes(k)))return res.status(400).json({error:'Unexpected move field'});
+  if(!source.allowActions||!destination.allowActions)return res.status(403).json({error:'Actions disabled by operator configuration on one of the hosts'});
+  if(!source.ssh||!destination.ssh)return res.status(409).json({error:'A move needs both hosts reached over SSH from this console'});
+  if((source.remoteSocket||'')!==(destination.remoteSocket||'')||(source.remoteStateDir||'')!==(destination.remoteStateDir||''))return res.status(409).json({error:'A move needs both hosts on the same runtime paths'});
+  const toolsDir=config.toolsDir||process.env.PODMESH_TOOLS_DIR||path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../../../../../podmesh/tools');
+  try{const report=await runMove({source,destination,universe_uuid:p.universe_uuid,authorization_ref:p.authorization_ref.trim(),keep_source:!!p.keep_source,toolsDir});cached=null;generation++;res.status(report.result==='moved'?200:report.result==='refused'?409:502).json(report);}
+  catch(e){cached=null;generation++;res.status(502).json({result:'unknown',message:e.message,steps:[]});}
+ });
  app.get('/api/relationships',async(req,res)=>{
   if(!requireReadSession(req,res,origin,token))return;
   if(!relationships)return res.json({status:'unavailable',error:'No manager relationship endpoint is configured'});
@@ -56,7 +85,7 @@ export function createApp(config,{call=request,origin='http://127.0.0.1:4175',re
  app.get('/api/snapshot',async(_req,res)=>{
   if(!cached||Date.now()-cached.receivedAt>10000){
    const captured=generation;loading??=Promise.all(hosts.map(async h=>{
-    const row={id:h.id,name:h.name,allowActions:!!h.allowActions,responses:{},errors:{},optionalErrors:{},receivedAt:Date.now()};
+    const row={id:h.id,name:h.name,allowActions:!!h.allowActions,canMove:!!(h.allowActions&&h.ssh),responses:{},errors:{},optionalErrors:{},receivedAt:Date.now()};
     for(const operation of ['identity','capabilities','inventory','observations']){
      try{const response=await call(h,{operation},{timeout:15000});row.responses[operation]=response;if(!response.ok)row.errors[operation]=response.error||'API refused';}catch(e){row.errors[operation]=e.message;break;}
     }
