@@ -108,6 +108,14 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             began_at INTEGER NOT NULL,
             state TEXT NOT NULL,
             detail TEXT);
+         CREATE TABLE IF NOT EXISTS recovery_point_final_captures(
+            recovery_point_uuid TEXT PRIMARY KEY,
+            universe_uuid TEXT NOT NULL,
+            container_id TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            captured_at INTEGER NOT NULL,
+            resumed_operation_id TEXT,
+            resumed_at INTEGER);
          CREATE TABLE IF NOT EXISTS recovery_point_live_promote_attempts(
             operation_id TEXT PRIMARY KEY,
             universe_uuid TEXT NOT NULL,
@@ -309,6 +317,9 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
     if operation == "recovery_point_discard" {
         return discard(db, request, uuid);
     }
+    if operation == "recovery_point_resume" {
+        return resume_final(db, request, uuid);
+    }
     if operation != "recovery_point_prepare" {
         return Err("Unsupported recovery point operation".into());
     }
@@ -327,8 +338,15 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
         None => CAPTURE_STOPPED,
         Some(v) => v.as_str().ok_or("capture must be \"stopped\" or \"live\"")?,
     };
+    let resume_after = match request.get("resume") {
+        None => true,
+        Some(v) => v.as_bool().ok_or("resume must be true or false")?,
+    };
     if capture == CAPTURE_LIVE {
-        return prepare_live(db, uuid, id, reference);
+        return prepare_live(db, uuid, id, reference, resume_after);
+    }
+    if !resume_after {
+        return Err("resume applies to a live capture only".into());
     }
     if capture != CAPTURE_STOPPED {
         return Err("capture must be \"stopped\" or \"live\"".into());
@@ -821,7 +839,7 @@ fn verify_restored(container_id: Option<&str>, observed: Option<&Value>, log: &P
 /// When the resume fails the point is still recorded -- its archive is whole and verified -- and the answer
 /// says `resumed: false` with the reason: the universe is then stopped with its checkpoint files kept, and an
 /// ordinary `start` begins it afresh without its memory. Nothing here starts it on its own.
-fn prepare_live(db: &Connection, uuid: &str, id: &str, reference: &str) -> Result<Value, Error> {
+fn prepare_live(db: &Connection, uuid: &str, id: &str, reference: &str, resume_after: bool) -> Result<Value, Error> {
     let name = format!("podmesh-{uuid}");
     let Some(c) = lc::inspect(&name)? else {
         return Err("No such universe on this host; nothing was captured".into());
@@ -906,27 +924,34 @@ fn prepare_live(db: &Connection, uuid: &str, id: &str, reference: &str) -> Resul
     // --- The resume: the same container ID, from the files Podman kept. The archive is complete on disk and
     // untouched by it; its digest and the manifest wait until the universe is back, adding nothing to the
     // interruption.
-    let resume_began = Instant::now();
-    let resume = mg::restore_kept(&resume_unit, id, &container_id, open(&work.join("resume.stdout"))?, open(&work.join("resume.stderr"))?)?;
-    let resume_seconds = resume_began.elapsed().as_secs_f64();
-    let interruption_seconds = began.elapsed().as_secs_f64();
-    let now_c = lc::inspect(&name)?;
-    let restore_log = work.join("restore.log");
-    let restore_preserved = now_c.as_ref().is_some_and(|c| mg::copy_podman_log(c, "RestoreLog", "restore.log", &restore_log));
-    let resume_stats = print_stats(&work.join("resume.stdout"));
-    let resume_failure = verify_restored(Some(&container_id), now_c.as_ref(), &restore_log, restore_preserved, opened_at).err();
-    // The memory image Podman kept for the resume is a second copy of the universe's memory beside the archive;
-    // once the resume is verified it serves nothing, and it is removed from the container's own storage.
-    let kept_images_removed_bytes = if resume_failure.is_none() { now_c.as_ref().map(remove_kept_images) } else { None };
-    if let Some(reason) = &resume_failure {
-        let stderr = mg::read_bounded(&work.join("resume.stderr")).unwrap_or_default();
-        mg::write_private(
-            &work.join("resume-failure.json"),
-            serde_json::to_string_pretty(&json!({"reason": reason, "exit_code": resume.code(), "stderr_tail": mg::tail(&stderr),
-                "observed": now_c.as_ref().map(lc::state_view)}))?
-            .as_bytes(),
-        )?;
-    }
+    // A final capture is not resumed: the universe stays stopped with its images kept, so that nothing it does
+    // after the dump is lost -- it runs next where this point is promoted, or here again by recovery_point_resume.
+    let (resume_seconds, interruption_seconds, now_c, restore_preserved, restore_log, resume_stats, resume_failure, kept_images_removed_bytes) = if resume_after {
+        let resume_began = Instant::now();
+        let resume = mg::restore_kept(&resume_unit, id, &container_id, open(&work.join("resume.stdout"))?, open(&work.join("resume.stderr"))?)?;
+        let resume_seconds = resume_began.elapsed().as_secs_f64();
+        let interruption_seconds = began.elapsed().as_secs_f64();
+        let now_c = lc::inspect(&name)?;
+        let restore_log = work.join("restore.log");
+        let restore_preserved = now_c.as_ref().is_some_and(|c| mg::copy_podman_log(c, "RestoreLog", "restore.log", &restore_log));
+        let resume_stats = print_stats(&work.join("resume.stdout"));
+        let resume_failure = verify_restored(Some(&container_id), now_c.as_ref(), &restore_log, restore_preserved, opened_at).err();
+        // The memory image Podman kept for the resume is a second copy of the universe's memory beside the archive;
+        // once the resume is verified it serves nothing, and it is removed from the container's own storage.
+        let kept_images_removed_bytes = if resume_failure.is_none() { now_c.as_ref().map(remove_kept_images) } else { None };
+        if let Some(reason) = &resume_failure {
+            let stderr = mg::read_bounded(&work.join("resume.stderr")).unwrap_or_default();
+            mg::write_private(
+                &work.join("resume-failure.json"),
+                serde_json::to_string_pretty(&json!({"reason": reason, "exit_code": resume.code(), "stderr_tail": mg::tail(&stderr),
+                    "observed": now_c.as_ref().map(lc::state_view)}))?
+                .as_bytes(),
+            )?;
+        }
+        (resume_seconds, Some(interruption_seconds), now_c, restore_preserved, restore_log, resume_stats, resume_failure, kept_images_removed_bytes)
+    } else {
+        (0.0, None, after_dump.clone(), false, work.join("restore.log"), Value::Null, None, None)
+    };
 
     // --- The point: digest, rename, manifest, record.
     let archive_bytes = fs::metadata(&archive_tmp)?.len();
@@ -940,10 +965,10 @@ fn prepare_live(db: &Connection, uuid: &str, id: &str, reference: &str) -> Resul
     let now = crate::now() as i64;
     let host = host_uuid(db)?;
     let capture = json!({
-        "mode": CAPTURE_LIVE, "container_id": container_id,
-        "dump_seconds": round3(dump_seconds), "resume_seconds": round3(resume_seconds), "interruption_seconds": round3(interruption_seconds),
+        "mode": CAPTURE_LIVE, "container_id": container_id, "final": !resume_after,
+        "dump_seconds": round3(dump_seconds), "resume_seconds": round3(resume_seconds), "interruption_seconds": interruption_seconds.map(round3),
         "dump_statistics": dump_stats, "resume_statistics": resume_stats,
-        "resumed": resume_failure.is_none(), "resume_failure": resume_failure,
+        "resumed": resume_after && resume_failure.is_none(), "resume_failure": resume_failure,
         "kept_images_removed_bytes": kept_images_removed_bytes,
         "dump_log_sha256": dump_log_sha256,
         "source_runtime": {"binary_sha256": facts["runtime"]["sha256"][mg::RUNTIME_REAL], "git_id": mg::RUNTIME_GIT_ID, "kernel_release": facts["runtime"]["kernel"]},
@@ -973,7 +998,11 @@ fn prepare_live(db: &Connection, uuid: &str, id: &str, reference: &str) -> Resul
         "data_lifecycle_declared": false,
         "data_lifecycle_note": "a PodMesh universe carries no ShaperOS manifest.json; the field the design requires is absent and says so",
         "stop": null,
-        "stop_note": "no stop operation: the universe was checkpointed by the qualified runtime and resumed in place from the kept images",
+        "stop_note": if resume_after {
+            "no stop operation: the universe was checkpointed by the qualified runtime and resumed in place from the kept images"
+        } else {
+            "no stop operation: the universe was checkpointed by the qualified runtime and left stopped with its images kept; it runs next where this point is promoted, or here again by recovery_point_resume"
+        },
         "consistency": {
             "class": LIVE_CLASS,
             "quiesce_mechanism": "CRIU dump by the qualified private runtime: processes frozen, memory and descriptors dumped, processes ended; Podman exported the writable layer while the universe was stopped, into the same archive; the universe then resumed in place from the kept checkpoint images",
@@ -1015,6 +1044,12 @@ fn prepare_live(db: &Connection, uuid: &str, id: &str, reference: &str) -> Resul
         params![point, uuid, generation, parent, id, manifest_sha256, archive_sha256, archive_bytes as i64, now, outbox.to_string_lossy().to_string(), CAPTURE_LIVE],
     )?;
     tx.execute("UPDATE recovery_point_live_captures SET state='recorded' WHERE operation_id=?1", [id])?;
+    if !resume_after {
+        tx.execute(
+            "INSERT INTO recovery_point_final_captures(recovery_point_uuid,universe_uuid,container_id,operation_id,captured_at) VALUES(?1,?2,?3,?4,?5)",
+            params![point, uuid, container_id, id, now],
+        )?;
+    }
     tx.commit()?;
     Ok(json!({
         "recovery_point_uuid": point,
@@ -1027,10 +1062,13 @@ fn prepare_live(db: &Connection, uuid: &str, id: &str, reference: &str) -> Resul
         "archive": {"name": ARCHIVE, "sha256": archive_sha256, "bytes": archive_bytes},
         "consistency_class": LIVE_CLASS,
         "capture": manifest["capture"],
-        "resumed": resume_failure.is_none(),
+        "resumed": resume_after && resume_failure.is_none(),
+        "final": !resume_after,
         "universe": now_c.as_ref().map(lc::state_view),
         "replayed": false,
-        "note": if resume_failure.is_none() {
+        "note": if !resume_after {
+            "prepared and unsigned; a FINAL capture: the universe is stopped with its images kept and loses nothing after the dump; promote this point elsewhere, or bring it back here with recovery_point_resume"
+        } else if resume_failure.is_none() {
             "prepared and unsigned; the universe resumed in place with its memory, interrupted for the dump and the resume"
         } else {
             "prepared and unsigned; THE RESUME FAILED: the universe is stopped with its checkpoint files kept, and start begins it afresh without its memory"
@@ -1099,6 +1137,87 @@ fn settle_interrupted_capture(db: &Connection, id: &str, uuid: &str, c: &Value, 
         "An earlier attempt of this live capture was interrupted before its point was recorded; the universe was settled as reported and no point was recorded. Capture again under a new operation ID",
         detail,
     ))
+}
+
+/// Brings a universe left stopped by a final live capture back in place, with its memory, from the images the
+/// capture kept: the way back when its promotion elsewhere did not happen. It is a start, so it passes the lease
+/// gate and the reservation gate; and it refuses once the container no longer holds that capture's images.
+fn resume_final(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error> {
+    let id = lc::text(request, "operation_id")?;
+    lc::token(id)?;
+    let point = lc::text(request, "recovery_point_uuid")?;
+    lc::token(point)?;
+    let row: Option<(String, String, Option<String>, Option<i64>)> = db
+        .query_row(
+            "SELECT universe_uuid,container_id,resumed_operation_id,resumed_at FROM recovery_point_final_captures WHERE recovery_point_uuid=?1",
+            [point],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((owner, container_id, resumed_by, resumed_at)) = row else {
+        return Err("No final capture with this identifier on this host; nothing was resumed".into());
+    };
+    if owner != uuid {
+        return Err(format!("This final capture is of universe {owner}, not of the one this request names; nothing was resumed").into());
+    }
+    let name = format!("podmesh-{uuid}");
+    if let Some(by) = resumed_by {
+        if by == id {
+            let c = lc::inspect(&name)?;
+            return Ok(json!({"universe_uuid": uuid, "recovery_point_uuid": point, "resumed": true, "resumed_at": resumed_at,
+                "universe": c.as_ref().map(lc::state_view), "replayed": true}));
+        }
+        return Err(format!("This final capture was already resumed here by operation {by}; nothing was resumed again").into());
+    }
+    let unit = format!("podmesh-final-resume-{id}.scope");
+    if mg::unit_busy(&unit) {
+        return Err("The resume scope of this operation has not finished; retry after it finishes".into());
+    }
+    mg::refuse_if_reserved(db, uuid, "recovery_point_resume")?;
+    crate::activation::refuse_if_not_activated(db, uuid, "recovery_point_resume (the resume is a start)")?;
+    let Some(c) = lc::inspect(&name)? else {
+        return Err("The universe's container is no longer on this host (deleted after its promotion elsewhere?); nothing was resumed".into());
+    };
+    let dir = mg::base()?.join(id);
+    fs::create_dir_all(&dir)?;
+    let since = crate::now() as i64;
+    // An earlier attempt of this operation may have resumed it already: observed, not repeated.
+    let already = c["Id"].as_str() == Some(container_id.as_str()) && lc::process_active(&c) && c["State"]["Restored"] == json!(true);
+    let (exit_code, seconds, observed) = if already {
+        (None, 0.0, Some(c))
+    } else {
+        if c["Id"].as_str() != Some(container_id.as_str()) {
+            return Err("The container under this universe's name is not the one the final capture left; nothing was resumed".into());
+        }
+        if lc::process_active(&c) || c["State"]["Checkpointed"] != json!(true) {
+            return Err(failure("The container is not stopped with a checkpoint kept; nothing was resumed", json!({"observed": lc::state_view(&c)})));
+        }
+        let open = |path: &Path| fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path);
+        let began = Instant::now();
+        let exit = mg::restore_kept(&unit, id, &container_id, open(&dir.join("resume.stdout"))?, open(&dir.join("resume.stderr"))?)?;
+        (exit.code(), began.elapsed().as_secs_f64(), lc::inspect(&name)?)
+    };
+    let log = dir.join("restore.log");
+    let preserved = observed.as_ref().is_some_and(|c| mg::copy_podman_log(c, "RestoreLog", "restore.log", &log));
+    let bound = if already { 0 } else { since };
+    if let Err(reason) = verify_restored(Some(&container_id), observed.as_ref(), &log, preserved, bound) {
+        let stderr = mg::read_bounded(&dir.join("resume.stderr")).unwrap_or_default();
+        return Err(failure(
+            format!("The resume could not be verified: {reason}; if the universe is not running, start begins it afresh without its memory"),
+            json!({"exit_code": exit_code, "stderr_tail": mg::tail(&stderr), "observed": observed.as_ref().map(lc::state_view)}),
+        ));
+    }
+    if let Some(c2) = observed.as_ref() {
+        remove_kept_images(c2);
+    }
+    let now = crate::now() as i64;
+    db.execute(
+        "UPDATE recovery_point_final_captures SET resumed_operation_id=?2, resumed_at=?3 WHERE recovery_point_uuid=?1",
+        params![point, id, now],
+    )?;
+    Ok(json!({"universe_uuid": uuid, "recovery_point_uuid": point, "resumed": true, "resumed_at": now, "seconds": round3(seconds),
+        "universe": observed.as_ref().map(lc::state_view), "replayed": false,
+        "note": "the universe runs again here with the memory of its final capture; the point stays recorded, and a copy staged elsewhere must not be promoted now"}))
 }
 
 /// Whether a verified live promotion of this host bound this container ID, whatever the universe: the collector's

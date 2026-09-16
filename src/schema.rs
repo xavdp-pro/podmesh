@@ -144,8 +144,10 @@ pub fn all() -> Value {
 
     put("recovery_point_prepare", op("universe", "reservation", "captures a universe as a recovery point, honestly unsigned: stopped (its rootfs, class quiescent) or live (a memory checkpoint resumed in place, class memory-coherent)", Some(vec![
         en("capture", false, &["stopped", "live"], "stopped (default) exports a universe already stopped; live checkpoints a running universe and resumes it in place, interrupted about half a second, gated by the activation lease as a start is"),
+        f("resume", "boolean", false, "live only: false makes a final capture, the universe left stopped with its images kept, to be promoted elsewhere or resumed here by recovery_point_resume; default true"),
     ])));
     put("recovery_point_stage", op("universe", "none", "holds a live point's archive on this host for a later promotion, verified against its manifest; no container is created", Some(vec![uuid("recovery_point_uuid", "the live point, in this host's inbox")])));
+    put("recovery_point_resume", op("universe", "lease", "brings a universe left stopped by a final live capture back in place, with its memory", Some(vec![uuid("recovery_point_uuid", "the final capture")])));
     put("recovery_point_discard", op("universe", "none", "removes a staged live point's archive from this host", Some(vec![uuid("recovery_point_uuid", "the staged point")])));
     put("recovery_point_status", op("read", "none", "the recovery points of this host", Some(vec![])));
     put("recovery_point_restore", op("universe", "none", "restores a point into quarantine, isolated", Some(vec![uuid("recovery_point_uuid", "the point"), uuid("restored_universe_uuid", "the quarantine universe")])));

@@ -938,5 +938,32 @@ development console: a planned takeover clicked lab-c to lab-b and back, 9.9 s f
 memory kept; no horizontal scroll at phone width. The first front stays at `/` until the new one
 has replaced every view (the Explorer and the fractal views are not ported yet).
 
-Not done: pruning policy exposed in the console; the Explorer and fractal views in the new front.
+**A planned switchover loses nothing (same day, later).** The first planned takeover took a fresh live copy,
+let the universe run on until the stop, then promoted the copy: what the universe did in between was lost. The
+switchover now takes a FINAL live capture (`recovery_point_prepare` with `capture: live, resume: false`), which
+leaves the universe stopped with its images kept, carries and stages it, moves the lease and promotes it running.
+If any step fails before the promotion, the tool brings the universe back on the active host with
+`recovery_point_resume` (taking its lease back if it had released it), and never while the standby holds a
+container for the universe. In stopped mode it stops, captures, restores into quarantine, promotes and starts,
+and starts the universe again on a failure. Proofs:
+
+- `tests/check-live-switchover.py` (lab-b to lab-a, 25 checks, passed): after a final capture the counter in the
+  stopped container's own files does not advance; `recovery_point_resume` brings the universe back with its
+  memory, a replay repeats nothing, a second resume is refused; in the switchover the active host writes nothing
+  after the capture and the standby continues from that value (frozen at 17, 19 at the first sample); a resume on
+  the active host after its lease is released is refused.
+- `tests/test_replicate_switchover.py` (9 cases, no laboratory): the order of every step, and the rollback at each
+  failure point, for both modes.
+- Through the console on the test universe:
+
+| Planned switchover | Universe interrupted | Total | Data lost |
+| --- | --- | --- | --- |
+| lab-c to lab-b | 4.16 s | 6.3 s | nothing |
+| lab-b to lab-c | 3.95 s | 5.8 s | nothing |
+
+The interruption is the final dump (0.5 s), the carriage through the workstation, the staging and the promotion
+(1.3 to 1.5 s). It grows with the universe's memory, since the whole image is carried while the universe is
+stopped; an iterative pre-copy would shorten it for large universes and is not built.
+
+Not done: pruning policy exposed in the console; the Explorer and fractal views in the new front; pre-copy.
 

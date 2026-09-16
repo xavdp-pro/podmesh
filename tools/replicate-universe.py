@@ -30,9 +30,13 @@ controller and PodMesh never acts on its own: armed and disarmed by the operator
 Settings, runs and copies live in the universe's ledger (PODMESH_HA_LEDGER, default ~/.podmesh-ha).
 Environment: PODMESH_SOCKET, PODMESH_STATE_DIR, PODMESH_UNIT for the hosts' service.
 
-`takeover` makes a standby the active host. `--planned` is a switchover chosen while the active host is fine:
-a fresh replication to that standby first, then the active copy is stopped and its lease released, the
-standby promotes, and the stopped copy left on the old active host is deleted. Without it, the active host
+`takeover` makes a standby the active host. `--planned` is a switchover chosen while the active host is fine,
+and it loses nothing: in live mode a FINAL capture (checkpointed with its memory, not resumed) is carried and
+staged on the standby, the lease moves, and the standby promotes it running; in stopped mode the universe is
+stopped, captured, restored into quarantine on the standby, promoted and started. The universe is interrupted
+from the capture to the promotion, and the report measures it. If a step fails before the promotion, the
+universe is brought back on the active host (resumed with its memory, or started) and the report says so.
+The stopped copy left on the old active host is deleted after the promotion. Without it, the active host
 is taken as lost: the tool refuses while that host is reachable and holds a live lease, fences it if it is
 reachable, waits out the lease and the margin, then promotes the newest copy the standby holds. A live copy
 comes back running with its memory; a stopped copy is promoted network-disabled and started afresh. The
@@ -44,7 +48,7 @@ import argparse, json, os, pathlib, subprocess, sys, tempfile, time, uuid
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tests'))
-from podmesh_two_hosts import Host, request  # noqa: E402
+from podmesh_two_hosts import Host, request, transfer  # noqa: E402
 
 REF = 'replicate-universe-tool'
 MAX_RUNS_KEPT = 20
@@ -52,6 +56,10 @@ MAX_RUNS_KEPT = 20
 
 class Refused(Exception):
     pass
+
+
+class RolledBack(Refused):
+    """A switchover that failed and has already been undone as far as it could be; never undone twice."""
 
 
 def done(code, report):
@@ -212,42 +220,30 @@ def cmd_takeover(args):
     if args.planned:
         if A is None:
             raise Refused('a planned switchover needs the active host; it cannot be reached, so this is a takeover of a lost host (without --planned)')
-        # A fresh copy first, so that the switchover loses only what the universe does between this capture and the stop.
-        status = ok(A, request('activation_status', u, args.reference), 'activation_status')
-        if not status.get('live'):
-            ok(A, request('activation_acquire', u, args.reference), 'activation_acquire (the lease had lapsed)')
-        argv = [sys.executable, '-B', str(HERE / 'ha-standby.py'), '--reference', args.reference, 'cycle', '--universe', u,
-                '--active', rep['active'], '--standby', args.standby, '--capture', rep.get('capture', 'stopped')]
-        p = subprocess.run(argv, capture_output=True, text=True, env=dict(os.environ))
-        if p.returncode:
-            try:
-                reason = json.loads(p.stdout).get('refused')
-            except ValueError:
-                reason = (p.stderr or p.stdout)[-400:]
-            raise Refused(f'the fresh replication before the switchover refused, and nothing was switched: {reason}')
+        switched = planned_switchover(args, u, rep, A, B, lease_seconds, margin)
         ledger = load(u)
-        stopped_at = time.time()
-        ok(A, request('stop', u, args.reference, timeout_seconds=10, on_timeout='kill'), 'stop on the active host')
-        ok(A, request('activation_release', u, args.reference), 'activation_release on the active host')
+        save_after_takeover(u, ledger, rep, args, t0, switched['point'], switched['capture'])
+        if armed:
+            cmd_start(args)
+        report.update(switched, schedule_rearmed=armed, seconds=round(time.time() - t0, 1))
+        return report
+    if A is not None:
+        status = ok(A, request('activation_status', u, args.reference), 'activation_status on the active host')
+        if status.get('live') and status.get('holder_host_uuid') == A.identity:
+            raise Refused('the active host is reachable and holds a live lease: that is a planned switchover, not the takeover of a lost host')
+        fenced = ok(A, {'operation': 'activation_fence', 'operation_id': str(uuid.uuid4()), 'authorization_ref': args.reference,
+                        'timeout_seconds': 10}, 'activation_fence on the active host')
+        report['fence'] = next((e for e in fenced.get('fenced', []) + fenced.get('left_running_or_absent', []) if e.get('universe_uuid') == u), None)
+        until = (status.get('expires_at') or 0) + (status.get('takeover_margin_seconds') or margin) + 1
+        clock = A
     else:
-        if A is not None:
-            status = ok(A, request('activation_status', u, args.reference), 'activation_status on the active host')
-            if status.get('live') and status.get('holder_host_uuid') == A.identity:
-                raise Refused('the active host is reachable and holds a live lease: that is a planned switchover, not the takeover of a lost host')
-            fenced = ok(A, {'operation': 'activation_fence', 'operation_id': str(uuid.uuid4()), 'authorization_ref': args.reference,
-                            'timeout_seconds': 10}, 'activation_fence on the active host')
-            report['fence'] = next((e for e in fenced.get('fenced', []) + fenced.get('left_running_or_absent', []) if e.get('universe_uuid') == u), None)
-            until = (status.get('expires_at') or 0) + (status.get('takeover_margin_seconds') or margin) + 1
-            clock = A
-        else:
-            # Unreachable: any lease it holds ends at most lease_seconds after now; the margin is the clock-skew budget.
-            until = B.call('time')['time'] + lease_seconds + margin + 1
-            clock = B
-        began = time.time()
-        while clock.call('time')['time'] < until:
-            time.sleep(1)
-        waited = time.time() - began
-        stopped_at = None
+        # Unreachable: any lease it holds ends at most lease_seconds after now; the margin is the clock-skew budget.
+        until = B.call('time')['time'] + lease_seconds + margin + 1
+        clock = B
+    began = time.time()
+    while clock.call('time')['time'] < until:
+        time.sleep(1)
+    waited = time.time() - began
     copy = newest_copy(ledger, B.identity)
     if copy is None:
         raise Refused('the standby holds no copy of this universe; run a replication to it first')
@@ -264,26 +260,135 @@ def cmd_takeover(args):
         ok(B, request('start', u, args.reference, observe_seconds=1), 'start on the standby')
     promotion_seconds = time.time() - began
     copy['promoted'] = int(time.time())
-    retired = None
-    if args.planned:
-        r = A.api(request('delete', u, args.reference))
-        retired = {'deleted': bool(r.get('ok')), 'error': r.get('error')}
+    save_after_takeover(u, ledger, rep, args, t0, copy['point'], copy.get('capture', 'stopped'))
+    if armed:
+        cmd_start(args)
+    prepared = copy.get('prepared_at') or 0
+    report.update({'capture': copy.get('capture', 'stopped'), 'point': copy['point'], 'generation': copy['generation'],
+                   'copy_age_seconds': int(time.time() - prepared) if prepared else None, 'data_lost': 'what the universe did after its copy was taken',
+                   'waited_seconds': round(waited, 1), 'promotion_seconds': round(promotion_seconds, 3), 'with_memory': live,
+                   'started': bool(promoted.get('started')) if live else True, 'old_active_copy': None,
+                   'schedule_rearmed': armed, 'seconds': round(time.time() - t0, 1)})
+    return report
+
+
+def save_after_takeover(u, ledger, rep, args, t0, point, capture):
     old_active = rep['active']
     rep['active'] = args.standby
     rep['standbys'] = [s for s in rep['standbys'] if s != args.standby] + [old_active]
     ledger['replication'] = rep
     ledger.setdefault('takeovers', []).append({'at': int(t0), 'from': old_active, 'to': args.standby, 'planned': bool(args.planned),
-                                               'point': copy['point'], 'capture': copy.get('capture', 'stopped')})
+                                               'point': point, 'capture': capture})
     save(u, ledger)
-    if armed:
-        cmd_start(args)
-    prepared = copy.get('prepared_at') or 0
-    report.update({'capture': copy.get('capture', 'stopped'), 'point': copy['point'], 'generation': copy['generation'],
-                   'copy_age_seconds': int((stopped_at or time.time()) - prepared) if prepared else None,
-                   'waited_seconds': round(waited, 1), 'promotion_seconds': round(promotion_seconds, 3), 'with_memory': live,
-                   'started': bool(promoted.get('started')) if live else True, 'old_active_copy': retired,
-                   'schedule_rearmed': armed, 'seconds': round(time.time() - t0, 1)})
-    return report
+
+
+def planned_switchover(args, u, rep, A, B, lease_seconds, margin):
+    """A switchover that loses nothing. The universe is interrupted from its final capture to its promotion; a
+    failure before the promotion brings it back on the active host, and is raised with what was done."""
+    capture = rep.get('capture', 'stopped')
+    status = ok(A, request('activation_status', u, args.reference), 'activation_status')
+    if not status.get('live'):
+        ok(A, request('activation_acquire', u, args.reference), 'activation_acquire (the lease had lapsed)')
+    began = time.time()
+    released = False
+    step = 'final capture'
+
+    def roll_back(reason, point=None, quarantined=None):
+        done = {'failed_at': step, 'reason': reason}
+        # Only while the standby runs nothing of the universe: the way back must never make a second instance.
+        on_standby = B.call('inspect', name='podmesh-' + u)['container']
+        if on_standby is not None:
+            done['brought_back'] = 'not attempted: the standby holds a container for the universe; decide from what each host shows'
+            raise RolledBack(f'the switchover failed at {step} and nothing was undone: {json.dumps(done)}')
+        if released:
+            done['lease_reacquired'] = bool(A.api(request('activation_acquire', u, args.reference)).get('ok'))
+        if capture == 'live' and point:
+            r = A.api(request('recovery_point_resume', u, args.reference, recovery_point_uuid=point))
+        else:
+            r = A.api(request('start', u, args.reference, observe_seconds=1))
+        done['brought_back'] = {'ok': bool(r.get('ok')), 'error': r.get('error')}
+        if quarantined:
+            B.api(request('delete', quarantined, args.reference))
+        raise RolledBack(f'the switchover failed at {step}; the universe was brought back on the active host: {json.dumps(done)}')
+
+    if capture == 'live':
+        final = A.api(request('recovery_point_prepare', u, args.reference, capture='live', resume=False))
+        if not final.get('ok'):
+            raise Refused(f"the final capture refused, and the universe is where it was: {final.get('error')}")
+        point, data = final['data']['recovery_point_uuid'], final['data']
+        dump_seconds = (data.get('capture') or {}).get('dump_seconds')
+        try:
+            step = 'transfer'
+            transfer(A, B, point, files=('recovery-point-manifest.json', 'checkpoint.tar.zst'))
+            step = 'staging'
+            staged = B.api(request('recovery_point_stage', u, args.reference, recovery_point_uuid=point))
+            if not staged.get('ok'):
+                roll_back(staged.get('error'), point)
+            step = 'lease move'
+            ok(A, request('activation_release', u, args.reference), 'activation_release on the active host')
+            released = True
+            ok(B, request('activation_require', u, args.reference, lease_seconds=lease_seconds, takeover_margin_seconds=margin,
+                          desired_standbys=len(rep['standbys'])), 'activation_require on the standby')
+            ok(B, request('activation_acquire', u, args.reference), 'activation_acquire on the standby')
+            step = 'promotion'
+            promote_began = time.time()
+            promoted = B.api(request('recovery_point_promote', u, args.reference, recovery_point_uuid=point))
+        except RolledBack:
+            raise
+        except Exception as e:  # noqa: BLE001 -- any failure before the promotion rolls back
+            roll_back(str(e)[-400:], point)
+        if not promoted.get('ok'):
+            roll_back(promoted.get('error'), point)
+        promotion_seconds = time.time() - promote_began
+        generation = data['generation']
+    else:
+        stopped = A.api(request('stop', u, args.reference, timeout_seconds=10, on_timeout='kill'))
+        if not stopped.get('ok') or stopped['data'].get('forced') is not False:
+            if stopped.get('ok'):
+                A.api(request('start', u, args.reference, observe_seconds=1))
+            raise Refused(f"the stop for the final capture escalated or refused; the universe was started again: {stopped.get('error') or stopped.get('data')}")
+        dump_seconds = None
+        quarantined = None
+        try:
+            step = 'final capture'
+            prepared = ok(A, request('recovery_point_prepare', u, args.reference), 'recovery_point_prepare')
+            point, generation = prepared['recovery_point_uuid'], prepared['generation']
+            step = 'transfer'
+            transfer(A, B, point, files=('recovery-point-manifest.json', 'rootfs.tar'))
+            step = 'restore on the standby'
+            quarantined = str(uuid.uuid4())
+            ok(B, request('recovery_point_restore', quarantined, args.reference, recovery_point_uuid=point), 'recovery_point_restore')
+            step = 'lease move'
+            ok(A, request('activation_release', u, args.reference), 'activation_release on the active host')
+            released = True
+            ok(B, request('activation_require', u, args.reference, lease_seconds=lease_seconds, takeover_margin_seconds=margin,
+                          desired_standbys=len(rep['standbys'])), 'activation_require on the standby')
+            ok(B, request('activation_acquire', u, args.reference), 'activation_acquire on the standby')
+            step = 'promotion'
+            promote_began = time.time()
+            promoted = B.api(request('recovery_point_promote', u, args.reference, restored_universe_uuid=quarantined, network_profile='isolated'))
+            if promoted.get('ok'):
+                step = 'start on the standby'
+                started = B.api(request('start', u, args.reference, observe_seconds=1))
+                if not started.get('ok'):
+                    raise Refused(f"the universe was promoted on the standby but did not start there: {started.get('error')}; the active host was left stopped")
+        except RolledBack:
+            raise
+        except Refused as e:
+            if step == 'start on the standby':
+                raise
+            roll_back(str(e), None, quarantined)
+        except Exception as e:  # noqa: BLE001
+            roll_back(str(e)[-400:], None, quarantined)
+        if not promoted.get('ok'):
+            roll_back(promoted.get('error'), None, quarantined)
+        promotion_seconds = time.time() - promote_began
+    interruption = time.time() - began
+    retired = A.api(request('delete', u, args.reference))
+    return {'capture': capture, 'point': point, 'generation': generation, 'with_memory': capture == 'live', 'started': True,
+            'copy_age_seconds': 0, 'data_lost': 'nothing: the capture was final', 'interruption_seconds': round(interruption, 2),
+            'dump_seconds': dump_seconds, 'promotion_seconds': round(promotion_seconds, 3), 'waited_seconds': 0,
+            'old_active_copy': {'deleted': bool(retired.get('ok')), 'error': retired.get('error')}}
 
 
 def cmd_start(args):

@@ -463,6 +463,15 @@ copy; a quarantined copy becomes the universe itself, under the lease.
   bounded memory) and, under a policy, the lease gate, because the resume is a start. The attempt is recorded
   before the dump; a retry of a capture the service did not see to the end records no point, resumes the
   universe from its kept images if the dump left it stopped, and reports what it found.
+- With `resume: false`, the live capture is **final**: the universe is left stopped with its checkpoint images
+  kept and loses nothing after the dump; the answer says `final: true`, `resumed: false`, and reports no
+  interruption end, since the universe runs next wherever the point is promoted. `recovery_point_resume`
+  (`recovery_point_uuid`) is the way back when that promotion does not happen: it restores the universe in place
+  from the kept images, with its memory, under the reservation and lease gates (the resume is a start). Refused,
+  in this order: no final capture with that identifier here; a capture of another universe; already resumed by
+  another operation; a migration reservation; the lease gate; the container gone, replaced, or no longer stopped
+  with its checkpoint kept. A replay of the same operation repeats nothing, and a universe the interrupted
+  attempt already resumed is recorded by observation.
 - `recovery_point_stage` (`recovery_point_uuid`) records a live point from `inbox/` on a standby, creating no
   container: a second instance of a running universe must not exist even stopped. It refuses, with every
   blocker listed, what a promotion would discover too late: the image absent or its recorded name not
