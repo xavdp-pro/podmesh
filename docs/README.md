@@ -85,6 +85,7 @@ The next packaging target is **`0.1.0~experimental7`** — scope and gates in
 | `pause`, `resume`, `resources` (memory and CPU, live) and their console actions | yes | yes | 1 host: `check-pause-resources.py`; the console path measured to lab-c | no | no |
 | Moving a universe from the console (`tools/move-universe.py` over the migration chain; network-disabled universes) | yes | yes (gateway, browser) | 2 hosts: lab-c to lab-b, measured | no | no |
 | Operation schemas in `capabilities` (58 operations) and `storage_status` with the growth rule | yes | yes | 1 host: `check-capabilities-schema.py`, `check-storage-status.py` | no | no |
+| The console's generic operation engine over the schemas (`Run` view, `/api/hosts/:id/operations`) | yes (web tree) | yes (gateway 54, browser) | lab-c through the gateway | no | no |
 | The manager's administration app (Express API, React) | yes (web tree) | yes (`tests/app.test.mjs`, browser) | 3 replicas, driven from the public hostname | no (image built on the hosts) | no |
 
 ## Manager, governor and makers

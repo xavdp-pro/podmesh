@@ -716,6 +716,18 @@ filesystem shared with the system — which is the laboratory's answer today. Th
 form engine over these schemas is the next step; universe volumes and their growth come with the
 dedicated disks.
 
+**The console's generic engine is built the same day (web tree):** a `Run` view lists every
+operation a host advertises in a searchable styled list, draws its form from the host's schema
+(types, bounds, permitted values, the universe when the kind needs one), validates in place against
+the same bounds before anything is sent, and sends one JSON request under a mandate through
+`/api/hosts/:id/operations`, where the gateway validates again against the schema it fetches from
+the host — reads under the read session, mutations under the mutating one and only on a host that
+allows actions, a cross-host chain step refused as the tool's. Measured through the console's
+gateway on lab-c's development daemon: `storage_status` read, `pause` and `resume` sent generically,
+and a CPU allowance under the bound refused by the gateway with the daemon's own wording. Verified in
+a browser: the searchable list, the fields drawn from the schema, a value outside the bound refused in
+place, the request sent as typed, and a chain step shown as the tool's with nothing to send.
+
 Measured inside the governor's replica the same day: the manager resident commits in about 230 ms
 on the laboratory VMs while its control deadline is 250 ms with 25 ms reserved for the answer, so
 nearly every first append answers `append_observation_uncertain` although the fact lands. Every
