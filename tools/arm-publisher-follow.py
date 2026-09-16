@@ -189,6 +189,21 @@ def refresh_only():
     sys.exit(0 if report['result'] == 'PASS' else 1)
 
 
+def ensure_administrator(alias, universe):
+    """A deployed manager has an administrator from its first minute, and nobody has to remember
+    to make one. Not a default account: `bootstrap` draws a fresh random password, prints it once
+    on this root-only channel and marks the account so the manager opens nothing but the page
+    that replaces it. Idempotent -- a manager that already has one is left alone."""
+    admin_tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'manager-admin.py')
+    p = subprocess.run([sys.executable, '-B', admin_tool, 'bootstrap', '--host', targets[alias],
+                        '--universe', universe, '--alias', alias, '--reference', REFERENCE],
+                       env=dict(os.environ, PODMESH_HOST_ALIAS=alias), capture_output=True, text=True)
+    if p.returncode:
+        print(f'administrator bootstrap on {alias} failed: {(p.stderr or p.stdout)[-300:]}', file=sys.stderr)
+        return {'bootstrap': 'failed'}
+    return json.loads(p.stdout)
+
+
 def follow_route(alias, governor):
     r = hosts[alias].api(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=lab_hosts[governor]))
     if r.get('ok'):
@@ -227,6 +242,7 @@ hosts[G].ok(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE,
 follow_route('lab-b', G)
 follow_route('lab-c', G)
 
+administrator = ensure_administrator(G, universes[G])
 clis = {a: detect_cli(h) for a, h in hosts.items()}
 for a, h in hosts.items():
     install_follow(h, clis[a], proof)
@@ -241,6 +257,7 @@ report = {
     'epoch': rot['epoch'],
     'takeover_method': proof.get('method'),
     'takeover_how': how,
+    'administrator': administrator,
     'universes': universes,
     'network_uuid': NET,
     'lease_seconds': LEASE,
