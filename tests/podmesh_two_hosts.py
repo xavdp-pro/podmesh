@@ -424,6 +424,66 @@ def n_processes(*needles):
         if all(n.encode() in argv for n in needles):
             found.append(int(pid))
     return found
+def n_interrupt_live(request, needles, unit, seconds=300):
+    """Sends a live recovery-point request and SIGKILLs the service the moment a Podman process whose arguments
+    contain every needle is visible (a live capture's checkpoint, a live promotion's restore). The command runs
+    in its own scope and outlives the service; this waits for that scope to finish and returns what it saw.
+    The service is NOT brought back: `relaunch_service` does that."""
+    box = []
+    def send():
+        try:
+            box.append(n_api(request))
+        except Exception as e:  # noqa: BLE001 -- the connection dies with the service
+            box.append({'connection': str(e)})
+    thread = threading.Thread(target=send)
+    thread.start()
+    wanted = [n.encode() for n in needles]
+    def matching():
+        found = []
+        for pid in filter(str.isdigit, os.listdir('/proc')):
+            try:
+                argv = open(f'/proc/{pid}/cmdline', 'rb').read().split(b'\0')
+            except OSError:
+                continue
+            if argv and argv[0].endswith(b'/podman') and all(any(w in a for a in argv) for w in wanted):
+                found.append(int(pid))
+        return found
+    began = time.time()
+    pids = []
+    while not pids:
+        assert time.time() < began + seconds and thread.is_alive(), ('the command was never observed', box)
+        pids = matching()
+        time.sleep(.002)
+    at_kill = {'command_pids': pids, 'seen_after_seconds': round(time.time() - began, 3), 'scope_before_kill': n_scope(unit)['active_state']}
+    subprocess.run(['systemctl', 'kill', '--signal=SIGKILL', _unit()], check=True)
+    at_kill['command_alive_after_kill'] = bool(matching())
+    thread.join(30)
+    deadline = time.time() + seconds
+    while n_scope(unit)['active_state'] not in ('inactive', 'failed', ''):
+        assert time.time() < deadline, 'the scope did not finish'
+        time.sleep(.2)
+    at_kill['scope_finished_after_seconds'] = round(time.time() - began, 3)
+    return {'first_response': box[0] if box else None, 'at_kill': at_kill}
+def n_relaunch_service(seconds=60):
+    """Brings the service back after a kill: an installed unit is restarted; a transient development unit, which
+    systemd does not restart, is launched again with the same executable, environment and directories."""
+    unit = _unit()
+    show = lambda prop: subprocess.run(['systemctl', 'show', f'--property={prop}', '--value', unit], capture_output=True, text=True).stdout.strip()
+    if show('Transient') != 'yes':
+        subprocess.run(['systemctl', 'restart', unit], check=True)
+        return n_ready(seconds)
+    exec_start = show('ExecStart')
+    path = exec_start.split('path=', 1)[1].split(' ', 1)[0].strip(';') if 'path=' in exec_start else None
+    environment = show('Environment').split()
+    runtime, state = show('RuntimeDirectory'), show('StateDirectory')
+    assert path and os.path.isfile(path), ('the transient unit names no executable', exec_start)
+    subprocess.run(['systemctl', 'stop', unit], capture_output=True)
+    subprocess.run(['systemctl', 'reset-failed', unit], capture_output=True)
+    argv = ['systemd-run', f'--unit={unit}', f'--property=RuntimeDirectory={runtime}', '--property=RuntimeDirectoryMode=0700',
+            f'--property=StateDirectory={state}', '--property=StateDirectoryMode=0700', '--property=UMask=0077']
+    argv += [f'--setenv={e}' for e in environment] + [path]
+    subprocess.run(argv, check=True, capture_output=True)
+    return n_ready(seconds)
 def n_interrupt_restore(request, import_path, unit):
     """Sends migration_restore and kills the service while the restore command runs in its own scope.
 

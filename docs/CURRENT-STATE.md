@@ -870,15 +870,15 @@ column. Measured on the development service, a small universe on lab-c:
 | console, Replicate now | 1 standby | 6.2 s | 3.49 s |
 | console, scheduled | 1 standby | 7.5 s | 3.80 s |
 
-Live runs of the same universe, 16 September 2026, where the last column is the interruption, the
-dump plus the resume:
+Live runs of the same universe (lab-c to lab-a), 16 September 2026, where the last column is the
+interruption, the dump plus the resume:
 
 | Run | Target | Total | Universe interrupted |
 | --- | --- | --- | --- |
 | tool, now | 1 standby | 4.7 s | 1.11 s |
 | console, Replicate now | 1 standby | 5.2 s | 1.11 s |
 
-`tests/check-live-replication-two-hosts.py` (lab-a to lab-c, 31 checks, passed) proves on a
+`tests/check-live-replication-two-hosts.py` (lab-c to lab-a, 31 checks, passed) proves on a
 counter universe whose token lives only in memory: the capture resumes in place with the same
 token; staging creates no container; the refusals (second staging, no policy, another universe,
 a discarded point, a second promotion) change nothing; after the active copy stops and releases
@@ -892,8 +892,40 @@ refuses any container named or labelled for the universe; a durable attempt row 
 restore, and a replay decides by observing the restore instant, never restoring twice; a capture
 the service did not see to the end is settled on retry (resumed from the kept images if the dump
 left the universe stopped) and records no point; a promoted container is owned for stop, delete
-and the collector. **Not proven on the lab:** those two crash paths, which need the service killed
-inside a sub-second window.
+and the collector.
 
-Not done: pruning policy exposed in the console, and a takeover started from the console.
+**Both crash paths are proven** by `tests/check-live-replication-interrupt.py` (lab-b to lab-a,
+30 checks, passed), on a universe holding about 690 MiB so that each command lasts long enough:
+
+| Service SIGKILLed | Killed after | Command finished in its scope after | Retry of the same operation |
+| --- | --- | --- | --- |
+| during a live capture's checkpoint | 1.9 s | 11.2 s | refused as interrupted, no point recorded; universe resumed from its kept images, same memory token |
+| during a live promotion's restore | 1.8 s | 15.2 s | finished by observation, nothing restored twice; universe running on the standby, same memory token |
+
+The transient development unit is not restarted by systemd; the harness's `relaunch_service`
+launches it again with its own executable, environment and directories. What the capture path
+means for an operator: after the service dies mid-capture the universe stays stopped with its
+checkpoint kept until the same operation is sent again. The service does not resume it on its own
+at startup, by the rule that PodMesh never acts unasked.
+
+**Takeover from the console.** `tools/replicate-universe.py takeover --standby T [--planned]` and
+the console route (`action: takeover`, `standby`, `planned`) make a standby the active host.
+Planned: a fresh replication to that standby, stop and lease release on the active host,
+promotion, the stopped copy deleted on the old active host, the ledger updated (the old active
+host becomes a standby) and a schedule re-armed if one was armed. Unplanned (the active host is
+lost): refused while the active host is reachable with a live lease, the active host fenced when
+reachable, the lease and margin waited out, then the newest copy promoted. Measured through the
+console on the test universe, live mode:
+
+| Takeover | Total | Copy age at the stop | Promotion |
+| --- | --- | --- | --- |
+| planned, lab-c to lab-b | 8.2 s | 1 s | 1.15 s |
+| planned, lab-b back to lab-c | 8.6 s | 1 s | 1.43 s |
+
+Each time the universe came back restored, with its original start marker on disk. An unplanned
+takeover while lab-b held its lease was refused (409). Lab-a is read-only in the development
+console's configuration and a takeover onto it is refused there (403). **Not proven:** the
+unplanned path against a host really lost, which needs the network cut procedure.
+
+Not done: pruning policy exposed in the console.
 

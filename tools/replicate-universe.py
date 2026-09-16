@@ -16,6 +16,8 @@ and a universe the migration checks accept (network none, no mounts, bounded mem
     tools/replicate-universe.py start  --universe U      the schedule armed: a run every interval
     tools/replicate-universe.py stop   --universe U      the schedule disarmed; copies and policy stay
     tools/replicate-universe.py status --universe U      target, schedule, last run, every standby's copy
+    tools/replicate-universe.py takeover --universe U --standby lab@… [--planned]
+                                                         the standby becomes the active host
     tools/replicate-universe.py summary                  every configured universe from the ledger alone, no host reached
 
 `--standbys all` replicates to every host but the active one; `--standbys N` to the N others with the most
@@ -27,6 +29,14 @@ The schedule is a timer on this workstation (systemd --user), because the workst
 controller and PodMesh never acts on its own: armed and disarmed by the operator, visible in `status`.
 Settings, runs and copies live in the universe's ledger (PODMESH_HA_LEDGER, default ~/.podmesh-ha).
 Environment: PODMESH_SOCKET, PODMESH_STATE_DIR, PODMESH_UNIT for the hosts' service.
+
+`takeover` makes a standby the active host. `--planned` is a switchover chosen while the active host is fine:
+a fresh replication to that standby first, then the active copy is stopped and its lease released, the
+standby promotes, and the stopped copy left on the old active host is deleted. Without it, the active host
+is taken as lost: the tool refuses while that host is reachable and holds a live lease, fences it if it is
+reachable, waits out the lease and the margin, then promotes the newest copy the standby holds. A live copy
+comes back running with its memory; a stopped copy is promoted network-disabled and started afresh. The
+ledger then names the standby as the active host and the old active host as a standby.
 
 One JSON report on stdout; exit 0 on success, 1 on a refusal with its reason.
 """
@@ -126,6 +136,7 @@ def cmd_configure(args):
         ok(active, request('activation_acquire', u, args.reference), 'activation_acquire')
     ledger = load(u)
     ledger['replication'] = {'active': args.active, 'hosts': args.hosts.split(','), 'standbys': chosen, 'mode': args.standbys, 'capture': args.capture,
+                             'lease_seconds': status.get('lease_seconds') or lease, 'takeover_margin_seconds': status.get('takeover_margin_seconds') or 30,
                              'chosen_because': why, 'interval_seconds': interval, 'configured_at': int(time.time())}
     save(u, ledger)
     return {'result': 'configured', 'universe': u, 'active': args.active, 'standbys': chosen, 'chosen_because': why, 'capture': args.capture,
@@ -162,6 +173,117 @@ def cmd_run(args):
     return {'result': 'replicated', 'universe': u, 'capture': rep.get('capture', 'stopped'),
             **{k: report.get(k) for k in ('point', 'generation', 'copies', 'stopped_for_seconds', 'pruned_on_standbys', 'discarded_on_standbys')},
             'seconds': entry['seconds']}
+
+
+def try_host(target):
+    try:
+        return host(target)
+    except Exception:  # noqa: BLE001 -- an unreachable host is a fact the takeover acts on
+        return None
+
+
+def newest_copy(ledger, identity):
+    mine = [c for c in ledger.get('cycles', []) if c.get('standby') == identity
+            and not c.get('pruned') and not c.get('discarded') and not c.get('promoted')]
+    return mine[-1] if mine else None
+
+
+def cmd_takeover(args):
+    u = args.universe
+    ledger = load(u)
+    rep = ledger.get('replication')
+    if not rep:
+        raise Refused('the universe has no replication configured; nothing records where its copies are')
+    if args.standby not in rep['standbys']:
+        raise Refused(f'{args.standby} is not a standby of this universe ({", ".join(rep["standbys"])})')
+    t0 = time.time()
+    B = try_host(args.standby)
+    if B is None:
+        raise Refused(f'the standby {args.standby} cannot be reached; nothing was changed')
+    armed = timer_state(u)['armed']
+    if armed:
+        cmd_stop(args)
+    lease_seconds = int(rep.get('lease_seconds') or max(60, min(3600, rep['interval_seconds'] * 3)))
+    margin = int(rep.get('takeover_margin_seconds') or 30)
+    A = try_host(rep['active'])
+    report = {'result': 'taken_over', 'universe': u, 'from': rep['active'], 'to': args.standby, 'planned': bool(args.planned),
+              'active_reachable': A is not None, 'schedule_was_armed': armed}
+    waited = 0.0
+    if args.planned:
+        if A is None:
+            raise Refused('a planned switchover needs the active host; it cannot be reached, so this is a takeover of a lost host (without --planned)')
+        # A fresh copy first, so that the switchover loses only what the universe does between this capture and the stop.
+        status = ok(A, request('activation_status', u, args.reference), 'activation_status')
+        if not status.get('live'):
+            ok(A, request('activation_acquire', u, args.reference), 'activation_acquire (the lease had lapsed)')
+        argv = [sys.executable, '-B', str(HERE / 'ha-standby.py'), '--reference', args.reference, 'cycle', '--universe', u,
+                '--active', rep['active'], '--standby', args.standby, '--capture', rep.get('capture', 'stopped')]
+        p = subprocess.run(argv, capture_output=True, text=True, env=dict(os.environ))
+        if p.returncode:
+            try:
+                reason = json.loads(p.stdout).get('refused')
+            except ValueError:
+                reason = (p.stderr or p.stdout)[-400:]
+            raise Refused(f'the fresh replication before the switchover refused, and nothing was switched: {reason}')
+        ledger = load(u)
+        stopped_at = time.time()
+        ok(A, request('stop', u, args.reference, timeout_seconds=10, on_timeout='kill'), 'stop on the active host')
+        ok(A, request('activation_release', u, args.reference), 'activation_release on the active host')
+    else:
+        if A is not None:
+            status = ok(A, request('activation_status', u, args.reference), 'activation_status on the active host')
+            if status.get('live') and status.get('holder_host_uuid') == A.identity:
+                raise Refused('the active host is reachable and holds a live lease: that is a planned switchover, not the takeover of a lost host')
+            fenced = ok(A, {'operation': 'activation_fence', 'operation_id': str(uuid.uuid4()), 'authorization_ref': args.reference,
+                            'timeout_seconds': 10}, 'activation_fence on the active host')
+            report['fence'] = next((e for e in fenced.get('fenced', []) + fenced.get('left_running_or_absent', []) if e.get('universe_uuid') == u), None)
+            until = (status.get('expires_at') or 0) + (status.get('takeover_margin_seconds') or margin) + 1
+            clock = A
+        else:
+            # Unreachable: any lease it holds ends at most lease_seconds after now; the margin is the clock-skew budget.
+            until = B.call('time')['time'] + lease_seconds + margin + 1
+            clock = B
+        began = time.time()
+        while clock.call('time')['time'] < until:
+            time.sleep(1)
+        waited = time.time() - began
+        stopped_at = None
+    copy = newest_copy(ledger, B.identity)
+    if copy is None:
+        raise Refused('the standby holds no copy of this universe; run a replication to it first')
+    ok(B, request('activation_require', u, args.reference, lease_seconds=lease_seconds, takeover_margin_seconds=margin,
+                  desired_standbys=len(rep['standbys'])), 'activation_require on the standby')
+    ok(B, request('activation_acquire', u, args.reference), 'activation_acquire on the standby')
+    live = copy.get('capture') == 'live'
+    began = time.time()
+    if live:
+        promoted = ok(B, request('recovery_point_promote', u, args.reference, recovery_point_uuid=copy['point']), 'recovery_point_promote')
+    else:
+        promoted = ok(B, request('recovery_point_promote', u, args.reference, restored_universe_uuid=copy['quarantined_uuid'],
+                                 network_profile='isolated'), 'recovery_point_promote')
+        ok(B, request('start', u, args.reference, observe_seconds=1), 'start on the standby')
+    promotion_seconds = time.time() - began
+    copy['promoted'] = int(time.time())
+    retired = None
+    if args.planned:
+        r = A.api(request('delete', u, args.reference))
+        retired = {'deleted': bool(r.get('ok')), 'error': r.get('error')}
+    old_active = rep['active']
+    rep['active'] = args.standby
+    rep['standbys'] = [s for s in rep['standbys'] if s != args.standby] + [old_active]
+    ledger['replication'] = rep
+    ledger.setdefault('takeovers', []).append({'at': int(t0), 'from': old_active, 'to': args.standby, 'planned': bool(args.planned),
+                                               'point': copy['point'], 'capture': copy.get('capture', 'stopped')})
+    save(u, ledger)
+    if armed:
+        cmd_start(args)
+    prepared = copy.get('prepared_at') or 0
+    report.update({'capture': copy.get('capture', 'stopped'), 'point': copy['point'], 'generation': copy['generation'],
+                   'copy_age_seconds': int((stopped_at or time.time()) - prepared) if prepared else None,
+                   'waited_seconds': round(waited, 1), 'promotion_seconds': round(promotion_seconds, 3), 'with_memory': live,
+                   'started': bool(promoted.get('started')) if live else True, 'old_active_copy': retired,
+                   'schedule_rearmed': armed, 'seconds': round(time.time() - t0, 1)})
+    return report
 
 
 def cmd_start(args):
@@ -259,12 +381,14 @@ def main():
     c.add_argument('--capture', default='stopped', choices=('stopped', 'live'), help='live: never stopped, checkpointed with memory and resumed in place')
     for name in ('run', 'start', 'stop', 'status'):
         s = sub.add_parser(name); s.add_argument('--universe', required=True)
+    k = sub.add_parser('takeover'); k.add_argument('--universe', required=True); k.add_argument('--standby', required=True)
+    k.add_argument('--planned', action='store_true', help='a switchover while the active host is fine: fresh copy, stop, promote, retire the old copy')
     sub.add_parser('summary')
     args = p.parse_args()
     if args.command == 'configure' and not 60 <= args.interval <= 86400:
         done(1, {'result': 'refused', 'error': '--interval must be from 60 to 86400 seconds'})
     try:
-        report = {'configure': cmd_configure, 'run': cmd_run, 'start': cmd_start, 'stop': cmd_stop, 'status': cmd_status, 'summary': cmd_summary}[args.command](args)
+        report = {'configure': cmd_configure, 'run': cmd_run, 'start': cmd_start, 'stop': cmd_stop, 'status': cmd_status, 'summary': cmd_summary, 'takeover': cmd_takeover}[args.command](args)
         done(0, report)
     except Refused as e:
         done(1, {'result': 'refused', 'error': str(e)})
