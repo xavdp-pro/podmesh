@@ -5,8 +5,17 @@ The daemon still does not elect a governor or mint a takeover proof. This tick r
 publisher_status, starts the connector only with the installed proof when this host is
 eligible at that epoch, and stops it when this host is not eligible. See
 docs/PUBLISHER-FOLLOW-LAB.md.
+
+A mandate that renews is BOUNDED, and refused otherwise. An unbounded renewal would push the
+holder's lease forward for ever, and lease expiry is the only thing that withdraws a governor
+nobody can reach: with it gone, a partitioned host keeps publishing while a standby takes the
+role at the barrier, which is the two-connector case the contract forbids. So `renew=1`
+requires `not_after` (the wall-clock second the mandate dies) and `renew_below` (renew only
+inside that many seconds of the lease's end, which also keeps the journal from growing by one
+row every tick). After `not_after` the tick grants nothing more and renews nothing: what is
+published runs out its lease and the tick's own stop branch withdraws it.
 """
-import json, os, subprocess, sys, tempfile, uuid
+import json, os, subprocess, sys, tempfile, time, uuid
 
 MANDATE = os.environ.get("PODMESH_PUBLISHER_FOLLOW_MANDATE", "/etc/podmesh/publisher-follow-mandate")
 CLI = os.environ.get("PODMESH_CLI", "/usr/bin/podmesh")
@@ -32,6 +41,8 @@ def load_mandate(path):
     resource = vals.get("resource", "")
     proof_path = vals.get("proof", "")
     renew = vals.get("renew", "0")
+    not_after = vals.get("not_after", "")
+    renew_below = vals.get("renew_below", "")
     if not ref or any(c for c in ref if c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:-"):
         fail("the mandate names no usable authorization_ref")
     if not resource or any(c for c in resource if c not in "abcdefABCDEF0123456789-"):
@@ -40,7 +51,14 @@ def load_mandate(path):
         fail("the mandate names no usable absolute proof path")
     if renew not in ("0", "1"):
         fail("the mandate's renew must be 0 or 1")
-    return ref, resource, proof_path, renew == "1"
+    if not not_after.isdigit():
+        fail("the mandate must carry not_after, the wall-clock second it dies")
+    if renew == "1" and not renew_below.isdigit():
+        fail("a mandate that renews must carry renew_below, the seconds of lease left below which it renews")
+    below = int(renew_below) if renew_below.isdigit() else 0
+    if renew == "1" and not 0 < below <= 86400:
+        fail("the mandate's renew_below must be from 1 to 86400 seconds")
+    return ref, resource, proof_path, renew == "1", int(not_after), below
 
 
 def cli(operation, payload):
@@ -75,7 +93,9 @@ def maybe_renew(ref, resource):
 
 
 def main():
-    ref, resource, proof_path, renew = load_mandate(MANDATE)
+    ref, resource, proof_path, renew, not_after, renew_below = load_mandate(MANDATE)
+    now = int(time.time())
+    expired = now >= not_after
     status, code = cli("publisher_status", {"resource": resource, "operation_id": str(uuid.uuid4()), "authorization_ref": ref})
     if code or not status.get("ok"):
         fail(f"publisher_status refused: {status.get('error') or status}", 1)
@@ -85,8 +105,13 @@ def main():
     unit_state = ((data.get("unit") or {}).get("state") or "")
     active = unit_state in ("active", "activating")
     eligible = data.get("publisher_eligible") is True
-    if eligible and renew:
-        maybe_renew(ref, resource)
+    # Renew only inside the window the mandate names, and never once the mandate has died: the
+    # lease must be able to lapse, both at the end of the demonstration and on a host nobody can
+    # reach.
+    if eligible and renew and not expired:
+        expires_at = ((data.get("lease") or {}).get("expires_at")) or 0
+        if expires_at - now <= renew_below:
+            maybe_renew(ref, resource)
     if eligible and active:
         sys.exit(0)
     if not eligible:
@@ -95,6 +120,8 @@ def main():
             if sc or not stop.get("ok"):
                 fail(f"publisher_stop refused: {stop.get('error') or stop}", 1)
         sys.exit(0)
+    if expired:
+        fail(f"the mandate died at {not_after}; nothing is started under it (what is published runs out its lease)", 0)
     if not os.path.isfile(proof_path):
         fail(f"eligible but no proof at {proof_path}; the agent must install the gate's document", 0)
     proof = json.loads(open(proof_path, encoding="utf-8").read())

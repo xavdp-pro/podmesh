@@ -43,6 +43,9 @@ PROOF_REMOTE = '/run/podmesh-publisher-follow/proof.json'
 MANDATE_REMOTE = '/run/podmesh-publisher-follow/mandate'
 FOLLOW_REMOTE = '/usr/local/lib/podmesh-publisher-follow-lab/podmesh-publisher-follow'
 LEASE, MARGIN = 3600, 30
+# The mandate's own life, and how near the lease's end a tick renews.
+MANDATE_SECONDS = int(os.environ.get('PODMESH_FOLLOW_MANDATE_SECONDS', 24 * 3600))
+RENEW_BELOW = int(os.environ.get('PODMESH_FOLLOW_RENEW_BELOW', 900))
 STATE_DIR = pathlib.Path.home() / 'Bureau/REMOTE3/podmesh-lab/cursor/publisher-follow'
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 G = 'lab-a'
@@ -63,8 +66,10 @@ def pub(operation, alias, **extra):
 
 
 def detect_cli(h):
-    out = h.ssh('ls -1 /opt/podmesh-dev-ha/*/podmesh 2>/dev/null | tail -1').stdout.decode().strip()
-    assert out.endswith('/podmesh'), (h.role, out)
+    """The CLI beside the daemon this host is actually running -- not whatever sorts last in
+    /opt: a tick calling a client from another build fails silently every ten seconds."""
+    out = h.ssh('D=$(sudo -n readlink -f /proc/$(systemctl show -p ExecMainPID --value ' + unit + ')/exe); echo "$(dirname "$D")/podmesh"').stdout.decode().strip()
+    assert out.endswith('/podmesh') and h.ssh(f'test -x {out}', check=False).returncode == 0, (h.role, out)
     return out
 
 
@@ -129,7 +134,11 @@ def install_follow(h, cli, proof):
     h.ssh(f'sudo -n install -D -m 0755 /dev/stdin {FOLLOW_REMOTE}', input_bytes=open(FOLLOW, 'rb').read())
     h.ssh('sudo -n mkdir -p -m 0700 /run/podmesh-publisher-follow')
     h.ssh(f'sudo -n install -m 0600 /dev/stdin {PROOF_REMOTE}', input_bytes=json.dumps(proof).encode())
-    mandate = f'authorization_ref={REFERENCE}\nresource={LOGICAL}\nproof={PROOF_REMOTE}\nrenew=1\n'
+    # Bounded: the mandate dies on its own clock, and renewal happens near the lease's end, not
+    # every tick. An unbounded renewal would make the holder's lease immortal, and lease expiry
+    # is what withdraws a governor nobody can reach (docs/PUBLISHER-FOLLOW-LAB.md).
+    mandate = (f'authorization_ref={REFERENCE}\nresource={LOGICAL}\nproof={PROOF_REMOTE}\nrenew=1\n'
+               f'not_after={int(time.time()) + MANDATE_SECONDS}\nrenew_below={RENEW_BELOW}\n')
     h.ssh(f'sudo -n install -m 0600 /dev/stdin {MANDATE_REMOTE}', input_bytes=mandate.encode())
     h.ssh(f'sudo -n systemctl stop {TIMER}.timer {TIMER}.service 2>/dev/null; sudo -n systemctl reset-failed {TIMER}.timer {TIMER}.service 2>/dev/null', check=False)
     h.ssh(

@@ -22,13 +22,32 @@ On `podmesh-dev-ha` only, the operator authorizes a follow tick analogous to `po
 - If not eligible and a connector is recorded or active, it calls `publisher_stop`.
 - If `renew=1` and this host is eligible, the tick calls `activation_renew` so a standing
   laboratory hostname does not die with the first lease. A host that is not the holder
-  never renews.
+  never renews. **The renewal is bounded, and a mandate that renews without bounds is
+  refused.** `not_after` is the wall-clock second the mandate dies; after it the tick grants
+  nothing and renews nothing, so what is published runs out its lease and the tick's own stop
+  branch withdraws it. `renew_below` is how near the lease's end a tick renews, which also
+  keeps the journal from growing by a row every ten seconds. Counter-review of 2026-09-16:
+  measured unbounded, the holder's lease moved forward faster than it burned (+21 s over 14 s
+  of clock) and could never lapse; bounded, it burns down and renews about three times an hour.
 - Enabling the timer is the operator's; cleanup stops the timer and removes the mandate.
+
+**What an armed renewal costs, and why it is bounded.** Lease expiry is the only thing that
+withdraws a governor nobody can reach: eligibility is read from this host's own journal, so a
+host cut from its peers and from the agent stays eligible for as long as its lease lives. With
+an immortal lease it would keep publishing while a standby takes the role at the barrier, and
+Cloudflare accepts both connectors on one tunnel -- the case the invariant of
+`MANAGER-PUBLISHER-CONTRACT.md` forbids. The bound restores the lapse. It does not make the
+demonstration free: while the mandate stands, a governor lost for real is withdrawn only when
+its lease runs out, and a standby may publish only at the barrier (the lease plus the margin
+recorded at the rotation), so a long lease buys a stable hostname with a long outage. Choose
+the lease for what is being shown, and keep `podmesh-fence` in mind for the case where the tick
+itself cannot run.
 
 This does **not** rotate the epoch or publish the exclusive route. Those remain the
 agent's (`tools/ha-standby.py`). After a rotation the agent must deliver the new proof
 to the hosts (`python3 -B tools/arm-publisher-follow.py --refresh`). A lapsed lease still
-withdraws through fence / reconciliation. The takeover proof itself still expires; a
+withdraws through the tick's stop branch, fence or reconciliation -- provided the mandate is not
+renewing it out of reach of expiry, which is what the bound above prevents. The takeover proof itself still expires; a
 connector that dies after that needs a new rotate, not this tick.
 
 ## What it is not

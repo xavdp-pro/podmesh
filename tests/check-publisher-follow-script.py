@@ -21,10 +21,28 @@ p = run({'PODMESH_PUBLISHER_FOLLOW_MANDATE': str(bad)}, 3)
 assert 'resource UUID' in p.stderr
 checks.append('refuses a mandate that names no resource UUID')
 
-bad.write_text('authorization_ref=ok\nresource=91eeb6bf-5489-405b-b77a-53105b0aff7a\nproof=/tmp/x\nrenew=yes\n')
+UUID = '91eeb6bf-5489-405b-b77a-53105b0aff7a'
+bad.write_text(f'authorization_ref=ok\nresource={UUID}\nproof=/tmp/x\nrenew=yes\n')
 p = run({'PODMESH_PUBLISHER_FOLLOW_MANDATE': str(bad)}, 3)
 assert "renew must be 0 or 1" in p.stderr
 checks.append('refuses a mandate whose renew is not 0 or 1')
+
+# The bound on renewal: a mandate that renews for ever would make the holder's lease immortal,
+# and lease expiry is what withdraws a governor nobody can reach.
+bad.write_text(f'authorization_ref=ok\nresource={UUID}\nproof=/tmp/x\nrenew=1\nrenew_below=900\n')
+p = run({'PODMESH_PUBLISHER_FOLLOW_MANDATE': str(bad)}, 3)
+assert 'not_after' in p.stderr
+checks.append('refuses a mandate that carries no not_after')
+
+bad.write_text(f'authorization_ref=ok\nresource={UUID}\nproof=/tmp/x\nrenew=1\nnot_after=4102444800\n')
+p = run({'PODMESH_PUBLISHER_FOLLOW_MANDATE': str(bad)}, 3)
+assert 'renew_below' in p.stderr
+checks.append('refuses a renewing mandate that names no renewal window')
+
+bad.write_text(f'authorization_ref=ok\nresource={UUID}\nproof=/tmp/x\nrenew=1\nnot_after=4102444800\nrenew_below=0\n')
+p = run({'PODMESH_PUBLISHER_FOLLOW_MANDATE': str(bad)}, 3)
+assert 'renew_below must be' in p.stderr
+checks.append('refuses a renewal window of zero')
 
 print('PASS')
 for c in checks:
