@@ -210,7 +210,12 @@ test('replication runs the tool for the active host with every other SSH host as
  assert.equal((await post({...base,host:'l',action:'run'})).status,409);
  assert.equal((await post({...base,action:'run'},{'X-Podmesh-Token':''})).status,401);
  for(const action of ['run','start','stop']){assert.equal((await post({...base,action})).status,200);assert.deepEqual(runs.at(-1),['--reference','fixture',action,'--universe',U]);}
- assert.equal(runs.filter(a=>a.includes('configure')).length,3);});
+ assert.equal(runs.filter(a=>a.includes('configure')).length,3);
+ assert.equal((await post({...base,action:'takeover',standby:'b',planned:true})).status,200);assert.deepEqual(runs.at(-1),['--reference','fixture','takeover','--universe',U,'--standby','lab@b','--planned']);
+ assert.equal((await post({...base,action:'takeover',standby:'c',planned:false})).status,200);assert.deepEqual(runs.at(-1).slice(-4),['--universe',U,'--standby','lab@c']);
+ for(const bad of [{...base,action:'takeover',standby:'a',planned:true},{...base,action:'takeover',standby:'l',planned:true},{...base,action:'takeover',standby:'b'},{...base,action:'run',standby:'b'},{...base,action:'takeover',standby:'b',planned:true,capture:'live'}])
+  assert.equal((await post(bad)).status,400,JSON.stringify(bad));
+ assert.equal((await post({...base,action:'takeover',standby:'r',planned:true})).status,403);});
 test('health carries the replication summary from the ledger, and says when it cannot be read',async t=>{
  let app,answer;const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
  const U='00000000-0000-4000-8000-00000000000b',seen=[];
