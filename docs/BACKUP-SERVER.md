@@ -2,7 +2,7 @@
 
 > **Intent Classification**: GENERIC INTENT (Universal / Parameterized Blueprint)
 >
-> Rule 0B mandates that exact string (`RULES.md:98`); revisions 1 to 5 paraphrased it.
+> Rule 0B mandates that exact string (`RULES.md#rule-0b-intent-header-classification`); revisions 1 to 5 paraphrased it.
 > This service is a reusable blueprint, not one client's universe.
 > **Perimeter**: P1 (Rule 0A — it holds encryption keys, signing authority and every
 > universe's data, so it is classified before design, not after)
@@ -135,9 +135,9 @@ is enough. Missing a level is a hole."
 
 - Level 2 is the **volumes, not the overlay**. `nosav/`, caches, image layers and
   `node_modules` are excluded. `app/` is code in git and is *not* a substitute for a
-  volume backup (that clause is Rule 4, `RULES.md:397`, not Rule 16).
+  volume backup (that clause is Rule 4, `RULES.md#rule-4`, not Rule 16).
 - Level 3 is a **real dump**, not a live volume tar — and it is the relational dump
-  **plus the Qdrant snapshot** (`RULES.md:842`). Omitting the vector collection is a
+  **plus the Qdrant snapshot** (`RULES.md#rule-16`). Omitting the vector collection is a
   hole by this rule's own words, and it also breaks erasure: a service that never
   captures the collection cannot honour an erasure over it.
 - Level 4 is git, and **git is never treated as a data backup**.
@@ -161,8 +161,8 @@ nothing behind (`.part` then rename); `.env` is excluded in every spelling; and 
 tool is called is proven with a recorder on a PATH built from scratch.
 
 Rule 12 **also governs transport**, but only within a scope this service mostly falls
-outside: `RULES.md:753` binds "all archive transfers (`PROJECT.tar.bz2`,
-`REMOTE.tar.bz2`)" and `RULES.md:848` widens that to "any `tar.bz2` that leaves the
+outside: `RULES.md#rule-12` binds "all archive transfers (`PROJECT.tar.bz2`,
+`REMOTE.tar.bz2`)" and `RULES.md#rule-16-archive-hygiene-scope` widens that to "any `tar.bz2` that leaves the
 host". A content-addressed chunk pull is neither. Where a `tar.bz2` does leave a host —
 B2's volume archives — the clause applies in full. See Decision X3, which revision 3
 mis-read as a collision when it is a gap.
@@ -170,7 +170,7 @@ mis-read as a collision when it is a gap.
 Rule 20's closed-loop quality gate applies: the delivered interaction is exercised, not
 simulated.
 
-**Rule 10 — no duration, anywhere.** `RULES.md:555-559`: *"No document, pitch, README,
+**Rule 10 — no duration, anywhere.** `RULES.md#rule-10-zero-duration-figure`: *"No document, pitch, README,
 doctrine page, or client-facing sentence in this repository states a restore or
 cold-boot duration — **not even to dismiss it**. A number quoted in order to be refuted
 still gets lifted out of its paragraph and quoted back as a promise."* The sanctioned
@@ -235,7 +235,7 @@ image identity to "level 4 / 5". That was wrong: level 4 is git code and archite
 level 5 is the off-site copy of protected levels, and neither is an image registry.
 
 Revision 2 then said the manifest could "declare explicitly whether this recovery point
-carries the content itself". **That is forbidden.** Rule 11 at `RULES.md:740-746` (16 September 2026 numbering; `:677-683` before the amendment) is
+carries the content itself". **That is forbidden.** Rule 11 at `RULES.md#rule-11-what-is-restored` is
 explicit:
 
 > A universe's restorable identity is its `manifest.json`, its `cfg-image-lock.json`
@@ -249,8 +249,8 @@ an image layer.
 
 **What PodMesh can actually record today, which is less.** Rule 11's restorable identity
 assumes a `cfg-image-lock.json` and a source commit. PodMesh has neither: a creation
-request carries a **full local image ID** (`LOCAL-API.md:31`, `:85`), and PodMesh
-**never pulls** (`LOCAL-API.md:151`). A local image ID is neither a pullable registry
+request carries a **full local image ID** (`LOCAL-API.md`, Typed mutation requests), and PodMesh
+**never pulls** (`LOCAL-API.md`, `migration_destination_preflight`). A local image ID is neither a pullable registry
 digest nor a recorded commit, so Rule 11's "rebuilt from source, or pulled by the digest
 the lock names" is **unreachable in PodMesh as it stands**. B1 therefore records the
 local image ID and nothing more, its restore target must already hold that image, and
@@ -263,14 +263,14 @@ commit or pulled by its locked digest is a **reproducibility defect that must su
 and the manifest's job is to make it visible — not to paper over it with a copy.
 
 The same rule fixes the unit: the **universe** is what can be snapshotted, exported and
-restored as one thing (`RULES.md:570-572`). A brick is an application container built
+restored as one thing (`RULES.md#rule-11`). A brick is an application container built
 from an immutable image, and is not a backup unit.
 
 **The word means two things, and this document must not equivocate.** In the Shaper OS
 canon a *universe* is a **system container** — an LXC or, since Rule 11's amendment of
 16 September 2026, a `nested` Podman container — with its own init, its own package set,
 its own nftables. In PodMesh today a *universe* is a **Podman container** with a UUID
-(`DELIVERY-CHECKLIST.md:42`, `:44` — no single line states it; the two together do). Read naively, the sentence above would say PodMesh has
+(`DELIVERY-CHECKLIST.md` §2 Lifecycle, its start/stop and cloning items — no single item states it; the two together do). Read naively, the sentence above would say PodMesh has
 no backup units at all, which is not what Rule 11 means and not what this service is for.
 
 The reconciliation: **Rule 11's unit is the unit of a *complete* recovery point.** A
@@ -363,7 +363,7 @@ classes:
 
   **The stop must be unforced, and this is a precondition, not a detail.** PodMesh's stop
   sends the container's stop signal and then **SIGKILL** if it is still running after the
-  timeout, reporting the escalation as `forced: true` (`LOCAL-API.md:62`). A SIGKILLed
+  timeout, reporting the escalation as `forced: true` (`LOCAL-API.md`, Stop). A SIGKILLed
   process never ran its shutdown path, so the application's own files may be mid-write —
   the stop bought coherence across pieces but not a settled application. A capture may
   therefore claim `quiescent` only when the stop operation reported **`forced: false`**.
@@ -450,7 +450,7 @@ written into a design as a safeguard. That sentence is withdrawn.
 documents it does not want inside a 4 KiB request: the service writes them into
 `outbox/<authorization_id>/` under its state directory, which **only the service writes**,
 and an **external transport controller running as root** moves them; the reverse
-direction lands in `inbox/<authorization_id>/` (`LOCAL-API.md:99`). The Backup Server
+direction lands in `inbox/<authorization_id>/` (`LOCAL-API.md`, serial migration between two hosts). The Backup Server
 reuses that pattern rather than inventing a transport. *Revision 5 said it "adds no new
 mechanism", which was false and worth correcting because it discourages an implementer
 from noticing the two things that genuinely have to be built.* It adds exactly two, both
@@ -497,12 +497,12 @@ With those two built, the flow is:
 **The mesh is not required for B1, and B1 does not use it.** Rule 13's WireGuard mesh is
 optional by PodMesh's own contract, its authentication is an open design question
 elsewhere (`CONTROL-SERVICES-UNIVERSE.md`), and it has never been run end to end
-(`docs/README.md:49` records both transports as owing tests). B1 therefore pulls over ordinary
+(`docs/README.md`, row P13, records both transports as owing tests). B1 therefore pulls over ordinary
 existing IP connectivity, which is the same transport the three lab hosts already use.
 Where a deployment does put the Backup Server on the mesh, it is a peer like any other:
 an interface exists and is addressable, **nothing behind it answers**, and Rule 13's
 mandatory named-peer comment applies to its `[Peer]` block like every other
-(`RULES.md:812-819`).
+(`RULES.md#rule-13-peer-comments`).
 
 A compromised host therefore cannot reach the Backup Server, cannot enumerate other
 universes' backups and cannot delete anything. *Accepted by the review, subject to D3
@@ -631,7 +631,7 @@ derives from it.
 **Three different things are called a manifest in this ecosystem** and they must not be
 confused: the canon's universe `manifest.json` (Rule 11's restorable identity, and where
 Rule 31's `dataLifecycle` lives); PodMesh's existing **migration checkpoint manifest**,
-hashed into a transfer handoff (`LOCAL-API.md:88`, re-hashed at `:103`); and this service's **recovery-point
+hashed into a transfer handoff (`LOCAL-API.md`, `migration_authorize_transfer`, re-hashed by `migration_destination_preflight`); and this service's **recovery-point
 manifest**, described here. Where this document says "the manifest" unqualified, it
 means the third. It is immutable, versioned and authenticated, and it binds:
 
@@ -671,7 +671,7 @@ the instant it is produced.
 *Missing from revision 3, which called the manifest "authenticated" and "signed" without
 ever naming a signer — a root of trust anchored in nothing.*
 
-Rule 36 (`RULES.md:1117`, `:1126`) settles the shape: a private key never leaves its
+Rule 36 (`RULES.md#rule-36`) settles the shape: a private key never leaves its
 level, so there is **no fleet-wide signing key** and the Backup Server never signs what
 it did not produce. The manifest binds a **producer identity commitment** and a
 signature over the canonical serialization of every other field.
@@ -702,7 +702,7 @@ same defect as anchoring it in nothing.* In PodMesh's own terms:
 
   **`authorization_ref` is not that key and must never be used as one.** PodMesh states
   it plainly: *"`authorization_ref` is audit provenance, not a remotely verified
-  credential"* (`PREPARE-A-HOST.md:38`). Revision 4 made it the signer's identity, which
+  credential"* (`PREPARE-A-HOST.md`, Persistence and access). Revision 4 made it the signer's identity, which
   would have built the root of trust on a string the source host chooses for itself and
   nobody checks. It is recorded verbatim in the manifest as **provenance** — it answers
   *under what authority was this sealing requested*, which is worth keeping — and it is
@@ -848,7 +848,7 @@ housekeeping step that cannot run is a reported failure over a surviving archive
 ## Data lifecycle and erasure — and the conflict it creates
 
 *Missing from revisions 1 and 2 entirely; found by a canon sweep.* Rule 31
-(`RULES.md:1037-1043`) binds this service directly:
+(`RULES.md#rule-31`) binds this service directly:
 
 - **Every universe declares its `dataLifecycle` in `manifest.json`**: `personalData`
   true or false; `retention` as a duration or `unlimited`, **per data class** (GED
@@ -999,7 +999,7 @@ are **hypotheses until the sequential lab comparison of B0 records equivalent re
 evidence**, and nothing may be built as though they were settled.
 
 And the clause both sibling documents carry and this one had dropped
-(`PREPARE-A-HOST.md:56-57`, `DELIVERY-CHECKLIST.md:73`): **no disk is ever reformatted
+(`PREPARE-A-HOST.md`, Storage recommendation for PodMesh Backup Server; `DELIVERY-CHECKLIST.md` §5): **no disk is ever reformatted
 automatically to obtain a preferred backend.** A host that lacks one uses the portable
 fallback and says so.
 
@@ -1078,9 +1078,9 @@ Deliberately small, and shaped by the reviewer:
    create, start, stop, delete, clone and the migration operations, and nothing that runs
    a command in a running universe. Two routes work and both are in this project's
    existing practice: fold the write into the container's own `command` at create time,
-   which the API already accepts (`LOCAL-API.md:31-32`), or write it with direct Podman,
+   which the API already accepts (`LOCAL-API.md`, Typed mutation requests), or write it with direct Podman,
    which is this project's declared convention for fixtures as opposed to the operations
-   under test (`REVIEW-EXPERIMENTAL3.md:7`). B1 uses the first, so the marker is part of
+   under test (`REVIEW-EXPERIMENTAL3.md`, Governance). B1 uses the first, so the marker is part of
    the universe PodMesh created rather than something reached around it.
 
    **And the command must handle its stop signal, or step 0 breaks step 1.** These two
@@ -1095,7 +1095,7 @@ Deliberately small, and shaped by the reviewer:
 
    **The marker value is interpolated as a literal, because PodMesh passes no
    environment.** The creation request accepts exactly `operation_id`, `universe_uuid`,
-   `authorization_ref`, `image` and `command` (`LOCAL-API.md:27-33`), and the daemon
+   `authorization_ref`, `image` and `command` (`LOCAL-API.md`, Typed mutation requests), and the daemon
    parses only `image` and `command` (`src/lifecycle.rs:358-371`). A command referencing
    a shell variable would expand it to the empty string, write a zero-byte marker, and
    fail step 7 on every run — the same class of defect as the signal one, in the same
@@ -1211,7 +1211,7 @@ here precisely.
 
 *The two errors: it said B1 has "no `tar`", when B1's mandatory path is the **portable
 archive fallback** and the checklist's own wording for it is "stopped-universe archive"
-(`DELIVERY-CHECKLIST.md:65`) — B1 does produce an archive, and step 1 says so. And it
+(`DELIVERY-CHECKLIST.md` §4) — B1 does produce an archive, and step 1 says so. And it
 put the **archive-failure clause** among the clauses with "no subject yet" and then
 listed that same clause, in its own words, among the ones B1 exercises. A document
 cannot both test a clause and have no subject for it.*
@@ -1221,20 +1221,20 @@ entirely, counted clause 5 twice as though it were two, filed volume exclusions 
 Rule 12 when they are Rule 16 level 2, and claimed a clause whose testable half has no
 subject in PodMesh. Rule 20 makes coverage limits a recorded obligation, so the
 accounting is done clause by clause against the canon's own order.* The eight clauses of
-"what a backup archive never contains, and what it never lies about" (`RULES.md:759-803`):
+"what a backup archive never contains, and what it never lies about" (`RULES.md#rule-12-what-a-backup-archive-never-contains`):
 
 | # | Clause | B1 |
 | --- | --- | --- |
-| 1 | The key that opens the coffer does not travel with the coffer (`:759`) | **exercised** — the KEK's two copies live outside the source host and outside the datastore, per the X2 interim |
-| 2 | The backup's encryption key is its own key (`:765`) | **partly** — the half that says the key reaches its tool through the environment and never a command line is exercised; the half that refuses a key equal to `VAULT_MASTER_KEY` has **no subject**, because PodMesh has no vault and no such key exists to compare against |
-| 3 | A dump that was not taken is announced, never written empty (`:772`) | **no subject** — no database |
-| 4 | The archive command's failure is the backup's failure (`:779`) | **exercised** — B1's mandatory path produces an archive, and the status line is printed only after that archive exists, has a size and has a checksum. Step 10's interrupted capture is this clause's test |
-| 5 | A failure after the archive is complete keeps the archive, and a housekeeping step that cannot run is a reported failure over a surviving archive (`:783`) | **exercised** — one clause, tested by step 10's interrupted transfer and publication |
-| 6 | A dump that failed leaves nothing behind, written `.part` and renamed only once it has a size (`:788`) | **no subject** — it is written about dumps and B1 has none. The archive analogue is clause 4 and is not double-counted here |
-| 7 | `.env` in every spelling (`:793`) | **no subject** — no `.env`, including `deploy/env` |
-| 8 | How the script calls the client is proven with a recorder (`:796`) | **no subject** — no dump client to call. B2 and B3 introduce both the client and the recorder |
+| 1 | The key that opens the coffer does not travel with the coffer (`RULES.md#rule-12-key-does-not-travel-with-the-coffer`) | **exercised** — the KEK's two copies live outside the source host and outside the datastore, per the X2 interim |
+| 2 | The backup's encryption key is its own key (`RULES.md#rule-12-backup-key-is-its-own`) | **partly** — the half that says the key reaches its tool through the environment and never a command line is exercised; the half that refuses a key equal to `VAULT_MASTER_KEY` has **no subject**, because PodMesh has no vault and no such key exists to compare against |
+| 3 | A dump that was not taken is announced, never written empty (`RULES.md#rule-12-dump-not-taken-is-announced`) | **no subject** — no database |
+| 4 | The archive command's failure is the backup's failure (`RULES.md#rule-12-archive-failure-is-backup-failure`) | **exercised** — B1's mandatory path produces an archive, and the status line is printed only after that archive exists, has a size and has a checksum. Step 10's interrupted capture is this clause's test |
+| 5 | A failure after the archive is complete keeps the archive, and a housekeeping step that cannot run is a reported failure over a surviving archive (`RULES.md#rule-12-complete-archive-is-kept`) | **exercised** — one clause, tested by step 10's interrupted transfer and publication |
+| 6 | A dump that failed leaves nothing behind, written `.part` and renamed only once it has a size (`RULES.md#rule-12-failed-dump-leaves-nothing`) | **no subject** — it is written about dumps and B1 has none. The archive analogue is clause 4 and is not double-counted here |
+| 7 | `.env` in every spelling (`RULES.md#rule-12-env-in-every-spelling`) | **no subject** — no `.env`, including `deploy/env` |
+| 8 | How the script calls the client is proven with a recorder (`RULES.md#rule-12-client-call-proven-with-a-recorder`) | **no subject** — no dump client to call. B2 and B3 introduce both the client and the recorder |
 
-**Not engaged at all:** Rule 12's transport requirements (`:753-757`; `:758` already
+**Not engaged at all:** Rule 12's transport requirements (`RULES.md#rule-12`; `RULES.md#rule-12-what-a-backup-archive-never-contains` already
 opens the eight clauses above), scoped by their own
 opening line to `tar.bz2` archive transfers. B1's archive is chunked and encrypted before
 it moves and no `tar.bz2` leaves anything — see X3, and its owner.
@@ -1342,7 +1342,7 @@ supply the number either, because its interim deduplicates nothing across univer
 there is only one. The first real figure needs two universes under one candidate shape,
 which is a measurement lot of its own.
 
-**And the canon may already have answered it.** `RULES.md:1214` says R2 buckets are
+**And the canon may already have answered it.** `RULES.md#rule-37-fleet-map` says R2 buckets are
 *"derivable (`r2://<instance-id>`), never enumerated"*, while this design proposes one
 bucket with universes enumerated inside it. A per-instance bucket makes cross-universe
 deduplication impossible at the storage layer — which would settle X1 as shape 1 by
@@ -1369,8 +1369,8 @@ the ciphertext, and neither may depend on PodMesh being restored.
 Revision 3 called this a canon conflict and escalated it without reading the scope
 first. It is narrower than that. Rule 12's transport requirements are scoped by their
 own opening line to *"All archive transfers (`PROJECT.tar.bz2`, `REMOTE.tar.bz2`)"*
-(`RULES.md:753`), and Rule 16 widens them to *"any `tar.bz2` that leaves the host"*
-(`RULES.md:848`). This service transfers **content-addressed encrypted chunks**, which
+(`RULES.md#rule-12`), and Rule 16 widens them to *"any `tar.bz2` that leaves the host"*
+(`RULES.md#rule-16-archive-hygiene-scope`). This service transfers **content-addressed encrypted chunks**, which
 are not `tar.bz2` leaving a host. The literal canon therefore does not govern this
 transport: it is **silent**.
 
@@ -1378,8 +1378,8 @@ Silence is not permission, so an amendment is still owed — the canon should sa
 governs a chunk pull, a datastore sync and an operator download separately, and the
 Cloudflare Tunnel remains right for the distribution case it was written for.
 
-**And the canon says where an owed amendment is filed**: `RULES.md:5-6` and Rule 35
-(`RULES.md:1108`) send doctrine-versus-code gaps to `doctrine/CONVERGENCE-STATE.md`.
+**And the canon says where an owed amendment is filed**: `RULES.md#canon-preamble` and Rule 35
+(`RULES.md#rule-35`) send doctrine-versus-code gaps to `doctrine/CONVERGENCE-STATE.md`.
 That file exists and today carries no PodMesh entry at all. Declaring an amendment
 "owed" with no owner and no trigger is precisely the shape Rule 35 calls quietly
 softening doctrine to match what was built, so **this gap must be filed there, with an
@@ -1458,10 +1458,10 @@ starting.
 Each is a verbatim clause of the canon that binds this service without changing its
 shape. They belong in the B1 checklist, not in a later hardening pass.
 
-- **Private keys never cross a level** (Rule 36, `:1117`, `:1126`): the parent's Ed25519
+- **Private keys never cross a level** (Rule 36, `RULES.md#rule-36`): the parent's Ed25519
   authority key never leaves the parent, and no private key climbs into a ledger or
   descends into a child. No archive may contain one.
-- **`lastBackup` in `status.json` is canonical** (Rule 37, `:1174-1176`): every board or
+- **`lastBackup` in `status.json` is canonical** (Rule 37, `RULES.md#rule-37-status-json`): every board or
   cockpit tile is a rendering of it, never a rival.
 
   *Revision 4 added "this service writes it", which asserts two objects PodMesh does not
@@ -1474,45 +1474,45 @@ shape. They belong in the B1 checklist, not in a later hardening pass.
   invents no substitute.** Its own records are the manifests and the catalogue, which
   are evidence, not a rival status surface. Resolving X1's Rule 37 question resolves
   this one with it.
-- **The test universe is destroyed after it passes** (Rule 10, `:542`;
-  `SHAPER-OS-V1.14/LAW.md:13` and `:19` — the root file, not the eight-line pointer at
+- **The test universe is destroyed after it passes** (Rule 10, `RULES.md#rule-10-destroy-after-test`;
+  `SHAPER-OS-V1.14/LAW.md#law-test-rebuilt-then-destroyed` and `#law-test-rebuilt-clean-sheet` — the root file, not the eight-line pointer at
   `software/LAW.md`): a validation run rebuilds from empty and destroys the vehicle, which is what
   makes it a cold-recovery proof rather than a warm one.
 - **Never wipe what you did not provision** (`SHAPER-OS-V1.14/docs/agent/BOOT-CONTRACT.md`
-  §2, `:27-30`): no volume, no
+  §2): no volume, no
   database, no universe. If it is unclear whether a machine carries production, it does.
-- **Halt on a missing secret** (Rule 0J, `:232-233`; BOOT-CONTRACT §12, `:173`): a
+- **Halt on a missing secret** (Rule 0J, `RULES.md#rule-0j-zero-blind-execution`; BOOT-CONTRACT §12): a
   required key that is absent, empty or still a placeholder stops the run before
   anything is built or launched, and names what is missing.
-- **Off-site encryption is AES-256-GCM to a cold bucket** (Rule 16, `:844`), copying the
+- **Off-site encryption is AES-256-GCM to a cold bucket** (Rule 16, `RULES.md#rule-16`), copying the
   archives and dumps — never a git clone pretending to be a backup.
-- **Namespace isolation on restore** (Rule 22, `:948-949`): a universe's vector
+- **Namespace isolation on restore** (Rule 22, `RULES.md#rule-22-isolated-qdrant-collection`): a universe's vector
   collection is its own, and a restore never cross-mounts one into another.
-- **Multi-threaded compression** for archive creation (Rule 12, `:754`) — this binds
+- **Multi-threaded compression** for archive creation (Rule 12, `RULES.md#rule-12`) — this binds
   **B2 onward**, which create `tar.bz2` archives. B1 creates none, and X3's scope
   finding rules the same bullet list out for a chunk pull; keeping it as a B1
   obligation would contradict that finding in the same document.
-- **Proof is read from outside the producer** (BOOT-CONTRACT §9, `:102-106`; the
-  doctrinal parent is Rule 0G, `RULES.md:164-176`, "no fake, no fallback"): a
+- **Proof is read from outside the producer** (BOOT-CONTRACT §9; the
+  doctrinal parent is Rule 0G, `RULES.md#rule-0g`, "no fake, no fallback"): a
   `COMPLETED` status is not proof that a file is correct, and a health endpoint
   answering 200 is not proof that a job ran.
-- **A repair loop that can give up** (Rule 27, `LAW.md:24`): B1 step 10 retries four
+- **A repair loop that can give up** (Rule 27, `LAW.md#law-repair-loop-can-give-up`): B1 step 10 retries four
   interrupted operations, so each needs a declared bound, a backoff and a resting
   terminal state. A retry that never stops is not recovery.
-- **The parent repairs the child, never itself** (Rule 23, `LAW.md:17`; the SSH-authority row beneath it at `:18` is Rule 36, not Rule 24 — Rule 24 is the Root Guardian Law, `RULES.md:960`): the
+- **The parent repairs the child, never itself** (Rule 23, `LAW.md#law-parent-repairs-child`; the SSH-authority row beneath it, `LAW.md#law-parent-holds-ssh-authority`, is Rule 36, not Rule 24 — Rule 24 is the Root Guardian Law, `RULES.md#rule-24`): the
   recovery agent described below sits **outside** the service it restores. A Backup
   Server that repairs its own running instance breaks the external-healing law, which
   is exactly why the bootstrap is a separate `podmesh-recovery` package on a clean host
   rather than a self-repair mode.
 - **Every WireGuard peer block carries a human-readable comment** (Rule 13,
-  `:812-819`): the canon requires `### Client <hostname> (CT <vmid> on <host>)` above
+  `RULES.md#rule-13-peer-comments`): the canon requires `### Client <hostname> (CT <vmid> on <host>)` above
   every `[Peer]`, and *"anonymous or untagged peer blocks are strictly prohibited"*. B1
   does not use the mesh, so it registers no peer and the clause has no subject there.
   The moment a deployment does put the Backup Server on the mesh — the highest-value
   target in the constellation, per D1 — its peer block is exactly the one that must be
   identifiable at a glance, and an unnamed key on the gateway is the harder failure to
   audit later.
-- **Every checklist item records what actually happened** (Rule 20, `:906-909`): target
+- **Every checklist item records what actually happened** (Rule 20, `RULES.md#rule-20-record-what-actually-happened`): target
   and source version, execution date, steps, expected and observed results, the actual
   evidence reference, the execution actor, and coverage limits — with independent review
   supplementing the agent's own run, and human acceptance separate from both. This binds
@@ -1536,8 +1536,8 @@ an agent that had not re-read the file first, and the tooling's warning that the
 had changed was misread.
 
 Three sibling documents kept pointing at the contract this one had dropped:
-`PREPARE-A-HOST.md:47-48`, `LVM-LAB-PLAN.md:11`, and `DELIVERY-CHECKLIST.md:64-65`
-and `:70`. An implementer starting B1 in that window would have found no named
+`PREPARE-A-HOST.md` (its storage recommendation), `LVM-LAB-PLAN.md`, and `DELIVERY-CHECKLIST.md`
+§4 and §5. An implementer starting B1 in that window would have found no named
 capture source and would plausibly have invented `podman pause` plus a copy — which is
 precisely what the restored section forbids, and precisely the error the first
 counter-review's BBS-R1 was written to prevent.
