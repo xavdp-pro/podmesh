@@ -41,11 +41,16 @@ Subcommands:
                                  declare the policy on the host under the gate's authority, rotate the
                                  epoch to it, acquire; starting is the operator's (the API's `start`)
   cycle         --universe U --active SSH --standby SSH [--also SSH]... [--keep N --keep-points N --minimum-age S]
+                [--capture stopped|live]
                                  one capture: declare the collector's retention on the active host,
                                  stop, prepare, renew, start again; carry; restore into quarantine on
-                                 the standby; prune older copies
+                                 the standby; prune older copies. `--capture live` never stops the
+                                 universe: it is checkpointed with its memory and resumed in place
+                                 (interrupted for the dump, under a second for a small universe), the
+                                 archive is staged on each standby, and older staged points discarded
   takeover      --universe U --active SSH --standby SSH [--also SSH]... [--no-start]
                                  [--network-profile isolated|managed --network-address IP]
+                                 (a live copy is promoted running, with its memory: no start, no network flags)
                                  the standby takes over, under the lease and margin recorded by
                                  `activate` (never this invocation's defaults): refuses while the active host is reachable
                                  and entitled (that is a planned handoff, not a takeover); otherwise
@@ -373,6 +378,8 @@ def cmd_cycle(args):
     # it every time with the same values, so a universe under this tool is never left without one.
     ok(A, request('collection_retention_declare', u, args.reference, keep_latest=args.keep_points, minimum_age_seconds=args.minimum_age),
        'collection_retention_declare')
+    if args.capture == 'live':
+        return cycle_live(args, A, standbys, ledger)
     began = A.call('time')['time']
     stopped = ok(A, request('stop', u, args.reference, timeout_seconds=args.stop_timeout, on_timeout='kill'), 'stop for capture')
     if stopped.get('forced') is not False:
@@ -427,12 +434,56 @@ def cmd_cycle(args):
          'note': 'the active host\'s archives are the collector\'s (class 5, under the retention declared here); this tool never deletes them'})
 
 
+def cycle_live(args, A, standbys, ledger):
+    """One live capture: the universe is checkpointed with its memory and resumed in place, never stopped by a
+    `stop`; the archive is carried to each standby and staged there, ready to be promoted running."""
+    u = args.universe
+    prepared = ok(A, request('recovery_point_prepare', u, args.reference, capture='live'), 'recovery_point_prepare (live)')
+    point = prepared['recovery_point_uuid']
+    capture = prepared.get('capture') or {}
+    if not prepared.get('resumed'):
+        raise Refusal(f'the live capture was recorded but the universe did not resume in place ({capture.get("resume_failure")}); '
+                      'it is stopped on the active host with its checkpoint files kept, and nothing was carried')
+    listed = ok(A, request('recovery_point_status', u, args.reference), 'recovery_point_status')
+    row = next(r for r in listed['recovery_points'] if r['recovery_point_uuid'] == point)
+    ok(A, request('activation_renew', u, args.reference), 'activation_renew')
+    copies, discarded, kept = [], [], []
+    for B in standbys:
+        carried = transfer(A, B, point, files=('recovery-point-manifest.json', 'checkpoint.tar.zst'))
+        staged = ok(B, request('recovery_point_stage', u, args.reference, recovery_point_uuid=point), f'recovery_point_stage on {B.role}')
+        ledger['cycles'].append({'point': point, 'generation': prepared['generation'], 'prepared_at': row['prepared_at'],
+                                 'capture': 'live', 'archive_sha256': prepared['archive']['sha256'], 'archive_bytes': prepared['archive']['bytes'],
+                                 'standby': B.identity, 'staged_at': staged['staged_at'], 'carried_bytes': carried['files']['checkpoint.tar.zst']['bytes'],
+                                 'interruption_seconds': capture.get('interruption_seconds')})
+        copies.append({'standby': B.identity, 'staged_point': point})
+        mine = [c for c in ledger['cycles'] if c.get('standby') == B.identity and c.get('capture') == 'live']
+        for old in mine[:max(len(mine) - args.keep, 0)]:
+            if old.get('discarded') or old.get('promoted'):
+                continue
+            r = B.api(request('recovery_point_discard', u, args.reference, recovery_point_uuid=old['point']))
+            if r.get('ok'):
+                old['discarded'] = int(time.time())
+                discarded.append(old['point'])
+            else:
+                old['discard_refused'] = r.get('error')
+                kept.append({'point': old['point'], 'refused': r.get('error')})
+    save_ledger(u, ledger)
+    out({'universe': u, 'active': A.identity, 'standbys': [B.identity for B in standbys], 'point': point, 'capture': 'live',
+         'generation': prepared['generation'], 'copies': copies, 'consistency_class': prepared.get('consistency_class'),
+         'stopped_for_seconds': capture.get('interruption_seconds'),
+         'interruption': {k: capture.get(k) for k in ('dump_seconds', 'resume_seconds', 'interruption_seconds')},
+         'archive_bytes': prepared['archive']['bytes'], 'discarded_on_standbys': discarded, 'discard_refused': kept,
+         'points_on_active_outbox': len(listed['recovery_points']),
+         'retention_declared_on_active': {'keep_latest': args.keep_points, 'minimum_age_seconds': args.minimum_age},
+         'note': 'never stopped: the universe was checkpointed with its memory and resumed in place; the interruption is the dump plus the resume'})
+
+
 def cmd_takeover(args):
     gate = gate_or_refuse()
     (B,) = hosts(args, ('standby', args.standby))
     u = args.universe
     ledger = load_ledger(u)
-    copies = [c for c in ledger['cycles'] if not c.get('pruned') and not c.get('promoted') and c.get('standby', B.identity) == B.identity]
+    copies = [c for c in ledger['cycles'] if not c.get('pruned') and not c.get('discarded') and not c.get('promoted') and c.get('standby', B.identity) == B.identity]
     if not copies:
         raise Refusal('no quarantined copy of this universe is recorded on this standby; run a cycle to it first')
     newest = copies[-1]
@@ -472,15 +523,22 @@ def cmd_takeover(args):
     current = gate.inspect(u)
     permit = permit_for(gate, u, B, current['epoch'])
     lease = ok(B, request('activation_acquire', u, args.reference, permit=permit), 'activation_acquire on the standby')
-    promotion = {'restored_universe_uuid': newest['quarantined_uuid'], 'network_profile': args.network_profile}
-    if args.network_address:
-        promotion['network_address'] = args.network_address
+    live = newest.get('capture') == 'live'
+    if live:
+        # A staged live point comes back running with its memory: the promotion is the start.
+        promotion = {'recovery_point_uuid': newest['point']}
+    else:
+        promotion = {'restored_universe_uuid': newest['quarantined_uuid'], 'network_profile': args.network_profile}
+        if args.network_address:
+            promotion['network_address'] = args.network_address
     promoted = ok(B, request('recovery_point_promote', u, args.reference, **promotion), 'recovery_point_promote')
     newest['promoted'] = int(time.time())
     ledger['rotations'].append({'epoch': permit['epoch'], 'to': B.identity, 'at': int(time.time()), 'by': 'takeover'})
     save_ledger(u, ledger)
     started = None
-    if not args.no_start:
+    if live:
+        started = promoted
+    elif not args.no_start:
         started = ok(B, request('start', u, args.reference, observe_seconds=1), 'start on the standby')
     # The new grant is delivered to every other host that can be reached -- the old active, and any
     # other standby -- so that each screen learns the epoch and a stale permit bound to it is refused.
@@ -500,7 +558,8 @@ def cmd_takeover(args):
     out({'universe': u, 'standby': B.identity, 'active': A.identity if A else None, 'active_reachable': A is not None,
          'waited': waited, 'epoch': permit['epoch'], 'lease': {k: lease[k] for k in ('generation', 'expires_at', 'live')},
          'promoted_from': {'point': newest['point'], 'generation': newest['generation'], 'prepared_at': newest['prepared_at'],
-                           'quarantined_uuid': newest['quarantined_uuid']},
+                           'capture': newest.get('capture', 'stopped'), 'quarantined_uuid': newest.get('quarantined_uuid'),
+                           'with_memory': live},
          'data_lost_since_seconds': int(time.time()) - newest['prepared_at'],
          'started': started is not None, 'active_superseded': superseded, 'other_standbys_informed': others,
          'not_proven': ['mutual exclusion beyond the epoch: the gate is this workstation\'s file and PodMesh cannot verify a permit\'s origin',
@@ -519,6 +578,7 @@ def main():
     ro.add_argument('--margin', type=int, default=None); ro.add_argument('--standbys', type=int, default=None)
     c = sub.add_parser('cycle'); c.add_argument('--universe', required=True); c.add_argument('--active', required=True); c.add_argument('--standby', required=True)
     c.add_argument('--also', action='append', help='a further standby (repeatable): one capture, restored on each')
+    c.add_argument('--capture', default='stopped', choices=('stopped', 'live'), help='live: checkpoint with memory and resume in place, no stop')
     c.add_argument('--keep', type=int, default=3, help='quarantined copies kept on each standby')
     c.add_argument('--keep-points', type=int, default=3, help='recovery points the collector keeps on the active host whatever their age')
     c.add_argument('--minimum-age', type=int, default=3600, help='seconds a recovery point must be old before the collector may take it')

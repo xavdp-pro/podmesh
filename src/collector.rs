@@ -708,6 +708,7 @@ struct Point {
     rootfs_bytes: i64,
     prepared_at: i64,
     outbox: String,
+    capture: String,
 }
 fn point_row(r: &rusqlite::Row) -> rusqlite::Result<Point> {
     Ok(Point {
@@ -721,9 +722,10 @@ fn point_row(r: &rusqlite::Row) -> rusqlite::Result<Point> {
         rootfs_bytes: r.get(7)?,
         prepared_at: r.get(8)?,
         outbox: r.get(9)?,
+        capture: r.get(10)?,
     })
 }
-const POINT_COLUMNS: &str = "recovery_point_uuid,universe_uuid,generation,operation_id,state,manifest_sha256,rootfs_sha256,rootfs_bytes,prepared_at,outbox";
+const POINT_COLUMNS: &str = "recovery_point_uuid,universe_uuid,generation,operation_id,state,manifest_sha256,rootfs_sha256,rootfs_bytes,prepared_at,outbox,capture";
 /// Every prepared point, oldest generation first, so that the bound falls on the newest ones -- which the
 /// retention keeps anyway.
 fn prepared_points(db: &Connection) -> Result<Vec<Point>, Error> {
@@ -821,7 +823,8 @@ fn classify_point(db: &Connection, p: &Point, hash: bool) -> Result<Candidate, E
     if !path_matches {
         blockers.push("the recorded outbox path is not the path this service derives for the point; nothing under it is touched".into());
     }
-    let rootfs = expected.join(crate::recovery_point::ROOTFS);
+    // The one archive a point holds: the rootfs export of a stopped capture, or the checkpoint export of a live one.
+    let rootfs = expected.join(crate::recovery_point::piece_name(&p.capture));
     match tr::regular_file(&rootfs) {
         Err(e) => {
             proofs["archive"] = json!({"present": false, "error": e.to_string()});
@@ -1567,7 +1570,7 @@ fn point_removal_verdict(dir: &std::path::Path) -> (bool, Vec<String>) {
 fn remove_point_files(point: &str) -> Result<u64, Error> {
     let dir = tr::outbox(point)?;
     let mut removed = 0u64;
-    for name in [crate::recovery_point::ROOTFS, crate::recovery_point::MANIFEST, "rootfs.tar.partial"] {
+    for name in [crate::recovery_point::ROOTFS, crate::recovery_point::ARCHIVE, crate::recovery_point::MANIFEST, "rootfs.tar.partial", "checkpoint.tar.zst.partial"] {
         let path = dir.join(name);
         match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

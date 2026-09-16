@@ -23,18 +23,31 @@
 //! which universe a past stop belonged to. An exit code of 137 is the escalation signature
 //! the API document names, and a point whose stop escalated has no class: it is recorded as
 //! a failed capture, never as a weaker success.
-use crate::lifecycle as lc;
+use crate::lifecycle::{self as lc, failure};
 use crate::migration as mg;
 use crate::transfer as tr;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
+use std::fs;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+use std::time::Instant;
 
 type Error = Box<dyn std::error::Error>;
 
 pub const FORMAT: &str = "podmesh-recovery-point/0-unsigned-unencrypted";
 pub const MANIFEST: &str = "recovery-point-manifest.json";
 pub const ROOTFS: &str = "rootfs.tar";
+/// The archive of a live point: Podman's checkpoint export (CRIU images and the writable layer), zstd.
+pub const ARCHIVE: &str = "checkpoint.tar.zst";
+pub const CAPTURE_STOPPED: &str = "stopped";
+pub const CAPTURE_LIVE: &str = "live";
+pub const PIECE_ROOTFS: &str = "rootfs-export";
+pub const PIECE_CHECKPOINT: &str = "podman-checkpoint-export";
+/// The class a live point may claim (docs/BACKUP-SERVER.md): a memory checkpoint bound to the exact disk state
+/// it was taken against -- which the dump produces by construction, its processes being stopped when Podman
+/// exports the writable layer into the same archive.
+const LIVE_CLASS: &str = "memory-coherent";
 /// Where a restore's imported image is tagged; only images named nowhere else are ever removed.
 pub const RESTORE_REPOSITORY: &str = "localhost/podmesh-restore:";
 const EXPORT_TIMEOUT_SECONDS: u64 = 900;
@@ -72,8 +85,56 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             recovery_point_uuid TEXT NOT NULL,
             container_id TEXT NOT NULL,
             lease_generation INTEGER NOT NULL,
+            promoted_at INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS recovery_point_staged(
+            recovery_point_uuid TEXT PRIMARY KEY,
+            universe_uuid TEXT NOT NULL,
+            operation_id TEXT NOT NULL UNIQUE,
+            generation INTEGER NOT NULL,
+            archive_sha256 TEXT NOT NULL,
+            archive_bytes INTEGER NOT NULL,
+            manifest_sha256 TEXT NOT NULL,
+            image_id TEXT NOT NULL,
+            inbox TEXT NOT NULL,
+            staged_at INTEGER NOT NULL,
+            discarded_at INTEGER,
+            discard_operation_id TEXT,
+            promoted_operation_id TEXT);
+         CREATE TABLE IF NOT EXISTS recovery_point_live_captures(
+            operation_id TEXT PRIMARY KEY,
+            universe_uuid TEXT NOT NULL,
+            container_id TEXT NOT NULL,
+            recovery_point_uuid TEXT NOT NULL,
+            began_at INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            detail TEXT);
+         CREATE TABLE IF NOT EXISTS recovery_point_live_promote_attempts(
+            operation_id TEXT PRIMARY KEY,
+            universe_uuid TEXT NOT NULL,
+            recovery_point_uuid TEXT NOT NULL,
+            lease_generation INTEGER NOT NULL,
+            launched_at INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            detail TEXT);
+         CREATE TABLE IF NOT EXISTS recovery_point_live_promotions(
+            operation_id TEXT PRIMARY KEY,
+            universe_uuid TEXT NOT NULL,
+            recovery_point_uuid TEXT NOT NULL,
+            container_id TEXT NOT NULL,
+            lease_generation INTEGER NOT NULL,
+            restore_log_sha256 TEXT NOT NULL,
             promoted_at INTEGER NOT NULL);",
     )?;
+    // The capture mode of a point, added beside the original columns: a journal from before live points gains
+    // it with the mode every earlier point was made with.
+    let has_capture = {
+        let mut s = db.prepare("PRAGMA table_info(recovery_points)")?;
+        let names: Vec<String> = s.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<_, _>>()?;
+        names.iter().any(|n| n == "capture")
+    };
+    if !has_capture {
+        db.execute("ALTER TABLE recovery_points ADD COLUMN capture TEXT NOT NULL DEFAULT 'stopped'", [])?;
+    }
     Ok(())
 }
 
@@ -215,29 +276,38 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
     if operation == "recovery_point_status" {
         let points: Vec<Value> = {
             let mut s = db.prepare(
-                "SELECT recovery_point_uuid,generation,parent_recovery_point_uuid,state,manifest_sha256,rootfs_sha256,rootfs_bytes,prepared_at,outbox
+                "SELECT recovery_point_uuid,generation,parent_recovery_point_uuid,state,manifest_sha256,rootfs_sha256,rootfs_bytes,prepared_at,outbox,capture
                  FROM recovery_points WHERE universe_uuid=?1 ORDER BY generation",
             )?;
             let rows: Vec<Value> = s
                 .query_map([uuid], |r| {
+                    let capture: String = r.get(9)?;
                     Ok(json!({
                         "recovery_point_uuid": r.get::<_, String>(0)?, "generation": r.get::<_, i64>(1)?,
                         "parent_recovery_point_uuid": r.get::<_, Option<String>>(2)?, "state": r.get::<_, String>(3)?,
                         "manifest_sha256": r.get::<_, String>(4)?, "rootfs_sha256": r.get::<_, String>(5)?,
                         "rootfs_bytes": r.get::<_, i64>(6)?, "prepared_at": r.get::<_, i64>(7)?, "outbox": r.get::<_, String>(8)?,
+                        "archive": piece_name(&capture), "capture": capture,
                     }))
                 })?
                 .collect::<Result<_, _>>()?;
             rows
         };
-        return Ok(json!({"universe_uuid": uuid, "recovery_points": points,
-            "note": "every point here is prepared and unsigned; none is sealed, because this build can produce no signature"}));
+        let staged = staged_for(db, uuid)?;
+        return Ok(json!({"universe_uuid": uuid, "recovery_points": points, "staged": staged,
+            "note": "every point here is prepared and unsigned; none is sealed, because this build can produce no signature. rootfs_sha256 and rootfs_bytes name a live point's checkpoint archive; `archive` says which file"}));
     }
     if operation == "recovery_point_restore" {
         return restore(db, request, uuid);
     }
     if operation == "recovery_point_promote" {
         return promote(db, request, uuid);
+    }
+    if operation == "recovery_point_stage" {
+        return stage(db, request, uuid);
+    }
+    if operation == "recovery_point_discard" {
+        return discard(db, request, uuid);
     }
     if operation != "recovery_point_prepare" {
         return Err("Unsupported recovery point operation".into());
@@ -253,6 +323,16 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
 
     // A universe mid-handoff is not captured: its reservation is the authority on its state.
     mg::refuse_if_reserved(db, uuid, "recovery_point_prepare")?;
+    let capture = match request.get("capture") {
+        None => CAPTURE_STOPPED,
+        Some(v) => v.as_str().ok_or("capture must be \"stopped\" or \"live\"")?,
+    };
+    if capture == CAPTURE_LIVE {
+        return prepare_live(db, uuid, id, reference);
+    }
+    if capture != CAPTURE_STOPPED {
+        return Err("capture must be \"stopped\" or \"live\"".into());
+    }
 
     let name = format!("podmesh-{uuid}");
     let Some(c) = lc::inspect(&name)? else {
@@ -348,7 +428,7 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
         },
         "pieces": [{
             "name": ROOTFS,
-            "kind": "rootfs-export",
+            "kind": PIECE_ROOTFS,
             "order": 0,
             "bytes": rootfs_bytes,
             "plaintext_sha256": rootfs_sha256,
@@ -370,9 +450,10 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
         return Err("The manifest written to the outbox does not hash to the value computed in memory".into());
     }
     db.execute(
-        "INSERT INTO recovery_points VALUES(?1,?2,?3,?4,?5,'prepared',?6,?7,?8,?9,?10)",
+        "INSERT INTO recovery_points(recovery_point_uuid,universe_uuid,generation,parent_recovery_point_uuid,operation_id,state,manifest_sha256,rootfs_sha256,rootfs_bytes,prepared_at,outbox,capture)
+         VALUES(?1,?2,?3,?4,?5,'prepared',?6,?7,?8,?9,?10,?11)",
         params![point, uuid, generation, parent, id, manifest_sha256, rootfs_sha256, rootfs_bytes as i64, now,
-                outbox.to_string_lossy().to_string()],
+                outbox.to_string_lossy().to_string(), CAPTURE_STOPPED],
     )?;
     Ok(json!({
         "recovery_point_uuid": point,
@@ -437,6 +518,9 @@ fn restore(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error>
         return Err("A restore creates a new identity: the restored universe must not reuse the source universe's UUID".into());
     }
     let piece = &manifest["pieces"][0];
+    if piece["kind"].as_str() == Some(PIECE_CHECKPOINT) {
+        return Err("This point is a live memory checkpoint: it restores as running processes and gets no quarantined copy; hold it with recovery_point_stage and bring it back with recovery_point_promote under the lease".into());
+    }
     let expected_sha = piece["plaintext_sha256"].as_str().ok_or("The manifest's piece has no digest")?;
     let expected_bytes = piece["bytes"].as_u64().ok_or("The manifest's piece has no size")?;
     let rootfs = inbox.join(ROOTFS);
@@ -552,6 +636,10 @@ fn promote(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error>
     let id = lc::text(request, "operation_id")?;
     lc::token(id)?;
     let reference = lc::text(request, "authorization_ref")?;
+    // A staged live point is promoted by its own identifier; a quarantined copy by the copy's.
+    if request.get("recovery_point_uuid").is_some() && request.get("restored_universe_uuid").is_none() {
+        return promote_live(db, request, uuid);
+    }
     let restored = lc::text(request, "restored_universe_uuid")?;
     lc::token(restored)?;
     if let Some(previous) = promotion_view(db, id, true)? {
@@ -626,6 +714,873 @@ fn promote(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error>
         params![id, uuid, restored, point, container_id, generation, crate::now() as i64],
     )?;
     promotion_view(db, id, false)?.ok_or_else(|| "The promotion was recorded but cannot be read back".into())
+}
+
+// ------------------------------------------------------------------------------------------------
+// Live points: a running universe captured and resumed in place; the copy staged, then promoted.
+// ------------------------------------------------------------------------------------------------
+
+/// The archive a point holds, by its capture mode.
+pub fn piece_name(capture: &str) -> &'static str {
+    if capture == CAPTURE_LIVE { ARCHIVE } else { ROOTFS }
+}
+
+/// An exit code that may be unknown (an attempt resumed after an interruption did not see its command end).
+struct ExitCode(Option<i32>);
+impl ExitCode {
+    fn code(&self) -> Option<i32> {
+        self.0
+    }
+}
+
+fn round3(v: f64) -> f64 {
+    (v * 1000.0).round() / 1000.0
+}
+
+/// Podman's `--print-stats` answer from a command's preserved stdout, or null when there is none to read.
+fn print_stats(stdout: &Path) -> Value {
+    let bytes = mg::read_bounded(stdout).unwrap_or_default();
+    let text = String::from_utf8_lossy(&bytes);
+    match text.find('{') {
+        Some(i) => serde_json::from_str(text[i..].trim()).unwrap_or(Value::Null),
+        None => Value::Null,
+    }
+}
+
+/// The dump is verified before anything resumes: the same container, checkpointed and stopped; an archive that
+/// lists the CRIU entries; a dump log by the qualified runtime that reports success. The command's exit code
+/// alone proves nothing.
+fn verify_dump(container_id: &str, observed: Option<&Value>, archive: &Path, log: &Path) -> Result<(), String> {
+    let c = observed.ok_or("the universe container disappeared during the dump")?;
+    if c["Id"].as_str() != Some(container_id) {
+        return Err("the container under the universe name is no longer the one that was dumped".into());
+    }
+    if c["State"]["Checkpointed"] != json!(true) || lc::process_active(c) {
+        return Err(format!("the container is not in a checkpointed, stopped state (state {})", lc::status(c)));
+    }
+    let bytes = fs::metadata(archive).map(|m| m.len()).unwrap_or(0);
+    if bytes == 0 {
+        return Err("the archive is missing or empty".into());
+    }
+    let listing = std::process::Command::new("/usr/bin/tar").arg("-tf").arg(archive).output().map_err(|e| format!("the archive could not be listed: {e}"))?;
+    let entries = String::from_utf8_lossy(&listing.stdout);
+    if !listing.status.success() || !["config.dump", "spec.dump", "checkpoint/inventory.img"].iter().all(|e| entries.lines().any(|l| l == *e)) {
+        return Err("the archive is unreadable or lacks the expected checkpoint entries".into());
+    }
+    if !mg::copy_podman_log(c, "CheckpointLog", "dump.log", log) {
+        return Err("the CRIU dump log is unavailable".into());
+    }
+    let text = fs::read_to_string(log).unwrap_or_default();
+    if !text.contains(&format!("(gitid {})", mg::RUNTIME_GIT_ID)) || !text.contains("Dumping finished successfully") {
+        return Err("the dump log does not show a successful dump by the qualified private runtime".into());
+    }
+    Ok(())
+}
+
+/// A resumed or promoted universe is verified from outside: the expected container, running and not frozen,
+/// reported restored after this operation began, and a restore log by the qualified runtime that reports success.
+fn verify_restored(container_id: Option<&str>, observed: Option<&Value>, log: &Path, preserved: bool, since: i64) -> Result<(), String> {
+    let c = observed.ok_or("the universe container is absent")?;
+    if let Some(expected) = container_id {
+        if c["Id"].as_str() != Some(expected) {
+            return Err("the container under the universe name is not the one that was checkpointed".into());
+        }
+    }
+    if !lc::process_active(c) {
+        return Err(format!("the universe is not running (state {})", lc::status(c)));
+    }
+    if crate::cleanup::frozen(c["Id"].as_str().unwrap_or("")) {
+        return Err("the container's cgroup is frozen: the universe is suspended, not running".into());
+    }
+    if c["State"]["Restored"] != json!(true) {
+        return Err("Podman does not report the container as restored".into());
+    }
+    if !c["State"]["RestoredAt"].as_str().and_then(lc::epoch).is_some_and(|t| t >= since) {
+        return Err("the container was not restored after this operation began".into());
+    }
+    if !preserved {
+        return Err("the CRIU restore log is unavailable".into());
+    }
+    let text = fs::read_to_string(log).unwrap_or_default();
+    if !text.contains(&format!("(gitid {})", mg::RUNTIME_GIT_ID)) || !text.contains("Restore finished successfully") {
+        return Err("the restore log does not show a successful restore by the qualified private runtime".into());
+    }
+    Ok(())
+}
+
+/// A recovery point of a RUNNING universe that the universe survives. The qualified private runtime dumps its
+/// processes -- memory and descriptors, then the processes end -- Podman exports the writable layer of the
+/// stopped container into the same archive, and the universe resumes in place from the checkpoint files Podman
+/// kept. Memory and disk are of one instant, the design's `memory-coherent` class, and the universe is
+/// interrupted for the dump and the resume rather than stopped and started: its memory continues. Measured
+/// about half a second on a small universe (2026-09-16). Refused outside the migration checkpoint's qualified
+/// scope (network-disabled, mount-free, unprivileged, no TTY, musl or rseq-free glibc processes, at most 1 GiB,
+/// the private runtime intact), and, where a policy names the universe, without this host's live lease:
+/// resuming is a start.
+///
+/// When the resume fails the point is still recorded -- its archive is whole and verified -- and the answer
+/// says `resumed: false` with the reason: the universe is then stopped with its checkpoint files kept, and an
+/// ordinary `start` begins it afresh without its memory. Nothing here starts it on its own.
+fn prepare_live(db: &Connection, uuid: &str, id: &str, reference: &str) -> Result<Value, Error> {
+    let name = format!("podmesh-{uuid}");
+    let Some(c) = lc::inspect(&name)? else {
+        return Err("No such universe on this host; nothing was captured".into());
+    };
+    if c["Config"]["Labels"]["io.podmesh.universe"].as_str() != Some(uuid) {
+        return Err("The container is not this universe; nothing was captured".into());
+    }
+    // An earlier attempt of this operation that the service did not see to the end: the dump may have ended the
+    // processes and nobody resumed them. It is settled first -- the universe brought back in place from its kept
+    // images if it is stopped and checkpointed -- and reported as an interrupted capture: no point is recorded
+    // from bytes whose resume this service did not observe.
+    if let Some((began_at, recorded_container, recorded_point, state)) = db
+        .query_row(
+            "SELECT began_at,container_id,recovery_point_uuid,state FROM recovery_point_live_captures WHERE operation_id=?1",
+            [id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)),
+        )
+        .optional()?
+    {
+        return settle_interrupted_capture(db, id, uuid, &c, began_at, &recorded_container, &recorded_point, &state);
+    }
+    crate::activation::refuse_if_not_activated(db, uuid, "recovery_point_prepare (live: the resume is a start)")?;
+    let (blockers, facts) = mg::capture_assess(db, uuid, &c)?;
+    if !blockers.is_empty() {
+        return Err(failure("Live capture preconditions not met; nothing was suspended or written", json!({"blockers": blockers, "facts": facts})));
+    }
+    let container_id = c["Id"].as_str().ok_or("Universe container has no ID")?.to_string();
+    let dump_unit = format!("podmesh-live-capture-{id}.scope");
+    let resume_unit = format!("podmesh-live-resume-{id}.scope");
+    if mg::unit_busy(&dump_unit) || mg::unit_busy(&resume_unit) {
+        return Err("A scope of this operation has not finished, or its state cannot be queried; retry after it finishes".into());
+    }
+    let work = mg::base()?.join(id);
+    fs::create_dir_all(&work)?;
+    fs::set_permissions(&work, fs::Permissions::from_mode(0o700))?;
+    let open = |path: &Path| fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path);
+    let point = fs::read_to_string("/proc/sys/kernel/random/uuid")?.trim().to_string();
+    let outbox = tr::outbox(&point)?;
+    tr::private_dir(&outbox)?;
+    let archive_tmp = outbox.join(format!("{ARCHIVE}.partial"));
+    let archive = outbox.join(ARCHIVE);
+
+    // --- Durable before anything is suspended: an interruption from here on is settled by the next attempt.
+    let opened_at = crate::now() as i64;
+    db.execute(
+        "INSERT INTO recovery_point_live_captures VALUES(?1,?2,?3,?4,?5,'dumping',NULL)",
+        params![id, uuid, container_id, point, opened_at],
+    )?;
+    // --- The dump. From here until the resume below, the universe's processes are stopped.
+    let began = Instant::now();
+    let dump = mg::checkpoint_export(&dump_unit, id, &container_id, &archive_tmp, open(&work.join("dump.stdout"))?, open(&work.join("dump.stderr"))?)?;
+    let dump_seconds = began.elapsed().as_secs_f64();
+    let closed_at = crate::now() as i64;
+    let after_dump = lc::inspect(&name)?;
+    let dump_log = work.join("dump.log");
+    let dump_stats = print_stats(&work.join("dump.stdout"));
+    if let Err(reason) = verify_dump(&container_id, after_dump.as_ref(), &archive_tmp, &dump_log) {
+        let _ = fs::remove_file(&archive_tmp);
+        // A universe the dump left stopped is brought back in place, once; what happened is in the refusal.
+        let brought_back = match after_dump.as_ref() {
+            Some(c2) if !lc::process_active(c2) && c2["State"]["Checkpointed"] == json!(true) => {
+                let r = mg::restore_kept(&resume_unit, id, &container_id, open(&work.join("resume.stdout"))?, open(&work.join("resume.stderr"))?);
+                let now_c = lc::inspect(&name)?;
+                json!({"attempted": true, "exit_code": r.ok().and_then(|s| s.code()), "running_now": now_c.as_ref().is_some_and(lc::process_active)})
+            }
+            _ => json!({"attempted": false}),
+        };
+        let now_c = lc::inspect(&name)?;
+        let stderr = mg::read_bounded(&work.join("dump.stderr")).unwrap_or_default();
+        let detail = json!({"reason": reason, "exit_code": dump.code(), "stderr_tail": mg::tail(&stderr), "observed": now_c.as_ref().map(lc::state_view),
+            "brought_back": brought_back, "artifact_directory": work, "dump_statistics": dump_stats});
+        mg::write_private(&work.join("failure.json"), serde_json::to_string_pretty(&detail)?.as_bytes())?;
+        let _ = fs::remove_dir(&outbox);
+        db.execute("UPDATE recovery_point_live_captures SET state='dump_failed', detail=?2 WHERE operation_id=?1", params![id, detail.to_string()])?;
+        return Err(failure(
+            format!("Live capture failed: {reason}; no recovery point was recorded. If the universe is not running now, start begins it afresh without its memory"),
+            detail,
+        ));
+    }
+    let dump_log_sha256 = mg::sha256(&dump_log)?;
+
+    // --- The resume: the same container ID, from the files Podman kept. The archive is complete on disk and
+    // untouched by it; its digest and the manifest wait until the universe is back, adding nothing to the
+    // interruption.
+    let resume_began = Instant::now();
+    let resume = mg::restore_kept(&resume_unit, id, &container_id, open(&work.join("resume.stdout"))?, open(&work.join("resume.stderr"))?)?;
+    let resume_seconds = resume_began.elapsed().as_secs_f64();
+    let interruption_seconds = began.elapsed().as_secs_f64();
+    let now_c = lc::inspect(&name)?;
+    let restore_log = work.join("restore.log");
+    let restore_preserved = now_c.as_ref().is_some_and(|c| mg::copy_podman_log(c, "RestoreLog", "restore.log", &restore_log));
+    let resume_stats = print_stats(&work.join("resume.stdout"));
+    let resume_failure = verify_restored(Some(&container_id), now_c.as_ref(), &restore_log, restore_preserved, opened_at).err();
+    // The memory image Podman kept for the resume is a second copy of the universe's memory beside the archive;
+    // once the resume is verified it serves nothing, and it is removed from the container's own storage.
+    let kept_images_removed_bytes = if resume_failure.is_none() { now_c.as_ref().map(remove_kept_images) } else { None };
+    if let Some(reason) = &resume_failure {
+        let stderr = mg::read_bounded(&work.join("resume.stderr")).unwrap_or_default();
+        mg::write_private(
+            &work.join("resume-failure.json"),
+            serde_json::to_string_pretty(&json!({"reason": reason, "exit_code": resume.code(), "stderr_tail": mg::tail(&stderr),
+                "observed": now_c.as_ref().map(lc::state_view)}))?
+            .as_bytes(),
+        )?;
+    }
+
+    // --- The point: digest, rename, manifest, record.
+    let archive_bytes = fs::metadata(&archive_tmp)?.len();
+    let archive_sha256 = mg::sha256(&archive_tmp)?;
+    fs::set_permissions(&archive_tmp, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&archive_tmp, &archive)?;
+    let (parent, generation) = match latest(db, uuid)? {
+        Some((previous, g)) => (Some(previous), g + 1),
+        None => (None, 1),
+    };
+    let now = crate::now() as i64;
+    let host = host_uuid(db)?;
+    let capture = json!({
+        "mode": CAPTURE_LIVE, "container_id": container_id,
+        "dump_seconds": round3(dump_seconds), "resume_seconds": round3(resume_seconds), "interruption_seconds": round3(interruption_seconds),
+        "dump_statistics": dump_stats, "resume_statistics": resume_stats,
+        "resumed": resume_failure.is_none(), "resume_failure": resume_failure,
+        "kept_images_removed_bytes": kept_images_removed_bytes,
+        "dump_log_sha256": dump_log_sha256,
+        "source_runtime": {"binary_sha256": facts["runtime"]["sha256"][mg::RUNTIME_REAL], "git_id": mg::RUNTIME_GIT_ID, "kernel_release": facts["runtime"]["kernel"]},
+        "restore_log_sha256": if restore_preserved { mg::sha256(&restore_log).ok() } else { None },
+        "runtime_git_id": mg::RUNTIME_GIT_ID, "artifact_directory": work,
+    });
+    let manifest = json!({
+        "format_version": FORMAT,
+        "state": "prepared",
+        "signed": false,
+        "signature": null,
+        "signing_algorithm": null,
+        "producer_identity": host,
+        "authorization_ref": reference,
+        "universe_uuid": uuid,
+        "recovery_point_uuid": point,
+        "parent_recovery_point_uuid": parent,
+        "generation": generation,
+        "capture_operation_id": id,
+        "image_id": c["Image"],
+        "image_name_at_capture": c["ImageName"],
+        "podman_config": {
+            "cmd": c["Config"]["Cmd"], "entrypoint": c["Config"]["Entrypoint"], "env": c["Config"]["Env"],
+            "labels": c["Config"]["Labels"], "working_dir": c["Config"]["WorkingDir"], "stop_signal": c["Config"]["StopSignal"],
+        },
+        "data_lifecycle": null,
+        "data_lifecycle_declared": false,
+        "data_lifecycle_note": "a PodMesh universe carries no ShaperOS manifest.json; the field the design requires is absent and says so",
+        "stop": null,
+        "stop_note": "no stop operation: the universe was checkpointed by the qualified runtime and resumed in place from the kept images",
+        "consistency": {
+            "class": LIVE_CLASS,
+            "quiesce_mechanism": "CRIU dump by the qualified private runtime: processes frozen, memory and descriptors dumped, processes ended; Podman exported the writable layer while the universe was stopped, into the same archive; the universe then resumed in place from the kept checkpoint images",
+            "boundary_opened_at": opened_at,
+            "boundary_closed_at": closed_at,
+            "maximum_freeze_seconds": 300,
+            "claim_basis": "the memory image and the writable layer were taken while the universe's processes were stopped by the same dump, so the memory is bound to the exact disk state it was taken against; the dump log names the qualified runtime and reports success",
+        },
+        "capture": capture,
+        "pieces": [{
+            "name": ARCHIVE,
+            "kind": PIECE_CHECKPOINT,
+            "order": 0,
+            "bytes": archive_bytes,
+            "plaintext_sha256": archive_sha256,
+            "ciphertext_sha256": null,
+            "chunks": null,
+            "compression": "zstd",
+            "contents": "Podman checkpoint export: CRIU images under checkpoint/, config.dump, spec.dump, network.status, the writable layer as rootfs-diff.tar",
+        }],
+        "chunking": null,
+        "encryption": null,
+        "compression": null,
+        "declared_exclusions": ["volumes: none exist for this universe class", "image bytes: never captured, per Rule 11", "network: none; a restore keeps the universe network-disabled"],
+        "level_completeness": {"level_2_volumes": "not applicable", "level_3_databases": "not applicable"},
+        "producer_software": {"podmesh": env!("CARGO_PKG_VERSION"), "minimum_restore_tool": FORMAT},
+        "prepared_at": now,
+    });
+    let canonical = serde_json::to_string(&manifest)?;
+    let manifest_sha256 = mg::sha256_bytes(canonical.as_bytes())?;
+    mg::write_private(&outbox.join(MANIFEST), canonical.as_bytes())?;
+    if mg::sha256(&outbox.join(MANIFEST))? != manifest_sha256 {
+        return Err("The manifest written to the outbox does not hash to the value computed in memory".into());
+    }
+    let tx = db.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO recovery_points(recovery_point_uuid,universe_uuid,generation,parent_recovery_point_uuid,operation_id,state,manifest_sha256,rootfs_sha256,rootfs_bytes,prepared_at,outbox,capture)
+         VALUES(?1,?2,?3,?4,?5,'prepared',?6,?7,?8,?9,?10,?11)",
+        params![point, uuid, generation, parent, id, manifest_sha256, archive_sha256, archive_bytes as i64, now, outbox.to_string_lossy().to_string(), CAPTURE_LIVE],
+    )?;
+    tx.execute("UPDATE recovery_point_live_captures SET state='recorded' WHERE operation_id=?1", [id])?;
+    tx.commit()?;
+    Ok(json!({
+        "recovery_point_uuid": point,
+        "generation": generation,
+        "parent_recovery_point_uuid": manifest["parent_recovery_point_uuid"],
+        "state": "prepared",
+        "signed": false,
+        "outbox": outbox,
+        "manifest_sha256": manifest_sha256,
+        "archive": {"name": ARCHIVE, "sha256": archive_sha256, "bytes": archive_bytes},
+        "consistency_class": LIVE_CLASS,
+        "capture": manifest["capture"],
+        "resumed": resume_failure.is_none(),
+        "universe": now_c.as_ref().map(lc::state_view),
+        "replayed": false,
+        "note": if resume_failure.is_none() {
+            "prepared and unsigned; the universe resumed in place with its memory, interrupted for the dump and the resume"
+        } else {
+            "prepared and unsigned; THE RESUME FAILED: the universe is stopped with its checkpoint files kept, and start begins it afresh without its memory"
+        },
+    }))
+}
+
+/// The memory image files Podman kept under the container's own storage (`<StaticDir>/checkpoint`), removed once a
+/// resume from them is verified. Bounded to that one directory, which must hold a CRIU inventory; the bytes freed,
+/// or zero when there was nothing this service recognizes.
+fn remove_kept_images(c: &Value) -> u64 {
+    let Some(dir) = c["StaticDir"].as_str().filter(|d| d.starts_with(mg::CONTAINER_STORAGE) && !d.contains("..")) else { return 0 };
+    let kept = Path::new(dir).join("checkpoint");
+    if !kept.join("inventory.img").is_file() {
+        return 0;
+    }
+    let bytes: u64 = fs::read_dir(&kept)
+        .map(|entries| entries.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum())
+        .unwrap_or(0);
+    match fs::remove_dir_all(&kept) {
+        Ok(()) => bytes,
+        Err(_) => 0,
+    }
+}
+
+/// Settles an earlier attempt of the same live capture that the service did not see to the end. Never records a
+/// point: whatever the archive holds, its resume was not observed by this service. The universe is brought back in
+/// place if the dump left it stopped and checkpointed; otherwise its state is reported as found.
+#[allow(clippy::too_many_arguments)]
+fn settle_interrupted_capture(db: &Connection, id: &str, uuid: &str, c: &Value, began_at: i64, container_id: &str, point: &str, state: &str) -> Result<Value, Error> {
+    if state == "recorded" {
+        return Err("This capture was recorded but its record cannot be read back; nothing was repeated".into());
+    }
+    let dump_unit = format!("podmesh-live-capture-{id}.scope");
+    let resume_unit = format!("podmesh-live-resume-{id}.scope");
+    if mg::unit_busy(&dump_unit) || mg::unit_busy(&resume_unit) {
+        return Err("An earlier attempt of this capture is still running in its scope; retry after it finishes".into());
+    }
+    let work = mg::base()?.join(id);
+    let mut brought_back = json!({"attempted": false});
+    if c["Id"].as_str() == Some(container_id) && !lc::process_active(c) && c["State"]["Checkpointed"] == json!(true) && state == "dumping" {
+        let since = crate::now() as i64;
+        let open = |path: &Path| fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path);
+        let exit = mg::restore_kept(&format!("podmesh-live-settle-{id}.scope"), id, container_id, open(&work.join("settle.stdout"))?, open(&work.join("settle.stderr"))?);
+        let now_c = lc::inspect(&format!("podmesh-{uuid}"))?;
+        let log = work.join("settle-restore.log");
+        let preserved = now_c.as_ref().is_some_and(|c| mg::copy_podman_log(c, "RestoreLog", "restore.log", &log));
+        let verified = verify_restored(Some(container_id), now_c.as_ref(), &log, preserved, since);
+        if verified.is_ok() {
+            if let Some(c2) = now_c.as_ref() {
+                remove_kept_images(c2);
+            }
+        }
+        brought_back = json!({"attempted": true, "exit_code": exit.ok().and_then(|s| s.code()), "verified": verified.is_ok(),
+            "reason": verified.err(), "observed": now_c.as_ref().map(lc::state_view)});
+    }
+    let outbox = tr::outbox(point)?;
+    for name in [format!("{ARCHIVE}.partial"), ARCHIVE.to_string(), MANIFEST.to_string()] {
+        let _ = fs::remove_file(outbox.join(name));
+    }
+    let _ = fs::remove_dir(&outbox);
+    let detail = json!({"interrupted_attempt_began_at": began_at, "state_found": state, "brought_back": brought_back,
+        "observed": lc::observe(uuid)?});
+    db.execute("UPDATE recovery_point_live_captures SET state='interrupted', detail=?2 WHERE operation_id=?1", params![id, detail.to_string()])?;
+    Err(failure(
+        "An earlier attempt of this live capture was interrupted before its point was recorded; the universe was settled as reported and no point was recorded. Capture again under a new operation ID",
+        detail,
+    ))
+}
+
+/// Whether a verified live promotion of this host bound this container ID, whatever the universe: the collector's
+/// and the abort paths' question.
+pub(crate) fn promoted_live_container(db: &Connection, container_id: &str) -> Result<bool, Error> {
+    ensure_schema(db)?;
+    Ok(db
+        .query_row("SELECT 1 FROM recovery_point_live_promotions WHERE container_id=?1", [container_id], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+fn staged_row(db: &Connection, point: &str) -> Result<Option<(String, String, Option<i64>, Option<String>, Option<String>, String, String, i64)>, Error> {
+    Ok(db
+        .query_row(
+            "SELECT universe_uuid,operation_id,discarded_at,discard_operation_id,promoted_operation_id,inbox,archive_sha256,archive_bytes
+             FROM recovery_point_staged WHERE recovery_point_uuid=?1",
+            [point],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+        )
+        .optional()?)
+}
+
+const STAGED_NOTE: &str = "a memory checkpoint restores as running processes, so no copy is created here: the archive is held, verified against its manifest, and restored only by recovery_point_promote under the lease";
+
+fn staged_view(db: &Connection, id: &str, replayed: bool) -> Result<Option<Value>, Error> {
+    let row: Option<(String, String, i64, String, i64, String, String, String, i64, Option<i64>, Option<String>)> = db
+        .query_row(
+            "SELECT recovery_point_uuid,universe_uuid,generation,archive_sha256,archive_bytes,manifest_sha256,image_id,inbox,staged_at,discarded_at,promoted_operation_id
+             FROM recovery_point_staged WHERE operation_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?)),
+        )
+        .optional()?;
+    let Some((point, uuid, generation, sha, bytes, manifest_sha256, image, inbox, staged_at, discarded_at, promoted)) = row else { return Ok(None) };
+    let present = discarded_at.is_none() && tr::regular_file(&Path::new(&inbox).join(ARCHIVE)).ok().flatten() == Some(bytes as u64);
+    let image_present = lc::images()?.iter().any(|i| lc::image_id(i) == image);
+    Ok(Some(json!({
+        "recovery_point_uuid": point, "universe_uuid": uuid, "generation": generation,
+        "archive": {"name": ARCHIVE, "sha256": sha, "bytes": bytes, "present": present},
+        "manifest_sha256": manifest_sha256, "image_id": image, "image_present_on_this_host": image_present,
+        "staged": true, "quarantined": false, "container": null, "started": false,
+        "staged_at": staged_at, "discarded_at": discarded_at, "promoted_operation_id": promoted, "replayed": replayed,
+        "consistency_class": LIVE_CLASS, "note": STAGED_NOTE,
+        "manifest_verification": "unsigned: the archive is bound to the manifest by digest; the manifest's origin is not authenticated, and this build could not check a signature if one were present",
+    })))
+}
+
+/// Every live point staged on this host for a universe, with whether its archive is still there.
+fn staged_for(db: &Connection, uuid: &str) -> Result<Vec<Value>, Error> {
+    let mut s = db.prepare(
+        "SELECT recovery_point_uuid,operation_id,generation,archive_sha256,archive_bytes,image_id,inbox,staged_at,discarded_at,promoted_operation_id
+         FROM recovery_point_staged WHERE universe_uuid=?1 ORDER BY generation",
+    )?;
+    let rows: Vec<(String, String, i64, String, i64, String, String, i64, Option<i64>, Option<String>)> = s
+        .query_map([uuid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)))?
+        .collect::<Result<_, _>>()?;
+    let now = crate::now() as i64;
+    Ok(rows
+        .into_iter()
+        .map(|(point, op, generation, sha, bytes, image, inbox, staged_at, discarded_at, promoted)| {
+            let present = discarded_at.is_none() && tr::regular_file(&Path::new(&inbox).join(ARCHIVE)).ok().flatten() == Some(bytes as u64);
+            json!({"recovery_point_uuid": point, "operation_id": op, "generation": generation,
+                "archive": {"name": ARCHIVE, "sha256": sha, "bytes": bytes, "present": present}, "image_id": image,
+                "staged_at": staged_at, "age_seconds": now - staged_at, "discarded_at": discarded_at, "promoted_operation_id": promoted})
+        })
+        .collect())
+}
+
+/// Hold a live point on this host for a later promotion. A memory checkpoint restores as running processes, and
+/// a second running instance of a universe is exactly what a standby must never be; so, unlike a stopped point,
+/// a live one gets no quarantined container: its archive is verified against its manifest -- canonical form,
+/// pinned format, unsigned and saying so, size and digest -- and recorded under the universe's OWN identity, the
+/// one it is promoted into. Nothing runs, no image is imported.
+fn stage(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error> {
+    let id = lc::text(request, "operation_id")?;
+    lc::token(id)?;
+    let point = lc::text(request, "recovery_point_uuid")?;
+    lc::token(point)?;
+    if let Some(previous) = staged_view(db, id, true)? {
+        return Ok(previous);
+    }
+    let inbox = tr::inbox(point)?;
+    if !inbox.is_dir() {
+        return Err("No recovery point with this identifier in the inbox; nothing was staged".into());
+    }
+    let (bytes, manifest) = tr::read_document(&inbox, MANIFEST)?
+        .ok_or("The inbox holds no manifest for this recovery point; nothing was staged")?;
+    let manifest_sha256 = mg::sha256_bytes(&bytes)?;
+    if manifest["format_version"].as_str() != Some(FORMAT) {
+        return Err(format!("The manifest format {:?} is not {FORMAT}; nothing was staged", manifest["format_version"]).into());
+    }
+    if serde_json::to_string(&manifest)?.as_bytes() != bytes.as_slice() {
+        return Err("The manifest is not in canonical form; its digest cannot be trusted to name it, and nothing was staged".into());
+    }
+    if manifest["signed"] != json!(false) {
+        return Err("The manifest claims a signature this build cannot verify; a signature nobody can check is refused rather than trusted, and nothing was staged".into());
+    }
+    let source = manifest["universe_uuid"].as_str().ok_or("The manifest names no source universe")?;
+    if source != uuid {
+        return Err(format!("A live point is staged under its own universe's identity ({source}); it has no quarantine identity, and this request names {uuid}").into());
+    }
+    let piece = &manifest["pieces"][0];
+    if piece["kind"].as_str() != Some(PIECE_CHECKPOINT) {
+        return Err("This point is the rootfs export of a stopped universe; it is restored into quarantine with recovery_point_restore, not staged".into());
+    }
+    let expected_sha = piece["plaintext_sha256"].as_str().ok_or("The manifest's piece has no digest")?;
+    let expected_bytes = piece["bytes"].as_u64().ok_or("The manifest's piece has no size")?;
+    let archive = inbox.join(ARCHIVE);
+    let Some(size) = tr::regular_file(&archive)? else {
+        return Err("The inbox holds no checkpoint archive for this recovery point; nothing was staged".into());
+    };
+    if size != expected_bytes {
+        return Err(format!("The archive is {size} bytes, not the {expected_bytes} the manifest binds; nothing was staged").into());
+    }
+    if mg::sha256(&archive)? != expected_sha {
+        return Err("The archive does not hash to the digest the manifest binds; nothing was staged".into());
+    }
+    if let Some((_, op, ..)) = staged_row(db, point)? {
+        return Err(format!("This point is already staged on this host by operation {op}").into());
+    }
+    let image = manifest["image_id"].as_str().ok_or("The manifest names no image")?.trim_start_matches("sha256:").to_string();
+    // A staged copy is one this host could promote: what a takeover would discover too late is checked now, and
+    // any blocker refuses the staging with the whole list.
+    let mut blockers: Vec<String> = vec![];
+    if !lc::images()?.iter().any(|i| lc::image_id(i) == image) {
+        blockers.push(format!("image sha256:{image} is not present in the local store; PodMesh never pulls"));
+    }
+    let runtime = mg::runtime_facts(&mut blockers);
+    let source = &manifest["capture"]["source_runtime"];
+    let local_binary = runtime["sha256"][mg::RUNTIME_REAL].as_str().unwrap_or("");
+    if source["binary_sha256"].as_str() != Some(local_binary) {
+        blockers.push(format!("the local runtime binary {local_binary} differs from the source runtime {}", source["binary_sha256"].as_str().unwrap_or("unrecorded")));
+    }
+    if source["git_id"].as_str() != Some(mg::RUNTIME_GIT_ID) {
+        blockers.push(format!("the source runtime git ID {} is not the qualified {}", source["git_id"].as_str().unwrap_or("unrecorded"), mg::RUNTIME_GIT_ID));
+    }
+    let kernel = runtime["kernel"].as_str().unwrap_or("");
+    if source["kernel_release"].as_str() != Some(kernel) {
+        blockers.push(format!("the local kernel release {kernel} differs from the source kernel {}", source["kernel_release"].as_str().unwrap_or("unrecorded")));
+    }
+    let mut archive_facts = json!({});
+    match crate::restore::archive_contents(&archive) {
+        Ok((config, entries)) => {
+            if config["rootfsImageID"].as_str() != Some(image.as_str()) || config["labels"]["io.podmesh.universe"].as_str() != Some(uuid) {
+                blockers.push("the archive configuration does not name the manifest's image and this universe's label".into());
+            }
+            // Podman's import pulls the image by its recorded name when that name does not resolve locally; the
+            // name must resolve here to the very image the manifest binds, or the promotion could pull.
+            match config["rootfsImageName"].as_str().filter(|n| !n.is_empty()) {
+                None => blockers.push("the archive records no image name; Podman's import would try to pull an empty name".into()),
+                Some(name) => {
+                    let resolved = lc::run_podman(lc::QUICK, &["image", "inspect", "--format", "{{.Id}}", name]).ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().trim_start_matches("sha256:").to_string());
+                    if resolved.as_deref() != Some(image.as_str()) {
+                        blockers.push(format!("the image name {name} the archive records does not resolve here to sha256:{image}; Podman's import would pull it"));
+                    }
+                }
+            }
+            let missing: Vec<&str> = ["config.dump", "spec.dump", "checkpoint/inventory.img"].into_iter().filter(|e| !entries.iter().any(|l| l == e)).collect();
+            if !missing.is_empty() {
+                blockers.push(format!("the archive lacks expected entries: {}", missing.join(", ")));
+            }
+            archive_facts = json!({"image_id": config["rootfsImageID"], "image_name": config["rootfsImageName"], "universe_label": config["labels"]["io.podmesh.universe"], "entries": entries.len()});
+        }
+        Err(e) => blockers.push(format!("the archive cannot be read: {e}")),
+    }
+    match crate::restore::uncompressed_bytes(&archive) {
+        Ok(b) => {
+            let required = b.saturating_mul(2).saturating_add(mg::SPACE_MARGIN_BYTES);
+            let available = mg::available_bytes(Path::new(mg::CONTAINER_STORAGE));
+            archive_facts["uncompressed_bytes"] = json!(b);
+            if available < required {
+                blockers.push(format!("{available} bytes available under {}, {required} required to promote this point", mg::CONTAINER_STORAGE));
+            }
+        }
+        Err(e) => blockers.push(format!("the archive cannot be decompressed: {e}")),
+    }
+    if !blockers.is_empty() {
+        return Err(failure("This point could not be promoted on this host; nothing was staged", json!({"blockers": blockers, "archive": archive_facts, "runtime": runtime})));
+    }
+    let generation = manifest["generation"].as_i64().ok_or("The manifest carries no generation")?;
+    db.execute(
+        "INSERT INTO recovery_point_staged(recovery_point_uuid,universe_uuid,operation_id,generation,archive_sha256,archive_bytes,manifest_sha256,image_id,inbox,staged_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![point, uuid, id, generation, expected_sha, size as i64, manifest_sha256, image, inbox.to_string_lossy().to_string(), crate::now() as i64],
+    )?;
+    staged_view(db, id, false)?.ok_or_else(|| "The staging was recorded but cannot be read back".into())
+}
+
+/// Remove a staged point's archive and manifest from this host's inbox. Bounded to the point's own directory,
+/// recomputed from its identifier; a point promoted here is refused, its archive being the record of what was
+/// restored. The workstation tool uses this to keep the newest copies on each standby.
+fn discard(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error> {
+    let id = lc::text(request, "operation_id")?;
+    lc::token(id)?;
+    let point = lc::text(request, "recovery_point_uuid")?;
+    lc::token(point)?;
+    let Some((owner, staged_by, discarded_at, discard_op, promoted, inbox, _, _)) = staged_row(db, point)? else {
+        return Err("No staged point with this identifier on this host; nothing was discarded".into());
+    };
+    if owner != uuid {
+        return Err(format!("This point is staged for universe {owner}, not for the one this request names; nothing was discarded").into());
+    }
+    let view = |replayed: bool, removed: u64, dir_removed: bool| {
+        json!({"recovery_point_uuid": point, "universe_uuid": uuid, "staged_by": staged_by, "discarded": true,
+            "bytes_removed": removed, "directory_removed": dir_removed, "replayed": replayed})
+    };
+    if discard_op.as_deref() == Some(id) {
+        return Ok(view(true, 0, !Path::new(&inbox).exists()));
+    }
+    if let Some(at) = discarded_at {
+        return Err(format!("This point was already discarded at {at} by operation {}", discard_op.unwrap_or_default()).into());
+    }
+    if let Some(p) = promoted {
+        return Err(format!("This point was promoted here by operation {p}; its archive stays as the record of what was restored, and nothing was discarded").into());
+    }
+    let dir = tr::inbox(point)?;
+    if dir.to_string_lossy() != inbox {
+        return Err("The recorded inbox path is not the path this service derives for the point; nothing was touched".into());
+    }
+    let mut removed = 0u64;
+    for name in [MANIFEST, ARCHIVE] {
+        let path = dir.join(name);
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+            Ok(m) if m.is_file() => {
+                removed += m.len();
+                fs::remove_file(&path)?;
+            }
+            Ok(_) => return Err(format!("{} is not a regular file; nothing under the directory is removed", path.display()).into()),
+        }
+    }
+    let dir_removed = match fs::remove_dir(&dir) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        // Anything else in the directory was not written by this service; it stays, and the answer says so.
+        Err(_) => false,
+    };
+    db.execute(
+        "UPDATE recovery_point_staged SET discarded_at=?2, discard_operation_id=?3 WHERE recovery_point_uuid=?1",
+        params![point, crate::now() as i64, id],
+    )?;
+    Ok(view(false, removed, dir_removed))
+}
+
+const LIVE_PROMOTION_NOTE: &str = "a memory checkpoint restore resumes the processes: the universe is running now, with the memory the point holds, under the same lease gate a start goes through; there is no separate start";
+
+fn live_promotion_view(db: &Connection, id: &str, replayed: bool) -> Result<Option<Value>, Error> {
+    Ok(db
+        .query_row(
+            "SELECT universe_uuid,recovery_point_uuid,container_id,lease_generation,restore_log_sha256,promoted_at
+             FROM recovery_point_live_promotions WHERE operation_id=?1",
+            [id],
+            |r| Ok(json!({
+                "universe_uuid": r.get::<_, String>(0)?, "recovery_point_uuid": r.get::<_, String>(1)?,
+                "container_id": r.get::<_, String>(2)?, "lease_generation": r.get::<_, i64>(3)?,
+                "restore_log_sha256": r.get::<_, String>(4)?, "promoted_at": r.get::<_, i64>(5)?,
+                "started": true, "resumed_from_checkpoint": true, "consistency_class": LIVE_CLASS,
+                "network": {"profile": crate::network::PROFILE_ISOLATED, "requested_address": null}, "secrets": [],
+                "replayed": replayed, "scope": PROMOTION_SCOPE, "note": LIVE_PROMOTION_NOTE,
+            })),
+        )
+        .optional()?)
+}
+
+/// Whether a verified live promotion of this host binds this universe to this container ID: the ownership of a
+/// universe that came back from a staged checkpoint, as a migration restore's is on a destination.
+pub(crate) fn promoted_live_here(db: &Connection, uuid: &str, container_id: &str) -> Result<bool, Error> {
+    ensure_schema(db)?;
+    Ok(db
+        .query_row(
+            "SELECT 1 FROM recovery_point_live_promotions WHERE universe_uuid=?1 AND container_id=?2",
+            params![uuid, container_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Promote a staged live point into the universe's OWN identity on this host: the takeover step for a live
+/// copy. The gate is the one every promotion passes -- a policy here, and this host's live lease -- and the
+/// effect is a CRIU restore of the archive under the universe's name: the processes resume with the memory
+/// the point holds, so the universe is RUNNING when this returns, and the answer says so; there is no separate
+/// start, and the lease gate passed here is the one a start would pass. Only where the universe is absent:
+/// a container already carrying its name or label refuses the promotion. Verified from outside as a migration
+/// restore is; a failed attempt's non-running container is removed so that the operator can try again, a
+/// running one is never touched and is reported.
+fn promote_live(db: &Connection, request: &Value, uuid: &str) -> Result<Value, Error> {
+    let id = lc::text(request, "operation_id")?;
+    lc::token(id)?;
+    let point = lc::text(request, "recovery_point_uuid")?;
+    lc::token(point)?;
+    if let Some(previous) = live_promotion_view(db, id, true)? {
+        return Ok(previous);
+    }
+    let Some((owner, _, discarded_at, _, promoted, inbox, archive_sha256, archive_bytes)) = staged_row(db, point)? else {
+        return Err("No staged point with this identifier on this host; nothing was promoted".into());
+    };
+    if owner != uuid {
+        return Err(format!("This point is staged for universe {owner}, not for the one this request names; nothing was promoted").into());
+    }
+    if discarded_at.is_some() {
+        return Err("This point was discarded from this host; nothing was promoted".into());
+    }
+    if let Some(p) = promoted {
+        return Err(format!("This point was already promoted here by operation {p}; nothing was promoted again").into());
+    }
+    if let Some(profile) = request.get("network_profile") {
+        if profile.as_str() != Some(crate::network::PROFILE_ISOLATED) {
+            return Err("A live point restores the universe network-disabled, as it was captured: only the isolated profile is possible, and it may be omitted".into());
+        }
+    }
+    if request.get("secrets").is_some() || request.get("network_address").is_some() {
+        return Err("A live point carries no secrets and no address: the universe comes back exactly as it was captured".into());
+    }
+    let name = format!("podmesh-{uuid}");
+    let unit = format!("podmesh-live-promote-{id}.scope");
+    let dir = mg::base()?.join(id);
+    // An earlier attempt of this operation that reached the restore command: decided by observation only, never
+    // by launching a second restore. Its container, if it is there, is verified against the attempt's own launch
+    // instant and recorded; if nothing was created, the attempt is forgotten and the gates below run again.
+    let attempt: Option<(i64, i64, String)> = db
+        .query_row(
+            "SELECT launched_at,lease_generation,state FROM recovery_point_live_promote_attempts WHERE operation_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    if let Some((launched_at, generation, state)) = attempt {
+        if mg::unit_busy(&unit) {
+            return Err("An earlier attempt of this promotion is still running in its scope; retry after it finishes".into());
+        }
+        let observed = lc::inspect(&name)?;
+        let created_by_attempt = observed.as_ref().is_some_and(|c| {
+            // An imported container keeps the source's creation time; the restore instant is this attempt's own.
+            c["State"]["RestoredAt"].as_str().and_then(lc::epoch).is_some_and(|t| t >= launched_at) && c["Config"]["Labels"]["io.podmesh.universe"].as_str() == Some(uuid)
+        });
+        if created_by_attempt {
+            return finish_live_promotion(db, id, uuid, point, &dir, launched_at, generation, None, 0.0, json!({"resumed_after_interruption": true, "attempt_state": state}), observed);
+        }
+        db.execute("DELETE FROM recovery_point_live_promote_attempts WHERE operation_id=?1", [id])?;
+    }
+    // The gates a create passes, which this path does not go through: a migration reservation or an unresolved
+    // restore claim holds the universe; a collected universe's tombstone refuses its identity.
+    mg::refuse_if_reserved(db, uuid, "recovery_point_promote")?;
+    mg::refuse_identity_reuse(db, uuid, "recovery_point_promote")?;
+    crate::activation::ensure_schema(db)?;
+    if crate::activation::policy(db, uuid)?.is_none() {
+        return Err("recovery_point_promote refused: this universe is under no activation policy on this host; declare one with activation_require and acquire its lease first".into());
+    }
+    crate::activation::refuse_if_not_activated(db, uuid, "recovery_point_promote")?;
+    let generation = crate::activation::lease(db, uuid)?.map(|l| l.generation).ok_or("The lease vanished between the gate and the record")?;
+    if let Some(c) = lc::inspect(&name)? {
+        return Err(failure(
+            "A container already carries this universe's name on this host; a live point is restored only where the universe is absent, and nothing was promoted",
+            json!({"container": lc::state_view(&c)}),
+        ));
+    }
+    let labelled = crate::restore::labelled(uuid)?;
+    if !labelled.is_empty() {
+        return Err(failure(
+            "A container already carries this universe's label on this host; a live point is restored only where the universe is absent, and nothing was promoted",
+            json!({"labelled_containers": labelled}),
+        ));
+    }
+    if mg::unit_busy(&unit) {
+        return Err("The promotion scope of this operation has not finished, or its state cannot be queried; retry after it finishes".into());
+    }
+    // A private copy, hashed after copying: a later change in the inbox cannot reach the restore.
+    fs::create_dir_all(&dir)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    let archive = dir.join(ARCHIVE);
+    if archive.exists() {
+        fs::remove_file(&archive)?;
+    }
+    mg::copy_private(&Path::new(&inbox).join(ARCHIVE), &archive)?;
+    let copied = mg::sha256(&archive)?;
+    if copied != archive_sha256 || fs::metadata(&archive)?.len() != archive_bytes as u64 {
+        let _ = fs::remove_file(&archive);
+        return Err(format!("The staged archive no longer matches its record (sha256 {copied}); nothing was promoted").into());
+    }
+    let graph_root = lc::podman(lc::QUICK, &["info", "--format", "{{.Store.GraphRoot}}"])?.trim().to_string();
+    if graph_root != mg::CONTAINER_STORAGE {
+        return Err(format!("Podman graph root {graph_root} is not the qualified default store {}", mg::CONTAINER_STORAGE).into());
+    }
+    let required = crate::restore::uncompressed_bytes(&archive)?.saturating_mul(2).saturating_add(mg::SPACE_MARGIN_BYTES);
+    let available = mg::available_bytes(Path::new(&graph_root));
+    if available < required {
+        return Err(format!("{available} bytes available under {graph_root}, {required} required; nothing was promoted").into());
+    }
+    let open = |path: &Path| fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path);
+    let since = crate::now() as i64;
+    // Durable before the command can start: a replay decides by observation from here on.
+    db.execute(
+        "INSERT INTO recovery_point_live_promote_attempts VALUES(?1,?2,?3,?4,?5,'launched',NULL)",
+        params![id, uuid, point, generation, since],
+    )?;
+    let began = Instant::now();
+    let bound = crate::cleanup::Bound::new(Path::new(&graph_root), required, &unit);
+    let (exit, mut prevention) = mg::restore_import(&unit, id, &archive, &name, open(&dir.join("promote.stdout"))?, open(&dir.join("promote.stderr"))?, Some(&bound))?;
+    let seconds = began.elapsed().as_secs_f64();
+    let observed = lc::inspect(&name)?;
+    crate::cleanup::confirm_or_thaw(&mut prevention, observed.as_ref().and_then(|c| c["Id"].as_str()));
+    finish_live_promotion(db, id, uuid, point, &dir, since, generation, exit.code(), seconds, prevention, observed)
+}
+
+/// Verifies the container a live promotion's restore left under the universe's name -- bound to the attempt's own
+/// launch instant -- and records the promotion, or removes a non-running container the attempt created and refuses.
+#[allow(clippy::too_many_arguments)]
+fn finish_live_promotion(
+    db: &Connection,
+    id: &str,
+    uuid: &str,
+    point: &str,
+    dir: &Path,
+    since: i64,
+    generation: i64,
+    exit_code: Option<i32>,
+    seconds: f64,
+    prevention: Value,
+    observed: Option<Value>,
+) -> Result<Value, Error> {
+    let exit = ExitCode(exit_code);
+    let log = dir.join("restore.log");
+    let preserved = observed.as_ref().is_some_and(|c| mg::copy_podman_log(c, "RestoreLog", "restore.log", &log));
+    let verified = verify_restored(None, observed.as_ref(), &log, preserved, since).and_then(|()| {
+        let c = observed.as_ref().ok_or("absent")?;
+        if c["Config"]["Labels"]["io.podmesh.universe"].as_str() != Some(uuid) {
+            return Err("the restored container does not carry this universe's label".to_string());
+        }
+        let image: String = db.query_row("SELECT image_id FROM recovery_point_staged WHERE recovery_point_uuid=?1", [point], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if c["Image"].as_str().map(|i| i.trim_start_matches("sha256:")) != Some(image.as_str()) {
+            return Err("the restored container's image is not the point's image".to_string());
+        }
+        if c["HostConfig"]["NetworkMode"].as_str() != Some("none") || c["Mounts"].as_array().map(|m| !m.is_empty()).unwrap_or(true) {
+            return Err("the restored container is not network-disabled and mount-free".to_string());
+        }
+        Ok(())
+    });
+    if let Err(reason) = verified {
+        let stderr = mg::read_bounded(&dir.join("promote.stderr")).unwrap_or_default();
+        // A container this attempt created and that is not running is removed, so that the operator can try
+        // again from a clean host; one that runs is never touched here and is named.
+        let created_here = observed.as_ref().filter(|c| c["Created"].as_str().and_then(lc::epoch).is_some_and(|t| t >= since));
+        let removed = match created_here {
+            Some(c) if !lc::process_active(c) => {
+                let cid = c["Id"].as_str().unwrap_or("").to_string();
+                let out = lc::run_podman(lc::QUICK, &["rm", "--force", "--time", "0", &cid])?;
+                json!({"container_id": cid, "removed": out.status.success()})
+            }
+            Some(c) => json!({"container_id": c["Id"], "removed": false, "reason": "the container is running; nothing running is removed by a failed verification"}),
+            None => Value::Null,
+        };
+        let detail = json!({"reason": reason, "exit_code": exit.code(), "seconds": round3(seconds), "stderr_tail": mg::tail(&stderr),
+            "observed": observed.as_ref().map(lc::state_view), "restore_log_preserved": preserved.then(|| log.display().to_string()),
+            "prevention": prevention, "failed_container": removed, "artifact_directory": dir});
+        mg::write_private(&dir.join("failure.json"), serde_json::to_string_pretty(&detail)?.as_bytes())?;
+        // The attempt is closed: a retry of this operation runs every gate again, and a container left running
+        // refuses it there by name.
+        db.execute("DELETE FROM recovery_point_live_promote_attempts WHERE operation_id=?1", [id])?;
+        return Err(failure(format!("The live promotion could not be verified: {reason}; nothing was promoted"), detail));
+    }
+    let c = observed.ok_or("Restored container not observable")?;
+    let container_id = c["Id"].as_str().unwrap_or("").to_string();
+    let log_sha256 = mg::sha256(&log)?;
+    let now = crate::now() as i64;
+    let tx = db.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO recovery_point_live_promotions VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![id, uuid, point, container_id, generation, log_sha256, now],
+    )?;
+    tx.execute("UPDATE recovery_point_staged SET promoted_operation_id=?2 WHERE recovery_point_uuid=?1", params![point, id])?;
+    tx.execute("UPDATE recovery_point_live_promote_attempts SET state='promoted' WHERE operation_id=?1", [id])?;
+    tx.commit()?;
+    let mut view = live_promotion_view(db, id, false)?.ok_or("The promotion was recorded but cannot be read back")?;
+    view["restore"] = json!({"seconds": round3(seconds), "statistics": print_stats(&dir.join("promote.stdout")), "prevention": prevention,
+        "log": log, "runtime_git_id": mg::RUNTIME_GIT_ID});
+    view["universe"] = lc::state_view(&c);
+    Ok(view)
 }
 
 /// The images a restore imported for a universe -- the quarantined copy's own, or, for a promoted

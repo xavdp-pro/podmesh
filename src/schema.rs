@@ -142,11 +142,16 @@ pub fn all() -> Value {
         f("scope", "string", true, "the replica's granted scope"), f("subject", "string", true, "1-128 safe ASCII"), f("value", "string", true, "at most 4096 bytes"),
     ])));
 
-    put("recovery_point_prepare", op("universe", "none", "captures a stopped universe as a recovery point, honestly unsigned", Some(vec![])));
+    put("recovery_point_prepare", op("universe", "reservation", "captures a universe as a recovery point, honestly unsigned: stopped (its rootfs, class quiescent) or live (a memory checkpoint resumed in place, class memory-coherent)", Some(vec![
+        en("capture", false, &["stopped", "live"], "stopped (default) exports a universe already stopped; live checkpoints a running universe and resumes it in place, interrupted about half a second, gated by the activation lease as a start is"),
+    ])));
+    put("recovery_point_stage", op("universe", "none", "holds a live point's archive on this host for a later promotion, verified against its manifest; no container is created", Some(vec![uuid("recovery_point_uuid", "the live point, in this host's inbox")])));
+    put("recovery_point_discard", op("universe", "none", "removes a staged live point's archive from this host", Some(vec![uuid("recovery_point_uuid", "the staged point")])));
     put("recovery_point_status", op("read", "none", "the recovery points of this host", Some(vec![])));
     put("recovery_point_restore", op("universe", "none", "restores a point into quarantine, isolated", Some(vec![uuid("recovery_point_uuid", "the point"), uuid("restored_universe_uuid", "the quarantine universe")])));
-    put("recovery_point_promote", op("universe", "lease", "promotes a quarantined restore into the universe's own identity, on a network profile", Some(vec![
-        uuid("recovery_point_uuid", "the point"), en("network_profile", true, &["isolated", "managed"], "the profile"), f("network_address", "string", false, "the address, for managed"), f("secrets", "object[]", false, "secrets to mount again"),
+    put("recovery_point_promote", op("universe", "lease", "promotes a quarantined copy (restored_universe_uuid, on a network profile, not started) or a staged live point (recovery_point_uuid, resumed running and isolated) into the universe's own identity", Some(vec![
+        f("restored_universe_uuid", "uuid", false, "the quarantined copy of a stopped point"), f("recovery_point_uuid", "uuid", false, "the staged live point"),
+        en("network_profile", false, &["isolated", "managed"], "the profile, required for a quarantined copy; a live point is always isolated"), f("network_address", "string", false, "the address, for managed"), f("secrets", "object[]", false, "secrets to mount again (quarantined copy)"),
     ])));
 
     put("collection_retention_declare", op("universe", "none", "how many recovery points to keep and the minimum age before one may be collected", Some(vec![

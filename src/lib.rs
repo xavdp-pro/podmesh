@@ -132,7 +132,8 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
             "network_declare" | "network_undeclare" | "network_route_publish" | "network_route_withdraw" | "network_status" => network::execute(db, request)?,
             "activation_require" | "activation_acquire" | "activation_renew" | "activation_release"
             | "activation_supersede" | "activation_status" | "activation_fence" | "activation_fence_preview" => activation::execute(db, request)?,
-            "recovery_point_prepare" | "recovery_point_status" | "recovery_point_restore" | "recovery_point_promote" => recovery_point::execute(db, request)?,
+            "recovery_point_prepare" | "recovery_point_status" | "recovery_point_restore" | "recovery_point_promote"
+            | "recovery_point_stage" | "recovery_point_discard" => recovery_point::execute(db, request)?,
             "migration_status" => migration::status(db, request)?,
             "storage_status" => storage::status()?,
             "host_status" => health::host_status()?,
@@ -141,7 +142,7 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
                 "schemas": schema::all(),
                 "schema_version": "podmesh-operation-schema/1",
                 "version":option_env!("PODMESH_PACKAGE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
-                "operations":["capabilities","identity","inventory","observations","activation_require","activation_acquire","activation_renew","activation_release","activation_supersede","activation_status","activation_fence","activation_fence_preview","recovery_point_prepare","recovery_point_status","recovery_point_restore","recovery_point_promote","create","delete","clone","start","stop","pause","resume","resources","storage_status","host_status","universe_stats"],
+                "operations":["capabilities","identity","inventory","observations","activation_require","activation_acquire","activation_renew","activation_release","activation_supersede","activation_status","activation_fence","activation_fence_preview","recovery_point_prepare","recovery_point_status","recovery_point_restore","recovery_point_promote","recovery_point_stage","recovery_point_discard","create","delete","clone","start","stop","pause","resume","resources","storage_status","host_status","universe_stats"],
                 "experimental_operations":["migration_preflight","migration_checkpoint","migration_status","migration_authorize_transfer",
                     "migration_complete_transfer","migration_retire_source","migration_release","migration_abandon","migration_restore_local",
                     "migration_destination_preflight","migration_restore","migration_restore_abort",
@@ -167,7 +168,10 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
                 },
                 "scope":"local rootful Podman; network-disabled universes created or cloned by this host's PodMesh journal; one request at a time",
                 "contracts":{
-                    "ownership":"delete, start, stop and clone sources require a verified create, clone or migration_restore in this host's journal for the same universe and container ID",
+                    "ownership":"delete, start, stop and clone sources require a verified create, clone, migration_restore or live recovery_point_promote in this host's journal for the same universe and container ID",
+                    "recovery_point_prepare":"capture stopped (default) exports a universe already stopped (class quiescent); capture live checkpoints a running universe with the qualified private runtime and resumes it in place from the kept images (class memory-coherent): the universe is interrupted for the dump and the resume, about half a second on a small universe, and its memory continues; gated by the activation lease as a start is; refused for a universe with a network, mounts, a TTY, more than 1 GiB of memory or non-musl processes",
+                    "recovery_point_stage":"a live point's archive held on this host, verified against its manifest, no container created: a memory checkpoint restores as running processes, so the copy is restored only by recovery_point_promote under the lease",
+                    "recovery_point_discard":"removes a staged point's archive and manifest from this host's inbox; refused for a point promoted here",
                     "start":"observe_seconds 0-30 (default 2); reports running or not running as observed, with exit code when not running",
                     "stop":"timeout_seconds 0-300 and on_timeout kill|leave_running are required; kill lets podman escalate to SIGKILL after the timeout, leave_running only sends the stop signal",
                     "pause":"freezes every process of a running universe; memory and address stay; never gated by the lease; a paused universe answers none_already_paused",

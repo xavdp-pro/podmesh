@@ -155,7 +155,7 @@ pub(crate) fn verified_owner(db: &Connection, container_id: &str) -> Result<bool
         [container_id],
         |r| r.get(0),
     )?;
-    if claimed {
+    if claimed || crate::recovery_point::promoted_live_container(db, container_id)? {
         return Ok(true);
     }
     // The ID is hexadecimal, so LIKE only narrows the scan; each candidate is checked exactly.
@@ -242,7 +242,7 @@ fn load_handoff(authorization: &str) -> Result<Handoff, Error> {
     let sha256 = mg::sha256_bytes(&bytes)?;
     Ok(Handoff { value: v, bytes, sha256 })
 }
-fn labelled(uuid: &str) -> Result<Vec<Value>, Error> {
+pub(crate) fn labelled(uuid: &str) -> Result<Vec<Value>, Error> {
     Ok(tr::all_containers()?
         .into_iter()
         .filter(|c| c["Labels"][UNIVERSE_LABEL].as_str() == Some(uuid))
@@ -284,7 +284,7 @@ fn bounded_output(command: &mut Command, limit: u64) -> Result<(bool, Vec<u8>), 
     Ok((child.wait()?.success(), bytes))
 }
 /// Podman's container configuration and the entry list of the archive, read without extracting to disk.
-fn archive_contents(archive: &Path) -> Result<(Value, Vec<String>), Error> {
+pub(crate) fn archive_contents(archive: &Path) -> Result<(Value, Vec<String>), Error> {
     const LIMIT: u64 = 4 * 1024 * 1024;
     let (readable, config) = bounded_output(
         Command::new("/usr/bin/timeout")

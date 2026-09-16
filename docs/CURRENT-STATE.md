@@ -163,7 +163,7 @@ durably imported and **replied to** by its peer — the reply simply not read in
 fsyncing transactions. The outbound ledger closes exactly and no fact was lost.
 
 The decisive reading is of `docs/MANAGER-G2-DURABLE-EXCHANGE.md`: its normative failure-semantics
-table at `:470` and invariant G2-I07 at `:80` **require** a source to retain a prepared/incomplete
+table and invariant G2-I07 **require** a source to retain a prepared/incomplete
 attempt when a reply is lost after the destination commits. The candidate obeys its contract. So
 the gate's `incomplete_attempt_count == 0` asks that a specified failure mode never occur during a
 campaign — a specification question for the gate's author, not a defect. The genuine defect is
@@ -273,7 +273,7 @@ uncoordinated live capture "crash-consistent" (a false guarantee headed for a ma
 describing the host surface as read-only while requiring dumps and snapshots that write,
 and giving restore no exclusion contract at all though it can mint a second active copy.
 All corrected. A delegated read-only sweep of the whole canon then found clauses the
-design never accounted for, one of which **contradicted it**: Rule 11 (`RULES.md:740-746` since the 16 September amendment; `:677-683` before it) forbids
+design never accounted for, one of which **contradicted it**: Rule 11 (`RULES.md#rule-11-what-is-restored`) forbids
 backing up images, because a backup containing them hides that the original may no longer
 be reproducible. Rule 10 forbids stating any restore duration anywhere, even to dismiss
 one. Rule 31 was missing entirely and creates a structural conflict — fractal erasure
@@ -318,7 +318,7 @@ own words to `tar.bz2` leaving a host and a chunk pull is outside it, the canon'
 "universe" (the LXC) is reconciled with PodMesh's (a Podman container), and per-universe
 keys are declared as B1's interim so no operator decision blocks it. The review also
 corrected a claim I had made too strongly — dedup and per-universe erasability are *not*
-mutually exclusive; a fourth encryption shape keeps both — and noted that `RULES.md:1214`
+mutually exclusive; a fourth encryption shape keeps both — and noted that `RULES.md#rule-37-fleet-map`
 may already have settled X1 before it ever reaches Xavier.
 
 **B1 still needs a third review** to move from NO-GO to GO: all six items are addressed,
@@ -853,8 +853,13 @@ most available memory, named in the report) and declares a lease-only activation
 outlives the interval; `run` replicates now; `start` arms a `systemd --user` timer on the workstation,
 the transport controller; `stop` disarms it and keeps the copies; `status` reads each standby's
 latest copy and checks it is still there; `summary` reads the ledger alone for the Health view. Each
-run STOPS the universe for its capture; live replication without a stop does not exist in this
-version, and the console says so. The console's universe drawer carries the panel (target, schedule,
+stopped run STOPS the universe for its capture. A **live** run (`--capture live`, the console's Mode)
+never stops it: `recovery_point_prepare` with `capture: live` checkpoints it with its memory through
+the qualified runtime, exports the writable layer while its processes are stopped by that same
+dump, and resumes it in place from the kept images; the archive is carried and staged on each
+standby (`recovery_point_stage`, which checks the image, runtime, kernel and space a promotion
+needs), older staged points are discarded, and a takeover promotes the newest one running, memory
+included (`recovery_point_promote` with `recovery_point_uuid`). The console says which mode runs. The console's universe drawer carries the panel (target, schedule,
 Replicate now, Start and Stop schedule, the copy on each standby) and the Health view a replication
 column. Measured on the development service, a small universe on lab-c:
 
@@ -865,6 +870,30 @@ column. Measured on the development service, a small universe on lab-c:
 | console, Replicate now | 1 standby | 6.2 s | 3.49 s |
 | console, scheduled | 1 standby | 7.5 s | 3.80 s |
 
-Not done: replication without stopping the universe, pruning policy exposed in the console, and a
-takeover started from the console.
+Live runs of the same universe, 16 September 2026, where the last column is the interruption, the
+dump plus the resume:
+
+| Run | Target | Total | Universe interrupted |
+| --- | --- | --- | --- |
+| tool, now | 1 standby | 4.7 s | 1.11 s |
+| console, Replicate now | 1 standby | 5.2 s | 1.11 s |
+
+`tests/check-live-replication-two-hosts.py` (lab-a to lab-c, 31 checks, passed) proves on a
+counter universe whose token lives only in memory: the capture resumes in place with the same
+token; staging creates no container; the refusals (second staging, no policy, another universe,
+a discarded point, a second promotion) change nothing; after the active copy stops and releases
+its lease, the promotion brings the universe back running on the standby with the same token and
+the counter from the capture onward; a replay restores nothing twice; the promoted universe
+accepts a typed stop and start. Interruption 0.87 s, promotion 1.34 s on that run.
+
+The design was reviewed adversarially before the lab run; the fixes it forced are in the build:
+the promotion passes the reservation, restore claim and tombstone gates a `create` passes, and
+refuses any container named or labelled for the universe; a durable attempt row precedes the
+restore, and a replay decides by observing the restore instant, never restoring twice; a capture
+the service did not see to the end is settled on retry (resumed from the kept images if the dump
+left the universe stopped) and records no point; a promoted container is owned for stop, delete
+and the collector. **Not proven on the lab:** those two crash paths, which need the service killed
+inside a sub-second window.
+
+Not done: pruning policy exposed in the console, and a takeover started from the console.
 

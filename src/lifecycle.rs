@@ -343,7 +343,7 @@ pub(crate) fn owned(db: &Connection, c: &Value, uuid: &str, role: &str) -> Resul
     // ownership is the verified migration_restore that binds this universe to this container ID. A local
     // restore from a preserved archive produces a new container ID the same way.
     if let Some(id) = c["Id"].as_str() {
-        if restore::restored_here(db, uuid, id)? || recovery::restored_locally(db, uuid, id)? {
+        if restore::restored_here(db, uuid, id)? || recovery::restored_locally(db, uuid, id)? || crate::recovery_point::promoted_live_here(db, uuid, id)? {
             return Ok(());
         }
     }

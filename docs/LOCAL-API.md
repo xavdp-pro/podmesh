@@ -455,6 +455,31 @@ copy; a quarantined copy becomes the universe itself, under the lease.
   and requested address the universe was created with. Refused, in this order: no such copy here; a copy of a different universe; a copy promoted
   into itself; no activation policy for the universe on this host; then the lease gate's three reasons. The
   quarantined copy is left in place. The answer carries the lease generation and the `scope` sentence above.
+- `recovery_point_prepare` with `capture: "live"` takes a **running** universe instead: the qualified runtime
+  dumps it with its memory, Podman exports the writable layer while the dump holds its processes stopped, and
+  the universe resumes in place from the kept images, which are then removed. The point holds
+  `checkpoint.tar.zst`, its class is `memory-coherent`, and the answer reports `dump_seconds`,
+  `resume_seconds` and `interruption_seconds`. It takes the migration checks (network none, no mounts, no TTY,
+  bounded memory) and, under a policy, the lease gate, because the resume is a start. The attempt is recorded
+  before the dump; a retry of a capture the service did not see to the end records no point, resumes the
+  universe from its kept images if the dump left it stopped, and reports what it found.
+- `recovery_point_stage` (`recovery_point_uuid`) records a live point from `inbox/` on a standby, creating no
+  container: a second instance of a running universe must not exist even stopped. It refuses, with every
+  blocker listed, what a promotion would discover too late: the image absent or its recorded name not
+  resolving here to the same ID (Podman's import would pull), a runtime binary, runtime git ID or kernel
+  release different from the source's, an archive whose configuration does not name the image and
+  universe, missing CRIU entries, too little space.
+- `recovery_point_discard` (`recovery_point_uuid`) removes a staged point's files and keeps its record; a
+  promoted point is refused.
+- `recovery_point_promote` with `recovery_point_uuid` instead of `restored_universe_uuid` restores a staged
+  live point **running**, with its memory, network none; there is no separate start. Refused, in this order:
+  no such staged point here; staged for another universe; discarded; already promoted; a profile other than
+  isolated, or secrets or an address; a migration reservation or unresolved restore claim; a collected
+  universe's tombstone; no activation policy; the lease gate's three reasons; a container named or labelled
+  for the universe on this host. A durable attempt row precedes the restore; a replay of an attempt that
+  reached it decides by observation (a container for the universe restored since the attempt began) and
+  never restores twice. The container is owned by the verified promotion, for `stop`, `delete` and the
+  collector.
 
 How the two files reach the inbox is the transport controller's, as for migrations: PodMesh reads
 `inbox/` and never writes it. The two-host suite's controller carries an outbox to an inbox over SSH.

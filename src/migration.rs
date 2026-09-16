@@ -725,6 +725,82 @@ pub(crate) fn preflight(db: &Connection, uuid: &str, b: &Binding, existing: Opti
 fn scope_unit(id: &str) -> String {
     format!("podmesh-checkpoint-{id}.scope")
 }
+/// The checkpoint blockers of a RUNNING universe this journal owns, without a migration's two-host binding:
+/// what a live recovery point (`recovery_point_prepare`, `capture: live`) must find true before anything is
+/// suspended. Read-only; the same facts a preflight reports.
+pub(crate) fn capture_assess(db: &Connection, uuid: &str, c: &Value) -> Result<(Vec<String>, Value), Error> {
+    lc::owned(db, c, uuid, "Live capture source")?;
+    let mut blockers = vec![];
+    let state = lc::status(c).to_string();
+    if !lc::process_active(c) {
+        blockers.push(format!("container state {state} is not running; only a running process can be checkpointed"));
+    }
+    if c["HostConfig"]["NetworkMode"].as_str() != Some("none") {
+        blockers.push("network mode is not none".into());
+    }
+    if c["Mounts"].as_array().map(|m| !m.is_empty()).unwrap_or(true) {
+        blockers.push("container has volumes or bind mounts".into());
+    }
+    if c["HostConfig"]["Privileged"].as_bool() != Some(false) {
+        blockers.push("container is privileged or its privilege mode is unknown".into());
+    }
+    if c["Config"]["Tty"].as_bool() == Some(true) {
+        blockers.push("containers with a TTY are outside the qualified scope".into());
+    }
+    let runtime = runtime_facts(&mut blockers);
+    let (processes, space) = if lc::process_active(c) {
+        let (processes, memory) = process_facts(c, &mut blockers, false);
+        let observed_id = c["Id"].as_str().ok_or("Universe container has no ID")?;
+        (processes, space_facts(observed_id, memory, &mut blockers)?)
+    } else {
+        (Value::Null, Value::Null)
+    };
+    let facts = json!({"observed_at": crate::now(), "container": lc::state_view(c), "image_id": c["Image"],
+        "network_mode": c["HostConfig"]["NetworkMode"], "runtime": runtime, "processes": processes, "space": space});
+    Ok((blockers, facts))
+}
+/// One exported checkpoint of a running container, in a transient scope the caller names (see `scoped_podman`).
+/// Without `--leave-running`: the processes are ended by the dump, so the writable layer Podman exports next is
+/// the exact disk state the memory image was taken against.
+pub(crate) fn checkpoint_export(unit: &str, id: &str, container_id: &str, archive: &Path, stdout: fs::File, stderr: fs::File) -> Result<ExitStatus, Error> {
+    let export = format!("--export={}", archive.display());
+    Ok(scoped_podman(
+        unit,
+        id,
+        CHECKPOINT_SECONDS,
+        &["container", "checkpoint", &export, "--compress=zstd", "--keep", "--file-locks", "--print-stats", container_id],
+        stdout,
+        stderr,
+        None,
+    )?
+    .0)
+}
+/// The same container resumed in place from the checkpoint files Podman kept for it (`--keep`).
+pub(crate) fn restore_kept(unit: &str, id: &str, container_id: &str, stdout: fs::File, stderr: fs::File) -> Result<ExitStatus, Error> {
+    Ok(scoped_podman(
+        unit,
+        id,
+        CHECKPOINT_SECONDS,
+        &["container", "restore", "--keep", "--file-locks", "--print-stats", container_id],
+        stdout,
+        stderr,
+        None,
+    )?
+    .0)
+}
+/// An exported checkpoint archive restored as a container named `name`, under the caller's bound on the graph root.
+pub(crate) fn restore_import(unit: &str, id: &str, archive: &Path, name: &str, stdout: fs::File, stderr: fs::File, bound: Option<&Bound>) -> Result<(ExitStatus, Value), Error> {
+    let import = format!("--import={}", archive.display());
+    scoped_podman(
+        unit,
+        id,
+        CHECKPOINT_SECONDS,
+        &["container", "restore", &import, "--name", name, "--keep", "--file-locks", "--print-stats"],
+        stdout,
+        stderr,
+        bound,
+    )
+}
 /// Whether a transient scope may still hold its command. `is-active` reports a scope that is still
 /// activating or deactivating as not active, so only a finished or absent unit counts as done; a query
 /// that cannot be answered fails closed.
