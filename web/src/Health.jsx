@@ -3,6 +3,15 @@ import {replicationSummary,linkState,ratio,bytes,age,STORE_WARN_BYTES} from './h
 const short=s=>s?String(s).slice(0,8):'—';
 function Bar({value,label,tone}){const pct=value==null?0:Math.round(value*100);return <div className="hbar" aria-label={label}><span className={'hbar-fill '+(tone||(pct>=90?'bad':pct>=70?'warn':'ok'))} style={{width:pct+'%'}}/></div>;}
 const badge={healthy:['green','healthy'],degraded:['amber','degraded'],failing:['red','failing'],absent:['muted','no manager']};
+// A universe's replication at a glance: the manager replicates itself peer to peer (the links below); an ordinary universe
+// by warm-standby runs set up from its drawer, summarised from the workstation's ledger.
+function ReplicationCell({universe,replication:r}){
+ if(universe.manager)return <small>peer to peer, see the links below</small>;
+ if(!r)return <span className="badge muted">none</span>;
+ const failed=r.last_run&&!r.last_run.ok;
+ return <><span className={'badge '+(failed?'red':r.armed?'green':'amber')}>{failed?'last run failed':r.armed?'scheduled':'manual'}</span>
+  <small>{r.mode==='all'?'all':r.standbys} standby{r.standbys>1?'s':''}{r.armed&&r.interval_seconds?` · every ${r.interval_seconds>=3600?`${r.interval_seconds/3600} h`:`${Math.round(r.interval_seconds/60)} min`}`:''} · last copy {age(r.last_copy_age_seconds==null?null:r.last_copy_age_seconds*1000)}{r.last_run?.stopped_for_seconds!=null?` · stopped ${r.last_run.stopped_for_seconds} s`:''}</small>{failed&&<small className="op-error">{r.last_run.error}</small>}</>;
+}
 export default function Health({session,renewSession}){
  const[data,D]=useState(null),[error,E]=useState(''),[busy,B]=useState(false);
  async function load(){B(true);try{const r=await fetch('/api/health',{headers:{'X-Podmesh-Token':session.token}});if(r.status===401){await renewSession();E('The console session was renewed; refreshing.');return;}if(!r.ok)throw Error((await r.json().catch(()=>({}))).error||'Health unavailable');D(await r.json());E('');}catch(e){E(e.message);}finally{B(false);}}
@@ -30,14 +39,14 @@ export default function Health({session,renewSession}){
     </article>;})}
   </section>
   <section className="panel">
-   <div className="panel-title"><div><h2>Universes</h2><p>CPU as a share of one core over a 500 ms sample, memory and its limit from the cgroup, disk written from Podman.</p></div></div>
-   <div className="table-wrap"><table><thead><tr><th>Universe</th><th>Host</th><th>State</th><th>CPU</th><th>Memory</th><th>Disk written</th></tr></thead><tbody>
+   <div className="panel-title"><div><h2>Universes</h2><p>CPU as a share of one core over a 500 ms sample, memory and its limit from the cgroup, disk written from Podman. Replication is set up, run and stopped from each universe’s drawer.</p>{data.replicationError&&<p className="op-error">{data.replicationError}</p>}</div></div>
+   <div className="table-wrap"><table><thead><tr><th>Universe</th><th>Host</th><th>State</th><th>CPU</th><th>Memory</th><th>Disk written</th><th>Replication</th></tr></thead><tbody>
     {hosts.flatMap(h=>(h.universes||[]).map(u=><tr key={h.id+u.universe_uuid}>
      <td><code>{short(u.universe_uuid)}</code>{u.manager&&<small className="tag">manager</small>}</td><td>{h.name}</td>
      <td><span className={'badge '+(u.state==='running'?'green':u.state==='paused'?'amber':'muted')}>{u.state}</span></td>
      <td>{u.cpu_percent_of_one_core==null?'—':<><Bar value={ratio(u.cpu_percent_of_one_core,100*(u.cpus_allowed||h.host?.cpu_count||1))} label="cpu"/><small>{u.cpu_percent_of_one_core} %{u.cpus_allowed?` of ${u.cpus_allowed} core`:''}</small></>}</td>
      <td>{u.memory_current_bytes==null?'—':<><Bar value={ratio(u.memory_current_bytes,u.memory_max_bytes||h.host?.memory_total_bytes)} label="memory"/><small>{bytes(u.memory_current_bytes)}{u.memory_max_bytes?` of ${bytes(u.memory_max_bytes)}`:' (no limit)'}</small></>}</td>
-     <td>{bytes(u.disk_written_bytes)}</td></tr>))}
+     <td>{bytes(u.disk_written_bytes)}</td><td><ReplicationCell universe={u} replication={data.replication?.[u.universe_uuid]}/></td></tr>))}
    </tbody></table></div>
   </section>
   <section className="panel">

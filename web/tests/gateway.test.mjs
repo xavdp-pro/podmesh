@@ -190,3 +190,32 @@ test('health reads every host on its own, reports a failing one, and reads manag
  assert.equal(a.host.cpu_count,2);assert.equal(a.universes.length,2);assert.equal(a.managers.length,1);assert.equal(a.managers[0].links[0].outcome,'local_exchange_failure');assert.equal(a.managers[0].store_bytes,123);
  assert.match(b.errors.runtime,/without host_status/);assert.match(c.errors.transport,/unreachable/);
  assert.deepEqual(calls.filter(([,op])=>op==='manager_status').map(([h,,u])=>h+':'+u),['a:'+M]);});
+test('replication runs the tool for the active host with every other SSH host as candidate, and refuses what is not a replication',async t=>{
+ const runs=[];let app;const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ app=createApp({hosts:[{id:'a',name:'A',ssh:'lab@a',allowActions:true},{id:'b',name:'B',ssh:'lab@b',allowActions:true},{id:'c',name:'C',ssh:'lab@c',allowActions:true},{id:'r',name:'R',ssh:'lab@r',allowActions:false},{id:'l',name:'L',socket:'/l.sock',allowActions:true}],toolsDir:'/tools'},
+  {origin:url,call:async()=>({ok:true,data:{}}),runReplication:async r=>{runs.push(r.args);return r.args.includes('status')?{result:'status',configured:false}:r.args.includes('refuse')?{result:'refused',error:'no'}:{result:r.args[2]};}});
+ const session=await fetch(url+'/api/session').then(r=>r.json());
+ const U='00000000-0000-4000-8000-000000000001';
+ const post=(body,extra={})=>fetch(url+'/api/replication',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Podmesh-Token':session.token,...extra},body:JSON.stringify(body)});
+ const st=await fetch(url+`/api/replication/a/${U}`,{headers:{'X-Podmesh-Token':session.token}}).then(r=>r.json());
+ assert.equal(st.result,'status');assert.deepEqual(st.candidates.map(c=>c.id),['b','c','r']);
+ const base={host:'a',universe_uuid:U,authorization_ref:'fixture'};
+ assert.equal((await post({...base,action:'configure',standbys:'all',interval_seconds:900})).status,200);
+ assert.deepEqual(runs.at(-1),['--reference','fixture','configure','--universe',U,'--active','lab@a','--hosts','lab@a,lab@b,lab@c,lab@r','--standbys','all','--interval','900']);
+ assert.equal((await post({...base,action:'configure',standbys:2,interval_seconds:60})).status,200);assert.equal(runs.at(-1)[runs.at(-1).indexOf('--standbys')+1],'2');
+ for(const bad of [{...base,action:'configure',standbys:4,interval_seconds:900},{...base,action:'configure',standbys:'all',interval_seconds:30},{...base,action:'run',standbys:'all'},{...base,action:'explode'},{...base,action:'run',extra:1},{...base,action:'run',authorization_ref:''}])
+  assert.equal((await post(bad)).status,400,JSON.stringify(bad));
+ assert.equal((await post({...base,host:'r',action:'run'})).status,403);
+ assert.equal((await post({...base,host:'l',action:'run'})).status,409);
+ assert.equal((await post({...base,action:'run'},{'X-Podmesh-Token':''})).status,401);
+ for(const action of ['run','start','stop']){assert.equal((await post({...base,action})).status,200);assert.deepEqual(runs.at(-1),['--reference','fixture',action,'--universe',U]);}
+ assert.equal(runs.filter(a=>a.includes('configure')).length,2);});
+test('health carries the replication summary from the ledger, and says when it cannot be read',async t=>{
+ let app,answer;const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
+ const U='00000000-0000-4000-8000-00000000000b',seen=[];
+ app=createApp({hosts:[{id:'a',name:'A',ssh:'lab@a'}]},{origin:url,call:async()=>({ok:true,data:{operations:[]}}),runReplication:async r=>{seen.push(r.args);return answer;}});
+ const session=await fetch(url+'/api/session').then(r=>r.json());const get=()=>fetch(url+'/api/health',{headers:{'X-Podmesh-Token':session.token}}).then(r=>r.json());
+ answer={result:'summary',universes:{[U]:{mode:'all',standbys:2,armed:true,interval_seconds:900,last_copy_age_seconds:30,last_run:{ok:true,stopped_for_seconds:3.4}}}};
+ const body=await get();assert.equal(body.replication[U].standbys,2);assert.equal(body.replicationError,null);assert.deepEqual(seen[0],['summary']);
+ answer={result:'unknown',error:'the replication tool answered nothing readable'};
+ const bad=await get();assert.deepEqual(bad.replication,{});assert.match(bad.replicationError,/nothing readable/);});

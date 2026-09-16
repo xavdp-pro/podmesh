@@ -39,3 +39,9 @@
 .hbar{height:.45rem;border-radius:1rem;background:#e4dccb;overflow:hidden;min-width:5rem}.hbar-fill{display:block;height:100%;border-radius:1rem}.hbar-fill.ok{background:#215547}.hbar-fill.warn{background:#b7862b}.hbar-fill.bad{background:#8c3b2e}
 td small{display:block;color:#7a7268;font-size:.78rem}td small.tag{display:inline-block;margin-left:.4rem;padding:0 .35rem;border-radius:.3rem;background:#dfe9e3;color:#183f35}.outcome{font-family:ui-monospace,monospace}.warn-text{color:#8a5a12;font-weight:600}
 .table-wrap{overflow-x:auto}
+
+/* replication, in the universe drawer */
+.replication{margin-top:1.2rem;padding-top:1rem;border-top:1px solid #e4dccb;display:flex;flex-direction:column;gap:.7rem}.replication h3{margin:0}
+.replication-head{display:flex;align-items:center;gap:.6rem}.replication-head .icon{margin-left:auto}.replication-note{margin:0;color:#7a7268;font-size:.88rem;line-height:1.4}
+.replication label{display:flex;flex-direction:column;gap:.3rem;font-size:.85rem;color:#4a433b}.replication input{padding:.5rem .7rem;border:1px solid #d8cfbe;border-radius:.4rem;background:#fffdf8;font:inherit}
+.replication table{width:100%;border-collapse:collapse;font-size:.88rem}.replication th,.replication td{text-align:left;padding:.35rem .5rem;border-bottom:1px solid #e4dccb}

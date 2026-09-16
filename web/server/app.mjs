@@ -34,6 +34,16 @@ function requireMutatingSession(req,res,origin,token){if(req.headers.origin!==or
 import {spawn} from 'node:child_process';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
+// A replication runs tools/replicate-universe.py from the PodMesh tree on this workstation, like a move.
+function defaultRunReplication({args,host,toolsDir}){
+ const tool=path.join(toolsDir,'replicate-universe.py');
+ const env={...process.env,PODMESH_SOCKET:host.remoteSocket||'/run/podmesh/api.sock',PODMESH_STATE_DIR:host.remoteStateDir||'/var/lib/podmesh',PODMESH_UNIT:host.remoteUnit||'podmesh.service'};
+ return new Promise(resolve=>{const out=[];let done=false;const p=spawn('python3',['-B',tool,...args],{env,stdio:['ignore','pipe','pipe']});
+  const timer=setTimeout(()=>{if(!done){done=true;p.kill();resolve({result:'unknown',error:'the replication tool did not finish within ten minutes; read the status again'});}},600000);
+  p.stdout.on('data',d=>out.push(d));p.stderr.resume();
+  p.on('error',e=>{if(!done){done=true;clearTimeout(timer);resolve({result:'unknown',error:'the replication tool could not be started: '+e.message});}});
+  p.on('close',()=>{if(done)return;done=true;clearTimeout(timer);const text=Buffer.concat(out).toString('utf8');try{resolve(JSON.parse(text.slice(text.indexOf('{'))));}catch{resolve({result:'unknown',error:'the replication tool answered nothing readable',raw:text.slice(-600)});}});});
+}
 function defaultRunMove({source,destination,universe_uuid,authorization_ref,keep_source,toolsDir}){
  const tool=path.join(toolsDir,'move-universe.py');
  const env={...process.env,PODMESH_SOCKET:source.remoteSocket||'/run/podmesh/api.sock',PODMESH_STATE_DIR:source.remoteStateDir||'/var/lib/podmesh',PODMESH_UNIT:source.remoteUnit||'podmesh.service'};
@@ -44,7 +54,7 @@ function defaultRunMove({source,destination,universe_uuid,authorization_ref,keep
   p.on('error',e=>{if(!done){done=true;clearTimeout(timer);resolve({result:'unknown',message:'the move tool could not be started: '+e.message,steps:[]});}});
   p.on('close',()=>{if(done)return;done=true;clearTimeout(timer);const text=Buffer.concat(out).toString('utf8');try{resolve(JSON.parse(text.slice(text.indexOf('{'))));}catch{resolve({result:'unknown',message:'the move tool answered nothing readable; inspect both hosts',steps:[],raw:text.slice(-800)});}});});
 }
-export function createApp(config,{call=request,origin='http://127.0.0.1:4175',relationshipFetch=fetch,now=()=>Date.now(),runMove=defaultRunMove}={}){
+export function createApp(config,{call=request,origin='http://127.0.0.1:4175',relationshipFetch=fetch,now=()=>Date.now(),runMove=defaultRunMove,runReplication=defaultRunReplication}={}){
  const app=express();const token=randomBytes(32).toString('hex');
  const hosts=config.hosts||[];if(hosts.length>16)throw Error('Maximum16 hosts');
  const relationships=relationshipSource(config.relationships);
@@ -55,6 +65,7 @@ export function createApp(config,{call=request,origin='http://127.0.0.1:4175',re
  // Health, read-only: for every host, what it carries (host_status), what each universe uses (universe_stats), and for
  // every manager universe its replication links as the resident reports them (manager_status). Each host answers on its
  // own; one that fails is reported as such, never hidden, and never blocks the others.
+ const replicationToolsDir=()=>config.toolsDir||process.env.PODMESH_TOOLS_DIR||path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../../../../../podmesh/tools');
  app.get('/api/health',async(req,res)=>{
   if(!requireReadSession(req,res,origin,token))return;
   const rows=await Promise.all(hosts.map(async h=>{
@@ -78,7 +89,10 @@ export function createApp(config,{call=request,origin='http://127.0.0.1:4175',re
    }catch(e){row.errors.transport=e.message;}
    return row;
   }));
-  res.json({receivedAt:now(),hosts:rows});
+  // Replication of ordinary universes, from the workstation's ledger alone (no host is reached for it).
+  let replication={},replicationError=null;const toolHost=hosts.find(h=>h.ssh);
+  if(toolHost){const r=await runReplication({args:['summary'],host:toolHost,toolsDir:replicationToolsDir()});if(r.result==='summary')replication=r.universes||{};else replicationError=r.error||'the replication summary could not be read';}
+  res.json({receivedAt:now(),hosts:rows,replication,replicationError});
  });
  // The generic engine: any operation the host advertises with a schema, validated here against that schema -- the same
  // bounds the daemon enforces -- and sent as it was built. Reads need the read session; mutations the mutating one and a
@@ -118,6 +132,39 @@ export function createApp(config,{call=request,origin='http://127.0.0.1:4175',re
   const problem=validateAgainst(schema,p);if(problem)return res.status(400).json({error:problem});
   try{const result=await call(host,p,{timeout:schema.kind==='read'?30000:330000});if(schema.kind!=='read'){cached=null;generation++;}res.json(result);}
   catch(e){if(schema.kind!=='read'){cached=null;generation++;}res.status(502).json({error:e.message,operation_id:p.operation_id,outcome:'unknown'});}
+ });
+ // Replication of a universe to standbys: status (read), and configure / run / start / stop (mutating), each through the
+ // replication tool; the active host is the one the universe runs on, the candidates every other SSH host of this console.
+ app.get('/api/replication/:host/:universe',async(req,res)=>{
+  if(!requireReadSession(req,res,origin,token))return;
+  const host=hosts.find(h=>h.id===req.params.host);if(!host)return res.status(404).json({error:'Unknown host'});
+  if(!uuid.test(req.params.universe))return res.status(400).json({error:'Invalid universe'});
+  const report=await runReplication({args:['status','--universe',req.params.universe],host,toolsDir:replicationToolsDir()});
+  res.status(report.result==='status'?200:502).json({...report,candidates:hosts.filter(h=>h.ssh&&h.id!==host.id).map(h=>({id:h.id,name:h.name,ssh:h.ssh}))});
+ });
+ app.post('/api/replication',express.json({limit:'8kb'}),async(req,res)=>{
+  if(!requireMutatingSession(req,res,origin,token))return;
+  const p=req.body||{};const host=hosts.find(h=>h.id===p.host);
+  if(!host)return res.status(404).json({error:'Unknown host'});
+  if(!['configure','run','start','stop'].includes(p.action)||!uuid.test(p.universe_uuid)||typeof p.authorization_ref!=='string'||!p.authorization_ref.trim()||p.authorization_ref.length>256)return res.status(400).json({error:'Invalid replication request'});
+  if(Object.keys(p).some(k=>!['action','host','universe_uuid','authorization_ref','standbys','interval_seconds'].includes(k)))return res.status(400).json({error:'Unexpected replication field'});
+  if(!host.allowActions)return res.status(403).json({error:'Actions disabled by operator configuration'});
+  if(!host.ssh)return res.status(409).json({error:'A replication needs the active host reached over SSH from this console'});
+  const others=hosts.filter(h=>h.ssh&&h.id!==host.id);
+  let args=['--reference',p.authorization_ref.trim()];
+  if(p.action==='configure'){
+   if(!others.length)return res.status(409).json({error:'No other host reached over SSH to replicate to'});
+   const standbys=p.standbys==='all'?'all':Number.isInteger(p.standbys)&&p.standbys>=1&&p.standbys<=others.length?String(p.standbys):null;
+   if(!standbys)return res.status(400).json({error:`standbys must be "all" or 1 to ${others.length}`});
+   if(!Number.isInteger(p.interval_seconds)||p.interval_seconds<60||p.interval_seconds>86400)return res.status(400).json({error:'interval_seconds must be from 60 to 86400'});
+   args.push('configure','--universe',p.universe_uuid,'--active',host.ssh,'--hosts',[host.ssh,...others.map(h=>h.ssh)].join(','),'--standbys',standbys,'--interval',String(p.interval_seconds));
+  }else{
+   if(p.standbys!==undefined||p.interval_seconds!==undefined)return res.status(400).json({error:'standbys and interval_seconds belong to configure'});
+   args.push(p.action,'--universe',p.universe_uuid);
+  }
+  const report=await runReplication({args,host,toolsDir:replicationToolsDir()});
+  if(p.action==='run'||p.action==='configure'){cached=null;generation++;}
+  res.status(report.result==='refused'?409:report.result==='unknown'?502:200).json(report);
  });
  // A move: one universe, two hosts of this configuration, both reached over SSH and both allowing actions, on the same runtime paths.
  app.post('/api/moves',express.json({limit:'8kb'}),async(req,res)=>{
