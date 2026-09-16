@@ -19,11 +19,13 @@ journal, the store or a peer.
     tools/manager-admin.py revoke --host lab@… --universe <replica universe uuid> --login someone
 
 `bootstrap` is what a deployment runs: a manager that is up has an administrator from the first
-minute, and nobody has to remember to make one. It is NOT a default account -- a default password
-is a published password. It draws a fresh random one, writes it nowhere but the store's hash,
-prints it once on this root-only channel, and marks the account `must_change`, so the page it
-opens is the one that replaces that password and nothing else works until it is. Running it again
-on a manager that already has an administrator does nothing.
+minute, and nobody has to remember to make one. On the operator's decision of 2026-09-16 it gives
+that account a simple default password, replaced at the first sign-in; the account is marked
+`must_change`, so the only page it opens is the one that replaces it and it may name nobody until
+it does. The consequence is stated rather than hidden: a default password is known in advance, so
+between the deployment and that first sign-in anyone who reaches the page can take the account.
+`--password` (or PODMESH_DEFAULT_ADMIN_PASSWORD) gives a deployment its own instead. Running
+bootstrap again on a manager that already has an administrator does nothing.
 
 Environment: the usual laboratory variables (PODMESH_SOCKET, PODMESH_STATE_DIR, PODMESH_UNIT),
 and PODMESH_REPLICA_SET when `--scope` is not given, to find the replica's scope.
@@ -37,6 +39,12 @@ from podmesh_two_hosts import Host  # noqa: E402
 SUBJECT_PREFIX = 'admin.user.'
 FLAG_PREFIX = 'admin.flag.'
 DEPLOY_LOGIN = 'admin'
+# The operator's decision of 2026-09-16: a simple default password, changed at the first
+# sign-in. Stated plainly, since it is known in advance: from the minute a manager is deployed
+# until someone signs in and replaces it, whoever reaches the page can take that account. The
+# forced change is what closes the window, so deploy and sign in in the same breath. Override it
+# with --password or PODMESH_DEFAULT_ADMIN_PASSWORD when a deployment should not use it.
+DEFAULT_PASSWORD = os.environ.get('PODMESH_DEFAULT_ADMIN_PASSWORD', 'podmesh')
 LOGIN_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789-_.'
 MIN_PASSWORD = 12
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 16384, 8, 1
@@ -104,11 +112,30 @@ def observe(h, args, scope, subject, value):
             raise SystemExit(f'the control door refused: {last}')
         time.sleep(2)
         try:
-            if subject[len(SUBJECT_PREFIX):] in administrators(h, args) and subject.startswith(SUBJECT_PREFIX):
+            if landed(h, args, subject, value):
                 return {'note': f'observed after an uncertain answer on attempt {attempt + 1}'}
         except SystemExit:
             pass
     raise SystemExit(f'the control door stayed uncertain: {last}')
+
+
+def landed(h, args, subject, value):
+    """Did that exact observation land? Whatever its subject -- an administrator's hash or the
+    flag beside it. The resident answers `uncertain` when it cannot say, and measured on
+    2026-09-16 it answers that while the fact is in fact appended, so the store is what decides,
+    never the answer."""
+    for fact in raw_facts(h, args):
+        if fact.get('subject') == subject and fact.get('value') == value:
+            return True
+    return False
+
+
+def raw_facts(h, args):
+    out = h.call('podman_run', args=['exec', 'podmesh-' + args.universe,
+                                     '/usr/lib/podmesh-manager/podmesh-managerd', '--inspect-store',
+                                     '--config', '/etc/podmesh-manager/config.json',
+                                     '--state-dir', '/var/lib/podmesh-manager'])
+    return json.loads(out['stdout']).get('ordered_facts') or []
 
 
 def administrators(h, args):
@@ -118,11 +145,7 @@ def administrators(h, args):
                     'universe_uuid': args.universe, 'authorization_ref': args.reference})
     if not answer.get('ok'):
         raise SystemExit(f'the control door refused: {answer.get("error")}')
-    out = h.call('podman_run', args=['exec', 'podmesh-' + args.universe,
-                                     '/usr/lib/podmesh-manager/podmesh-managerd', '--inspect-store',
-                                     '--config', '/etc/podmesh-manager/config.json',
-                                     '--state-dir', '/var/lib/podmesh-manager'])
-    facts = json.loads(out['stdout']).get('ordered_facts') or []
+    facts = raw_facts(h, args)
     # The store keeps every revision of a subject, not only the last: the current state of a
     # login is its highest revision inside each scope, and a revocation is just the revision that
     # says `revoked`.
@@ -150,6 +173,7 @@ def main():
     p.add_argument('--login')
     p.add_argument('--scope', help='the replica\'s granted scope; else read from the replica set')
     p.add_argument('--alias', help='lab-a, lab-b, lab-c: which scope of the replica set')
+    p.add_argument('--password', help='the password a bootstrap gives the deployment account; else the default')
     p.add_argument('--reference', default='manager-admin-tool')
     args = p.parse_args()
     h = host_of(args)
@@ -160,13 +184,13 @@ def main():
             print(json.dumps({'bootstrap': 'not needed', 'administrators': sorted(live)}, indent=2))
             return
         scope = scope_of(args, h)
-        # 24 characters of base32 from the OS: not a default password, and not one anybody typed.
-        password = secrets.token_urlsafe(18)
+        password = args.password or DEFAULT_PASSWORD
         observe(h, args, scope, SUBJECT_PREFIX + DEPLOY_LOGIN, hash_password(password))
         observe(h, args, scope, FLAG_PREFIX + DEPLOY_LOGIN, 'must_change')
         print(json.dumps({'bootstrap': 'created', 'login': DEPLOY_LOGIN, 'password': password, 'scope': scope,
-                          'note': 'shown once, on this root-only channel; the manager refuses everything else '
-                                  'until this password is replaced at the first sign-in'}, indent=2))
+                          'default': password == DEFAULT_PASSWORD,
+                          'note': 'the account opens nothing but the page that replaces this password. A default '
+                                  'password is known in advance: sign in and change it now, not later'}, indent=2))
         return
     if args.command == 'list':
         print(json.dumps({'administrators': administrators(h, args)}, indent=2, sort_keys=True))

@@ -27,13 +27,19 @@ simply the revision that says `revoked`.
 door to power. The first administrator is written from the host that carries a replica, as root,
 through PodMesh's typed control door (`manager_observe`), by `tools/manager-admin.py`.
 
-**A deployment creates it, and it is not a default account.** `tools/manager-admin.py bootstrap`
-runs as part of deploying the manager (`tools/arm-publisher-follow.py` calls it): a manager that
-is up has an administrator from its first minute, so nobody has to remember to make one. It
-draws a fresh random password from the operating system, prints it **once** on that root-only
-channel, and marks the account `must_change`. A default password is a published password; there
-is none here, and two deployments never share one. Running bootstrap again on a manager that
-already has an administrator does nothing.
+**A deployment creates it, with a default password changed at the first sign-in.**
+`tools/manager-admin.py bootstrap` runs as part of deploying the manager
+(`tools/arm-publisher-follow.py` calls it): a manager that is up has an administrator from its
+first minute, so nobody has to remember to make one. The operator decided on 2026-09-16 that the
+password is a simple default — `admin` / `podmesh` — replaced at the first sign-in, rather than a
+random one printed once. The account is marked `must_change`, so the only page it opens is the
+one that replaces it and it may name nobody until it does.
+
+The consequence is stated rather than hidden, because a default password is known in advance:
+between the deployment and that first sign-in, whoever reaches the page can take the account.
+The forced change is what closes that window, so a deployment and its first sign-in belong in the
+same breath. `--password`, or `PODMESH_DEFAULT_ADMIN_PASSWORD`, gives a deployment its own
+instead. Running bootstrap again on a manager that already has an administrator does nothing.
 
 ## What the surface refuses
 
@@ -66,6 +72,11 @@ property of this surface.
 `packaging/podmesh-manager/universe/origin.py` in the web tree (the origin responder, which now
 carries `/admin`), `tools/manager-admin.py` (bootstrap, create, list, revoke through the control
 door), and the bootstrap call in `tools/arm-publisher-follow.py`.
+
+Measured on 2026-09-16: the resident answers `append_observation_uncertain` on an append that
+in fact lands. The tool therefore reads the store back for that exact subject and value rather
+than trusting the answer, and repeats only while the fact is genuinely absent, so an
+administrator is never written twice nor silently missing.
 
 `tests/check-manager-admin-origin.py` in the web tree runs the responder against a stub resident
 and a stub control socket and exercises fifteen gates: everything 503 without the mark; `/ready`
