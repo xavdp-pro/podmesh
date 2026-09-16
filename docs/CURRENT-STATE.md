@@ -704,6 +704,24 @@ outcome carried back, `migration_complete_transfer`, `migration_release`, `delet
 Not done: moving a managed-network universe, and the storage comparison (LVM thin, ZFS, Btrfs),
 whose 60 GB disks have not been added to the laboratory VMs.
 
+## One mechanism to control everything (2026-09-16, the operator's go)
+
+`capabilities` now publishes a machine-readable schema for each of the 58 advertised operations
+(`LOCAL-API.md`, "The schemas"): kind, gate, fields with types and the bounds the daemon enforces,
+the eleven migration steps honestly undescribed. `tests/check-capabilities-schema.py` holds the
+schemas to the daemon on lab-c: every advertised operation described, and ten values just outside
+a stated bound refused naming the field. `storage_status` reads what carries Podman's storage and
+applies the operator's rule: growth only on a dedicated LVM, ZFS or Btrfs volume, refused on a
+filesystem shared with the system — which is the laboratory's answer today. The console's generic
+form engine over these schemas is the next step; universe volumes and their growth come with the
+dedicated disks.
+
+Measured inside the governor's replica the same day: the manager resident commits in about 230 ms
+on the laboratory VMs while its control deadline is 250 ms with 25 ms reserved for the answer, so
+nearly every first append answers `append_observation_uncertain` although the fact lands. Every
+client of its control door reads the store back rather than trusting the answer; the operator met
+the case on the public page when a password change landed and its flag was reported refused.
+
 ## Next actions, in order
 
 1. Done: independent read-only counter-review of the source-side milestone (Claude
