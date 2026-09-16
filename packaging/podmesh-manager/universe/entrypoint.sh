@@ -26,34 +26,14 @@ export PODMESH_MANAGER_NETWORK_MODE=authenticated-static-peers
 child=$!
 echo "manager-universe: resident started pid=$child"
 
-# The origin a publishing connector proxies to: a small HTTP responder on port 8080, fail-closed.
-# It answers /ready with this replica's logical and replica identities and, ONLY while PodMesh has
-# marked this replica governor (a root-only file it writes at the exclusive publication and removes
-# at the withdrawal or the fence), the epoch it was marked with; without the mark, or on any other
-# path, it answers 503 -- a connector that reaches a replica that is not the governor gets nothing.
-# It decides nothing: the mark is PodMesh's, under the epoch gate. The manager's web interface is
-# not served here yet; this is the epoch-qualified origin the publisher contract requires.
-python3 - <<'EOF' >/dev/null 2>&1 &
-import http.server, json, os
-cfg = json.load(open('/etc/podmesh-manager/config.json'))
-identity = {'logical_manager_id': cfg['network']['manager']['logical_manager_id'], 'replica_id': cfg['network']['replica_id']}
-MARK = '/run/podmesh-manager/governor.json'
-class Origin(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *a): pass
-    def do_GET(self):
-        try:
-            mark = json.load(open(MARK))
-        except Exception:
-            mark = None
-        if self.path != '/ready' or not mark:
-            body = json.dumps({'ready': False, 'reason': 'not the governor' if self.path == '/ready' else 'no such path', **identity}).encode()
-            self.send_response(503); self.send_header('Content-Type', 'application/json'); self.send_header('Content-Length', str(len(body))); self.end_headers()
-            self.wfile.write(body); return
-        body = json.dumps({'ready': True, **identity, 'epoch': mark.get('epoch'), 'marked_at': mark.get('marked_at')}).encode()
-        self.send_response(200); self.send_header('Content-Type', 'application/json'); self.send_header('Content-Length', str(len(body))); self.end_headers()
-        self.wfile.write(body)
-http.server.ThreadingHTTPServer(('0.0.0.0', 8080), Origin).serve_forever()
-EOF
+# The origin a publishing connector proxies to: a small HTTP responder on port 8080, fail-closed
+# on the governor mark (a root-only file PodMesh writes at the exclusive publication, under the
+# epoch gate, and removes at the withdrawal or the fence). Without it every path answers 503: a
+# connector that reaches a replica which is not the governor gets nothing. It decides nothing
+# about the role. It also carries the administration surface (/admin): an administrator is a
+# replicated fact, and the FIRST one is never created there -- it is written from the host, as
+# root, through PodMesh's control door. See origin.py.
+python3 /usr/local/lib/podmesh-manager/origin.py >/dev/null 2>&1 &
 origin=$!
 echo "manager-universe: origin responder started pid=$origin (fail-closed until PodMesh marks this replica governor)"
 
