@@ -15,6 +15,8 @@ const origin = path.join(tree, 'packaging', 'podmesh-manager', 'universe', 'orig
 const sources = [
   ...walk(path.join(web, 'src')).filter(f => /\.(jsx?|mjs|html)$/.test(f)),
   path.join(web, 'index.html'),
+  ...(fs.existsSync(path.join(web, 'next', 'src')) ? walk(path.join(web, 'next', 'src')).filter(f => /\.(jsx?|mjs|html)$/.test(f)) : []),
+  path.join(web, 'next', 'index.html'),
   ...['src', 'server'].filter(d => fs.existsSync(path.join(origin, d))).flatMap(d => walk(path.join(origin, d))).filter(f => /\.(jsx?|mjs|html)$/.test(f)),
   path.join(origin, 'index.html'),
 ].filter(f => fs.existsSync(f));
@@ -25,6 +27,7 @@ const read = f => fs.readFileSync(f, 'utf8')
 test('the rules are checked against real sources, not an empty list', () => {
   assert.ok(sources.some(f => f.endsWith('main.jsx')), 'the console source is missing from the scan');
   assert.ok(sources.some(f => f.includes('/origin/src/')), 'the manager origin app is missing from the scan');
+  assert.ok(sources.some(f => f.includes('/next/src/')), 'the console\'s new front is missing from the scan');
 });
 
 test('no native form post: a form carries neither method nor action', () => {

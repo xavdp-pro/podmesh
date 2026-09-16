@@ -59,7 +59,8 @@ export function createApp(config,{call=request,origin='http://127.0.0.1:4175',re
  const hosts=config.hosts||[];if(hosts.length>16)throw Error('Maximum16 hosts');
  const relationships=relationshipSource(config.relationships);
  const ids=new Set();for(const h of hosts){if(!/^[a-z0-9-]+$/.test(h.id)||ids.has(h.id)||h.ssh&&!/^[a-zA-Z0-9_.@-]+$/.test(h.ssh)||h.ssh?.startsWith('-'))throw Error('Invalid host configuration');if(!!h.ssh===!!h.socket||typeof h.name!=='string'||!h.name.trim())throw Error('Explicit host transport and name required');ids.add(h.id);}
- app.use((req,res,next)=>{res.set('Cache-Control','no-store');res.set('X-Content-Type-Options','nosniff');res.set('Referrer-Policy','no-referrer');res.set('X-Frame-Options','DENY');res.set('Content-Security-Policy',"default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");if(req.headers.host!==new URL(origin).host)return res.status(403).json({error:'Unexpected host'});next();});
+ // Inline styles only, as the administration app allows them: the new front's toasts inject their stylesheet; scripts stay 'self'.
+ app.use((req,res,next)=>{res.set('Cache-Control','no-store');res.set('X-Content-Type-Options','nosniff');res.set('Referrer-Policy','no-referrer');res.set('X-Frame-Options','DENY');res.set('Content-Security-Policy',"default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");if(req.headers.host!==new URL(origin).host)return res.status(403).json({error:'Unexpected host'});next();});
  app.use(express.json({limit:'4kb'}));
  app.get('/api/session',(_req,res)=>res.json({token,mode:'local-operator',hosts:hosts.map(({id,name,allowActions,ssh})=>({id,name,allowActions:!!allowActions,canMove:!!(allowActions&&ssh)}))}));
  // Health, read-only: for every host, what it carries (host_status), what each universe uses (universe_stats), and for
