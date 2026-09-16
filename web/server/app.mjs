@@ -1,5 +1,5 @@
 import express from 'express';
-import {randomBytes} from 'node:crypto';
+import {randomBytes,randomUUID} from 'node:crypto';
 import {request} from './transport.mjs';
 const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const actions=new Set(['create','clone','start','stop','pause','resume','resources','delete']);
@@ -52,6 +52,34 @@ export function createApp(config,{call=request,origin='http://127.0.0.1:4175',re
  app.use((req,res,next)=>{res.set('Cache-Control','no-store');res.set('X-Content-Type-Options','nosniff');res.set('Referrer-Policy','no-referrer');res.set('X-Frame-Options','DENY');res.set('Content-Security-Policy',"default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");if(req.headers.host!==new URL(origin).host)return res.status(403).json({error:'Unexpected host'});next();});
  app.use(express.json({limit:'4kb'}));
  app.get('/api/session',(_req,res)=>res.json({token,mode:'local-operator',hosts:hosts.map(({id,name,allowActions,ssh})=>({id,name,allowActions:!!allowActions,canMove:!!(allowActions&&ssh)}))}));
+ // Health, read-only: for every host, what it carries (host_status), what each universe uses (universe_stats), and for
+ // every manager universe its replication links as the resident reports them (manager_status). Each host answers on its
+ // own; one that fails is reported as such, never hidden, and never blocks the others.
+ app.get('/api/health',async(req,res)=>{
+  if(!requireReadSession(req,res,origin,token))return;
+  const rows=await Promise.all(hosts.map(async h=>{
+   const row={id:h.id,name:h.name,errors:{}};
+   try{
+    const caps=await call(h,{operation:'capabilities'},{timeout:15000});
+    const ops=new Set(caps?.ok?caps.data.operations||[]:[]);
+    if(!ops.has('host_status')||!ops.has('universe_stats')){row.errors.runtime='This host runs a PodMesh without host_status and universe_stats';return row;}
+    const id=()=>randomUUID();
+    const [hs,us]=await Promise.all([call(h,{operation:'host_status',operation_id:id(),authorization_ref:'console-health'},{timeout:20000}),call(h,{operation:'universe_stats',operation_id:id(),authorization_ref:'console-health'},{timeout:30000})]);
+    if(hs.ok)row.host=hs.data;else row.errors.host_status=hs.error||'refused';
+    if(us.ok)row.universes=us.data.universes;else row.errors.universe_stats=us.error||'refused';
+    row.managers=[];
+    for(const u of (us.ok?us.data.universes:[]).filter(x=>x.state==='running'&&x.manager===true)){
+     const ms=await call(h,{operation:'manager_status',operation_id:id(),universe_uuid:u.universe_uuid,authorization_ref:'console-health'},{timeout:20000}).catch(e=>({ok:false,error:e.message}));
+     if(!ms.ok){row.managers.push({universe_uuid:u.universe_uuid,error:ms.error||'refused'});continue;}
+     const rs=ms.data.resident_status||{};
+     row.managers.push({universe_uuid:u.universe_uuid,replica_id:rs.replica_id,store_bytes:ms.data.store_bytes,
+      links:Object.entries(rs.peers||{}).map(([peer,v])=>({peer,outcome:v.outcome,last_success_age_ms:v.last_success_age_ms,failures:v.failures,successes:v.authenticated_successes,acknowledged_history_len:v.acknowledged_history_len,local_history_len:v.local_history_len_at_attempt,next_attempt_in_ms:v.next_attempt_in_ms}))});
+    }
+   }catch(e){row.errors.transport=e.message;}
+   return row;
+  }));
+  res.json({receivedAt:now(),hosts:rows});
+ });
  // The generic engine: any operation the host advertises with a schema, validated here against that schema -- the same
  // bounds the daemon enforces -- and sent as it was built. Reads need the read session; mutations the mutating one and a
  // host that allows actions; a 'tool' step is refused here (a workstation tool drives it across hosts).
