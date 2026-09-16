@@ -833,3 +833,38 @@ three-host qualification, Sonnet 5 medium.
 - Local ignored `evidence/experimental4/` and `evidence/migration-source/`: raw
   results. Internal addresses and runtime state paths remain there, not in public
   configuration examples.
+
+## Resources, replication health and replication controls (2026-09-16)
+
+The operator asked to see, for each universe, its CPU, memory, disk and replication state, and to
+start, schedule and stop its replication to all hosts or a chosen number of them.
+
+**Health view (web tree).** `host_status` (cores, load, memory, what carries Podman's storage) and
+`universe_stats` (CPU from the cgroup over a 500 ms sample, memory and its limit, disk written, a
+`manager` flag) feed a view that also reads each manager replica's resident links. On the lab it
+shows the manager's replication failing on all six links while facts still arrive: the frozen
+resident re-verifies its whole exchange audit table on every audit write and never compacts it, so
+past a few MiB of store an exchange misses its deadline. The fix belongs to the resident and is
+reported to Codex; recreating the replicas one at a time resets the stores meanwhile.
+
+**Replication of an ordinary universe.** `tools/replicate-universe.py` wraps the warm-standby cycle
+(`tools/ha-standby.py cycle`): `configure` picks the standbys (every other host, or the N with the
+most available memory, named in the report) and declares a lease-only activation policy whose lease
+outlives the interval; `run` replicates now; `start` arms a `systemd --user` timer on the workstation,
+the transport controller; `stop` disarms it and keeps the copies; `status` reads each standby's
+latest copy and checks it is still there; `summary` reads the ledger alone for the Health view. Each
+run STOPS the universe for its capture; live replication without a stop does not exist in this
+version, and the console says so. The console's universe drawer carries the panel (target, schedule,
+Replicate now, Start and Stop schedule, the copy on each standby) and the Health view a replication
+column. Measured on the development service, a small universe on lab-c:
+
+| Run | Target | Total | Universe stopped |
+| --- | --- | --- | --- |
+| tool, now | 1 standby | 6.5 s | 3.38 s |
+| timer, every 60 s | 2 standbys | 9.4 s | 3.52 s |
+| console, Replicate now | 1 standby | 6.2 s | 3.49 s |
+| console, scheduled | 1 standby | 7.5 s | 3.80 s |
+
+Not done: replication without stopping the universe, pruning policy exposed in the console, and a
+takeover started from the console.
+
