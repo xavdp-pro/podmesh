@@ -106,6 +106,9 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
             | "clone"
             | "start"
             | "stop"
+            | "pause"
+            | "resume"
+            | "resources"
             | "migration_preflight"
             | "migration_checkpoint"
             | "migration_authorize_transfer"
@@ -130,7 +133,7 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
             "migration_status" => migration::status(db, request)?,
             "capabilities" => json!({
                 "version":option_env!("PODMESH_PACKAGE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
-                "operations":["capabilities","identity","inventory","observations","activation_require","activation_acquire","activation_renew","activation_release","activation_supersede","activation_status","activation_fence","activation_fence_preview","recovery_point_prepare","recovery_point_status","recovery_point_restore","recovery_point_promote","create","delete","clone","start","stop"],
+                "operations":["capabilities","identity","inventory","observations","activation_require","activation_acquire","activation_renew","activation_release","activation_supersede","activation_status","activation_fence","activation_fence_preview","recovery_point_prepare","recovery_point_status","recovery_point_restore","recovery_point_promote","create","delete","clone","start","stop","pause","resume","resources"],
                 "experimental_operations":["migration_preflight","migration_checkpoint","migration_status","migration_authorize_transfer",
                     "migration_complete_transfer","migration_retire_source","migration_release","migration_abandon","migration_restore_local",
                     "migration_destination_preflight","migration_restore","migration_restore_abort",
@@ -159,6 +162,9 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
                     "ownership":"delete, start, stop and clone sources require a verified create, clone or migration_restore in this host's journal for the same universe and container ID",
                     "start":"observe_seconds 0-30 (default 2); reports running or not running as observed, with exit code when not running",
                     "stop":"timeout_seconds 0-300 and on_timeout kill|leave_running are required; kill lets podman escalate to SIGKILL after the timeout, leave_running only sends the stop signal",
+                    "pause":"freezes every process of a running universe; memory and address stay; never gated by the lease; a paused universe answers none_already_paused",
+                    "resume":"thaws a paused universe; gated by the activation lease exactly as start; a running universe answers none_already_running",
+                    "resources":"memory_bytes (32 MiB to this host's total) and/or cpus (0.1 to this host's cores); applied to the live cgroup and read back from the kernel when running, kept for the next start otherwise",
                     "retry":"a verified operation ID returns its historical result with a fresh observation; pending or failed operations are re-evaluated; no cancellation operation",
                     "clone":"stopped, mount-free source through a committed snapshot image"
                 }

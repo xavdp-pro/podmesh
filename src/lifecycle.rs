@@ -20,12 +20,15 @@ const SNAPSHOT_FOR: &str = "io.podmesh.snapshot-for";
 const SNAPSHOT_OPERATION: &str = "io.podmesh.snapshot-operation";
 const SNAPSHOT_SOURCE: &str = "io.podmesh.snapshot-source-container";
 const SNAPSHOT_REPOSITORY: &str = "localhost/podmesh-clone:";
-const OPERATIONS: [&str; 16] = [
+const OPERATIONS: [&str; 19] = [
     "create",
     "delete",
     "clone",
     "start",
     "stop",
+    "pause",
+    "resume",
+    "resources",
     "migration_preflight",
     "migration_checkpoint",
     "migration_authorize_transfer",
@@ -46,6 +49,11 @@ const COMMIT: u64 = 300;
 const DEFAULT_OBSERVE_SECONDS: u64 = 2;
 const MAX_OBSERVE_SECONDS: u64 = 30;
 const MAX_STOP_TIMEOUT_SECONDS: u64 = 300;
+/// The smallest memory limit a universe may be given: below it, a container with any runtime in it
+/// is killed at once, which is not a limit but a stop by other means.
+const MIN_MEMORY_BYTES: u64 = 32 * 1024 * 1024;
+/// The smallest CPU allowance, a tenth of a core; the largest is what the host has.
+const MIN_CPUS: f64 = 0.1;
 // Time allowed to Podman itself beyond the declared graceful stop period.
 const STOP_MARGIN_SECONDS: u64 = 30;
 const POLL: Duration = Duration::from_millis(200);
@@ -90,6 +98,17 @@ enum Params<'a> {
         timeout: u64,
         on_timeout: &'a str,
     },
+    /// Freeze every process of a running universe (`podman pause`): its memory stays, nothing runs.
+    Pause,
+    /// Thaw a paused universe (`podman unpause`). It leaves a running writer behind, so it is
+    /// gated exactly as `start` is.
+    Resume,
+    /// Set the memory limit and the CPU allowance of a universe, applied to its live cgroup when
+    /// it runs and kept for its next start (`podman update`). At least one of the two.
+    Resources {
+        memory_bytes: Option<u64>,
+        cpus: Option<f64>,
+    },
     MigrationPreflight(Binding<'a>),
     MigrationCheckpoint(Binding<'a>),
     MigrationAuthorize {
@@ -132,6 +151,9 @@ impl Params<'_> {
             Params::Delete => "delete",
             Params::Start { .. } => "start",
             Params::Stop { .. } => "stop",
+            Params::Pause => "pause",
+            Params::Resume => "resume",
+            Params::Resources { .. } => "resources",
             Params::MigrationPreflight(_) => "migration_preflight",
             Params::MigrationCheckpoint(_) => "migration_checkpoint",
             Params::MigrationAuthorize { .. } => "migration_authorize_transfer",
@@ -420,6 +442,36 @@ fn parse<'a>(db: &Connection, operation: &str, uuid: &str, request: &'a Value) -
                 .filter(|v| ["kill", "leave_running"].contains(v))
                 .ok_or("on_timeout must be \"kill\" or \"leave_running\"")?;
             Params::Stop { timeout, on_timeout }
+        }
+        "pause" => Params::Pause,
+        "resume" => Params::Resume,
+        "resources" => {
+            let memory_bytes = match request.get("memory_bytes") {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    let m = v.as_u64().ok_or("memory_bytes must be a positive integer of bytes")?;
+                    let total = host_memory_bytes()?;
+                    if m < MIN_MEMORY_BYTES || m > total {
+                        return Err(format!("memory_bytes must be from {MIN_MEMORY_BYTES} to this host's {total} bytes").into());
+                    }
+                    Some(m)
+                }
+            };
+            let cpus = match request.get("cpus") {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    let c = v.as_f64().ok_or("cpus must be a number of cores, fractions allowed")?;
+                    let cores = host_cpus() as f64;
+                    if !(MIN_CPUS..=cores).contains(&c) {
+                        return Err(format!("cpus must be from {MIN_CPUS} to this host's {cores} cores").into());
+                    }
+                    Some((c * 100.0).round() / 100.0)
+                }
+            };
+            if memory_bytes.is_none() && cpus.is_none() {
+                return Err("resources requires memory_bytes, cpus or both".into());
+            }
+            Params::Resources { memory_bytes, cpus }
         }
         "migration_preflight" | "migration_checkpoint" => {
             // Every identity the checkpoint is bound to is explicit and immutable.
@@ -722,9 +774,11 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
     // A migration reservation or an unresolved restore claim blocks every generic operation that could run, replace
     // or remove the universe. Stop stays available: it cannot run, replace or remove the source, although stopping
     // a source whose checkpoint failed does end its process. Migration operations apply their own state checks.
+    // Pausing, resuming and changing a cgroup's limits all touch the process set a checkpoint in
+    // flight is about, so they wait for the reservation like the rest.
     if matches!(
         params,
-        Params::Create { .. } | Params::Clone { .. } | Params::Delete | Params::Start { .. }
+        Params::Create { .. } | Params::Clone { .. } | Params::Delete | Params::Start { .. } | Params::Pause | Params::Resume | Params::Resources { .. }
     ) {
         migration::refuse_if_reserved(db, uuid, params.name())?;
     }
@@ -739,6 +793,7 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
     if matches!(
         params,
         Params::Start { .. }
+            | Params::Resume
             | Params::Clone { .. }
             | Params::MigrationRestore { .. }
             | Params::MigrationRestoreLocal { .. }
@@ -763,6 +818,9 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
         Params::Delete => delete(db, uuid, &name, existing),
         Params::Start { observe_seconds } => start(db, attempt, id, uuid, &name, existing, *observe_seconds),
         Params::Stop { timeout, on_timeout } => stop(db, attempt, id, uuid, &name, existing, *timeout, on_timeout),
+        Params::Pause => pause(db, uuid, &name, existing),
+        Params::Resume => resume(db, uuid, &name, existing),
+        Params::Resources { memory_bytes, cpus } => resources(db, uuid, &name, existing, *memory_bytes, *cpus),
         Params::MigrationPreflight(binding) => migration::preflight(db, uuid, binding, existing),
         Params::MigrationCheckpoint(binding) => migration::checkpoint(db, attempt, id, uuid, &name, binding, existing),
         Params::MigrationAuthorize {
@@ -994,6 +1052,182 @@ fn start(
     }
     Ok(result)
 }
+fn host_memory_bytes() -> Result<u64, Error> {
+    let info = std::fs::read_to_string("/proc/meminfo")?;
+    let kib: u64 = info
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse().ok())
+        .ok_or("MemTotal not found in /proc/meminfo")?;
+    Ok(kib * 1024)
+}
+
+fn host_cpus() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+fn state_result(c: &Value, uuid: &str, operation: &str, action: &str, note: &str) -> Value {
+    let mut result = state_view(c);
+    result["status"] = json!("verified");
+    result["operation"] = json!(operation);
+    result["universe_uuid"] = json!(uuid);
+    result["action"] = json!(action);
+    result["observed_state"] = c["State"]["Status"].clone();
+    result["note"] = json!(note);
+    result
+}
+
+/// Freeze a running universe. Its processes stop being scheduled, its memory and its network
+/// address stay; Podman reports `paused`. A paused universe is already stopped for every purpose
+/// of a second writer, so this is never gated by the lease, and it is idempotent by state.
+fn pause(db: &Connection, uuid: &str, name: &str, existing: Option<Value>) -> Result<Value, Error> {
+    let c = existing.ok_or("Universe container not found")?;
+    owned(db, &c, uuid, "Target")?;
+    let state = status(&c);
+    if state == "paused" {
+        return Ok(state_result(&c, uuid, "pause", "none_already_paused", "the universe was already paused; nothing was sent"));
+    }
+    if state != "running" {
+        return Err(failure(format!("Container state {state} is outside the pause contract: only a running universe is paused"), json!({"observed": state_view(&c)})));
+    }
+    if let Err(e) = podman(QUICK, &["pause", name]) {
+        let observed = inspect(name)?.map(|c| state_view(&c));
+        return Err(failure(format!("Pause failed: {e}"), json!({"observed": observed})));
+    }
+    let c = inspect(name)?.ok_or("Container disappeared after pause")?;
+    if status(&c) != "paused" {
+        return Err(failure("Podman reported success but the universe is not paused", json!({"observed": state_view(&c)})));
+    }
+    Ok(state_result(&c, uuid, "pause", "paused", "every process of the universe is frozen; its memory and its address stay; resume thaws it"))
+}
+
+/// Thaw a paused universe. It leaves a running writer behind, so the caller passed the same gate
+/// as `start`; a universe that is running already is left alone.
+fn resume(db: &Connection, uuid: &str, name: &str, existing: Option<Value>) -> Result<Value, Error> {
+    let c = existing.ok_or("Universe container not found")?;
+    owned(db, &c, uuid, "Target")?;
+    let state = status(&c);
+    if state == "running" {
+        return Ok(state_result(&c, uuid, "resume", "none_already_running", "the universe was running; nothing was sent"));
+    }
+    if state != "paused" {
+        return Err(failure(format!("Container state {state} is outside the resume contract: only a paused universe is resumed (a stopped one is started)"), json!({"observed": state_view(&c)})));
+    }
+    if let Err(e) = podman(QUICK, &["unpause", name]) {
+        let observed = inspect(name)?.map(|c| state_view(&c));
+        return Err(failure(format!("Resume failed: {e}"), json!({"observed": observed})));
+    }
+    let c = inspect(name)?.ok_or("Container disappeared after resume")?;
+    if status(&c) != "running" {
+        return Err(failure("Podman reported success but the universe is not running", json!({"observed": state_view(&c)})));
+    }
+    Ok(state_result(&c, uuid, "resume", "resumed", "the universe's processes run again from where they were frozen"))
+}
+
+/// What the kernel enforces for this container right now: its cgroup's memory.max and cpu.max,
+/// read from the unified hierarchy. `None` when the container has no cgroup (not running).
+fn cgroup_limits(c: &Value) -> Option<Value> {
+    let path = c["State"]["CgroupPath"].as_str().filter(|p| !p.is_empty())?;
+    let dir = std::path::Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
+    let read = |f: &str| std::fs::read_to_string(dir.join(f)).ok().map(|s| s.trim().to_string());
+    let memory_max = read("memory.max")?;
+    let cpu_max = read("cpu.max")?;
+    // cpu.max is "<quota> <period>" in microseconds, or "max <period>".
+    let cpus = {
+        let mut it = cpu_max.split_whitespace();
+        match (it.next(), it.next().and_then(|p| p.parse::<f64>().ok())) {
+            (Some("max"), _) => None,
+            (Some(q), Some(period)) => q.parse::<f64>().ok().map(|q| (q / period * 100.0).round() / 100.0),
+            _ => None,
+        }
+    };
+    Some(json!({
+        "cgroup": path,
+        "memory_max_bytes": memory_max.parse::<u64>().ok(),
+        "memory_unlimited": memory_max == "max",
+        "cpu_max": cpu_max,
+        "cpus": cpus,
+    }))
+}
+
+/// Set the memory limit and the CPU allowance of a universe (`podman update`). On a running
+/// universe the kernel applies them to its cgroup at once, and the result reads them back from
+/// there; on a stopped one they are kept for its next start and read back from Podman's record.
+fn resources(db: &Connection, uuid: &str, name: &str, existing: Option<Value>, memory_bytes: Option<u64>, cpus: Option<f64>) -> Result<Value, Error> {
+    let c = existing.ok_or("Universe container not found")?;
+    owned(db, &c, uuid, "Target")?;
+    let state = status(&c);
+    if !(state == "running" || state == "paused" || STOPPED.contains(&state)) {
+        return Err(failure(format!("Container state {state} is outside the resources contract"), json!({"observed": state_view(&c)})));
+    }
+    let mut args: Vec<String> = vec!["update".into()];
+    if let Some(m) = memory_bytes {
+        // The same value for swap: a limit on memory alone lets the universe spill into swap
+        // instead of being limited.
+        args.push("--memory".into()); args.push(m.to_string());
+        args.push("--memory-swap".into()); args.push(m.to_string());
+    }
+    if let Some(cp) = cpus {
+        args.push("--cpus".into()); args.push(format!("{cp}"));
+    }
+    args.push(name.into());
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    if let Err(e) = podman(QUICK, &argv) {
+        let observed = inspect(name)?.map(|c| state_view(&c));
+        return Err(failure(format!("Resources update failed: {e}"), json!({"observed": observed})));
+    }
+    let c = inspect(name)?.ok_or("Container disappeared after the update")?;
+    let recorded_memory = c["HostConfig"]["Memory"].as_u64().unwrap_or(0);
+    let recorded_nano = c["HostConfig"]["NanoCpus"].as_u64().unwrap_or(0);
+    let recorded_cpus = (recorded_nano as f64 / 1e7).round() / 100.0;
+    let memory_agrees = memory_bytes.is_none_or(|m| recorded_memory == m);
+    let cpus_agree = cpus.is_none_or(|cp| (recorded_cpus - cp).abs() <= 0.011);
+    // Measured on Podman 5.4.2: on a running, paused or never-started universe the record follows
+    // the update at once; on an exited one the record shown by inspect keeps the previous values
+    // while the next start applies the new ones. So a disagreement is a failure everywhere but on
+    // an exited universe, where the verification is deferred to that start and said to be.
+    let exited = !(state == "running" || state == "paused" || state == "created");
+    if !exited {
+        if !memory_agrees {
+            return Err(failure("Podman reported success but records another memory limit", json!({"requested": memory_bytes, "recorded": recorded_memory})));
+        }
+        if !cpus_agree {
+            return Err(failure("Podman reported success but records another CPU allowance", json!({"requested": cpus, "recorded": recorded_cpus})));
+        }
+    }
+    let kernel = cgroup_limits(&c);
+    if let Some(k) = kernel.as_ref() {
+        if let Some(m) = memory_bytes {
+            if k["memory_max_bytes"].as_u64() != Some(m) {
+                return Err(failure("The kernel does not enforce the requested memory limit", json!({"requested": m, "kernel": k})));
+            }
+        }
+        if let Some(cp) = cpus {
+            if k["cpus"].as_f64().is_none_or(|v| (v - cp).abs() > 0.011) {
+                return Err(failure("The kernel does not enforce the requested CPU allowance", json!({"requested": cp, "kernel": k})));
+            }
+        }
+    }
+    let verification = if kernel.is_some() {
+        "kernel"
+    } else if memory_agrees && cpus_agree {
+        "recorded"
+    } else {
+        "deferred"
+    };
+    let mut result = state_result(&c, uuid, "resources", "updated", match verification {
+        "kernel" => "applied to the running universe's cgroup and read back from the kernel",
+        "recorded" => "recorded by Podman for the universe's next start; nothing runs to apply it to now",
+        _ => "accepted by Podman for the universe's next start, which applies it; Podman's record of an exited universe shows the previous values until then (measured on 5.4.2), so this is not verified here",
+    });
+    result["verification"] = json!(verification);
+    result["requested"] = json!({"memory_bytes": memory_bytes, "cpus": cpus});
+    result["recorded"] = json!({"memory_bytes": recorded_memory, "memory_unlimited": recorded_memory == 0, "cpus": if recorded_nano == 0 { Value::Null } else { json!(recorded_cpus) }});
+    result["kernel"] = kernel.unwrap_or(Value::Null);
+    Ok(result)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stop_result(
     c: &Value,

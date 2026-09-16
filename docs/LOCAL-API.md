@@ -64,6 +64,44 @@ Both fields are required; there is no default escalation.
 
 A universe that is already stopped returns `action: none_already_stopped` without sending a signal. Stop never removes the container, its filesystem or volumes.
 
+## Pause and resume
+
+```json
+{"operation": "pause", "operation_id": "...", "universe_uuid": "...", "authorization_ref": "..."}
+{"operation": "resume", "operation_id": "...", "universe_uuid": "...", "authorization_ref": "..."}
+```
+
+`pause` freezes every process of a running universe (`podman pause`): its memory and its
+address stay, nothing is scheduled, and the result is verified from Podman (`paused`). A paused
+universe is already stopped for every purpose of a second writer, so `pause` is never gated by the
+activation lease; a universe already paused answers `action: none_already_paused` and nothing is
+sent; any other state is refused at the contract (a stopped universe is not paused, it is stopped).
+
+`resume` thaws a paused universe (`podman unpause`). It leaves a running writer behind, so it passes
+**the same gate as `start`**: under an activation policy it is refused without a live lease on this
+host. A running universe answers `action: none_already_running`; a stopped one is refused, since a
+stopped universe is started, not resumed. A migration reservation blocks both, as it blocks `start`.
+
+## Resources
+
+```json
+{"operation": "resources", "operation_id": "...", "universe_uuid": "...", "authorization_ref": "...", "memory_bytes": 134217728, "cpus": 0.5}
+```
+
+Sets the memory limit and the CPU allowance of a universe (`podman update`), one or both:
+`memory_bytes` from 32 MiB to this host's total memory (swap is limited to the same value, so a
+limit is a limit), `cpus` from 0.1 to this host's number of cores, fractions allowed, rounded to a
+hundredth. On a running or paused universe the kernel applies them to its cgroup at once, and the
+result reads them back from there — `kernel.memory_max_bytes`, `kernel.cpu_max`, `kernel.cpus` from
+the unified hierarchy — and refuses when Podman's record or the kernel disagrees with what was
+asked (`verification: "kernel"`). On a universe created and never started, Podman records them for
+its first start (`verification: "recorded"`). On an exited universe, measured on Podman 5.4.2, the
+update is accepted and the next start applies it, but Podman's record shown by inspect keeps the
+previous values until that start: the result says `verification: "deferred"` and its note says it
+is not verified here. Out-of-range values, and a request naming neither field, are refused before
+anything is sent. A migration reservation blocks it. Removing a limit is not offered in this
+version.
+
 ## Timeouts, interruption and cancellation
 
 There is no cancellation operation. The service handles one request at a time; a client disconnect or client timeout does not cancel the operation, which continues to completion. Each Podman call is bounded (30 s; commits 300 s; stop `timeout_seconds` + 30 s); a call exceeding its bound is terminated and the operation fails with the re-observed state, not an assumed one. If the service itself is killed, the operation remains `pending`. Every attempt is recorded in the `operation_attempts` table.
