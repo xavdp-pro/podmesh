@@ -7,12 +7,21 @@ every path answers 503: a connector that reaches a replica which is not the gove
 nothing. This process decides nothing about the role.
 
 Surfaces:
-  GET  /            the human page (governor only)
-  GET  /ready       the machine JSON the publisher contract requires
-  GET  /admin       sign in, or the administration page with a session
-  POST /admin/login
-  POST /admin/logout
-  POST /admin/users create another administrator, with a session
+  GET  /                    the human page (governor only)
+  GET  /ready               the machine JSON the publisher contract requires
+  GET  /admin               the administration page: one document, driven by script
+  GET  /admin/api/state     what the page shows: which view, and the administrators once signed in
+  POST /admin/api/login     {login, password}
+  POST /admin/api/logout
+  POST /admin/api/password  {current, next, again}
+  POST /admin/api/users     {login, password}
+
+NO FORM POSTS (operator rule, 2026-09-16, INTENT.md "Web surfaces"). Nothing here is a native
+form submission: the page calls the API from script, stays in place, keeps what was typed and
+shows the precise refusal where the person is looking. It is enforced twice -- the API refuses
+any body that is not `application/json` (which a native form cannot send, so this also closes
+cross-site form forgery), and the page's policy sets `form-action 'none'`, so the browser itself
+refuses to submit a form.
 
 WHERE ADMINISTRATORS COME FROM. An administrator is a replicated fact, written through the
 resident's control socket in this replica's own granted scope, subject `admin.user.<login>`,
@@ -170,111 +179,110 @@ def session_of(headers):
 
 STYLE = ('body{margin:0;background:#f4efe4;color:#1c1916;font-family:ui-sans-serif,system-ui,sans-serif}'
          'main{max-width:40rem;margin:10vh auto;padding:0 1.5rem}h1{font-size:1.6rem;font-weight:600}'
-         'p,dd,li{line-height:1.45;color:#4a433b}dl{display:grid;grid-template-columns:8rem 1fr;gap:.35rem 1rem}'
-         'dt{color:#7a7268}a{color:#215547}label{display:block;margin:.9rem 0 .2rem;color:#7a7268;font-size:.9rem}'
-         'input{width:100%;padding:.55rem .7rem;border:1px solid #d8cfbe;border-radius:.4rem;background:#fffdf8;font:inherit}'
-         'button{margin-top:1.1rem;padding:.55rem 1.1rem;border:0;border-radius:.4rem;background:#215547;color:#f4efe4;font:inherit;cursor:pointer}'
+         'h2{font-size:1.1rem;margin-top:2rem}p,dd,li{line-height:1.45;color:#4a433b}'
+         'dl{display:grid;grid-template-columns:8rem 1fr;gap:.35rem 1rem}dt{color:#7a7268}a{color:#215547}'
+         'label{display:block;margin:.9rem 0 .2rem;color:#7a7268;font-size:.9rem}'
+         'input{box-sizing:border-box;width:100%;padding:.55rem .7rem;border:1px solid #d8cfbe;border-radius:.4rem;background:#fffdf8;font:inherit}'
+         '.act{margin-top:1.1rem;padding:.55rem 1.1rem;border:0;border-radius:.4rem;background:#215547;color:#f4efe4;font:inherit;cursor:pointer}'
+         '.act[disabled]{opacity:.6;cursor:wait}.quiet{margin-left:.5rem;padding:.2rem .6rem;border:1px solid #d8cfbe;border-radius:.3rem;background:transparent;color:#4a433b;font:inherit;cursor:pointer}'
          'table{border-collapse:collapse;width:100%;margin-top:1rem}td,th{text-align:left;padding:.4rem .6rem;border-bottom:1px solid #e4dccb}'
          '.note{background:#efe7d6;border-left:3px solid #215547;padding:.8rem 1rem;border-radius:.2rem}'
-         '.bad{border-left-color:#8c3b2e}code{font-size:.92em}'
-         '.secret{position:relative}.secret input{padding-right:3.4rem}'
-         '.secret button{position:absolute;right:.35rem;top:.3rem;margin:0;padding:.3rem .55rem;background:transparent;'
+         '.bad{border-left-color:#8c3b2e}code{font-size:.92em}[hidden]{display:none!important}'
+         '.secret{position:relative}.secret input{padding-right:3.6rem}'
+         '.secret button{position:absolute;right:.35rem;top:50%;transform:translateY(-50%);margin:0;padding:.25rem .55rem;background:transparent;'
          'color:#7a7268;border:1px solid #d8cfbe;border-radius:.3rem;font-size:.8rem;cursor:pointer}'
          '.secret button:hover{color:#215547;border-color:#215547}')
 
-# A password typed into a field nobody can read is a password nobody can check. The eye shows what
-# is actually in the field -- a capital the keyboard added, a space a password manager left --
-# which is most of what makes a sign-in fail. It is the only script on the page, and the policy
-# admits it by nonce and nothing else.
-EYE = ("document.querySelectorAll('.secret').forEach(function(box){"
-       "var i=box.querySelector('input'),b=box.querySelector('button');"
-       "b.addEventListener('click',function(){"
-       "var shown=i.type==='text';i.type=shown?'password':'text';"
-       "b.textContent=shown?'\\u25cf\\u25cf\\u25cf':'\\u25c9';"
-       "b.setAttribute('aria-label',shown?'Show the password':'Hide the password');"
-       "i.focus();});});")
-
-
-def secret_field(field_id, name, label, autocomplete):
-    return (f'<label for="{field_id}">{label}</label><div class="secret">'
-            f'<input id="{field_id}" name="{name}" type="password" autocomplete="{autocomplete}">'
-            f'<button type="button" aria-label="Show the password" title="Show the password">&#128065;</button></div>')
-
-
-def shell(title, body, nonce=''):
-    script = f'<script nonce="{nonce}">{EYE}</script>' if nonce else ''
-    return (f'<!doctype html><html lang="en"><meta charset="utf-8">'
-            f'<meta name="viewport" content="width=device-width, initial-scale=1">'
-            f'<title>{html.escape(title)}</title><style>{STYLE}</style><main>{body}</main>{script}</html>').encode()
+# The page is one document; what it shows comes from /admin/api/state, every action is a JSON call.
+# Everything the server sends is put in place with textContent, never parsed as markup. The eye on a
+# password field shows what is really in it -- a capital a keyboard added, a space a password manager
+# left -- which is most of what makes a sign-in fail.
+APP = r"""
+(function(){
+var root=document.getElementById('app');
+function el(tag,attrs){var e=document.createElement(tag);attrs=attrs||{};
+ Object.keys(attrs).forEach(function(k){if(k==='text')e.textContent=attrs[k];else if(k==='cls')e.className=attrs[k];else e.setAttribute(k,attrs[k]);});
+ for(var i=2;i<arguments.length;i++){var c=arguments[i];if(c)e.appendChild(typeof c==='string'?document.createTextNode(c):c);}return e;}
+function field(id,label,type,auto){var input=el('input',{id:id,type:type,autocomplete:auto,spellcheck:'false',autocapitalize:'off'});
+ var box=el('div',{cls:type==='password'?'secret':''},input);
+ if(type==='password'){var b=el('button',{type:'button','aria-label':'Show the password',text:'show'});
+  b.addEventListener('click',function(){var shown=input.type==='text';input.type=shown?'password':'text';
+   b.textContent=shown?'show':'hide';b.setAttribute('aria-label',shown?'Show the password':'Hide the password');input.focus();});
+  box.appendChild(b);}
+ return {node:el('div',{},el('label',{for:id,text:label}),box),input:input};}
+function note(){return el('p',{cls:'note bad',hidden:'hidden',role:'alert'});}
+function show(n,text,good){n.textContent=text;n.className='note'+(good?'':' bad');n.hidden=!text;}
+function call(path,body){return fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})})
+ .then(function(r){return r.json().catch(function(){return {error:'The manager answered '+r.status+' without a readable reason.'};}).then(function(j){j._status=r.status;return j;});})
+ .catch(function(){return {error:'The manager could not be reached.',_status:0};});}
+function action(button,run){button.addEventListener('click',function(ev){ev.preventDefault();button.disabled=true;
+ run().then(function(){button.disabled=false;});});}
+function page(title){root.textContent='';root.appendChild(el('p',{text:'PODMESH / MANAGER'}));root.appendChild(el('h1',{text:title}));}
+function load(){return fetch('/admin/api/state',{credentials:'same-origin'}).then(function(r){return r.json();})
+ .then(render).catch(function(){page('Unavailable');root.appendChild(el('p',{cls:'note bad',text:'The manager could not be reached.'}));});}
+function render(s){
+ if(s.view==='closed'){page('Not the governor');root.appendChild(el('p',{cls:'note bad',text:'This replica does not hold the role; it administers nothing.'}));return;}
+ if(s.view==='none'){page('No administrator exists yet.');
+  root.appendChild(el('p',{cls:'note',text:'The first administrator is written from the host that carries the governor, as root, through PodMesh’s control door; a deployment does it (tools/manager-admin.py bootstrap).'}));return;}
+ if(s.view==='login'){page('Sign in');var n=note();root.appendChild(n);
+  var l=field('login','Administrator','text','username'),p=field('password','Password','password','current-password');
+  var go=el('button',{cls:'act',type:'button',text:'Sign in'});root.appendChild(l.node);root.appendChild(p.node);root.appendChild(go);
+  [l.input,p.input].forEach(function(i){i.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();go.click();}});});
+  action(go,function(){show(n,'');return call('/admin/api/login',{login:l.input.value,password:p.input.value}).then(function(j){
+   if(j.ok)return load();show(n,j.error||'Refused.');p.input.focus();});});l.input.focus();return;}
+ if(s.view==='change'){page('Change the password.');
+  root.appendChild(el('p',{cls:'note',text:'This account still carries the password it was given when the manager was deployed. Nothing else opens until it is replaced.'}));
+  var n2=note();root.appendChild(n2);
+  var c=field('current','Current password','password','current-password'),x=field('next','New password','password','new-password'),a=field('again','New password again','password','new-password');
+  var ch=el('button',{cls:'act',type:'button',text:'Change it'});[c,x,a].forEach(function(f){root.appendChild(f.node);});root.appendChild(ch);
+  root.appendChild(el('p',{},'Signed in as ',el('code',{text:s.login}),'.'));
+  action(ch,function(){show(n2,'');return call('/admin/api/password',{current:c.input.value,next:x.input.value,again:a.input.value}).then(function(j){
+   if(j.ok)return load();show(n2,j.error||'Refused.');});});c.input.focus();return;}
+ page('Administration');
+ var who=el('p',{},'Signed in as ',el('code',{text:s.login}),' on the governor at epoch ',el('code',{text:String(s.epoch)}),'.');
+ var out=el('button',{cls:'quiet',type:'button',text:'Sign out'});who.appendChild(out);root.appendChild(who);
+ action(out,function(){return call('/admin/api/logout').then(load);});
+ var msg=note();root.appendChild(msg);
+ if(s.message){show(msg,s.message,true);}
+ root.appendChild(el('h2',{text:'Administrators'}));
+ var table=el('table',{},el('tr',{},el('th',{text:'login'}),el('th',{text:'scope'})));
+ (s.administrators||[]).forEach(function(r){table.appendChild(el('tr',{},el('td',{},el('code',{text:r.login})),
+  el('td',{text:r.scopes.join(', ')+(r.conflict?' — written in more than one scope':'')})));});
+ root.appendChild(table);
+ root.appendChild(el('h2',{text:'Create an administrator'}));
+ root.appendChild(el('p',{},'Written as a replicated fact in this replica’s own scope ',el('code',{text:s.scope}),'. The password is hashed on the replica and never stored, logged or replicated.'));
+ var nl=field('new-login','Login','text','off'),np=field('new-password','Password','password','new-password');
+ var mk=el('button',{cls:'act',type:'button',text:'Create'});root.appendChild(nl.node);root.appendChild(np.node);root.appendChild(mk);
+ action(mk,function(){show(msg,'');return call('/admin/api/users',{login:nl.input.value,password:np.input.value}).then(function(j){
+  if(j.ok){nl.input.value='';np.input.value='';return load().then(function(){var m=document.querySelector('[role=alert]');if(m)show(m,j.message,true);});}
+  show(msg,j.error||'Refused.');});});
+}
+load();
+})();
+"""
 
 
 def page_home(mark):
     lid, rid = html.escape(identity['logical_manager_id']), html.escape(identity['replica_id'])
-    return shell('PodMesh manager',
-                 f'<p>PODMESH / MANAGER ORIGIN</p><h1>This replica is the governor.</h1>'
-                 f'<p>The public hostname reaches the replica that currently holds the exclusive role. '
-                 f'Machine JSON stays at <a href="/ready"><code>/ready</code></a>, administration at '
-                 f'<a href="/admin">/admin</a>.</p>'
-                 f'<dl><dt>epoch</dt><dd><code>{html.escape(str(mark.get("epoch")))}</code></dd>'
-                 f'<dt>replica</dt><dd><code>{rid}</code></dd>'
-                 f'<dt>logical</dt><dd><code>{lid}</code></dd></dl>')
+    return (f'<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+            f'<title>PodMesh manager</title><style>{STYLE}</style><main>'
+            f'<p>PODMESH / MANAGER ORIGIN</p><h1>This replica is the governor.</h1>'
+            f'<p>The public hostname reaches the replica that currently holds the exclusive role. '
+            f'Machine JSON stays at <a href="/ready"><code>/ready</code></a>, administration at <a href="/admin">/admin</a>.</p>'
+            f'<dl><dt>epoch</dt><dd><code>{html.escape(str(mark.get("epoch")))}</code></dd>'
+            f'<dt>replica</dt><dd><code>{rid}</code></dd><dt>logical</dt><dd><code>{lid}</code></dd></dl></main></html>').encode()
 
 
-def page_login(message='', nonce=''):
-    warning = f'<p class="note bad">{html.escape(message)}</p>' if message else ''
-    return shell('Sign in — PodMesh manager',
-                 f'<p>PODMESH / MANAGER</p><h1>Sign in</h1>{warning}'
-                 f'<form method="post" action="/admin/login">'
-                 f'<label for="login">Administrator</label><input id="login" name="login" autocomplete="username" autofocus>'
-                 + secret_field('password', 'password', 'Password', 'current-password') +
-                 f'<button type="submit">Sign in</button></form>', nonce)
+def page_app(nonce):
+    return (f'<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+            f'<title>Administration — PodMesh manager</title><style>{STYLE}</style>'
+            f'<main id="app"><p>PODMESH / MANAGER</p><p>Loading…</p></main>'
+            f'<script nonce="{nonce}">{APP}</script></html>').encode()
 
 
-def page_no_admin():
-    return shell('No administrator — PodMesh manager',
-                 '<p>PODMESH / MANAGER</p><h1>No administrator exists yet.</h1>'
-                 '<p class="note">The first administrator is not created from this page. It is written on the host '
-                 'that carries the governor, as root, through PodMesh\'s control door:</p>'
-                 '<p><code>podmesh manager_admin_create</code> — see <code>tools/manager-admin.py</code>.</p>'
-                 '<p>What has power has no front door. Once one administrator is on record, that administrator '
-                 'names the next ones here.</p>')
-
-
-def page_change(login, message='', bad=False, nonce=''):
-    note = f'<p class="note{" bad" if bad else ""}">{html.escape(message)}</p>' if message else ''
-    return shell('Change the password — PodMesh manager',
-                 f'<p>PODMESH / MANAGER</p><h1>Change the password.</h1>'
-                 f'<p class="note">This account still carries the password it was given when the manager was '
-                 f'deployed. Nothing else opens until it is replaced.</p>{note}'
-                 f'<form method="post" action="/admin/password">'
-                 + secret_field('current', 'current', 'Current password', 'current-password')
-                 + secret_field('next', 'next', 'New password', 'new-password')
-                 + secret_field('again', 'again', 'New password again', 'new-password') +
-                 f'<button type="submit">Change it</button></form>'
-                 f'<p>Signed in as <code>{html.escape(login)}</code>.</p>', nonce)
-
-
-def page_admin(mark, login, admins, message='', bad=False, nonce=''):
-    rows = ''
-    for name, entry in sorted(admins.items()):
-        conflict = ' <em>(written in more than one scope)</em>' if len(entry['scopes']) > 1 else ''
-        rows += f'<tr><td><code>{html.escape(name)}</code></td><td>{html.escape(", ".join(entry["scopes"]))}{conflict}</td></tr>'
-    note = f'<p class="note{" bad" if bad else ""}">{html.escape(message)}</p>' if message else ''
-    return shell('Administration — PodMesh manager',
-                 f'<p>PODMESH / MANAGER</p><h1>Administration</h1>'
-                 f'<p>Signed in as <code>{html.escape(login)}</code> on the governor at epoch '
-                 f'<code>{html.escape(str(mark.get("epoch")))}</code>. '
-                 f'<form method="post" action="/admin/logout" style="display:inline">'
-                 f'<button type="submit" style="margin:0;padding:.2rem .6rem">Sign out</button></form></p>{note}'
-                 f'<h2 style="font-size:1.1rem">Administrators</h2>'
-                 f'<table><tr><th>login</th><th>scope</th></tr>{rows}</table>'
-                 f'<h2 style="font-size:1.1rem;margin-top:2rem">Create an administrator</h2>'
-                 f'<p>Written as a replicated fact in this replica\'s own scope <code>{html.escape(SCOPE)}</code>. '
-                 f'The password is hashed here and never stored, logged or replicated.</p>'
-                 f'<form method="post" action="/admin/users">'
-                 f'<label for="new-login">Login</label><input id="new-login" name="login" autocomplete="off">'
-                 + secret_field('new-password', 'password', 'Password', 'new-password') +
-                 f'<button type="submit">Create</button></form>', nonce)
+def admin_rows(admins):
+    return [{'login': name, 'scopes': entry['scopes'], 'conflict': len(entry['scopes']) > 1}
+            for name, entry in sorted(admins.items())]
 
 
 class Origin(http.server.BaseHTTPRequestHandler):
@@ -283,44 +291,43 @@ class Origin(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def reply(self, code, body, kind='text/html; charset=utf-8', cookie=None, nonce=None):
+    def send(self, code, body, kind, nonce=None, cookie=None):
         self.send_response(code)
         self.send_header('Content-Type', kind)
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Referrer-Policy', 'no-referrer')
-        csp = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'"
-        if nonce:
-            csp += f"; script-src 'nonce-{nonce}'"
-        self.send_header('Content-Security-Policy', csp)
+        script = f"script-src 'nonce-{nonce}'; " if nonce else ''
+        # form-action 'none': the browser itself refuses to submit a form from this origin.
+        self.send_header('Content-Security-Policy',
+                         f"default-src 'none'; style-src 'unsafe-inline'; {script}connect-src 'self'; form-action 'none'; frame-ancestors 'none'")
         if cookie:
             self.send_header('Set-Cookie', cookie)
         self.end_headers()
         self.wfile.write(body)
 
-    def page(self, code, maker, cookie=None):
-        nonce = secrets.token_urlsafe(16)
-        return self.reply(code, maker(nonce), cookie=cookie, nonce=nonce)
+    def api(self, code, payload, cookie=None):
+        self.send(code, json.dumps(payload).encode(), 'application/json', cookie=cookie)
 
     def closed(self, path):
         reason = 'not the governor' if path in ('/', '/index.html', '/ready') or path.startswith('/admin') else 'no such path'
-        self.reply(503, json.dumps({'ready': False, 'reason': reason, **identity}).encode(), 'application/json')
+        self.send(503, json.dumps({'ready': False, 'reason': reason, **identity}).encode(), 'application/json')
 
-    def form(self):
+    def body(self):
+        """The JSON body of an API call, or None. Anything else -- a native form's urlencoded or
+        multipart body included -- is refused before it is read."""
+        kind = (self.headers.get('Content-Type') or '').split(';')[0].strip().lower()
+        if kind != 'application/json':
+            return None
         length = int(self.headers.get('Content-Length') or 0)
-        if length <= 0 or length > 4096:
-            return {}
-        raw = self.rfile.read(length).decode('utf-8', 'replace')
-        return {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
-
-    def see(self, where, cookie=None):
-        self.send_response(303)
-        self.send_header('Location', where)
-        self.send_header('Content-Length', '0')
-        if cookie:
-            self.send_header('Set-Cookie', cookie)
-        self.end_headers()
+        if length < 0 or length > 4096:
+            return None
+        try:
+            data = json.loads(self.rfile.read(length) or b'{}')
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
 
     def do_GET(self):
         path = self.path.split('?', 1)[0]
@@ -328,23 +335,26 @@ class Origin(http.server.BaseHTTPRequestHandler):
         if not mark:
             return self.closed(path)
         if path in ('/', '/index.html'):
-            return self.reply(200, page_home(mark))
+            return self.send(200, page_home(mark), 'text/html; charset=utf-8')
         if path == '/ready':
-            return self.reply(200, json.dumps({'ready': True, **identity, 'epoch': mark.get('epoch'),
-                                               'marked_at': mark.get('marked_at')}).encode(), 'application/json')
+            return self.api(200, {'ready': True, **identity, 'epoch': mark.get('epoch'), 'marked_at': mark.get('marked_at')})
         if path == '/admin':
+            nonce = secrets.token_urlsafe(16)
+            return self.send(200, page_app(nonce), 'text/html; charset=utf-8', nonce=nonce)
+        if path == '/admin/api/state':
             try:
                 admins = administrators()
             except Exception:
-                return self.reply(503, shell('Unavailable', '<h1>The store could not be read.</h1>'))
+                return self.api(503, {'error': 'The store could not be read.'})
             if not admins:
-                return self.reply(200, page_no_admin())
+                return self.api(200, {'view': 'none'})
             _, entry = session_of(self.headers)
             if not entry:
-                return self.page(200, lambda n: page_login(nonce=n))
+                return self.api(200, {'view': 'login'})
             if flags().get(entry['login']) == MUST_CHANGE:
-                return self.page(200, lambda n: page_change(entry['login'], nonce=n))
-            return self.page(200, lambda n: page_admin(mark, entry['login'], admins, nonce=n))
+                return self.api(200, {'view': 'change', 'login': entry['login']})
+            return self.api(200, {'view': 'admin', 'login': entry['login'], 'epoch': mark.get('epoch'),
+                                  'scope': SCOPE, 'administrators': admin_rows(admins)})
         return self.closed(path)
 
     def do_POST(self):
@@ -352,41 +362,45 @@ class Origin(http.server.BaseHTTPRequestHandler):
         mark = governor()
         if not mark:
             return self.closed(path)
-        if path == '/admin/logout':
+        if not path.startswith('/admin/api/'):
+            # No form posts: there is no endpoint a native form could reach.
+            return self.api(405, {'error': 'No form posts here; the page calls /admin/api/ with JSON.'})
+        fields = self.body()
+        if fields is None:
+            return self.api(415, {'error': 'The API takes a JSON body (Content-Type: application/json), at most 4096 bytes.'})
+        if path == '/admin/api/logout':
             token, _ = session_of(self.headers)
             sessions.pop(token, None)
-            return self.see('/admin', 'podmesh_admin=; Path=/admin; Max-Age=0; HttpOnly; SameSite=Strict; Secure')
-        if path == '/admin/login':
-            fields = self.form()
-            login = (fields.get('login') or '').strip().lower()
-            password = fields.get('password') or ''
-            until = failures.get(login, {}).get('until', 0)
-            if until > time.time():
-                return self.page(429, lambda n: page_login('Too many attempts for that administrator. Wait a minute.', nonce=n))
+            return self.api(200, {'ok': True}, 'podmesh_admin=; Path=/admin; Max-Age=0; HttpOnly; SameSite=Strict; Secure')
+        if path == '/admin/api/login':
+            login = str(fields.get('login') or '').strip().lower()
+            password = str(fields.get('password') or '')
+            if failures.get(login, {}).get('until', 0) > time.time():
+                return self.api(429, {'error': 'Too many attempts for that administrator. Wait a minute.'})
             try:
                 admins = administrators()
             except Exception:
-                return self.reply(503, shell('Unavailable', '<h1>The store could not be read.</h1>'))
+                return self.api(503, {'error': 'The store could not be read.'})
             entry = admins.get(login)
             if not entry or not verify_password(password, entry['value']):
                 count = failures.get(login, {}).get('count', 0) + 1
                 failures[login] = {'count': count, 'until': time.time() + 60 if count >= 5 else 0}
-                return self.page(401, lambda n: page_login('Wrong administrator or password.', nonce=n))
+                return self.api(401, {'error': 'Wrong administrator or password.'})
             failures.pop(login, None)
             token = secrets.token_urlsafe(32)
             sessions[token] = {'login': login, 'until': time.time() + SESSION_SECONDS}
-            return self.see('/admin', f'podmesh_admin={token}; Path=/admin; Max-Age={SESSION_SECONDS}; HttpOnly; SameSite=Strict; Secure')
-        if path == '/admin/password':
-            _, entry = session_of(self.headers)
-            if not entry:
-                return self.page(401, lambda n: page_login('Sign in first.', nonce=n))
-            fields = self.form()
-            login = entry['login']
-            try:
-                admins = administrators()
-            except Exception:
-                return self.reply(503, shell('Unavailable', '<h1>The store could not be read.</h1>'))
-            current, nxt, again = fields.get('current') or '', fields.get('next') or '', fields.get('again') or ''
+            return self.api(200, {'ok': True},
+                            f'podmesh_admin={token}; Path=/admin; Max-Age={SESSION_SECONDS}; HttpOnly; SameSite=Strict; Secure')
+        _, entry = session_of(self.headers)
+        if not entry:
+            return self.api(401, {'error': 'Sign in first. An administrator is named by an administrator.'})
+        login = entry['login']
+        try:
+            admins = administrators()
+        except Exception:
+            return self.api(503, {'error': 'The store could not be read.'})
+        if path == '/admin/api/password':
+            current, nxt, again = (str(fields.get(k) or '') for k in ('current', 'next', 'again'))
             record = admins.get(login)
             problem = None
             if not record or not verify_password(current, record['value']):
@@ -400,52 +414,35 @@ class Origin(http.server.BaseHTTPRequestHandler):
             elif nxt.lower() == login:
                 problem = 'A password that is the login is not a password.'
             if problem:
-                return self.page(400, lambda n: page_change(login, problem, bad=True, nonce=n))
+                return self.api(400, {'error': problem})
             try:
                 append_observation(SUBJECT_PREFIX + login, hash_password(nxt))
                 append_observation(FLAG_PREFIX + login, 'changed')
             except Exception as e:
-                return self.page(503, lambda n: page_change(login, f'The resident refused: {e}', bad=True, nonce=n))
-            try:
-                admins = administrators()
-            except Exception:
-                pass
-            return self.page(200, lambda n: page_admin(mark, login, admins, 'The password was changed.', nonce=n))
-        if path == '/admin/users':
-            _, entry = session_of(self.headers)
-            if not entry:
-                return self.page(401, lambda n: page_login('Sign in first. An administrator is named by an administrator.', nonce=n))
-            if flags().get(entry['login']) == MUST_CHANGE:
-                return self.page(403, lambda n: page_change(entry['login'], 'Replace the deployment password before naming anyone.', bad=True, nonce=n))
-            fields = self.form()
-            login = (fields.get('login') or '').strip().lower()
-            password = fields.get('password') or ''
-            try:
-                admins = administrators()
-            except Exception:
-                return self.reply(503, shell('Unavailable', '<h1>The store could not be read.</h1>'))
+                return self.api(503, {'error': f'The resident refused: {e}'})
+            return self.api(200, {'ok': True, 'message': 'The password was changed.'})
+        if path == '/admin/api/users':
+            if flags().get(login) == MUST_CHANGE:
+                return self.api(403, {'error': 'Replace the deployment password before naming anyone.'})
+            new = str(fields.get('login') or '').strip().lower()
+            password = str(fields.get('password') or '')
             problem = None
-            if not login or any(c not in LOGIN_ALPHABET for c in login) or len(login) > 64:
+            if not new or any(c not in LOGIN_ALPHABET for c in new) or len(new) > 64:
                 problem = 'A login is 1 to 64 characters from a-z, 0-9, dot, dash and underscore.'
-            elif login in admins:
+            elif new in admins:
                 problem = 'That administrator already exists.'
             elif len(password) < MIN_PASSWORD:
                 problem = f'A password is at least {MIN_PASSWORD} characters.'
-            elif password.lower() == login:
+            elif password.lower() == new:
                 problem = 'A password that is the login is not a password.'
             if problem:
-                return self.page(400, lambda n: page_admin(mark, entry['login'], admins, problem, bad=True, nonce=n))
+                return self.api(400, {'error': problem})
             try:
-                append_observation(SUBJECT_PREFIX + login, hash_password(password))
+                append_observation(SUBJECT_PREFIX + new, hash_password(password))
             except Exception as e:
-                return self.page(503, lambda n: page_admin(mark, entry['login'], admins, f'The resident refused: {e}', bad=True, nonce=n))
-            try:
-                admins = administrators()
-            except Exception:
-                pass
-            return self.page(200, lambda n: page_admin(mark, entry['login'], admins,
-                                              f'Administrator {login} created in {SCOPE}; it replicates to the other replicas.', nonce=n))
-        return self.closed(path)
+                return self.api(503, {'error': f'The resident refused: {e}'})
+            return self.api(200, {'ok': True, 'message': f'Administrator {new} created in {SCOPE}; it replicates to the other replicas.'})
+        return self.api(404, {'error': 'No such call.'})
 
 
 if __name__ == '__main__':

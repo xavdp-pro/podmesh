@@ -3,7 +3,9 @@
 
 No lab, no container: the responder is run against a stub resident (a script printing the
 ordered facts) and a stub control socket that records what it is asked to append. What is
-verified: every path is 503 without the governor mark, including the administration ones; with
+verified: every path is 503 without the governor mark, including the administration ones; no
+native form post anywhere (the operator's rule of 2026-09-16) -- the page carries no form, its
+policy forbids submitting one, and the server refuses a urlencoded body; with
 no administrator on record the page refuses and names the host door instead; a login is refused
 without a session; creation is refused without a session; a wrong password is refused and a
 right one opens a session; a created administrator is written as an observation in this
@@ -62,19 +64,29 @@ env = dict(os.environ, PODMESH_MANAGER_CONFIG=str(work / 'config.json'), PODMESH
            PODMESH_MANAGER_BINARY=str(stub), PODMESH_GOVERNOR_MARK=str(mark), PODMESH_ORIGIN_PORT=str(PORT))
 server = subprocess.Popen([sys.executable, '-B', str(ORIGIN)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-def ask(method, path, body=None, cookie=None):
+def ask(method, path, body=None, cookie=None, kind='application/json'):
     c = http.client.HTTPConnection('127.0.0.1', PORT, timeout=15)
     headers = {}
+    data = None
     if body is not None:
-        headers['Content-Type'] = 'application/x-www-form-urlencoded'
+        headers['Content-Type'] = kind
+        data = json.dumps(body) if kind == 'application/json' and not isinstance(body, str) else body
     if cookie:
         headers['Cookie'] = cookie
-    c.request(method, path, body, headers)
+    c.request(method, path, data, headers)
     r = c.getresponse()
     text = r.read().decode('utf-8', 'replace')
-    out = (r.status, text, r.getheader('Set-Cookie') or '', r.getheader('Location') or '')
+    out = (r.status, text, r.getheader('Set-Cookie') or '', r.getheader('Content-Security-Policy') or '')
     c.close()
     return out
+
+
+def js(text):
+    try:
+        return json.loads(text)
+    except ValueError:
+        return {}
+
 
 for _ in range(60):
     try:
@@ -85,111 +97,116 @@ else:
     raise AssertionError('the origin did not come up')
 
 try:
-    # fail-closed, administration included
-    for path in ('/', '/ready', '/admin'):
+    # fail-closed, administration and its API included
+    for path in ('/', '/ready', '/admin', '/admin/api/state'):
         status, text, _, _ = ask('GET', path)
         assert status == 503 and 'not the governor' in text, (path, status, text[:200])
-    status, _, _, _ = ask('POST', '/admin/login', 'login=x&password=y')
+    status, _, _, _ = ask('POST', '/admin/api/login', {'login': 'x', 'password': 'y'})
     assert status == 503
-    checks.append('without the governor mark every path answers 503, administration and its login included')
+    checks.append('without the governor mark every path answers 503, the administration API and its sign-in included')
 
     mark.write_text(json.dumps({'resource': LOGICAL, 'epoch': 7, 'marked_at': int(time.time())}))
     status, text, _, _ = ask('GET', '/ready')
-    assert status == 200 and json.loads(text)['epoch'] == 7 and json.loads(text)['replica_id'] == REPLICA, text
+    assert status == 200 and js(text)['epoch'] == 7 and js(text)['replica_id'] == REPLICA, text
     checks.append('with the mark, /ready answers the contract JSON at the marked epoch')
 
+    # the operator's rule: no form posts, enforced by the server and by the browser's policy
+    status, text, _, csp = ask('GET', '/admin')
+    assert status == 200 and '<form' not in text and 'method="post"' not in text.lower(), text[:300]
+    assert "form-action 'none'" in csp and "script-src 'nonce-" in csp, csp
+    assert 'Show the password' in text, 'the eye is missing from the password fields'
+    checks.append("the administration page carries no form at all, its policy sets form-action 'none', and its password fields carry the eye")
+    status, text, _, _ = ask('POST', '/admin/api/login', 'login=admin&password=podmesh', kind='application/x-www-form-urlencoded')
+    assert status == 415, (status, text[:200])
+    status, text, _, _ = ask('POST', '/admin/login', 'login=admin&password=podmesh', kind='application/x-www-form-urlencoded')
+    assert status == 405, (status, text[:200])
+    checks.append('a native form post is refused: 415 on the API for a urlencoded body, 405 on any path outside the API')
+
     # no administrator: the page refuses and names the host door
-    status, text, _, _ = ask('GET', '/admin')
-    assert status == 200 and 'No administrator exists yet' in text and 'not created from this page' in text, text[:300]
-    status, text, _, _ = ask('POST', '/admin/users', 'login=intruder&password=correcthorsebattery')
+    status, text, _, _ = ask('GET', '/admin/api/state')
+    assert status == 200 and js(text) == {'view': 'none'}, text
+    status, text, _, _ = ask('POST', '/admin/api/users', {'login': 'intruder', 'password': 'correcthorsebattery'})
     assert status == 401 and not appended, (status, appended)
-    checks.append('with no administrator on record: the page refuses and names the host door; a creation without a session appends nothing')
+    checks.append('with no administrator on record: the state says so and names nobody; a creation without a session appends nothing')
 
-    # one administrator exists, written from the host door
-    import hashlib, secrets as _s
+    # one administrator exists, written from the host door with the default password
+    import hashlib
     salt = bytes.fromhex('00112233445566778899aabbccddeeff')
-    digest = hashlib.scrypt(b'first-admin-password', salt=salt, n=16384, r=8, p=1, dklen=32)
+    digest = hashlib.scrypt(b'podmesh', salt=salt, n=16384, r=8, p=1, dklen=32)
     stored = f'scrypt.16384.8.1.{salt.hex()}.{digest.hex()}'
-    set_facts([{'scope': SCOPE, 'subject': 'admin.user.xavier', 'value': stored, 'subject_revision': 1}])
-    status, text, _, _ = ask('GET', '/admin')
-    assert status == 200 and 'Sign in' in text and 'xavier' not in text, text[:300]
-    checks.append('with an administrator on record the page asks to sign in, and names nobody before that')
+    set_facts([{'scope': SCOPE, 'subject': 'admin.user.admin', 'value': stored, 'subject_revision': 1}])
+    status, text, _, _ = ask('GET', '/admin/api/state')
+    assert js(text) == {'view': 'login'}, text
+    checks.append('with an administrator on record the state asks to sign in, and names nobody before that')
 
-    status, text, cookie, _ = ask('POST', '/admin/login', 'login=xavier&password=wrong-password')
-    assert status == 401 and not cookie, (status, cookie)
-    checks.append('a wrong password is refused and opens no session')
+    status, text, cookie, _ = ask('POST', '/admin/api/login', {'login': 'admin', 'password': 'wrong-password'})
+    assert status == 401 and not cookie and js(text)['error'] == 'Wrong administrator or password.', (status, cookie, text)
+    checks.append('a wrong password is refused with its reason in JSON, and opens no session')
 
-    status, _, cookie, where = ask('POST', '/admin/login', 'login=xavier&password=first-admin-password')
-    assert status == 303 and where == '/admin' and 'HttpOnly' in cookie and 'Secure' in cookie and 'SameSite=Strict' in cookie, (status, cookie)
+    status, text, cookie, _ = ask('POST', '/admin/api/login', {'login': ' Admin ', 'password': 'podmesh'})
+    assert status == 200 and js(text)['ok'] and 'HttpOnly' in cookie and 'Secure' in cookie and 'SameSite=Strict' in cookie, (status, cookie)
     session = cookie.split(';')[0]
-    checks.append('the right password opens a session whose cookie is HttpOnly, Secure and SameSite=Strict')
+    checks.append('the right password opens a session (the login trimmed and lower-cased), the cookie HttpOnly, Secure and SameSite=Strict')
 
-    status, text, _, _ = ask('GET', '/admin', cookie=session)
-    assert status == 200 and 'Administration' in text and 'xavier' in text, text[:300]
-    checks.append('the session shows the administration page and the administrators on record')
+    status, text, _, _ = ask('GET', '/admin/api/state', cookie=session)
+    assert js(text)['view'] == 'admin' and js(text)['administrators'][0]['login'] == 'admin', text
+    checks.append('the session shows the administration view and the administrators on record')
 
-    # the rules of creation
-    for body, fragment in (('login=UPPER%20CASE&password=correcthorsebattery', 'A login is 1 to 64'),
-                           ('login=x&password=short', 'at least 12'),
-                           ('login=repeatrepeats&password=repeatrepeats', 'not a password'),
-                           ('login=xavier&password=correcthorsebattery', 'already exists')):
-        status, text, _, _ = ask('POST', '/admin/users', body, cookie=session)
-        assert status == 400 and fragment in text, (body, status, text[:200])
+    for body, fragment in (({'login': 'UPPER CASE', 'password': 'correcthorsebattery'}, 'A login is 1 to 64'),
+                           ({'login': 'x', 'password': 'short'}, 'at least 12'),
+                           ({'login': 'repeatrepeats', 'password': 'repeatrepeats'}, 'not a password'),
+                           ({'login': 'admin', 'password': 'correcthorsebattery'}, 'already exists')):
+        status, text, _, _ = ask('POST', '/admin/api/users', body, cookie=session)
+        assert status == 400 and fragment in js(text).get('error', ''), (body, status, text[:200])
     assert not appended, appended
-    checks.append('a bad login, a short password, a password equal to its login and a login already taken: each refused, nothing appended')
+    checks.append('a bad login, a short password, a password equal to its login and a login already taken: each refused in JSON, nothing appended')
 
-    status, text, _, _ = ask('POST', '/admin/users', 'login=second&password=another-good-password', cookie=session)
-    assert status == 200 and 'created' in text, text[:300]
+    status, text, _, _ = ask('POST', '/admin/api/users', {'login': 'second', 'password': 'another-good-password'}, cookie=session)
+    assert status == 200 and js(text)['ok'], text[:300]
     assert len(appended) == 1, appended
     wrote = appended[0]
-    assert wrote['operation'] == 'append_observation' and wrote['scope'] == SCOPE, wrote
-    assert wrote['subject'] == 'admin.user.second', wrote
+    assert wrote['operation'] == 'append_observation' and wrote['scope'] == SCOPE and wrote['subject'] == 'admin.user.second', wrote
     assert wrote['value'].startswith('scrypt.16384.8.1.') and len(wrote['value']) <= 128, wrote['value'][:40]
     assert 'another-good-password' not in json.dumps(wrote), 'the password reached the store'
     checks.append("the created administrator is one observation in this replica's own scope, the password hashed and absent from what is written")
 
-    # the account a deployment creates: it carries a flag, and nothing opens until it is replaced
-    set_facts([{'scope': SCOPE, 'subject': 'admin.user.xavier', 'value': stored, 'subject_revision': 1},
-               {'scope': SCOPE, 'subject': 'admin.flag.xavier', 'value': 'must_change', 'subject_revision': 1}])
-    status, text, _, _ = ask('GET', '/admin', cookie=session)
-    assert status == 200 and 'Change the password' in text and 'Create an administrator' not in text, text[:300]
-    status, text, _, _ = ask('POST', '/admin/users', 'login=third&password=another-good-password', cookie=session)
-    assert status == 403 and 'Replace the deployment password' in text and len(appended) == 1, (status, appended)
-    checks.append('an account still carrying its deployment password opens only the change page, and may name nobody')
+    # the deployment account: nothing opens until its default password is replaced
+    set_facts([{'scope': SCOPE, 'subject': 'admin.user.admin', 'value': stored, 'subject_revision': 1},
+               {'scope': SCOPE, 'subject': 'admin.flag.admin', 'value': 'must_change', 'subject_revision': 1}])
+    status, text, _, _ = ask('GET', '/admin/api/state', cookie=session)
+    assert js(text) == {'view': 'change', 'login': 'admin'}, text
+    status, text, _, _ = ask('POST', '/admin/api/users', {'login': 'third', 'password': 'another-good-password'}, cookie=session)
+    assert status == 403 and 'deployment password' in js(text)['error'] and len(appended) == 1, (status, appended)
+    checks.append('an account still carrying its deployment password sees only the change view, and may name nobody')
 
-    for body, fragment in (('current=wrong&next=a-good-new-password&again=a-good-new-password', 'current password is wrong'),
-                           ('current=first-admin-password&next=a-good-new-password&again=different-one', 'two new entries differ'),
-                           ('current=first-admin-password&next=short&again=short', 'at least 12'),
-                           ('current=first-admin-password&next=first-admin-password&again=first-admin-password', 'the old one')):
-        status, text, _, _ = ask('POST', '/admin/password', body, cookie=session)
-        assert status == 400 and fragment in text, (body, status, text[:200])
+    for body, fragment in (({'current': 'wrong', 'next': 'a-good-new-password', 'again': 'a-good-new-password'}, 'current password is wrong'),
+                           ({'current': 'podmesh', 'next': 'a-good-new-password', 'again': 'different-one'}, 'two new entries differ'),
+                           ({'current': 'podmesh', 'next': 'short', 'again': 'short'}, 'at least 12'),
+                           ({'current': 'podmesh', 'next': 'podmesh', 'again': 'podmesh'}, 'at least 12')):
+        status, text, _, _ = ask('POST', '/admin/api/password', body, cookie=session)
+        assert status == 400 and fragment in js(text).get('error', ''), (body, status, text[:200])
     assert len(appended) == 1, appended
-    checks.append('a wrong current password, two differing entries, a short one and the old one again: each refused, nothing appended')
+    checks.append('a wrong current password, two differing entries and a short one: each refused in JSON, nothing appended')
 
-    status, text, _, _ = ask('POST', '/admin/password', 'current=first-admin-password&next=a-good-new-password&again=a-good-new-password', cookie=session)
-    assert status == 200 and 'password was changed' in text, text[:300]
-    assert len(appended) == 3, appended
-    assert appended[1]['subject'] == 'admin.user.xavier' and appended[1]['value'].startswith('scrypt.'), appended[1]
-    assert appended[2]['subject'] == 'admin.flag.xavier' and appended[2]['value'] == 'changed', appended[2]
+    status, text, _, _ = ask('POST', '/admin/api/password', {'current': 'podmesh', 'next': 'a-good-new-password', 'again': 'a-good-new-password'}, cookie=session)
+    assert status == 200 and js(text)['ok'], text[:300]
+    assert len(appended) == 3 and appended[1]['subject'] == 'admin.user.admin' and appended[2] ['subject'] == 'admin.flag.admin' and appended[2]['value'] == 'changed', appended
     assert 'a-good-new-password' not in json.dumps(appended), 'the new password reached the store'
     checks.append('the change writes the new hash and clears the flag, and the new password is absent from what is written')
-    set_facts([{'scope': SCOPE, 'subject': 'admin.user.xavier', 'value': stored, 'subject_revision': 1}])
 
-    # what it looks like once replicated, and a login in two scopes
-    set_facts([{'scope': SCOPE, 'subject': 'admin.user.xavier', 'value': stored, 'subject_revision': 1},
-               {'scope': 'm-u2/lab-b/observations', 'subject': 'admin.user.xavier', 'value': stored, 'subject_revision': 1}])
-    status, text, _, _ = ask('GET', '/admin', cookie=session)
-    assert 'more than one scope' in text, text[:400]
+    set_facts([{'scope': SCOPE, 'subject': 'admin.user.admin', 'value': stored, 'subject_revision': 1},
+               {'scope': 'm-u2/lab-b/observations', 'subject': 'admin.user.admin', 'value': stored, 'subject_revision': 1}])
+    status, text, _, _ = ask('GET', '/admin/api/state', cookie=session)
+    assert js(text)['administrators'][0]['conflict'] is True, text
     checks.append('a login written in two scopes is shown as a conflict, not silently resolved')
 
-    status, _, cookie, _ = ask('POST', '/admin/logout', '', cookie=session)
-    status, text, _, _ = ask('GET', '/admin', cookie=session)
-    assert 'Sign in' in text, text[:200]
+    ask('POST', '/admin/api/logout', {}, cookie=session)
+    status, text, _, _ = ask('GET', '/admin/api/state', cookie=session)
+    assert js(text) == {'view': 'login'}, text
     checks.append('signing out closes the session')
 
-    # the mark removed mid-session: everything closes again
     mark.unlink()
-    status, text, _, _ = ask('GET', '/admin', cookie=session)
+    status, text, _, _ = ask('GET', '/admin/api/state', cookie=session)
     assert status == 503, (status, text[:200])
     checks.append('the mark removed, the administration closes with everything else')
     print(json.dumps({'result': 'PASS', 'checks': checks}, indent=2))
