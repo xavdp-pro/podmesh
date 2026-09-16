@@ -11,10 +11,12 @@ const web = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const tree = path.dirname(web);
 const walk = dir => fs.readdirSync(dir, {withFileTypes: true}).flatMap(e =>
   e.isDirectory() ? walk(path.join(dir, e.name)) : [path.join(dir, e.name)]);
+const origin = path.join(tree, 'packaging', 'podmesh-manager', 'universe', 'origin');
 const sources = [
   ...walk(path.join(web, 'src')).filter(f => /\.(jsx?|mjs|html)$/.test(f)),
   path.join(web, 'index.html'),
-  path.join(tree, 'packaging', 'podmesh-manager', 'universe', 'origin.py'),
+  ...['src', 'server'].filter(d => fs.existsSync(path.join(origin, d))).flatMap(d => walk(path.join(origin, d))).filter(f => /\.(jsx?|mjs|html)$/.test(f)),
+  path.join(origin, 'index.html'),
 ].filter(f => fs.existsSync(f));
 const read = f => fs.readFileSync(f, 'utf8')
   // comments explain the rules and may name what they forbid; code may not
@@ -22,7 +24,7 @@ const read = f => fs.readFileSync(f, 'utf8')
 
 test('the rules are checked against real sources, not an empty list', () => {
   assert.ok(sources.some(f => f.endsWith('main.jsx')), 'the console source is missing from the scan');
-  assert.ok(sources.some(f => f.endsWith('origin.py')), 'the manager origin is missing from the scan');
+  assert.ok(sources.some(f => f.includes('/origin/src/')), 'the manager origin app is missing from the scan');
 });
 
 test('no native form post: a form carries neither method nor action', () => {
@@ -39,6 +41,7 @@ test('no JavaScript alert, confirm or prompt: a modal instead', () => {
 
 test('no system select: a styled list instead', () => {
   for (const f of sources) {
-    assert.doesNotMatch(read(f), /<select\b|createElement\(\s*['"]select['"]\s*\)/i, `${path.relative(tree, f)} draws a system select`);
+    // lower-case only: <select> is the browser's element, <Select> a styled component of ours
+    assert.doesNotMatch(read(f), /<select\b|createElement\(\s*['"]select['"]\s*\)/, `${path.relative(tree, f)} draws a system select`);
   }
 });

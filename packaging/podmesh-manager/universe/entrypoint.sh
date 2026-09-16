@@ -30,10 +30,11 @@ echo "manager-universe: resident started pid=$child"
 # on the governor mark (a root-only file PodMesh writes at the exclusive publication, under the
 # epoch gate, and removes at the withdrawal or the fence). Without it every path answers 503: a
 # connector that reaches a replica which is not the governor gets nothing. It decides nothing
-# about the role. It also carries the administration surface (/admin): an administrator is a
-# replicated fact, and the FIRST one is never created there -- it is written from the host, as
-# root, through PodMesh's control door. See origin.py.
-python3 /usr/local/lib/podmesh-manager/origin.py >/dev/null 2>&1 &
+# about the role. It also carries the administration app (/admin, React over an Express API, the
+# same stack as the operator's other tools): an administrator is a replicated fact, and the FIRST
+# one is never created there -- it is written from the host, as root, through PodMesh's control
+# door. See origin/server/app.mjs.
+node /usr/lib/podmesh-manager/origin/server/index.mjs &
 origin=$!
 echo "manager-universe: origin responder started pid=$origin (fail-closed until PodMesh marks this replica governor)"
 

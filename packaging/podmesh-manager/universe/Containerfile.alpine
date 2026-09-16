@@ -5,10 +5,10 @@
 # creation (Codex's finding B2: a key baked into a layer leaves with the image). One image serves
 # every replica of every host; `podman image save` of it contains no key, which the check proves.
 FROM docker.io/library/alpine:3.22
-RUN apk add --no-cache python3
+RUN apk add --no-cache python3 nodejs
 COPY podmesh-managerd /usr/lib/podmesh-manager/podmesh-managerd
 COPY entrypoint.sh /usr/local/bin/manager-universe
-COPY origin.py /usr/local/lib/podmesh-manager/origin.py
-RUN chmod 755 /usr/lib/podmesh-manager/podmesh-managerd /usr/local/bin/manager-universe /usr/local/lib/podmesh-manager/origin.py \
+COPY origin/ /usr/lib/podmesh-manager/origin/
+RUN chmod 755 /usr/lib/podmesh-manager/podmesh-managerd /usr/local/bin/manager-universe \
  && mkdir -p /etc/podmesh-manager /run/podmesh-manager /var/lib/podmesh-manager && chmod 700 /etc/podmesh-manager /run/podmesh-manager /var/lib/podmesh-manager
 CMD ["/usr/local/bin/manager-universe"]

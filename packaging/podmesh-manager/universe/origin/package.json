@@ -1,0 +1,36 @@
+{
+  "name": "podmesh-manager-origin",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "The manager universe's origin: /ready, the human page and the administration app, fail-closed on the governor mark.",
+  "scripts": {
+    "dev": "vite --port 5180",
+    "build": "vite build",
+    "start": "node server/index.mjs",
+    "test": "vitest run",
+    "test:browser": "node ../../../../tests/browser-manager-admin.mjs"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.5.2",
+    "helmet": "^8.2.0",
+    "jsonwebtoken": "^9.0.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.2.2",
+    "@vitejs/plugin-react": "^6.0.1",
+    "axios": "^1.15.0",
+    "framer-motion": "^12.38.0",
+    "lucide-react": "^1.8.0",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "react-hot-toast": "^2.6.0",
+    "react-router-dom": "^7.14.1",
+    "supertest": "^7.2.2",
+    "tailwindcss": "^4.2.2",
+    "vite": "^8.0.8",
+    "vitest": "^4.1.7",
+    "zustand": "^5.0.12"
+  }
+}
