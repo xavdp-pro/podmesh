@@ -191,3 +191,5 @@ pub fn control_relay(socket: &str) -> Result<(), Error> {
     std::io::stdout().write_all(&reply)?;
     Ok(())
 }
+
+pub(crate) const CONTROL_SOCKET_PATH: &str = CONTROL_SOCKET;

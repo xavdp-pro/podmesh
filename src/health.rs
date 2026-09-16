@@ -90,8 +90,13 @@ pub fn universe_stats() -> Result<Value, Error> {
             }
             None => (None, None, None, None, None),
         };
+        // A manager universe is one whose running resident carries the control socket at the manager
+        // contract path -- the same test manager_status applies before it relays anything.
+        let manager = ins["State"]["Pid"].as_i64().filter(|p| ins["State"]["Running"] == json!(true) && *p > 0)
+            .is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}/root/{}", crate::manager::CONTROL_SOCKET_PATH)).exists());
         universes.push(json!({
             "universe_uuid": labels["io.podmesh.universe"],
+            "manager": manager,
             "name": c["Names"][0],
             "state": ins["State"]["Status"],
             "image": ins["ImageName"],
