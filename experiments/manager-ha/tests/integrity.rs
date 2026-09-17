@@ -178,6 +178,91 @@ fn edited_prepared_row_error() -> DurableError {
     )
 }
 
+fn rowid_gap(table: &str) -> DurableError {
+    DurableError::Corrupt(format!("stored {table} rowids are not contiguous from 1"))
+}
+
+const AUDIT_COLUMNS: &str = "audit_event_id, attempt_id, wire_nonce, direction, phase,
+    authenticated_peer_id, peer_claim, operation_id, request_frame_bytes,
+    request_announced_body_bytes, request_sha256, reply_frame_bytes,
+    reply_announced_body_bytes, reply_sha256, outcome, error_category, reason_code,
+    local_receipt_operation_id, local_receipt_sha256,
+    remote_receipt_operation_id, remote_receipt_sha256, replayed, record_json, sha256";
+
+fn enum_text(value: &impl serde::Serialize) -> String {
+    serde_json::to_value(value)
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Inserts one well-formed audit row exactly as the Store writes it, but at an
+/// explicit rowid and without the Store. The schema allows it: no trigger is
+/// dropped.
+fn insert_audit_row_at(lab: &Lab, rowid: i64, event: &ExchangeAuditEvent) {
+    let record_json = serde_json::to_string(event).unwrap();
+    let checksum = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&("podmesh-manager-ha-exchange-audit/1", &record_json)).unwrap()
+        )
+    );
+    let size = |value: Option<u64>| value.map(|value| i64::try_from(value).unwrap());
+    Connection::open(lab.database())
+        .unwrap()
+        .execute(
+            &format!(
+                "INSERT INTO exchange_audit_events (rowid, {AUDIT_COLUMNS}) VALUES (
+                    ?25, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)"
+            ),
+            params![
+                event.audit_event_id,
+                event.attempt_id,
+                event.wire_nonce,
+                enum_text(&event.direction),
+                enum_text(&event.phase),
+                event.authenticated_peer_id,
+                event.peer_claim,
+                event.operation_id,
+                i64::try_from(event.request_frame_bytes).unwrap(),
+                size(event.request_announced_body_bytes),
+                event.request_sha256,
+                i64::try_from(event.reply_frame_bytes).unwrap(),
+                size(event.reply_announced_body_bytes),
+                event.reply_sha256,
+                enum_text(&event.outcome),
+                event.error_category.map(|value| enum_text(&value)),
+                event.reason_code.map(|value| enum_text(&value)),
+                event.local_receipt_operation_id,
+                event.local_receipt_sha256,
+                event.remote_receipt_operation_id,
+                event.remote_receipt_sha256,
+                i64::from(event.replayed),
+                record_json,
+                checksum,
+                rowid,
+            ],
+        )
+        .unwrap();
+}
+
+/// Inserts the malformed audit row of
+/// `rows_appended_by_another_writer_are_verified_by_the_next_transaction` at an
+/// explicit rowid, with a plain SQL insert.
+fn insert_malformed_audit_row_at(lab: &Lab, rowid: i64, audit_event_id: &str) {
+    Connection::open(lab.database())
+        .unwrap()
+        .execute(
+            &format!(
+                "INSERT INTO exchange_audit_events (rowid, {AUDIT_COLUMNS}) VALUES (?1, ?2, 'attempt:forged', 'nonce', 'outbound', 'outbound_request_prepared', NULL, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL, 'incomplete', NULL, NULL, NULL, NULL, NULL, NULL, 0, '{{}}', ?3)"
+            ),
+            params![rowid, audit_event_id, "0".repeat(64)],
+        )
+        .unwrap();
+}
+
 fn assert_failed_closed(lab: &Lab, store: &mut Store, expected: &DurableError) {
     let rows = lab.audit_rows();
     assert_eq!(&store.execute(&Request::Export {}).unwrap_err(), expected);
@@ -308,6 +393,197 @@ fn edited_last_verified_row_is_detected_by_the_next_transaction() {
         .unwrap();
     transaction.commit().unwrap();
     let expected = DurableError::Corrupt("stored audit record or hash mismatch".into());
+    assert_eq!(store.execute(&Request::Export {}).unwrap_err(), expected);
+    assert_failed_closed(&lab, &mut store, &expected);
+}
+
+/// Review of lot V2-R, probe P1: a malformed audit row added by a plain SQL
+/// insert, no trigger dropped, at a rowid before the first row. Before the rowid
+/// rule, exports, audit records, observations and a new open in the same process
+/// all succeeded, and only a complete verification refused the store.
+#[test]
+fn a_row_added_before_the_first_row_is_refused_by_the_next_transaction() {
+    let lab = Lab::new();
+    let mut store = lab.open();
+    store.record_exchange_audit(&prepared("verified")).unwrap();
+    store.execute(&Request::Export {}).unwrap();
+
+    insert_malformed_audit_row_at(&lab, -1, "forged-before-first");
+    let expected = rowid_gap("exchange_audit_events");
+    assert_eq!(store.execute(&Request::Export {}).unwrap_err(), expected);
+    assert_eq!(store.integrity().unwrap().full_verifications, 1);
+    assert_failed_closed(&lab, &mut store, &expected);
+    let (success, reply) = lab.request_in_new_process(&Request::Export {});
+    assert!(!success);
+    assert_eq!(reply["error"], expected.to_string());
+}
+
+/// Probe P2: a corrupt fact before the first fact is refused by a transaction that
+/// only records an audit row and loads no fact.
+#[test]
+fn a_fact_added_before_the_first_fact_is_refused_by_a_transaction_that_loads_no_fact() {
+    let lab = Lab::new();
+    let mut store = lab.open();
+    store
+        .execute_with_receipt(&observation("first", "value"))
+        .unwrap();
+    store.execute(&Request::Export {}).unwrap();
+
+    Connection::open(lab.database())
+        .unwrap()
+        .execute(
+            "INSERT INTO facts(rowid, event_id, fact_json, sha256) VALUES (-7, 'forged-fact', '{}', ?1)",
+            [format!("{:064x}", 0)],
+        )
+        .unwrap();
+    let expected = rowid_gap("facts");
+    assert_eq!(
+        store
+            .record_exchange_audit(&prepared("audit-only"))
+            .unwrap_err(),
+        expected
+    );
+    assert_failed_closed(&lab, &mut store, &expected);
+}
+
+/// Probe P1b: one well-formed row after a gap moved the last verified row past
+/// the gap, and malformed rows then added inside it passed every transaction. The
+/// rows after the last verified row must continue the table's rowids, whoever
+/// wrote them.
+#[test]
+fn a_row_added_after_a_gap_is_refused_by_the_next_transaction() {
+    let lab = Lab::new();
+    let mut store = lab.open();
+    store.record_exchange_audit(&prepared("verified")).unwrap();
+    store.execute(&Request::Export {}).unwrap();
+
+    // A well-formed row that continues the rowids is verified and accepted,
+    // although no Store wrote it.
+    insert_audit_row_at(&lab, 2, &prepared("next"));
+    store.execute(&Request::Export {}).unwrap();
+
+    insert_audit_row_at(&lab, 1_000_000, &prepared("after-gap"));
+    let expected = rowid_gap("exchange_audit_events");
+    assert_eq!(
+        store
+            .record_exchange_audit(&prepared("refused"))
+            .unwrap_err(),
+        expected
+    );
+    assert_failed_closed(&lab, &mut store, &expected);
+    // The rows the gap would have hidden are refused with it.
+    insert_malformed_audit_row_at(&lab, 500, "forged-in-gap");
+    assert_eq!(store.execute(&Request::Export {}).unwrap_err(), expected);
+    let (success, reply) = lab.request_in_new_process(&Request::Export {});
+    assert!(!success);
+    assert_eq!(reply["error"], expected.to_string());
+}
+
+/// Probe P7: `REPLACE` deletes the row it conflicts with and inserts the new one.
+/// SQLite fires no delete trigger for that implicit delete while
+/// `recursive_triggers` is off, its default, and the update trigger does not fire
+/// on an insert: an old row changes with every trigger in place. When the row
+/// keeps its rowid, only a complete verification reads it again.
+#[test]
+fn an_old_row_replaced_in_place_is_detected_by_the_complete_verification() {
+    let lab = Lab::new();
+    let mut store = lab.open();
+    store.record_exchange_audit(&prepared("old")).unwrap();
+    store.record_exchange_audit(&prepared("newer")).unwrap();
+    store.execute(&Request::Export {}).unwrap();
+
+    let connection = Connection::open(lab.database()).unwrap();
+    assert!(connection
+        .execute(
+            "UPDATE exchange_audit_events SET request_frame_bytes=999 WHERE audit_event_id='audit-old'",
+            [],
+        )
+        .is_err());
+    assert!(connection
+        .execute(
+            "DELETE FROM exchange_audit_events WHERE audit_event_id='audit-old'",
+            [],
+        )
+        .is_err());
+    let replaced = AUDIT_COLUMNS.replace("request_frame_bytes,", "999,");
+    assert_eq!(
+        connection
+            .execute(
+                &format!(
+                    "REPLACE INTO exchange_audit_events (rowid, {AUDIT_COLUMNS})
+                     SELECT rowid, {replaced} FROM exchange_audit_events WHERE audit_event_id='audit-old'"
+                ),
+                [],
+            )
+            .unwrap(),
+        1
+    );
+    let (rowid, bytes): (i64, i64) = connection
+        .query_row(
+            "SELECT rowid, request_frame_bytes FROM exchange_audit_events WHERE audit_event_id='audit-old'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((rowid, bytes), (1, 999));
+
+    // Neither the last verified row nor a change of the rowids: the next
+    // transactions do not read it.
+    store.execute(&Request::Export {}).unwrap();
+    store
+        .record_exchange_audit(&prepared("after-replace"))
+        .unwrap();
+    assert!(store.integrity().unwrap().failure.is_none());
+    assert_eq!(
+        store.verify_full().unwrap_err(),
+        edited_prepared_row_error()
+    );
+    assert_failed_closed(&lab, &mut store, &edited_prepared_row_error());
+}
+
+fn replace_through_primary_key(lab: &Lab, audit_event_id: &str) {
+    Connection::open(lab.database())
+        .unwrap()
+        .execute(
+            &format!(
+                "REPLACE INTO exchange_audit_events ({AUDIT_COLUMNS})
+                 SELECT {AUDIT_COLUMNS} FROM exchange_audit_events WHERE audit_event_id=?1"
+            ),
+            [audit_event_id],
+        )
+        .unwrap();
+}
+
+/// A `REPLACE` through the primary key alone deletes the old row and appends its
+/// replacement with the next rowid. The replacement is verified by the next
+/// transaction like any appended row; the gap left behind is found by the next
+/// complete verification, or by the next transaction when the replaced row was
+/// the first.
+#[test]
+fn a_row_replaced_through_its_primary_key_leaves_a_gap_that_is_refused() {
+    let lab = Lab::new();
+    let mut store = lab.open();
+    for label in ["first", "middle", "last"] {
+        store.record_exchange_audit(&prepared(label)).unwrap();
+    }
+    store.execute(&Request::Export {}).unwrap();
+
+    // The same bytes under a new rowid: the appended row verifies, the gap at
+    // rowid 2 waits for the complete verification.
+    replace_through_primary_key(&lab, "audit-middle");
+    store.execute(&Request::Export {}).unwrap();
+    assert!(store.integrity().unwrap().failure.is_none());
+    let expected = rowid_gap("exchange_audit_events");
+    assert_eq!(store.verify_full().unwrap_err(), expected);
+    assert_failed_closed(&lab, &mut store, &expected);
+
+    let lab = Lab::new();
+    let mut store = lab.open();
+    for label in ["first", "middle", "last"] {
+        store.record_exchange_audit(&prepared(label)).unwrap();
+    }
+    store.execute(&Request::Export {}).unwrap();
+    replace_through_primary_key(&lab, "audit-first");
     assert_eq!(store.execute(&Request::Export {}).unwrap_err(), expected);
     assert_failed_closed(&lab, &mut store, &expected);
 }

@@ -107,18 +107,21 @@ pub const DEFAULT_FULL_VERIFICATION_INTERVAL: Duration = Duration::from_secs(600
 /// new file that reuses the inode of a deleted one.
 type IntegrityKey = (u64, u64, Option<(u64, u32)>, String, String);
 
-/// The integrity model of one store within one process.
+/// The integrity model of one database file within one process.
 ///
 /// A complete verification of every fact, receipt and audit row runs when the
-/// process first opens the store and whenever [`Store::verify_full`] runs (the
-/// periodic pass). Every transaction verifies the schema shape and only the rows
-/// appended after the last verified row of each table, and checks that this last
-/// verified row is unchanged. Rows the operation reads or extends (a replayed
-/// receipt, a replayed audit event, the audit rows of the attempt it appends to)
-/// are verified when read. Any verification failure fails the store closed for
-/// the rest of the process: every later open, write and export returns that same
-/// error. An edit to an older row that no operation reads is detected by the next
-/// complete verification, not by the next transaction.
+/// process first opens the file and whenever [`Store::verify_full`] runs (the
+/// periodic pass). Every transaction verifies the schema shape, checks that the
+/// last verified row of each table is unchanged and that no row precedes the
+/// first, and verifies the rows appended after the last verified row, which must
+/// continue the table's rowids without a gap (see [`verify_contiguous_rowids`]).
+/// Rows the operation reads or extends (a replayed receipt, a replayed audit
+/// event, the audit rows of the attempt it appends to, the facts it loads) are
+/// verified when read. Any verification failure fails the file closed for the
+/// rest of the process: every later open, write and export returns that same
+/// error. An in-place change to an older row that no operation reads, including
+/// a removed or replaced row, is detected by the next complete verification, not
+/// by the next transaction.
 #[derive(Default)]
 struct StoreIntegrityEntry {
     state: Mutex<IntegrityState>,
@@ -141,8 +144,9 @@ struct VerifiedPositions {
     audits: TablePosition,
 }
 
-/// A verified table prefix: every row with a rowid at or below `rowid` has been
-/// verified, and `sha256` is the stored checksum of the row at `rowid`.
+/// A verified table prefix: the table's rows were exactly the rowids 1 to
+/// `rowid` (none when `rowid` is 0) and every one of them was verified; `sha256`
+/// is the stored checksum of the row at `rowid`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct TablePosition {
     rowid: i64,
@@ -157,6 +161,8 @@ enum AppendOnlyTable {
 }
 
 impl AppendOnlyTable {
+    const ALL: [Self; 3] = [Self::Facts, Self::Receipts, Self::Audits];
+
     const fn name(self) -> &'static str {
         match self {
             Self::Facts => "facts",
@@ -1034,6 +1040,73 @@ fn table_tail(connection: &Connection, table: AppendOnlyTable) -> DurableResult<
         .unwrap_or_default())
 }
 
+/// The rowid rule of the append-only tables, checked by a complete verification.
+///
+/// The Store never names a rowid, never deletes a row, and the triggers refuse
+/// `DELETE`, so SQLite numbers the rows of each table 1, 2, 3, … in insertion
+/// order: a plain insert takes the largest rowid plus one, and a failed statement
+/// or a rolled-back transaction removes its row, so the next insert reuses that
+/// rowid. A table whose rows are not exactly the rowids 1 to their count was
+/// written by something other than the Store, and a verified prefix of it would
+/// no longer be every row at or below its last verified row.
+fn verify_contiguous_rowids(connection: &Connection, table: AppendOnlyTable) -> DurableResult<()> {
+    let (count, first, last) = connection
+        .query_row(
+            &format!(
+                "SELECT count(*), min(rowid), max(rowid) FROM {}",
+                table.name()
+            ),
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .map_err(error)?;
+    if count > 0 && (first != Some(1) || last != Some(count)) {
+        return Err(rowid_gap(table));
+    }
+    Ok(())
+}
+
+/// The rowid rule checked by every transaction: no row precedes rowid 1. With
+/// the rows up to the last verified row known to be exactly 1 to its rowid, a row
+/// that any writer adds without removing a stored row either has a rowid at or
+/// below 0, refused here in one seek of the table, or follows the last verified
+/// row, where [`next_rowid`] refuses a gap before the row is verified.
+fn verify_first_rowid(connection: &Connection, table: AppendOnlyTable) -> DurableResult<()> {
+    let first: Option<i64> = connection
+        .query_row(
+            &format!("SELECT min(rowid) FROM {}", table.name()),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(error)?;
+    if first.is_some_and(|first| first != 1) {
+        return Err(rowid_gap(table));
+    }
+    Ok(())
+}
+
+/// Requires an appended row to continue its table's rowids without a gap.
+fn next_rowid(table: AppendOnlyTable, previous: &TablePosition, rowid: i64) -> DurableResult<()> {
+    if previous.rowid.checked_add(1) == Some(rowid) {
+        Ok(())
+    } else {
+        Err(rowid_gap(table))
+    }
+}
+
+fn rowid_gap(table: AppendOnlyTable) -> DurableError {
+    DurableError::Corrupt(format!(
+        "stored {} rowids are not contiguous from 1",
+        table.name()
+    ))
+}
+
 /// Whether the last verified row of every table is still present with the same
 /// stored checksum.
 fn positions_unchanged(
@@ -1061,13 +1134,17 @@ fn positions_unchanged(
 
 /// Verifies only the rows appended after the verified positions, with the same
 /// per-row checks as a complete verification, and the complete audit sequence of
-/// every exchange attempt those rows belong to.
+/// every exchange attempt those rows belong to. No table may have a row before
+/// rowid 1, and the appended rows must continue each table's rowids.
 fn verify_appended_rows(
     connection: &Connection,
     topology: &Topology,
     replica_id: &str,
     positions: &VerifiedPositions,
 ) -> DurableResult<VerifiedPositions> {
+    for table in AppendOnlyTable::ALL {
+        verify_first_rowid(connection, table)?;
+    }
     let receipts = verify_appended_receipts(
         connection,
         topology.logical_manager_id(),
@@ -1557,6 +1634,7 @@ fn verify_appended_facts(
     let mut position = from.clone();
     for row in rows {
         let (rowid, id, encoded, hash) = row.map_err(error)?;
+        next_rowid(AppendOnlyTable::Facts, &position, rowid)?;
         replica
             .ingest(decode_fact_row(&id, &encoded, &hash)?)
             .map_err(corrupt_model)?;
@@ -1707,6 +1785,7 @@ fn verify_appended_receipts(
     let mut position = from.clone();
     for row in rows {
         let (receipt, rowid) = row.map_err(error)?;
+        next_rowid(AppendOnlyTable::Receipts, &position, rowid)?;
         verify_receipt_row(logical_manager_id, &receipt)?;
         position = TablePosition {
             rowid,
@@ -1773,6 +1852,9 @@ fn validate_receipt_metadata(
 
 fn verify_all(connection: &Connection, topology: &Topology, replica_id: &str) -> DurableResult<()> {
     verify_immutable_schema(connection)?;
+    for table in AppendOnlyTable::ALL {
+        verify_contiguous_rowids(connection, table)?;
+    }
     verify_receipts(connection, topology.logical_manager_id())?;
     load(connection, topology, replica_id)?;
     verify_audits(connection, topology, replica_id)?;
@@ -3232,6 +3314,7 @@ fn verify_appended_audits(
     let mut attempts = BTreeSet::new();
     for row in rows {
         let (stored, rowid) = row.map_err(error)?;
+        next_rowid(AppendOnlyTable::Audits, &position, rowid)?;
         let (event, record_json, sha256) = decode_audit_row(stored)?;
         let evidence = verify_loaded_audit(
             connection,
@@ -3342,7 +3425,8 @@ fn phase_rank(phase: AuditPhase) -> u8 {
 ///
 /// # Errors
 /// Rejects missing/non-regular stores, schema or identity mismatch, SQLite
-/// integrity failure and any corrupt fact, receipt, audit or receipt link.
+/// integrity failure, a table whose rowids are not contiguous from 1, and any
+/// corrupt fact, receipt, audit or receipt link.
 pub fn inspect_read_only(
     path: &Path,
     configuration: &Configuration,
@@ -3381,6 +3465,9 @@ pub fn inspect_read_only(
         return Err(DurableError::Corrupt(
             "SQLite integrity check failed".into(),
         ));
+    }
+    for table in AppendOnlyTable::ALL {
+        verify_contiguous_rowids(&transaction, table)?;
     }
     verify_receipts(&transaction, topology.logical_manager_id())?;
     let replica = load(&transaction, &topology, replica_id)?;
