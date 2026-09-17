@@ -1,7 +1,8 @@
 [Unit]
 Description=PodMesh restore after boot, once, under the operator's mandate (disabled unless the operator enables it)
 Documentation=file:/usr/share/doc/podmesh/LOCAL-API.md
-After=podmesh.service time-sync.target
+After=podmesh.service time-sync.target network-online.target
+Wants=network-online.target
 Requires=podmesh.service
 ConditionPathExists=/etc/podmesh/restore-mandate
 [Service]

@@ -17,8 +17,10 @@
 //! is to run is considered.
 //!
 //! WHAT IS NEVER RESTORED HERE, whatever the last intent says:
-//! - a universe on the managed network: its routes, NAT table and alias are not re-applied at boot
-//!   yet, and a universe restored without them runs unreachable;
+//! - a universe on the managed network while the host's network declaration is not effective: after
+//!   a boot, `network_reapply` re-applies the declaration's bridge, peer routes and NAT exemption, and a
+//!   universe restored without them would run unreachable; its /32 routes and alias are published again
+//!   by whoever holds the role, never restored from the ledger;
 //! - a universe whose activation is bound to an external authority's epoch: a host that rebooted
 //!   must be authorised again (`activation.rs`, where a permit is bound to the boot);
 //! - a universe under a lease, unless the lease was acquired or renewed during this boot: a host
@@ -242,7 +244,17 @@ fn before_start(db: &Connection, uuid: &str, last: &LastIntent, f: &Facts) -> Re
         return Ok(skip("already_running", "running", json!({"observed": lc::state_view(&c)})));
     }
     if c["Config"]["Labels"][crate::network::LABEL_PROFILE].as_str() == Some(crate::network::PROFILE_MANAGED) {
-        return Ok(skip("not_restored", "managed_network", json!({"note": "the managed network's routes, NAT table and alias are not re-applied at boot yet"})));
+        // A managed universe comes back only onto a network that is effective again: after a boot,
+        // `network_reapply` restores the declaration's bridge, peer routes and NAT exemption first.
+        match crate::network::declaration_effective(db)? {
+            Some(true) => {}
+            other => {
+                return Ok(skip("not_restored", "managed_network_not_effective", json!({
+                    "declaration_effective": other,
+                    "note": "the host's network declaration must be effective, its effects re-applied by network_reapply after a boot, before a managed universe is restored",
+                })));
+            }
+        }
     }
     if exists(db, "recovery_point_restores", "SELECT 1 FROM recovery_point_restores WHERE restored_universe_uuid=?1", uuid)? {
         return Ok(skip("not_restored", "quarantined_copy", json!({"note": "a restore copy is evidence, not a service; promote it to run it"})));

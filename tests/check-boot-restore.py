@@ -12,7 +12,8 @@ THIS SUITE REBOOTS THE HOST. It refuses to begin while any container runs there,
 and enabled, and unless the restore unit is enabled with a mandate naming PODMESH_REBOOT_MANDATE. Seven universes,
 each in one state a boot must treat differently: running with no policy, stopped, paused, created and never started,
 running under a lease longer than the reboot, running under a lease shorter than the reboot, and left stopped by a
-final live capture. A lease held before the reboot entitles nothing after it: a universe under a lease comes back
+final live capture, and running on the managed network, whose declaration's routes and NAT exemption the reboot
+removes and the boot unit re-applies before the restore. A lease held before the reboot entitles nothing after it: a universe under a lease comes back
 only once whoever decides where it runs has acquired or renewed its lease during this boot. Every product action goes through the API; the reboot and the out-of-band kill of the last leg are
 the only actions around it."""
 import json, os, sys, tempfile, time, uuid
@@ -31,7 +32,7 @@ mandate = os.environ['PODMESH_REBOOT_MANDATE']
 control = tempfile.mkdtemp(prefix='podmesh-boot-restore-')
 checks, results = [], {}
 A = Host('host', os.environ['PODMESH_REBOOT_SSH'], control, socket_path, state_dir, unit)
-U = {name: str(uuid.uuid4()) for name in ('running', 'stopped', 'paused', 'created', 'lease_long', 'lease_short', 'final')}
+U = {name: str(uuid.uuid4()) for name in ('running', 'stopped', 'paused', 'created', 'lease_long', 'lease_short', 'final', 'managed')}
 
 
 def check(condition, label, detail=None):
@@ -69,8 +70,16 @@ try:
     # ------------------------------------------------------------------ preconditions: an idle host, units armed
     running = shell("sudo -n podman ps --format '{{.Names}}'")
     check(running == '', 'no container runs on the host before the suite', running)
-    foreign = [p for p in A.ok({'operation': 'boot_restore_status'})['plan'] if p['would'] in ('restore', 'restored_earlier_this_boot')]
-    check(not foreign, 'no universe already on the host would be restored by the reboot', foreign)
+    foreign = [p for p in A.ok({'operation': 'boot_restore_status'})['plan']
+               if p['would'] in ('restore', 'restored_earlier_this_boot') or p.get('reason') == 'managed_network_not_effective']
+    check(not foreign, 'no universe already on the host would be restored by the reboot, managed ones included', foreign)
+    # The network as a boot would leave it repaired: whatever the host's own drift, then nothing left to re-apply.
+    first = A.ok({'operation': 'network_reapply', 'operation_id': str(uuid.uuid4()), 'authorization_ref': REF})
+    again = A.ok({'operation': 'network_reapply', 'operation_id': str(uuid.uuid4()), 'authorization_ref': REF})
+    check(first.get('declaration') and again['reapplied'] == [] and again['routes_withdrawn'] == [],
+          'network_reapply repairs the declaration once and then finds nothing to re-apply', {'first': first.get('reapplied'), 'withdrawn': first.get('routes_withdrawn'), 'again': again.get('reapplied')})
+    results['network_before'] = {'reapplied': first['reapplied'], 'routes_withdrawn': [r['ip'] for r in first['routes_withdrawn']]}
+    peer_pools = [e['key'] for e in first['already_present'] + first['reapplied'] if e['kind'] == 'peer_route']
     check(shell(f'systemctl is-enabled {unit}') == 'enabled' and shell(f'systemctl show -p Transient --value {unit}') == 'no',
           'the service is an installed, enabled unit')
     check(shell(f'systemctl is-enabled {restore_unit}') == 'enabled', 'the restore unit is enabled')
@@ -80,7 +89,7 @@ try:
 
     # ------------------------------------------------------------------ seven universes, seven states
     for name in U:
-        A.ok(request('create', U[name], REF, image='sha256:' + alpine, network_profile='isolated', command=COUNTER))
+        A.ok(request('create', U[name], REF, image='sha256:' + alpine, network_profile='managed' if name == 'managed' else 'isolated', command=COUNTER))
     A.ok(request('start', U['running'], REF))
     A.ok(request('start', U['stopped'], REF))
     A.ok(request('stop', U['stopped'], REF, timeout_seconds=5, on_timeout='kill'))
@@ -93,26 +102,29 @@ try:
     A.ok(request('activation_acquire', U['lease_short'], REF))
     A.ok(request('start', U['lease_short'], REF))
     A.ok(request('start', U['final'], REF))
+    A.ok(request('start', U['managed'], REF))
+    managed_ip = container('managed')['Config']['Labels'].get('io.podmesh.universe-ip')
+    check(managed_ip and managed_ip in json.dumps(container('managed')['NetworkSettings']), 'the managed universe runs at its allocated address', managed_ip)
     time.sleep(2)
     final = A.ok(request('recovery_point_prepare', U['final'], REF, capture='live', resume=False))
     check(final.get('final') is True and container('final')['State']['Status'] != 'running', 'the final capture left its universe stopped', final)
     states = {name: container(name)['State']['Status'] for name in U}
     check(states == {'running': 'running', 'stopped': 'exited', 'paused': 'paused', 'created': 'created', 'lease_long': 'running',
-                     'lease_short': 'running', 'final': states['final']}, 'the seven states are set', states)
+                     'lease_short': 'running', 'final': states['final'], 'managed': 'running'}, 'the eight states are set', states)
 
     plan = {p['universe_uuid']: p for p in A.ok({'operation': 'boot_restore_status'})['plan']}
-    check(all(plan.get(U[n], {}).get('would') == 'already_running' for n in ('running', 'lease_long', 'lease_short')),
-          'status: the three running universes are the only ones intended to run, and they already run', plan)
+    check(all(plan.get(U[n], {}).get('would') == 'already_running' for n in ('running', 'lease_long', 'lease_short', 'managed')),
+          'status: the four running universes are the only ones intended to run, and they already run', plan)
     check(not any(U[n] in plan for n in ('stopped', 'paused', 'created', 'final')), 'status: stopped, paused, created and final are not intended to run', plan)
 
     # ------------------------------------------------------------------ B3: a service restart touches nothing
-    before = {n: started_at(n) for n in ('running', 'lease_long', 'lease_short', 'paused')}
+    before = {n: started_at(n) for n in ('running', 'lease_long', 'lease_short', 'paused', 'managed')}
     A.call('restart_with_fault')
     A.call('ready', seconds=60)
     after = {n: started_at(n) for n in before}
     check(after == before, 'a service restart leaves running and paused universes untouched', {'before': before, 'after': after})
     restart_pass = A.ok({'operation': 'boot_restore', 'operation_id': str(uuid.uuid4()), 'authorization_ref': REF, 'observe_seconds': 2})
-    check(restart_pass['counts']['restored'] == 0 and all(decision_of(restart_pass, n)['decision'] == 'already_running' for n in ('running', 'lease_long', 'lease_short')),
+    check(restart_pass['counts']['restored'] == 0 and all(decision_of(restart_pass, n)['decision'] == 'already_running' for n in ('running', 'lease_long', 'lease_short', 'managed')),
           'a pass after the service restart starts nothing: the running universes are already running', restart_pass['counts'])
     boot_before = restart_pass['boot_id']
     check(all(journal_operation(f"boot-{boot_before.replace('-', '')}-{U[n].replace('-', '')}") is None for n in U),
@@ -136,6 +148,14 @@ try:
     check(row is not None and row['status'] == 'verified' and json.loads(row['request'])['authorization_ref'] == mandate,
           'the boot pass is journaled, verified, under the mandate', row)
     boot_pass = json.loads(row['result'])
+    net_row = journal_operation('boot-network-' + boot.replace('-', ''))
+    check(net_row is not None and net_row['status'] == 'verified', 'the boot unit re-applied the network before the restore, journaled and verified', net_row)
+    net_pass = json.loads(net_row['result'])
+    results['boot_network'] = {'reapplied': net_pass['reapplied'], 'routes_withdrawn': [r['ip'] for r in net_pass['routes_withdrawn']]}
+    check({e['kind'] for e in net_pass['reapplied']} >= {'peer_route', 'nat_table'}, 'the reboot had removed the peer routes and the NAT exemption, and the pass put them back', net_pass['reapplied'])
+    for pool in peer_pools:
+        check(pool in shell(f'ip -4 route show {pool}'), f'the peer route to {pool} is in the kernel again')
+    check('podmesh-managed' in shell('sudo -n nft list tables'), 'the NAT exemption table is in the kernel again')
     results['boot_pass_counts'] = boot_pass['counts']
     check(boot_pass['boot_id'] == boot and boot_pass['clock_synchronized'] is True, 'the pass ran in this boot with a synchronized clock', boot_pass.get('clock_synchronized'))
 
@@ -146,6 +166,10 @@ try:
           'B2: the universe with no policy is running again, started by the pass', d)
     check(start_row and start_row['status'] == 'verified' and json.loads(start_row['request'])['authorization_ref'] == mandate,
           'its start names the mandate in the journal', start_row)
+    d = decision_of(boot_pass, 'managed')
+    c = container('managed')
+    check(d is not None and d['decision'] == 'restored' and c['State']['Status'] == 'running' and managed_ip in json.dumps(c['NetworkSettings']),
+          'the managed universe is running again at its own address, once the network is effective', d)
     for name in ('lease_long', 'lease_short'):
         d = decision_of(boot_pass, name)
         check(d is not None and d['decision'] == 'not_restored' and d['reason'] == 'lease_not_renewed_since_boot'

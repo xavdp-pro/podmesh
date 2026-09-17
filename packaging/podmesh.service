@@ -5,6 +5,9 @@ After=network.target
 ExecStart=/usr/bin/podmeshd
 RuntimeDirectory=podmesh
 RuntimeDirectoryMode=0700
+# Kept across a restart of the service: a publisher's runtime configuration lives there, and the connector
+# it started outlives the daemon. Removed when the service stops for good, and at every boot.
+RuntimeDirectoryPreserve=restart
 StateDirectory=podmesh
 StateDirectoryMode=0700
 UMask=0077

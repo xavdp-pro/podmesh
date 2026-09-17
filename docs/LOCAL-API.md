@@ -523,7 +523,9 @@ the operator's decision.
   again, whatever its own parameters. A universe is therefore started at most once per boot, whatever the number of
   passes.
 - Never restored, whatever the last intent says:
-  - `managed_network`: its routes, NAT table and alias are not re-applied at boot yet;
+  - `managed_network_not_effective`: a universe on the managed network while the host's declaration is not
+    effective; after a boot the unit runs `network_reapply` first, and the universe's /32 routes and alias
+    are published again by whoever holds the role, never restored from the ledger;
   - `quarantined_copy`: a restore copy is evidence, not a service;
   - `epoch_gated`: a policy bound to an external authority's epoch; a rebooted host must be authorised again;
   - `lease_not_renewed_since_boot`: a universe under a lease comes back only once its lease has been acquired or
@@ -545,7 +547,8 @@ the operator's decision.
 
 The packaged script `/usr/bin/podmesh-restore` waits for the service's socket (60 seconds at most) and, for 90 seconds
 at most, for the clock to be synchronized, then sends one request whose operation ID is `boot-restore-<boot_id without
-hyphens>`, so a second run in the same boot replays the first pass. Not covered: a manager universe on the isolated
+hyphens>` after re-applying the network (`network_reapply`, `boot-network-<boot_id without hyphens>`), so a
+second run in the same boot replays the first pass. Not covered: a manager universe on the isolated
 profile is not recognised as one while it is stopped, and an operation written without an attempt row (a journal
 rolled back to experimental3) is not ordered.
 
@@ -579,6 +582,14 @@ remains (`network_status`: `effects`, `incomplete_effects`).
   withdrawn with the route; `alias_universe_uuid` and `alias_effective` in `network_status`); refused when
   nothing runs at `via` here. `network_route_withdraw` (`universe_uuid`) removes the routes of a universe,
   and the alias with them.
+- `network_reapply` (host-wide; no fields). A reboot removes every route and nftables table PodMesh made while
+  the ledger still records them effective, and the reconciliation at startup only reports that drift. This
+  re-applies the effects of this host's effective declaration that the kernel or Podman no longer shows -- the
+  bridge, the peer routes, the NAT exemption, none of them exclusive -- verifies each from outside, and
+  withdraws every recorded /32 route whose kernel route is gone, with the alias it carried: a /32 route is never
+  re-applied from the ledger, and whoever holds the role publishes it again under a live lease. Refused while
+  the declaration is not effective; a second call finds nothing to re-apply. The restore unit calls it at boot
+  before `boot_restore`, under the operation ID `boot-network-<boot_id without hyphens>`.
 
 ## Experimental: secrets a universe is given at creation (development tree, not packaged)
 

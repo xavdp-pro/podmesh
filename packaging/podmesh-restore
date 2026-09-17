@@ -6,8 +6,9 @@
 # its universes has to bring them back on its own. This script is what a oneshot unit runs once
 # at boot so that the host does: it refuses to run without the operator's mandate file, waits for
 # the service's socket and, for a bounded time, for the clock to be synchronized (a lease is judged
-# on the wall clock), then sends one typed request whose operation ID is derived from this boot, so
-# a second run in the same boot replays the first pass. It decides nothing; the daemon's
+# on the wall clock), then re-applies the network declaration's effects the boot removed and sends one
+# typed restore request, both with operation IDs derived from this boot, so a second run in the same
+# boot replays the first pass. It decides nothing; the daemon's
 # `boot_restore` does, through the same gates as any start, and its report goes to the journal.
 # Enabling the unit is the operator's decision (LOCAL-API.md, "Restoring after a boot").
 #
@@ -58,7 +59,12 @@ while [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" != 
 done
 boot=$(tr -d '-' < /proc/sys/kernel/random/boot_id)
 request=$(mktemp)
-trap 'rm -f "$request"' EXIT
+network=$(mktemp)
+trap 'rm -f "$request" "$network"' EXIT
+# The network first: a managed universe is restored only onto a declaration effective again. A failure
+# here is reported and the restore still runs; managed universes then stay where they are.
+printf '{"operation_id":"boot-network-%s","authorization_ref":"%s"}\n' "$boot" "$ref" > "$network"
+PODMESH_SOCKET="$socket" "$cli" network_reapply "$network" || echo "podmesh-restore: network_reapply did not succeed; managed universes will not be restored" >&2
 printf '{"operation_id":"boot-restore-%s","authorization_ref":"%s","observe_seconds":%s}\n' "$boot" "$ref" "$observe" > "$request"
 # The same operation ID is sent again at most twice: a verified pass is replayed, an interrupted one
 # re-evaluated, and a start it already verified is never repeated.

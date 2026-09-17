@@ -95,6 +95,7 @@ pub fn all() -> Value {
         int("timeout_seconds", true, 0, Some(300), "the graceful wait for each stop"),
     ])));
     put("activation_fence_preview", op("read", "none", "what a fence would do now, without journaling anything", Some(vec![])));
+    put("network_reapply", op("host", "none", "after a boot: re-applies the declaration's bridge, peer routes and NAT exemption the kernel lost, and withdraws the /32 routes whose kernel route is gone", Some(vec![])));
     put("boot_restore", op("host", "lease,reservation", "starts, at most once per boot each, the universes this host's journal says should run, through the start gates; called at boot by the local unit under the operator's mandate", Some(vec![
         int("observe_seconds", false, 0, Some(30), "how long each start is observed; default 2"),
     ])));

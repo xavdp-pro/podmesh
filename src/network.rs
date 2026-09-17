@@ -1016,9 +1016,89 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
                 return Err(format!("the withdrawal of the route for {ip} did not complete: {report}").into());
             }
         }
+        "network_reapply" => {
+            let mut report = reapply(db)?;
+            report["effective_after"] = view(db)?;
+            return Ok(report);
+        }
         _ => return Err("Unsupported network operation".into()),
     }
     view(db)
+}
+
+/// Whether this host's declaration is effective in the kernel and Podman now: its state recorded
+/// effective and each of its own effects -- the bridge, the peer routes, the NAT exemption -- read
+/// present. `Some(false)` when there is no declaration or an effect is missing; `None` when an effect
+/// could not be read.
+pub(crate) fn declaration_effective(db: &Connection) -> Result<Option<bool>, Error> {
+    ensure_schema(db)?;
+    let Some(d) = declared(db)? else { return Ok(Some(false)) };
+    if d.state != "effective" {
+        return Ok(Some(false));
+    }
+    let mut unknown = false;
+    for e in effect_rows(db, Some(&d.network_uuid))? {
+        if e.state != "effective" || !matches!(e.kind.as_str(), "bridge" | "peer_route" | "nat_table") {
+            continue;
+        }
+        match effect_verify(&e) {
+            Some(true) => {}
+            Some(false) => return Ok(Some(false)),
+            None => unknown = true,
+        }
+    }
+    Ok(if unknown { None } else { Some(true) })
+}
+
+/// After a boot the kernel has lost every route and nftables table PodMesh made, while the ledger still
+/// records them effective, and the startup reconciliation only reports that drift. This re-applies the
+/// effects of this host's effective declaration that the kernel or Podman no longer shows -- the bridge,
+/// the peer routes and the NAT exemption, none of them exclusive -- and withdraws every recorded /32
+/// route whose kernel route is gone, with the alias it carried, so that whoever holds the role publishes
+/// it again under a live lease. A /32 route is never re-applied from the ledger: after a boot,
+/// exclusivity is decided again, never assumed.
+fn reapply(db: &Connection) -> Result<Value, Error> {
+    let Some(d) = declared(db)? else {
+        return Ok(json!({"declaration": null, "reapplied": [], "already_present": [], "routes_withdrawn": [], "note": "no network is declared on this host"}));
+    };
+    if d.state != "effective" {
+        return Err(format!("the declaration of network {} is {}, not effective; nothing is re-applied", d.network_uuid, d.state).into());
+    }
+    let (mut reapplied, mut present, mut failed) = (vec![], vec![], vec![]);
+    for e in effect_rows(db, Some(&d.network_uuid))? {
+        if e.state != "effective" || !matches!(e.kind.as_str(), "bridge" | "peer_route" | "nat_table") {
+            continue;
+        }
+        match effect_verify(&e) {
+            Some(true) => present.push(json!({"kind": e.kind, "key": e.key})),
+            Some(false) => {
+                let applied = effect_apply(&e).and_then(|_| match effect_verify(&e) {
+                    Some(true) => Ok(()),
+                    Some(false) => Err("not effective after being re-applied".into()),
+                    None => Err("could not be verified after being re-applied".into()),
+                });
+                match applied {
+                    Ok(()) => reapplied.push(json!({"kind": e.kind, "key": e.key})),
+                    Err(err) => failed.push(json!({"kind": e.kind, "key": e.key, "error": err.to_string()})),
+                }
+            }
+            None => failed.push(json!({"kind": e.kind, "key": e.key, "error": "its presence could not be read"})),
+        }
+    }
+    let mut s = db.prepare("SELECT ip,via FROM network_routes WHERE state IS NULL OR state='effective' ORDER BY ip")?;
+    let routes: Vec<(String, String)> = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let mut withdrawn = vec![];
+    for (ip, via) in routes {
+        let gone = routes_for(&format!("{ip}/32")).is_some_and(|held| !held.iter().any(|l| l.contains(&format!("via {via}"))));
+        if gone {
+            let r = withdraw_route(db, &ip)?;
+            withdrawn.push(json!({"ip": ip, "via": via, "withdrawn": r["withdrawn"], "steps": r["steps"]}));
+        }
+    }
+    if !failed.is_empty() {
+        return Err(format!("some effects of the declaration could not be re-applied: {}", json!(failed)).into());
+    }
+    Ok(json!({"declaration": d.network_uuid, "reapplied": reapplied, "already_present": present, "routes_withdrawn": withdrawn}))
 }
 
 /// Withdraw one recorded route with everything it carried: the row marked `removing` first, each
