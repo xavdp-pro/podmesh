@@ -181,13 +181,14 @@ test('health reads every host on its own, reports a failing one, and reads manag
   if(p.operation==='capabilities')return {ok:true,data:{operations:h.id==='b'?['identity']:['host_status','universe_stats','manager_status']}};
   if(p.operation==='host_status')return {ok:true,data:{cpu_count:2,load_average:{'1m':0.5},memory_total_bytes:100,memory_available_bytes:40,storage:{backend:'plain',dedicated:false,growth:'refused',size_bytes:1000,used_bytes:400}}};
   if(p.operation==='universe_stats')return {ok:true,data:{universes:[{universe_uuid:M,state:'running',manager:true,image:'sha256:aa'},{universe_uuid:U,state:'running',manager:false,image:'alpine'}]}};
-  if(p.operation==='manager_status')return {ok:true,data:{store_bytes:123,resident_status:{replica_id:'r1',peers:{p2:{outcome:'local_exchange_failure',last_success_age_ms:1000000,failures:9,authenticated_successes:3,acknowledged_history_len:25}}}}};
+  if(p.operation==='manager_status')return {ok:true,data:{store_bytes:123,resident_status:{replica_id:'r1',peers:{p2:{outcome:'local_exchange_failure',last_success_age_ms:1000000,last_attempt_age_ms:4000,acknowledged_unchanged:false,refresh_ms:600000,max_backoff_ms:30000,failures:9,authenticated_successes:3,acknowledged_history_len:25}}}}};
   return {ok:false,error:'unexpected'};}});
  const session=await fetch(url+'/api/session').then(r=>r.json());
  assert.equal((await fetch(url+'/api/health')).status,401);
  const body=await fetch(url+'/api/health',{headers:{'X-Podmesh-Token':session.token}}).then(r=>r.json());
  const [a,b,c]=body.hosts;
  assert.equal(a.host.cpu_count,2);assert.equal(a.universes.length,2);assert.equal(a.managers.length,1);assert.equal(a.managers[0].links[0].outcome,'local_exchange_failure');assert.equal(a.managers[0].store_bytes,123);
+ const link=a.managers[0].links[0];assert.deepEqual([link.last_attempt_age_ms,link.acknowledged_unchanged,link.refresh_ms,link.max_backoff_ms],[4000,false,600000,30000]);
  assert.match(b.errors.runtime,/without host_status/);assert.match(c.errors.transport,/unreachable/);
  assert.deepEqual(calls.filter(([,op])=>op==='manager_status').map(([h,,u])=>h+':'+u),['a:'+M]);});
 test('replication runs the tool for the active host with every other SSH host as candidate, and refuses what is not a replication',async t=>{

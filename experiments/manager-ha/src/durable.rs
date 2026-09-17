@@ -1368,6 +1368,57 @@ fn authenticated_import_receipt_id_parts(
     Ok(format!("network:{}", digest(&material)))
 }
 
+impl Store {
+    /// Returns the highest producer sequence among the facts this store appended
+    /// itself, as the responses of its `observe` receipts record them, or `None`
+    /// when it appended none. A fact of this replica's own origin that the store
+    /// imported from a peer has no `observe` receipt and is not counted. The
+    /// receipts are read, and each verified, in one verified read transaction.
+    ///
+    /// # Errors
+    /// Returns the transaction's errors, and `corrupt` for an `observe` receipt
+    /// whose row or response does not verify.
+    pub fn highest_local_observation(&mut self) -> DurableResult<Option<u64>> {
+        self.guarded(|store| {
+            let transaction = begin_verified(
+                &mut store.connection,
+                &store.integrity,
+                &store.topology,
+                &store.replica_id,
+                TransactionBehavior::Deferred,
+            )?;
+            let highest = {
+                let mut statement = transaction
+                    .prepare(&format!(
+                        "SELECT {RECEIPT_COLUMNS} FROM receipts WHERE kind = ?1"
+                    ))
+                    .map_err(error)?;
+                let rows = statement
+                    .query_map([enum_text(&ReceiptKind::Observe)?], read_receipt_row)
+                    .map_err(error)?;
+                let mut highest = None;
+                for row in rows {
+                    let receipt = row.map_err(error)?;
+                    verify_receipt_row(store.topology.logical_manager_id(), &receipt)?;
+                    let Ok(Response::Observed { fact }) =
+                        serde_json::from_str(&receipt.response_json)
+                    else {
+                        return Err(DurableError::Corrupt(
+                            "stored observe receipt does not record an observation".into(),
+                        ));
+                    };
+                    if fact.origin_replica_id == store.replica_id {
+                        highest = highest.max(Some(fact.producer_sequence));
+                    }
+                }
+                highest
+            };
+            transaction.commit().map_err(error)?;
+            Ok(highest)
+        })
+    }
+}
+
 fn mutation_operation_id(request: &Request) -> DurableResult<Option<&String>> {
     match request {
         Request::Observe { operation_id, .. } => {

@@ -85,7 +85,7 @@ export function createApp(config,{call=request,origin='http://127.0.0.1:4175',re
      if(!ms.ok){row.managers.push({universe_uuid:u.universe_uuid,error:ms.error||'refused'});continue;}
      const rs=ms.data.resident_status||{};
      row.managers.push({universe_uuid:u.universe_uuid,replica_id:rs.replica_id,store_bytes:ms.data.store_bytes,
-      links:Object.entries(rs.peers||{}).map(([peer,v])=>({peer,outcome:v.outcome,last_success_age_ms:v.last_success_age_ms,failures:v.failures,successes:v.authenticated_successes,acknowledged_history_len:v.acknowledged_history_len,local_history_len:v.local_history_len_at_attempt,next_attempt_in_ms:v.next_attempt_in_ms}))});
+      links:Object.entries(rs.peers||{}).map(([peer,v])=>({peer,outcome:v.outcome,last_success_age_ms:v.last_success_age_ms,last_attempt_age_ms:v.last_attempt_age_ms,acknowledged_unchanged:v.acknowledged_unchanged,refresh_ms:v.refresh_ms,max_backoff_ms:v.max_backoff_ms,failures:v.failures,successes:v.authenticated_successes,acknowledged_history_len:v.acknowledged_history_len,local_history_len:v.local_history_len_at_attempt,next_attempt_in_ms:v.next_attempt_in_ms}))});
     }
    }catch(e){row.errors.transport=e.message;}
    return row;

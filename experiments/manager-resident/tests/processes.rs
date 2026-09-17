@@ -147,6 +147,7 @@ impl Lab {
                 incoming_workers: 2,
                 full_verification_interval_ms: None,
                 unchanged_snapshot_refresh_ms: None,
+                catch_up_window_ms: None,
             })
             .collect();
         drop(listeners);
@@ -173,6 +174,9 @@ impl Lab {
             .unwrap();
     }
     fn start(&mut self, i: usize) {
+        self.start_with_stderr(i, Stdio::inherit());
+    }
+    fn start_with_stderr(&mut self, i: usize, stderr: Stdio) {
         let path = self._dir.path().join(format!("r{i}.json"));
         fs::write(&path, serde_json::to_vec(&self.configs[i]).unwrap()).unwrap();
         self.children[i] = Some(
@@ -180,16 +184,28 @@ impl Lab {
                 .env("PODMESH_MANAGER_NETWORK_MODE", "authenticated-static-peers")
                 .arg(path)
                 .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
+                .stderr(stderr)
                 .spawn()
                 .unwrap(),
         );
-        until(
-            || self.control(i, "status").is_some(),
-            Duration::from_secs(5),
-        );
+        let (bound, allowance) = readiness_bound();
+        let started = Instant::now();
+        loop {
+            if let Some(exit) = self.children[i].as_mut().unwrap().try_wait().unwrap() {
+                panic!("resident r{i} exited while starting: {exit}");
+            }
+            if self.control(i, "status").is_some() {
+                break;
+            }
+            assert!(
+                started.elapsed() < bound + allowance,
+                "resident r{i} did not answer status within {bound:?} (load allowance {allowance:?})"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
     }
     fn status(&self, i: usize) -> Value {
+        let (bound, allowance) = readiness_bound();
         let start = Instant::now();
         loop {
             if let Some(reply) = self.control(i, "status") {
@@ -198,8 +214,8 @@ impl Lab {
                 }
             }
             assert!(
-                start.elapsed() < Duration::from_secs(5),
-                "status did not become available"
+                start.elapsed() < bound + allowance,
+                "status did not become available within {bound:?} (load allowance {allowance:?})"
             );
             thread::sleep(Duration::from_millis(25));
         }
@@ -259,7 +275,11 @@ impl Lab {
             assert!(
                 matches!(
                     reply["error"].as_str(),
-                    Some("append_observation_busy" | "append_observation_uncertain")
+                    Some(
+                        "append_observation_busy"
+                            | "append_observation_uncertain"
+                            | "append_observation_catching_up"
+                    )
                 ),
                 "unexpected append reply: {reply}"
             );
@@ -299,6 +319,44 @@ impl Lab {
         assert!(child.wait().unwrap().success());
         assert!(!self.configs[i].control_socket.exists());
     }
+    fn start_all(&mut self) {
+        for i in 0..3 {
+            self.start(i);
+        }
+    }
+    fn stop_all(&mut self) {
+        for i in 0..3 {
+            if self.children[i].is_some() {
+                self.stop(i);
+            }
+        }
+    }
+    /// Waits until a resident reports that it has caught up with its peers.
+    fn wait_caught_up(&self, i: usize) {
+        until(
+            || self.status(i)["catch_up"]["caught_up"] == true,
+            Duration::from_secs(10),
+        );
+    }
+    /// The database and its SQLite sidecars of a stopped replica.
+    fn store_files(&self, i: usize) -> Vec<std::path::PathBuf> {
+        ["", "-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| {
+                let mut path = self.configs[i].network.database_path.as_os_str().to_owned();
+                path.push(suffix);
+                std::path::PathBuf::from(path)
+            })
+            .collect()
+    }
+    fn delete_store(&self, i: usize) {
+        assert!(self.children[i].is_none());
+        for path in self.store_files(i) {
+            if path.exists() {
+                fs::remove_file(path).unwrap();
+            }
+        }
+    }
 }
 impl Drop for Lab {
     fn drop(&mut self) {
@@ -308,6 +366,20 @@ impl Drop for Lab {
         }
     }
 }
+/// How long a resident may take to answer status. The universe gives a whole
+/// start 25 seconds, the catch-up window included, so a resident must bind its
+/// control socket within a few seconds. `PODMESH_RESIDENT_TEST_LOAD_ALLOWANCE_MS`
+/// adds an explicit allowance for a machine known to be loaded; a failure names
+/// the bound and the allowance apart.
+fn readiness_bound() -> (Duration, Duration) {
+    let allowance = std::env::var("PODMESH_RESIDENT_TEST_LOAD_ALLOWANCE_MS")
+        .ok()
+        .and_then(|milliseconds| milliseconds.parse().ok())
+        .map_or(Duration::ZERO, Duration::from_millis);
+    (Duration::from_secs(5), allowance)
+}
+
+#[track_caller]
 fn until(mut predicate: impl FnMut() -> bool, timeout: Duration) {
     let start = Instant::now();
     while !predicate() {
@@ -328,8 +400,10 @@ fn three_residents_converge_partition_reconnect_restart_and_preserve_conflicts()
             proxies.push((isolated, proxy));
         }
     }
+    // A replica appends only once it has caught up with both peers, so all three
+    // run before the first append.
+    lab.start_all();
     for i in 0..3 {
-        lab.start(i);
         let reply = lab.append(
             i,
             "initial",
@@ -452,14 +526,50 @@ fn wrong_key_and_oversized_frames_do_not_import() {
     assert_eq!(lab.count(1), 0);
     assert_eq!(lab.count(2), 0);
     assert_eq!(lab.status(0)["peers"]["r1"]["authenticated_successes"], 0);
-    let mut stream = TcpStream::connect(lab.configs[1].network.bind).unwrap();
-    stream.write_all(&524_289_u32.to_be_bytes()).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    let mut reply = Vec::new();
-    stream.read_to_end(&mut reply).unwrap();
+    // An oversized frame is answered and imports nothing. A connection that
+    // arrives while both incoming workers are busy is closed unread and counted
+    // as rejected, which resets it: that is admission, tested on its own, and
+    // such an attempt is repeated.
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let rejected = lab.status(1)["rejected_connections"].as_u64().unwrap();
+        let mut stream = TcpStream::connect(lab.configs[1].network.bind).unwrap();
+        stream.write_all(&524_289_u32.to_be_bytes()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut reply = Vec::new();
+        match stream.read_to_end(&mut reply) {
+            Ok(_) => break,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ConnectionReset
+                    && attempts < 5
+                    && lab.status(1)["rejected_connections"].as_u64().unwrap() > rejected =>
+            {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => panic!("oversized frame attempt {attempts}: {error}"),
+        }
+    }
     assert_eq!(lab.count(1), 0);
+    // Neither the refused import nor the refused push catches r1 up with r0, and
+    // an empty store keeps refusing appends.
+    until(
+        || lab.status(1)["catch_up"]["peers_imported"] == json!(["r2"]),
+        Duration::from_secs(10),
+    );
+    let catch_up = lab.status(1)["catch_up"].clone();
+    assert_eq!(catch_up["peers_missing"], json!(["r0"]));
+    assert_eq!(catch_up["caught_up"], false);
+    assert_eq!(
+        lab.control_value(
+            1,
+            json!({"operation":"append_observation","operation_id":"refused-peer","scope":"s1","subject":"subject","value":"value"}),
+        )
+        .unwrap()["error"],
+        "append_observation_catching_up"
+    );
     for i in 0..3 {
         lab.stop(i);
     }
@@ -556,7 +666,8 @@ fn unknown_control_fields_are_refused_without_shutdown() {
 #[test]
 fn append_observation_is_uid_bound_nonexclusive_and_idempotent() {
     let mut lab = Lab::new();
-    lab.start(0);
+    // An empty store appends only after every peer caught it up.
+    lab.start_all();
     let first = lab.append(0, "append.1:local", "s0", "subject-1", "value");
     assert_eq!(first["response"]["result"], "observed");
     assert_eq!(first["response"]["fact"]["exclusive_resource"], Value::Null);
@@ -592,7 +703,7 @@ fn append_observation_is_uid_bound_nonexclusive_and_idempotent() {
         .try_wait()
         .unwrap()
         .is_none());
-    lab.stop(0);
+    lab.stop_all();
 }
 
 #[test]
@@ -626,7 +737,7 @@ fn append_observation_refuses_another_uid_before_store_access_and_stays_live() {
 #[test]
 fn append_observation_accepts_any_4096_byte_utf8_value_and_bounds_raw_frames() {
     let mut lab = Lab::new();
-    lab.start(0);
+    lab.start_all();
     let escaped = "\\".repeat(4096);
     let reply = lab.append(0, "escaped-value", "s0", "subject", &escaped);
     assert_eq!(reply["response"]["result"], "observed");
@@ -650,13 +761,14 @@ fn append_observation_accepts_any_4096_byte_utf8_value_and_bounds_raw_frames() {
         .try_wait()
         .unwrap()
         .is_none());
-    lab.stop(0);
+    lab.stop_all();
 }
 
 #[test]
 fn append_observation_disconnect_replays_after_restart() {
     let mut lab = Lab::new();
-    lab.start(0);
+    lab.start_all();
+    lab.wait_caught_up(0);
     let request = json!({
         "operation":"append_observation",
         "operation_id":"disconnect-replay",
@@ -685,7 +797,7 @@ fn append_observation_disconnect_replays_after_restart() {
         .unwrap();
     assert_eq!(changed["error"], "append_observation_refused");
     assert_eq!(lab.count(0), 1);
-    lab.stop(0);
+    lab.stop_all();
 }
 
 #[test]
@@ -752,7 +864,9 @@ fn append_busy_deadline_keeps_shutdown_responsive_and_retry_recovers_commit() {
     let mut lab = Lab::new();
     lab.configs[0].interval_ms = 60_000;
     lab.configs[0].max_backoff_ms = 60_000;
-    lab.start(0);
+    // The peers run so that r0 has caught up with them before its store is locked.
+    lab.start_all();
+    lab.wait_caught_up(0);
     let ready = lab._dir.path().join("sqlite-lock-ready");
     let mut holder = Command::new("python3")
         .arg("-c")
@@ -807,12 +921,13 @@ fn append_busy_deadline_keeps_shutdown_responsive_and_retry_recovers_commit() {
     assert!(child.wait().unwrap().success());
     assert_eq!(lab.count(0), 1);
     lab.start(0);
+    lab.wait_caught_up(0);
     let replay = lab.control_value(0, request).unwrap();
     assert_eq!(replay["replayed"], true);
     let observed = lab.control_value(0, second).unwrap();
     assert_eq!(observed["response"]["result"], "observed");
     assert_eq!(lab.count(0), 2);
-    lab.stop(0);
+    lab.stop_all();
 }
 
 #[test]
@@ -970,12 +1085,15 @@ fn inspect_store_is_network_independent_and_does_not_mutate_source() {
 #[test]
 fn hierarchical_owned_scope_uses_the_control_api() {
     let mut lab = Lab::new();
-    lab.configs[0].network.manager.grants[0].scope = "s0/local".into();
-    lab.start(0);
+    // Every replica declares the same topology, or they refuse each other's imports.
+    for config in &mut lab.configs {
+        config.network.manager.grants[0].scope = "s0/local".into();
+    }
+    lab.start_all();
     let reply = lab.append(0, "hierarchical-scope", "s0/local", "subject", "value");
     assert_eq!(reply["response"]["result"], "observed");
     assert_eq!(lab.count(0), 1);
-    lab.stop(0);
+    lab.stop_all();
 }
 
 #[test]
@@ -1427,12 +1545,19 @@ fn acknowledged_unchanged_snapshot_is_refreshed_after_the_configured_delay() {
         Duration::from_secs(10),
     );
     let first = peer_successes(&lab, 0, "r1");
-    thread::sleep(Duration::from_millis(3_500));
-    let later = peer_successes(&lab, 0, "r1");
-    // About one refresh per second, not one exchange per 100 ms interval.
+    let started = Instant::now();
+    // About one refresh per second, not one exchange per 100 ms interval: the
+    // third exchange after this one cannot come before two refreshes have
+    // elapsed, however slow a loaded machine makes each exchange, and it comes
+    // well before a refresh twice as long would allow.
+    until(
+        || peer_successes(&lab, 0, "r1") >= first + 3,
+        Duration::from_secs(15),
+    );
+    let elapsed = started.elapsed();
     assert!(
-        (first + 2..=first + 5).contains(&later),
-        "{first} then {later} authenticated exchanges"
+        (Duration::from_millis(1_900)..Duration::from_secs(6)).contains(&elapsed),
+        "three exchanges after {elapsed:?}"
     );
     for i in 0..3 {
         lab.stop(i);
@@ -1472,8 +1597,15 @@ fn periodic_full_verification_fails_the_store_closed_after_an_old_row_is_edited(
     let mut lab = Lab::new();
     lab.configs[0].full_verification_interval_ms = Some(1_000);
     // r1 keeps the default ten-minute interval; r2 stays down, so both keep
-    // appending failed-attempt audit rows after the edited one.
-    lab.start(0);
+    // appending failed-attempt audit rows after the edited one. Each store holds
+    // a fact of its own origin, so each resident appends once its catch-up window
+    // has elapsed although r2 never answers.
+    for i in 0..2 {
+        lab.configs[i].catch_up_window_ms = Some(1_000);
+        lab.observe(i, "seed", None);
+    }
+    let log = lab._dir.path().join("r0.stderr");
+    lab.start_with_stderr(0, Stdio::from(fs::File::create(&log).unwrap()));
     lab.start(1);
     lab.append(0, "before-edit", "s0", "subject", "value");
     lab.append(1, "before-edit", "s1", "subject", "value");
@@ -1492,6 +1624,16 @@ fn periodic_full_verification_fails_the_store_closed_after_an_old_row_is_edited(
         "subject": "subject",
         "value": "value",
     });
+    // The periodic pass closes the store. An append that ran past its deadline
+    // before that may still be draining, and answers busy meanwhile.
+    until(
+        || {
+            fs::read_to_string(&log)
+                .unwrap()
+                .contains("resident store verification failed: corrupt")
+        },
+        Duration::from_secs(10),
+    );
     until(
         || {
             lab.control_value(0, request.clone()).unwrap()["error"]
@@ -1575,4 +1717,824 @@ fn optional_verification_and_refresh_settings_are_bounded() {
         Duration::from_millis(2_500)
     );
     assert_eq!(config.full_verification_interval(), Duration::from_secs(5));
+    assert_eq!(
+        config.catch_up_window(),
+        podmesh_manager_resident_lab::DEFAULT_CATCH_UP_WINDOW
+    );
+    assert!(serialized.get("catch_up_window_ms").is_none());
+    for (window, valid) in [
+        (Some(1_000), true),
+        (Some(15_000), true),
+        (Some(999), false),
+        (Some(15_001), false),
+    ] {
+        config.catch_up_window_ms = window;
+        assert_eq!(config.validate().is_ok(), valid, "{window:?}");
+    }
+    config.catch_up_window_ms = Some(3_000);
+    assert_eq!(config.catch_up_window(), Duration::from_secs(3));
+}
+
+fn peer_mut<'a>(config: &'a mut Configuration, peer: &str) -> &'a mut Peer {
+    config
+        .network
+        .peers
+        .iter_mut()
+        .find(|candidate| candidate.replica_id == peer)
+        .unwrap()
+}
+
+fn boot_append(operation: &str) -> Value {
+    json!({
+        "operation": "append_observation",
+        "operation_id": operation,
+        "scope": "s2",
+        "subject": "boot",
+        "value": format!("{operation} value"),
+    })
+}
+
+/// Repeats one append until it is observed. Returns the observed reply and how
+/// many times the resident answered that it was still catching up; once an
+/// append has gone past the catch-up gate, the gate never answers again.
+fn append_when_caught_up(
+    lab: &Lab,
+    i: usize,
+    request: &Value,
+    timeout: Duration,
+) -> (Value, usize) {
+    let started = Instant::now();
+    let mut catching_up = 0;
+    let mut past_gate = false;
+    loop {
+        let reply = lab.control_value(i, request.clone()).unwrap();
+        if reply["response"]["result"] == "observed" {
+            return (reply, catching_up);
+        }
+        match reply["error"].as_str() {
+            Some("append_observation_catching_up") => {
+                assert!(!past_gate, "catching up again: {reply}");
+                catching_up += 1;
+            }
+            Some("append_observation_busy" | "append_observation_uncertain") => past_gate = true,
+            _ => panic!("unexpected append reply: {reply}"),
+        }
+        assert!(
+            started.elapsed() < timeout,
+            "no append observed within {timeout:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn inspection(lab: &Lab, i: usize) -> podmesh_manager_ha_lab::durable::CanonicalStoreInspection {
+    let c = &lab.configs[i].network;
+    let start = Instant::now();
+    loop {
+        match inspect_read_only(&c.database_path, &c.manager, &c.replica_id) {
+            Ok(inspection) => return inspection,
+            Err(error) => {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "inspection remained unavailable: {error}"
+                );
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+}
+
+/// Waits until the three replicas hold `facts` facts and every link's last
+/// exchange succeeded, then requires identical canonical histories without a
+/// conflict: no replica reused a sequence number under other bytes.
+fn assert_converged(lab: &Lab, facts: usize) {
+    until(
+        || (0..3).all(|i| lab.count(i) == facts),
+        Duration::from_secs(15),
+    );
+    until(
+        || {
+            (0..3).all(|i| {
+                lab.status(i)["peers"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(|link| link["outcome"] == "authenticated_import_receipt")
+            })
+        },
+        Duration::from_secs(15),
+    );
+    let inspections: Vec<_> = (0..3).map(|i| inspection(lab, i)).collect();
+    for inspection in &inspections {
+        assert_eq!(inspection.history_count, facts);
+        assert!(inspection.conflicts.is_empty());
+        assert_eq!(
+            inspection.logical_history_sha256,
+            inspections[0].logical_history_sha256
+        );
+    }
+}
+
+#[test]
+fn an_emptied_replica_imports_its_own_facts_before_it_appends_and_takes_the_next_sequence() {
+    let mut lab = Lab::new();
+    // r1 and r2 reach each other only through proxies that can drop every connection.
+    let to_r2 = Proxy::new(lab.configs[2].network.bind);
+    let to_r1 = Proxy::new(lab.configs[1].network.bind);
+    peer_mut(&mut lab.configs[1], "r2").endpoint = to_r2.address;
+    peer_mut(&mut lab.configs[2], "r1").endpoint = to_r1.address;
+    lab.start_all();
+    for n in 1..=3 {
+        let request = boot_append(&format!("boot-{n}"));
+        assert_eq!(
+            append_when_caught_up(&lab, 2, &request, Duration::from_secs(10)).0["response"]["fact"]
+                ["producer_sequence"],
+            n
+        );
+    }
+    lab.append(0, "peer-fact", "s0", "peer", "value");
+    assert_converged(&lab, 4);
+
+    // r2 loses its store and restarts while r1 can neither reach it nor be reached.
+    lab.stop(2);
+    lab.delete_store(2);
+    to_r1.blocked.store(true, Ordering::SeqCst);
+    to_r2.blocked.store(true, Ordering::SeqCst);
+    lab.start(2);
+    // r0 gives r2 back its three facts; a store that held none of its own at start
+    // still appends only once every peer caught it up, and never touches the store
+    // before that.
+    until(
+        || lab.status(2)["catch_up"]["peers_imported"] == json!(["r0"]),
+        Duration::from_secs(10),
+    );
+    assert_eq!(lab.count(2), 4);
+    let refused_until = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < refused_until {
+        assert_eq!(
+            lab.control_value(2, boot_append("boot-4")).unwrap()["error"],
+            "append_observation_catching_up"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let status = lab.status(2);
+    assert_eq!(status["catch_up"]["caught_up"], false);
+    assert_eq!(status["catch_up"]["caught_up_by"], Value::Null);
+    assert_eq!(status["catch_up"]["peers_missing"], json!(["r1"]));
+    assert_eq!(status["catch_up"]["own_facts_at_start"], 0);
+    assert_eq!(lab.count(2), 4);
+
+    // Once r1 answers again, r2 catches up with it, and its next fact takes the
+    // sequence after the three its peers held.
+    to_r1.blocked.store(false, Ordering::SeqCst);
+    to_r2.blocked.store(false, Ordering::SeqCst);
+    let (reply, _) =
+        append_when_caught_up(&lab, 2, &boot_append("boot-4"), Duration::from_secs(10));
+    let fact = &reply["response"]["fact"];
+    assert_eq!(fact["event_id"], "r2:00000000000000000004");
+    assert_eq!(fact["subject_revision"], 4);
+    assert_eq!(fact["predecessor"], "r2:00000000000000000003");
+    let status = lab.status(2);
+    assert_eq!(status["catch_up"]["caught_up_by"], "every_peer");
+    assert_eq!(status["catch_up"]["peers_missing"], json!([]));
+    assert_converged(&lab, 5);
+
+    // With every link open, the same loss is caught up within a few exchanges.
+    lab.stop(2);
+    lab.delete_store(2);
+    let spawned = Instant::now();
+    lab.start(2);
+    let (reply, catching_up) =
+        append_when_caught_up(&lab, 2, &boot_append("boot-5"), Duration::from_secs(10));
+    let observed_after = spawned.elapsed();
+    assert_eq!(
+        reply["response"]["fact"]["event_id"],
+        "r2:00000000000000000005"
+    );
+    let catch_up = lab.status(2)["catch_up"].clone();
+    assert_eq!(catch_up["caught_up_by"], "every_peer");
+    assert_eq!(catch_up["own_facts_at_start"], 0);
+    assert_converged(&lab, 6);
+    println!(
+        "MEASURED emptied store, both peers live: caught up {} ms after the resident started exchanging; \
+         its first append was observed {} ms after the process was spawned, after {catching_up} \
+         append(s) answered catching_up",
+        catch_up["caught_up_after_ms"],
+        observed_after.as_millis()
+    );
+    lab.stop_all();
+}
+
+/// Answers catching up, typed, to every append for a while.
+#[track_caller]
+fn assert_catching_up_for(lab: &Lab, i: usize, operation: &str, duration: Duration) {
+    let until = Instant::now() + duration;
+    while Instant::now() < until {
+        assert_eq!(
+            lab.control_value(i, boot_append(operation)).unwrap()["error"],
+            "append_observation_catching_up"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn with_a_peer_down_only_a_store_whose_latest_own_fact_it_appended_appends_after_the_window() {
+    let mut lab = Lab::new();
+    for config in &mut lab.configs {
+        config.catch_up_window_ms = Some(2_000);
+    }
+    lab.start_all();
+    for n in 1..=2 {
+        lab.append(
+            2,
+            &format!("boot-{n}"),
+            "s2",
+            "boot",
+            &format!("boot-{n} value"),
+        );
+    }
+    assert_converged(&lab, 2);
+    lab.stop(1);
+
+    // An emptied store keeps refusing, typed, past its window while r1 is down,
+    // although r0 gave it back both of its facts.
+    lab.stop(2);
+    lab.delete_store(2);
+    lab.start(2);
+    until(|| lab.count(2) == 2, Duration::from_secs(10));
+    assert_catching_up_for(&lab, 2, "boot-3", Duration::from_secs(3));
+    let catch_up = lab.status(2)["catch_up"].clone();
+    assert_eq!(catch_up["caught_up"], false);
+    assert_eq!(catch_up["peers_imported"], json!(["r0"]));
+    assert_eq!(catch_up["peers_missing"], json!(["r1"]));
+    assert_eq!(catch_up["own_facts_at_start"], 0);
+    assert_eq!(catch_up["window_ms"], 2_000);
+    assert_eq!(lab.count(2), 2);
+
+    // Restarted, the store holds its two facts, imported rather than appended:
+    // this process too waits for r1.
+    lab.stop(2);
+    lab.start(2);
+    assert_catching_up_for(&lab, 2, "boot-3", Duration::from_secs(3));
+    let catch_up = lab.status(2)["catch_up"].clone();
+    assert_eq!(catch_up["own_facts_at_start"], 2);
+    assert_eq!(catch_up["latest_own_fact_appended_locally"], false);
+    assert_eq!(catch_up["peers_missing"], json!(["r1"]));
+
+    // r1 returns: r2 catches up with both peers and appends its next fact itself.
+    lab.start(1);
+    let (reply, _) =
+        append_when_caught_up(&lab, 2, &boot_append("boot-3"), Duration::from_secs(10));
+    assert_eq!(
+        reply["response"]["fact"]["event_id"],
+        "r2:00000000000000000003"
+    );
+    assert_converged(&lab, 3);
+
+    // With r1 down again, the store whose latest own fact it appended itself
+    // appends once the window has elapsed, having reached r0 and tried r1.
+    lab.stop(1);
+    lab.stop(2);
+    let spawned = Instant::now();
+    lab.start(2);
+    let (reply, catching_up) =
+        append_when_caught_up(&lab, 2, &boot_append("boot-4"), Duration::from_secs(10));
+    assert!(spawned.elapsed() >= Duration::from_secs(2));
+    assert!(catching_up > 0);
+    assert_eq!(
+        reply["response"]["fact"]["event_id"],
+        "r2:00000000000000000004"
+    );
+    let catch_up = lab.status(2)["catch_up"].clone();
+    assert_eq!(catch_up["caught_up_by"], "window");
+    assert!(catch_up["caught_up_after_ms"].as_u64().unwrap() >= 2_000);
+    assert_eq!(catch_up["own_facts_at_start"], 3);
+    assert_eq!(catch_up["latest_own_fact_appended_locally"], true);
+    assert_eq!(catch_up["peers_matched"], json!(["r0"]));
+    assert_eq!(catch_up["peers_missing"], json!(["r1"]));
+    assert_eq!(catch_up["peers_not_attempted"], json!([]));
+
+    // r1 comes back and nothing collides.
+    lab.start(1);
+    assert_converged(&lab, 4);
+    lab.stop_all();
+}
+
+#[test]
+fn an_emptied_store_that_imported_its_own_facts_back_waits_for_every_peer_at_its_next_start() {
+    let mut lab = Lab::new();
+    for config in &mut lab.configs {
+        config.catch_up_window_ms = Some(1_000);
+    }
+    lab.start_all();
+    lab.append(2, "boot-1", "s2", "boot", "boot-1 value");
+    assert_converged(&lab, 1);
+    // r0 goes down holding r2:1 only; r1 receives r2:2 and r2:3.
+    lab.stop(0);
+    lab.append(2, "boot-2", "s2", "boot", "boot-2 value");
+    lab.append(2, "boot-3", "s2", "boot", "boot-3 value");
+    until(|| lab.count(1) == 3, Duration::from_secs(10));
+    // r1, the only other holder of r2:2 and r2:3, goes down, and r2 loses its store.
+    lab.stop(1);
+    lab.stop(2);
+    lab.delete_store(2);
+    lab.start(0);
+    lab.start(2);
+    // The first start gets r2:1 back from r0 and refuses while r1 is down, until
+    // the universe entrypoint ends it at its budget.
+    until(|| lab.count(2) == 1, Duration::from_secs(10));
+    assert_catching_up_for(&lab, 2, "boot-after-loss", Duration::from_millis(1_500));
+    lab.stop(2);
+    // The second start holds r2:1, of its own origin but imported: it does not
+    // take r2:2, which r1 holds with other bytes, when its window elapses.
+    lab.start(2);
+    assert_catching_up_for(&lab, 2, "boot-after-loss", Duration::from_secs(3));
+    let catch_up = lab.status(2)["catch_up"].clone();
+    assert_eq!(catch_up["caught_up"], false);
+    assert_eq!(catch_up["own_facts_at_start"], 1);
+    assert_eq!(catch_up["latest_own_fact_appended_locally"], false);
+    assert_eq!(catch_up["peers_missing"], json!(["r1"]));
+    // r1 returns: r2 gets r2:2 and r2:3 back, and its next fact takes the fourth
+    // sequence; every replica converges on one history.
+    lab.start(1);
+    let (reply, _) = append_when_caught_up(
+        &lab,
+        2,
+        &boot_append("boot-after-loss"),
+        Duration::from_secs(15),
+    );
+    assert_eq!(
+        reply["response"]["fact"]["event_id"],
+        "r2:00000000000000000004"
+    );
+    assert_converged(&lab, 4);
+    lab.stop_all();
+}
+
+#[test]
+fn a_short_window_waits_until_every_peer_was_tried_and_one_caught_up() {
+    let mut lab = Lab::new();
+    lab.start_all();
+    lab.append(2, "boot-1", "s2", "boot", "boot-1 value");
+    assert_converged(&lab, 1);
+    lab.stop(2);
+    let saved: Vec<_> = lab
+        .store_files(2)
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).ok();
+            (path, bytes)
+        })
+        .collect();
+    lab.start(2);
+    lab.append(2, "boot-2", "s2", "boot", "boot-2 value");
+    assert_converged(&lab, 2);
+    // r1's resident stops, so an attempt to it lasts its 2 s connect deadline;
+    // r0, which holds r2:2, stays up.
+    lab.stop(1);
+    lab.stop(2);
+    for (path, bytes) in &saved {
+        match bytes {
+            Some(bytes) => fs::write(path, bytes).unwrap(),
+            None => {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    assert_eq!(lab.count(2), 1);
+    // r2 restarts on its older copy with a 1 s window, r1 listed first.
+    lab.configs[2].catch_up_window_ms = Some(1_000);
+    lab.configs[2].network.peers.swap(0, 1);
+    assert_eq!(lab.configs[2].network.peers[0].replica_id, "r1");
+    lab.start(2);
+    let (reply, _) = append_when_caught_up(
+        &lab,
+        2,
+        &boot_append("boot-restored"),
+        Duration::from_secs(15),
+    );
+    // It did not append at the 1 s mark: it first reached r0, which pushed r2:2
+    // back, then took the next sequence.
+    assert_eq!(
+        reply["response"]["fact"]["event_id"],
+        "r2:00000000000000000003"
+    );
+    let catch_up = lab.status(2)["catch_up"].clone();
+    assert_eq!(catch_up["caught_up_by"], "window");
+    assert!(catch_up["caught_up_after_ms"].as_u64().unwrap() >= 2_000);
+    assert_eq!(catch_up["peers_imported"], json!(["r0"]));
+    assert_eq!(catch_up["peers_missing"], json!(["r1"]));
+    assert_eq!(catch_up["peers_ahead"], json!([]));
+    assert_eq!(catch_up["latest_own_fact_appended_locally"], true);
+    until(|| lab.count(0) == 3, Duration::from_secs(10));
+    lab.start(1);
+    assert_converged(&lab, 3);
+    lab.stop_all();
+}
+
+fn push_backs(lab: &Lab, i: usize, peer: &str) -> u64 {
+    lab.status(i)["peers"][peer]["push_backs"].as_u64().unwrap()
+}
+
+#[test]
+fn a_replica_restored_from_an_older_store_is_pushed_back_to_within_a_few_intervals() {
+    let mut lab = Lab::new();
+    for config in &mut lab.configs {
+        config.unchanged_snapshot_refresh_ms = Some(600_000);
+    }
+    lab.start_all();
+    lab.append(0, "first", "s0", "subject", "first");
+    assert_converged(&lab, 1);
+    lab.stop(2);
+    let saved: Vec<_> = lab
+        .store_files(2)
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).ok();
+            (path, bytes)
+        })
+        .collect();
+    lab.start(2);
+    lab.append(0, "second", "s0", "subject", "second");
+    lab.append(1, "third", "s1", "subject", "third");
+    assert_converged(&lab, 3);
+    // Every link now holds an acknowledgement of the current snapshot, which
+    // nobody pushes again before ten minutes, and no exchange is under way.
+    let all_acknowledged = || {
+        (0..3).all(|i| {
+            lab.status(i)["peers"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|link| link["acknowledged_unchanged"] == true)
+        })
+    };
+    until(all_acknowledged, Duration::from_secs(15));
+    settled_audit_counts(&lab, &[0, 1, 2]);
+    assert!(all_acknowledged());
+    let before = push_backs(&lab, 0, "r2") + push_backs(&lab, 1, "r2");
+
+    // r2 comes back on its older copy, which lacks two facts its peers believe
+    // it acknowledged.
+    lab.stop(2);
+    for (path, bytes) in &saved {
+        match bytes {
+            Some(bytes) => fs::write(path, bytes).unwrap(),
+            None => {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    assert_eq!(lab.count(2), 1);
+    lab.start(2);
+    let bound = Instant::now();
+    until(|| lab.count(2) == 3, Duration::from_secs(10));
+    let converged = bound.elapsed();
+    assert!(
+        push_backs(&lab, 0, "r2") + push_backs(&lab, 1, "r2") > before,
+        "convergence did not come from a push-back: before {before}, r0 {} r1 {}",
+        lab.status(0)["peers"]["r2"],
+        lab.status(1)["peers"]["r2"],
+    );
+    // Interval 100 ms: a few intervals, not the ten-minute refresh.
+    assert!(converged < Duration::from_secs(3), "{converged:?}");
+    assert_converged(&lab, 3);
+    println!(
+        "MEASURED push-back: r2 restored from an older store held all three facts {} ms after \
+         its control socket answered (interval 100 ms, refresh 600 s)",
+        converged.as_millis()
+    );
+    lab.stop_all();
+}
+
+#[test]
+fn status_reports_catch_up_and_what_the_health_of_a_link_needs() {
+    let mut lab = Lab::new();
+    lab.start_all();
+    lab.append(0, "status-fact", "s0", "subject", "value");
+    assert_converged(&lab, 1);
+    until(
+        || {
+            lab.status(0)["peers"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|link| link["acknowledged_unchanged"] == true)
+        },
+        Duration::from_secs(15),
+    );
+    let status = lab.status(0);
+    let catch_up = &status["catch_up"];
+    assert_eq!(catch_up["caught_up"], true);
+    assert_eq!(catch_up["caught_up_by"], "every_peer");
+    assert!(catch_up["caught_up_after_ms"].is_u64());
+    assert_eq!(catch_up["own_facts_at_start"], 0);
+    assert_eq!(catch_up["latest_own_fact_appended_locally"], false);
+    assert_eq!(catch_up["window_ms"], 15_000);
+    assert_eq!(catch_up["peers_missing"], json!([]));
+    assert_eq!(catch_up["peers_ahead"], json!([]));
+    assert_eq!(catch_up["peers_not_attempted"], json!([]));
+    let refresh =
+        u64::try_from(podmesh_manager_resident_lab::DEFAULT_UNCHANGED_SNAPSHOT_REFRESH.as_millis())
+            .unwrap();
+    for peer in ["r1", "r2"] {
+        let link = &status["peers"][peer];
+        assert_eq!(link["outcome"], "authenticated_import_receipt");
+        assert_eq!(link["refresh_ms"], refresh);
+        assert_eq!(link["max_backoff_ms"], 400);
+        assert_eq!(link["push_backs"], 0);
+        assert!(link["last_success_age_ms"].is_u64());
+        assert_eq!(link["last_attempt_age_ms"], link["last_success_age_ms"]);
+        assert_eq!(link["authenticated_refusals"], 0);
+        assert_eq!(link["last_refusal_reason"], Value::Null);
+        assert_eq!(link["refused_imports"], 0);
+        assert_eq!(
+            link["identity_collisions"],
+            json!({"imports_refused": 0, "pushes_refused": 0, "event_id": null})
+        );
+    }
+
+    // r1 stops answering: the next push to it fails after its last success.
+    lab.stop(1);
+    lab.append(0, "status-change", "s0", "subject", "changed");
+    until(
+        || lab.status(0)["peers"]["r1"]["outcome"] != "authenticated_import_receipt",
+        Duration::from_secs(10),
+    );
+    let link = lab.status(0)["peers"]["r1"].clone();
+    assert_eq!(link["acknowledged_unchanged"], false);
+    assert!(
+        link["last_attempt_age_ms"].as_u64().unwrap()
+            < link["last_success_age_ms"].as_u64().unwrap()
+    );
+    assert!(link["next_attempt_in_ms"].as_u64().unwrap() <= 400);
+    lab.stop_all();
+}
+
+#[test]
+fn an_idle_replica_adds_at_most_twelve_audit_rows_per_refresh() {
+    let mut lab = Lab::new();
+    // A refresh of one second stands for the ten-minute default: an idle
+    // replica's audit growth is proportional to it.
+    for config in &mut lab.configs {
+        config.unchanged_snapshot_refresh_ms = Some(1_000);
+    }
+    lab.start_all();
+    lab.append(0, "idle-growth", "s0", "subject", "value");
+    assert_converged(&lab, 1);
+    thread::sleep(Duration::from_secs(2));
+    let before = audit_counts(&lab, &[0, 1, 2]);
+    let started = Instant::now();
+    thread::sleep(Duration::from_secs(8));
+    let after = audit_counts(&lab, &[0, 1, 2]);
+    let refreshes = started.elapsed().as_secs_f64();
+    let per_refresh: Vec<f64> = before
+        .iter()
+        .zip(&after)
+        .map(|(before, after)| (after - before) as f64 / refreshes)
+        .collect();
+    println!(
+        "MEASURED idle growth: {per_refresh:.1?} audit rows per replica per second at a \
+         one-second refresh (at most two pushes sent at two rows and two received at four \
+         per refresh; a visit waits up to one interval past the refresh)"
+    );
+    // Push-back never turns an idle manager into a busy one.
+    assert!(
+        per_refresh.iter().all(|rows| *rows <= 13.0),
+        "{per_refresh:?}"
+    );
+    lab.stop_all();
+}
+
+#[test]
+fn a_periodic_verification_that_could_not_run_is_retried_at_the_exchange_interval() {
+    let mut lab = Lab::new();
+    lab.configs[0].full_verification_interval_ms = Some(8_000);
+    let log = lab._dir.path().join("r0.stderr");
+    let spawned = Instant::now();
+    lab.start_with_stderr(0, Stdio::from(fs::File::create(&log).unwrap()));
+    lab.start(1);
+    lab.start(2);
+    lab.append(0, "before-edit", "s0", "subject", "value");
+    assert_converged(&lab, 1);
+    until(
+        || {
+            lab.status(0)["peers"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|link| link["acknowledged_unchanged"] == true)
+        },
+        Duration::from_secs(10),
+    );
+    // No transaction reads the oldest audit row: only a complete pass notices it.
+    edit_oldest_audit_row(&lab, 0);
+    // r0's first periodic pass, eight seconds after it started, cannot open its
+    // store: a directory stands at its path. Removing the file's permissions would
+    // not do: while one connection of the process holds the file, SQLite keeps
+    // the descriptor of a closed one and reuses it for the next open.
+    assert!(
+        spawned.elapsed() < Duration::from_secs(6),
+        "setup outlasted the first pass"
+    );
+    let database = lab.configs[0].network.database_path.clone();
+    let retained = database.with_extension("retained");
+    fs::rename(&database, &retained).unwrap();
+    fs::create_dir(&database).unwrap();
+    let logged = |line: &str| fs::read_to_string(&log).unwrap().contains(line);
+    until(
+        || logged("resident store verification could not run"),
+        Duration::from_secs(10),
+    );
+    thread::sleep(Duration::from_secs(1));
+    fs::remove_dir(&database).unwrap();
+    fs::rename(&retained, &database).unwrap();
+    let readable = Instant::now();
+    until(
+        || logged("resident store verification failed: corrupt"),
+        Duration::from_secs(10),
+    );
+    let detected = readable.elapsed();
+    // The pass was retried within the maximum backoff, not eight seconds after
+    // the pass that could not run.
+    assert!(detected < Duration::from_secs(3), "{detected:?}");
+    let not_run = fs::read_to_string(&log)
+        .unwrap()
+        .matches("resident store verification could not run")
+        .count();
+    assert!(not_run >= 2, "{not_run}");
+    assert_eq!(
+        lab.control_value(
+            0,
+            json!({"operation":"append_observation","operation_id":"after-edit","scope":"s0","subject":"subject","value":"value"}),
+        )
+        .unwrap()["error"],
+        "append_observation_uncertain"
+    );
+    println!(
+        "MEASURED periodic pass retry: {not_run} passes could not run; the edited row was \
+         detected {} ms after the store became readable again (interval 100 ms, maximum \
+         backoff 400 ms, verification interval 8 s)",
+        detected.as_millis()
+    );
+    lab.stop_all();
+}
+
+#[test]
+fn a_replica_without_peers_is_caught_up_at_once() {
+    let mut lab = Lab::new();
+    let config = &mut lab.configs[0];
+    config.network.manager.replicas.truncate(1);
+    config.network.manager.grants.truncate(1);
+    config.network.peers.clear();
+    lab.start(0);
+    let reply = lab
+        .control_value(
+            0,
+            json!({"operation":"append_observation","operation_id":"alone","scope":"s0","subject":"subject","value":"value"}),
+        )
+        .unwrap();
+    assert_eq!(reply["response"]["result"], "observed", "{reply}");
+    let catch_up = lab.status(0)["catch_up"].clone();
+    assert_eq!(catch_up["caught_up_by"], "no_peers");
+    assert_eq!(catch_up["caught_up_after_ms"], 0);
+    assert_eq!(catch_up["peers_missing"], json!([]));
+    lab.stop(0);
+}
+
+/// Changes the type of a column of the oldest audit row, with the no-update
+/// trigger dropped: a complete verification cannot read that row back, a
+/// storage failure rather than a checksum mismatch.
+fn tamper_oldest_audit_row_type(lab: &Lab, i: usize) {
+    let script = r"
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1], timeout=5, isolation_level=None)
+connection.executescript('''
+BEGIN IMMEDIATE;
+DROP TRIGGER exchange_audit_events_no_update;
+UPDATE exchange_audit_events SET request_frame_bytes = 'not-a-number'
+  WHERE rowid = (SELECT min(rowid) FROM exchange_audit_events);
+CREATE TRIGGER exchange_audit_events_no_update BEFORE UPDATE ON exchange_audit_events BEGIN SELECT RAISE(ABORT, 'immutable exchange audit event'); END;
+COMMIT;
+''')
+";
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(&lab.configs[i].network.database_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_store_closed_by_a_storage_failure_is_reported_closed_and_not_retried() {
+    let mut lab = Lab::new();
+    lab.configs[0].full_verification_interval_ms = Some(1_000);
+    let log = lab._dir.path().join("r0.stderr");
+    lab.start_with_stderr(0, Stdio::from(fs::File::create(&log).unwrap()));
+    lab.start(1);
+    lab.start(2);
+    lab.append(0, "before-tamper", "s0", "subject", "value");
+    assert_converged(&lab, 1);
+    tamper_oldest_audit_row_type(&lab, 0);
+    let lines = |line: &str| fs::read_to_string(&log).unwrap().matches(line).count();
+    until(
+        || lines("resident store verification failed: storage") >= 1,
+        Duration::from_secs(10),
+    );
+    assert_eq!(lines("the store is closed for this process"), 1);
+    let not_run = lines("resident store verification could not run");
+    thread::sleep(Duration::from_millis(3_500));
+    // Later passes keep the one-second interval and say the store is still
+    // closed: none is retried as a pass that could not run.
+    assert_eq!(lines("resident store verification could not run"), not_run);
+    let still_closed = lines("resident store is still closed for this process");
+    assert!((2..=5).contains(&still_closed), "{still_closed}");
+    assert_eq!(
+        lab.control_value(
+            0,
+            json!({"operation":"append_observation","operation_id":"after-tamper","scope":"s0","subject":"subject","value":"value"}),
+        )
+        .unwrap()["error"],
+        "append_observation_uncertain"
+    );
+    lab.stop_all();
+}
+
+#[test]
+fn an_identity_collision_is_counted_on_both_sides_and_named_once() {
+    let mut lab = Lab::new();
+    // Refused exchanges are retried at the backoff and refreshed every second,
+    // so both sides see many refusals.
+    for config in &mut lab.configs {
+        config.unchanged_snapshot_refresh_ms = Some(1_000);
+    }
+    let logs: Vec<_> = (0..3)
+        .map(|i| lab._dir.path().join(format!("r{i}.stderr")))
+        .collect();
+    for (i, log) in logs.iter().enumerate() {
+        lab.start_with_stderr(i, Stdio::from(fs::File::create(log).unwrap()));
+    }
+    lab.append(2, "boot-1", "s2", "boot", "boot-1 value");
+    assert_converged(&lab, 1);
+    // The fork the catch-up rule prevents, made directly in the store: r2 loses
+    // its store and appends another first fact before its resident runs again.
+    lab.stop(2);
+    lab.delete_store(2);
+    lab.observe(2, "forked", None);
+    let log = fs::OpenOptions::new().append(true).open(&logs[2]).unwrap();
+    lab.start_with_stderr(2, Stdio::from(log));
+    let collisions =
+        |i: usize, peer: &str| lab.status(i)["peers"][peer]["identity_collisions"].clone();
+    until(
+        || {
+            [(0, "r2"), (1, "r2"), (2, "r0"), (2, "r1")]
+                .into_iter()
+                .all(|(i, peer)| collisions(i, peer)["imports_refused"].as_u64().unwrap() >= 2)
+                && collisions(2, "r0")["pushes_refused"].as_u64().unwrap() >= 1
+                && collisions(0, "r2")["pushes_refused"].as_u64().unwrap() >= 1
+        },
+        Duration::from_secs(20),
+    );
+    thread::sleep(Duration::from_secs(2));
+    for (i, peer) in [(0, "r2"), (1, "r2"), (2, "r0"), (2, "r1")] {
+        let link = lab.status(i)["peers"][peer].clone();
+        assert_eq!(
+            link["identity_collisions"]["event_id"],
+            "r2:00000000000000000001"
+        );
+        assert_eq!(
+            link["outcome"], "authenticated_remote_refusal",
+            "r{i} to {peer}"
+        );
+        assert_eq!(link["last_refusal_reason"], "policy_violation");
+        assert!(
+            link["refused_imports"].as_u64().unwrap()
+                >= link["identity_collisions"]["imports_refused"]
+                    .as_u64()
+                    .unwrap()
+        );
+    }
+    // One line on standard error per peer names the collision, however many
+    // refusals repeat it.
+    let named = |i: usize, peer: &str| {
+        fs::read_to_string(&logs[i])
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                line.contains(&format!("refused an import from {peer}: event identity collision on r2:00000000000000000001"))
+            })
+            .count()
+    };
+    assert_eq!(named(0, "r2"), 1);
+    assert_eq!(named(1, "r2"), 1);
+    assert_eq!(named(2, "r0"), 1);
+    assert_eq!(named(2, "r1"), 1);
+    lab.stop_all();
 }

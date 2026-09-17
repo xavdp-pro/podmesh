@@ -179,8 +179,10 @@ activation/append-observation.py \
   --value <frozen-non-secret-value>
 ~~~
 
-Busy or uncertain responses retry the identical serialized request. A changed
-operation needs a new operation ID. After the external campaign has observed
+Busy, uncertain or catching-up responses retry the identical serialized request,
+for 25 seconds by default: a resident that has not caught up with its peers yet
+answers catching up and touches nothing. A failure prints the last answer. A
+changed operation needs a new operation ID. After the external campaign has observed
 stable canonical equality, capture each host separately:
 
 ~~~sh

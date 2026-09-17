@@ -6,7 +6,7 @@
 
 use std::fmt::Write as _;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     fs::File,
     io::{Read, Write},
@@ -23,6 +23,7 @@ use podmesh_manager_ha_lab::durable::{
     Configuration, DurableError, ExchangeAuditEvent, RefusalReason, Request, Response, Snapshot,
     Store,
 };
+use podmesh_manager_ha_lab::Fact;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -334,8 +335,12 @@ impl Node {
                 }
             };
             let mut authenticated = false;
-            let result =
-                self.serve_connection_inner(stream, drop_after_decision, &mut authenticated);
+            let result = self.serve_connection_inner(
+                stream,
+                drop_after_decision,
+                &mut authenticated,
+                &mut |_| {},
+            );
             if authenticated {
                 return result;
             }
@@ -353,8 +358,31 @@ impl Node {
     /// # Errors
     /// Returns a local I/O error when the bounded request/reply cannot complete.
     pub fn serve_connection(&mut self, stream: TcpStream) -> Result<(), Error> {
+        self.serve_connection_reporting(stream, |_| {})
+    }
+
+    /// Handles exactly one bounded authenticated exchange on an accepted stream,
+    /// like [`Node::serve_connection`], and reports the durable decision it made
+    /// on an authenticated request: `on_decision` runs once, as soon as the
+    /// import is committed or replayed, or the refusal recorded, and before the
+    /// reply is prepared, so the decision is reported whatever happens to the
+    /// reply. A diagnostic, or a failure before a decision, never calls it.
+    ///
+    /// # Errors
+    /// Returns a local I/O error when the bounded request/reply cannot complete,
+    /// including after a decision that was reported.
+    pub fn serve_connection_reporting(
+        &mut self,
+        stream: TcpStream,
+        on_decision: impl FnOnce(&ServedDecision),
+    ) -> Result<(), Error> {
         let mut authenticated = false;
-        self.serve_connection_inner(stream, false, &mut authenticated)
+        let mut on_decision = Some(on_decision);
+        self.serve_connection_inner(stream, false, &mut authenticated, &mut |decision| {
+            if let Some(report) = on_decision.take() {
+                report(decision);
+            }
+        })
     }
 
     /// Sends one locally exported snapshot to one exact configured peer.
@@ -517,6 +545,7 @@ impl Node {
                         receipt_operation_id: receipt_operation_id.clone(),
                         receipt_sha256: receipt_sha256.clone(),
                         replayed,
+                        snapshot_facts: request.snapshot.facts.len(),
                     });
                 let valid = result.is_ok();
                 self.finish_outbound(
@@ -736,6 +765,7 @@ impl Node {
         mut stream: TcpStream,
         drop_after_decision: bool,
         authenticated: &mut bool,
+        on_decision: &mut dyn FnMut(&ServedDecision),
     ) -> Result<(), Error> {
         let preauth_nonce = new_preauth_nonce();
         let received = match metered_read_frame(&mut stream, Instant::now() + IO_TIMEOUT) {
@@ -828,7 +858,9 @@ impl Node {
                 &received.evidence,
                 &peer,
                 RefusalReason::InvalidRequest,
+                IdentityCollisions::default(),
                 drop_after_decision,
+                on_decision,
             );
         }
         if request.snapshot.configuration != self.configuration {
@@ -839,7 +871,9 @@ impl Node {
                 &received.evidence,
                 &peer,
                 RefusalReason::PolicyViolation,
+                IdentityCollisions::default(),
                 drop_after_decision,
+                on_decision,
             );
         }
         let import_event = audit_event(
@@ -859,6 +893,9 @@ impl Node {
         ) {
             Ok(imported) => imported,
             Err(DurableError::Refused(reason)) if signable_reason(reason) => {
+                // The refusal carries only its closed reason, on the wire and from
+                // the durable import, so a collision is found again here.
+                let collisions = self.identity_collisions(&request.snapshot);
                 return self.refuse_authenticated(
                     &mut stream,
                     &attempt_id,
@@ -866,7 +903,9 @@ impl Node {
                     &received.evidence,
                     &peer,
                     reason,
+                    collisions,
                     drop_after_decision,
+                    on_decision,
                 );
             }
             Err(error) => {
@@ -888,6 +927,14 @@ impl Node {
                 "durable manager returned an unexpected import response",
             ));
         };
+        // The import is durable from here on, whatever happens to the reply.
+        on_decision(&ServedDecision::Imported(ServedImport {
+            source_replica_id: peer.replica_id.clone(),
+            snapshot_facts: request.snapshot.facts.len(),
+            inserted,
+            history_len,
+            replayed: imported.executed.replayed,
+        }));
         let Some(receipt) = (if self.take_post_auth_failure(PostAuthFailure::MissingReceipt) {
             None
         } else {
@@ -1016,7 +1063,9 @@ impl Node {
         request_evidence: &FrameEvidence,
         peer: &Peer,
         reason: RefusalReason,
+        collisions: IdentityCollisions,
         drop_after_decision: bool,
+        on_decision: &mut dyn FnMut(&ServedDecision),
     ) -> Result<(), Error> {
         let decision = audit_event_with_reason(
             attempt_id,
@@ -1030,6 +1079,12 @@ impl Node {
             reason,
         );
         self.record_audit(&decision)?;
+        on_decision(&ServedDecision::Refused(ServedRefusal {
+            source_replica_id: peer.replica_id.clone(),
+            reason,
+            identity_collisions: collisions.count,
+            first_identity_collision: collisions.first,
+        }));
         let reply = sign_reply(
             WireReply::Refused {
                 source_replica_id: self.replica_id.clone(),
@@ -1317,6 +1372,39 @@ impl Node {
             .find(|peer| peer.replica_id == id)
             .ok_or_else(|| Error::refused("peer is not configured"))
     }
+
+    /// Finds the facts of a refused snapshot whose event ID the local history
+    /// holds with other bytes. A history that cannot be exported reports none.
+    fn identity_collisions(&mut self, snapshot: &Snapshot) -> IdentityCollisions {
+        let Ok(Response::Snapshot { snapshot: local }) = self.store.execute(&Request::Export {})
+        else {
+            return IdentityCollisions::default();
+        };
+        let held: BTreeMap<&str, &Fact> = local
+            .facts
+            .iter()
+            .map(|fact| (fact.event_id.as_str(), fact))
+            .collect();
+        let colliding: BTreeSet<&str> = snapshot
+            .facts
+            .iter()
+            .filter(|fact| {
+                held.get(fact.event_id.as_str())
+                    .is_some_and(|local| *local != *fact)
+            })
+            .map(|fact| fact.event_id.as_str())
+            .collect();
+        IdentityCollisions {
+            count: colliding.len(),
+            first: colliding.first().map(|id| (*id).to_string()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct IdentityCollisions {
+    count: usize,
+    first: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1326,6 +1414,49 @@ pub struct ImportResult {
     pub receipt_operation_id: String,
     pub receipt_sha256: String,
     pub replayed: bool,
+    /// Facts in the snapshot this node sent. The peer's history, after the import
+    /// the receipt acknowledges, holds every one of them.
+    pub snapshot_facts: usize,
+}
+
+/// An authenticated snapshot that serving one connection imported: its facts,
+/// receipt and accepted import audit committed, or its durable receipt replayed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServedImport {
+    /// The configured peer whose request authenticated and whose snapshot it was.
+    pub source_replica_id: String,
+    /// Facts in the snapshot that peer sent.
+    pub snapshot_facts: usize,
+    /// Facts the import inserted; for a replay, the count of the original commit.
+    pub inserted: usize,
+    /// Local history length after the import; for a replay, after the original commit.
+    pub history_len: usize,
+    /// Whether the durable receipt was replayed rather than committed by this connection.
+    pub replayed: bool,
+}
+
+/// What serving one connection durably decided on an authenticated request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServedDecision {
+    /// The snapshot was imported, or its durable receipt replayed.
+    Imported(ServedImport),
+    /// The request was refused with a signed reason.
+    Refused(ServedRefusal),
+}
+
+/// An authenticated request that serving one connection refused, once its
+/// refusal decision was recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServedRefusal {
+    /// The configured peer whose request authenticated.
+    pub source_replica_id: String,
+    /// The closed reason the signed refusal carries, which is all the peer receives.
+    pub reason: RefusalReason,
+    /// For a refused import, the facts of the peer's snapshot whose event ID this
+    /// node holds with other bytes; zero for a refusal decided before the import.
+    pub identity_collisions: usize,
+    /// The smallest of those event IDs.
+    pub first_identity_collision: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1396,6 +1527,7 @@ pub struct Error {
     category: ErrorCategory,
     source: ErrorSource,
     detail: String,
+    refusal_reason: Option<RefusalReason>,
 }
 
 impl Error {
@@ -1418,6 +1550,7 @@ impl Error {
             category,
             source: ErrorSource::Local,
             detail: value.to_string(),
+            refusal_reason: None,
         }
     }
     fn remote_diagnostic(category: ErrorCategory, detail: String) -> Self {
@@ -1425,6 +1558,7 @@ impl Error {
             category,
             source: ErrorSource::UnauthenticatedRemoteDiagnostic,
             detail,
+            refusal_reason: None,
         }
     }
     fn authenticated_refusal(reason: RefusalReason) -> Self {
@@ -1432,6 +1566,7 @@ impl Error {
             category: ErrorCategory::Refused,
             source: ErrorSource::AuthenticatedRemoteRefusal,
             detail: format!("authenticated remote refusal: {reason}"),
+            refusal_reason: Some(reason),
         }
     }
     fn durable(error: DurableError) -> Self {
@@ -1451,6 +1586,12 @@ impl Error {
     #[must_use]
     pub fn source(&self) -> ErrorSource {
         self.source
+    }
+    /// Returns the closed reason of a verified signed refusal, and nothing for
+    /// any other error.
+    #[must_use]
+    pub fn refusal_reason(&self) -> Option<RefusalReason> {
+        self.refusal_reason
     }
 }
 
@@ -2529,6 +2670,174 @@ mod tests {
             .into_iter()
             .collect()
         );
+    }
+
+    type Served = (Option<ServedDecision>, Result<(), Error>);
+
+    /// Serves one connection on a fresh listener through the public reporting
+    /// seam, or, with `drop_after_decision`, loses the reply after the decision.
+    fn spawn_reporting_server(
+        configuration: ConfigurationFile,
+        drop_after_decision: bool,
+    ) -> (SocketAddr, thread::JoinHandle<Served>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut node = configuration.open().unwrap();
+            let mut reported = None;
+            let result = if drop_after_decision {
+                node.serve_connection_inner(stream, true, &mut false, &mut |decision| {
+                    reported = Some(decision.clone());
+                })
+            } else {
+                node.serve_connection_reporting(stream, |decision| {
+                    reported = Some(decision.clone());
+                })
+            };
+            (reported, result)
+        });
+        (address, worker)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn served_connection_reports_imports_and_refusals_with_their_collisions() {
+        let directory = tempfile::tempdir().unwrap();
+        let addresses = placeholder_addresses();
+        let mut r1 = configuration(&directory, "r1", &addresses);
+        let r2 = configuration(&directory, "r2", &addresses);
+        observe(&r1, "served-origin");
+        let destination_fact = Request::Observe {
+            operation_id: "served-destination".into(),
+            scope: "scope2".into(),
+            subject: "universe".into(),
+            exclusive_resource: None,
+            active_claim: false,
+            value: "observed".into(),
+        };
+        r2.open().unwrap().store.execute(&destination_fact).unwrap();
+        let mut attempts = 0;
+        let mut exchange = |source: &mut ConfigurationFile, operation: &str, lose_reply| {
+            let (address, worker) = spawn_reporting_server(r2.clone(), lose_reply);
+            point_peer(source, "r2", address);
+            attempts += 1;
+            let nonce = format!("served-nonce-{attempts}");
+            let sent = source.open().unwrap().sync_to("r2", operation, &nonce);
+            (sent, worker.join().unwrap())
+        };
+
+        // A committed import: the destination holds a fact the snapshot lacked.
+        let (sent, (decision, result)) = exchange(&mut r1, "served-operation", false);
+        let sent = sent.unwrap();
+        assert!(!sent.replayed);
+        assert_eq!((sent.snapshot_facts, sent.history_len), (1, 2));
+        assert!(result.is_ok());
+        let committed = ServedImport {
+            source_replica_id: "r1".into(),
+            snapshot_facts: 1,
+            inserted: 1,
+            history_len: 2,
+            replayed: false,
+        };
+        assert_eq!(decision, Some(ServedDecision::Imported(committed.clone())));
+
+        // An identical retry replays the receipt and reports the original counts.
+        let (sent, (decision, result)) = exchange(&mut r1, "served-operation", false);
+        assert!(sent.unwrap().replayed);
+        assert!(result.is_ok());
+        assert_eq!(
+            decision,
+            Some(ServedDecision::Imported(ServedImport {
+                replayed: true,
+                ..committed
+            }))
+        );
+
+        // A changed snapshot under the same operation is refused, with its reason
+        // on both sides and no collision.
+        observe(&r1, "served-changed");
+        let (sent, (decision, result)) = exchange(&mut r1, "served-operation", false);
+        let refused = sent.unwrap_err();
+        assert_eq!(refused.source(), ErrorSource::AuthenticatedRemoteRefusal);
+        assert_eq!(
+            refused.refusal_reason(),
+            Some(RefusalReason::OperationIdReused)
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            decision,
+            Some(ServedDecision::Refused(ServedRefusal {
+                source_replica_id: "r1".into(),
+                reason: RefusalReason::OperationIdReused,
+                identity_collisions: 0,
+                first_identity_collision: None,
+            }))
+        );
+
+        // A history that reused an event ID with other bytes is refused as a policy
+        // violation on the wire; the destination names the collision.
+        let mut forked = r1.clone();
+        forked.database_path = directory.path().join("r1-forked.sqlite");
+        forked
+            .open()
+            .unwrap()
+            .store
+            .execute(&Request::Observe {
+                operation_id: "served-forked".into(),
+                scope: "scope1".into(),
+                subject: "universe".into(),
+                exclusive_resource: None,
+                active_claim: false,
+                value: "other bytes".into(),
+            })
+            .unwrap();
+        let (sent, (decision, result)) = exchange(&mut forked, "served-forked", false);
+        assert_eq!(
+            sent.unwrap_err().refusal_reason(),
+            Some(RefusalReason::PolicyViolation)
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            decision,
+            Some(ServedDecision::Refused(ServedRefusal {
+                source_replica_id: "r1".into(),
+                reason: RefusalReason::PolicyViolation,
+                identity_collisions: 1,
+                first_identity_collision: Some("r1:00000000000000000001".into()),
+            }))
+        );
+        assert_eq!(history_len(&r2), 2);
+
+        // An unauthenticated request decides nothing and reports nothing.
+        let mut wrong_key = r1.clone();
+        wrong_key.peers.iter_mut().for_each(|peer| {
+            if peer.replica_id == "r2" {
+                peer.shared_key_hex = WRONG_KEY.into();
+            }
+        });
+        let (sent, (decision, _)) = exchange(&mut wrong_key, "served-wrong-key", false);
+        assert!(sent
+            .as_ref()
+            .is_err_and(|error| error.refusal_reason().is_none()));
+        assert_eq!(decision, None);
+        assert_eq!(history_len(&r2), 2);
+
+        // A reply lost after the commit still reports the durable import.
+        let (sent, (decision, result)) = exchange(&mut r1, "served-after-change", true);
+        assert!(sent.is_err());
+        assert!(result.is_err());
+        assert_eq!(
+            decision,
+            Some(ServedDecision::Imported(ServedImport {
+                source_replica_id: "r1".into(),
+                snapshot_facts: 2,
+                inserted: 1,
+                history_len: 3,
+                replayed: false,
+            }))
+        );
+        assert_eq!(history_len(&r2), 3);
     }
 
     #[test]
