@@ -604,7 +604,7 @@ stays as the record of what was open and recommended.
 ## Continuity of service under a mandate (2026-09-17)
 
 The operator's goal, 2026-09-16: continuity of service. This section amends two statements above for the
-laboratory, under a written mandate (`podmesh-lab/claude/PCA-MANDATE-2026-09-17.md`): the fence timer, "shipped
+laboratory, under a written mandate (`mandate:pca-2026-09-17`, kept in the maintainers' records): the fence timer, "shipped
 disabled, enabling it is the operator's decision 4", is enabled on the three laboratory hosts' development service;
 and the agent's side, "a tool and not a timer", runs on a timer for the universes the operator guards. PodMesh
 itself still acts on nothing by itself: the daemon is unchanged in that respect, and both timers are the operator's,
@@ -639,6 +639,6 @@ margin, reading each host's grace from its mandate (15 s at a 2 s grace; the cam
 the replication interval. Recovery time: about 2 R + L + M + the SSH timeouts + the promotion, measured 62 to 95 s
 at L = 30, M = 20, R = 10.
 
-**Proven** on the laboratory (four legs, CURRENT-STATE.md) and by `tests/test_replicate_guard.py`. **Not claimed:**
+**Proven** on the laboratory (four legs, in the maintainers' campaign records) and by `tests/test_replicate_guard.py`. **Not claimed:**
 mutual exclusion beyond the fence (a host too sick to run its fence, or whose clock runs far behind, is not
 covered), a redundant guardian, fencing out of band, a recovery point shorter than the replication interval.

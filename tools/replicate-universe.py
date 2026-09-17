@@ -18,7 +18,7 @@ and a universe the migration checks accept (network none, no mounts, bounded mem
     tools/replicate-universe.py status --universe U      target, schedule, last run, every standby's copy
     tools/replicate-universe.py takeover --universe U --standby lab@… [--planned]
                                                          the standby becomes the active host
-    tools/replicate-universe.py guard   --universe U [--lease 30 --margin 15 --tick 10] [--keep-stale]
+    tools/replicate-universe.py guard   --universe U [--lease 30 --margin 20 --tick 10] [--keep-stale]
                                                          continuity: the guardian renews the lease and fails over
     tools/replicate-universe.py unguard --universe U      the guardian disarmed (read the warning it prints)
     tools/replicate-universe.py summary                  every configured universe from the ledger alone, no host reached
@@ -47,8 +47,8 @@ ledger then names the standby as the active host and the old active host as a st
 
 `guard` is continuity of service under the operator's mandate. A `systemd --user` timer on this workstation
 runs `guard-tick` every `tick` seconds: it renews the universe's lease on the active host (re-acquiring a lease
-the guardian itself let lapse); when the active host cannot be reached, it waits until the last successful
-renewal plus the lease plus the margin, then takes the universe over on the first standby that is reachable and
+the guardian itself let lapse); when the active host cannot be reached, it waits for two failed ticks and
+the last renewal attempt plus the lease plus the margin, then takes the universe over on the first standby that is reachable and
 holds a copy, in the standbys' order; and it reintegrates a host that comes back after a takeover: a stale
 copy still running there is a split-brain observed, stopped through the API and recorded; the stale copy is
 then deleted (or kept with --keep-stale) so that the next replication stages a fresh one. The takeover never

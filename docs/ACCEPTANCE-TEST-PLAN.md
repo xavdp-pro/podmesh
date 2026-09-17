@@ -23,6 +23,6 @@ Current qualified status (standalone Linux mode). Gates 1–5 are partially exer
 
 `0.1.0~experimental5` is the first package to carry the migration operations. It is published and qualified on **one** host: eight suites on its installed service, 143 checks, host identity and journal preserved across the upgrade, unrelated containers, images and volumes unchanged. The other two hosts deliberately remain at experimental4 while a development lot uses them, so gate 6 is exercised in package form only for the source side (preflight, checkpoint, interruption). Transfer, destination restore, return trip and the recovery paths are qualified on a development build, on two hosts, for one Alpine musl workload of about 0.5 GiB without networking or volumes.
 
-Networking (including unique clone IPs), volumes, purge, clean-host installation, gate 7 and gate 8 are not validated through PodMesh. A reservation is not fencing. See DELIVERY-CHECKLIST.md for the exact scope and evidence. Earlier standalone migration-kit experiments do not satisfy these service acceptance gates.
+Networking (including unique clone IPs), volumes, purge, clean-host installation, gate 7 and gate 8 are not validated through PodMesh. A reservation is not fencing. The maintainers keep the exact scope and its evidence with the laboratory records. Earlier standalone migration-kit experiments do not satisfy these service acceptance gates.
 
 The same contracts must ultimately be checked in standalone Linux mode and ShaperOS-integrated mode. Passing one mode does not validate the other.

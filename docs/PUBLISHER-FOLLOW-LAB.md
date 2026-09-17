@@ -60,6 +60,6 @@ connector that dies after that needs a new rotate, not this tick.
 
 Workstation: `python3 -B tools/arm-publisher-follow.py` with the usual M-U2 lab environment
 and the private Cloudflare files. Re-apply without new replicas:
-`python3 -B tools/arm-publisher-follow.py --refresh`. Evidence:
-`podmesh-lab/cursor/publisher-follow/`. `--lease` on `ha-standby.py rotate` overrides the
+`python3 -B tools/arm-publisher-follow.py --refresh`. Evidence: the directory
+named by `PODMESH_FOLLOW_STATE_DIR` (default `~/.podmesh-publisher-follow`). `--lease` on `ha-standby.py rotate` overrides the
 ledger's previous policy (a 20 s leftover from a suite must not starve a standing demo).

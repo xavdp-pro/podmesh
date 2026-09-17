@@ -34,7 +34,7 @@ Description: Experimental local Podman lifecycle and manager engine
  Volumes, join/leave occupied hosts, Backup Server and control-services
  universe are out of scope. The self-fence timer (podmesh-fence.timer) is
  shipped disabled and runs nothing without the operator's mandate file.
- See docs/EXPERIMENTAL7-SCOPE.md for allowed claims and open gates.
+ See docs/EXPERIMENTAL-SCOPE.md for the experimental boundary.
 CONTROL
 cat > "$work/DEBIAN/postinst" <<'SCRIPT'
 #!/bin/sh

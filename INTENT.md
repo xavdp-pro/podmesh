@@ -60,12 +60,12 @@ The experimental service and local lifecycle API exist. Full migration, the
 UUID/IP allocator and HA coordination remain incomplete. See
 [the experimental scope](docs/EXPERIMENTAL-SCOPE.md) for the boundary between
 current SHAPER conformance and the authorized Podman research, and
-[experimental7 scope](docs/EXPERIMENTAL7-SCOPE.md) for the current packaging
-target and open gates.
+[the ideal scene](docs/IDEAL-SCENE.md) for what PodMesh must become and how it is
+certified. The maintainers keep the packaging targets, open gates, decision record
+and laboratory evidence in their private companion repository.
 Public instructions describe generic hosts. The laboratory is an example, not a
-runtime dependency. See README.md for the complete inventory, decisions, candidate
-mechanisms, deferred DNS work and qualified evidence. Existing SHAPER governing
-texts remain authoritative; this intent does not replace or rewrite them.
+runtime dependency. Existing SHAPER governing texts remain authoritative; this
+intent does not replace or rewrite them.
 
 ## Delivery order: build for our own tandem first
 
@@ -82,7 +82,7 @@ PodMesh stays efficient when **one demonstrable artifact** advances at a time.
 Lab JSON, transient services and installed packages are different claims; do not
 merge them in conversation or in marketing.
 
-**Ladder of truth** — each step is explicit in `docs/README.md`; agents separate
+**Ladder of truth** — each step is recorded with its evidence in the maintainers' status record; agents separate
 facts instead of inferring “done” from the previous step:
 
 1. *Coded* on `main`
@@ -100,7 +100,7 @@ on a side channel.
 
 **Widen vs ship** — after step 2 passes for an increment, default work is step 3
 then 4, not a new feature line. New coding on `main` is allowed when it serves
-the frozen increment or an entry in `docs/README.md` marked OPEN with acceptance
+the frozen increment or a target of `docs/IDEAL-SCENE-PROGRAM.md` with acceptance
 criteria; otherwise defer. Re-run suites on the **delta** (changed binary or
 changed harness), not the full regression, unless the delta touches shared core,
 network effects, or signing.

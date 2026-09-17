@@ -64,7 +64,7 @@ The manager's own web application beyond administration. Roles or permissions be
 revoked and recreated through the root door. Durability: a replica keeps its store in its
 container, with **no volume**, so a replica deleted and recreated starts empty and re-imports
 from its peers; recreating all replicas at once would lose every fact, administrators included.
-That is the managed-network universe contract's open item (`docs/README.md`, P09), not a
+That is the managed-network universe contract's open item (product requirement P09), not a
 property of this surface.
 
 ## What is built

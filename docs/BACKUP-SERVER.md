@@ -102,7 +102,7 @@ blocking findings:
   closed list rather than prose, and two shifted citations are corrected.
 
 Revision 1 was counter-reviewed by OpenAI Codex
-([docs/reference/review-backup-server-codex-2026-09-13.md](reference/review-backup-server-codex-2026-09-13.md), verdict OPEN with six
+(the counter-review of 2026-09-13, kept in the maintainers' records, verdict OPEN with six
 blocking findings). This revision answers BBS-R1 to BBS-R6 and folds BBS-R7 to BBS-R12
 into the manifest, state and test contract. Three of the blocking findings were errors
 of mine and are named as such where they are corrected. A second, fresh review then
@@ -270,7 +270,7 @@ from an immutable image, and is not a backup unit.
 canon a *universe* is a **system container** — an LXC or, since Rule 11's amendment of
 16 September 2026, a `nested` Podman container — with its own init, its own package set,
 its own nftables. In PodMesh today a *universe* is a **Podman container** with a UUID
-(`DELIVERY-CHECKLIST.md` §2 Lifecycle, its start/stop and cloning items — no single item states it; the two together do). Read naively, the sentence above would say PodMesh has
+(the delivery checklist's lifecycle section, its start/stop and cloning items — no single item states it; the two together do). Read naively, the sentence above would say PodMesh has
 no backup units at all, which is not what Rule 11 means and not what this service is for.
 
 The reconciliation: **Rule 11's unit is the unit of a *complete* recovery point.** A
@@ -497,7 +497,7 @@ With those two built, the flow is:
 **The mesh is not required for B1, and B1 does not use it.** Rule 13's WireGuard mesh is
 optional by PodMesh's own contract, its authentication is an open design question
 elsewhere (`CONTROL-SERVICES-UNIVERSE.md`), and it has never been run end to end
-(`docs/README.md`, row P13, records both transports as owing tests). B1 therefore pulls over ordinary
+(the delivery inventory, row P13, records both transports as owing tests). B1 therefore pulls over ordinary
 existing IP connectivity, which is the same transport the three lab hosts already use.
 Where a deployment does put the Backup Server on the mesh, it is a peer like any other:
 an interface exists and is addressable, **nothing behind it answers**, and Rule 13's
@@ -912,7 +912,7 @@ together, and before B5 puts anything off-site under a lock.
 ## Off-site (Rule 16 level 5)
 
 Codex's environment inspection
-([docs/reference/r2-encrypted-key-backup-2026-09-13.md](reference/r2-encrypted-key-backup-2026-09-13.md)) establishes both the shape
+(the environment inspection of 2026-09-13, kept in the maintainers' records) establishes both the shape
 and the current blocker. Cloudflare R2 through its S3-compatible API is a suitable
 off-site target. **It is not provisionable today**: the general Cloudflare token
 verifies and lists zones and tunnels, but R2 bucket listing returns HTTP 403 and no R2
@@ -999,7 +999,7 @@ are **hypotheses until the sequential lab comparison of B0 records equivalent re
 evidence**, and nothing may be built as though they were settled.
 
 And the clause both sibling documents carry and this one had dropped
-(`PREPARE-A-HOST.md`, Storage recommendation for PodMesh Backup Server; `DELIVERY-CHECKLIST.md` §5): **no disk is ever reformatted
+(`PREPARE-A-HOST.md`, Storage recommendation for PodMesh Backup Server; the delivery checklist §5): **no disk is ever reformatted
 automatically to obtain a preferred backend.** A host that lacks one uses the portable
 fallback and says so.
 
@@ -1080,7 +1080,7 @@ Deliberately small, and shaped by the reviewer:
    existing practice: fold the write into the container's own `command` at create time,
    which the API already accepts (`LOCAL-API.md`, Typed mutation requests), or write it with direct Podman,
    which is this project's declared convention for fixtures as opposed to the operations
-   under test (`REVIEW-EXPERIMENTAL3.md`, Governance). B1 uses the first, so the marker is part of
+   under test (the experimental3 review, Governance). B1 uses the first, so the marker is part of
    the universe PodMesh created rather than something reached around it.
 
    **And the command must handle its stop signal, or step 0 breaks step 1.** These two
@@ -1211,7 +1211,7 @@ here precisely.
 
 *The two errors: it said B1 has "no `tar`", when B1's mandatory path is the **portable
 archive fallback** and the checklist's own wording for it is "stopped-universe archive"
-(`DELIVERY-CHECKLIST.md` §4) — B1 does produce an archive, and step 1 says so. And it
+(the delivery checklist §4) — B1 does produce an archive, and step 1 says so. And it
 put the **archive-failure clause** among the clauses with "no subject yet" and then
 listed that same clause, in its own words, among the ones B1 exercises. A document
 cannot both test a clause and have no subject for it.*
@@ -1283,14 +1283,14 @@ That is the whole of it, and it is worth having exactly because it is bounded.
 ## Delivery order: B0 and B1 in parallel, then B2 onward
 
 **B0 — qualify local capture backends.** *(Restored from `0cc7dd5`.)* Run the authorized
-sequential 60 GB lab comparison in [LVM-LAB-PLAN.md](LVM-LAB-PLAN.md): LVM2/thin, ZFS,
+sequential 60 GB lab comparison in the laboratory's storage comparison plan: LVM2/thin, ZFS,
 then Btrfs. For each backend, prove quiesce, snapshot, immediate release of the live
 universe, transfer from the snapshot, restore on another host, failure handling and
 capacity behaviour. Also prove the ordinary-filesystem fallback with a stopped universe.
 This establishes the capture adapters the later lots use; **it does not make a local
 snapshot an independent backup.**
 
-B0 is `DELIVERY-CHECKLIST.md` §4 and it comes before §5. B1 does not depend on it — a
+B0 is the delivery checklist's §4 and it comes before §5. B1 does not depend on it — a
 stopped, mount-free fixture needs no snapshot backend — so the two may proceed in
 parallel, but B2 onward do depend on it.
 
@@ -1536,7 +1536,7 @@ an agent that had not re-read the file first, and the tooling's warning that the
 had changed was misread.
 
 Three sibling documents kept pointing at the contract this one had dropped:
-`PREPARE-A-HOST.md` (its storage recommendation), `LVM-LAB-PLAN.md`, and `DELIVERY-CHECKLIST.md`
+`PREPARE-A-HOST.md` (its storage recommendation), the laboratory's storage plan, and the delivery checklist
 §4 and §5. An implementer starting B1 in that window would have found no named
 capture source and would plausibly have invented `podman pause` plus a copy — which is
 precisely what the restored section forbids, and precisely the error the first

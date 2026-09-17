@@ -1,7 +1,7 @@
 # PodMesh Rust implementation plan
 
 Status: planned, not implemented. Owner: Xavier de Poorter.
-References: INTENT.md and README.md feature inventory P01-P23.
+References: INTENT.md and the product requirements P01-P23 (maintainers' decision record).
 Initial audience: our human-agent tandem. GUI follows the working CLI/API.
 
 ## Ordered implementation slices

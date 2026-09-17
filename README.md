@@ -26,14 +26,14 @@ An experimental Rust service and CLI provide local inventory, persistent host id
 
 The service currently exposes a root-only Unix socket and uses the default rootful Podman store. A request's authorization reference records provenance; it is not an implemented remote authorization system. The local administrator controls access.
 
-See [the intent](INTENT.md), [delivery checklist](docs/DELIVERY-CHECKLIST.md), and [acceptance test plan](docs/ACCEPTANCE-TEST-PLAN.md) for requirements and qualified status.
+See [the intent](INTENT.md), [the ideal scene](docs/IDEAL-SCENE.md) with its [program](docs/IDEAL-SCENE-PROGRAM.md) and [certification checklists](docs/IDEAL-SCENE-CHECKLISTS.md), and the [acceptance test plan](docs/ACCEPTANCE-TEST-PLAN.md) for direction, requirements and qualification criteria. The [documentation index](docs/README.md) lists every document, and the [operations guide](docs/OPERATIONS.md) shows how to run the experimental tools.
 
 The development tree, not yet packaged, also carries: the [local API reference](docs/LOCAL-API.md) of every
 operation; [universe high availability](docs/UNIVERSE-HIGH-AVAILABILITY.md) — activation leases, epochs from an
 external gate, recovery points, restore into quarantine, promotion, and the agent's side as
 [`tools/ha-standby.py`](tools/ha-standby.py); the [garbage collection contract](docs/GARBAGE-COLLECTION.md) and its
 implemented classes; and the [Backup Server design](docs/BACKUP-SERVER.md). Each states what it proves and what it
-does not, and [CURRENT-STATE.md](docs/CURRENT-STATE.md) is the handoff to read first.
+does not. The maintainers keep the laboratory status, campaign records and reviews in a private repository; this repository carries what is needed to understand, build and operate PodMesh.
 
 ## Debian delivery
 

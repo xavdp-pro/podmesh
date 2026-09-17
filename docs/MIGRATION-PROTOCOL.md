@@ -5,7 +5,7 @@ Status: provisional design decision, 2026-09-11. Taken by the implementing tande
 take over without per-step approval. Not implemented. Xavier may amend or revoke it
 at any time; implementation lots record every deviation in this file.
 
-This completes the source-side checkpoint milestone ([REVIEW-MIGRATION-SOURCE.md](REVIEW-MIGRATION-SOURCE.md),
+This completes the source-side checkpoint milestone (its review, kept in the maintainers' records, and
 [LOCAL-API.md](LOCAL-API.md)). It answers the open question left by that milestone:
 when may a checkpointed source run again, who authorizes a transfer, and what proves
 that exactly one host holds an active universe.

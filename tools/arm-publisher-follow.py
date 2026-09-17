@@ -46,7 +46,7 @@ LEASE, MARGIN = 3600, 30
 # The mandate's own life, and how near the lease's end a tick renews.
 MANDATE_SECONDS = int(os.environ.get('PODMESH_FOLLOW_MANDATE_SECONDS', 24 * 3600))
 RENEW_BELOW = int(os.environ.get('PODMESH_FOLLOW_RENEW_BELOW', 900))
-STATE_DIR = pathlib.Path.home() / 'Bureau/REMOTE3/podmesh-lab/cursor/publisher-follow'
+STATE_DIR = pathlib.Path(os.environ.get('PODMESH_FOLLOW_STATE_DIR') or pathlib.Path.home() / '.podmesh-publisher-follow')
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 G = 'lab-a'
 

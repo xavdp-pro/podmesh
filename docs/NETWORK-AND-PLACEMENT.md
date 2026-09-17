@@ -2,7 +2,7 @@
 
 Status: operator design decisions, 2026-09-11. Not implementation or canon.
 
-Read README.md first for the consolidated record and later manager/partition
+The consolidated decision record is kept by the maintainers; read [IDEAL-SCENE.md](IDEAL-SCENE.md) for the direction and later manager/partition
 decisions. Storage engines and distributed DNS serving below are early proposals,
 not selected implementations. The later manager proposal includes the DNS service.
 

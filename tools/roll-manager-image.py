@@ -11,8 +11,8 @@ lose every fact, administrators included.
 Coupure: the public hostname answers 503 (not the governor) from the governor's replacement until
 `tools/arm-publisher-follow.py --refresh` puts the mark back -- run it right after, and warn anyone
 looking at the page first. Environment: PODMESH_SOCKET, PODMESH_STATE_DIR, PODMESH_UNIT,
-PODMESH_REPLICA_CONFIGS, PODMESH_REPLICA_SET, and PODMESH_WEB_TREE (default
-../podmesh-lab/worktrees/podmesh-web relative to this repository).
+PODMESH_REPLICA_CONFIGS, PODMESH_REPLICA_SET, PODMESH_PUBLISHER_HOSTS (alias=ssh-target pairs,
+comma-separated) and PODMESH_WEB_TREE (the web tree holding packaging/podmesh-manager).
 """
 import json, os, subprocess, sys, tempfile, uuid
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -20,11 +20,11 @@ sys.path.insert(0, os.path.join(HERE, '..', 'tests'))
 from podmesh_two_hosts import Host, request  # noqa: E402
 from podmesh_manager_lab import declare_replica_config, replica_create  # noqa: E402
 
-WEB = os.environ.get('PODMESH_WEB_TREE') or os.path.normpath(os.path.join(HERE, '..', '..', 'podmesh-lab', 'worktrees', 'podmesh-web'))
+WEB = os.environ['PODMESH_WEB_TREE']
 UNIVERSE = os.path.join(WEB, 'packaging', 'podmesh-manager', 'universe')
 replica_set = json.load(open(os.environ['PODMESH_REPLICA_SET']))
 LOGICAL, SERVICE = replica_set['logical_manager_id'], os.environ.get('PODMESH_MANAGER_SERVICE_ADDRESS', '10.86.0.100')
-targets = dict(pair.split('=', 1) for pair in os.environ.get('PODMESH_PUBLISHER_HOSTS', 'lab-a=lab@192.168.10.156,lab-b=lab@192.168.10.157,lab-c=lab@192.168.10.154').split(','))
+targets = dict(pair.split('=', 1) for pair in os.environ['PODMESH_PUBLISHER_HOSTS'].split(','))
 addresses = {r['alias']: r['address'] for r in replica_set['replicas']}
 G = os.environ.get('PODMESH_GOVERNOR_ALIAS', 'lab-a')
 state_dir = os.environ['PODMESH_STATE_DIR']
