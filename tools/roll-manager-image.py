@@ -23,8 +23,11 @@ collide with the ones the peers hold and exchanges are refused both ways.)
 
 Only the active manager's host interrupts the public page: before its replica goes, that host's follow tick
 stops, the connector stops and the service address is withdrawn; once its new replica runs, the service
-address is published again and the tick re-armed. `tools/arm-publisher-follow.py --refresh` then writes the
-active manager's mark again -- warn anyone looking at the page first. Rolling another host interrupts nothing.
+address is published again and the tick re-armed. The tick can only start the connector again with a
+takeover proof that is still valid, and a proof lives one lease (an hour in the laboratory): the roll reads
+the installed proof before it cuts anything and stops if it has less than PODMESH_ROLL_PROOF_MARGIN seconds
+left (default 600), naming `tools/arm-publisher-follow.py --refresh`, which issues a new one under a new
+epoch. Warn anyone looking at the page first. Rolling another host interrupts nothing.
 
 Environment: PODMESH_SOCKET, PODMESH_STATE_DIR, PODMESH_UNIT, PODMESH_REPLICA_CONFIGS, PODMESH_REPLICA_SET,
 PODMESH_PUBLISHER_HOSTS (alias=ssh-target pairs, comma-separated), PODMESH_WEB_TREE (the web tree holding
@@ -57,6 +60,8 @@ BUILD_DIR = '/root/manager-universe-m-u2'
 BACKUPS = '/var/lib/podmesh-lab-roll'
 STORE = '/var/lib/podmesh-manager'
 PREVIOUS_TAG = GENERIC_TAG + '-previous'
+PROOF_REMOTE = '/run/podmesh-publisher-follow/proof.json'
+PROOF_MARGIN = int(os.environ.get('PODMESH_ROLL_PROOF_MARGIN', 600))
 OBSERVE = 30
 TIMER = 'podmesh-publisher-follow-lab'
 stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
@@ -106,6 +111,15 @@ def start_old(h, u):
     say(f'{h.role}: old replica started again: {r.get("ok")} {(r.get("data") or {}).get("application_outcome", r.get("error", ""))}')
 
 
+def proof_left(h):
+    """Seconds left on the takeover proof installed on this host, None when there is none to read."""
+    out = root(h, f'test -f {PROOF_REMOTE} && python3 -c "import json,time; print(int(json.load(open(\'{PROOF_REMOTE}\'))[\'expires_at\'] - time.time()))"', check=False)
+    try:
+        return int(out.split()[-1])
+    except (ValueError, IndexError):
+        return None
+
+
 binary_sha = sha256(BINARY)
 entrypoint_path = os.path.join(UNIVERSE, 'entrypoint.sh')
 entrypoint_sha = sha256(entrypoint_path)
@@ -144,6 +158,14 @@ for a in order:
     say(f'{a}: image {image[:12]} built, resident and entrypoint attested')
 
     if a == ACTIVE:
+        # Nothing publishes again without a valid proof: a cut taken with an expired one lasts until an
+        # operator runs the refresh (measured on 2026-09-17: 4 min 33 s instead of the 20 s announced).
+        left = proof_left(h)
+        entry['takeover_proof_seconds_left'] = left
+        if left is None or left < PROOF_MARGIN:
+            raise SystemExit(f'{a}: the installed takeover proof has {left} s left (margin {PROOF_MARGIN}); '
+                             'run tools/arm-publisher-follow.py --refresh first, then roll again')
+        say(f'{a}: takeover proof valid for {left} s')
         h.ssh(f'sudo -n systemctl stop {TIMER}.timer {TIMER}.service 2>/dev/null', check=False)
         r = h.api(dict(operation='publisher_stop', operation_id=str(uuid.uuid4()), authorization_ref=ref, resource=LOGICAL))
         say(f'{a}: follow tick stopped; publisher_stop: {r.get("ok")} {r.get("error", "")[:80]}')
