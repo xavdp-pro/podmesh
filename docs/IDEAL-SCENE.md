@@ -6,20 +6,14 @@ that closes them) and [IDEAL-SCENE-CHECKLISTS.md](IDEAL-SCENE-CHECKLISTS.md) (wh
 
 ## How this document is built
 
-The frame is the administrative scale and the evaluation method of L. Ron Hubbard's management writings, used here
-as a planning tool and nothing more. The scale orders the subjects of an activity: *goals, purposes, policy, plans,
-programs, projects, orders, ideal scenes, statistics, valuable final products*, and every item must agree with every
-other item on the same subject. An **ideal scene** "expresses what a scene or area ought to be"; it is something that
-can be achieved, and without one "he will not be able to recognize departures from it". The evaluation compares the
-existing scene with the ideal scene, names the major departure (the situation), finds the reason that opens the way
-to handling it (the why), and writes the handling as a program of targets. A **statistic** is "a number or amount
-compared to an earlier number or amount of the same thing". A **valuable final product** is what the activity
-produces that others can exchange for.
-
-Sources: [Administrative Scale](https://www.scientologycourses.org/tools-for-life/targets/steps/administrative-scale.html),
-[Plans and Programs](https://www.scientologyhandbook.org/targets/sh17_3.htm), the Data Series titles "How to Find and
-Establish an Ideal Scene", "The Situation" and "Handling—Policy, Plans, Programs, Projects and Orders Defined"
-([index](https://vinaire.me/2022/07/10/data-series-scientology/)).
+The frame is a planning scale used in management practice, taken here as a planning tool and nothing more. It
+orders the subjects of an activity: *goals, purposes, policy, plans, programs, projects, orders, ideal scenes,
+statistics, valuable final products*, and every item must agree with every other item on the same subject. An
+**ideal scene** states what an area ought to be, in terms that can be reached; without one, departures from it
+cannot be recognised. The evaluation compares the existing scene with the ideal scene, names the major departure
+(the situation), finds the reason that opens the way to handling it (the why), and writes the handling as a
+program of targets. A **statistic** is a number or amount compared to an earlier number or amount of the same
+thing. A **valuable final product** is what the activity produces that others can exchange for.
 
 This document is the top of the scale for PodMesh. The program and the checklists derive from it; when they
 disagree with it, one of them is wrong and is corrected until all agree.
