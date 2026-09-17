@@ -5,8 +5,15 @@
 # fact is not observed exits 2 (the universe is then "not running when observed"), a stop whose typed
 # shutdown is not acknowledged exits 3 (an honest failed stop, never a silent wait for escalation).
 # The optional argument `--fault boot|shutdown` injects those failures for the laboratory check.
+#
+# The start has a budget. Whoever starts the universe observes it for at most 30 seconds (PodMesh's
+# bound on observe_seconds), so a boot that cannot be observed ends, with exit 2, within 25 seconds of
+# this script's start: a start is never recorded as running for a replica that is about to fail.
 set -eu
 umask 077
+budget_seconds=25
+started_at=$(date +%s)
+elapsed() { echo $(( $(date +%s) - started_at )); }
 fault=${2:-none}
 [ "${1:-}" = "--fault" ] || fault=none
 mkdir -p /run/podmesh-manager /var/lib/podmesh-manager && chmod 700 /run/podmesh-manager /var/lib/podmesh-manager
@@ -27,26 +34,26 @@ child=$!
 echo "manager-universe: resident started pid=$child"
 
 # The origin a publishing connector proxies to: a small HTTP responder on port 8080, fail-closed
-# on the governor mark (a root-only file PodMesh writes at the exclusive publication, under the
-# epoch gate, and removes at the withdrawal or the fence). Without it every path answers 503: a
-# connector that reaches a replica which is not the governor gets nothing. It decides nothing
+# on the active manager's mark (a root-only file PodMesh writes at the exclusive publication, under
+# the epoch gate, and removes at the withdrawal or the fence). Without it every path answers 503: a
+# connector that reaches a replica which is not the active manager gets nothing. It decides nothing
 # about the role. It also carries the administration app (/admin, React over an Express API, the
 # same stack as the operator's other tools): an administrator is a replicated fact, and the FIRST
 # one is never created there -- it is written from the host, as root, through PodMesh's control
 # door. See origin/server/app.mjs.
 node /usr/lib/podmesh-manager/origin/server/index.mjs &
 origin=$!
-echo "manager-universe: origin responder started pid=$origin (fail-closed until PodMesh marks this replica governor)"
+echo "manager-universe: origin responder started pid=$origin (fail-closed until PodMesh marks this replica as the active manager)"
 
 control() { # control <socket> <json>: one typed request, read to end of stream, reply on stdout
   python3 - "$1" "$2" <<'EOF'
 import socket, sys, os, time
 path, req = sys.argv[1], sys.argv[2].encode()
-for _ in range(50):
+for _ in range(20):
     if os.path.exists(path):
         break
     time.sleep(0.1)
-s = socket.socket(socket.AF_UNIX); s.settimeout(15); s.connect(path); s.sendall(req); s.shutdown(socket.SHUT_WR)
+s = socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(path); s.sendall(req); s.shutdown(socket.SHUT_WR)
 reply = b""
 while True:
     chunk = s.recv(4096)
@@ -60,6 +67,23 @@ socket_path=/run/podmesh-manager/control.sock
 [ "$fault" = boot ] && boot_socket=/run/podmesh-manager/no-such.sock || boot_socket=$socket_path
 [ "$fault" = shutdown ] && stop_socket=/run/podmesh-manager/no-such.sock || stop_socket=$socket_path
 
+# The resident binds its control socket only after it has opened its store and verified it whole,
+# which takes longer as the store grows (about a second for thirty thousand audit rows, measured on
+# 2026-09-17). Wait for the socket within the budget, and stop waiting as soon as the resident is gone.
+while [ ! -S "$socket_path" ]; do
+  if ! kill -0 "$child" 2>/dev/null; then
+    echo "manager-universe: RESIDENT EXITED before binding its control socket; refusing to run"
+    exit 2
+  fi
+  if [ "$(elapsed)" -ge "$budget_seconds" ]; then
+    echo "manager-universe: CONTROL SOCKET NOT BOUND within ${budget_seconds}s; refusing to run"
+    kill -KILL "$child" 2>/dev/null || true
+    exit 2
+  fi
+  sleep 0.2
+done
+echo "manager-universe: control socket bound after $(elapsed)s"
+
 # Readiness requirement: the start is not a start until the resident has observed this boot's fact.
 boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
 opid=$(cat /proc/sys/kernel/random/uuid)
@@ -72,22 +96,23 @@ scope=$(python3 -c 'import json,sys; c=json.load(open("/etc/podmesh-manager/conf
 # operation ID it has already appended rather than appending it twice, so the retry is safe and
 # the fact ends up observed once. Any other answer is terminal. Measured on 2026-09-15: a replica
 # restarted right after its typed stop answered `append_observation_uncertain` once, and this
-# entrypoint refused to run -- correctly, on that contract, and needlessly.
+# entrypoint refused to run -- correctly, on that contract, and needlessly. The retries stop at the
+# start's budget, not at a count.
 observed=no; attempt=0
-while [ $attempt -lt 10 ]; do
+while :; do
   attempt=$((attempt + 1))
   reply=$(control "$boot_socket" "{\"operation\":\"append_observation\",\"operation_id\":\"$opid\",\"scope\":\"$scope\",\"subject\":\"boot\",\"value\":\"boot-$boot\"}" 2>&1) || true
   if printf '%s' "$reply" | grep -q '"result":"observed"'; then observed=yes; break; fi
-  if printf '%s' "$reply" | grep -q 'append_observation_uncertain\|append_observation_busy'; then
+  if printf '%s' "$reply" | grep -q 'append_observation_uncertain\|append_observation_busy' && [ "$(elapsed)" -lt "$budget_seconds" ]; then
     echo "manager-universe: boot fact attempt $attempt: $(printf '%s' "$reply" | tail -1 | cut -c1-80); retrying the same operation"
-    sleep 1; continue
+    sleep 0.5; continue
   fi
   break
 done
 if [ "$observed" = yes ]; then
-  echo "manager-universe: boot fact observed (attempt $attempt): $(printf '%s' "$reply" | cut -c1-120)"
+  echo "manager-universe: boot fact observed (attempt $attempt, $(elapsed)s after the start): $(printf '%s' "$reply" | cut -c1-120)"
 else
-  echo "manager-universe: BOOT FACT NOT OBSERVED after $attempt attempt(s); refusing to run: $(printf '%s' "$reply" | tail -1 | cut -c1-200)"
+  echo "manager-universe: BOOT FACT NOT OBSERVED after $attempt attempt(s) and $(elapsed)s; refusing to run: $(printf '%s' "$reply" | tail -1 | cut -c1-200)"
   kill -KILL "$child" 2>/dev/null || true
   exit 2
 fi

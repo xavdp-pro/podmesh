@@ -15,7 +15,7 @@ export default function App() {
   const { t } = useI18n()
   const { state, loading, failure, refresh, expired } = useSession()
   useEffect(() => { setExpiredHandler(expired); refresh() }, [refresh, expired])
-  if (failure === 'not the governor') return <Closed kind="closed" />
+  if (failure === 'not the active manager') return <Closed kind="closed" />
   if (failure) return <main className="booting" role="alert"><p>{t('brand')}</p><p>{t('common.unreachable')}</p></main>
   if (loading && !state) return <main className="booting"><p>{t('brand')}</p><p>{t('common.loading')}</p></main>
   if (state.view === 'none') return <Closed kind="none" />

@@ -1,8 +1,8 @@
-// The manager universe's origin as an Express application, fail-closed on the governor mark.
+// The manager universe's origin as an Express application, fail-closed on the active manager's mark.
 //
 // Surfaces: GET / (the human page), GET /ready (the publisher contract's JSON), the administration
 // app under /admin (built files) and its API under /admin/api. Without the mark every path answers
-// 503: a connector that reaches a replica which is not the governor gets nothing.
+// 503: a connector that reaches a replica which is not the active manager gets nothing.
 //
 // Administrators are replicated facts (`admin.user.<login>` with a scrypt hash, `admin.flag.<login>`
 // while the deployment password is still in place), written in this replica's own scope through
@@ -57,7 +57,7 @@ export function flags(facts) {
 
 const cookies = req => Object.fromEntries((req.headers.cookie || '').split(';').map(p => p.trim().split('=')).filter(([k]) => k).map(([k, ...v]) => [k, v.join('=')]))
 
-export function createApp({ identity, scope, governor, facts, append, dist = path.resolve(import.meta.dirname, '../dist'), secret = randomBytes(32), secure = true, now = () => Date.now() }) {
+export function createApp({ identity, scope, activeManager, facts, append, dist = path.resolve(import.meta.dirname, '../dist'), secret = randomBytes(32), secure = true, now = () => Date.now() }) {
   const app = express()
   app.disable('x-powered-by')
   app.set('trust proxy', 1)
@@ -83,14 +83,14 @@ export function createApp({ identity, scope, governor, facts, append, dist = pat
 
   const closed = (req, res) => {
     const p = req.path
-    const reason = p === '/' || p === '/index.html' || p === '/ready' || p.startsWith('/admin') ? 'not the governor' : 'no such path'
+    const reason = p === '/' || p === '/index.html' || p === '/ready' || p.startsWith('/admin') ? 'not the active manager' : 'no such path'
     res.status(503).json({ ready: false, reason, ...identity })
   }
   // Fail-closed first: nothing is served without the mark, the administration app included.
-  app.use((req, res, next) => { req.mark = governor(); if (!req.mark) return closed(req, res); next() })
+  app.use((req, res, next) => { req.mark = activeManager(); if (!req.mark) return closed(req, res); next() })
 
   app.get(['/', '/index.html'], (req, res) => {
-    res.type('html').send(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>PodMesh manager</title><style>body{margin:0;background:#f4efe4;color:#1c1916;font-family:ui-sans-serif,system-ui,sans-serif}main{max-width:40rem;margin:12vh auto;padding:0 1.5rem}h1{font-size:1.6rem;font-weight:600}p,dd{line-height:1.45;color:#4a433b}dl{display:grid;grid-template-columns:8rem 1fr;gap:.35rem 1rem}dt{color:#7a7268}a{color:#215547}</style><main><p>PODMESH / MANAGER ORIGIN</p><h1>This replica is the governor.</h1><p>The public hostname reaches the replica that currently holds the exclusive role. Machine JSON stays at <a href="/ready"><code>/ready</code></a>, administration at <a href="/admin/">/admin</a>.</p><dl><dt>epoch</dt><dd><code>${Number(req.mark.epoch) || ''}</code></dd><dt>replica</dt><dd><code>${identity.replica_id}</code></dd><dt>logical</dt><dd><code>${identity.logical_manager_id}</code></dd></dl></main></html>`)
+    res.type('html').send(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>PodMesh manager</title><style>body{margin:0;background:#f4efe4;color:#1c1916;font-family:ui-sans-serif,system-ui,sans-serif}main{max-width:40rem;margin:12vh auto;padding:0 1.5rem}h1{font-size:1.6rem;font-weight:600}p,dd{line-height:1.45;color:#4a433b}dl{display:grid;grid-template-columns:8rem 1fr;gap:.35rem 1rem}dt{color:#7a7268}a{color:#215547}</style><main><p>PODMESH / MANAGER ORIGIN</p><h1>This replica is the active manager.</h1><p>The public hostname reaches the replica that currently holds the exclusive role. Machine JSON stays at <a href="/ready"><code>/ready</code></a>, administration at <a href="/admin/">/admin</a>.</p><dl><dt>epoch</dt><dd><code>${Number(req.mark.epoch) || ''}</code></dd><dt>replica</dt><dd><code>${identity.replica_id}</code></dd><dt>logical</dt><dd><code>${identity.logical_manager_id}</code></dd></dl></main></html>`)
   })
   app.get('/ready', (req, res) => res.json({ ready: true, ...identity, epoch: req.mark.epoch, marked_at: req.mark.marked_at }))
 

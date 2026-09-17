@@ -15,14 +15,18 @@ export function readConfig(path) {
   return { identity, scope: grant.scope, control: cfg.control_socket }
 }
 
-// The governor mark: PodMesh's root-only file, present only while this replica holds the role.
-export const markReader = path => () => {
-  try {
-    const mark = JSON.parse(readFileSync(path, 'utf8'))
-    return mark && typeof mark === 'object' ? mark : null
-  } catch {
-    return null
+// The active manager's mark: PodMesh's root-only file, present only while this replica holds the
+// role. The first of the paths that holds a mark answers.
+export const markReader = paths => () => {
+  for (const path of paths) {
+    try {
+      const mark = JSON.parse(readFileSync(path, 'utf8'))
+      if (mark && typeof mark === 'object' && !Array.isArray(mark)) return mark
+    } catch {
+      // absent or unreadable: the next path, then closed
+    }
   }
+  return null
 }
 
 // The ordered facts, read by the resident's own read-only inspection (never by opening the store).

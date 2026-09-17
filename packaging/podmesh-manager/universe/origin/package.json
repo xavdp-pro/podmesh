@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "The manager universe's origin: /ready, the human page and the administration app, fail-closed on the governor mark.",
+  "description": "The manager universe's origin: /ready, the human page and the administration app, fail-closed on the active manager's mark.",
   "scripts": {
     "dev": "vite --port 5180",
     "build": "vite build",

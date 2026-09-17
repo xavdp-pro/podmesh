@@ -12,7 +12,7 @@ api.interceptors.response.use(
   err => {
     const status = err.response?.status
     if (status === 401 && !String(err.config?.url || '').endsWith('/login')) onExpired()
-    if (status === 503 && err.response?.data?.reason === 'not the governor') return Promise.reject({ error: 'not the governor', closed: true })
+    if (status === 503 && err.response?.data?.reason === 'not the active manager') return Promise.reject({ error: 'not the active manager', closed: true })
     return Promise.reject(err.response?.data || { error: err.message, unreachable: true })
   },
 )

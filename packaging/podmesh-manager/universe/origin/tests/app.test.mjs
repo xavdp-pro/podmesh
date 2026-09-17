@@ -3,7 +3,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import request from 'supertest'
 import { createApp, administrators } from '../server/app.mjs'
-import { hashPassword, observer } from '../server/resident.mjs'
+import { hashPassword, markReader, observer } from '../server/resident.mjs'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
@@ -23,7 +23,7 @@ beforeEach(() => {
   appended = []
   app = createApp({
     identity, scope: SCOPE, dist: '/nonexistent',
-    governor: () => mark,
+    activeManager: () => mark,
     facts: async () => facts,
     append: async (subject, value) => { appended.push({ subject, value }); return 'observed' },
     secret: Buffer.alloc(32, 7),
@@ -36,12 +36,12 @@ async function signIn(login = 'admin', password = 'podmesh') {
 }
 
 describe('fail-closed', () => {
-  it('answers 503 on every path without the governor mark, the API included', async () => {
+  it('answers 503 on every path without the active manager\'s mark, the API included', async () => {
     mark = null
     for (const p of ['/', '/ready', '/admin', '/admin/api/state']) {
       const res = await request(app).get(p)
       expect(res.status).toBe(503)
-      expect(res.body.reason).toBe('not the governor')
+      expect(res.body.reason).toBe('not the active manager')
     }
     expect((await request(app).post('/admin/api/login').send({ login: 'x', password: 'y' })).status).toBe(503)
   })
@@ -230,4 +230,30 @@ describe('an uncertain answer from the resident', () => {
     await expect(append('admin.user.y', 'v')).rejects.toThrow(/did not observe/)
     close()
   }, 20000)
+})
+
+describe("the active manager's mark on disk", () => {
+  const dir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'podmesh-mark-'))
+  it('is read from the first path that holds one, the previous path only when the new one is absent', () => {
+    const d = dir()
+    const renamed = path.join(d, 'active-manager.json'), previous = path.join(d, 'governor.json')
+    const read = markReader([renamed, previous])
+    expect(read()).toBeNull()
+    fs.writeFileSync(previous, JSON.stringify({ epoch: 153, marked_at: 1 }))
+    expect(read()).toEqual({ epoch: 153, marked_at: 1 })
+    fs.writeFileSync(renamed, JSON.stringify({ epoch: 154, marked_at: 2 }))
+    expect(read()).toEqual({ epoch: 154, marked_at: 2 })
+    fs.rmSync(renamed); fs.rmSync(previous)
+    expect(read()).toBeNull()
+  })
+  it('stays closed on a mark that is not a JSON object', () => {
+    const d = dir()
+    const file = path.join(d, 'active-manager.json')
+    fs.writeFileSync(file, 'not json')
+    expect(markReader([file])()).toBeNull()
+    fs.writeFileSync(file, '7')
+    expect(markReader([file])()).toBeNull()
+    fs.writeFileSync(file, '[]')
+    expect(markReader([file])()).toBeNull()
+  })
 })

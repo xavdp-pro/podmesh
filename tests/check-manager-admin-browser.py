@@ -25,7 +25,7 @@ stored = f"scrypt.16384.8.1.{salt.hex()}.{hashlib.scrypt(b'podmesh', salt=salt, 
 stub = work / 'resident'
 stub.write_text('#!/bin/sh\ncat "$(dirname "$0")/facts.json"\n')
 stub.chmod(0o755)
-(work / 'governor.json').write_text(json.dumps({'epoch': 3, 'marked_at': int(time.time())}))
+(work / 'active-manager.json').write_text(json.dumps({'epoch': 3, 'marked_at': int(time.time())}))
 
 def control():
     s = socket.socket(socket.AF_UNIX); s.bind(config['control_socket']); s.listen(4)
@@ -37,7 +37,7 @@ def control():
 threading.Thread(target=control, daemon=True).start()
 
 env = dict(os.environ, PODMESH_MANAGER_CONFIG=str(work / 'config.json'), PODMESH_MANAGER_STATE=str(work),
-           PODMESH_MANAGER_BINARY=str(stub), PODMESH_GOVERNOR_MARK=str(work / 'governor.json'), PODMESH_ORIGIN_PORT=str(PORT))
+           PODMESH_MANAGER_BINARY=str(stub), PODMESH_ACTIVE_MANAGER_MARK=str(work / 'active-manager.json'), PODMESH_ORIGIN_PORT=str(PORT))
 server = subprocess.Popen(['node', str(ORIGIN / 'server' / 'index.mjs')], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 try:
     for _ in range(50):
