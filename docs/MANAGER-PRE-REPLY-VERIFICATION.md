@@ -2,10 +2,13 @@
 
 Status: **shape 2 chosen and implemented on 2026-09-17 (lot V2-R, branch
 `claude/v2-manager`); not yet qualified on the laboratory.** The integrity model and its
-trade-off are in [the last section](#the-chosen-shape-2026-09-17-full-verification-leaves-the-reply-path).
-Everything before it is the original measurement of the candidate, kept as measured: the defect
-standing between the manager and any claim of long-running viability. It is not a G2 evidence
-problem: the G2 gate passes. It is a property of the candidate, and it gets worse on its own.
+trade-off are in [its section](#the-chosen-shape-2026-09-17-full-verification-leaves-the-reply-path).
+How a replica rejoins its peers, and how little an idle manager exchanges, are in
+[the last section](#rejoining-and-idling-2026-09-17-the-exchange-lot) (the exchange lot, branch
+`claude/v2-exchange`). Everything before those two sections is the original measurement of the
+candidate, kept as measured: the defect standing between the manager and any claim of long-running
+viability. It is not a G2 evidence problem: the G2 gate passes. It is a property of the candidate,
+and it gets worse on its own.
 
 Nothing here qualifies or disqualifies anything. It is a measurement and a reading of the
 candidate's own source.
@@ -268,9 +271,10 @@ slow it down.
   made two full copies per exchange and grew from 14.6 to 56.7 ms per exchange.
 - **Unchanged snapshots are not exchanged every interval.** The resident pushes its snapshot to a
   peer when it differs from the digest that peer last acknowledged with an authenticated receipt,
-  and otherwise every `unchanged_snapshot_refresh_ms`, 60,000 ms by default. An idle three-replica
-  manager no longer adds six audit rows per ordered pair per interval. Every exchange that does
-  happen keeps the same audit accounting.
+  and otherwise every `unchanged_snapshot_refresh_ms`, 60,000 ms by default in this lot and
+  600,000 ms since the exchange lot below. An idle three-replica manager no longer adds six audit
+  rows per ordered pair per interval. Every exchange that does happen keeps the same audit
+  accounting.
 
 ### Measured
 
@@ -306,10 +310,152 @@ pays six fsync'd commits, it is 34.8 and 31.2 ms (slowest 257 ms).
 
 - **The first open is still linear in the store.** A new resident verifies everything before it binds
   its control socket: about 1.05 s at 30,004 audit rows on this workstation (about 31 µs per row), to
-  be measured on the laboratory hosts. The universe entrypoint waits 5 s for the socket before its
-  first boot-fact attempt; a store that keeps growing will cross that budget. Change-driven pushes
-  slow the growth; they do not bound the table.
+  be measured on the laboratory hosts. The universe entrypoint gives the whole start 25 s, the socket
+  wait and the boot fact's catch-up included (see the exchange lot below); a store that keeps growing
+  will cross that budget. Change-driven pushes and the ten-minute refresh slow the growth; they do
+  not bound the table.
 - **The table still only grows.** Retention, sealing or rotation remains a separate design.
 - **A preflight copy remains after a change by another process**, and at a process's first open.
 - **Laboratory qualification**: a soak of the three replicas on this candidate, with the incomplete
   attempt counts, exchange latencies and restart times measured there.
+
+## Rejoining and idling, 2026-09-17: the exchange lot
+
+Status: **implemented on branch `claude/v2-exchange`, on top of lot V2-R; not yet qualified on the
+laboratory.** The schema, the wire protocol and the G2 attempt accounting are unchanged: every
+exchange this lot adds is an ordinary exchange with its prepared and terminal audit rows, and an
+append refused while catching up touches no table.
+
+### The hazard: a store that lost facts of its own
+
+A fact's identity is `<replica_id>:<20-digit producer sequence>`, and a replica numbers a new fact
+after the highest sequence of its own origin in its store. A store that lacks some of its own facts,
+deleted or restored from an older copy, numbers its next fact with a sequence its peers already
+hold, with other bytes: the boot fact's value carries the host's boot ID. Every import that carries
+both versions is then refused as an event identity collision, in both directions, for good.
+Importing its own older facts back from a peer first avoids it: an imported fact of its own origin
+moves the next sequence past it.
+
+### Catch-up before the first local append
+
+- Until a process has caught up with its peers, `append_observation` answers
+  `append_observation_catching_up`, after its authorization checks and without touching the store.
+  The state latches: once caught up, a process stays caught up.
+- A peer is caught up with when this process has committed or replayed an authenticated import from
+  it, or when that peer's authenticated receipt for a push of this process reported a history exactly
+  as long as the pushed snapshot. A peer that imported a snapshot holds every fact of it, so an equal
+  count means it held nothing this replica lacked; the receipt binds that count under the pair key. A
+  refused import or push counts for nothing.
+- A process whose store held at least one fact of its own origin when it started may also append once
+  the catch-up window has elapsed since it started exchanging: `catch_up_window_ms`, 15,000 ms by
+  default, between 1,000 and 20,000.
+- A store without any fact of its own never appends before every peer is caught up with: it keeps
+  refusing, typed, while one is unreachable. A topology without peers is caught up at once.
+- `status` reports `catch_up`: `caught_up`, `caught_up_by` (`every_peer`, `window` or `no_peers`),
+  `caught_up_after_ms`, `peers_imported`, `peers_matched`, `peers_missing`, `own_facts_at_start` and
+  `window_ms`.
+
+Counting imports alone would make every clean restart wait the whole window: its peers hold exactly
+its facts, so none has anything to push back, and each still holds its acknowledgement from the
+previous process, which it does not push again before the refresh. A replica that starts after its
+peers on a fresh manager would likewise wait for their backoff, up to 30 s with the laboratory
+settings, past the start budget. The receipt rule catches both up within their own first pushes.
+
+The universe entrypoint retries a `catching_up` boot fact like `busy` and `uncertain`, with the same
+operation ID, within its 25-second start budget.
+
+### Push-back
+
+When an authenticated import from a peer commits and leaves this replica with more facts than the
+peer's snapshot carried, the replica forgets that peer's acknowledgement and makes its next push to it
+due at once, at most once per interval per peer. A replay does not: it reports the counts of its
+original commit. An attempt that overlapped the request does not record its acknowledgement, so the
+requested push follows. The transport reports the import through
+`Node::serve_connection_reporting` as soon as it is durable, before the reply, with the source
+replica, the snapshot's fact count and the resulting history length. The resident also learns there
+that its own snapshot changed, so its status stops calling an acknowledgement current as soon as an
+import made a push due, not once the connection has ended.
+
+A restarted process holds no acknowledgement and pushes to every peer at once; every live peer that
+holds facts the restarted store lacks pushes them back at once. The expected catch-up of a restarted
+replica with every peer up is therefore a few exchanges, its first push to each peer and each peer's
+push back, each a few fsync'd commits; each unreachable peer adds, to the sequential outgoing worker,
+the deadline of its attempt (connect retries up to 2 s on a host that does not answer).
+
+### The refresh, the idle growth and the liveness bound
+
+`unchanged_snapshot_refresh_ms` now defaults to 600,000 ms. An idle replica of a three-replica
+manager adds at most twelve audit rows per refresh: two pushes sent at two rows each, two received at
+four. At the former 60 s that was about 17,000 rows a day per replica; at 600 s it is at most 1,728,
+and an idle store, with the cost of its first open, grows ten times more slowly.
+
+An idle link is confirmed once per refresh. The last authenticated success of a live link is never
+older than the refresh plus one interval plus one exchange with each peer, which the outgoing worker
+visits in turn (an exchange is bounded by its connect, write and read deadlines of 2 s each), and a
+link whose attempt failed is retried within the maximum backoff. **The liveness bound is the refresh
+plus the maximum backoff plus one exchange**: 600 s + 30 s + about 6 s with the laboratory settings,
+with a margin for the other peers' visits. A peer that stops answering on an idle link is reported by
+the first attempt after it, at most one refresh plus that margin after the last success; a resident
+that is down is visible at once, since its own status no longer answers. Peer status gains
+`last_attempt_age_ms`, `acknowledged_unchanged`, `refresh_ms`, `max_backoff_ms` and `push_backs`.
+
+The console calls a link healthy while its last authenticated success is within the refresh plus the
+maximum backoff plus a 15-second margin (one exchange, a visit of the other peer and one interval) and
+no attempt failed after it. A link is degraded from the first failed attempt after that success,
+while the success is within the bound: the resident has just said that the peer did not answer, and
+waiting for the bound would hide a dead peer for up to one more backoff. It is failing past the bound,
+or when it never succeeded. A resident that reports neither figure is judged on a 60 s refresh and a
+300 s backoff.
+
+### The periodic verification does not silently stop
+
+A periodic complete verification that could not run, because the store did not open or the pass
+could not take its snapshot, verified nothing and closed nothing; lot V2-R nevertheless scheduled the
+next pass a whole interval later, so one transient failure doubled the detection interval of the
+trade-off above. Such a pass is now retried after a backoff that starts at `interval_ms` and doubles
+up to `max_backoff_ms`, never later than the verification interval. A verification failure waits
+for the next regular pass, since the store is already closed. The resident's main loop supervises
+the verification worker like the outgoing one: if it stops, the resident exits with an error instead
+of serving without its detection interval.
+
+### Measured
+
+Three residents on one workstation, laboratory settings (interval 1 s, maximum backoff 30 s,
+default refresh and window), release build, stores on the ext4 build volume, one scenario at a time,
+from a scratch copy of the process tests: ten restarts of each of the first two kinds over two series,
+two of the third.
+
+| Restart of one replica | Caught up, after it started exchanging | Boot fact observed, after its spawn |
+| --- | ---: | ---: |
+| clean, store unchanged, both peers live | 40–106 ms | 68–137 ms |
+| store deleted, both peers live | 106–912 ms, median 140 ms | 187–973 ms |
+| store with facts of its own, one peer down | 15,000 ms (window) | 15,026–15,030 ms |
+
+A replica restarted on an older copy of its store, whose peers each held an acknowledgement of their
+current snapshot and a refresh of ten minutes, held every fact again 83–425 ms after its spawn. The
+slowest samples are consistent with a peer's outgoing worker still inside an attempt towards the
+restarted replica, whose connect retries last up to 2 s; this was not isolated.
+
+The resident suite measures the same paths at a 100 ms interval, debug build, `/tmp` on the root
+volume, with the whole suite running in parallel beside another lot's benchmarks, over eight runs:
+an emptied replica caught up 221–438 ms after it started exchanging, a replica on an older store held
+every fact 167–337 ms after its control socket answered, an idle replica added 8.0–10.6 audit rows per
+second at a one-second refresh (at most twelve per refresh: each visit waits up to one interval past
+the refresh), and an edited row was detected 100–175 ms after a store that had been unreadable during
+the periodic pass became readable again.
+
+### What this does not settle
+
+- **A store with facts of its own, while the peer holding its later facts is down.** After the
+  window it appends, and the collision above happens when that peer returns: both sides refuse the
+  other's imports, visibly (authenticated refusals, degraded links), and nothing repairs it. A longer
+  window moves the boundary; it does not remove it.
+- **An emptied store with a peer down** does not boot within the entrypoint's budget: the universe
+  start fails, visibly, until that peer answers. This is chosen: the alternative is a fork.
+- **The start budget.** A store that already held facts of its own, with a peer down, boots after
+  its first open plus the window; the 25-second budget holds while the control socket binds within
+  about ten seconds.
+- **An idle link between two live replicas** is confirmed once per refresh: a partition between them
+  shows within one refresh plus the margin above, not sooner.
+- **Laboratory qualification**: catch-up, push-back and first-open times on the laboratory hosts, and
+  the idle growth of the three replicas over a day.

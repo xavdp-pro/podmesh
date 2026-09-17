@@ -10,8 +10,8 @@ fencing or activation, or changes enrollment.
 ## Resident behavior
 
 A persistent TCP listener admits a fixed number of workers. Each calls the
-transport's `Node::serve_connection` for exactly one authenticated, bounded frame
-and atomic import. Excess connections are closed and counted without an application
+transport's `Node::serve_connection_reporting` for exactly one authenticated, bounded
+frame and atomic import. Excess connections are closed and counted without an application
 queue; the kernel has its own finite backlog. One outgoing worker visits the exact
 configured peers sequentially, with independent bounded exponential backoff.
 Successful exchange resets the peer interval. An unreachable peer does not become
@@ -22,23 +22,59 @@ Operation IDs and nonces use OS randomness. The same observed snapshot reuses an
 operation ID, avoiding a new receipt for each unchanged poll. After restart, IDs
 are fresh. The outgoing worker records the digest of the snapshot each peer last
 acknowledged with an authenticated receipt: it exchanges again when the local snapshot
-differs, and otherwise only after the unchanged-snapshot refresh delay, so idle replicas
-add no audit rows at every interval. The acknowledgement state restarts empty, and a
-peer restored from an older store receives the local facts at the latest after that
-delay. The transport exports again inside its call: an incoming import between
-the scheduler's snapshot digest and that export can cause a transient replay
-binding refusal. A changed digest creates a fresh ID on the next attempt. The
-transaction refuses mismatches rather than making an unsafe mutation.
+differs, and otherwise only after the unchanged-snapshot refresh delay, ten minutes by
+default. An idle replica therefore adds its audit rows once per refresh, not at every
+interval: at three replicas, two pushes sent at two rows each and two received at four,
+twelve rows per refresh or at most 1,728 a day. The acknowledgement state restarts
+empty, so a restarted process pushes to every peer at once.
+
+Push-back covers the other direction. When an authenticated import from a peer commits
+and leaves this replica with more facts than that peer's snapshot carried, the replica
+forgets that peer's acknowledgement and makes its next push to it due at once, at most
+once per interval per peer. A replayed receipt reports the counts of its original
+commit and pushes nothing back. An attempt that overlapped such a request does not
+record its acknowledgement, so the requested push follows it. A peer restarted on an
+emptied or older store therefore receives the facts it lacks within a few exchanges of
+its own first push, not after the refresh. The transport exports again inside its
+call: an incoming import between the scheduler's snapshot digest and that export can
+cause a transient replay binding refusal. A changed digest creates a fresh ID on the
+next attempt. The transaction refuses mismatches rather than making an unsafe mutation.
+
+A process appends no local fact before it has caught up with its peers. A store that
+lacks some facts of its own origin, deleted or restored from an older copy, would
+otherwise number its next fact with a producer sequence its peers already hold with
+other bytes, and each side would refuse every later import from the other, for good.
+A peer is caught up with once this process has committed or replayed an authenticated
+import from it, or once that peer's authenticated receipt for a push of this process
+reported a history exactly as long as the pushed snapshot: having imported it, the peer
+held nothing this replica lacked. Without that second rule a clean restart would wait
+for the window, since its peers have nothing to push back and still hold an
+acknowledgement of their own snapshot. A refused import or push counts for nothing. A
+process whose store held at least one fact of its own origin when it started also
+appends once the catch-up window has elapsed since it started exchanging, which bounds
+a start while a peer is down, at the price of the collision above if that peer held
+facts the store lacks. A store without any such fact never appends before every peer
+is caught up with, and keeps refusing, typed, while one is unreachable. A replica
+without peers is caught up at once. Until it is caught up, `append_observation` answers
+`append_observation_catching_up` without touching the store. The state latches for the
+process.
 
 SQLite retains the dependency's WAL/FULL, immutable history and receipt checks,
 identity binding and atomic import. The resident's first store open verifies the whole
 store before the listener and control socket exist; a background worker repeats that
 complete verification, in a read transaction, every full-verification interval, and
-writes a failed pass to standard error. Any failed verification closes the store for the
-process: appends answer `append_observation_uncertain`, exchanges fail, status and
-shutdown stay available, and a restarted resident refuses to start on that store. A held lock file prevents two residents on the
-same configured database path. It does not fence copied databases, path aliases
-or a privileged actor. No history/receipt compaction or disk quota exists yet.
+writes a failed pass to standard error. A pass that could not run, because the store did
+not open or the pass could not take its snapshot, verified and closed nothing: it is
+retried after a backoff that starts at `interval_ms` and doubles up to
+`max_backoff_ms`, never later than the verification interval, and each attempt is
+written to standard error. The main loop supervises that worker like the outgoing one:
+a resident whose verification or replication worker stopped exits with an error. Any
+failed verification closes the store for the process: appends answer
+`append_observation_uncertain`, exchanges fail, status and shutdown stay available, and
+a restarted resident refuses to start on that store. A held lock file prevents two
+residents on the same configured database path. It does not fence copied databases,
+path aliases or a privileged actor. No history/receipt compaction or disk quota exists
+yet.
 
 ## Configuration and bounds
 
@@ -92,9 +128,10 @@ before opting into real networking.
 Unknown JSON fields are refused. The required configuration has `network` (the
 complete transport `ConfigurationFile`), `control_socket`,
 `observation_writer_uid`, `interval_ms`, `max_backoff_ms`, and
-`incoming_workers`. `observation_writer_uid` fails closed when absent. Two fields
+`incoming_workers`. `observation_writer_uid` fails closed when absent. Three fields
 are optional and omitted when serialized unset: `full_verification_interval_ms`
-(default 600,000) and `unchanged_snapshot_refresh_ms` (default 60,000). The
+(default 600,000), `unchanged_snapshot_refresh_ms` (default 600,000) and
+`catch_up_window_ms` (default 15,000). The
 private socket is `0600`, so the current package-facing boundary normally makes
 UID 0 or the service account its only reachable writer. Shared group/ACL writer
 admission is deferred to Stage P; this service does not weaken the socket mode.
@@ -115,7 +152,8 @@ endpoints, commands or topology. Protect local config/DB; never commit secrets.
 | Periodic interval | 100–60,000 ms |
 | Maximum backoff | At least interval, at most 300,000 ms |
 | Complete store verification | Optional, 1,000–86,400,000 ms; default 600,000 ms |
-| Unchanged snapshot refresh | Optional, at least interval, at most 3,600,000 ms; default 60,000 ms |
+| Unchanged snapshot refresh | Optional, at least interval, at most 3,600,000 ms; default 600,000 ms |
+| Catch-up window | Optional, 1,000–20,000 ms; default 15,000 ms, well within the universe's 25-second start budget |
 | Control request frame | 32,768 bytes within the shared 250 ms control deadline |
 | Observation value | Nonempty UTF-8, at most 4,096 bytes |
 | Control response | 32,768 bytes within the shared 250 ms control deadline |
@@ -158,7 +196,9 @@ an oversized frame returns `control request bound exceeded`. Invalid append valu
 UID or policy failures, and durable policy refusals return
 `append_observation_refused`. An occupied worker returns
 `append_observation_busy`; it admits no new work and makes no claim about whether
-a prior request with that operation ID will commit. `status_unavailable` is a
+a prior request with that operation ID will commit. A process that has not caught up
+with its peers returns `append_observation_catching_up` after the authorization checks
+and before any store access; retry the identical request. `status_unavailable` is a
 bounded diagnostic failure.
 
 A missing reply, a partial JSON reply or `append_observation_uncertain` leaves the
@@ -196,8 +236,24 @@ that is unacceptable.
 
 Status includes peer counters, last authenticated success age, next retry delay,
 acknowledged history count, local history count observed before attempt, and
-`history_count_delta`. This is not exact causal lag
-or convergence proof: equal counts can differ, and replayed receipts describe a
+`history_count_delta`. Each peer also reports `last_attempt_age_ms`, the age of the
+end of the last attempt whatever its outcome (equal to `last_success_age_ms` when that
+attempt succeeded, smaller once one failed after it); `acknowledged_unchanged`, true
+when that peer's receipt acknowledges the current local snapshot, the refresh has not
+elapsed and no push is due; the effective `refresh_ms` and `max_backoff_ms`; and
+`push_backs`. An idle link is confirmed once per refresh. A live link's last success is
+never older than the refresh plus one interval plus one exchange with each peer, since
+the outgoing worker visits them in turn (an exchange is bounded by connect, write and
+read deadlines of 2 seconds each); a link whose attempt failed is retried within the
+maximum backoff. The liveness bound a consumer should apply is therefore the refresh
+plus the maximum backoff plus one exchange, with a margin for those visits, and a failed
+attempt after the last success speaks at once. A peer that stops answering on an idle
+link is reported by the first attempt after it, at most one refresh plus that same
+margin after the last success.
+`catch_up` reports `caught_up`, `caught_up_by` (`every_peer`, `window` or `no_peers`),
+`caught_up_after_ms` since the process started exchanging, `peers_imported`,
+`peers_matched`, `peers_missing`, `own_facts_at_start` and `window_ms`. None of this is
+exact causal lag or convergence proof: equal counts can differ, and replayed receipts describe a
 historical committed result. Unknown values remain null. Unsigned diagnostics
 and failed exchanges clear `history_count_delta` to null; the previous acknowledged
 count is retained only as historical data with its last-success age. A new local
