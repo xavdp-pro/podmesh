@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex, MutexGuard, OnceLock,
+        Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -180,6 +180,14 @@ impl Drop for LiveConnection {
 /// on them.
 #[derive(Default)]
 struct StoreIntegrityEntry {
+    /// The failure that closed this database file for the process, if any. Every
+    /// commit of a transaction on the file holds it shared while SQLite commits,
+    /// and recording a failure takes it exclusively: a failure is recorded either
+    /// before a commit, which then rolls back and returns it, or once the commits
+    /// in flight have finished. Sharing costs those commits nothing, and the
+    /// positions are under their own lock, so no operation of this process waits
+    /// for another's commit.
+    closed: RwLock<Option<DurableError>>,
     state: Mutex<IntegrityState>,
     full_pass: Mutex<()>,
 }
@@ -187,7 +195,6 @@ struct StoreIntegrityEntry {
 #[derive(Default)]
 struct IntegrityState {
     positions: Option<VerifiedPositions>,
-    failure: Option<DurableError>,
     last_full_verification: Option<Instant>,
     full_verifications: u64,
 }
@@ -636,11 +643,12 @@ impl Store {
     /// # Errors
     /// Reports a poisoned integrity lock.
     pub fn integrity(&self) -> DurableResult<StoreIntegrity> {
+        let failure = closed_state(&self.integrity)?.clone();
         let state = integrity_state(&self.integrity)?;
         Ok(StoreIntegrity {
             full_verifications: state.full_verifications,
             last_full_verification_age: state.last_full_verification.map(|at| at.elapsed()),
-            failure: state.failure.clone(),
+            failure,
         })
     }
 
@@ -857,9 +865,20 @@ fn integrity_state(entry: &StoreIntegrityEntry) -> DurableResult<MutexGuard<'_, 
     lock(&entry.state, "store integrity lock")
 }
 
+/// The failure that closed a database file, shared with every other reader and
+/// committer of this process.
+fn closed_state(
+    entry: &StoreIntegrityEntry,
+) -> DurableResult<RwLockReadGuard<'_, Option<DurableError>>> {
+    entry
+        .closed
+        .read()
+        .map_err(|_| DurableError::Storage("store closure lock poisoned".into()))
+}
+
 impl StoreIntegrityEntry {
     fn refuse_if_failed(&self) -> DurableResult<()> {
-        integrity_state(self)?.failure.clone().map_or(Ok(()), Err)
+        closed_state(self)?.clone().map_or(Ok(()), Err)
     }
 
     /// The verified positions and the number of complete verifications so far.
@@ -869,9 +888,11 @@ impl StoreIntegrityEntry {
     }
 
     /// Records the first verification failure; every later operation returns it.
+    /// Taking the closure exclusively waits for the commits in flight, so none of
+    /// them completes after this failure is recorded.
     fn fail_closed(&self, problem: DurableError) -> DurableError {
-        if let Ok(mut state) = self.state.lock() {
-            state.failure.get_or_insert_with(|| problem.clone());
+        if let Ok(mut closed) = self.closed.write() {
+            closed.get_or_insert_with(|| problem.clone());
         }
         problem
     }
@@ -886,14 +907,16 @@ impl StoreIntegrityEntry {
     }
 
     /// Commits a transaction on this database file unless the file has failed
-    /// closed. The integrity state stays locked while SQLite commits, so a
-    /// failure is recorded either before the commit, which then rolls back and
-    /// returns that failure, or once the commit has completed: no transaction of
-    /// the process commits after the file is closed, including one that began,
-    /// or waited for the write lock, before the failure was recorded.
+    /// closed. The closure stays shared while SQLite commits, so a failure is
+    /// recorded either before the commit, which then rolls back and returns that
+    /// failure, or once this commit and the other commits in flight have
+    /// completed: no transaction of the process commits after the file is closed,
+    /// including one that began, or waited for the write lock, before the failure
+    /// was recorded. Other operations of the process share the same lock and never
+    /// wait for this commit.
     fn commit(&self, transaction: Transaction<'_>) -> DurableResult<()> {
-        let state = integrity_state(self)?;
-        if let Some(failure) = &state.failure {
+        let closed = closed_state(self)?;
+        if let Some(failure) = closed.as_ref() {
             return Err(failure.clone());
         }
         transaction.commit().map_err(error)
