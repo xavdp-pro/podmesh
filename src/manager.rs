@@ -132,6 +132,11 @@ fn observe(request: &Value, uuid: &str) -> Result<Value, Error> {
     let (door, facts) = locate(uuid)?;
     let reply = control(&door, &json!({"operation": "append_observation", "operation_id": id, "scope": scope, "subject": subject, "value": value}))?;
     if let Some(error) = reply.get("error").and_then(Value::as_str) {
+        // A resident that has not yet caught up with its peers since it started appends nothing
+        // and says so; the same operation is retried as is once it has (the resident's catch-up rule).
+        if error == "append_observation_catching_up" {
+            return Err("the resident has not caught up with its peers since it started (append_observation_catching_up): nothing was appended; retry the same operation".into());
+        }
         return Err(format!("the resident refused the observation: {error}").into());
     }
     Ok(json!({"universe_uuid": uuid, "container": facts, "scope": scope, "subject": subject, "resident_reply": reply,

@@ -99,23 +99,35 @@ def observe(h, args, scope, subject, value):
     The resident answers `append_observation_uncertain` when it cannot say whether the fact
     landed -- a replica restarted under the request, for instance. Uncertain is not failed: the
     store is read back, and the attempt is repeated only while the subject is genuinely absent,
-    so an administrator is never written twice and never silently missing."""
+    so an administrator is never written twice and never silently missing. A replica that has
+    not yet caught up with its peers since it started answers `append_observation_catching_up`
+    and appends nothing: it is waited for, up to 60 s."""
     last = ''
-    for attempt in range(5):
+    deadline = time.time() + 60
+    attempt = 0
+    while True:
+        attempt += 1
         answer = h.api({'operation': 'manager_observe', 'operation_id': str(uuid.uuid4()),
                         'universe_uuid': args.universe, 'authorization_ref': args.reference,
                         'scope': scope, 'subject': subject, 'value': value})
         if answer.get('ok'):
             return answer['data']
         last = answer.get('error') or ''
+        if 'catching_up' in last:
+            if time.time() >= deadline:
+                raise SystemExit(f'the replica did not catch up with its peers within 60 s: {last}')
+            time.sleep(2)
+            continue
         if 'uncertain' not in last and 'busy' not in last:
             raise SystemExit(f'the control door refused: {last}')
         time.sleep(2)
         try:
             if landed(h, args, subject, value):
-                return {'note': f'observed after an uncertain answer on attempt {attempt + 1}'}
+                return {'note': f'observed after an uncertain answer on attempt {attempt}'}
         except SystemExit:
             pass
+        if attempt >= 5:
+            break
     raise SystemExit(f'the control door stayed uncertain: {last}')
 
 
