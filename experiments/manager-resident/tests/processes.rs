@@ -188,17 +188,24 @@ impl Lab {
                 .spawn()
                 .unwrap(),
         );
-        until(
-            || {
-                if let Some(exit) = self.children[i].as_mut().unwrap().try_wait().unwrap() {
-                    panic!("resident r{i} exited while starting: {exit}");
-                }
-                self.control(i, "status").is_some()
-            },
-            Duration::from_secs(15),
-        );
+        let (bound, allowance) = readiness_bound();
+        let started = Instant::now();
+        loop {
+            if let Some(exit) = self.children[i].as_mut().unwrap().try_wait().unwrap() {
+                panic!("resident r{i} exited while starting: {exit}");
+            }
+            if self.control(i, "status").is_some() {
+                break;
+            }
+            assert!(
+                started.elapsed() < bound + allowance,
+                "resident r{i} did not answer status within {bound:?} (load allowance {allowance:?})"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
     }
     fn status(&self, i: usize) -> Value {
+        let (bound, allowance) = readiness_bound();
         let start = Instant::now();
         loop {
             if let Some(reply) = self.control(i, "status") {
@@ -207,8 +214,8 @@ impl Lab {
                 }
             }
             assert!(
-                start.elapsed() < Duration::from_secs(15),
-                "status did not become available"
+                start.elapsed() < bound + allowance,
+                "status did not become available within {bound:?} (load allowance {allowance:?})"
             );
             thread::sleep(Duration::from_millis(25));
         }
@@ -359,6 +366,19 @@ impl Drop for Lab {
         }
     }
 }
+/// How long a resident may take to answer status. The universe gives a whole
+/// start 25 seconds, the catch-up window included, so a resident must bind its
+/// control socket within a few seconds. `PODMESH_RESIDENT_TEST_LOAD_ALLOWANCE_MS`
+/// adds an explicit allowance for a machine known to be loaded; a failure names
+/// the bound and the allowance apart.
+fn readiness_bound() -> (Duration, Duration) {
+    let allowance = std::env::var("PODMESH_RESIDENT_TEST_LOAD_ALLOWANCE_MS")
+        .ok()
+        .and_then(|milliseconds| milliseconds.parse().ok())
+        .map_or(Duration::ZERO, Duration::from_millis);
+    (Duration::from_secs(5), allowance)
+}
+
 #[track_caller]
 fn until(mut predicate: impl FnMut() -> bool, timeout: Duration) {
     let start = Instant::now();
@@ -506,6 +526,33 @@ fn wrong_key_and_oversized_frames_do_not_import() {
     assert_eq!(lab.count(1), 0);
     assert_eq!(lab.count(2), 0);
     assert_eq!(lab.status(0)["peers"]["r1"]["authenticated_successes"], 0);
+    // An oversized frame is answered and imports nothing. A connection that
+    // arrives while both incoming workers are busy is closed unread and counted
+    // as rejected, which resets it: that is admission, tested on its own, and
+    // such an attempt is repeated.
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let rejected = lab.status(1)["rejected_connections"].as_u64().unwrap();
+        let mut stream = TcpStream::connect(lab.configs[1].network.bind).unwrap();
+        stream.write_all(&524_289_u32.to_be_bytes()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut reply = Vec::new();
+        match stream.read_to_end(&mut reply) {
+            Ok(_) => break,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ConnectionReset
+                    && attempts < 5
+                    && lab.status(1)["rejected_connections"].as_u64().unwrap() > rejected =>
+            {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => panic!("oversized frame attempt {attempts}: {error}"),
+        }
+    }
+    assert_eq!(lab.count(1), 0);
     // Neither the refused import nor the refused push catches r1 up with r0, and
     // an empty store keeps refusing appends.
     until(
@@ -523,14 +570,6 @@ fn wrong_key_and_oversized_frames_do_not_import() {
         .unwrap()["error"],
         "append_observation_catching_up"
     );
-    let mut stream = TcpStream::connect(lab.configs[1].network.bind).unwrap();
-    stream.write_all(&524_289_u32.to_be_bytes()).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    let mut reply = Vec::new();
-    stream.read_to_end(&mut reply).unwrap();
-    assert_eq!(lab.count(1), 0);
     for i in 0..3 {
         lab.stop(i);
     }
@@ -1509,14 +1548,15 @@ fn acknowledged_unchanged_snapshot_is_refreshed_after_the_configured_delay() {
     let started = Instant::now();
     // About one refresh per second, not one exchange per 100 ms interval: the
     // third exchange after this one cannot come before two refreshes have
-    // elapsed, however slow a loaded machine makes each exchange.
+    // elapsed, however slow a loaded machine makes each exchange, and it comes
+    // well before a refresh twice as long would allow.
     until(
         || peer_successes(&lab, 0, "r1") >= first + 3,
         Duration::from_secs(15),
     );
     let elapsed = started.elapsed();
     assert!(
-        elapsed >= Duration::from_millis(1_900),
+        (Duration::from_millis(1_900)..Duration::from_secs(6)).contains(&elapsed),
         "three exchanges after {elapsed:?}"
     );
     for i in 0..3 {
