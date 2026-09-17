@@ -3,7 +3,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import request from 'supertest'
 import { createApp, administrators } from '../server/app.mjs'
-import { hashPassword, markReader, observer } from '../server/resident.mjs'
+import { factsReader, hashPassword, markReader, observer } from '../server/resident.mjs'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
@@ -255,5 +255,22 @@ describe("the active manager's mark on disk", () => {
     expect(markReader([file])()).toBeNull()
     fs.writeFileSync(file, '[]')
     expect(markReader([file])()).toBeNull()
+  })
+})
+
+describe("the store's facts", () => {
+  it('are read through the facts-only inspection, and a failed or unreadable inspection is an error', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'podmesh-facts-'))
+    const args = path.join(dir, 'arguments')
+    const binary = path.join(dir, 'podmesh-managerd')
+    const answer = JSON.stringify({ history_count: 1, ordered_facts: [fact('admin.user.admin', stored)], logical_history_sha256: '0'.repeat(64) })
+    fs.writeFileSync(binary, `#!/bin/sh\nprintf '%s\\n' "$@" > '${args}'\nprintf '%s' '${answer}'\n`, { mode: 0o755 })
+    const read = factsReader({ binary, config: '/etc/podmesh-manager/config.json', state: '/var/lib/podmesh-manager' })
+    expect(await read()).toEqual([fact('admin.user.admin', stored)])
+    expect(fs.readFileSync(args, 'utf8').trim().split('\n')).toEqual(['--inspect-store', '--facts-only', '--config', '/etc/podmesh-manager/config.json', '--state-dir', '/var/lib/podmesh-manager'])
+    fs.writeFileSync(binary, '#!/bin/sh\necho "corrupt: stored fact hash mismatch" >&2\nexit 1\n')
+    await expect(read()).rejects.toThrow('the store could not be inspected')
+    fs.writeFileSync(binary, '#!/bin/sh\nprintf "not json"\n')
+    await expect(read()).rejects.toThrow('the store could not be inspected')
   })
 })

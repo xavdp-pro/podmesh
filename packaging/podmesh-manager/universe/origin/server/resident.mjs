@@ -30,8 +30,12 @@ export const markReader = paths => () => {
 }
 
 // The ordered facts, read by the resident's own read-only inspection (never by opening the store).
+// `--facts-only` verifies the schema, the identity and every fact of its private copy and prints the
+// facts alone: neither its output nor its verification grows with the exchange audit table, whereas
+// the full inspection prints every audit row (21 MB at 21,700 rows, 96 MB at 100,000, measured on
+// 2026-09-17) and would outgrow this buffer near 70,000.
 export const factsReader = ({ binary, config, state }) => () => new Promise((resolve, reject) => {
-  execFile(binary, ['--inspect-store', '--config', config, '--state-dir', state], { timeout: 20000, maxBuffer: 64 << 20 }, (err, stdout) => {
+  execFile(binary, ['--inspect-store', '--facts-only', '--config', config, '--state-dir', state], { timeout: 20000, maxBuffer: 64 << 20 }, (err, stdout) => {
     if (err) return reject(new Error('the store could not be inspected'))
     try {
       resolve(JSON.parse(stdout).ordered_facts || [])
