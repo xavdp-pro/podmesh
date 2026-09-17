@@ -49,10 +49,10 @@ there runs the HA-10 shape on three hosts and proves, by the frozen candidate's 
   the fact is observed once or the start fails as before. Since 2026-09-17 a
   `catching_up` answer is retried the same way: the resident appends nothing before it has
   caught up with its peers, so that a store which lost some of this replica's own facts gets
-  them back before the boot fact takes the next sequence number. A store with no fact of its
-  own and a peer that stays unreachable is therefore refused a start at the budget. Any other
-  answer stays terminal, and the injected boot fault (a socket that does not exist) still exits
-  2 at once.
+  them back before the boot fact takes the next sequence number. An emptied store, or one that
+  only imported its own facts back, is therefore refused a start at the budget while a peer
+  stays unreachable, and so is a replica that reaches no peer. Any other answer stays terminal,
+  and the injected boot fault (a socket that does not exist) still exits 2 at once.
 - **Attested binary.** The check exports `/usr/lib/podmesh-manager/podmesh-managerd` from the
   universe and refuses any inspection unless its SHA-256 equals the inspector's on the
   workstation; both digests are recorded in the result.

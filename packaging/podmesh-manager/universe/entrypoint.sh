@@ -104,11 +104,13 @@ scope=$(python3 -c 'import json,sys; c=json.load(open("/etc/podmesh-manager/conf
 # that a store which lost some of this replica's own facts gets them back before the boot fact
 # takes the next sequence number, instead of reusing one its peers hold with other bytes, which
 # they would refuse for good. It touched nothing, so the retry is safe. With every peer up this
-# takes a few exchanges; a store that already held facts of its own also appends once its catch-up
-# window has elapsed, 15 s by default after the resident starts exchanging, which fits the budget
-# when the control socket was bound within about ten seconds. A store with no fact of its own and a
-# peer that stays unreachable is refused a start at the budget, visibly, rather than forking its
-# history.
+# takes a few exchanges. A store whose latest fact of its own it appended itself also appends once
+# its catch-up window has elapsed (15 s at most, from the moment its control socket is bound), it
+# has reached one peer and tried every other: this clock counts whole seconds, so the last attempt
+# is certain only 24 s after this script started, and attempts are about 0.6 s apart, so such a
+# start fits the budget while the socket is bound within about 8 s. An emptied store, or one that
+# only imported its own facts back, is refused a start at the budget while a peer stays
+# unreachable, visibly, rather than forking its history; so is a replica that reaches no peer.
 observed=no; attempt=0
 while :; do
   attempt=$((attempt + 1))
