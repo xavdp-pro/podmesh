@@ -7,6 +7,12 @@ This record consolidates the operator's conversation. It is design input, not
 SHAPER canon, an implemented specification, or proof of high availability.
 Dialogue is French; repository assets, documentation and comments are English.
 
+**Direction since 2026-09-17:** [IDEAL-SCENE.md](IDEAL-SCENE.md) states what PodMesh ought to be on any
+topology (one host to ten and more, with or without shared storage);
+[IDEAL-SCENE-PROGRAM.md](IDEAL-SCENE-PROGRAM.md) compares it with the existing scene and orders the targets;
+[IDEAL-SCENE-CHECKLISTS.md](IDEAL-SCENE-CHECKLISTS.md) lists what proves each part. When this record and the
+ideal scene disagree, the ideal scene is the reference and the record is corrected.
+
 ## Purpose
 
 Build an open-source Podman management layer for autonomous Linux hosts: physical

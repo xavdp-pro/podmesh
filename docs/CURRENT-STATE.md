@@ -1060,3 +1060,17 @@ operator requires it: only on the manager replica in charge of the system (the p
 Not done: pruning policy exposed in the console; the Explorer and fractal views in the new front; pre-copy; a
 redundant guardian; out-of-band fencing.
 
+## The ideal scene, the program and the checklists (2026-09-17)
+
+The operator asked for PodMesh's documentation from the point of view of the ideal scene, then a rational plan and
+checklists, for every kind of adopter: one host, two, ten at once, with or without shared replicated storage such as
+CephFS, and adding a host without friction. They are [IDEAL-SCENE.md](IDEAL-SCENE.md) (goal, purposes, the invariants,
+the valuable final products, the ideal scene per area and per topology, the statistics),
+[IDEAL-SCENE-PROGRAM.md](IDEAL-SCENE-PROGRAM.md) (the existing scene with evidence, ten departures, the situation, the
+why, the program: primary, vital, conditional, operating and production targets) and
+[IDEAL-SCENE-CHECKLISTS.md](IDEAL-SCENE-CHECKLISTS.md) (the invariants, the node, universe declaration, disconnection
+and reconnection, host loss, data protection, topology certification, growth, observability, laboratory hygiene).
+The research behind the disconnection model (Nomad, Kubernetes, KubeEdge, OpenYurt, Swarm, Pacemaker, SBD, DRBD,
+witness designs, SWIM and Lifeguard, Corrosion, fencing tokens) is kept with its sources in the laboratory store,
+`podmesh-lab/claude/RECHERCHE-PARTITIONS-2026-09-17.md`.
+
