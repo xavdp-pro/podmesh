@@ -535,7 +535,7 @@ fn effect_apply(e: &Effect) -> Result<(), Error> {
             let pid = running_pid(&text_of(&e.intent, "universe"))?.ok_or("the universe that is to carry the address is not running")?;
             alias_add(pid, &text_of(&e.intent, "ip"))
         }
-        crate::publisher::KIND_MARK => crate::publisher::mark_write(&text_of(&e.intent, "carrier"), &text_of(&e.intent, "resource"), e.intent["epoch"].as_i64().unwrap_or(0)),
+        kind if crate::publisher::is_mark(kind) => crate::publisher::mark_write(&text_of(&e.intent, "carrier"), &text_of(&e.intent, "resource"), e.intent["epoch"].as_i64().unwrap_or(0)),
         crate::publisher::KIND_PUBLISHER => crate::publisher::connector_start_by_intent(&e.intent),
         other => Err(format!("unknown effect kind {other}").into()),
     }
@@ -561,7 +561,7 @@ fn effect_verify(e: &Effect) -> Option<bool> {
             None => Some(false),
             Some(pid) => alias_present(pid, &text_of(&e.intent, "ip")),
         },
-        crate::publisher::KIND_MARK => crate::publisher::mark_present(&text_of(&e.intent, "carrier")),
+        kind if crate::publisher::is_mark(kind) => crate::publisher::mark_present(&text_of(&e.intent, "carrier")),
         crate::publisher::KIND_PUBLISHER => crate::publisher::connector_present(&text_of(&e.intent, "resource")),
         _ => None,
     }
@@ -590,10 +590,19 @@ fn effect_undo(e: &Effect) -> Result<(), Error> {
             Ok(())
         }
         "alias" => alias_remove(&text_of(&e.intent, "universe"), &text_of(&e.intent, "ip")),
-        crate::publisher::KIND_MARK => crate::publisher::mark_remove(&text_of(&e.intent, "carrier")),
+        kind if crate::publisher::is_mark(kind) => crate::publisher::mark_remove(&text_of(&e.intent, "carrier")),
         crate::publisher::KIND_PUBLISHER => crate::publisher::connector_stop(&text_of(&e.intent, "resource")),
         other => Err(format!("unknown effect kind {other}").into()),
     }
+}
+
+/// Whether an effect just applied is there as its apply leaves it: its presence, except for the
+/// active manager's mark, whose write also leaves nothing at the previous path.
+fn effect_verify_applied(e: &Effect) -> Option<bool> {
+    if crate::publisher::is_mark(&e.kind) {
+        return crate::publisher::mark_written(&text_of(&e.intent, "carrier"));
+    }
+    effect_verify(e)
 }
 
 /// Apply, then verify from outside, then record effective. An error leaves the row `applying`
@@ -601,7 +610,7 @@ fn effect_undo(e: &Effect) -> Result<(), Error> {
 fn effect_do(db: &Connection, e: &Effect) -> Result<(), Error> {
     effect_apply(e)?;
     fault(&format!("after-{}", e.kind))?;
-    match effect_verify(e) {
+    match effect_verify_applied(e) {
         Some(true) => effect_state(db, e, "effective", None),
         Some(false) => Err(format!("{} {} is not effective after being applied", e.kind, e.key).into()),
         None => Err(format!("{} {} could not be verified after being applied; its state is unknown", e.kind, e.key).into()),

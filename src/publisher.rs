@@ -37,10 +37,21 @@ use std::io::{Read, Write};
 type Error = Box<dyn std::error::Error>;
 
 pub const KIND_PUBLISHER: &str = "publisher";
-// The active manager's mark. Its effect kind and its path inside the universe keep the names that
-// journals and running manager images already use; a later, compatible rename changes both.
-pub const KIND_MARK: &str = "governor_mark";
-const MARK_PATH: &str = "/run/podmesh-manager/governor.json";
+// The active manager's mark: its effect kind in the ledger and its path inside the carrier universe.
+pub const KIND_MARK: &str = "active_manager_mark";
+const MARK_PATH: &str = "/run/podmesh-manager/active-manager.json";
+// The names both had before 2026-09-17. The hosts' journals keep rows of the previous kind, some
+// left `applying` or `removing` by a crash: the same effect, matched wherever the kind is matched
+// (`is_mark`) until no journal holds one, and never rewritten. The previous path is still removed
+// at every write and every removal, until no running manager image reads it: the origin falls back
+// to it when the current path is absent, so a file left there would keep a withdrawn replica marked.
+const KIND_MARK_PREVIOUS: &str = "governor_mark";
+const MARK_PATH_PREVIOUS: &str = "/run/podmesh-manager/governor.json";
+
+/// Whether a ledger row's kind is the active manager's mark, under its name or the previous one.
+pub(crate) fn is_mark(kind: &str) -> bool {
+    kind == KIND_MARK || kind == KIND_MARK_PREVIOUS
+}
 
 pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
     db.execute_batch(
@@ -321,31 +332,55 @@ fn origin_ready(ip: &str, port: u16) -> Result<(u16, Value), String> {
 }
 
 /// The active manager's mark inside the carrier universe: written and removed with
-/// `podman exec`, root-only.
+/// `podman exec`, root-only. A write removes the previous path too.
 pub(crate) fn mark_write(carrier: &str, resource: &str, epoch: i64) -> Result<(), Error> {
     // Lab-only: a mark one epoch behind, so that the readiness check has a lie to catch.
     let epoch = if std::env::var("PODMESH_FAULT").as_deref() == Ok("publisher-stale-mark") { epoch - 1 } else { epoch };
     let content = json!({"resource": resource, "epoch": epoch, "marked_at": crate::now()}).to_string();
-    lc::podman(lc::QUICK, &["exec", &format!("podmesh-{carrier}"), "sh", "-c", &format!("umask 077; printf '%s' '{content}' > {MARK_PATH}.tmp && mv -f {MARK_PATH}.tmp {MARK_PATH}")])?;
+    lc::podman(
+        lc::QUICK,
+        &["exec", &format!("podmesh-{carrier}"), "sh", "-c", &format!("umask 077; printf '%s' '{content}' > {MARK_PATH}.tmp && mv -f {MARK_PATH}.tmp {MARK_PATH} && rm -f {MARK_PATH_PREVIOUS}")],
+    )?;
     Ok(())
 }
 
-pub(crate) fn mark_present(carrier: &str) -> Option<bool> {
-    let out = std::process::Command::new("podman").args(["exec", &format!("podmesh-{carrier}"), "test", "-f", MARK_PATH]).output().ok()?;
+/// Which of the mark's paths hold a file inside the carrier, the current and the previous, read
+/// with one `podman exec`; `None` when that could not be read.
+fn mark_files(carrier: &str) -> Option<(bool, bool)> {
+    let name = format!("podmesh-{carrier}");
+    let script = format!("for p in {MARK_PATH} {MARK_PATH_PREVIOUS}; do if test -f $p; then echo present; else echo absent; fi; done");
+    let out = std::process::Command::new("podman").args(["exec", &name, "sh", "-c", &script]).output().ok()?;
     if out.status.success() {
-        return Some(true);
+        let text = String::from_utf8_lossy(&out.stdout);
+        let seen: Vec<&str> = text.split_whitespace().collect();
+        return match seen[..] {
+            [current, previous] => Some((current == "present", previous == "present")),
+            _ => None,
+        };
     }
-    // A universe that is not running carries no mark; exec on it fails for that reason.
-    match lc::inspect(&format!("podmesh-{carrier}")) {
-        Ok(Some(c)) if c["State"]["Running"] == json!(true) => Some(false),
-        Ok(_) => Some(false),
+    // A universe that is not running carries no mark; exec on it fails for that reason. One that
+    // runs and could not be read is unknown.
+    match lc::inspect(&name) {
+        Ok(Some(c)) if c["State"]["Running"] == json!(true) => None,
+        Ok(_) => Some((false, false)),
         Err(_) => None,
     }
 }
 
+/// Whether a mark is there at either path, a file the origin would read: what the status reports,
+/// what drift is judged on, and what a removal must leave false.
+pub(crate) fn mark_present(carrier: &str) -> Option<bool> {
+    mark_files(carrier).map(|(current, previous)| current || previous)
+}
+
+/// Whether the mark is as a write leaves it: at the current path, and nothing at the previous one.
+pub(crate) fn mark_written(carrier: &str) -> Option<bool> {
+    mark_files(carrier).map(|(current, previous)| current && !previous)
+}
+
 pub(crate) fn mark_remove(carrier: &str) -> Result<(), Error> {
     if mark_present(carrier) == Some(true) {
-        lc::podman(lc::QUICK, &["exec", &format!("podmesh-{carrier}"), "rm", "-f", MARK_PATH])?;
+        lc::podman(lc::QUICK, &["exec", &format!("podmesh-{carrier}"), "rm", "-f", MARK_PATH, MARK_PATH_PREVIOUS])?;
     }
     Ok(())
 }
@@ -468,6 +503,7 @@ fn view(db: &Connection, resource: &str) -> Result<Value, Error> {
     let carrier_identity = service.as_ref().and_then(|(_, carrier)| {
         crate::manager::execute(db, &json!({"operation": "manager_status", "universe_uuid": carrier})).ok().map(|s| s["resident_status"]["replica_id"].clone())
     });
+    let mark = service.as_ref().and_then(|(_, carrier)| mark_present(carrier));
     Ok(json!({
         "resource": resource,
         "declared": {"hostname": p.hostname, "tunnel_uuid": p.tunnel_uuid, "credential": p.credential, "origin_port": p.origin_port},
@@ -478,7 +514,9 @@ fn view(db: &Connection, resource: &str) -> Result<Value, Error> {
         "service": service.as_ref().map(|(ip, carrier)| json!({"ip": ip, "carrier_universe_uuid": carrier})),
         "carrier_replica_id": carrier_identity,
         "origin_readiness": readiness,
-        "governor_mark": service.as_ref().and_then(|(_, carrier)| mark_present(carrier)),
+        "active_manager_mark": mark,
+        // Deprecated: the field's previous name, the same value, kept for one release.
+        "governor_mark": mark,
         "transition": transition_of(db, resource)?.map(|(s, e)| json!({"state": s, "epoch": e})),
         "publisher_eligible": eligible,
         "reasons": reasons,
@@ -618,6 +656,12 @@ fn perform(db: &Connection, request: &Value, resource: &str) -> Result<Value, Er
     }
 }
 
+/// The ledger rows a withdrawal of the resource undoes, in the ledger's order: the connector's and
+/// the mark's, under either of the mark's kinds, whatever their state.
+fn publisher_effects(db: &Connection, resource: &str) -> Result<Vec<crate::network::Effect>, Error> {
+    Ok(crate::network::effect_rows_public(db, Some(resource))?.into_iter().filter(|e| e.kind == KIND_PUBLISHER || is_mark(&e.kind)).collect())
+}
+
 /// The connector stopped and the mark removed, each recorded `removing` first and verified gone:
 /// what `publisher_stop` and the fence do. The effects of the resource whose kind is the
 /// publisher's or the mark's, last first (the connector before the mark).
@@ -625,10 +669,7 @@ fn withdraw(db: &Connection, resource: &str, why: &str, id: &str) -> Result<Valu
     if let Some((_, epoch)) = transition_of(db, resource)? {
         transition(db, resource, "stopping", epoch, id)?;
     }
-    let effects: Vec<_> = crate::network::effect_rows_public(db, Some(resource))?
-        .into_iter()
-        .filter(|e| e.kind == KIND_PUBLISHER || e.kind == KIND_MARK)
-        .collect();
+    let effects = publisher_effects(db, resource)?;
     let mut steps = vec![];
     let mut failed = false;
     for e in effects.iter().rev() {
@@ -664,11 +705,67 @@ pub(crate) fn withdraw_unentitled(db: &Connection, entitled: &dyn Fn(&str) -> bo
             continue;
         }
         // Nothing to withdraw is not a withdrawal: reported only when something was there.
-        let had = crate::network::effect_rows_public(db, Some(&resource))?.iter().any(|e| e.kind == KIND_PUBLISHER || e.kind == KIND_MARK)
-            || connector_present(&resource) == Some(true);
+        let had = !publisher_effects(db, &resource)?.is_empty() || connector_present(&resource) == Some(true);
         if had {
             report.push(withdraw(db, &resource, "fence", id)?);
         }
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const R: &str = "91eeb6bf-5489-405b-b77a-53105b0aff7a";
+    const CARRIER: &str = "c7a1f732-80b5-4421-9241-e08066f04cb8";
+
+    fn journal() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        crate::network::ensure_schema(&db).unwrap();
+        ensure_schema(&db).unwrap();
+        db
+    }
+
+    fn row(db: &Connection, kind: &str, key: &str, owner: &str, state: &str) {
+        db.execute(
+            "INSERT INTO network_effects(kind,key,owner,intent,state,operation_id,changed_at) VALUES(?1,?2,?3,?4,?5,'x',0)",
+            params![kind, key, owner, json!({"carrier": CARRIER, "resource": owner, "epoch": 1}).to_string(), state],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_mark_is_matched_under_its_previous_kind() {
+        assert!(is_mark("active_manager_mark") && is_mark("governor_mark"));
+        for other in [KIND_PUBLISHER, "route", "alias", "bridge", "peer_route", "nat_table", ""] {
+            assert!(!is_mark(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_withdrawal_finds_marks_of_the_previous_kind_in_every_state() {
+        let db = journal();
+        let key = format!("{R}@{CARRIER}");
+        // As an earlier build left them in a host's journal: a mark effective beside its connector,
+        // and marks left `applying` and `removing` by crashes.
+        row(&db, "governor_mark", &key, R, "effective");
+        row(&db, KIND_PUBLISHER, &unit_name(R), R, "effective");
+        row(&db, "governor_mark", &key, R, "applying");
+        row(&db, "governor_mark", &key, R, "removing");
+        // This build's mark, a kind that is not the publisher's under the same owner, and another
+        // resource's mark.
+        row(&db, "active_manager_mark", &key, R, "applying");
+        row(&db, "route", "10.86.0.100/32", R, "effective");
+        row(&db, "active_manager_mark", "elsewhere", "00000000-0000-4000-8000-000000000002", "effective");
+        let found: Vec<(String, String)> = publisher_effects(&db, R).unwrap().into_iter().map(|e| (e.kind, e.state)).collect();
+        let expected = [
+            ("governor_mark", "effective"),
+            ("publisher", "effective"),
+            ("governor_mark", "applying"),
+            ("governor_mark", "removing"),
+            ("active_manager_mark", "applying"),
+        ];
+        assert_eq!(found, expected.map(|(k, s)| (k.to_string(), s.to_string())));
+    }
 }

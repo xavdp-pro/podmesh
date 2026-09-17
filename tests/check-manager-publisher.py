@@ -200,7 +200,7 @@ try:
     st = wait_connector(G)
     assert st['unit']['state'] == 'active' and st['connector_id'], st
     assert st['origin_readiness']['status'] == 200 and st['origin_readiness']['body']['epoch'] == e1 and st['origin_readiness']['body']['replica_id'] == replica_ids[G], st['origin_readiness']
-    assert st['carrier_replica_id'] == replica_ids[G] and st['governor_mark'] is True, st
+    assert st['carrier_replica_id'] == replica_ids[G] and st['active_manager_mark'] is True, st
     checks.append(f'{G} started its connector: unit active, connection {st["connector_id"][:8]}… registered, the origin ready at epoch {e1} with {G}\'s replica, the mark present')
     status, body = public_ready()
     assert status == 200 and body['logical_manager_id'] == LOGICAL and body['replica_id'] == replica_ids[G] and body['epoch'] == e1, (status, body)
@@ -219,7 +219,7 @@ try:
     fence_op = str(uuid.uuid4())
     fence = hosts[G].ok({'operation': 'activation_fence', 'operation_id': fence_op, 'authorization_ref': reference, 'timeout_seconds': 10})
     pw = fence['publishers_withdrawn']
-    assert pw and pw[0]['withdrawn'] is True and [s['kind'] for s in pw[0]['steps'] if not s.get('unrecorded')] == ['publisher', 'governor_mark'], fence
+    assert pw and pw[0]['withdrawn'] is True and [s['kind'] for s in pw[0]['steps'] if not s.get('unrecorded')] == ['publisher', 'active_manager_mark'], fence
     rw = [r for r in fence['routes_withdrawn'] if r['ip'] == SERVICE]
     assert rw and rw[0]['withdrawn'] is True, fence
     st = pub('publisher_status', G)['data']

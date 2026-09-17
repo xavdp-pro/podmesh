@@ -305,7 +305,7 @@ try:
     assert withdrawn_lines, log[-2000:]
     withdrawn_at_g = float(withdrawn_lines[0].split()[0])
     st = pub('publisher_status', G)['data']
-    assert st['unit']['state'] != 'active' and st['publisher_eligible'] is False and st['governor_mark'] in (False, None), st
+    assert st['unit']['state'] != 'active' and st['publisher_eligible'] is False and st['active_manager_mark'] in (False, None), st
     assert withdrawn_at_g < publish_at_s + 1.0, (withdrawn_at_g, publish_at_s)
     stops = [l for l in log.splitlines() if '"event": "fence"' in l or 'podmesh-publisher' in l]
     checks.append(f'{G}\'s own journal: its timer withdrew at {withdrawn_at_g} ({round(withdrawn_at_g - lease_expires, 1)} s after the lapse, {round(publish_at_s - withdrawn_at_g, 1)} s before {S} published); its connector inactive, no mark, not eligible')

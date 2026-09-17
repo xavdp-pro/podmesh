@@ -99,7 +99,7 @@ def refused(document, fragment, label):
     assert fragment in r['error'], (label, 'refused for another reason', r['error'])
     assert not unit_active() and origin() == '503', (label, 'the refusal left something')
     st = pub('publisher_status')['data']
-    assert st['transition'] is None and st['governor_mark'] is False, (label, st)
+    assert st['transition'] is None and st['active_manager_mark'] is False, (label, st)
     checks.append(f'refused ({fragment}): {label}')
 
 u = str(uuid.uuid4())

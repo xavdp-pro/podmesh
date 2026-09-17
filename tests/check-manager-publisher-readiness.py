@@ -112,7 +112,7 @@ try:
     assert origin()[0] == '503', 'the stale mark was not compensated'
     assert A.ssh(f'systemctl is-active podmesh-publisher-{LOGICAL}.service', check=False).stdout.decode().strip() != 'active'
     st = pub('publisher_status')['data']
-    assert st['governor_mark'] is False and st['unit']['state'] != 'active', st
+    assert st['active_manager_mark'] is False and st['unit']['state'] != 'active', st
     checks.append('under the active manager\'s mark written one epoch behind, the start was refused by the readiness check, the mark compensated (origin back to 503), no connector unit')
 
     daemon()

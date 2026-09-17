@@ -13,9 +13,9 @@ address; the connection from lab-a and lab-c now lands on lab-b's replica, lab-a
 carries nothing. Between the two, with nothing announced, the connection fails at once. Cleanup
 returns the hosts to their initial state.
 
-Same environment as check-manager-governor-managed.py. The images must be built from configurations
-whose replicas listen on every address (bind 0.0.0.0): a replica bound to its own address alone
-does not answer at the alias, which is what the first run of this suite found.
+Same environment as check-manager-active-manager-managed.py. The images must be built from
+configurations whose replicas listen on every address (bind 0.0.0.0): a replica bound to its own
+address alone does not answer at the alias, which is what the first run of this suite found.
 """
 import json, os, pathlib, subprocess, sys, tempfile, time, uuid
 

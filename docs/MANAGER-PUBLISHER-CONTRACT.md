@@ -6,9 +6,16 @@ at the end, and nothing above it is a claim about code.
 
 Naming (the operator's decision of 2026-09-17): the **active manager** is the manager replica
 whose host holds a live, unsuperseded activation lease on the logical manager resource under the
-epoch gate. PodMesh's documents and identifiers called it the governor before that date;
-identifiers keep the word for compatibility with journals and APIs (`governor_mark`, for
-example), and "governor" alone now means the SHAPER canon's governor.
+epoch gate. The identifiers of its mark were renamed that day, compatibly:
+
+- the mark's path inside the carrier universe is `/run/podmesh-manager/active-manager.json`; a
+  node also removes `/run/podmesh-manager/governor.json` whenever it writes or removes the mark,
+  until no running manager image reads that path;
+- its kind in the network effects ledger is `active_manager_mark`; rows of kind `governor_mark`
+  written by earlier builds are the same effect, matched wherever the kind is matched and never
+  rewritten, until no host's journal holds one;
+- `publisher_status` reports it as `active_manager_mark`, and as `governor_mark`, deprecated,
+  with the same value for one release.
 
 The logical manager's human-facing interface is published through a Cloudflare Tunnel. That must
 not create a second election or a second authority: the connector is transport, it decides
@@ -33,7 +40,7 @@ stable, epoch-qualified service address and fails closed when that origin is not
 | tunnel UUID, hostname, credential's name, origin port | the host's journal (`publisher_declare`) | — |
 | the tunnel credential | Podman's secret store on the host (`secret_declare`), a root-only runtime copy while the connector runs | Git, an image layer, the journal, the replicated store, a recovery point |
 | the connector's identity | `cloudflared`'s own journal (`connection=<id>`) | the journal as truth |
-| the active manager's mark (resource, epoch, marked at) | a root-only file inside the carrier universe, written and removed by PodMesh | anywhere the universe could write it itself |
+| the active manager's mark (resource, epoch, marked at) | `/run/podmesh-manager/active-manager.json`, a root-only file inside the carrier universe, written and removed by PodMesh | anywhere the universe could write it itself |
 
 ## The origin, epoch-qualified
 
@@ -94,8 +101,9 @@ with it (`UNIVERSE-NETWORK-CONTRACT.md`, "Failure and cleanup states"), all with
 - `publisher_status` (read-only; `resource`): what is declared; the unit's state; the
   connector's identity from its journal; the lease and epoch; the service address and its
   carrier; the carrier's replica identity through the control door; the origin's readiness now;
-  the active manager's mark (`governor_mark`); `publisher_eligible` with the refusal reasons; the
-  last start, stop, fence and observed request.
+  the active manager's mark (`active_manager_mark`: true while a file is at its path or at the
+  previous one; `governor_mark`, deprecated, carries the same value); `publisher_eligible` with
+  the refusal reasons; the last start, stop, fence and observed request.
 
 ## Takeover, in order
 
@@ -172,3 +180,14 @@ withdrawal on lab-b came 30.5 s before lab-c's publication (both hosts' clocks r
 the switch reconnected lab-b, it was superseded, followed the role, converged as a standby and
 its connector stayed stopped. Not shown: clocks that lie (a one-second allowance), a wedged
 daemon on the cut side (self-withdrawal runs through the daemon).
+
+**2026-09-17, the mark's identifiers renamed, not yet run on the hosts:** a node writes the mark
+at `/run/podmesh-manager/active-manager.json` and removes the previous path in the same command;
+it verifies a write by a file at the mark's path and none at the previous one, and a removal by
+no file at either. New ledger rows are of kind `active_manager_mark`; the ledger's apply, verify
+and undo, the reconciliation, the withdrawal and the fence match `governor_mark` rows as well, and
+a unit test on an in-memory journal holds the withdrawal's selection of them in every state.
+`publisher_status` reports both fields. The origin that reads both paths is built in the web
+tree; an origin that reads only the previous path answers 503 to a mark at the new one, so a node
+running this build is refused at `publisher_start`'s readiness check until the manager image is
+rolled.

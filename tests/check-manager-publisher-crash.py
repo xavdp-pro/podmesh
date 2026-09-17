@@ -100,7 +100,7 @@ def unit_active():
 
 def nothing_left(label):
     st = pub('publisher_status')['data']
-    assert not unit_active() and st['transition'] is None and st['governor_mark'] is False and origin() == '503', (label, unit_active(), st.get('transition'), st.get('governor_mark'), origin())
+    assert not unit_active() and st['transition'] is None and st['active_manager_mark'] is False and origin() == '503', (label, unit_active(), st.get('transition'), st.get('active_manager_mark'), origin())
 
 u = str(uuid.uuid4())
 declared = False

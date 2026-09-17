@@ -6,7 +6,7 @@ machine. PodMesh names its own roles otherwise: the PodMesh node (podmeshd on ea
 (the replicated coordination service) and the active manager (the replica holding the role at an epoch). This
 test reads the tracked files where PodMesh speaks -- src/, tools/, tests/, packaging/, docs/, README.md,
 INTENT.md, AGENTS.md -- and fails on "maker", "makers", "governor" or "governors" wherever ALLOWED does not
-cover it: an identifier kept for compatibility until its compatible rename, a passage where the word names the
+cover it: a previous name kept for compatibility for its stated time, a passage where the word names the
 Shaper OS role, or this file. A word is a run of letters in any case; underscores, hyphens, dots, digits and
 camelCase humps end it, so identifiers are read too, and "governs" or "governed" are other words.
 No laboratory. Run: python3 -B tests/test_lexicon.py"""
@@ -24,14 +24,17 @@ RULE = ('PodMesh names its own roles PodMesh node (podmeshd on a host), PodMesh 
 # whitespace, so that a rewrapped paragraph still matches; an occurrence is allowed when a match of an entry
 # for its file contains it.
 ALLOWED = [
-    # (a) Identifiers kept for compatibility: journals, APIs, stored reports and running manager images use
-    #     them; a compatible rename at the manager image roll removes these entries.
-    ('*', r'\bgovernor_mark\b', "the mark's effect kind in the network effects ledger and publisher_status's field"),
-    ('src/publisher.rs', r'/run/podmesh-manager/governor\.json', "the mark's path, read by the origin in running manager images"),
+    # (a) Previous names after the compatible rename of 2026-09-17, each kept for its stated time
+    #     (docs/MANAGER-PUBLISHER-CONTRACT.md, "Naming"), and data recorded under the former word.
+    ('src/publisher.rs', r'\bgovernor_mark\b',
+     "the mark's previous effect kind, matched in the rows earlier builds wrote and in its unit test, and "
+     "publisher_status's deprecated field"),
+    ('src/publisher.rs', r'/run/podmesh-manager/governor\.json', "the mark's previous path, removed at every write and removal while running manager images read it"),
+    ('src/schema.rs', r'\bgovernor_mark\b', "publisher_status's deprecated field, named as such in the operation's description"),
+    ('docs/MANAGER-PUBLISHER-CONTRACT.md', r'`governor_mark`|`/run/podmesh-manager/governor\.json`',
+     "the mark's previous identifiers, mapped to the current ones with the time each is kept"),
     ('tools/roll-manager-image.py', r'\bPODMESH_GOVERNOR_ALIAS\b', 'the former name of the environment variable, still read'),
-    ('tools/arm-publisher-follow.py', r"'governor': G,", "a key of the state the tool prints and stores (state.json, refresh.json)"),
-    ('*', r'\bcheck-manager-governor-managed\.py\b', "a suite's file name, cited by other suites and documents"),
-    ('tests/check-manager-governor-managed.py', r"'disposable-lab-m-u2-governor'", "the authorization reference in the hosts' journals and the HA ledger"),
+    ('tests/check-manager-active-manager-managed.py', r"'disposable-lab-m-u2-governor'", "the authorization reference in the hosts' journals and the HA ledger"),
     # (b) The Shaper OS governor and maker, where PodMesh speaks about its integration with Shaper OS.
     ('INTENT.md', r'The governor maintains desired state|One maker per host|become a second governor|'
                   r'fictional SaaS governor|Makers materialize them through PodMesh',
@@ -53,8 +56,6 @@ ALLOWED = [
                                          r'Governor-to-maker-to-PodMesh|alternative governor inside podmeshd|through a maker\.',
      "the plan's Shaper integration slices"),
     ('docs/LOCAL-API.md', r"a maker forwarding a governor's row", 'who may ask for a reclaim in ShaperOS mode'),
-    ('docs/MANAGER-PUBLISHER-CONTRACT.md', r'''called it the governor before that date|"governor" alone now means the SHAPER canon's governor''',
-     'the naming note that maps the former word to the active manager'),
     # A citation of the fencing laboratory's model, whose class for the node is `Maker`.
     ('*', r'''\(the model's "maker"\)''', "the fencing laboratory model's own word for the node, quoted as such"),
 ]

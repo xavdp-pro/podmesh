@@ -10,7 +10,7 @@ with the facts of the point, imports the one it missed from its peers, appends i
 fact, and the three replicas converge again -- all while the active manager's announcement never
 moved.
 
-Same environment as check-manager-governor-managed.py. Verified from outside: the promoted
+Same environment as check-manager-active-manager-managed.py. Verified from outside: the promoted
 container's address from Podman, the fact sets from `podman cp` copies inspected by the attested
 inspector, the service route from the kernels. Not shown: a host loss (the rescue is on the same
 host, since a replica's address lives in its host's pool), a real partition, a signed manifest.

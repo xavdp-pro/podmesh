@@ -180,7 +180,7 @@ promoting or starting anything, and prints the permit for the other hosts' super
 resource is the logical manager's UUID; the exclusive effect is the `/32` of its service
 address (`10.86.0.100` in the lab, inside the prefix and outside every pool). Answering traffic
 at that address inside the replica is not built: what is proven is the announcement.
-`tests/check-manager-governor-managed.py` on the three hosts: step 4 reproduced; no host may
+`tests/check-manager-active-manager-managed.py` on the three hosts: step 4 reproduced; no host may
 publish before a policy exists; after `rotate` to lab-a (epoch 1) only lab-a publishes, lab-b
 is refused; `rotate` to lab-b (epoch 2), lab-a and lab-c superseded, lab-a's fence **withdrew
 the service route before lab-b published it**, the kernels showed no announcement in between
