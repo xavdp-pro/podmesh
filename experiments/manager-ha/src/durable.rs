@@ -13,7 +13,7 @@ use std::{
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -96,6 +96,7 @@ static EXPECTED_SCHEMA_SHAPE: OnceLock<Vec<(String, String, String)>> = OnceLock
 static PREFLIGHTED_STORES: OnceLock<Mutex<BTreeSet<PreflightKey>>> = OnceLock::new();
 static VERIFIED_STORES: OnceLock<Mutex<BTreeMap<IntegrityKey, Arc<StoreIntegrityEntry>>>> =
     OnceLock::new();
+static LIVE_FILES: OnceLock<Mutex<BTreeMap<LiveFileKey, Arc<LiveFile>>>> = OnceLock::new();
 
 /// Default interval between two complete background verifications of one
 /// store by a long-running process. The complete verification also runs once
@@ -106,6 +107,56 @@ pub const DEFAULT_FULL_VERIFICATION_INTERVAL: Duration = Duration::from_secs(600
 /// the filesystem reports it, replica and topology. Birth time distinguishes a
 /// new file that reuses the inode of a deleted one.
 type IntegrityKey = (u64, u64, Option<(u64, u32)>, String, String);
+
+/// The identity of one database file: device, inode and birth time.
+type FileIdentity = (u64, u64, Option<(u64, u32)>);
+
+/// One database path of this process, by directory entry: the device and inode
+/// of its directory, and its file name. Two spellings of a path name one entry.
+type LiveFileKey = (u64, u64, OsString);
+
+/// The SQLite connections this module holds on one database path, and the
+/// database file they have open.
+///
+/// POSIX advisory locks belong to a process and an inode, and closing any
+/// descriptor of a file releases every lock the process holds on that file ("How
+/// To Corrupt An SQLite Database File", section 2.2). SQLite keeps the descriptors
+/// of its own connections open until the last of them on a file closes, but a
+/// descriptor opened around SQLite, then closed, releases the locks of every
+/// connection the process has on the file. Another process could then take the
+/// write lock, check the WAL into the database under a snapshot a connection still
+/// reads, or delete the WAL at its close as the last connection while this process
+/// keeps committing into it. So this process opens the database, WAL and SHM files
+/// itself, to copy them for a preflight or an inspection, only while it holds no
+/// connection on the path, and holds `gate` while it copies them, so that no
+/// connection opens meanwhile.
+#[derive(Default)]
+struct LiveFile {
+    /// Connections open or opening on the path. A connection is counted, under
+    /// `gate`, before SQLite opens the file, and uncounted once SQLite has closed it.
+    connections: AtomicUsize,
+    /// Held while the files are copied and while a connection opens; holds the
+    /// identity of the file that the counted connections have open.
+    gate: Mutex<Option<FileIdentity>>,
+}
+
+/// One connection counted on a database path. It is declared after the
+/// connection it counts, so that it is dropped once SQLite has closed that
+/// connection.
+struct LiveConnection(Arc<LiveFile>);
+
+impl LiveConnection {
+    fn count(file: &Arc<LiveFile>) -> Self {
+        file.connections.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(file))
+    }
+}
+
+impl Drop for LiveConnection {
+    fn drop(&mut self) {
+        self.0.connections.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// The integrity model of one database file within one process.
 ///
@@ -430,10 +481,11 @@ pub struct IncompleteAttempt {
 /// Integrity follows the process-local model described on `StoreIntegrityEntry`.
 pub struct Store {
     connection: Connection,
+    /// Declared after `connection`, which is therefore closed before it is uncounted.
+    _live: LiveConnection,
     configuration: Configuration,
     topology: Topology,
     replica_id: String,
-    path: PathBuf,
     integrity: Arc<StoreIntegrityEntry>,
 }
 
@@ -473,60 +525,30 @@ impl Store {
     /// fact, receipt and audit row in a read transaction. Later opens in the same
     /// process check only that the last verified row of each table is unchanged.
     ///
+    /// An existing file is copied for a read-only preflight of its schema and
+    /// identity only while this process holds no connection on the path (see
+    /// `LiveFile`), and only when the process has not preflighted that file state
+    /// before. While the process has the store open, an open requires the path to
+    /// name the file that is open, and relies on the checks of its own transaction.
+    ///
     /// # Errors
     /// Rejects invalid configuration, mismatched identity, unknown schema, I/O
-    /// errors, and a database file whose verification failed in this process,
-    /// including a schema found corrupt by this open's preflight or transaction.
+    /// errors, another file at the path of a store this process has open, and a
+    /// database file whose verification failed in this process, including a schema
+    /// found corrupt by this open's preflight or transaction.
     pub fn open(
         path: &Path,
         configuration: Configuration,
         replica_id: &str,
     ) -> DurableResult<Self> {
         let topology = validate_local_configuration(&configuration, replica_id)?;
-        // The integrity entry of an existing file is known before its preflight:
-        // a file this process closed is refused without being copied, and a
-        // preflight that finds a corrupt schema closes the file.
-        let mut existing = None;
-        match fs::symlink_metadata(path) {
-            Ok(metadata) => {
-                require_regular_nonsymlink(path)?;
-                let integrity = integrity_entry(&metadata, &topology, replica_id)?;
-                integrity.refuse_if_failed()?;
-                let key = preflight_key(&metadata, &topology, replica_id)?;
-                let known = preflighted_stores()?.contains(&key);
-                if !known {
-                    preflight_existing_store(path, &topology, replica_id)
-                        .map_err(|problem| integrity.fail_closed_if_corrupt(problem))?;
-                }
-                existing = Some((key, integrity));
-            }
-            Err(problem) if problem.kind() == std::io::ErrorKind::NotFound => {}
-            Err(problem) => return Err(error(problem)),
-        }
-        let mut connection = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )
-        .map_err(error)?;
-        let integrity = match existing {
-            Some((expected, integrity)) => {
-                let current = fs::symlink_metadata(path).map_err(error)?;
-                if preflight_key(&current, &topology, replica_id)? != expected {
-                    return Err(DurableError::Storage(
-                        "manager store path changed after read-only preflight".into(),
-                    ));
-                }
-                integrity
-            }
-            None => integrity_entry(
-                &fs::symlink_metadata(path).map_err(error)?,
-                &topology,
-                replica_id,
-            )?,
-        };
+        let opened = open_counted_connection(path, &topology, replica_id)?;
+        let OpenedFile {
+            mut connection,
+            counted,
+            integrity,
+            first_connection,
+        } = opened;
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(error)?;
@@ -553,14 +575,16 @@ impl Store {
         connection
             .pragma_update(None, "synchronous", "FULL")
             .map_err(error)?;
-        let metadata = fs::symlink_metadata(path).map_err(error)?;
-        remember_preflighted(preflight_key(&metadata, &topology, replica_id)?)?;
+        if first_connection {
+            let metadata = fs::symlink_metadata(path).map_err(error)?;
+            remember_preflighted(preflight_key(&metadata, &topology, replica_id)?)?;
+        }
         let mut store = Self {
             connection,
+            _live: counted,
             configuration,
             topology,
             replica_id: replica_id.into(),
-            path: path.to_path_buf(),
             integrity,
         };
         if !unchanged {
@@ -650,34 +674,6 @@ impl Store {
         operation(self).map_err(|problem| integrity.fail_closed_if_corrupt(problem))
     }
 
-    /// Runs one write operation. When this process had already preflighted the
-    /// database file as it was before the operation, the file as this process's
-    /// own commit (and any checkpoint it ran) left it is preflighted too, so the
-    /// next open does not copy the whole store again. A change by anyone else
-    /// between two write operations still requires a new preflight.
-    fn guarded_write<T>(
-        &mut self,
-        operation: impl FnOnce(&mut Self) -> DurableResult<T>,
-    ) -> DurableResult<T> {
-        let trusted = self
-            .current_preflight_key()
-            .is_some_and(|key| preflighted_stores().is_ok_and(|stores| stores.contains(&key)));
-        let result = self.guarded(operation);
-        if trusted && result.is_ok() {
-            // The operation has committed; a failure to record the file state
-            // only costs a later preflight, so it cannot turn into an error.
-            if let Some(key) = self.current_preflight_key() {
-                let _ = remember_preflighted(key);
-            }
-        }
-        result
-    }
-
-    fn current_preflight_key(&self) -> Option<PreflightKey> {
-        let metadata = fs::symlink_metadata(&self.path).ok()?;
-        preflight_key(&metadata, &self.topology, &self.replica_id).ok()
-    }
-
     /// Applies one request atomically, acknowledging mutations only after commit.
     /// Mutation operation IDs replay the original result; incompatible reuse fails.
     ///
@@ -722,11 +718,7 @@ impl Store {
             store.integrity.commit(transaction)?;
             Ok(executed)
         };
-        if writes {
-            self.guarded_write(operation)
-        } else {
-            self.guarded(operation)
-        }
+        self.guarded(operation)
     }
 
     /// Imports an authenticated peer snapshot and atomically commits its facts,
@@ -768,7 +760,7 @@ impl Store {
             operation_id: local_operation_id.clone(),
             snapshot: snapshot.clone(),
         };
-        self.guarded_write(|store| {
+        self.guarded(|store| {
             let transaction = begin_verified(
                 &mut store.connection,
                 &store.integrity,
@@ -833,7 +825,7 @@ impl Store {
                 "inbound import audit must use the atomic authenticated-import API".into(),
             ));
         }
-        self.guarded_write(|store| {
+        self.guarded(|store| {
             let transaction = begin_verified(
                 &mut store.connection,
                 &store.integrity,
@@ -980,19 +972,145 @@ impl TablePosition {
     }
 }
 
-fn integrity_entry(
-    metadata: &fs::Metadata,
+/// The SQLite connection of one store open, with what the open learnt about the
+/// database file it names.
+struct OpenedFile {
+    connection: Connection,
+    /// Declared after `connection`: dropped once SQLite has closed it.
+    counted: LiveConnection,
+    integrity: Arc<StoreIntegrityEntry>,
+    /// This connection is the only one this process has on the path, so the file
+    /// was preflighted through a private copy before SQLite opened it.
+    first_connection: bool,
+}
+
+/// Opens the connection of a store and counts it on its path. An existing file is
+/// copied for a read-only preflight of its schema and identity only while this
+/// process holds no connection on the path, and only when the process has not
+/// preflighted that file state before; while it has the store open, the path must
+/// name the file that is open and the open's own transaction does the checking.
+fn open_counted_connection(
+    path: &Path,
     topology: &Topology,
     replica_id: &str,
-) -> DurableResult<Arc<StoreIntegrityEntry>> {
+) -> DurableResult<OpenedFile> {
+    let live = live_file(path)?;
+    // Held until this connection is counted and the file it opened is known: no copy
+    // of the files starts while it opens, and it does not open while one runs.
+    let mut open_file = lock(&live.gate, "live store lock")?;
+    let first_connection = live.connections.load(Ordering::SeqCst) == 0;
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) => Some(metadata),
+        Err(problem) if problem.kind() == std::io::ErrorKind::NotFound => None,
+        Err(problem) => return Err(error(problem)),
+    };
+    // The integrity entry of an existing file is known before its preflight: a file
+    // this process closed is refused without being copied, and a preflight that
+    // finds a corrupt schema closes the file.
+    let existing = match &before {
+        Some(metadata) => {
+            require_regular_nonsymlink(path)?;
+            let integrity = integrity_entry(metadata, topology, replica_id)?;
+            integrity.refuse_if_failed()?;
+            if first_connection {
+                let key = preflight_key(metadata, topology, replica_id)?;
+                if !preflighted_stores()?.contains(&key) {
+                    preflight_existing_store(path, topology, replica_id)
+                        .map_err(|problem| integrity.fail_closed_if_corrupt(problem))?;
+                }
+            } else if *open_file != Some(file_identity(metadata)) {
+                // Its sidecars may still be those of the open file: it is neither
+                // copied nor opened.
+                return Err(changed_live_file());
+            }
+            Some(integrity)
+        }
+        None if !first_connection => return Err(changed_live_file()),
+        None => None,
+    };
+    let counted = LiveConnection::count(&live);
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(error)?;
+    let current = fs::symlink_metadata(path).map_err(error)?;
+    if let Some(before) = &before {
+        if first_connection {
+            if preflight_key(&current, topology, replica_id)?
+                != preflight_key(before, topology, replica_id)?
+            {
+                return Err(DurableError::Storage(
+                    "manager store path changed after read-only preflight".into(),
+                ));
+            }
+        } else if file_identity(&current) != file_identity(before) {
+            return Err(changed_live_file());
+        }
+    }
+    if first_connection {
+        *open_file = Some(file_identity(&current));
+    }
+    drop(open_file);
+    let integrity = match existing {
+        Some(integrity) => integrity,
+        None => integrity_entry(&current, topology, replica_id)?,
+    };
+    Ok(OpenedFile {
+        connection,
+        counted,
+        integrity,
+        first_connection,
+    })
+}
+
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
     let birth = metadata
         .created()
         .ok()
         .and_then(|created| created.duration_since(UNIX_EPOCH).ok())
         .map(|since| (since.as_secs(), since.subsec_nanos()));
+    (metadata.dev(), metadata.ino(), birth)
+}
+
+fn live_file(path: &Path) -> DurableResult<Arc<LiveFile>> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| DurableError::Storage("manager store path names no file".into()))?;
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let directory = fs::metadata(directory).map_err(error)?;
+    let mut files = lock(
+        LIVE_FILES.get_or_init(|| Mutex::new(BTreeMap::new())),
+        "live store registry lock",
+    )?;
+    Ok(Arc::clone(
+        files
+            .entry((directory.dev(), directory.ino(), name.to_os_string()))
+            .or_default(),
+    ))
+}
+
+fn changed_live_file() -> DurableError {
+    DurableError::Storage(
+        "manager store path no longer names the database file this process has open".into(),
+    )
+}
+
+fn integrity_entry(
+    metadata: &fs::Metadata,
+    topology: &Topology,
+    replica_id: &str,
+) -> DurableResult<Arc<StoreIntegrityEntry>> {
+    let (device, inode, birth) = file_identity(metadata);
     let key = (
-        metadata.dev(),
-        metadata.ino(),
+        device,
+        inode,
         birth,
         replica_id.to_string(),
         json(topology)?,
@@ -3613,7 +3731,7 @@ pub fn inspect_read_only(
 ) -> DurableResult<CanonicalStoreInspection> {
     require_regular_nonsymlink(path)?;
     let topology = validate_local_configuration(configuration, replica_id)?;
-    let (_snapshot, mut connection) = open_read_only_snapshot(path)?;
+    let (_source, mut connection) = open_inspection_source(path)?;
     let (transaction, version) = begin_inspection(&mut connection, &topology, replica_id)?;
     let integrity: String = transaction
         .pragma_query_value(None, "integrity_check", |row| row.get(0))
@@ -3695,7 +3813,7 @@ pub fn inspect_facts_read_only(
 ) -> DurableResult<FactsInspection> {
     require_regular_nonsymlink(path)?;
     let topology = validate_local_configuration(configuration, replica_id)?;
-    let (_snapshot, mut connection) = open_read_only_snapshot(path)?;
+    let (_source, mut connection) = open_inspection_source(path)?;
     let (transaction, _) = begin_inspection(&mut connection, &topology, replica_id)?;
     verify_contiguous_rowids(&transaction, AppendOnlyTable::Facts)?;
     let replica = load(&transaction, &topology, replica_id)?;
@@ -3706,6 +3824,55 @@ pub fn inspect_facts_read_only(
         logical_history_sha256: logical_history_sha256(&topology, &ordered_facts)?,
         ordered_facts,
     })
+}
+
+/// What an inspection holds while it reads: the private copy it reads, made while
+/// this process held no connection on the store, or the count of its read-only
+/// connection on a store this process has open, whose files are not copied because
+/// copying them would release that process's locks.
+struct InspectionSource {
+    _copy: Option<ReadOnlySnapshot>,
+    _live: Option<LiveConnection>,
+}
+
+/// Opens the connection an inspection reads through: a stable private copy of the
+/// store, or, when this process has the store open, a read-only connection to the
+/// store itself, whose read transaction is then the inspection's snapshot.
+fn open_inspection_source(path: &Path) -> DurableResult<(InspectionSource, Connection)> {
+    let live = live_file(path)?;
+    let open_file = lock(&live.gate, "live store lock")?;
+    if live.connections.load(Ordering::SeqCst) == 0 {
+        let (snapshot, connection) = open_read_only_snapshot(path)?;
+        return Ok((
+            InspectionSource {
+                _copy: Some(snapshot),
+                _live: None,
+            },
+            connection,
+        ));
+    }
+    let before = fs::symlink_metadata(path).map_err(error)?;
+    if *open_file != Some(file_identity(&before)) {
+        return Err(changed_live_file());
+    }
+    let counted = LiveConnection::count(&live);
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(error)?;
+    if file_identity(&fs::symlink_metadata(path).map_err(error)?) != file_identity(&before) {
+        return Err(changed_live_file());
+    }
+    Ok((
+        InspectionSource {
+            _copy: None,
+            _live: Some(counted),
+        },
+        connection,
+    ))
 }
 
 /// Opens the read transaction of a read-only inspection of a private copy and

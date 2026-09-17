@@ -1050,8 +1050,12 @@ fn copy_store(lab: &Lab) -> PathBuf {
     copy
 }
 
+/// While this process has a store open, no open of it copies its files, whatever
+/// changed them: reading them around SQLite would release the locks of the
+/// connections this process holds on them. The child runs with a temporary
+/// directory that does not exist, so any copy fails.
 #[test]
-fn a_store_kept_open_trusts_its_own_checkpoints_but_not_changes_made_by_others() {
+fn a_store_this_process_has_open_is_never_copied_again() {
     let lab = Lab::new();
     // The child's temporary directory does not exist, so any read-only preflight
     // copy of an existing store fails instead of silently copying the store.
@@ -1078,7 +1082,7 @@ fn a_store_kept_open_trusts_its_own_checkpoints_but_not_changes_made_by_others()
 }
 
 #[test]
-#[ignore = "invoked as a child process by a_store_kept_open_trusts_its_own_checkpoints_but_not_changes_made_by_others"]
+#[ignore = "invoked as a child process by a_store_this_process_has_open_is_never_copied_again"]
 fn preflight_cache_worker() {
     let path = PathBuf::from(env::var_os("MANAGER_INTEGRITY_STORE").unwrap());
     let state = |path: &Path| {
@@ -1098,8 +1102,8 @@ fn preflight_cache_worker() {
         before,
         "no checkpoint changed the database file"
     );
-    // The file changed only through this process's own commits and checkpoints:
-    // later opens need no private copy.
+    // The file changed through this process's own commits and checkpoints: later
+    // opens copy nothing.
     for index in 0..3 {
         let mut again = Store::open(&path, configuration(), "r1").unwrap();
         again.execute(&Request::Export {}).unwrap();
@@ -1107,8 +1111,8 @@ fn preflight_cache_worker() {
             .execute_with_receipt(&observation(&format!("reopened-{index}"), "value"))
             .unwrap();
     }
-    // A checkpoint by another connection changes the file outside the Store; the
-    // next open must preflight it again, which cannot copy it here.
+    // A checkpoint by another connection changes the file outside the Store; while
+    // this process has the store open, its next open copies nothing either.
     store
         .record_exchange_audit(&prepared("pending-frames"))
         .unwrap();
@@ -1122,8 +1126,61 @@ fn preflight_cache_worker() {
         trusted,
         "the external checkpoint changed nothing"
     );
+    let mut again = Store::open(&path, configuration(), "r1").unwrap();
+    again.execute(&Request::Export {}).unwrap();
+
+    // An inspection of a store this process has open reads it through SQLite,
+    // in one read transaction, rather than copying it.
+    let inspected = inspect_read_only(&path, &configuration(), "r1").unwrap();
+    assert_eq!(inspected.history_count, 3);
+    assert_eq!(
+        inspect_facts_read_only(&path, &configuration(), "r1")
+            .unwrap()
+            .ordered_facts,
+        inspected.ordered_facts
+    );
+
+    // Once no store of this process has the file open, its files are copied again,
+    // which cannot copy them here.
+    drop(again);
+    drop(store);
     assert!(matches!(
         Store::open(&path, configuration(), "r1"),
         Err(DurableError::Storage(_))
     ));
+    assert!(matches!(
+        inspect_read_only(&path, &configuration(), "r1"),
+        Err(DurableError::Storage(_))
+    ));
+}
+
+/// Another database file at the path of a store this process has open is refused,
+/// and nothing of this process reads or opens it: its sidecars may be those of the
+/// file that is open.
+#[test]
+fn another_file_at_the_path_of_an_open_store_is_refused_untouched() {
+    let lab = Lab::new();
+    let mut kept = lab.open();
+    kept.record_exchange_audit(&prepared("one")).unwrap();
+    let copy = copy_store(&lab);
+    let copy_bytes = fs::read(&copy).unwrap();
+    fs::rename(&copy, lab.database()).unwrap();
+
+    let expected = DurableError::Storage(
+        "manager store path no longer names the database file this process has open".into(),
+    );
+    assert_eq!(
+        Store::open(&lab.database(), configuration(), "r1")
+            .err()
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        inspect_read_only(&lab.database(), &configuration(), "r1").unwrap_err(),
+        expected
+    );
+    assert_eq!(fs::read(lab.database()).unwrap(), copy_bytes);
+    // The store this process has open keeps serving from the file it opened.
+    kept.record_exchange_audit(&prepared("two")).unwrap();
+    assert!(kept.integrity().unwrap().failure.is_none());
 }
