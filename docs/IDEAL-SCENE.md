@@ -46,10 +46,10 @@ never lose what they were told to protect.**
 2. **No stop for lack of news.** A running universe is never stopped because a peer, the manager or a workstation
    is silent. It stops only by a recorded decision, by a newer epoch it has verifiably learned, or by the local
    disconnection policy its own class declares.
-3. **Decisions carry authority.** Every exclusive decision (where the active instance runs, which replica governs,
-   which replica publishes, that a host is lost) carries an epoch issued by a majority or by the operator's recorded
-   decision, the provenance (which agent, under which mandate) and a timestamp; every actuator checks the epoch
-   before it acts.
+3. **Decisions carry authority.** Every exclusive decision (where the active instance runs, which replica is the
+   active manager, which replica publishes, that a host is lost) carries an epoch issued by a majority or by the
+   operator's recorded decision, the provenance (which agent, under which mandate) and a timestamp; every actuator
+   checks the epoch before it acts.
 4. **Resumable, never repeated.** Every operation has an identity; an interrupted operation is finished or undone
    from what the hosts show, never by repeating an effect.
 5. **Nothing indispensable outside the hosts.** No lease, heartbeat, transport or decision lives on a workstation.

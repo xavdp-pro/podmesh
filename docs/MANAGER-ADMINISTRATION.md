@@ -4,7 +4,7 @@ Status: **built and run on the three laboratory hosts, 2026-09-16**. Owner: Xavi
 What is built is stated at the end; nothing above it is a claim about code.
 
 The manager universe answers on its origin, and a publishing connector carries that origin to a
-public hostname while this replica is the governor (`MANAGER-PUBLISHER-CONTRACT.md`). This
+public hostname while this replica is the active manager (`MANAGER-PUBLISHER-CONTRACT.md`). This
 document says who may administer it, where an administrator comes from, and what the surface
 refuses.
 
@@ -15,9 +15,9 @@ Subject `admin.user.<login>` in the writing replica's own granted scope, value
 `must_change` while the account still holds the password a deployment gave it. The password
 itself is never stored, never journaled, never replicated and never written to a command line.
 
-Each replica may write only in the scope it owns, so an administrator created on the governor
-lives in the governor's scope and reaches the others by replication, read-only. A login written
-in two scopes is a **conflict the page shows**; nothing picks a winner behind the operator's
+Each replica may write only in the scope it owns, so an administrator created on the active manager
+lives in the active manager's scope and reaches the others by replication, read-only. A login
+written in two scopes is a **conflict the page shows**; nothing picks a winner behind the operator's
 back. Inside one scope the current state of a login is its highest revision, and a revocation is
 simply the revision that says `revoked`.
 
@@ -43,8 +43,8 @@ instead. Running bootstrap again on a manager that already has an administrator 
 
 ## What the surface refuses
 
-- Every path, administration included, answers **503 without the governor mark** — the same
-  fail-closed rule as `/ready`. A replica that is not the governor administers nothing.
+- Every path, administration included, answers **503 without the active manager's mark** — the same
+  fail-closed rule as `/ready`. A replica that is not the active manager administers nothing.
 - With **no administrator on record**, the page says so and names the host door. It does not
   offer to create one.
 - **Creating an administrator requires a session**; an administrator is named by an

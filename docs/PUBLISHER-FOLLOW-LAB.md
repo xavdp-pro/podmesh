@@ -3,8 +3,8 @@
 Status: **lab mandate, 2026-09-16**. Not a production timer and not a second election.
 Owner: Xavier de Poorter.
 
-The publishing connector follows the governor (`MANAGER-PUBLISHER-CONTRACT.md`). The daemon
-still **does not** start a connector by itself: `publisher_start` needs the authority's
+The publishing connector follows the active manager (`MANAGER-PUBLISHER-CONTRACT.md`). The
+daemon still **does not** start a connector by itself: `publisher_start` needs the authority's
 takeover proof. What was missing for a standing laboratory hostname was a **host-side tick**,
 under a written mandate, that applies that proof when **this host is eligible**, and stops
 the connector when it is not.
@@ -32,16 +32,16 @@ On `podmesh-dev-ha` only, the operator authorizes a follow tick analogous to `po
 - Enabling the timer is the operator's; cleanup stops the timer and removes the mandate.
 
 **What an armed renewal costs, and why it is bounded.** Lease expiry is the only thing that
-withdraws a governor nobody can reach: eligibility is read from this host's own journal, so a
-host cut from its peers and from the agent stays eligible for as long as its lease lives. With
-an immortal lease it would keep publishing while a standby takes the role at the barrier, and
-Cloudflare accepts both connectors on one tunnel -- the case the invariant of
+withdraws an active manager nobody can reach: eligibility is read from this host's own journal,
+so a host cut from its peers and from the agent stays eligible for as long as its lease lives.
+With an immortal lease it would keep publishing while a standby takes the role at the barrier,
+and Cloudflare accepts both connectors on one tunnel -- the case the invariant of
 `MANAGER-PUBLISHER-CONTRACT.md` forbids. The bound restores the lapse. It does not make the
-demonstration free: while the mandate stands, a governor lost for real is withdrawn only when
-its lease runs out, and a standby may publish only at the barrier (the lease plus the margin
-recorded at the rotation), so a long lease buys a stable hostname with a long outage. Choose
-the lease for what is being shown, and keep `podmesh-fence` in mind for the case where the tick
-itself cannot run.
+demonstration free: while the mandate stands, an active manager lost for real is withdrawn only
+when its lease runs out, and a standby may publish only at the barrier (the lease plus the
+margin recorded at the rotation), so a long lease buys a stable hostname with a long outage.
+Choose the lease for what is being shown, and keep `podmesh-fence` in mind for the case where
+the tick itself cannot run.
 
 This does **not** rotate the epoch or publish the exclusive route. Those remain the
 agent's (`tools/ha-standby.py`). After a rotation the agent must deliver the new proof

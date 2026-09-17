@@ -197,8 +197,8 @@ fence ran while the lease was live and withdrew nothing; once the lease had laps
 clock, nobody renewing it and nobody calling anything, the role's route and the address its
 universe carried were gone within one interval (5.2 s after the lapse, observation included),
 the universe under no policy of its own still running. With the timer enabled, a partition that
-cuts the agent from the governor's host ends the way the takeover margin assumes: the cut host
-fences itself when its lease lapses, and the standby that waited lease + margin takes over.
+cuts the agent from the active manager's host ends the way the takeover margin assumes: the cut
+host fences itself when its lease lapses, and the standby that waited lease + margin takes over.
 
 **It is an operation and not a timer, deliberately.** PodMesh does not act on its own; the
 garbage collector carries the same constraint for the same reason. So the *timeliness* is the

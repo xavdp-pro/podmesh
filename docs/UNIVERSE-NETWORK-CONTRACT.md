@@ -76,13 +76,14 @@ ID, verified replays as history, interrupted attempts re-evaluated) and all carr
   of a logical manager, whose three replicas all run — and is published only by the host holding
   a live, unsuperseded activation lease on that resource under the epoch gate
   (`UNIVERSE-HIGH-AVAILABILITY.md`); the self-fence withdraws it once the lease is gone, so the
-  old governor's withdrawal precedes any new publication the agent asks for. An exclusive route
-  must point at a running universe of this host — the governor's replica — which then **carries
-  the address** as an alias inside its own network namespace, added before the route and
-  verified from inside, withdrawn with the route (by the fence or by `network_route_withdraw`);
-  the replica listens on every address of its universe (bind `0.0.0.0`) so that it answers there.
-  On the other hosts the agent publishes the plain route that follows the role (the address via
-  the governor's host), and withdraws it before the role moves.
+  old active manager's withdrawal precedes any new publication the agent asks for. An exclusive
+  route must point at a running universe of this host — the active manager replica — which then
+  **carries the address** as an alias inside its own network namespace, added before the route
+  and verified from inside, withdrawn with the route (by the fence or by
+  `network_route_withdraw`); the replica listens on every address of its universe (bind
+  `0.0.0.0`) so that it answers there. On the other hosts the agent publishes the plain route
+  that follows the role (the address via the active manager's host), and withdraws it before the
+  role moves.
 - `network_status` (read-only): declaration, allocations, published routes, and the effective
   state read from Podman and the kernel; an observation that cannot be made is `unknown`.
 - `inspect`/`observe` report the requested profile from the labels and the effective network from
@@ -168,7 +169,7 @@ one per owned scope, byte-identical sets on every replica, authenticated import 
 both peers on each, exchange audit rows present, integrity ok; cleanup returned every host's
 routes and networks to their initial state. This is campaign 6's data path inside universes.
 
-**Step 5 (2026-09-14), the governor role with all three running:** `network_route_publish`
+**Step 5 (2026-09-14), the active manager role with all three running:** `network_route_publish`
 takes an optional `exclusive_resource`: the route is then the exclusive effect of a role, and is
 accepted only from the host holding a live, unsuperseded activation lease on that resource
 under the epoch gate — refused under no policy, then for the lease gate's four reasons — and
@@ -210,34 +211,34 @@ carries the managed profile (above), the restore reports the source's network, a
 allocation no longer blocks the same universe from being allocated again (a second one-time
 rebuild of the allocations table: only live allocations are unique, per address and per
 universe). `tests/check-manager-recovery-managed.py` on the three hosts: three replicas
-converged with the governor announced on lab-a; lab-c's replica stopped through the typed stop,
-a recovery point prepared from it — its manifest recording the managed address — and the
+converged with the active manager announced on lab-a; lab-c's replica stopped through the typed
+stop, a recovery point prepared from it — its manifest recording the managed address — and the
 replica **deleted**, its address released; the two others moved on to a fourth fact it never
 saw, the announcement unmoved; the point restored on lab-c into quarantine (isolated, the
 source's managed address reported), a promotion at an address outside the host's pool refused,
 then promoted into the replica's own identity at its address under a lease, started, back at
 that address from Podman; it imported the fact it had missed from both peers, appended its own
-boot fact, and the three converged on five facts, the governor unchanged throughout; cleanup
-returned the hosts to their initial state. Not shown: a host loss (the rescue is on the same
-host, a replica's address living in its host's pool), a real partition, a signed manifest.
+boot fact, and the three converged on five facts, the active manager unchanged throughout;
+cleanup returned the hosts to their initial state. Not shown: a host loss (the rescue is on the
+same host, a replica's address living in its host's pool), a real partition, a signed manifest.
 The requirement of a profile on `promote` was removed and the single-host promote suite went
 red at its refusal; the reference build passed it again, with the network, two-host recovery,
-HA-tool, three-host, epoch, fence, restore, retention, governor and recovery suites. One
+HA-tool, three-host, epoch, fence, restore, retention, active manager and recovery suites. One
 defect of the two-host test helper surfaced on the way: each refusal snapshot hashed every
 archive both delivery directories held, so a suite under a 20-second lease lapsed on its own
 bookkeeping once other suites' leftovers reached gigabytes; snapshots now compare a stat
 fingerprint and transfers hash only their own documents.
 
 **The replica answers at the service address (2026-09-15):** the exclusive route gives the
-governor's replica the service address as an alias inside its network namespace (`nsenter -n`
+active manager replica the service address as an alias inside its network namespace (`nsenter -n`
 with the host's `ip`, nothing required inside the universe), verified from inside, withdrawn
 with the route by the fence and by `network_route_withdraw`; refused when nothing runs at `via`
 on this host. The replicas' configurations now listen on every address (the generator's
 default; a replica bound to its own address alone did not answer at the alias, which the first
 attempt found). `tests/check-manager-service-address.py` on the three hosts: with nothing
-announced, no replica carries the address and a connection to it fails at once; the governor
-on lab-a carries it — read inside each universe's namespace, on lab-a's only — and a TCP
-connection to the service address and port from lab-b and from lab-c is accepted, the
+announced, no replica carries the address and a connection to it fails at once; the
+active manager on lab-a carries it — read inside each universe's namespace, on lab-a's only — and
+a TCP connection to the service address and port from lab-b and from lab-c is accepted, the
 resident's `peak_incoming` counting it; the role moves to lab-b with all three running: lab-a's
 fence withdraws the route and the alias, the follow routes are withdrawn, a connection fails
 everywhere, lab-b publishes and its replica carries the address, the connection from lab-a and
@@ -246,21 +247,21 @@ with the route. Mutations: no alias on publication, and no alias removal by the 
 at its own check. Not shown: an authenticated exchange at the service address (the listener
 accepts; the protocol then needs a peer key), a real partition, a host loss.
 
-**A real partition (2026-09-15):** `tests/check-manager-partition.py` cuts the governor's host
-from the two others with an nftables table of its own (every packet dropped at prerouting and
-output, both directions; a dead man's switch on the host removes it after ten minutes whatever
-happens to the suite) while the agent still reaches every host. Measured on the three hosts:
-the two connected replicas converged on a fourth fact the cut replica never saw (it kept
+**A real partition (2026-09-15):** `tests/check-manager-partition.py` cuts the active manager's
+host from the two others with an nftables table of its own (every packet dropped at prerouting
+and output, both directions; a dead man's switch on the host removes it after ten minutes
+whatever happens to the suite) while the agent still reaches every host. Measured on the three
+hosts: the two connected replicas converged on a fourth fact the cut replica never saw (it kept
 running with three facts and kept carrying the service address); the service address was
 unreachable from the connected side; the agent moved the role to lab-b — rotation, supersession
 delivered to the cut host, its fence withdrawing route and alias on request — and lab-c reached
 the service address on lab-b; on reconnection the cut replica converged as a simple replica and
 reached the service address through the follow route. What it does not show, and says: a
-partition that also cuts the agent from the governor's host — that host keeps its alias until an
-agent reaches it, since the self-fence is an operation and PodMesh runs no timer; whether a
-timer may run it is the operator's decision (`UNIVERSE-HIGH-AVAILABILITY.md`). The first
-attempt hooked `input` only and the forwarded connections crossed the "cut"; the suite records
-that.
+partition that also cuts the agent from the active manager's host — that host keeps its alias
+until an agent reaches it, since the self-fence is an operation and PodMesh runs no timer;
+whether a timer may run it is the operator's decision (`UNIVERSE-HIGH-AVAILABILITY.md`). The
+first attempt hooked `input` only and the forwarded connections crossed the "cut"; the suite
+records that.
 
 **Crash and storage-failure safety (2026-09-15, Codex's finding B1):** the effects ledger,
 compensation and reconciliation above, built after the review found that a route, an address,

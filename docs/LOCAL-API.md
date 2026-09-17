@@ -610,7 +610,7 @@ or stopped. `secret_status` (read-only) lists names, digests and presence in the
 durable copy of a secret is the operator's, outside PodMesh; Podman's store at rest is root-only files on the
 host, the laboratory's accepted boundary.
 
-## Experimental: the publishing connector that follows the governor (development tree, not packaged)
+## Experimental: the publishing connector that follows the active manager (development tree, not packaged)
 
 The contract is `MANAGER-PUBLISHER-CONTRACT.md`. `publisher_declare` (`resource`, `hostname`, `tunnel_uuid`,
 `credential`, optional `origin_port`) records the connector by reference; `publisher_start` (`resource`,
@@ -619,8 +619,8 @@ the exclusive route and alias are effective, the credential is in Podman's store
 proof is of the kind the policy requires, its signature verified when the policy names the authority's key, and
 binds this transition (resource, epochs, holders, expiry, and its method: first, same holder, fence
 receipt, or a lease barrier already reached on this clock); then records its transition `starting`, writes
-the governor mark inside the carrier universe, requires the origin to answer ready with the expected logical
-manager, replica and epoch, runs `cloudflared` as a transient unit from a root-only runtime copy of the
+the active manager's mark inside the carrier universe, requires the origin to answer ready with the expected
+logical manager, replica and epoch, runs `cloudflared` as a transient unit from a root-only runtime copy of the
 credential, waits for its registration with Cloudflare, and records `effective`; the answer carries
 `published` and `connector_id`; `publisher_stop` stops it and removes the mark; `activation_fence` does the same first for every
 resource this host no longer holds (`publishers_withdrawn`); `publisher_observed` records an external request;

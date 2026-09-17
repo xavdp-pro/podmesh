@@ -1,8 +1,14 @@
-# The publishing connector follows the governor
+# The publishing connector follows the active manager
 
 Status: **contract written 2026-09-15 on the operator's decision**
 (`CLOUDFLARE-TUNNEL-MANAGER-HA-DECISION-2026-09-15`); what is built is stated in "What is built"
 at the end, and nothing above it is a claim about code.
+
+Naming (the operator's decision of 2026-09-17): the **active manager** is the manager replica
+whose host holds a live, unsuperseded activation lease on the logical manager resource under the
+epoch gate. PodMesh's documents and identifiers called it the governor before that date;
+identifiers keep the word for compatibility with journals and APIs (`governor_mark`, for
+example), and "governor" alone now means the SHAPER canon's governor.
 
 The logical manager's human-facing interface is published through a Cloudflare Tunnel. That must
 not create a second election or a second authority: the connector is transport, it decides
@@ -11,9 +17,9 @@ nothing, and a connector being online grants no manager authority.
 ## Invariant
 
 One public hostname, one logical tunnel (one tunnel UUID), three manager replicas, and — in this
-first candidate — **exactly one publishing `cloudflared`**, co-located with the governor replica
-and governed by the same resource (the logical manager UUID), the same epoch and the same fence
-as the service address (`UNIVERSE-NETWORK-CONTRACT.md`, `UNIVERSE-HIGH-AVAILABILITY.md`).
+first candidate — **exactly one publishing `cloudflared`**, co-located with the active manager
+replica and governed by the same resource (the logical manager UUID), the same epoch and the same
+fence as the service address (`UNIVERSE-NETWORK-CONTRACT.md`, `UNIVERSE-HIGH-AVAILABILITY.md`).
 
 Cloudflare accepts several connectors for one tunnel and does not say which receives a request;
 three connectors each pointing at their local replica would let a standby receive a write.
@@ -27,15 +33,15 @@ stable, epoch-qualified service address and fails closed when that origin is not
 | tunnel UUID, hostname, credential's name, origin port | the host's journal (`publisher_declare`) | — |
 | the tunnel credential | Podman's secret store on the host (`secret_declare`), a root-only runtime copy while the connector runs | Git, an image layer, the journal, the replicated store, a recovery point |
 | the connector's identity | `cloudflared`'s own journal (`connection=<id>`) | the journal as truth |
-| the governor mark (resource, epoch, marked at) | a root-only file inside the carrier universe, written and removed by PodMesh | anywhere the universe could write it itself |
+| the active manager's mark (resource, epoch, marked at) | a root-only file inside the carrier universe, written and removed by PodMesh | anywhere the universe could write it itself |
 
 ## The origin, epoch-qualified
 
 The manager universe answers `GET /ready` on its origin port (8080) with its logical manager
-and replica identities and, **only while the governor mark is present**, the epoch it was marked
-with — HTTP 200; without the mark, or on any other path, HTTP 503. The mark is PodMesh's: written
-at `publisher_start` under the epoch gate, removed at `publisher_stop` and by the fence. A
-connector that reaches a replica that is not the governor gets nothing. The manager's web
+and replica identities and, **only while the active manager's mark is present**, the epoch it was
+marked with — HTTP 200; without the mark, or on any other path, HTTP 503. The mark is PodMesh's:
+written at `publisher_start` under the epoch gate, removed at `publisher_stop` and by the fence.
+A connector that reaches a replica that is not the active manager gets nothing. The manager's web
 interface is not served there yet; this responder is the origin the contract requires today.
 
 ## Operations
@@ -66,9 +72,9 @@ with it (`UNIVERSE-NETWORK-CONTRACT.md`, "Failure and cleanup states"), all with
   such; under a policy without a key only the unsigned laboratory kind is accepted, on its
   binding alone, and the answer says `signed: false`. The agent's `previous` narrative is
   recorded beside it and decides nothing.
-  Then: the publisher's transition recorded `starting` before any effect; the governor mark
-  written inside the carrier universe and verified; the origin asked at the service address and
-  required to answer ready with the expected logical manager, the carrier's replica (as its
+  Then: the publisher's transition recorded `starting` before any effect; the active manager's
+  mark written inside the carrier universe and verified; the origin asked at the service address
+  and required to answer ready with the expected logical manager, the carrier's replica (as its
   resident names it through the control door) and the lease's epoch; the connector started as a
   transient unit from a root-only runtime copy of the credential with an ingress from the
   hostname to the service address, verified active **and registered with Cloudflare** (its
@@ -88,17 +94,18 @@ with it (`UNIVERSE-NETWORK-CONTRACT.md`, "Failure and cleanup states"), all with
 - `publisher_status` (read-only; `resource`): what is declared; the unit's state; the
   connector's identity from its journal; the lease and epoch; the service address and its
   carrier; the carrier's replica identity through the control door; the origin's readiness now;
-  the governor mark; `publisher_eligible` with the refusal reasons; the last start, stop, fence
-  and observed request.
+  the active manager's mark (`governor_mark`); `publisher_eligible` with the refusal reasons; the
+  last start, stop, fence and observed request.
 
 ## Takeover, in order
 
 1. Rotate the epoch through the external gate.
-2. Deliver the supersession and fence the previous governor (or, unreachable, wait its lease plus
-   margin: the timer on it withdraws its connector, its mark, its alias and its route on its own
-   clock — `packaging/podmesh-fence`).
-3. Observe on the previous governor, when reachable, the connector stopped and the address gone.
-4. Publish the service address on the new governor (`network_route_publish`, exclusive).
+2. Deliver the supersession and fence the previous active manager (or, unreachable, wait its
+   lease plus margin: the timer on it withdraws its connector, its mark, its alias and its route
+   on its own clock — `packaging/podmesh-fence`).
+3. Observe on the previous active manager, when reachable, the connector stopped and the
+   address gone.
+4. Publish the service address on the new active manager (`network_route_publish`, exclusive).
    The barrier (the previous lease plus the margin, counted from the rotation, since the
    previous holder may have renewed right up to it) can outlast the new holder's own lease:
    after it, the new holder acquires again with the rotation's permit — idempotent for the
@@ -129,23 +136,23 @@ wedged (lease-expiry self-withdrawal needs the daemon alive).
 **2026-09-15, the single publisher:** `src/publisher.rs` on the network effects ledger, the
 operations above, the origin responder in the manager universe's entrypoint (web tree), the
 fence stopping the connector and removing the mark before the address goes, the preview counting
-a connector without entitlement. `tests/check-manager-publisher.py` on lab-b (governor) and lab-c
-(standby) with a real laboratory tunnel and hostname: the standby's start refused by the lease
-gate; the governor's start refused before the service address and without an account of the
-previous publisher; started, its unit active, a connection registered, the origin ready at the
-epoch with the governor's replica; **an external request through the public hostname answered
-with the logical manager, that replica and that epoch**; after the rotation the old governor's
-fence stopped its connector and removed its mark before withdrawing its alias and route, its
-origin answered 503 at its own address, it was no longer eligible; the new governor published,
-started, and the same hostname answered with its replica and the new epoch. Two hosts, not
-three, on that day (the third was out of reach). The laboratory tunnel and hostname are the
-operator's private fixtures, disposable; the credential reaches a host only as a PodMesh secret.
-Cloudflare's edge answered 403 (error 1010) to a bare python User-Agent; the external request
-carries a browser-like one — the edge's own gate, not the manager's.
+a connector without entitlement. `tests/check-manager-publisher.py` on lab-b (active manager) and
+lab-c (standby) with a real laboratory tunnel and hostname: the standby's start refused by the
+lease gate; the active manager's start refused before the service address and without an account
+of the previous publisher; started, its unit active, a connection registered, the origin ready at
+the epoch with the active manager replica; **an external request through the public hostname
+answered with the logical manager, that replica and that epoch**; after the rotation the old
+active manager's fence stopped its connector and removed its mark before withdrawing its alias
+and route, its origin answered 503 at its own address, it was no longer eligible; the new
+active manager published, started, and the same hostname answered with its replica and the new
+epoch. Two hosts, not three, on that day (the third was out of reach). The laboratory tunnel and
+hostname are the operator's private fixtures, disposable; the credential reaches a host only as a
+PodMesh secret. Cloudflare's edge answered 403 (error 1010) to a bare python User-Agent; the
+external request carries a browser-like one — the edge's own gate, not the manager's.
 
 **2026-09-15, each gate mutated (item 8):** the permit check, the readiness epoch check
-(`tests/check-manager-publisher-readiness.py`, with a lab fault writing the governor mark one
-epoch behind: the start refused, the mark compensated, the origin back to 503, no unit; the
+(`tests/check-manager-publisher-readiness.py`, with a lab fault writing the active manager's mark
+one epoch behind: the start refused, the mark compensated, the origin back to 503, no unit; the
 fault-free start then succeeding), the connector stop in the fence, and the account of the
 previous publisher — each removed in turn went red at its own check, the reference build green
 on both suites. The main suite ends with the permit gate alone: the connector stopped, the lease
@@ -153,7 +160,7 @@ left to lapse, the route and the alias still effective, a start refused by the l
 nothing else.
 
 **2026-09-15, the hard test (item 6, the operator's decision 4):**
-`tests/check-manager-publisher-agent-cut.py` on lab-b (governor) and lab-c: lab-b cut from
+`tests/check-manager-publisher-agent-cut.py` on lab-b (active manager) and lab-c: lab-b cut from
 lab-c, its pool and the agent for 120 seconds by an nftables table with the dead man's switch
 armed and verified first, **its Internet egress kept** so that Cloudflare could still reach its
 connector; its lease (20 s) lapsed on its own clock and its self-withdrawal timer, under a
