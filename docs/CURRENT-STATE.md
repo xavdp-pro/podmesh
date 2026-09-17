@@ -1045,9 +1045,17 @@ What this does not prove or do: the guardian is one process on the workstation (
 is stopped by its host's fence after the lease: never two instances, none at all until it is back); a transient
 development service and fence timer do not survive a host reboot (the packaged units would); the recovery point
 objective is the replication interval, and a partitioned host's writes after the cut are lost with it; the fence
-trusts the host it runs on. Still armed on the laboratory at the end: the fence timer on the three hosts, the
-guardian and the live replication of the counter universe (active on lab-b) and the guardian of the demo universe
-(active on lab-b, its replication schedule not armed). Revocation is in the mandate.
+trusts the host it runs on. Armed on the laboratory at the end of the campaign: the fence timer on the three hosts,
+the guardian and the live replication of the counter universe (active on lab-b) and the guardian of the demo
+universe (active on lab-b, its replication schedule not armed).
+
+**The fence was disarmed the same morning, at the operator's request,** after he set the direction that follows:
+the workstation must determine nothing in the ecosystem, the guardian belongs in the manager that drives the
+system, and a node temporarily cut from the manager must keep serving. A fence that stops a universe as soon as a
+workstation stops renewing its lease is the opposite of that. The guardians still run on the workstation; without
+the fence, their automatic failover is safe against a host that is powered off but NOT against a network cut, where
+the cut host keeps its instance while the guardian starts another one. The Cloudflare tunnel stays where the
+operator requires it: only on the manager replica in charge of the system (the publisher follows the governor).
 
 Not done: pruning policy exposed in the console; the Explorer and fractal views in the new front; pre-copy; a
 redundant guardian; out-of-band fencing.
