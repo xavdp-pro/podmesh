@@ -41,8 +41,10 @@ enum AppendStartError {
 pub mod cli;
 
 /// Default delay after which a snapshot that a peer already acknowledged is
-/// pushed to that peer again although it has not changed.
-pub const DEFAULT_UNCHANGED_SNAPSHOT_REFRESH: Duration = Duration::from_secs(60);
+/// pushed to that peer again although it has not changed. An idle replica adds
+/// its twelve audit rows once per refresh, about 1,700 a day at three replicas,
+/// and an idle link confirms its peer once per refresh.
+pub const DEFAULT_UNCHANGED_SNAPSHOT_REFRESH: Duration = Duration::from_secs(600);
 
 /// Default catch-up window: how long after it starts exchanging a process whose
 /// store held facts of its own origin waits for peers it has not caught up with

@@ -2034,3 +2034,38 @@ fn status_reports_catch_up_and_what_the_health_of_a_link_needs() {
     assert!(link["next_attempt_in_ms"].as_u64().unwrap() <= 400);
     lab.stop_all();
 }
+
+#[test]
+fn an_idle_replica_adds_at_most_twelve_audit_rows_per_refresh() {
+    let mut lab = Lab::new();
+    // A refresh of one second stands for the ten-minute default: an idle
+    // replica's audit growth is proportional to it.
+    for config in &mut lab.configs {
+        config.unchanged_snapshot_refresh_ms = Some(1_000);
+    }
+    lab.start_all();
+    lab.append(0, "idle-growth", "s0", "subject", "value");
+    assert_converged(&lab, 1);
+    thread::sleep(Duration::from_secs(2));
+    let before = audit_counts(&lab, &[0, 1, 2]);
+    let started = Instant::now();
+    thread::sleep(Duration::from_secs(8));
+    let after = audit_counts(&lab, &[0, 1, 2]);
+    let refreshes = started.elapsed().as_secs_f64();
+    let per_refresh: Vec<f64> = before
+        .iter()
+        .zip(&after)
+        .map(|(before, after)| (after - before) as f64 / refreshes)
+        .collect();
+    println!(
+        "MEASURED idle growth: {per_refresh:.1?} audit rows per replica per second at a \
+         one-second refresh (at most two pushes sent at two rows and two received at four \
+         per refresh; a visit waits up to one interval past the refresh)"
+    );
+    // Push-back never turns an idle manager into a busy one.
+    assert!(
+        per_refresh.iter().all(|rows| *rows <= 13.0),
+        "{per_refresh:?}"
+    );
+    lab.stop_all();
+}
