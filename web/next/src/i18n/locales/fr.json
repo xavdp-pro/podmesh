@@ -297,6 +297,48 @@
     "takeover": {
       "standby": "Ce standby n’est pas un hôte de cette console.",
       "noCopy": "La bascule d'un hôte perdu exige une copie déjà présente sur ce standby."
+    },
+    "continuity": {
+      "bounds": "Bail de 5 à 3600 s, marge d’au moins 5 s, passage d’au moins 2 s et au plus un tiers du bail."
+    }
+  },
+  "continuity": {
+    "title": "Continuité de service",
+    "guarded": "sous garde",
+    "unguarded": "sans garde",
+    "failingOver": "bascule en cours",
+    "lead": "Sous garde, le gardien de ce poste renouvelle le bail de l'univers à chaque passage. Si l'hôte actif ne répond plus, il attend le bail plus la marge depuis le dernier renouvellement, puis relance l'univers sur le premier standby qui détient une copie, avec la mémoire de cette copie. Ce que l'univers a fait après sa dernière copie est perdu. Un hôte qui revient voit son ancienne copie arrêtée et supprimée.",
+    "lastTick": "Dernier passage",
+    "lastRenewal": "Dernier renouvellement",
+    "timing": "Bail + marge",
+    "every": "passage {{s}} s",
+    "order": "Ordre de bascule",
+    "fenceOn": "auto-isolement actif",
+    "fenceOff": "pas d'auto-isolement",
+    "unfencedWarning": "Pas d'auto-isolement sur {{hosts}} : un hôte coupé de ce poste continuerait de faire tourner l'univers pendant que le gardien le relance ailleurs. Activez d'abord la minuterie d'isolement sous mandat sur ces hôtes.",
+    "incidents": "Incidents",
+    "lost": "copie vieille de {{s}} s à la promotion",
+    "kind": {
+      "lost_host_failover": "bascule faite",
+      "host_reintegrated": "hôte réintégré",
+      "split_brain_observed": "seconde instance arrêtée",
+      "failover_refused": "bascule refusée",
+      "no_standby_for_failover": "aucun standby pour basculer"
+    },
+    "lease": "Bail (s)",
+    "margin": "Marge (s)",
+    "tick": "Passage (s)",
+    "objectives": "Données perdues au plus : l'intervalle de réplication ({{rpo}} s). De retour sur un standby après environ {{rto}} s.",
+    "keepStale": "Garder l'ancienne copie d'un hôte qui revient, arrêtée, au lieu de la supprimer",
+    "guard": "Mettre sous garde",
+    "arming": "Mise sous garde…",
+    "unguard": "Lever la garde",
+    "needsReplication": "Mettez d'abord en place la réplication : le gardien relance les copies qu'elle fait.",
+    "unguardTitle": "Lever la garde de cet univers",
+    "unguardMessage": "Plus rien ne basculera pour cet univers. Il reste sous son bail, désormais renouvelé seulement par ses passages de réplication ; avec l'auto-isolement actif sur les hôtes, il est arrêté si ces passages cessent.",
+    "toast": {
+      "guard": "Univers mis sous garde",
+      "unguard": "Garde levée"
     }
   }
 }

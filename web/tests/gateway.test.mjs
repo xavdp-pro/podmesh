@@ -215,7 +215,12 @@ test('replication runs the tool for the active host with every other SSH host as
  assert.equal((await post({...base,action:'takeover',standby:'c',planned:false})).status,200);assert.deepEqual(runs.at(-1).slice(-4),['--universe',U,'--standby','lab@c']);
  for(const bad of [{...base,action:'takeover',standby:'a',planned:true},{...base,action:'takeover',standby:'l',planned:true},{...base,action:'takeover',standby:'b'},{...base,action:'run',standby:'b'},{...base,action:'takeover',standby:'b',planned:true,capture:'live'}])
   assert.equal((await post(bad)).status,400,JSON.stringify(bad));
- assert.equal((await post({...base,action:'takeover',standby:'r',planned:true})).status,403);});
+ assert.equal((await post({...base,action:'takeover',standby:'r',planned:true})).status,403);
+ assert.equal((await post({...base,action:'guard'})).status,200);assert.deepEqual(runs.at(-1),['--reference','fixture','guard','--universe',U,'--lease','30','--margin','15','--tick','10']);
+ assert.equal((await post({...base,action:'guard',lease_seconds:60,takeover_margin_seconds:20,tick_seconds:15,keep_stale:true})).status,200);assert.deepEqual(runs.at(-1).slice(-7),['--lease','60','--margin','20','--tick','15','--keep-stale']);
+ assert.equal((await post({...base,action:'unguard'})).status,200);assert.deepEqual(runs.at(-1),['--reference','fixture','unguard','--universe',U]);
+ for(const bad of [{...base,action:'guard',lease_seconds:20,tick_seconds:10},{...base,action:'guard',takeover_margin_seconds:2},{...base,action:'guard',keep_stale:'yes'},{...base,action:'guard',standby:'b'},{...base,action:'unguard',lease_seconds:30},{...base,action:'run',tick_seconds:10}])
+  assert.equal((await post(bad)).status,400,JSON.stringify(bad));});
 test('health carries the replication summary from the ledger, and says when it cannot be read',async t=>{
  let app,answer;const s=http.createServer((req,res)=>app(req,res));s.listen(0,'127.0.0.1');await new Promise(r=>s.once('listening',r));t.after(()=>s.close());const url='http://127.0.0.1:'+s.address().port;
  const U='00000000-0000-4000-8000-00000000000b',seen=[];

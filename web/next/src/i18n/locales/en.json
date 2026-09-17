@@ -297,6 +297,48 @@
     "takeover": {
       "standby": "This standby is not a host of this console.",
       "noCopy": "The takeover of a lost host needs a copy already on this standby."
+    },
+    "continuity": {
+      "bounds": "Lease 5 to 3600 s, margin at least 5 s, tick at least 2 s and at most a third of the lease."
+    }
+  },
+  "continuity": {
+    "title": "Continuity of service",
+    "guarded": "guarded",
+    "unguarded": "not guarded",
+    "failingOver": "failing over",
+    "lead": "When guarded, the guardian on this workstation renews the universe's lease every tick. If the active host stops answering, it waits the lease plus the margin since the last renewal, then brings the universe back on the first standby that holds a copy, with the memory of that copy. What the universe did after its last copy is lost. A host that comes back has its old copy stopped and deleted.",
+    "lastTick": "Last tick",
+    "lastRenewal": "Last renewal",
+    "timing": "Lease + margin",
+    "every": "tick {{s}} s",
+    "order": "Failover order",
+    "fenceOn": "self-fence on",
+    "fenceOff": "no self-fence",
+    "unfencedWarning": "No self-fence on {{hosts}}: a host cut from this workstation would keep running the universe while the guardian starts it elsewhere. Enable the fence timer under a mandate there first.",
+    "incidents": "Incidents",
+    "lost": "copy {{s}} s old at the promotion",
+    "kind": {
+      "lost_host_failover": "failed over",
+      "host_reintegrated": "host reintegrated",
+      "split_brain_observed": "second instance stopped",
+      "failover_refused": "failover refused",
+      "no_standby_for_failover": "no standby to fail over to"
+    },
+    "lease": "Lease (s)",
+    "margin": "Margin (s)",
+    "tick": "Tick (s)",
+    "objectives": "Data lost at most: the replication interval ({{rpo}} s). Back on a standby after about {{rto}} s.",
+    "keepStale": "Keep a returning host's old copy stopped instead of deleting it",
+    "guard": "Guard this universe",
+    "arming": "Arming…",
+    "unguard": "Stop guarding",
+    "needsReplication": "Set up replication first: the guardian brings back the copies it makes.",
+    "unguardTitle": "Stop guarding this universe",
+    "unguardMessage": "Nothing will take over for this universe any more. It stays under its lease, now renewed only by its replication runs; with the hosts' self-fence enabled it is stopped if those runs stop.",
+    "toast": {
+      "guard": "Universe guarded",
+      "unguard": "Guard stopped"
     }
   }
 }

@@ -147,8 +147,8 @@ export function createApp(config,{call=request,origin='http://127.0.0.1:4175',re
   if(!requireMutatingSession(req,res,origin,token))return;
   const p=req.body||{};const host=hosts.find(h=>h.id===p.host);
   if(!host)return res.status(404).json({error:'Unknown host'});
-  if(!['configure','run','start','stop','takeover'].includes(p.action)||!uuid.test(p.universe_uuid)||typeof p.authorization_ref!=='string'||!p.authorization_ref.trim()||p.authorization_ref.length>256)return res.status(400).json({error:'Invalid replication request'});
-  if(Object.keys(p).some(k=>!['action','host','universe_uuid','authorization_ref','standbys','interval_seconds','capture','standby','planned'].includes(k)))return res.status(400).json({error:'Unexpected replication field'});
+  if(!['configure','run','start','stop','takeover','guard','unguard'].includes(p.action)||!uuid.test(p.universe_uuid)||typeof p.authorization_ref!=='string'||!p.authorization_ref.trim()||p.authorization_ref.length>256)return res.status(400).json({error:'Invalid replication request'});
+  if(Object.keys(p).some(k=>!['action','host','universe_uuid','authorization_ref','standbys','interval_seconds','capture','standby','planned','lease_seconds','takeover_margin_seconds','tick_seconds','keep_stale'].includes(k)))return res.status(400).json({error:'Unexpected replication field'});
   if(!host.allowActions)return res.status(403).json({error:'Actions disabled by operator configuration'});
   if(!host.ssh)return res.status(409).json({error:'A replication needs the active host reached over SSH from this console'});
   const others=hosts.filter(h=>h.ssh&&h.id!==host.id);
@@ -162,6 +162,13 @@ export function createApp(config,{call=request,origin='http://127.0.0.1:4175',re
    const capture=p.capture===undefined?'stopped':p.capture;
    if(!['stopped','live'].includes(capture))return res.status(400).json({error:'capture must be "stopped" or "live"'});
    args.push('configure','--universe',p.universe_uuid,'--active',host.ssh,'--hosts',[host.ssh,...others.map(h=>h.ssh)].join(','),'--standbys',standbys,'--interval',String(p.interval_seconds),'--capture',capture);
+  }else if(p.action==='guard'){
+   // Continuity: the guardian renews the lease every tick and fails over to the first standby with a copy after lease + margin.
+   const lease=p.lease_seconds??30,margin=p.takeover_margin_seconds??15,tick=p.tick_seconds??10;
+   if(![lease,margin,tick].every(Number.isInteger)||lease<5||lease>3600||margin<5||margin>3600||tick<2||lease<3*tick)return res.status(400).json({error:'lease_seconds 5-3600, takeover_margin_seconds 5-3600, tick_seconds at least 2 and at most a third of the lease'});
+   if(p.keep_stale!==undefined&&typeof p.keep_stale!=='boolean')return res.status(400).json({error:'keep_stale must be true or false'});
+   if(p.standbys!==undefined||p.interval_seconds!==undefined||p.capture!==undefined||p.standby!==undefined||p.planned!==undefined)return res.status(400).json({error:'guard takes lease_seconds, takeover_margin_seconds, tick_seconds and keep_stale'});
+   args.push('guard','--universe',p.universe_uuid,'--lease',String(lease),'--margin',String(margin),'--tick',String(tick),...(p.keep_stale?['--keep-stale']:[]));
   }else if(p.action==='takeover'){
    // The standby becomes the active host: planned = a switchover while the active host is fine; otherwise the active host is lost.
    const standby=others.find(h=>h.id===p.standby);
@@ -171,11 +178,11 @@ export function createApp(config,{call=request,origin='http://127.0.0.1:4175',re
    if(p.standbys!==undefined||p.interval_seconds!==undefined||p.capture!==undefined)return res.status(400).json({error:'standbys, interval_seconds and capture belong to configure'});
    args.push('takeover','--universe',p.universe_uuid,'--standby',standby.ssh,...(p.planned?['--planned']:[]));
   }else{
-   if(p.standbys!==undefined||p.interval_seconds!==undefined||p.capture!==undefined||p.standby!==undefined||p.planned!==undefined)return res.status(400).json({error:'standbys, interval_seconds and capture belong to configure; standby and planned to takeover'});
+   if(p.standbys!==undefined||p.interval_seconds!==undefined||p.capture!==undefined||p.standby!==undefined||p.planned!==undefined||p.lease_seconds!==undefined||p.takeover_margin_seconds!==undefined||p.tick_seconds!==undefined||p.keep_stale!==undefined)return res.status(400).json({error:'standbys, interval_seconds and capture belong to configure; standby and planned to takeover; lease, margin, tick and keep_stale to guard'});
    args.push(p.action,'--universe',p.universe_uuid);
   }
   const report=await runReplication({args,host,toolsDir:replicationToolsDir()});
-  if(p.action==='run'||p.action==='configure'||p.action==='takeover'){cached=null;generation++;}
+  if(['run','configure','takeover','guard','unguard'].includes(p.action)){cached=null;generation++;}
   res.status(report.result==='refused'?409:report.result==='unknown'?502:200).json(report);
  });
  // A move: one universe, two hosts of this configuration, both reached over SSH and both allowing actions, on the same runtime paths.

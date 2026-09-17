@@ -7,6 +7,7 @@ import Notice from '../components/Notice'
 import Badge from '../components/Badge'
 import Button from '../components/Button'
 import TakeoverModal from './TakeoverModal'
+import ContinuityPanel from './ContinuityPanel'
 import { useI18n } from '../store/useLocaleStore'
 import { useSession } from '../store/useSessionStore'
 import { getReplication, postReplication } from '../api/console'
@@ -141,6 +142,7 @@ export default function ReplicationPanel({ row, onChanged }) {
               </table>
             </div>
           )}
+          <ContinuityPanel row={row} status={status} onChanged={() => { load(); onChanged?.() }} />
           {lastTakeover && <Notice text={t('takeover.inPlace', { to: lastTakeover.toName || lastTakeover.to, capture: lastTakeover.capture === 'live' ? t('takeover.doneMemory') : t('takeover.doneAfresh') })} />}
         </>
       )}

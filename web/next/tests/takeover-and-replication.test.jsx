@@ -19,7 +19,7 @@ const copy = { capture: 'live', generation: 7, age_seconds: 42, present_on_host:
 beforeEach(() => { vi.clearAllMocks(); try { localStorage.setItem('podmesh.console.locale', 'en') } catch { /* jsdom */ } })
 afterEach(cleanup)
 
-const typeAuth = value => fireEvent.change(screen.getByLabelText('Authorization reference'), { target: { value } })
+const typeAuth = value => fireEvent.change(screen.getAllByLabelText('Authorization reference')[0], { target: { value } })
 
 describe('takeover', () => {
   it('sends the planned switchover exactly as the contract says', async () => {
@@ -89,5 +89,30 @@ describe('takeover without a copy on the standby', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Take over' }))
     await waitFor(() => expect(api.postReplication).toHaveBeenCalled())
     expect(api.postReplication.mock.calls[0][0].planned).toBe(true)
+  })
+})
+
+describe('continuity', () => {
+  it('builds the guard body within the bounds the server checks', async () => {
+    const { guardBody, unguardBody } = await import('../src/model/replication')
+    expect(guardBody({ host: 'lab-c', universe_uuid: U, authorization_ref: ' m ', lease_seconds: '30', takeover_margin_seconds: '15', tick_seconds: '10', keep_stale: false }))
+      .toEqual({ action: 'guard', host: 'lab-c', universe_uuid: U, authorization_ref: 'm', lease_seconds: 30, takeover_margin_seconds: 15, tick_seconds: 10, keep_stale: false })
+    expect(() => guardBody({ host: 'h', universe_uuid: U, authorization_ref: 'm', lease_seconds: 20, takeover_margin_seconds: 15, tick_seconds: 10 })).toThrow('continuity.bounds')
+    expect(unguardBody({ host: 'h', universe_uuid: U, authorization_ref: 'm' })).toEqual({ action: 'unguard', host: 'h', universe_uuid: U, authorization_ref: 'm' })
+  })
+
+  it('warns when a host has no self-fence, and shows the incidents', async () => {
+    const { default: ContinuityPanel } = await import('../src/features/ContinuityPanel')
+    const status = {
+      replication: { interval_seconds: 60 },
+      guard: { state: 'guarding', armed: true, lease_seconds: 30, takeover_margin_seconds: 15, tick_seconds: 10, order: ['lab@a', 'lab@b'], last_tick_age_seconds: 4, last_renewal_age_seconds: 4,
+        incidents: [{ at: 1789600000, kind: 'lost_host_failover', from: 'lab@c', to: 'lab@a', copy_age_seconds: 24 }] },
+      fence: [{ host: 'lab@c', mandate_present: true, timer_active: true }, { host: 'lab@a', mandate_present: false, timer_active: false }],
+    }
+    render(<ContinuityPanel row={row} status={status} />)
+    expect(screen.getByText('guarded')).toBeTruthy()
+    expect(screen.getByRole('alert').textContent).toContain('No self-fence on lab@a')
+    expect(screen.getByText(/lab@c → lab@a/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Stop guarding' })).toBeTruthy()
   })
 })

@@ -24,10 +24,11 @@ function ReplicationCell({ universe, replication: r }) {
   const { t } = useI18n()
   if (universe.manager) return <span className="text-xs text-ink-500">{t('health.peerToPeer')}</span>
   if (!r) return <Badge tone="muted">{t('health.none')}</Badge>
+  const guardBadge = r.guarded ? <Badge tone={r.guard_state === 'failing_over' ? 'red' : 'green'}>{r.guard_state === 'failing_over' ? t('continuity.failingOver') : t('continuity.guarded')}</Badge> : <Badge tone="muted">{t('continuity.unguarded')}</Badge>
   const failed = r.last_run && !r.last_run.ok
   return (
     <div className="space-y-0.5">
-      <Badge tone={failed ? 'red' : r.armed ? 'green' : 'amber'}>{failed ? t('health.lastRunFailed') : r.armed ? t('replication.scheduled') : t('health.manual')}</Badge>
+      <span className="flex flex-wrap gap-1"><Badge tone={failed ? 'red' : r.armed ? 'green' : 'amber'}>{failed ? t('health.lastRunFailed') : r.armed ? t('replication.scheduled') : t('health.manual')}</Badge>{guardBadge}</span>
       <p className="text-xs text-ink-500">
         {r.mode === 'all' ? t('health.allStandbys', { n: r.standbys }) : t('health.nStandbys', { n: r.standbys })}
         {r.armed && r.interval_seconds ? ` · ${t(`replication.every.${r.interval_seconds}`) !== `replication.every.${r.interval_seconds}` ? t(`replication.every.${r.interval_seconds}`) : `${r.interval_seconds} s`}` : ''}
@@ -36,6 +37,7 @@ function ReplicationCell({ universe, replication: r }) {
         {r.last_run?.stopped_for_seconds != null ? ` · ${r.last_run.capture === 'live' ? t('health.interrupted', { s: r.last_run.stopped_for_seconds }) : t('health.stoppedFor', { s: r.last_run.stopped_for_seconds })}` : ''}
       </p>
       {failed && <p className="text-xs text-terra-600">{r.last_run.error}</p>}
+      {r.last_incident && <p className="text-xs text-amber-600">{t(`continuity.kind.${r.last_incident.kind}`)} · {new Date(r.last_incident.at * 1000).toLocaleString()}</p>}
     </div>
   )
 }
