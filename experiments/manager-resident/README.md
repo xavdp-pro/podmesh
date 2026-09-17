@@ -57,11 +57,22 @@ fact of its own origin was appended by the store itself (its `observe` receipts 
 an emptied store that imported its own facts back never qualifies, in any later
 process), once the window has elapsed since the process started exchanging, one peer has
 been caught up with, and every other peer has been attempted and is not known to be
-ahead. This bounds a start while a peer is down, at the price of the collision above if
-that peer alone held later facts of a restored older copy. A replica that reaches no peer
-never appends. A replica without peers is caught up at once. Until it is caught up,
-`append_observation` answers `append_observation_catching_up` without touching the store.
-The state latches for the process.
+ahead — all of it on evidence no older than the window's end, which is why every peer is
+made due again when the window ends, with a fresh operation ID, its acknowledgement
+forgotten and its backoff restarted. A peer caught up with earlier may since have
+received, relayed from the peer the window would forgive, the very facts this store
+lacks. Receipts date that evidence (a receipt counts the peer's history no earlier than
+the attempt that drew it, or than the operation ID behind a replayed one); an imported
+snapshot does not, so it counts through the receipt whose history it covers. A peer that
+answers an authenticated refusal is reached, not forgiven. This bounds a start while a
+peer is down, at the price of the collision above if that peer alone held later facts of
+a restored older copy. A replica that reaches no peer never appends. A replica without
+peers is caught up at once. Until it is caught up, `append_observation` answers
+`append_observation_catching_up` without touching the store, and the replica keeps
+exchanging meanwhile: it is running, and not ready. The state latches for the process.
+While it is catching up, an authenticated import from a peer also makes its own next
+attempt to that peer due at once: the process needs a receipt of its own, which no
+import gives.
 
 A refused authenticated import is reported too. After a refused import the transport
 compares the refused snapshot with the local history; the resident counts refused
@@ -170,7 +181,7 @@ endpoints, commands or topology. Protect local config/DB; never commit secrets.
 | Maximum backoff | At least interval, at most 300,000 ms |
 | Complete store verification | Optional, 1,000–86,400,000 ms; default 600,000 ms |
 | Unchanged snapshot refresh | Optional, at least interval, at most 3,600,000 ms; default 600,000 ms |
-| Catch-up window | Optional, 1,000–15,000 ms; default 15,000 ms: the universe's 25-second start budget, counted in whole seconds, holds while the control socket binds within about 8 s |
+| Catch-up window | Optional, 1,000–15,000 ms; default 15,000 ms, plus the round of attempts taken after its end (one connect deadline per unreachable peer). The universe's 25-second start budget does not bound it: a replica catching up is running, not ready |
 | Control request frame | 32,768 bytes within the shared 250 ms control deadline |
 | Observation value | Nonempty UTF-8, at most 4,096 bytes |
 | Control response | 32,768 bytes within the shared 250 ms control deadline |
@@ -215,7 +226,9 @@ UID or policy failures, and durable policy refusals return
 `append_observation_busy`; it admits no new work and makes no claim about whether
 a prior request with that operation ID will commit. A process that has not caught up
 with its peers returns `append_observation_catching_up` after the authorization checks
-and before any store access; retry the identical request. `status_unavailable` is a
+and before any store access; retry the identical request, for as long as it takes. It is
+not a refusal: the replica is running and exchanging, and it appends nothing before it
+holds every fact of its own its peers hold. `status_unavailable` is a
 bounded diagnostic failure.
 
 A missing reply, a partial JSON reply or `append_observation_uncertain` leaves the
@@ -278,7 +291,8 @@ margin after the last success.
 `catch_up` reports `caught_up`, `caught_up_by` (`every_peer`, `window` or `no_peers`),
 `caught_up_after_ms` since the process started exchanging, `peers_imported`,
 `peers_matched`, `peers_missing`, `peers_ahead`, `peers_not_attempted`,
-`own_facts_at_start`, `latest_own_fact_appended_locally` and `window_ms`. None of this is
+`own_facts_at_start`, `latest_own_fact_appended_locally`, `window_ms` and
+`appends_observed`, the appends this process answered observed. None of this is
 exact causal lag or convergence proof: equal counts can differ, and replayed receipts describe a
 historical committed result. Unknown values remain null. Unsigned diagnostics
 and failed exchanges clear `history_count_delta` to null; the previous acknowledged

@@ -14,7 +14,7 @@ use std::{
     os::unix::{fs::PermissionsExt, net::UnixStream},
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     thread,
@@ -24,6 +24,9 @@ use std::{
 struct Proxy {
     address: SocketAddr,
     blocked: Arc<AtomicBool>,
+    /// How long a new connection is held before it is relayed: a peer that
+    /// answers, late, rather than one that is unreachable.
+    hold_ms: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -33,9 +36,11 @@ impl Proxy {
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
         let blocked = Arc::new(AtomicBool::new(false));
+        let hold_ms = Arc::new(AtomicU64::new(0));
         let stopping = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stopping);
         let block = Arc::clone(&blocked);
+        let hold = Arc::clone(&hold_ms);
         let worker = thread::spawn(move || {
             let mut workers = Vec::new();
             while !stop.load(Ordering::SeqCst) {
@@ -43,9 +48,13 @@ impl Proxy {
                     if block.load(Ordering::SeqCst) {
                         drop(source);
                     } else {
+                        let held = hold.load(Ordering::SeqCst);
                         workers.push(thread::spawn(move || {
+                            if held > 0 {
+                                thread::sleep(Duration::from_millis(held));
+                            }
                             if let Ok(mut destination) =
-                                TcpStream::connect_timeout(&target, Duration::from_millis(100))
+                                TcpStream::connect_timeout(&target, Duration::from_millis(500))
                             {
                                 let _ = source.set_read_timeout(Some(Duration::from_secs(3)));
                                 let _ = destination.set_read_timeout(Some(Duration::from_secs(3)));
@@ -72,6 +81,7 @@ impl Proxy {
         Self {
             address,
             blocked,
+            hold_ms,
             stopping,
             worker: Some(worker),
         }
@@ -366,9 +376,9 @@ impl Drop for Lab {
         }
     }
 }
-/// How long a resident may take to answer status. The universe gives a whole
-/// start 25 seconds, the catch-up window included, so a resident must bind its
-/// control socket within a few seconds. `PODMESH_RESIDENT_TEST_LOAD_ALLOWANCE_MS`
+/// How long a resident may take to answer status. The universe's 25-second start
+/// budget bounds the control socket's bind (catching up is not bounded by it), so
+/// a resident must bind that socket within a few seconds. `PODMESH_RESIDENT_TEST_LOAD_ALLOWANCE_MS`
 /// adds an explicit allowance for a machine known to be loaded; a failure names
 /// the bound and the allowance apart.
 fn readiness_bound() -> (Duration, Duration) {
@@ -541,7 +551,19 @@ fn wrong_key_and_oversized_frames_do_not_import() {
             .unwrap();
         let mut reply = Vec::new();
         match stream.read_to_end(&mut reply) {
-            Ok(_) => break,
+            Ok(_) => {
+                // The answer is a framed, unsigned diagnostic: the sender learns
+                // that its frame was refused as malformed, it is not left to a
+                // closed connection.
+                assert!(reply.len() > 4, "oversized frame answered with {reply:?}");
+                let announced = u32::from_be_bytes(reply[..4].try_into().unwrap());
+                assert_eq!(usize::try_from(announced).unwrap(), reply.len() - 4);
+                let diagnostic: Value = serde_json::from_slice(&reply[4..]).unwrap();
+                assert_eq!(diagnostic["result"], "diagnostic", "{diagnostic}");
+                assert_eq!(diagnostic["server_replica_id"], "r1");
+                assert_eq!(diagnostic["category"], "malformed");
+                break;
+            }
             Err(error)
                 if error.kind() == std::io::ErrorKind::ConnectionReset
                     && attempts < 5
@@ -2009,6 +2031,14 @@ fn with_a_peer_down_only_a_store_whose_latest_own_fact_it_appended_appends_after
     let catch_up = lab.status(2)["catch_up"].clone();
     assert_eq!(catch_up["caught_up_by"], "window");
     assert!(catch_up["caught_up_after_ms"].as_u64().unwrap() >= 2_000);
+    println!(
+        "MEASURED window with one peer down (window 2,000 ms, the attempt to the stopped peer \
+         costing its 2 s connect deadline): caught up {} ms after the resident started exchanging, \
+         its boot fact observed {} ms after the process was spawned, after {catching_up} \
+         answer(s) of catching up",
+        catch_up["caught_up_after_ms"],
+        spawned.elapsed().as_millis()
+    );
     assert_eq!(catch_up["own_facts_at_start"], 3);
     assert_eq!(catch_up["latest_own_fact_appended_locally"], true);
     assert_eq!(catch_up["peers_matched"], json!(["r0"]));
@@ -2191,6 +2221,13 @@ fn a_replica_restored_from_an_older_store_is_pushed_back_to_within_a_few_interva
     let bound = Instant::now();
     until(|| lab.count(2) == 3, Duration::from_secs(10));
     let converged = bound.elapsed();
+    // A push-back requested while an attempt is already past its due check is
+    // served by that attempt, which leaves its acknowledgement unrecorded, and
+    // counted at the next one: wait for the counter rather than read it once.
+    until(
+        || push_backs(&lab, 0, "r2") + push_backs(&lab, 1, "r2") > before,
+        Duration::from_secs(5),
+    );
     assert!(
         push_backs(&lab, 0, "r2") + push_backs(&lab, 1, "r2") > before,
         "convergence did not come from a push-back: before {before}, r0 {} r1 {}",
@@ -2536,5 +2573,234 @@ fn an_identity_collision_is_counted_on_both_sides_and_named_once() {
     assert_eq!(named(1, "r2"), 1);
     assert_eq!(named(2, "r0"), 1);
     assert_eq!(named(2, "r1"), 1);
+    lab.stop_all();
+}
+
+/// The files of a stopped replica's store and their bytes, to put back later.
+type SavedStore = Vec<(std::path::PathBuf, Option<Vec<u8>>)>;
+
+fn save_store(lab: &Lab, i: usize) -> SavedStore {
+    lab.store_files(i)
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).ok();
+            (path, bytes)
+        })
+        .collect()
+}
+
+fn restore_store(saved: &SavedStore) {
+    for (path, bytes) in saved {
+        match bytes {
+            Some(bytes) => fs::write(path, bytes).unwrap(),
+            None => {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
+/// The value one replica holds under an event ID, read without its resident.
+fn fact_value(lab: &Lab, i: usize, event_id: &str) -> Option<String> {
+    inspection(lab, i)
+        .ordered_facts
+        .iter()
+        .find(|fact| fact.event_id == event_id)
+        .map(|fact| fact.value.clone())
+}
+
+/// Leaves the laboratory in the state both window tests start from: r2 restored
+/// from an older copy of its store, whose latest own fact it appended itself,
+/// and r2:2, the fact that copy lacks, held by r0 alone. Every resident is
+/// stopped; r0 holds r2:1 and r2:2, r1 and r2 hold r2:1.
+fn older_copy_with_one_holder(lab: &mut Lab) {
+    lab.start_all();
+    lab.append(2, "boot-1", "s2", "boot", "boot-1 value");
+    assert_converged(lab, 1);
+    lab.stop(2);
+    let saved = save_store(lab, 2);
+    lab.stop(1);
+    lab.configs[2].catch_up_window_ms = Some(1_000);
+    lab.start(2);
+    let (reply, _) = append_when_caught_up(lab, 2, &boot_append("boot-2"), Duration::from_secs(15));
+    assert_eq!(
+        reply["response"]["fact"]["event_id"],
+        "r2:00000000000000000002"
+    );
+    until(|| lab.count(0) == 2, Duration::from_secs(10));
+    lab.stop(2);
+    lab.stop(0);
+    restore_store(&saved);
+    assert_eq!(lab.count(0), 2);
+    assert_eq!(lab.count(1), 1);
+    assert_eq!(lab.count(2), 1);
+}
+
+/// The window is evaluated after the event it learns, never before it. A receipt
+/// that shows a peer ahead can arrive as the first thing this process learns
+/// after the window's end: it must count, and refuse the append, rather than let
+/// the window latch on what was known before it.
+#[test]
+fn a_receipt_that_shows_a_peer_ahead_counts_before_the_window_is_weighed() {
+    let mut lab = Lab::new();
+    older_copy_with_one_holder(&mut lab);
+    // r2 and r1 exchange directly. r2 -> r0 passes through a relay that first
+    // drops every connection, then holds each one; r0 -> r2 and r0 <-> r1 are
+    // dropped, so r1 never receives r2:2 and r0 never pushes it back.
+    let r2_to_r0 = Proxy::new(lab.configs[0].network.bind);
+    let r0_to_r2 = Proxy::new(lab.configs[2].network.bind);
+    let r0_to_r1 = Proxy::new(lab.configs[1].network.bind);
+    let r1_to_r0 = Proxy::new(lab.configs[0].network.bind);
+    for proxy in [&r2_to_r0, &r0_to_r2, &r0_to_r1, &r1_to_r0] {
+        proxy.blocked.store(true, Ordering::SeqCst);
+    }
+    peer_mut(&mut lab.configs[2], "r0").endpoint = r2_to_r0.address;
+    peer_mut(&mut lab.configs[0], "r2").endpoint = r0_to_r2.address;
+    peer_mut(&mut lab.configs[0], "r1").endpoint = r0_to_r1.address;
+    peer_mut(&mut lab.configs[1], "r0").endpoint = r1_to_r0.address;
+    lab.start(0);
+    lab.start(1);
+    lab.configs[2].catch_up_window_ms = Some(3_000);
+    let spawned = Instant::now();
+    lab.start(2);
+    until(
+        || {
+            let catch_up = lab.status(2)["catch_up"].clone();
+            catch_up["peers_matched"] == json!(["r1"])
+                && catch_up["peers_missing"] == json!(["r0"])
+                && catch_up["peers_ahead"] == json!([])
+        },
+        Duration::from_secs(5),
+    );
+    // Two seconds in, r0 starts answering, 1.5 s late: the attempt that carries
+    // the window's end is the one whose receipt tells that r0 holds r2:2.
+    while spawned.elapsed() < Duration::from_millis(2_000) {
+        thread::sleep(Duration::from_millis(10));
+    }
+    r2_to_r0.hold_ms.store(1_500, Ordering::SeqCst);
+    r2_to_r0.blocked.store(false, Ordering::SeqCst);
+    let learnt = Instant::now();
+    loop {
+        let catch_up = lab.status(2)["catch_up"].clone();
+        if catch_up["peers_ahead"] == json!(["r0"]) {
+            break;
+        }
+        assert!(
+            learnt.elapsed() < Duration::from_secs(6),
+            "r2 never learnt that r0 holds facts it lacks; a held attempt may have outlasted \
+             the two-second read deadline on a loaded machine: {catch_up}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    // Well past the window's end, r2 still refuses to append: it knows r0 holds
+    // a fact it lacks.
+    while spawned.elapsed() < Duration::from_millis(4_500) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let reply = lab
+        .control_value(2, boot_append("boot-after-window"))
+        .unwrap();
+    assert_eq!(reply["error"], "append_observation_catching_up", "{reply}");
+    let catch_up = lab.status(2)["catch_up"].clone();
+    assert_eq!(catch_up["caught_up"], false);
+    assert_eq!(catch_up["caught_up_by"], Value::Null);
+    assert_eq!(catch_up["peers_ahead"], json!(["r0"]));
+
+    // Once r0 can push r2:2 back, r2 imports it and its next fact takes the
+    // sequence after it. Nothing forked.
+    r0_to_r2.blocked.store(false, Ordering::SeqCst);
+    let (reply, _) = append_when_caught_up(
+        &lab,
+        2,
+        &boot_append("boot-after-window"),
+        Duration::from_secs(15),
+    );
+    assert_eq!(
+        reply["response"]["fact"]["event_id"],
+        "r2:00000000000000000003"
+    );
+    assert_eq!(lab.status(2)["catch_up"]["caught_up_by"], "every_peer");
+    assert_eq!(
+        fact_value(&lab, 2, "r2:00000000000000000002"),
+        fact_value(&lab, 0, "r2:00000000000000000002")
+    );
+    lab.stop_all();
+}
+
+/// The window counts only what this process learnt after its end. A peer it
+/// caught up with earlier can receive, from the peer the window would forgive,
+/// the very facts this store lacks; the fresh round at the window's end sees
+/// that peer ahead and the append waits.
+#[test]
+fn the_window_weighs_only_evidence_taken_after_its_end() {
+    let mut lab = Lab::new();
+    older_copy_with_one_holder(&mut lab);
+    // r2 -> r1 direct; r1 -> r2 through a relay that is closed later. r2 <-> r0
+    // is dropped both ways: r0 is the peer the window would forgive. r0 -> r1 is
+    // opened later, so that r1 receives r2:2 from r0 alone.
+    let r1_to_r2 = Proxy::new(lab.configs[2].network.bind);
+    let r2_to_r0 = Proxy::new(lab.configs[0].network.bind);
+    let r0_to_r2 = Proxy::new(lab.configs[2].network.bind);
+    let r0_to_r1 = Proxy::new(lab.configs[1].network.bind);
+    let r1_to_r0 = Proxy::new(lab.configs[0].network.bind);
+    for proxy in [&r2_to_r0, &r0_to_r2, &r0_to_r1, &r1_to_r0] {
+        proxy.blocked.store(true, Ordering::SeqCst);
+    }
+    peer_mut(&mut lab.configs[1], "r2").endpoint = r1_to_r2.address;
+    peer_mut(&mut lab.configs[2], "r0").endpoint = r2_to_r0.address;
+    peer_mut(&mut lab.configs[0], "r2").endpoint = r0_to_r2.address;
+    peer_mut(&mut lab.configs[0], "r1").endpoint = r0_to_r1.address;
+    peer_mut(&mut lab.configs[1], "r0").endpoint = r1_to_r0.address;
+    lab.start(0);
+    lab.start(1);
+    lab.configs[2].catch_up_window_ms = Some(4_000);
+    let spawned = Instant::now();
+    lab.start(2);
+    until(
+        || {
+            let catch_up = lab.status(2)["catch_up"].clone();
+            catch_up["peers_matched"] == json!(["r1"]) && catch_up["peers_missing"] == json!(["r0"])
+        },
+        Duration::from_secs(5),
+    );
+    // r1 can no longer reach r2 and receives r2:2 from r0, well before r2's
+    // window ends: what r2 knows of r1 is now out of date.
+    r1_to_r2.blocked.store(true, Ordering::SeqCst);
+    r0_to_r1.blocked.store(false, Ordering::SeqCst);
+    until(|| lab.count(1) == 2, Duration::from_secs(10));
+    let received_after = spawned.elapsed();
+    assert!(
+        received_after < Duration::from_secs(4),
+        "r1 received r2:2 after r2's window had ended ({received_after:?}): inconclusive"
+    );
+    // Past the window's end, the fresh round finds r1 ahead and r2 keeps refusing.
+    assert_catching_up_for(&lab, 2, "boot-after-window", Duration::from_secs(4));
+    let catch_up = lab.status(2)["catch_up"].clone();
+    assert_eq!(catch_up["caught_up"], false, "{catch_up}");
+    assert_eq!(catch_up["peers_ahead"], json!(["r1"]));
+    assert_eq!(catch_up["peers_missing"], json!(["r0", "r1"]));
+    assert_eq!(catch_up["latest_own_fact_appended_locally"], true);
+
+    // r1 can push again: r2 imports r2:2, counts r1 caught up on a receipt taken
+    // after the window's end, and takes the next sequence with r0 still out of
+    // reach. The fact r1 holds is the one r2 holds.
+    r1_to_r2.blocked.store(false, Ordering::SeqCst);
+    let (reply, _) = append_when_caught_up(
+        &lab,
+        2,
+        &boot_append("boot-after-window"),
+        Duration::from_secs(20),
+    );
+    assert_eq!(
+        reply["response"]["fact"]["event_id"],
+        "r2:00000000000000000003"
+    );
+    let catch_up = lab.status(2)["catch_up"].clone();
+    assert_eq!(catch_up["caught_up_by"], "window");
+    assert_eq!(catch_up["peers_missing"], json!(["r0"]));
+    assert_eq!(
+        fact_value(&lab, 2, "r2:00000000000000000002"),
+        fact_value(&lab, 1, "r2:00000000000000000002")
+    );
     lab.stop_all();
 }
