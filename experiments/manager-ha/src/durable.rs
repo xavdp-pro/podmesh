@@ -123,8 +123,10 @@ type IntegrityKey = (u64, u64, Option<(u64, u32)>, String, String);
 /// write and export of that file returns that same error, and no transaction of
 /// the process commits on it afterwards. Another file at the same path is another
 /// database file. An in-place change to an older row that no operation reads,
-/// including a removed or replaced row, is detected by the next complete
-/// verification, not by the next transaction.
+/// including a replaced row or a removed row that leaves a gap, is detected by the
+/// next complete verification, not by the next transaction; a table whose last
+/// rows were removed is shorter and still verifies when no remaining row depends
+/// on them.
 #[derive(Default)]
 struct StoreIntegrityEntry {
     state: Mutex<IntegrityState>,

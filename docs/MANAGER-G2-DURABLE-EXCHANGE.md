@@ -81,7 +81,7 @@ unreachable peer remains unknown rather than stopped.
 | G2-I08 | Byte counts are actual framed bytes transferred in that phase, including the four-byte length prefix; request and reply announced sizes are recorded separately. |
 | G2-I09 | Audit data contains no pair key, configuration bytes or unbounded attacker-supplied detail. |
 | G2-I10 | Canonical inspection captures stable database, WAL and SHM bytes, opens only the private copy read-only, and never initializes, migrates, checkpoints or repairs the canonical store. |
-| G2-I11 | Corrupt facts, receipts or audit rows fail closed before replay, mutation or a successful inspection result. *Amended 2026-09-17 (lot V2-R):* a row appended since the last verification, a replayed receipt or audit row, and the rows of the attempt an audit row extends fail closed before that replay, mutation or reply; every row fails closed at a process's first open, at each periodic complete verification and before a successful inspection result; a failure closes the store for the rest of the process. See [MANAGER-PRE-REPLY-VERIFICATION.md](MANAGER-PRE-REPLY-VERIFICATION.md). |
+| G2-I11 | Corrupt facts, receipts or audit rows fail closed before replay, mutation or a successful inspection result. *Amended 2026-09-17 (lots V2-R and V2-S):* a row added since the last verification without removing a stored row, a replayed receipt or audit row, the rows of the attempt an audit row extends and the facts an operation loads fail closed before that replay, mutation or reply; every row fails closed at a process's first open, at each periodic complete verification and before a successful inspection result; a failure closes the database file for the rest of the process, which commits no transaction on it afterwards. See [MANAGER-PRE-REPLY-VERIFICATION.md](MANAGER-PRE-REPLY-VERIFICATION.md). |
 | G2-I12 | Retrying an identical operation reuses its mutation result but records a distinct transport attempt. |
 | G2-I13 | Reusing an operation ID for different request content refuses without partial durable state. |
 | G2-I14 | Audit or receipt failure prevents a success claim even when the remote outcome is uncertain. |
@@ -151,14 +151,19 @@ Allowed outcomes are:
 Rows are protected by no-update and no-delete triggers. Their checksum uses a
 domain-separated canonical JSON tuple. Every store operation verifies all fact,
 receipt and audit checksums before returning data or committing another mutation.
-*Amended 2026-09-17 (lot V2-R):* every store operation verifies the schema shape,
-the last verified row of each table, every row appended since, and any stored
-receipt or audit row it replays or extends, before returning data or committing
-another mutation; every fact, receipt and audit row is verified at a process's
-first open of the store and by a periodic complete verification. An in-place edit
-of an older row that no operation reads is detected at the next complete
-verification, and any verification failure closes the store for the rest of the
-process. See [MANAGER-PRE-REPLY-VERIFICATION.md](MANAGER-PRE-REPLY-VERIFICATION.md).
+*Amended 2026-09-17 (lots V2-R and V2-S):* every store operation verifies the
+schema shape, the last verified row of each table, that no table has a row before
+rowid 1, every row appended since, which must continue its table's rowids, the facts
+it loads, and any stored receipt or audit row it replays or extends, before
+returning data or committing another mutation; every fact, receipt and audit row,
+and the rowids of each table, are verified at a process's first open of the store
+and by a periodic complete verification. The triggers do not stop `REPLACE`, whose
+implicit delete fires no trigger: an in-place change of an older row that no
+operation reads, a replaced row or a removed row that leaves a gap included, is
+detected at the next complete verification; a table whose last rows were removed
+still verifies when no remaining row depends on them. Any failure to read or verify a stored row closes the
+database file for the rest of the process, which commits no transaction on it
+afterwards. See [MANAGER-PRE-REPLY-VERIFICATION.md](MANAGER-PRE-REPLY-VERIFICATION.md).
 Accepted inbound-import audit rows must reference the receipt inserted in the same
 transaction. The read-only verifier rejects a missing or mismatched reference.
 One sequence validator applies before insert (to the stored rows of the
@@ -290,7 +295,11 @@ pub fn inspect_read_only(
 
 It first captures stable database, WAL and SHM bytes into an atomically created
 mode-0700 private directory, then uses SQLite read-only flags and a deferred
-consistent transaction on that private copy. If raw copied WAL state cannot be
+consistent transaction on that private copy. *Amended 2026-09-17 (lot V2-S):* the
+capture reads the files twice and keeps them only when both reads are equal; a store
+whose files total more than 16 MiB is copied into the private directory and read
+again against that copy instead of twice into memory, so the capture's memory does
+not grow with the store. If raw copied WAL state cannot be
 opened, it captures another private snapshot and runs `VACUUM INTO` from that
 private copy into a second private file; the fallback never opens the canonical
 source through SQLite. After one successful preflight, a process cache bound to
@@ -334,10 +343,21 @@ Stage R must map the same read-only result into the eventual installed form
 `podmesh-managerd --inspect-store --config ... --state-dir ...`; that installed
 mapping is not claimed by Stage D.
 
+*Added 2026-09-17 (lot V2-S):* `podmesh-managerd --inspect-store --facts-only
+--config ... --state-dir ...` (durable API `inspect_facts_read_only`) captures the
+same private copy and verifies what the facts rest on: schema version and shape,
+identity, the rowids of `facts` and every fact's checksum, JSON, event identity and
+reducer validation. It prints `history_count`, `ordered_facts` and
+`logical_history_sha256`, with the values of the full inspection, reads no receipt
+or audit row and runs no SQLite integrity check, so neither its output nor its
+verification grows with the audit table. It is the administration app's facts
+reader, not an integrity verdict on the store.
+
 Inspection does not require network opt-in or a runtime directory. It must not
 create a missing database, lock, socket, WAL or SHM file. It exits nonzero on a
 missing store, incompatible schema, identity mismatch, integrity error, checksum
-error or receipt-link error. `--validate-config` remains separate and continues
+error or receipt-link error, and *(lot V2-S)* on a table whose rowids are not
+contiguous from 1. `--validate-config` remains separate and continues
 to report `durable_store_checked: false`.
 
 The qualification harness invokes this supported interface from a separate
@@ -482,7 +502,7 @@ success.
 | Reply is lost after destination commit | Destination retains import receipt and audit; source retains a prepared/incomplete attempt. Identical operation retry with a fresh nonce receives a replayed signed receipt. |
 | Source receives signed success but cannot persist terminal audit | Source reports uncertain/local storage failure, not success. |
 | Process dies after a prepared phase | Read-only inspection reports the attempt incomplete; recovery never invents a terminal outcome. |
-| Corrupt fact, receipt or audit row | Mutation, replay and successful inspection all fail closed. *Amended 2026-09-17 (lot V2-R):* replay of that row and successful inspection fail closed; mutation fails closed once the row is appended since the last verification, read by the operation, or found by a first open or a periodic complete verification, and the store then stays closed for the process. |
+| Corrupt fact, receipt or audit row | Mutation, replay and successful inspection all fail closed. *Amended 2026-09-17 (lots V2-R and V2-S):* replay of that row and successful inspection fail closed; mutation fails closed once the row is added since the last verification without removing a stored row, read by the operation, or found by a first open or a periodic complete verification, and the database file then stays closed for the process, which commits no transaction on it. |
 | Missing database during inspection | Refuse without creating any file. |
 
 ## Test inventory
@@ -546,8 +566,12 @@ success.
   namespace;
 - authenticated terminal phases reject unauthenticated predecessors;
 - prepared, partial outbound and complete inbound byte semantics are enforced;
-- audit replay normalization is restricted to atomic authenticated import; and
-- symlink and FIFO sidecars fail closed without blocking.
+- audit replay normalization is restricted to atomic authenticated import;
+- symlink and FIFO sidecars fail closed without blocking; and
+- *(lot V2-S)* a row added before a table's first row or after a gap is refused by
+  the next transaction; a row replaced in place is found by the complete
+  verification; an unreadable row read at use, and a schema found corrupt at open,
+  close the store; no transaction commits once the store is closed.
 
 ### Network crate
 
@@ -577,8 +601,11 @@ success.
 - partitioned replicas retain local owned observations and converge after
   reconnection;
 - accepted/refused exchanges contain the required audit phases and byte counts;
-- worker/admission bounds and existing framing deadlines still pass; and
-- `activation_authority` remains false in every status result.
+- worker/admission bounds and existing framing deadlines still pass;
+- `activation_authority` remains false in every status result; and
+- *(lot V2-S)* `--inspect-store --facts-only` prints the full inspection's facts,
+  reads no audit row, refuses a corrupt fact and is refused without
+  `--inspect-store`.
 
 Run locked tests, clippy with warnings denied and formatting checks for all three
 crates. Re-run packaging tests and the complete manager qualification harness.

@@ -66,7 +66,7 @@ The model follows these rules:
 | MH-18 | Non-mutating preflight and inspection | v2 WAL files and mismatched stores retain their bytes; symlinks and unexpected schema objects refuse | Tested locally |
 | MH-19 | Typed incomplete attempts | Locally allocated attempts remain distinct when a peer reuses a wire nonce; inbound and outbound unfinished phases are ordered and typed | Tested locally |
 | MH-20 | Durable inbound decisions | Accepted imports and authenticated refusals follow separate checked signed chains; unsigned diagnostic writes and no-reply closes are distinct terminals and cannot become authenticated outcomes | Tested locally; network wiring pending |
-| MH-21 | Bounded per-transaction verification | A process verifies a store completely at its first open and at each periodic pass; a transaction verifies the schema, the last verified rows and the appended rows; any failure closes the store for the process; append, audit insertion, receiver pre-reply and export cost the same at 1,000 and 30,000 audit rows | Tested locally; laboratory soak pending |
+| MH-21 | Bounded per-transaction verification | A process verifies a store completely at its first open and at each periodic pass; a transaction verifies the schema, the last verified rows, the rowids and the appended rows; any failure to read or verify a stored row closes the database file for the process, and no transaction commits on it afterwards; append, audit insertion, receiver pre-reply and export cost the same at 1,000 and 30,000 audit rows | Tested locally; laboratory soak pending |
 
 Run:
 
@@ -82,10 +82,13 @@ SQLite plus an append-only event history is selected **for this isolated laborat
 increment**, as authorized by the implementation task. This does not select a
 production storage standard or change the installed PodMesh service. The existing
 reducer and reconciliation rules remain the contract; `durable::Store` invokes
-them after reloading all stored facts inside each SQLite transaction: IMMEDIATE for
-`observe`, `import`, authenticated imports and audit records, DEFERRED (a read
-transaction that does not block writers) for `export`, `inspect` and
-`check_service`.
+them after reloading all stored facts inside the SQLite transaction of `observe`,
+`import`, an authenticated import, `export`, `inspect` and `check_service`. An audit
+record loads no fact: it reads the stored rows of its own attempt. Mutations and
+audit records run IMMEDIATE transactions; `export`, `inspect` and `check_service`
+run DEFERRED ones, read transactions that do not block writers. `Store::open` checks
+identity and the last verified rows in an IMMEDIATE transaction, so opening a store
+takes the write lock briefly.
 
 Schema v3 stores a canonical topology/replica binding, immutable serialized
 facts, typed mutation receipts and append-only typed exchange-audit events. WAL
@@ -96,21 +99,33 @@ IMMEDIATE transaction. Every insert must affect exactly one row. The exact
 `sqlite_master` shape is verified before replay or mutation, and immutable tables
 have no-update and no-delete triggers.
 
-Stored rows follow a process-local integrity model (see
+Stored rows follow a process-local integrity model, kept per database file (see
 [`docs/MANAGER-PRE-REPLY-VERIFICATION.md`](../../docs/MANAGER-PRE-REPLY-VERIFICATION.md)).
-The first open of a database file by a process verifies every receipt, fact, audit row
-and attempt sequence in a read transaction. Every later transaction verifies the schema
-shape, checks that the last verified row of each append-only table is present with the
-same checksum (otherwise it verifies everything again), and verifies only the rows
-appended since, with the same per-row checks and the complete sequence of each attempt
-they extend. A replayed receipt or audit event, and the stored rows of the attempt a new
-audit row extends, are verified when read; the candidate check reads those rows through
-the `UNIQUE(direction, attempt_id, phase)` index. `Store::verify_full` repeats the
-complete verification in a read transaction; long-running processes call it
-periodically (`DEFAULT_FULL_VERIFICATION_INTERVAL`, 600 s). Any verification failure
-closes the store for the rest of the process: later opens, writes and exports return
-the same error. An in-place edit of an older row that no operation reads is therefore
-detected at the next complete verification rather than by the next transaction.
+The Store numbers the rows of each append-only table 1, 2, 3, … without a gap: it never
+names a rowid and nothing deletes a row. The first open of a database file by a process
+verifies every receipt, fact, audit row and attempt sequence, and that each table's rows
+are exactly the rowids 1 to their count, in a read transaction. Every later transaction
+verifies the schema shape, checks that the last verified row of each append-only table
+is present with the same checksum (otherwise it verifies everything again) and that no
+row precedes rowid 1, and verifies only the rows appended since, which must continue
+the rowids, with the same per-row checks and the complete sequence of each attempt they
+extend. A row that any writer adds without removing a stored row is therefore verified or
+refused by the next transaction. The facts an operation loads, a replayed receipt or
+audit event, and the stored rows of the attempt a new audit row extends are verified when
+read; the candidate check reads those rows through the `UNIQUE(direction, attempt_id,
+phase)` index. `Store::verify_full` repeats the complete verification in a read
+transaction; long-running processes call it periodically
+(`DEFAULT_FULL_VERIFICATION_INTERVAL`, 600 s). Any failure to read or verify a stored row
+once a transaction holds its snapshot, or a schema found corrupt when the process opens
+the file again, closes that database file for the rest of the process: later opens,
+writes and exports return the same error, and every commit rechecks it under the lock
+that records it, so no transaction commits afterwards. A busy or locked store, a failed
+write or a failed commit closes nothing. The triggers refuse `UPDATE` and `DELETE` but
+not `REPLACE`, whose implicit delete fires no trigger: an in-place change of an older row
+that no operation reads, a replaced row or a removed row that leaves a gap included, is
+detected at the next complete verification rather than by the next transaction. A table
+whose last rows were removed is shorter and still verifies when no remaining row depends
+on them.
 
 Receipt checksums bind the logical manager, destination-local receipt identity,
 receipt kind, source replica, wire operation, stored request and stored response
@@ -180,7 +195,10 @@ replica and topology; in-place replacement and different identities do not match
 the cache. A write operation that starts from a preflighted file state also records
 the state its own commit and checkpoint left, so a process that keeps a store open does
 not copy it again after its own checkpoints; a change made by anyone else still requires
-a new preflight. The later source open uses SQLite `NOFOLLOW` and rechecks the path
+a new preflight. A capture reads the files twice and keeps them only when both reads are
+equal: into memory for a store whose files total at most 16 MiB, and above that by
+copying them into the private directory and comparing a second read with the copy
+through 1 MiB buffers, so a first open no longer holds twice the store in memory. The later source open uses SQLite `NOFOLLOW` and rechecks the path
 metadata identity. Tests preserve a killed-child v2 store with live
 uncheckpointed WAL frames and a mismatched live v3 WAL store byte for byte.
 Inspection and preflight reject symlinked or non-regular database and sidecar
@@ -201,8 +219,11 @@ experiments/manager-ha/target/debug/podmesh-manager-ha-lab --inspect-store \
   DATABASE CONFIGURATION_JSON_FILE REPLICA_ID
 ```
 
-It opens a stable private copy and never creates or changes the canonical store.
-There is no shell
+It opens a stable private copy and never creates or changes the canonical store. The
+resident's installed form also offers `--inspect-store --facts-only`, the durable
+`inspect_facts_read_only`: the same private copy, verified only for the schema,
+identity and facts, printing `history_count`, `ordered_facts` and
+`logical_history_sha256`. There is no shell
 execution, daemon, network listener, or implicit remote connection.
 
 Example using a disposable operator-owned directory:
@@ -272,12 +293,18 @@ explicit stale-backup fixtures.
 
 ## What this proves
 
-The ten original model tests retain the MH-01–MH-08 contract. Eight integrity tests
+The ten original model tests retain the MH-01–MH-08 contract. Twenty integrity tests
 cover the MH-21 model: an edited old audit row refused by a new process's first open and
 by the periodic pass, after which every operation fails closed; appended rows written by
 another writer; an edited last verified row; replayed receipts and audit rows; the
-per-attempt candidate check; and a store kept open that trusts its own checkpoints but
-not another connection's. A bounded-cost test times append, audit insertion, receiver
+per-attempt candidate check; a store kept open that trusts its own checkpoints but
+not another connection's; rows added before a table's first row or after a gap, refused by
+the next transaction; `REPLACE` in place found by the complete verification, and through
+the primary key leaving a refused gap; unreadable facts, receipts and audit rows read at
+use closing the store, while a busy store stays open; a schema found corrupt at open
+closing the store; another file at a closed store's path verified completely before it
+serves; and an operation waiting for the write lock while the store closes, which then
+commits nothing. Two unit tests cover the capture by copy of a larger store. A bounded-cost test times append, audit insertion, receiver
 pre-reply and export at 1,000 and 30,000 audit rows. The 69 executed process
 acceptance tests exercise real compiled child processes and separate temporary
 SQLite stores: restart, retry, sequence allocation, concurrent writers, disjoint
