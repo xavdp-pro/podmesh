@@ -117,11 +117,12 @@ type IntegrityKey = (u64, u64, Option<(u64, u32)>, String, String);
 /// continue the table's rowids without a gap (see [`verify_contiguous_rowids`]).
 /// Rows the operation reads or extends (a replayed receipt, a replayed audit
 /// event, the audit rows of the attempt it appends to, the facts it loads) are
-/// verified when read. Any verification failure fails the file closed for the
-/// rest of the process: every later open, write and export returns that same
-/// error. An in-place change to an older row that no operation reads, including
-/// a removed or replaced row, is detected by the next complete verification, not
-/// by the next transaction.
+/// verified when read. Any failure to read or verify a stored row once the
+/// transaction holds its snapshot fails the file closed for the rest of the
+/// process: every later open, write and export returns that same error. An
+/// in-place change to an older row that no operation reads, including a removed
+/// or replaced row, is detected by the next complete verification, not by the
+/// next transaction.
 #[derive(Default)]
 struct StoreIntegrityEntry {
     state: Mutex<IntegrityState>,
@@ -684,6 +685,7 @@ impl Store {
             )?;
             let executed = execute_transaction(
                 &transaction,
+                &store.integrity,
                 &store.configuration,
                 &store.topology,
                 &store.replica_id,
@@ -749,6 +751,7 @@ impl Store {
             )?;
             prevalidate_authenticated_import_audit(
                 &transaction,
+                &store.integrity,
                 &store.topology,
                 &store.replica_id,
                 &audit,
@@ -756,6 +759,7 @@ impl Store {
             )?;
             let executed = execute_transaction(
                 &transaction,
+                &store.integrity,
                 &store.configuration,
                 &store.topology,
                 &store.replica_id,
@@ -774,6 +778,7 @@ impl Store {
             audit.replayed = executed.replayed;
             let evidence = insert_audit(
                 &transaction,
+                &store.integrity,
                 &store.topology,
                 &store.replica_id,
                 &audit,
@@ -811,6 +816,7 @@ impl Store {
             )?;
             let evidence = insert_audit(
                 &transaction,
+                &store.integrity,
                 &store.topology,
                 &store.replica_id,
                 audit,
@@ -849,6 +855,19 @@ impl StoreIntegrityEntry {
             state.failure.get_or_insert_with(|| problem.clone());
         }
         problem
+    }
+
+    /// Returns stored rows an operation read at use, inside a transaction that
+    /// [`begin_verified`] opened. That transaction already holds its snapshot
+    /// (and a write transaction its write lock), and SQLite reports a busy or
+    /// locked database only while a transaction takes those, never on a read
+    /// inside a snapshot it holds. A failure here therefore concerns the stored
+    /// rows themselves: bytes that could not be read (`storage`) or rows that do
+    /// not verify (`corrupt`), and it closes the store as a failed verification of
+    /// those rows does. The operation's own writes and commit are not read
+    /// through this, so a full disk closes nothing.
+    fn read_at_use<T>(&self, read: DurableResult<T>) -> DurableResult<T> {
+        read.map_err(|problem| self.fail_closed(problem))
     }
 
     fn record_full_verification(
@@ -1285,6 +1304,7 @@ fn preflight_existing_store(
 
 fn execute_transaction(
     transaction: &Transaction<'_>,
+    integrity: &StoreIntegrityEntry,
     configuration: &Configuration,
     topology: &Topology,
     replica_id: &str,
@@ -1295,17 +1315,13 @@ fn execute_transaction(
     let operation_id = mutation_operation_id(request)?;
     if let Some(id) = operation_id {
         validate_receipt_operation_id(id, receipt_metadata.kind)?;
-        let prior = transaction
-            .query_row(
-                &format!("SELECT {RECEIPT_COLUMNS} FROM receipts WHERE operation_id=?1"),
-                [id],
-                read_receipt_row,
-            )
-            .optional()
-            .map_err(error)?;
+        // A replay returns stored bytes, so that receipt row is verified first.
+        let prior = integrity.read_at_use(stored_receipt(
+            transaction,
+            topology.logical_manager_id(),
+            id,
+        ))?;
         if let Some(prior) = prior {
-            // A replay returns stored bytes, so that receipt row is verified first.
-            verify_receipt_row(topology.logical_manager_id(), &prior)?;
             if prior.request_json != request_json
                 || prior.kind != enum_text(&receipt_metadata.kind)?
                 || prior.source_replica_id != receipt_metadata.source_replica_id
@@ -1326,7 +1342,7 @@ fn execute_transaction(
             });
         }
     }
-    let mut replica = load(transaction, topology, replica_id)?;
+    let mut replica = integrity.read_at_use(load(transaction, topology, replica_id))?;
     let before = replica.history.clone();
     let response = apply(configuration, &mut replica, request)?;
     for (id, fact) in &replica.history {
@@ -1752,6 +1768,26 @@ fn verify_receipt_row(logical_manager_id: &str, receipt: &StoredReceipt) -> Dura
     serde_json::from_str::<Response>(&receipt.response_json)
         .map_err(|_| DurableError::Corrupt("stored receipt response is invalid".into()))?;
     Ok(())
+}
+
+/// Reads the stored receipt of one operation ID, if there is one, and verifies it.
+fn stored_receipt(
+    connection: &Connection,
+    logical_manager_id: &str,
+    operation_id: &str,
+) -> DurableResult<Option<StoredReceipt>> {
+    let receipt = connection
+        .query_row(
+            &format!("SELECT {RECEIPT_COLUMNS} FROM receipts WHERE operation_id=?1"),
+            [operation_id],
+            read_receipt_row,
+        )
+        .optional()
+        .map_err(error)?;
+    if let Some(receipt) = &receipt {
+        verify_receipt_row(logical_manager_id, receipt)?;
+    }
+    Ok(receipt)
 }
 
 fn verify_receipts(connection: &Connection, logical_manager_id: &str) -> DurableResult<()> {
@@ -2562,13 +2598,27 @@ fn verify_audit_receipt_link(
     connection: &Connection,
     event: &ExchangeAuditEvent,
 ) -> DurableResult<()> {
-    let (Some(operation_id), Some(sha256)) = (
-        event.local_receipt_operation_id.as_deref(),
-        event.local_receipt_sha256.as_deref(),
-    ) else {
+    let Some((operation_id, sha256)) = local_receipt_reference(event) else {
         return Ok(());
     };
-    let Some(metadata) = receipt_metadata(connection, operation_id, sha256)? else {
+    check_audit_receipt_link(event, receipt_metadata(connection, operation_id, sha256)?)
+}
+
+/// The local receipt an audit event references: its identity and digest.
+fn local_receipt_reference(event: &ExchangeAuditEvent) -> Option<(&str, &str)> {
+    event
+        .local_receipt_operation_id
+        .as_deref()
+        .zip(event.local_receipt_sha256.as_deref())
+}
+
+/// Checks an audit event's local receipt reference against the metadata of the
+/// stored receipt with that identity and digest, `None` when there is none.
+fn check_audit_receipt_link(
+    event: &ExchangeAuditEvent,
+    metadata: Option<ReceiptMetadata>,
+) -> DurableResult<()> {
+    let Some(metadata) = metadata else {
         return Err(DurableError::InvalidAudit(
             "local receipt reference is missing or has a mismatched digest".into(),
         ));
@@ -2602,35 +2652,31 @@ fn verify_audit_receipt_link(
     Ok(())
 }
 
-/// Checks a candidate against the stored rows of its own attempt only. Every
-/// sequence rule is scoped to one attempt ID (per direction, plus the rule that
-/// an attempt ID cannot span both directions), so over a verified store this
-/// gives the same result as checking the candidate against the whole table.
+/// Checks a candidate against the stored rows of its own attempt only, as read
+/// and verified by [`load_attempt_audits`]. Every sequence rule is scoped to one
+/// attempt ID (per direction, plus the rule that an attempt ID cannot span both
+/// directions), so over a verified store this gives the same result as checking
+/// the candidate against the whole table.
 fn validate_candidate_audit_sequence(
-    connection: &Connection,
-    topology: &Topology,
-    replica_id: &str,
+    attempt: &[ExchangeAuditEvidence],
     event: &ExchangeAuditEvent,
 ) -> DurableResult<()> {
-    let existing = load_attempt_audits(connection, topology, replica_id, &event.attempt_id)?;
-    let mut events: Vec<_> = existing.iter().map(|entry| &entry.event).collect();
+    let mut events: Vec<_> = attempt.iter().map(|entry| &entry.event).collect();
     events.push(event);
     audit_sequence_problem(events).map_or(Ok(()), |detail| Err(DurableError::InvalidAudit(detail)))
 }
 
-fn prevalidate_authenticated_import_audit(
-    transaction: &Transaction<'_>,
+/// The checks of a candidate audit event that read no stored row: its fields and
+/// semantics, its receipt identities and its authenticated peer, which must be
+/// another configured replica.
+fn validate_candidate_audit(
     topology: &Topology,
     replica_id: &str,
-    audit: &ExchangeAuditEvent,
-    local_operation_id: &str,
+    event: &ExchangeAuditEvent,
 ) -> DurableResult<()> {
-    let mut candidate = audit.clone();
-    candidate.local_receipt_operation_id = Some(local_operation_id.into());
-    candidate.local_receipt_sha256 = Some(format!("{:064x}", 0));
-    validate_audit(&candidate)?;
-    validate_audit_identity(topology, replica_id, &candidate)?;
-    if let Some(peer_id) = candidate.authenticated_peer_id.as_deref() {
+    validate_audit(event)?;
+    validate_audit_identity(topology, replica_id, event)?;
+    if let Some(peer_id) = event.authenticated_peer_id.as_deref() {
         topology.instantiate(peer_id).map_err(|_| {
             DurableError::InvalidAudit("authenticated peer is not configured".into())
         })?;
@@ -2640,7 +2686,27 @@ fn prevalidate_authenticated_import_audit(
             ));
         }
     }
-    let existing = load_audit_by_id(transaction, topology, replica_id, &candidate.audit_event_id)?;
+    Ok(())
+}
+
+fn prevalidate_authenticated_import_audit(
+    transaction: &Transaction<'_>,
+    integrity: &StoreIntegrityEntry,
+    topology: &Topology,
+    replica_id: &str,
+    audit: &ExchangeAuditEvent,
+    local_operation_id: &str,
+) -> DurableResult<()> {
+    let mut candidate = audit.clone();
+    candidate.local_receipt_operation_id = Some(local_operation_id.into());
+    candidate.local_receipt_sha256 = Some(format!("{:064x}", 0));
+    validate_candidate_audit(topology, replica_id, &candidate)?;
+    let existing = integrity.read_at_use(load_audit_by_id(
+        transaction,
+        topology,
+        replica_id,
+        &candidate.audit_event_id,
+    ))?;
     if let Some(existing) = existing {
         let mut comparable = existing.event;
         comparable
@@ -2656,7 +2722,13 @@ fn prevalidate_authenticated_import_audit(
             ));
         }
     } else {
-        validate_candidate_audit_sequence(transaction, topology, replica_id, &candidate)?;
+        let attempt = integrity.read_at_use(load_attempt_audits(
+            transaction,
+            topology,
+            replica_id,
+            &candidate.attempt_id,
+        ))?;
+        validate_candidate_audit_sequence(&attempt, &candidate)?;
     }
     Ok(())
 }
@@ -2919,29 +2991,25 @@ fn validate_inbound_close(
 
 fn insert_audit(
     transaction: &Transaction<'_>,
+    integrity: &StoreIntegrityEntry,
     topology: &Topology,
     replica_id: &str,
     event: &ExchangeAuditEvent,
     allow_atomic_import_replay_normalization: bool,
 ) -> DurableResult<ExchangeAuditEvidence> {
-    validate_audit(event)?;
-    validate_audit_identity(topology, replica_id, event)?;
-    if let Some(peer_id) = event.authenticated_peer_id.as_deref() {
-        topology.instantiate(peer_id).map_err(|_| {
-            DurableError::InvalidAudit("authenticated peer is not configured".into())
-        })?;
-        if peer_id == replica_id {
-            return Err(DurableError::InvalidAudit(
-                "authenticated peer must be a distinct configured replica".into(),
-            ));
-        }
-    }
+    validate_candidate_audit(topology, replica_id, event)?;
     let record_json = json(event)?;
     let sha256 = audit_digest(&record_json)?;
-    if let Some(evidence) = replay_existing_audit(
+    // A replay returns stored evidence, so that row is verified before comparison;
+    // its canonical record JSON then equals the stored one.
+    let prior = integrity.read_at_use(load_audit_by_id(
         transaction,
         topology,
         replica_id,
+        &event.audit_event_id,
+    ))?;
+    if let Some(evidence) = replay_existing_audit(
+        prior,
         event,
         &record_json,
         &sha256,
@@ -2949,8 +3017,18 @@ fn insert_audit(
     )? {
         return Ok(evidence);
     }
-    validate_candidate_audit_sequence(transaction, topology, replica_id, event)?;
-    verify_audit_receipt_link(transaction, event)?;
+    let attempt = integrity.read_at_use(load_attempt_audits(
+        transaction,
+        topology,
+        replica_id,
+        &event.attempt_id,
+    ))?;
+    validate_candidate_audit_sequence(&attempt, event)?;
+    if let Some((operation_id, receipt_sha256)) = local_receipt_reference(event) {
+        let receipt =
+            integrity.read_at_use(receipt_metadata(transaction, operation_id, receipt_sha256))?;
+        check_audit_receipt_link(event, receipt)?;
+    }
     let inserted = transaction
         .execute(
             "INSERT INTO exchange_audit_events (
@@ -3018,18 +3096,17 @@ fn insert_audit(
     })
 }
 
+/// Compares a candidate audit event with the verified stored row of the same
+/// audit event ID, if there is one, and returns the evidence of an identical
+/// replay.
 fn replay_existing_audit(
-    transaction: &Transaction<'_>,
-    topology: &Topology,
-    replica_id: &str,
+    prior: Option<ExchangeAuditEvidence>,
     event: &ExchangeAuditEvent,
     record_json: &str,
     sha256: &str,
     allow_atomic_import_replay_normalization: bool,
 ) -> DurableResult<Option<ExchangeAuditEvidence>> {
-    // A replay returns stored evidence, so that row is verified before comparison;
-    // its canonical record JSON then equals the stored one.
-    let prior = load_audit_by_id(transaction, topology, replica_id, &event.audit_event_id)?
+    let prior = prior
         .map(|evidence| Ok::<_, DurableError>((json(&evidence.event)?, evidence.sha256)))
         .transpose()?;
     if let Some((prior_json, prior_sha256)) = prior {

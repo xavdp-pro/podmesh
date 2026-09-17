@@ -110,6 +110,40 @@ impl Lab {
             .unwrap();
         transaction.commit().unwrap();
     }
+
+    /// Changes one stored row of an append-only table with the table's no-update
+    /// trigger dropped, in one SQLite transaction, as an actor bypassing the Store
+    /// would.
+    fn edit_row(&self, table: &str, assignment: &str, condition: &str) {
+        let (trigger, message) = match table {
+            "facts" => ("facts_no_update", "immutable fact"),
+            "receipts" => ("receipts_no_update", "immutable receipt"),
+            _ => (
+                "exchange_audit_events_no_update",
+                "immutable exchange audit event",
+            ),
+        };
+        let mut connection = Connection::open(self.database()).unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute_batch(&format!("DROP TRIGGER {trigger}"))
+            .unwrap();
+        assert_eq!(
+            transaction
+                .execute(
+                    &format!("UPDATE {table} SET {assignment} WHERE {condition}"),
+                    [],
+                )
+                .unwrap(),
+            1
+        );
+        transaction
+            .execute_batch(&format!(
+                "CREATE TRIGGER {trigger} BEFORE UPDATE ON {table} BEGIN SELECT RAISE(ABORT, '{message}'); END;"
+            ))
+            .unwrap();
+        transaction.commit().unwrap();
+    }
 }
 
 fn configuration() -> Configuration {
@@ -645,6 +679,112 @@ fn replayed_receipt_and_audit_rows_are_verified_before_replay() {
         edited_prepared_row_error()
     );
     assert_failed_closed(&lab, &mut store, &edited_prepared_row_error());
+}
+
+/// Review of lot V2-R, probe P3: bytes that SQLite cannot return as their column
+/// (a BLOB where the Store writes text) in an old fact were met by the fact load
+/// of an export, which returned `storage` and closed nothing while audit records
+/// kept being written; the same bytes met by the verification of an appended row
+/// closed the store. A stored row read at use now closes it too.
+#[test]
+fn an_unreadable_fact_closes_the_store_whether_loaded_at_use_or_appended() {
+    let lab = Lab::new();
+    let mut store = lab.open();
+    for index in 0..2 {
+        store
+            .execute_with_receipt(&observation(&format!("fact-{index}"), "value"))
+            .unwrap();
+    }
+    store.execute(&Request::Export {}).unwrap();
+    // Not the last verified fact: only a fact load reads it.
+    lab.edit_row("facts", "fact_json=X'00'", "rowid=1");
+    let error = store.execute(&Request::Export {}).unwrap_err();
+    assert!(matches!(error, DurableError::Storage(_)), "{error:?}");
+    assert_failed_closed(&lab, &mut store, &error);
+
+    let lab = Lab::new();
+    let mut store = lab.open();
+    store.execute(&Request::Export {}).unwrap();
+    Connection::open(lab.database())
+        .unwrap()
+        .execute(
+            "INSERT INTO facts(event_id, fact_json, sha256) VALUES ('unreadable', X'00', 'x')",
+            [],
+        )
+        .unwrap();
+    let appended = store
+        .record_exchange_audit(&prepared("after-append"))
+        .unwrap_err();
+    assert!(matches!(appended, DurableError::Storage(_)), "{appended:?}");
+    assert_failed_closed(&lab, &mut store, &appended);
+}
+
+/// The stored receipt of a retried operation is read at use before its response
+/// is replayed.
+#[test]
+fn an_unreadable_receipt_met_by_a_replay_closes_the_store() {
+    let lab = Lab::new();
+    let mut store = lab.open();
+    let request = observation("replayed", "original");
+    store.execute_with_receipt(&request).unwrap();
+    store
+        .execute_with_receipt(&observation("later", "value"))
+        .unwrap();
+    store.execute(&Request::Export {}).unwrap();
+    lab.edit_row("receipts", "response_json=X'00'", "operation_id='replayed'");
+    let error = store.execute_with_receipt(&request).unwrap_err();
+    assert!(matches!(error, DurableError::Storage(_)), "{error:?}");
+    assert_failed_closed(&lab, &mut store, &error);
+}
+
+/// The stored rows of the attempt a new audit row extends, and the stored row of a
+/// replayed audit event, are read at use.
+#[test]
+fn unreadable_audit_rows_met_at_use_close_the_store() {
+    let first = prepared("attempt");
+    let mut completion = first.clone();
+    completion.audit_event_id = "audit-attempt-completed".into();
+    completion.phase = AuditPhase::OutboundExchangeCompleted;
+    completion.outcome = AuditOutcome::Unavailable;
+    completion.authenticated_peer_id = None;
+    completion.error_category = Some(AuditErrorCategory::Unavailable);
+    completion.reason_code = Some(RefusalReason::TransportUnavailable);
+    for next in [completion, first.clone()] {
+        let lab = Lab::new();
+        let mut store = lab.open();
+        store.record_exchange_audit(&first).unwrap();
+        store.record_exchange_audit(&prepared("later")).unwrap();
+        store.execute(&Request::Export {}).unwrap();
+        lab.edit_row(
+            "exchange_audit_events",
+            "record_json=X'00'",
+            "audit_event_id='audit-attempt'",
+        );
+        let error = store.record_exchange_audit(&next).unwrap_err();
+        assert!(matches!(error, DurableError::Storage(_)), "{error:?}");
+        assert_failed_closed(&lab, &mut store, &error);
+    }
+}
+
+/// Waiting for another connection's write lock reads no stored row: the operation
+/// returns `storage` when the busy timeout expires and the store stays open.
+#[test]
+fn a_busy_store_is_not_closed() {
+    let lab = Lab::new();
+    let mut store = lab.open();
+    store.record_exchange_audit(&prepared("before")).unwrap();
+    let blocker = Connection::open(lab.database()).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let error = store
+        .record_exchange_audit(&prepared("while-busy"))
+        .unwrap_err();
+    assert!(matches!(error, DurableError::Storage(_)), "{error:?}");
+    assert!(store.integrity().unwrap().failure.is_none());
+    blocker.execute_batch("ROLLBACK").unwrap();
+    store
+        .record_exchange_audit(&prepared("while-busy"))
+        .unwrap();
+    store.execute(&Request::Export {}).unwrap();
 }
 
 #[test]
