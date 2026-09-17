@@ -878,8 +878,9 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
     // repeats that verification in the background at the configured interval.
     let integrity_config = config.clone();
     let integrity_shared = Arc::clone(&shared);
-    let integrity =
-        thread::spawn(move || verify_store_periodically(&integrity_config, &integrity_shared));
+    let integrity = thread::spawn(move || {
+        verify_store_periodically(&integrity_config, &integrity_shared, startup_store);
+    });
     let mut workers = Vec::new();
     let mut append_workers = Vec::new();
     let result = (|| -> Result<()> {
@@ -1104,60 +1105,79 @@ fn write_control(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -
 
 /// Why a periodic pass did not verify the store.
 enum PassFailure {
-    /// The store failed verification, now or earlier in this process, and stays
-    /// closed for the rest of the process.
-    Verification(DurableError),
+    /// A verification failure closed the store for the rest of the process, in
+    /// this pass or earlier: later passes can only repeat it.
+    Closed(DurableError),
     /// The pass could not run: the store did not open, or the pass could not
     /// take its snapshot. Nothing was verified and nothing was closed.
     NotRun(DurableError),
 }
 
-fn verify_store_once(config: &Configuration) -> std::result::Result<(), PassFailure> {
-    let mut store = Store::open(
-        &config.network.database_path,
-        config.network.manager.clone(),
-        &config.network.replica_id,
-    )
-    .map_err(|problem| match problem {
-        DurableError::Corrupt(_) => PassFailure::Verification(problem),
-        other => PassFailure::NotRun(other),
-    })?;
-    store.verify_full().map_err(|problem| {
-        // A storage failure once the snapshot was held also closes the store.
+/// Runs one complete verification. `known` is the last store this worker opened:
+/// its integrity state tells a store a verification failure closed, whose later
+/// opens return that failure whatever its class, from a pass that could not run.
+fn verify_store_once(
+    config: &Configuration,
+    known: &mut Store,
+) -> std::result::Result<(), PassFailure> {
+    let classify = |known: &Store, problem: DurableError| {
         let closed = matches!(problem, DurableError::Corrupt(_))
-            || store
+            || known
                 .integrity()
                 .is_ok_and(|integrity| integrity.failure.is_some());
         if closed {
-            PassFailure::Verification(problem)
+            PassFailure::Closed(problem)
         } else {
             PassFailure::NotRun(problem)
         }
-    })
+    };
+    match Store::open(
+        &config.network.database_path,
+        config.network.manager.clone(),
+        &config.network.replica_id,
+    ) {
+        Ok(mut store) => {
+            let result = store.verify_full();
+            *known = store;
+            result.map_err(|problem| classify(known, problem))
+        }
+        Err(problem) => Err(classify(known, problem)),
+    }
 }
 
 /// Repeats the complete store verification at the configured interval, in a read
 /// transaction that does not block writers. A failed verification fails the store
 /// closed for this process: every later store open, append, import, audit and
-/// export returns that failure, while status and shutdown stay available. A pass
-/// that could not run is retried after a backoff that starts at the exchange
-/// interval and doubles up to the maximum backoff, never later than the next
-/// regular pass would have run, so the detection interval does not silently grow.
-fn verify_store_periodically(config: &Configuration, shared: &Shared) {
+/// export returns that failure, while status and shutdown stay available; later
+/// passes keep the interval and say the store is closed. A pass that could not
+/// run is retried after a backoff that starts at the exchange interval and
+/// doubles up to the maximum backoff, never later than the next regular pass
+/// would have run, so the detection interval does not silently grow.
+fn verify_store_periodically(config: &Configuration, shared: &Shared, mut known: Store) {
     let interval = config.full_verification_interval();
     let first_retry = Duration::from_millis(config.interval_ms).min(interval);
     let last_retry = Duration::from_millis(config.max_backoff_ms).min(interval);
     let mut retry = first_retry;
     let mut next = Instant::now() + interval;
+    let mut closed = false;
     while !shared.stopping.load(Ordering::SeqCst) {
         if Instant::now() >= next {
-            match verify_store_once(config) {
+            match verify_store_once(config, &mut known) {
                 Ok(()) => {
+                    closed = false;
                     retry = first_retry;
                     next = Instant::now() + interval;
                 }
-                Err(PassFailure::Verification(problem)) => {
-                    eprintln!("resident store verification failed: {problem}");
+                Err(PassFailure::Closed(problem)) => {
+                    if closed {
+                        eprintln!("resident store is still closed for this process: {problem}");
+                    } else {
+                        eprintln!(
+                            "resident store verification failed: {problem}; the store is closed for this process"
+                        );
+                    }
+                    closed = true;
+                    retry = first_retry;
                     next = Instant::now() + interval;
                 }
                 Err(PassFailure::NotRun(problem)) => {

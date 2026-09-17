@@ -2363,6 +2363,70 @@ fn a_replica_without_peers_is_caught_up_at_once() {
     lab.stop(0);
 }
 
+/// Changes the type of a column of the oldest audit row, with the no-update
+/// trigger dropped: a complete verification cannot read that row back, a
+/// storage failure rather than a checksum mismatch.
+fn tamper_oldest_audit_row_type(lab: &Lab, i: usize) {
+    let script = r"
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1], timeout=5, isolation_level=None)
+connection.executescript('''
+BEGIN IMMEDIATE;
+DROP TRIGGER exchange_audit_events_no_update;
+UPDATE exchange_audit_events SET request_frame_bytes = 'not-a-number'
+  WHERE rowid = (SELECT min(rowid) FROM exchange_audit_events);
+CREATE TRIGGER exchange_audit_events_no_update BEFORE UPDATE ON exchange_audit_events BEGIN SELECT RAISE(ABORT, 'immutable exchange audit event'); END;
+COMMIT;
+''')
+";
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(&lab.configs[i].network.database_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_store_closed_by_a_storage_failure_is_reported_closed_and_not_retried() {
+    let mut lab = Lab::new();
+    lab.configs[0].full_verification_interval_ms = Some(1_000);
+    let log = lab._dir.path().join("r0.stderr");
+    lab.start_with_stderr(0, Stdio::from(fs::File::create(&log).unwrap()));
+    lab.start(1);
+    lab.start(2);
+    lab.append(0, "before-tamper", "s0", "subject", "value");
+    assert_converged(&lab, 1);
+    tamper_oldest_audit_row_type(&lab, 0);
+    let lines = |line: &str| fs::read_to_string(&log).unwrap().matches(line).count();
+    until(
+        || lines("resident store verification failed: storage") >= 1,
+        Duration::from_secs(10),
+    );
+    assert_eq!(lines("the store is closed for this process"), 1);
+    let not_run = lines("resident store verification could not run");
+    thread::sleep(Duration::from_millis(3_500));
+    // Later passes keep the one-second interval and say the store is still
+    // closed: none is retried as a pass that could not run.
+    assert_eq!(lines("resident store verification could not run"), not_run);
+    let still_closed = lines("resident store is still closed for this process");
+    assert!((2..=5).contains(&still_closed), "{still_closed}");
+    assert_eq!(
+        lab.control_value(
+            0,
+            json!({"operation":"append_observation","operation_id":"after-tamper","scope":"s0","subject":"subject","value":"value"}),
+        )
+        .unwrap()["error"],
+        "append_observation_uncertain"
+    );
+    lab.stop_all();
+}
+
 #[test]
 fn an_identity_collision_is_counted_on_both_sides_and_named_once() {
     let mut lab = Lab::new();
