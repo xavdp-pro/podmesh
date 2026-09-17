@@ -100,6 +100,16 @@ Inbound order is fixed:
 5. append `inbound_reply_prepared` before a signed reply; and
 6. append exact full, partial, or zero-write terminal evidence.
 
+`Node::serve_connection_reporting` serves one accepted connection like
+`serve_connection` and also returns the authenticated import it committed or
+replayed: the authenticated source replica, the fact count of the snapshot it
+sent, the inserted count and local history length (those of the original commit
+for a replay), and the replay flag. The import is reported once step 4 has
+committed or replayed it, even when the reply is lost afterwards; a refusal, a
+diagnostic or a failure before step 4 reports none. The resident uses it to catch
+up with its peers and to push its snapshot back to a peer that lacks facts. It adds
+nothing to the wire protocol or the audit sequence.
+
 A pre-authentication attempt never changes nonce and carries no authenticated
 peer, operation, receipt, or replay authority. Unsigned diagnostics cannot follow
 a durable accepted/refused decision. A non-signable durable error before a
