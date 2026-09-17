@@ -1210,6 +1210,19 @@ fn run_full_verification(
     acquire_snapshot(&transaction)?;
     let verified = full_verification(&transaction, topology, replica_id)
         .map_err(|problem| integrity.fail_closed(problem))?;
+    finish_full_verification(integrity, transaction, verified, started, replace_positions)
+}
+
+/// Ends a complete verification: it counts as one only if its transaction
+/// commits, and it commits only while the database file is not closed, so a pass
+/// that ran while another operation closed the file returns that failure instead.
+fn finish_full_verification(
+    integrity: &StoreIntegrityEntry,
+    transaction: Transaction<'_>,
+    verified: VerifiedPositions,
+    started: Instant,
+    replace_positions: bool,
+) -> DurableResult<()> {
     integrity.commit(transaction)?;
     integrity.record_full_verification(verified, started, replace_positions)
 }
@@ -4382,7 +4395,79 @@ PRAGMA user_version=3;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
+
+    /// A failure is recorded only between commits: taking the closed state
+    /// exclusively waits for the commits that hold it shared. A store's commits are
+    /// WAL commits, which never wait for a reader, so this holds one open the only
+    /// way a commit waits at all: a rollback-journal commit behind a reader, until
+    /// its busy timeout expires.
+    #[test]
+    fn a_failure_is_recorded_only_once_the_commits_in_flight_have_finished() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("commit.sqlite");
+        let mut writer = Connection::open(&path).unwrap();
+        writer.execute_batch("CREATE TABLE t(x)").unwrap();
+        writer.busy_timeout(Duration::from_secs(1)).unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM t;")
+            .unwrap();
+        let entry = StoreIntegrityEntry::default();
+        let transaction = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction.execute("INSERT INTO t VALUES (1)", []).unwrap();
+
+        let commit_returned = AtomicBool::new(false);
+        let recorded_after_the_commit = AtomicBool::new(false);
+        std::thread::scope(|threads| {
+            let closing = threads.spawn(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                entry.fail_closed(DurableError::Corrupt("closed while committing".into()));
+                recorded_after_the_commit
+                    .store(commit_returned.load(Ordering::SeqCst), Ordering::SeqCst);
+            });
+            // The reader keeps the commit from taking the exclusive lock until the
+            // writer's busy timeout expires.
+            let committed = entry.commit(transaction);
+            commit_returned.store(true, Ordering::SeqCst);
+            assert!(committed.is_err(), "the reader did not hold the commit");
+            closing.join().unwrap();
+        });
+        assert!(
+            recorded_after_the_commit.load(Ordering::SeqCst),
+            "a failure was recorded while a commit was in flight"
+        );
+        assert!(entry.refuse_if_failed().is_err());
+    }
+
+    /// A complete verification that ran while another operation closed the file
+    /// neither commits nor counts.
+    #[test]
+    fn a_complete_verification_of_a_closed_file_does_not_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pass.sqlite");
+        let mut connection = Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TABLE t(x)").unwrap();
+        let entry = StoreIntegrityEntry::default();
+        let transaction = connection.transaction().unwrap();
+        let closed = DurableError::Corrupt("closed during the pass".into());
+        entry.fail_closed(closed.clone());
+        assert_eq!(
+            finish_full_verification(
+                &entry,
+                transaction,
+                VerifiedPositions::default(),
+                Instant::now(),
+                true,
+            ),
+            Err(closed)
+        );
+        assert_eq!(integrity_state(&entry).unwrap().full_verifications, 0);
+    }
 
     fn bytes(length: usize, seed: usize) -> Vec<u8> {
         (0..length)
