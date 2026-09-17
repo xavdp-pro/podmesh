@@ -486,7 +486,7 @@ impl Node {
                 {
                     // A complete request followed by total reply loss is uncertain.
                     // Stage D intentionally preserves only the prepared attempt.
-                    return Err(failure.error);
+                    return Err(failure.error.after_connection_attempt());
                 }
                 return self.finish_outbound(
                     &attempt_id,
@@ -679,8 +679,9 @@ impl Node {
             Error::unavailable(format!(
                 "outbound result is uncertain because terminal audit failed: {error}"
             ))
+            .after_connection_attempt()
         })?;
-        result
+        result.map_err(Error::after_connection_attempt)
     }
 
     fn record_audit(&mut self, event: &ExchangeAuditEvent) -> Result<(), Error> {
@@ -858,7 +859,7 @@ impl Node {
                 &received.evidence,
                 &peer,
                 RefusalReason::InvalidRequest,
-                IdentityCollisions::default(),
+                false,
                 drop_after_decision,
                 on_decision,
             );
@@ -871,7 +872,7 @@ impl Node {
                 &received.evidence,
                 &peer,
                 RefusalReason::PolicyViolation,
-                IdentityCollisions::default(),
+                false,
                 drop_after_decision,
                 on_decision,
             );
@@ -893,9 +894,6 @@ impl Node {
         ) {
             Ok(imported) => imported,
             Err(DurableError::Refused(reason)) if signable_reason(reason) => {
-                // The refusal carries only its closed reason, on the wire and from
-                // the durable import, so a collision is found again here.
-                let collisions = self.identity_collisions(&request.snapshot);
                 return self.refuse_authenticated(
                     &mut stream,
                     &attempt_id,
@@ -903,7 +901,7 @@ impl Node {
                     &received.evidence,
                     &peer,
                     reason,
-                    collisions,
+                    true,
                     drop_after_decision,
                     on_decision,
                 );
@@ -1063,7 +1061,7 @@ impl Node {
         request_evidence: &FrameEvidence,
         peer: &Peer,
         reason: RefusalReason,
-        collisions: IdentityCollisions,
+        refused_import: bool,
         drop_after_decision: bool,
         on_decision: &mut dyn FnMut(&ServedDecision),
     ) -> Result<(), Error> {
@@ -1079,12 +1077,43 @@ impl Node {
             reason,
         );
         self.record_audit(&decision)?;
+        let replied = self.reply_refusal(
+            stream,
+            attempt_id,
+            request,
+            request_evidence,
+            peer,
+            reason,
+            drop_after_decision,
+        );
+        // The refusal carries only its closed reason, on the wire and from the
+        // durable import, so a collision is found again here, once the sender has
+        // its answer: a slow export never delays that answer past its deadline.
+        let collisions = if refused_import {
+            self.identity_collisions(&request.snapshot)
+        } else {
+            IdentityCollisions::default()
+        };
         on_decision(&ServedDecision::Refused(ServedRefusal {
             source_replica_id: peer.replica_id.clone(),
             reason,
             identity_collisions: collisions.count,
             first_identity_collision: collisions.first,
         }));
+        replied
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reply_refusal(
+        &mut self,
+        stream: &mut TcpStream,
+        attempt_id: &str,
+        request: &WireRequest,
+        request_evidence: &FrameEvidence,
+        peer: &Peer,
+        reason: RefusalReason,
+        drop_after_decision: bool,
+    ) -> Result<(), Error> {
         let reply = sign_reply(
             WireReply::Refused {
                 source_replica_id: self.replica_id.clone(),
@@ -1528,6 +1557,7 @@ pub struct Error {
     source: ErrorSource,
     detail: String,
     refusal_reason: Option<RefusalReason>,
+    connection_attempted: bool,
 }
 
 impl Error {
@@ -1551,6 +1581,7 @@ impl Error {
             source: ErrorSource::Local,
             detail: value.to_string(),
             refusal_reason: None,
+            connection_attempted: false,
         }
     }
     fn remote_diagnostic(category: ErrorCategory, detail: String) -> Self {
@@ -1559,6 +1590,7 @@ impl Error {
             source: ErrorSource::UnauthenticatedRemoteDiagnostic,
             detail,
             refusal_reason: None,
+            connection_attempted: false,
         }
     }
     fn authenticated_refusal(reason: RefusalReason) -> Self {
@@ -1567,7 +1599,12 @@ impl Error {
             source: ErrorSource::AuthenticatedRemoteRefusal,
             detail: format!("authenticated remote refusal: {reason}"),
             refusal_reason: Some(reason),
+            connection_attempted: false,
         }
+    }
+    fn after_connection_attempt(mut self) -> Self {
+        self.connection_attempted = true;
+        self
     }
     fn durable(error: DurableError) -> Self {
         let category = match &error {
@@ -1592,6 +1629,13 @@ impl Error {
     #[must_use]
     pub fn refusal_reason(&self) -> Option<RefusalReason> {
         self.refusal_reason
+    }
+    /// Whether [`Node::sync_to`] had begun connecting to the peer when this error
+    /// ended the exchange. A failure to export, sign or record the prepared
+    /// attempt happens before any connection and says nothing about the peer.
+    #[must_use]
+    pub fn connection_attempted(&self) -> bool {
+        self.connection_attempted
     }
 }
 
@@ -2672,7 +2716,13 @@ mod tests {
         );
     }
 
-    type Served = (Option<ServedDecision>, Result<(), Error>);
+    /// What serving one connection reported, the operation and phase of every
+    /// audit row the destination held when it did, and the connection's result.
+    type Served = (
+        Option<ServedDecision>,
+        Vec<(Option<String>, AuditPhase)>,
+        Result<(), Error>,
+    );
 
     /// Serves one connection on a fresh listener through the public reporting
     /// seam, or, with `drop_after_decision`, loses the reply after the decision.
@@ -2686,16 +2736,21 @@ mod tests {
             let (stream, _) = listener.accept().unwrap();
             let mut node = configuration.open().unwrap();
             let mut reported = None;
-            let result = if drop_after_decision {
-                node.serve_connection_inner(stream, true, &mut false, &mut |decision| {
-                    reported = Some(decision.clone());
-                })
-            } else {
-                node.serve_connection_reporting(stream, |decision| {
-                    reported = Some(decision.clone());
-                })
+            let mut phases = Vec::new();
+            let mut report = |decision: &ServedDecision| {
+                reported = Some(decision.clone());
+                phases = inspection(&configuration)
+                    .ordered_audit_events
+                    .into_iter()
+                    .map(|evidence| (evidence.event.operation_id, evidence.event.phase))
+                    .collect();
             };
-            (reported, result)
+            let result = if drop_after_decision {
+                node.serve_connection_inner(stream, true, &mut false, &mut report)
+            } else {
+                node.serve_connection_reporting(stream, report)
+            };
+            (reported, phases, result)
         });
         (address, worker)
     }
@@ -2727,8 +2782,9 @@ mod tests {
             (sent, worker.join().unwrap())
         };
 
-        // A committed import: the destination holds a fact the snapshot lacked.
-        let (sent, (decision, result)) = exchange(&mut r1, "served-operation", false);
+        // A committed import: the destination holds a fact the snapshot lacked. It is
+        // reported as soon as it is durable, before the reply.
+        let (sent, (decision, phases, result)) = exchange(&mut r1, "served-operation", false);
         let sent = sent.unwrap();
         assert!(!sent.replayed);
         assert_eq!((sent.snapshot_facts, sent.history_len), (1, 2));
@@ -2741,9 +2797,24 @@ mod tests {
             replayed: false,
         };
         assert_eq!(decision, Some(ServedDecision::Imported(committed.clone())));
+        let recorded = |phases: &[(Option<String>, AuditPhase)], operation: &str, phase| {
+            phases
+                .iter()
+                .any(|(id, recorded)| id.as_deref() == Some(operation) && *recorded == phase)
+        };
+        assert!(recorded(
+            &phases,
+            "served-operation",
+            AuditPhase::InboundImportCommitted
+        ));
+        assert!(!recorded(
+            &phases,
+            "served-operation",
+            AuditPhase::InboundReplyPrepared
+        ));
 
         // An identical retry replays the receipt and reports the original counts.
-        let (sent, (decision, result)) = exchange(&mut r1, "served-operation", false);
+        let (sent, (decision, _, result)) = exchange(&mut r1, "served-operation", false);
         assert!(sent.unwrap().replayed);
         assert!(result.is_ok());
         assert_eq!(
@@ -2757,9 +2828,10 @@ mod tests {
         // A changed snapshot under the same operation is refused, with its reason
         // on both sides and no collision.
         observe(&r1, "served-changed");
-        let (sent, (decision, result)) = exchange(&mut r1, "served-operation", false);
+        let (sent, (decision, _, result)) = exchange(&mut r1, "served-operation", false);
         let refused = sent.unwrap_err();
         assert_eq!(refused.source(), ErrorSource::AuthenticatedRemoteRefusal);
+        assert!(refused.connection_attempted());
         assert_eq!(
             refused.refusal_reason(),
             Some(RefusalReason::OperationIdReused)
@@ -2792,12 +2864,19 @@ mod tests {
                 value: "other bytes".into(),
             })
             .unwrap();
-        let (sent, (decision, result)) = exchange(&mut forked, "served-forked", false);
+        let (sent, (decision, phases, result)) = exchange(&mut forked, "served-forked", false);
         assert_eq!(
             sent.unwrap_err().refusal_reason(),
             Some(RefusalReason::PolicyViolation)
         );
         assert!(result.is_ok());
+        // The collision is searched, and the refusal reported, once the signed refusal
+        // has been written.
+        assert!(recorded(
+            &phases,
+            "served-forked",
+            AuditPhase::InboundReplyWriteObserved
+        ));
         assert_eq!(
             decision,
             Some(ServedDecision::Refused(ServedRefusal {
@@ -2816,15 +2895,15 @@ mod tests {
                 peer.shared_key_hex = WRONG_KEY.into();
             }
         });
-        let (sent, (decision, _)) = exchange(&mut wrong_key, "served-wrong-key", false);
+        let (sent, (decision, _, _)) = exchange(&mut wrong_key, "served-wrong-key", false);
         assert!(sent
             .as_ref()
-            .is_err_and(|error| error.refusal_reason().is_none()));
+            .is_err_and(|error| error.refusal_reason().is_none() && error.connection_attempted()));
         assert_eq!(decision, None);
         assert_eq!(history_len(&r2), 2);
 
         // A reply lost after the commit still reports the durable import.
-        let (sent, (decision, result)) = exchange(&mut r1, "served-after-change", true);
+        let (sent, (decision, _, result)) = exchange(&mut r1, "served-after-change", true);
         assert!(sent.is_err());
         assert!(result.is_err());
         assert_eq!(
@@ -3198,9 +3277,10 @@ mod tests {
         observe(&r1, "blocked-success-fact");
         let mut source = r1.open().unwrap();
         source.fail_next_audit_at(AuditPhase::OutboundRequestPrepared);
+        // A local failure before any connection says nothing about the peer.
         assert!(source
             .sync_to("r2", "blocked-before-connect", "blocked-before-nonce")
-            .is_err());
+            .is_err_and(|error| !error.connection_attempted()));
         assert_eq!(inspection(&r1).audit_event_count, 0);
 
         let (address, server) =
@@ -3212,6 +3292,7 @@ mod tests {
             .sync_to("r2", "destination-audit-fails", "destination-failure-nonce")
             .unwrap_err();
         assert_ne!(error.source(), ErrorSource::AuthenticatedRemoteRefusal);
+        assert!(error.connection_attempted());
         assert!(server.join().unwrap().is_err());
         assert_eq!(history_len(&r2), 0);
         let destination = inspection(&r2);
@@ -3616,6 +3697,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.category(), ErrorCategory::Unavailable);
         assert_eq!(error.source(), ErrorSource::Local);
+        assert!(error.connection_attempted());
     }
 
     #[test]

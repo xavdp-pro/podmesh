@@ -228,9 +228,10 @@ enum CaughtUpBy {
     NoPeers,
     /// Every peer was caught up with.
     EveryPeer,
-    /// The window elapsed for a store whose latest fact of its own origin it had
-    /// appended itself, after one peer was caught up with and every other one was
-    /// attempted without being known to hold facts this replica lacks.
+    /// The window ended for a store whose latest fact of its own origin it had
+    /// appended itself, and evidence taken after its end showed one peer caught
+    /// up with and every other one unreached without being known to hold facts
+    /// this replica lacks.
     Window,
 }
 
@@ -247,6 +248,7 @@ struct CatchUpStatus {
     own_facts_at_start: usize,
     latest_own_fact_appended_locally: bool,
     window_ms: u64,
+    appends_observed: u64,
 }
 
 #[derive(Serialize)]
@@ -277,8 +279,16 @@ struct PeerCatchUp {
     /// The largest history a receipt from the peer counted beyond the facts this
     /// process pushed: the peer held facts this replica lacked.
     ahead_at: Option<usize>,
-    /// An attempt of this process to the peer has ended, whatever its outcome.
+    /// The earliest moment at which that history can have been counted.
+    ahead_counted_after: Option<Instant>,
+    /// The latest moment at which this replica is known to have held every fact
+    /// the peer held: a receipt that counted exactly the pushed facts, or one
+    /// that counted a history an import has since carried in full.
+    covered_since: Option<Instant>,
+    /// An attempt of this process to reach the peer has ended.
     attempted: bool,
+    /// The start of the latest attempt, when it drew no authenticated answer.
+    unreached_since: Option<Instant>,
 }
 
 impl PeerCatchUp {
@@ -294,6 +304,32 @@ impl PeerCatchUp {
     fn ahead(&self) -> bool {
         self.ahead_at.is_some() && !self.caught_up()
     }
+
+    /// Caught up with on evidence no older than `moment`.
+    fn caught_up_after(&self, moment: Instant) -> bool {
+        self.caught_up() && self.covered_since.is_some_and(|since| since >= moment)
+    }
+
+    /// Unreached by an attempt started at or after `moment`, and not known to
+    /// hold facts this replica lacks.
+    fn unreached_after(&self, moment: Instant) -> bool {
+        !self.ahead() && self.unreached_since.is_some_and(|since| since >= moment)
+    }
+}
+
+/// How one attempt to reach a peer ended.
+enum AttemptOutcome {
+    /// An authenticated receipt: the peer's history after importing the pushed
+    /// facts, and the earliest moment at which it can have been counted.
+    Receipt {
+        history: usize,
+        pushed: usize,
+        counted_after: Instant,
+    },
+    /// A verified signed refusal: the peer was reached and refused.
+    Refused,
+    /// No authenticated answer.
+    Unreached,
 }
 
 /// Whether this process has caught up with its peers, which it must have before
@@ -308,12 +344,20 @@ impl PeerCatchUp {
 /// or once its authenticated receipt for a push of this process counted exactly
 /// the pushed facts. A receipt counting more tells that the peer holds facts
 /// this replica lacks, until such an import. Every peer caught up with catches
-/// the process up. The window forgives the others, only to a store whose latest
-/// fact of its own origin was appended by the store itself (an emptied store
-/// that imported some of its own facts back still waits for every peer, in every
-/// later process), and only once one peer was caught up with and every other one
-/// was attempted without being known to hold facts this replica lacks: a replica
-/// that reaches no peer never appends. The state latches for the process.
+/// the process up.
+///
+/// The window forgives the others, only to a store whose latest fact of its own
+/// origin was appended by the store itself (an emptied store that imported some
+/// of its own facts back still waits for every peer, in every later process),
+/// and only on evidence no older than the window's end: when the window ends,
+/// every peer is made due again with a fresh operation, and the window applies
+/// once one peer is caught up with on such evidence and every other one is
+/// unreached by an attempt started after the end, none of them known to hold
+/// facts this replica lacks. A peer caught up with earlier is not enough: it may
+/// since have received such facts, relayed from a replica this process cannot
+/// reach. A peer that answers an authenticated refusal is reached, not forgiven:
+/// its exchange service works and its history stays unknown. A replica that
+/// reaches no peer never appends. The state latches for the process.
 struct CatchUp {
     /// When this process started exchanging.
     started: Instant,
@@ -323,9 +367,11 @@ struct CatchUp {
     /// appended by the store itself, not imported back from a peer.
     latest_own_fact_appended_locally: bool,
     peers: BTreeMap<String, PeerCatchUp>,
-    /// Since when every condition of the window but its duration has held.
-    window_ready_since: Option<Instant>,
+    /// Every peer was made due again when the window ended.
+    window_refreshed: bool,
     caught_up: Option<(CaughtUpBy, Instant)>,
+    /// Appends this process answered observed, replays included.
+    appends_observed: u64,
 }
 
 impl CatchUp {
@@ -347,71 +393,130 @@ impl CatchUp {
             own_facts_at_start,
             latest_own_fact_appended_locally,
             peers,
-            window_ready_since: None,
+            window_refreshed: false,
+            appends_observed: 0,
         }
     }
 
-    /// Every condition of the window but its duration.
-    fn window_ready(&self) -> bool {
+    fn window_end(&self) -> Instant {
+        self.started + self.window
+    }
+
+    /// Whether the window applies: every condition holds on evidence taken after
+    /// its end, so it can only start to hold when such evidence arrives.
+    fn window_applies(&self) -> bool {
+        let end = self.window_end();
         self.latest_own_fact_appended_locally
-            && self.peers.values().any(PeerCatchUp::caught_up)
+            && self.peers.values().any(|peer| peer.caught_up_after(end))
             && self
                 .peers
                 .values()
-                .all(|peer| peer.caught_up() || (peer.attempted && !peer.ahead()))
+                .all(|peer| peer.caught_up_after(end) || peer.unreached_after(end))
     }
 
     /// Whether this process may append, latching the first condition that held.
     fn evaluate(&mut self, now: Instant) -> bool {
         if self.caught_up.is_none() {
-            let window_end = self.started + self.window;
             if self.peers.values().all(PeerCatchUp::caught_up) {
                 self.caught_up = Some((CaughtUpBy::EveryPeer, now));
-            } else if let Some(ready) = self.window_ready_since.filter(|_| now >= window_end) {
-                self.caught_up = Some((CaughtUpBy::Window, ready.max(window_end)));
+            } else if self.window_applies() {
+                self.caught_up = Some((CaughtUpBy::Window, now));
             }
         }
         self.caught_up.is_some()
     }
 
-    /// Applies what one event taught about a peer. A window already due is
-    /// latched first, at the moment it became due.
+    /// Applies what one event taught about a peer, then evaluates: never the
+    /// other way round, or a receipt showing a peer ahead could latch a window
+    /// before it counts.
     fn learn(&mut self, peer: &str, now: Instant, update: impl FnOnce(&mut PeerCatchUp)) {
-        self.evaluate(now);
         if let Some(state) = self.peers.get_mut(peer) {
             update(state);
         }
-        self.window_ready_since = if self.window_ready() {
-            Some(self.window_ready_since.unwrap_or(now))
-        } else {
-            None
-        };
         self.evaluate(now);
     }
 
+    /// Records an authenticated import from the peer that this process committed
+    /// or replayed. The import carries the peer's history as it was exported,
+    /// which this process cannot date; what it dates is the history the import
+    /// covers, counted by a receipt.
     fn record_import(&mut self, peer: &str, snapshot_facts: usize, now: Instant) {
         self.learn(peer, now, |state| {
             state.imported_snapshot = state.imported_snapshot.max(Some(snapshot_facts));
+            if state
+                .ahead_at
+                .is_some_and(|history| snapshot_facts >= history)
+            {
+                state.covered_since = state.covered_since.max(state.ahead_counted_after);
+            }
         });
     }
 
-    /// Records the end of an attempt to a peer and, for an authenticated receipt,
-    /// the history it counted and the facts this process pushed.
-    fn record_attempt(&mut self, peer: &str, receipt: Option<(usize, usize)>, now: Instant) {
+    /// Records how an attempt that reached the network, started at `started`, ended.
+    fn record_attempt(
+        &mut self,
+        peer: &str,
+        started: Instant,
+        outcome: &AttemptOutcome,
+        now: Instant,
+    ) {
         self.learn(peer, now, |state| {
             state.attempted = true;
-            match receipt {
-                Some((history, pushed)) if history == pushed => {
+            state.unreached_since = None;
+            match *outcome {
+                // The peer's history, after importing the pushed facts, counted
+                // exactly as many: it held nothing this replica lacked.
+                AttemptOutcome::Receipt {
+                    history,
+                    pushed,
+                    counted_after,
+                } if history == pushed => {
                     state.matched = true;
                     state.ahead_at = None;
+                    state.ahead_counted_after = None;
+                    state.covered_since = state.covered_since.max(Some(counted_after));
                 }
-                Some((history, pushed)) if history > pushed => {
+                // It counted more: the peer held facts this replica lacked, unless
+                // an import has since carried a history at least as long, which a
+                // history that only grows makes the same one.
+                AttemptOutcome::Receipt {
+                    history,
+                    pushed,
+                    counted_after,
+                } if history > pushed => {
                     state.matched = false;
-                    state.ahead_at = state.ahead_at.max(Some(history));
+                    if Some(history) >= state.ahead_at {
+                        state.ahead_at = Some(history);
+                        state.ahead_counted_after =
+                            state.ahead_counted_after.max(Some(counted_after));
+                    }
+                    if state
+                        .imported_snapshot
+                        .is_some_and(|facts| facts >= history)
+                    {
+                        state.covered_since = state.covered_since.max(Some(counted_after));
+                    }
                 }
-                _ => {}
+                AttemptOutcome::Receipt { .. } | AttemptOutcome::Refused => {}
+                AttemptOutcome::Unreached => state.unreached_since = Some(started),
             }
         });
+    }
+
+    /// True once, when the window has ended before this process caught up: every
+    /// peer is then to be attempted again with a fresh operation, so that the
+    /// window counts only evidence taken after its end.
+    fn window_refresh_due(&mut self, now: Instant) -> bool {
+        let due = !self.window_refreshed
+            && self.caught_up.is_none()
+            && self.latest_own_fact_appended_locally
+            && now >= self.window_end();
+        self.window_refreshed |= due;
+        due
+    }
+
+    fn record_observed_append(&mut self) {
+        self.appends_observed = self.appends_observed.saturating_add(1);
     }
 
     fn named(&self, keep: impl Fn(&PeerCatchUp) -> bool) -> Vec<String> {
@@ -442,6 +547,7 @@ impl CatchUp {
             own_facts_at_start: self.own_facts_at_start,
             latest_own_fact_appended_locally: self.latest_own_fact_appended_locally,
             window_ms: millis(self.window),
+            appends_observed: self.appends_observed,
         }
     }
 }
@@ -735,12 +841,24 @@ fn record_served_import(shared: &Shared, import: &ServedImport) {
     if !import.replayed && import.inserted > 0 {
         shared.snapshot_generation.fetch_add(1, Ordering::SeqCst);
     }
+    let mut catching_up = false;
     if let Ok(mut catch_up) = shared.catch_up.lock() {
         catch_up.record_import(
             &import.source_replica_id,
             import.snapshot_facts,
             Instant::now(),
         );
+        catching_up = catch_up.caught_up.is_none();
+    }
+    // This request shows that the peer is exchanging again. A process that has
+    // not caught up needs a receipt of its own from it, dated, which no import
+    // gives: attempt it at once rather than at the end of a long backoff.
+    if catching_up {
+        if let Ok(mut peers) = shared.peers.lock() {
+            if let Some(state) = peers.get_mut(&import.source_replica_id) {
+                state.next_attempt = Instant::now();
+            }
+        }
     }
     // After a committed import this replica holds every fact of the snapshot, so
     // a longer history holds facts the peer lacks. A replay reports the counts of
@@ -978,6 +1096,9 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
                                     match receiver.recv_timeout(wait) {
                                         Ok(AppendCompletion::Observed(response)) => {
                                             let _ = worker.join();
+                                            if let Ok(mut catch_up) = shared.catch_up.lock() {
+                                                catch_up.record_observed_append();
+                                            }
                                             response
                                         }
                                         Ok(AppendCompletion::Refused) => {
@@ -1219,13 +1340,36 @@ fn synchronize(config: &Configuration, shared: &Shared) -> Result<()> {
     let mut backoffs = BTreeMap::new();
     let refresh = config.unchanged_snapshot_refresh();
     let interval = Duration::from_millis(config.interval_ms);
-    // Reuse one operation ID for an unchanged observed snapshot. Fresh IDs after
-    // restart are safe but receipts are not compacted by this laboratory.
-    let mut operations: BTreeMap<String, (Vec<u8>, String)> = BTreeMap::new();
+    // Reuse one operation ID for an unchanged observed snapshot, remembering when
+    // it was created: a replayed receipt counts a history no older than that.
+    // Fresh IDs after restart are safe but receipts are not compacted by this
+    // laboratory.
+    let mut operations: BTreeMap<String, (Vec<u8>, String, Instant)> = BTreeMap::new();
     while !shared.stopping.load(Ordering::SeqCst) {
         for peer in &config.network.peers {
             if shared.stopping.load(Ordering::SeqCst) {
                 break;
+            }
+            // When the window ends before this process caught up, every peer is
+            // attempted again at once with a fresh operation: the window counts
+            // only evidence taken after its end.
+            let refresh_due = shared
+                .catch_up
+                .lock()
+                .map_err(|_| "catch-up lock poisoned")?
+                .window_refresh_due(Instant::now());
+            if refresh_due {
+                let now = Instant::now();
+                let mut peers = shared.peers.lock().map_err(|_| "status lock poisoned")?;
+                for state in peers.values_mut() {
+                    state.acknowledged = None;
+                    state.next_attempt = now;
+                }
+                drop(peers);
+                // A peer that stayed down through the window is looked for again
+                // from the exchange interval, not from the backoff it had reached.
+                backoffs.clear();
+                operations.clear();
             }
             let push_back_requests = {
                 let mut peers = shared.peers.lock().map_err(|_| "status lock poisoned")?;
@@ -1279,10 +1423,11 @@ fn synchronize(config: &Configuration, shared: &Shared) -> Result<()> {
             }
             let operation = operations
                 .entry(peer.replica_id.clone())
-                .or_insert_with(|| (Vec::new(), String::new()));
+                .or_insert_with(|| (Vec::new(), String::new(), Instant::now()));
             if operation.0 != digest {
-                *operation = (digest.clone(), random_token()?);
+                *operation = (digest.clone(), random_token()?, Instant::now());
             }
+            let attempt_started = Instant::now();
             let outcome = match config.network.open() {
                 Ok(mut node) => node.sync_to(&peer.replica_id, &operation.1, &random_token()?),
                 Err(_) => {
@@ -1304,10 +1449,26 @@ fn synchronize(config: &Configuration, shared: &Shared) -> Result<()> {
             let backoff = backoffs
                 .entry(peer.replica_id.clone())
                 .or_insert(config.interval_ms);
-            let receipt_counts = outcome
-                .as_ref()
-                .ok()
-                .map(|receipt| (receipt.history_len, receipt.snapshot_facts));
+            // A local failure before any connection says nothing about the peer.
+            let attempt = match &outcome {
+                Ok(receipt) => Some(AttemptOutcome::Receipt {
+                    history: receipt.history_len,
+                    pushed: receipt.snapshot_facts,
+                    // A fresh receipt counts a history the peer committed during
+                    // this attempt; a replay counts the one of its first commit,
+                    // no older than the operation this process created.
+                    counted_after: if receipt.replayed {
+                        operation.2
+                    } else {
+                        attempt_started
+                    },
+                }),
+                Err(error) if !error.connection_attempted() => None,
+                Err(error) if error.source() == ErrorSource::AuthenticatedRemoteRefusal => {
+                    Some(AttemptOutcome::Refused)
+                }
+                Err(_) => Some(AttemptOutcome::Unreached),
+            };
             match outcome {
                 Ok(receipt) => {
                     state.status.authenticated_successes =
@@ -1359,11 +1520,13 @@ fn synchronize(config: &Configuration, shared: &Shared) -> Result<()> {
             // A peer whose history, after importing the pushed facts, counts exactly
             // as many held nothing this replica lacked; one that counts more held
             // facts this replica lacked.
-            shared
-                .catch_up
-                .lock()
-                .map_err(|_| "catch-up lock poisoned")?
-                .record_attempt(&peer.replica_id, receipt_counts, finished);
+            if let Some(attempt) = attempt {
+                shared
+                    .catch_up
+                    .lock()
+                    .map_err(|_| "catch-up lock poisoned")?
+                    .record_attempt(&peer.replica_id, attempt_started, &attempt, finished);
+            }
         }
         thread::sleep(Duration::from_millis(10));
     }

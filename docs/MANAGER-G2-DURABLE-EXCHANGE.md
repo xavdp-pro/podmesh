@@ -492,7 +492,7 @@ success.
 | Exclusive fields in local request | Typed JSON refusal; no store access. |
 | Storage failure during local append | No partial fact/receipt and no success response; report uncertain unless the durable layer proves a policy refusal. |
 | Append worker already occupied | Report busy immediately; admit no new worker and make no claim about a prior uncertain operation. |
-| Resident not yet caught up with its peers *(added 2026-09-17, exchange lot)* | Report `append_observation_catching_up` after UID and request validation and before any store access; no fact or receipt; the identical request may be retried. |
+| Resident not yet caught up with its peers *(added 2026-09-17, exchange lot)* | Report `append_observation_catching_up` after UID and request validation and before any store access; no fact or receipt; the identical request may be retried, for as long as it takes. The replica keeps exchanging meanwhile: it is running and not ready, and this is not a refusal. |
 | Local append exceeds the control response budget | Return uncertain, keep the resident responsive, drain the admitted worker on shutdown and resolve by identical operation-ID retry. |
 | Client disconnect after local commit | Outcome is uncertain; identical retry returns the original receipt and does not append again. |
 | Operation ID reused with different request | Refuse with zero mutation. |

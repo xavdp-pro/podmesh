@@ -1,14 +1,27 @@
 #!/bin/sh
 # PID 1 of the manager universe. It runs the resident, records each start as a fact through the
 # control socket only this process can reach, and turns the container's stop signal into the
-# resident's typed shutdown. Every failure is terminal and visible from outside: a start whose boot
-# fact is not observed exits 2 (the universe is then "not running when observed"), a stop whose typed
-# shutdown is not acknowledged exits 3 (an honest failed stop, never a silent wait for escalation).
-# The optional argument `--fault boot|shutdown` injects those failures for the laboratory check.
+# resident's typed shutdown.
 #
-# The start has a budget. Whoever starts the universe observes it for at most 30 seconds (PodMesh's
-# bound on observe_seconds), so a boot that cannot be observed ends, with exit 2, within 25 seconds of
-# this script's start: a start is never recorded as running for a replica that is about to fail.
+# Readiness contract. RUNNING means the resident is up and exchanging with its peers. READY means
+# this boot's fact is observed. A replica that has not caught up with its peers is running and not
+# yet ready: it keeps exchanging, so that the replicas started after it can catch up with it, and
+# this script keeps asking for the boot fact with no deadline, one line of the resident's catch-up
+# state in the log every 30 seconds. Readiness is visible in this log ("boot fact observed") and in
+# the resident's status (`catch_up.appends_observed`, `catch_up.caught_up`). Whoever waits for a
+# replica to be ready waits for that line, not for the container to be up.
+#
+# Every other failure is terminal and visible from outside: a boot fact refused for any other reason
+# exits 2 (the universe is then "not running when observed"), a stop whose typed shutdown is not
+# acknowledged exits 3 (an honest failed stop, never a silent wait for escalation). The optional
+# argument `--fault boot|shutdown` injects those failures for the laboratory check.
+#
+# The start has a budget of 25 seconds. It bounds the control socket's bind and the retries of an
+# `uncertain` or `busy` answer: whoever starts the universe observes it for at most 30 seconds
+# (PodMesh's bound on observe_seconds), so those failures end within 25 seconds of this script's
+# start and a start is never recorded as running for a replica that is about to fail. It does not
+# bound catching up, which is not a failure and can last as long as a peer stays out of reach; the
+# budget of the `uncertain` and `busy` retries restarts after each `catching_up` answer.
 set -eu
 umask 077
 budget_seconds=25
@@ -84,54 +97,12 @@ while [ ! -S "$socket_path" ]; do
 done
 echo "manager-universe: control socket bound after $(elapsed)s"
 
-# Readiness requirement: the start is not a start until the resident has observed this boot's fact.
-boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
-opid=$(cat /proc/sys/kernel/random/uuid)
-# The scope this replica owns, read from its own configuration: a fact appended outside an owned
-# scope is refused by the resident, and rightly so.
-scope=$(python3 -c 'import json,sys; c=json.load(open("/etc/podmesh-manager/config.json")); r=c["network"]["replica_id"]; print([g["scope"] for g in c["network"]["manager"]["grants"] if g["owner_replica_id"]==r][0])')
-# The same operation ID is retried, bounded, when the resident answers `uncertain` or `busy`: an
-# uncertain append is one whose outcome the resident could not tell (a store still opening after
-# the previous incarnation's shutdown, a worker past its deadline), and the resident replays an
-# operation ID it has already appended rather than appending it twice, so the retry is safe and
-# the fact ends up observed once. Any other answer is terminal. Measured on 2026-09-15: a replica
-# restarted right after its typed stop answered `append_observation_uncertain` once, and this
-# entrypoint refused to run -- correctly, on that contract, and needlessly. The retries stop at the
-# start's budget, not at a count.
-#
-# `catching_up` is retried the same way. The resident appends nothing before it has caught up with
-# its peers -- an import from each, or a receipt showing that the peer holds nothing it lacks -- so
-# that a store which lost some of this replica's own facts gets them back before the boot fact
-# takes the next sequence number, instead of reusing one its peers hold with other bytes, which
-# they would refuse for good. It touched nothing, so the retry is safe. With every peer up this
-# takes a few exchanges. A store whose latest fact of its own it appended itself also appends once
-# its catch-up window has elapsed (15 s at most, from the moment its control socket is bound), it
-# has reached one peer and tried every other: this clock counts whole seconds, so the last attempt
-# is certain only 24 s after this script started, and attempts are about 0.6 s apart, so such a
-# start fits the budget while the socket is bound within about 8 s. An emptied store, or one that
-# only imported its own facts back, is refused a start at the budget while a peer stays
-# unreachable, visibly, rather than forking its history; so is a replica that reaches no peer.
-observed=no; attempt=0
-while :; do
-  attempt=$((attempt + 1))
-  reply=$(control "$boot_socket" "{\"operation\":\"append_observation\",\"operation_id\":\"$opid\",\"scope\":\"$scope\",\"subject\":\"boot\",\"value\":\"boot-$boot\"}" 2>&1) || true
-  if printf '%s' "$reply" | grep -q '"result":"observed"'; then observed=yes; break; fi
-  if printf '%s' "$reply" | grep -q 'append_observation_uncertain\|append_observation_busy\|append_observation_catching_up' && [ "$(elapsed)" -lt "$budget_seconds" ]; then
-    echo "manager-universe: boot fact attempt $attempt: $(printf '%s' "$reply" | tail -1 | cut -c1-80); retrying the same operation"
-    sleep 0.5; continue
-  fi
-  break
-done
-if [ "$observed" = yes ]; then
-  echo "manager-universe: boot fact observed (attempt $attempt, $(elapsed)s after the start): $(printf '%s' "$reply" | cut -c1-120)"
-else
-  echo "manager-universe: BOOT FACT NOT OBSERVED after $attempt attempt(s) and $(elapsed)s; refusing to run: $(printf '%s' "$reply" | tail -1 | cut -c1-200)"
-  kill -KILL "$child" 2>/dev/null || true
-  exit 2
-fi
-
+# From here the typed shutdown is possible, so the stop signal is taken from here: a replica that is
+# still catching up must stop as honestly as a ready one, and it may wait a long time.
 shutdown_rc=0
+stopping=no
 shutdown() {
+  stopping=yes
   echo "manager-universe: stop signal received; requesting the typed shutdown"
   if reply=$(control "$stop_socket" '{"operation":"shutdown"}' 2>&1) && printf '%s' "$reply" | grep -q '"shutdown_requested":true'; then
     echo "manager-universe: shutdown acknowledged: $reply"
@@ -142,6 +113,89 @@ shutdown() {
   fi
 }
 trap shutdown TERM INT
+
+# One line of the resident's catch-up state, for the log of a replica that is running and not ready.
+catch_up_state() {
+  control "$socket_path" '{"operation":"status"}' 2>/dev/null | python3 -c '
+import json, sys
+try:
+    c = json.loads(sys.stdin.read().strip().splitlines()[-1])["catch_up"]
+except Exception:
+    print("catch-up state unavailable")
+    sys.exit(0)
+names = lambda key: ",".join(c.get(key) or []) or "-"
+print(
+    "imported=%s matched=%s missing=%s ahead=%s not_attempted=%s own_facts_at_start=%s"
+    " latest_own_fact_appended_locally=%s window_ms=%s"
+    % (names("peers_imported"), names("peers_matched"), names("peers_missing"), names("peers_ahead"),
+       names("peers_not_attempted"), c.get("own_facts_at_start"),
+       c.get("latest_own_fact_appended_locally"), c.get("window_ms"))
+)
+' 2>/dev/null || echo "catch-up state unavailable"
+}
+
+# Readiness requirement: the start is not a start until the resident has observed this boot's fact.
+boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+opid=$(cat /proc/sys/kernel/random/uuid)
+# The scope this replica owns, read from its own configuration: a fact appended outside an owned
+# scope is refused by the resident, and rightly so.
+scope=$(python3 -c 'import json,sys; c=json.load(open("/etc/podmesh-manager/config.json")); r=c["network"]["replica_id"]; print([g["scope"] for g in c["network"]["manager"]["grants"] if g["owner_replica_id"]==r][0])')
+# The same operation ID is retried, bounded, when the resident answers `uncertain` or `busy`: an
+# uncertain append is one whose outcome the resident could not tell (a store still opening after
+# the previous incarnation's shutdown, a worker past its deadline), and the resident replays an
+# operation ID it has already appended rather than appending it twice, so the retry is safe and
+# the fact ends up observed once. Measured on 2026-09-15: a replica restarted right after its typed
+# stop answered `append_observation_uncertain` once, and this entrypoint refused to run --
+# correctly, on that contract, and needlessly. Those retries stop at the budget, not at a count.
+#
+# `catching_up` is retried with no deadline. The resident appends nothing before it has caught up
+# with its peers -- an import from each, or a receipt showing that the peer holds nothing it lacks
+# -- so that a store which lost some of this replica's own facts gets them back before the boot
+# fact takes the next sequence number, instead of reusing one its peers hold with other bytes,
+# which they would refuse for good. It touched nothing, so the retry is safe. With every peer up
+# this takes a few exchanges. A store whose latest fact of its own it appended itself also appends
+# once its catch-up window has elapsed (15 s by default, from the moment the resident started) and
+# a fresh round of attempts, taken after that end, has reached one peer and reached no other. An
+# emptied store, one that only imported its own facts back, and a replica that reaches no peer wait
+# here for as long as it takes: they stay running and keep exchanging, which is what lets the other
+# replicas catch up with them, and they are never ready until their boot fact is observed.
+#
+# Any other answer is terminal.
+observed=no; attempt=0; catching_up=0; reported_at=0; retry_since=$started_at
+while :; do
+  attempt=$((attempt + 1))
+  reply=$(control "$boot_socket" "{\"operation\":\"append_observation\",\"operation_id\":\"$opid\",\"scope\":\"$scope\",\"subject\":\"boot\",\"value\":\"boot-$boot\"}" 2>&1) || true
+  if printf '%s' "$reply" | grep -q '"result":"observed"'; then observed=yes; break; fi
+  [ "$stopping" = yes ] && break
+  if printf '%s' "$reply" | grep -q 'append_observation_catching_up'; then
+    now=$(date +%s)
+    retry_since=$now
+    if [ "$catching_up" -eq 0 ] || [ $(( now - reported_at )) -ge 30 ]; then
+      reported_at=$now
+      echo "manager-universe: running, not ready: the resident is catching up with its peers ($(elapsed)s after the start, attempt $attempt); $(catch_up_state)"
+    fi
+    catching_up=$((catching_up + 1))
+    # Poll closely at first, so that a catch-up of a few exchanges is not delayed, then slowly: a
+    # replica can stay here for hours while a peer is out of reach.
+    if [ "$(elapsed)" -lt 60 ]; then sleep 0.5; else sleep 2; fi
+    continue
+  fi
+  if printf '%s' "$reply" | grep -q 'append_observation_uncertain\|append_observation_busy' && [ $(( $(date +%s) - retry_since )) -lt "$budget_seconds" ]; then
+    echo "manager-universe: boot fact attempt $attempt: $(printf '%s' "$reply" | tail -1 | cut -c1-80); retrying the same operation"
+    sleep 0.5; continue
+  fi
+  break
+done
+if [ "$observed" = yes ]; then
+  echo "manager-universe: boot fact observed (attempt $attempt, $(elapsed)s after the start): $(printf '%s' "$reply" | cut -c1-120)"
+elif [ "$stopping" = yes ]; then
+  echo "manager-universe: stopping before this boot's fact was observed, after $attempt attempt(s) and $(elapsed)s"
+else
+  echo "manager-universe: BOOT FACT NOT OBSERVED after $attempt attempt(s) and $(elapsed)s; refusing to run: $(printf '%s' "$reply" | tail -1 | cut -c1-200)"
+  kill -KILL "$child" 2>/dev/null || true
+  exit 2
+fi
+
 rc=0
 while :; do
   set +e; wait "$child"; rc=$?; set -e

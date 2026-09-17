@@ -57,6 +57,9 @@ function once(control, request) {
   })
 }
 
+// How long an administration request waits for a replica that has not caught up with its peers.
+export const CATCHING_UP_WAIT_MS = 10000
+
 // One typed observation in this replica's scope. The resident answers within a 250 ms control
 // deadline (its design): `observed` when the store committed in time, `append_observation_uncertain`
 // or `_busy` when it could not say -- and measured on 2026-09-16 the store then holds the fact
@@ -64,14 +67,30 @@ function once(control, request) {
 // (the resident refuses an ID it already has, so the fact lands once), and when every answer stays
 // uncertain the store itself is read back for that exact subject and value. Only a fact absent from
 // the store after that is a refusal.
-export const observer = ({ control, scope, facts }) => async (subject, value) => {
+//
+// `append_observation_catching_up` is not a refusal either: the resident appends nothing before it
+// holds every fact of its own its peers hold, and it touched nothing, so the same operation ID is
+// retried while that is the answer, for as long as a request can reasonably wait. After that the
+// caller is told that this replica is still catching up and that the same request can be repeated;
+// the replica is running and exchanging meanwhile.
+export const observer = ({ control, scope, facts, catchingUpWaitMs = CATCHING_UP_WAIT_MS }) => async (subject, value) => {
   const operation_id = randomBytes(16).toString('hex')
   const request = JSON.stringify({ operation: 'append_observation', operation_id, scope, subject, value })
+  const catchingUpUntil = Date.now() + catchingUpWaitMs
   let last = ''
-  for (let attempt = 0; attempt < 4; attempt++) {
+  let uncertain = 0
+  while (uncertain < 4) {
     last = await once(control, request)
     if (last.replace(/\s/g, '').includes('"result":"observed"')) return 'observed'
+    if (/append_observation_catching_up/.test(last)) {
+      if (Date.now() >= catchingUpUntil) {
+        throw new Error('this replica has not caught up with its peers yet, so it appends nothing; it is exchanging, and the same request can be repeated')
+      }
+      await new Promise(r => setTimeout(r, 400))
+      continue
+    }
     if (!/append_observation_(uncertain|busy)/.test(last)) break
+    uncertain += 1
     await new Promise(r => setTimeout(r, 400))
   }
   if (facts && /append_observation_(uncertain|busy)/.test(last)) {
