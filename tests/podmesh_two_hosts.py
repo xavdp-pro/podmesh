@@ -567,8 +567,10 @@ class Host:
         self.identity = self.call('api', request={'operation': 'identity'})['response']['data']['host_uuid']
 
     def ssh(self, command, input_bytes=None, check=True):
+        # ServerAlive bounds a session a silent network cut would otherwise hold for the TCP retransmission time.
         argv = ['ssh', '-o', 'BatchMode=yes', '-o', 'ControlMaster=auto', '-o', f'ControlPath={self.control}/%C',
-                '-o', 'ControlPersist=180', '-o', 'ConnectTimeout=15', self.target, command]
+                '-o', 'ControlPersist=180', '-o', f'ConnectTimeout={os.environ.get("PODMESH_SSH_CONNECT_TIMEOUT", "15")}',
+                '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=3', self.target, command]
         p = subprocess.run(argv, input=input_bytes, capture_output=True)
         if check and p.returncode:
             raise RuntimeError(f'{self.role} ssh failed ({p.returncode}): {command}\n{p.stderr.decode()}')

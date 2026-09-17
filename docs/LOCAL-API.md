@@ -386,7 +386,7 @@ lease. `stop` is never gated.
 - `activation_status` reports the policy, the lease, its history, the replication intent, this host's
   resources (memory available, CPU count, one-minute load, state-directory space — facts, never a decision)
   and a `scope` sentence stating what the lease proves.
-- `activation_fence` (`timeout_seconds`; no `universe_uuid`) stops every universe under a policy that this host
+- `activation_fence` (`timeout_seconds`, 0–300; no `universe_uuid`) stops every universe under a policy that this host
   holds no live lease for, and reports which it left alone and why. It must be called at least as often as the
   shortest lease, or a lapsed lease leaves a universe running. It also withdraws every exclusive route (below)
   published under a resource this host no longer holds a live, unsuperseded lease for, verified from the
@@ -395,7 +395,9 @@ lease. `stop` is never gated.
 - `activation_fence_preview` (read-only, not journaled; no fields) says what a fence would act on now:
   `pending` (universes running without entitlement, exclusive routes without entitlement),
   `incomplete_network_effects`, and `nothing_to_fence`. A timer asks it first and journals a fence only when
-  there is something to fence, so an idle host's journal does not grow with empty ticks.
+  there is something to fence, so an idle host's journal does not grow with empty ticks. Both read one Podman
+  container listing and one systemd unit listing per call and inspect only the universes that listing names
+  running, so their cost does not grow with the number of policy rows the journal has accumulated.
 
 **Epochs, from the fencing laboratory.** `experiments/manager-fencing` in the web tree models exclusion as an
 epoch issued by one external gate, rotated only by an explicit trusted action, with each maker keeping a durable

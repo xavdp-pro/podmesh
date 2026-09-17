@@ -1008,8 +1008,47 @@ on lab-a until something fenced it (the fence timer is packaged and disabled). T
 merged: PodMesh restores images, and reconciling two histories of the same application is the application's.
 The VM carried two other containers that stopped with it (a manager replica and the console's demo universe);
 both were started again afterwards. The manager's links were already failing for about eight hours before the
-campaign (the resident's audit-table issue reported to Codex).
+campaign (the resident's audit-table issue reported to Codex). **Correction, 2026-09-17:** the manager replica on
+lab-c started and exited again 12 s later (`BOOT FACT NOT OBSERVED after 10 attempt(s)`, the same resident issue);
+it has been stopped since.
 
-Not done: pruning policy exposed in the console; the Explorer and fractal views in the new front; pre-copy;
-automatic failover; a lost-host takeover with a network cut instead of a power cut.
+## Continuity of service, automatic (2026-09-17, the operator's goal: « le but est la continuité de service PCA »)
+
+The failover of a guarded universe is now automatic on the laboratory, under a written mandate
+(`podmesh-lab/claude/PCA-MANDATE-2026-09-17.md`, `authorization_ref=mandate:pca-2026-09-17`): the self-fence timer
+is enabled on the three hosts' development service, and a guardian on the workstation renews the lease and takes
+the universe over. The mechanism, its timing contract and what it does not do are in
+`UNIVERSE-HIGH-AVAILABILITY.md`, "Continuity of service under a mandate". The design was reviewed adversarially
+before the lab (five blockers confirmed, none refuted: the margin did not cover the fence's stop, the wait was based
+on the last acknowledged renewal, a crash between promotion and ledger swap could not be recovered, a run holding
+the lock starved the renewal, a host whose service is down but which still runs the universe would have been
+failed over into a second instance); every one is fixed in the tool and held by `tests/test_replicate_guard.py`
+(13 cases).
+
+Four legs on the counter universe (lease 30 s, margin 20 s, tick 10 s, live replication every 60 s), evidence in
+`podmesh-lab/claude/evidence/pca-2026-09-17/`:
+
+| Leg | What happened, from the host journals and the ledger |
+| --- | --- |
+| lab-c cut from the network (VM alive, dead man's switch first) | lease lapsed on lab-c at +26.8 s; lab-c fenced itself at +36.5 s (exit 137, forced after its 2 s grace); the guardian promoted the universe on lab-a at +94.8 s with the same memory token; 58 s between the old instance's end and the new one's start; network back at +200 s, lab-c's stopped copy found and reintegrated at +205 s |
+| planned switchover lab-a to lab-c under guard | 3.82 s interruption, nothing lost, the guardian followed the new active host |
+| lab-c's service stopped, the universe still running, SSH answering | no fence possible (it goes through the service); the guardian refused the failover at +58 s as a second instance, recorded once and counted; nothing started elsewhere; when the service came back the guardian re-took the lease 0.8 s later, before the fence's next tick: the universe kept running with its memory (the fence-first order would have stopped it and the guardian would have restarted it in place) |
+| lab-c's VM powered off | the guardian promoted the universe on lab-b at +62.4 s (promotion 1.2 s, memory kept, about 20 s of work lost since the last copy); lab-c back after 212 s with neither the transient service nor the fence timer; the service relaunched, the guardian deleted the stale copy 9 s later; the fence re-armed |
+
+Found and fixed during the campaign: the fence and its preview asked Podman and systemd once per policy row, and
+lab-a's journal holds 87 policies: every preview took 7.5 to 12 s, the timer ran them back to back and lab-a's
+service answered every request in 5 to 8 s (replication runs went from 7 s to 47 s). Both now read one container
+listing and one unit listing (preview 0.12 s). The guardian lost a refused failover's incident on reload (fixed:
+persisted, and a persisting condition is one incident, counted). The failover order did not follow a swap (fixed).
+
+What this does not prove or do: the guardian is one process on the workstation (if it stops, every guarded universe
+is stopped by its host's fence after the lease: never two instances, none at all until it is back); a transient
+development service and fence timer do not survive a host reboot (the packaged units would); the recovery point
+objective is the replication interval, and a partitioned host's writes after the cut are lost with it; the fence
+trusts the host it runs on. Still armed on the laboratory at the end: the fence timer on the three hosts, the
+guardian and the live replication of the counter universe (active on lab-b) and the guardian of the demo universe
+(active on lab-b, its replication schedule not armed). Revocation is in the mandate.
+
+Not done: pruning policy exposed in the console; the Explorer and fractal views in the new front; pre-copy; a
+redundant guardian; out-of-band fencing.
 

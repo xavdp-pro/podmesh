@@ -600,3 +600,45 @@ Codex's review of 2026-09-15 gave GO for that laboratory result. What still is *
 The decisions listed under "What is the operator's to decide" were taken by Codex on the
 operator's behalf on 2026-09-15 (`CODEX-REVIEW-M-U2-AND-DIRECTION-2026-09-15.md`); the list
 stays as the record of what was open and recommended.
+
+## Continuity of service under a mandate (2026-09-17)
+
+The operator's goal, 2026-09-16: continuity of service. This section amends two statements above for the
+laboratory, under a written mandate (`podmesh-lab/claude/PCA-MANDATE-2026-09-17.md`): the fence timer, "shipped
+disabled, enabling it is the operator's decision 4", is enabled on the three laboratory hosts' development service;
+and the agent's side, "a tool and not a timer", runs on a timer for the universes the operator guards. PodMesh
+itself still acts on nothing by itself: the daemon is unchanged in that respect, and both timers are the operator's,
+revocable, and named in every operation they cause (`authorization_ref=mandate:pca-2026-09-17`).
+
+**The mechanism.** On each host, `podmesh-fence` every 5 s under the mandate file, with a stop grace of 2 s: a
+universe under a policy whose lease has lapsed on that host's clock is stopped there. On the workstation,
+`tools/replicate-universe.py guard` arms a `systemd --user` timer that runs `guard-tick` every tick R:
+
+1. The renewal, outside the universe's lock: the instant of the attempt is written to a small file **before** the
+   request is sent, so a renewal the host committed but whose answer was lost still moves the base of the wait.
+   The universe is then observed on the active host; found not running while its lease is held, it is looked at
+   again under the lock (a live capture's dump stops it for about a second) and, still not running, started in
+   place and recorded (`self_fenced_by_late_guardian` or `universe_not_running`, memory lost).
+2. A failed tick counts. Once at least two consecutive ticks have failed and `now >= last attempt + L + M`, the
+   active host is observed over SSH without its service: `running` or `unknown` refuses the failover
+   (`failover_refused`, one incident counted) — a host whose service is down but which still runs the universe
+   cannot fence itself, and starting elsewhere would make a second instance. `unreachable`, `stopped` or `absent`
+   lets the first reachable standby holding a copy take over, in the guard's order.
+3. The takeover writes its intent (target, copy, operation IDs) before it touches the standby, promotes with those
+   IDs, then swaps the ledger. A tick that finds an intent resolves it from what the target shows before it renews
+   anything: finished (the target replays the same promotion), forgotten (nothing happened there), or held.
+4. A host that was the active host of a recorded takeover and answers again is reintegrated: a copy found running
+   there is a split-brain observed, stopped at once; the stale copy's state is recorded, then it is deleted (or
+   kept with `--keep-stale`), and the next replication run stages a fresh copy there.
+
+**The timing contract.** The old instance is last writing at the lease's end on its host, plus the fence's period
+(5 s), accuracy (1 s), round trips (budget 2 s) and stop grace (the mandate's, 2 s); its lease ended no later than
+the guardian's last attempt + L, up to the clock skew between the host and the workstation (budget 5 s). The standby
+is promoted no earlier than the last attempt + L + M. So M >= 5 + 1 + 2 + grace + 5, and `guard` refuses a smaller
+margin, reading each host's grace from its mandate (15 s at a 2 s grace; the campaign used 20 s). Recovery point:
+the replication interval. Recovery time: about 2 R + L + M + the SSH timeouts + the promotion, measured 62 to 95 s
+at L = 30, M = 20, R = 10.
+
+**Proven** on the laboratory (four legs, CURRENT-STATE.md) and by `tests/test_replicate_guard.py`. **Not claimed:**
+mutual exclusion beyond the fence (a host too sick to run its fence, or whose clock runs far behind, is not
+covered), a redundant guardian, fencing out of band, a recovery point shorter than the replication interval.

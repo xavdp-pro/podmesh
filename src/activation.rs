@@ -728,12 +728,55 @@ fn perform(db: &Connection, request: &serde_json::Value) -> Result<serde_json::V
 /// holds, and whether the network ledger carries anything incomplete. A timer asks this first
 /// and journals a fence only when there is something to fence (Codex, I2): the transition is
 /// evidence, the empty tick is not.
+/// The names of the universe containers Podman reports running (or still stopping), from one listing: a fence and
+/// its preview ask Podman once, not once per policy row. A journal that has accumulated many policies (87 on the
+/// laboratory's lab-a) otherwise spends seconds in child processes on every tick, and a daemon that serves one
+/// request at a time is unavailable for that long. `None` when the listing cannot be read: the callers then fall
+/// back to asking per universe, as before.
+pub(crate) fn running_universe_names(list: &[serde_json::Value]) -> std::collections::HashSet<String> {
+    list.iter()
+        .filter(|c| matches!(c["State"].as_str(), Some("running") | Some("stopping")))
+        .flat_map(|c| c["Names"].as_array().cloned().unwrap_or_default())
+        .filter_map(|n| n.as_str().map(str::to_string))
+        .filter(|n| n.starts_with("podmesh-"))
+        .collect()
+}
+
+fn running_universes() -> Option<std::collections::HashSet<String>> {
+    crate::transfer::all_containers().ok().map(|list| running_universe_names(&list))
+}
+
+/// The resources whose publishing connector unit is active or activating, from one `systemctl list-units`.
+pub(crate) fn active_publisher_resources(listing: &str) -> std::collections::HashSet<String> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let unit = fields.next()?;
+            let _load = fields.next()?;
+            let active = fields.next()?;
+            let resource = unit.strip_prefix("podmesh-publisher-")?.strip_suffix(".service")?;
+            matches!(active, "active" | "activating").then(|| resource.to_string())
+        })
+        .collect()
+}
+
+fn active_publishers() -> Option<std::collections::HashSet<String>> {
+    let out = std::process::Command::new("systemctl")
+        .args(["list-units", "--all", "--plain", "--no-legend", "--no-pager", "podmesh-publisher-*.service"])
+        .output()
+        .ok()?;
+    out.status.success().then(|| active_publisher_resources(&String::from_utf8_lossy(&out.stdout)))
+}
+
 pub(crate) fn fence_preview(db: &Connection) -> Result<serde_json::Value, Error> {
     let now = crate::now() as i64;
     let this_host = host_uuid(db)?;
     let mut statement = db.prepare("SELECT universe_uuid FROM activation_policy ORDER BY universe_uuid")?;
     let universes: Vec<String> = statement.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
     let mut pending = Vec::new();
+    let running = running_universes();
+    let publishers = active_publishers();
     for uuid in universes {
         let held = lease(db, &uuid)?;
         let overtaken = match held.as_ref() { Some(l) => superseded(db, &uuid, l)?, None => None };
@@ -741,14 +784,22 @@ pub(crate) fn fence_preview(db: &Connection) -> Result<serde_json::Value, Error>
         if entitled {
             continue;
         }
-        let observed = lc::observe(&uuid)?;
-        if observed["present"] == serde_json::json!(true) && observed["running"] == serde_json::json!(true) {
-            pending.push(serde_json::json!({"universe_uuid": uuid, "what": "running without entitlement"}));
+        // One listing decides who is not running; a universe it names is confirmed by inspection.
+        let maybe_running = running.as_ref().is_none_or(|names| names.contains(&format!("podmesh-{uuid}")));
+        if maybe_running {
+            let observed = lc::observe(&uuid)?;
+            if observed["present"] == serde_json::json!(true) && observed["running"] == serde_json::json!(true) {
+                pending.push(serde_json::json!({"universe_uuid": uuid, "what": "running without entitlement"}));
+            }
         }
         if crate::network::exclusive_route_held(db, &uuid)? {
             pending.push(serde_json::json!({"resource": uuid, "what": "exclusive route without entitlement"}));
         }
-        if crate::publisher::connector_present(&uuid) == Some(true) {
+        let connector = match publishers.as_ref() {
+            Some(active) => Some(active.contains(&uuid)),
+            None => crate::publisher::connector_present(&uuid),
+        };
+        if connector == Some(true) {
             pending.push(serde_json::json!({"resource": uuid, "what": "publishing connector without entitlement"}));
         }
     }
@@ -773,6 +824,7 @@ fn fence(db: &Connection, id: &str, timeout: u64) -> Result<serde_json::Value, E
     // Every resource this fence found this host NOT entitled to, whether or not anything had to be
     // withdrawn for it: what a fence receipt binds a takeover proof to (Codex, P0).
     let mut unentitled = Vec::new();
+    let listed = running_universes();
     for uuid in universes {
         let held = lease(db, &uuid)?;
         let overtaken = match held.as_ref() { Some(l) => superseded(db, &uuid, l)?, None => None };
@@ -782,9 +834,13 @@ fn fence(db: &Connection, id: &str, timeout: u64) -> Result<serde_json::Value, E
         if !entitled {
             unentitled.push(uuid.clone());
         }
-        let observed = lc::observe(&uuid)?;
-        let running = observed["present"] == serde_json::json!(true)
-            && observed["running"] == serde_json::json!(true);
+        // One listing decides who is not running; a universe it names (or every one, when it cannot be read) is
+        // confirmed by inspection before anything is stopped.
+        let maybe_running = listed.as_ref().is_none_or(|names| names.contains(&format!("podmesh-{uuid}")));
+        let running = maybe_running && {
+            let observed = lc::observe(&uuid)?;
+            observed["present"] == serde_json::json!(true) && observed["running"] == serde_json::json!(true)
+        };
         if entitled {
             left.push(serde_json::json!({"universe_uuid": uuid, "reason": "lease is live", "running": running}));
             continue;
@@ -861,4 +917,34 @@ fn fence(db: &Connection, id: &str, timeout: u64) -> Result<serde_json::Value, E
         "left_running_or_absent": left,
         "scope": "this host only; a host that never runs this operation is not fenced by it",
     }))
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::*;
+
+    #[test]
+    fn running_names_come_from_one_listing() {
+        let list: Vec<serde_json::Value> = serde_json::from_str(r#"[
+            {"Names":["podmesh-a"],"State":"running"},
+            {"Names":["podmesh-b"],"State":"exited"},
+            {"Names":["podmesh-c"],"State":"stopping"},
+            {"Names":["other"],"State":"running"},
+            {"Names":["podmesh-d"],"State":"paused"}
+        ]"#).unwrap();
+        let names = running_universe_names(&list);
+        assert!(names.contains("podmesh-a") && names.contains("podmesh-c"));
+        assert!(!names.contains("podmesh-b") && !names.contains("other") && !names.contains("podmesh-d"));
+    }
+
+    #[test]
+    fn active_publishers_come_from_one_unit_listing() {
+        let listing = "podmesh-publisher-91eeb6bf.service loaded active running cloudflared\n\
+                       podmesh-publisher-aaaa.service loaded inactive dead x\n\
+                       podmesh-publisher-bbbb.service loaded activating start y\n\
+                       other.service loaded active running z\n";
+        let active = active_publisher_resources(listing);
+        assert!(active.contains("91eeb6bf") && active.contains("bbbb"));
+        assert!(!active.contains("aaaa") && active.len() == 2);
+    }
 }
