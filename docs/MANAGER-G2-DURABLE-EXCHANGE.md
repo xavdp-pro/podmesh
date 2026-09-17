@@ -81,7 +81,7 @@ unreachable peer remains unknown rather than stopped.
 | G2-I08 | Byte counts are actual framed bytes transferred in that phase, including the four-byte length prefix; request and reply announced sizes are recorded separately. |
 | G2-I09 | Audit data contains no pair key, configuration bytes or unbounded attacker-supplied detail. |
 | G2-I10 | Canonical inspection captures stable database, WAL and SHM bytes, opens only the private copy read-only, and never initializes, migrates, checkpoints or repairs the canonical store. |
-| G2-I11 | Corrupt facts, receipts or audit rows fail closed before replay, mutation or a successful inspection result. |
+| G2-I11 | Corrupt facts, receipts or audit rows fail closed before replay, mutation or a successful inspection result. *Amended 2026-09-17 (lot V2-R):* a row appended since the last verification, a replayed receipt or audit row, and the rows of the attempt an audit row extends fail closed before that replay, mutation or reply; every row fails closed at a process's first open, at each periodic complete verification and before a successful inspection result; a failure closes the store for the rest of the process. See [MANAGER-PRE-REPLY-VERIFICATION.md](MANAGER-PRE-REPLY-VERIFICATION.md). |
 | G2-I12 | Retrying an identical operation reuses its mutation result but records a distinct transport attempt. |
 | G2-I13 | Reusing an operation ID for different request content refuses without partial durable state. |
 | G2-I14 | Audit or receipt failure prevents a success claim even when the remote outcome is uncertain. |
@@ -151,9 +151,18 @@ Allowed outcomes are:
 Rows are protected by no-update and no-delete triggers. Their checksum uses a
 domain-separated canonical JSON tuple. Every store operation verifies all fact,
 receipt and audit checksums before returning data or committing another mutation.
+*Amended 2026-09-17 (lot V2-R):* every store operation verifies the schema shape,
+the last verified row of each table, every row appended since, and any stored
+receipt or audit row it replays or extends, before returning data or committing
+another mutation; every fact, receipt and audit row is verified at a process's
+first open of the store and by a periodic complete verification. An in-place edit
+of an older row that no operation reads is detected at the next complete
+verification, and any verification failure closes the store for the rest of the
+process. See [MANAGER-PRE-REPLY-VERIFICATION.md](MANAGER-PRE-REPLY-VERIFICATION.md).
 Accepted inbound-import audit rows must reference the receipt inserted in the same
 transaction. The read-only verifier rejects a missing or mismatched reference.
-One sequence validator applies before insert, after load and while deriving typed
+One sequence validator applies before insert (to the stored rows of the
+candidate's attempt), after load and while deriving typed
 incomplete attempts. An authenticated accepted request observation has exactly one
 durable decision: `inbound_import_committed` with its authenticated-import receipt,
 or `inbound_refusal_recorded` with `authenticated_refusal` and a typed reason. The
@@ -287,7 +296,10 @@ private copy into a second private file; the fallback never opens the canonical
 source through SQLite. After one successful preflight, a process cache bound to
 device, inode, size, modification time, change time, topology and replica can
 avoid repeating unchanged source preflight work within one process. In-place
-replacement and different identities cannot reuse that entry. The later canonical
+replacement and different identities cannot reuse that entry. *Amended 2026-09-17
+(lot V2-R):* a write operation that starts from a preflighted state also records the
+state its own commit and checkpoint left; a change made by anyone else between two
+operations of the process still requires a new preflight. The later canonical
 read-write open uses SQLite `NOFOLLOW` and rechecks path metadata identity. It
 never opens a refused old or mismatched canonical store read-write. It requires an
 existing non-symlink regular database, schema v3 and the exact configured
@@ -470,7 +482,7 @@ success.
 | Reply is lost after destination commit | Destination retains import receipt and audit; source retains a prepared/incomplete attempt. Identical operation retry with a fresh nonce receives a replayed signed receipt. |
 | Source receives signed success but cannot persist terminal audit | Source reports uncertain/local storage failure, not success. |
 | Process dies after a prepared phase | Read-only inspection reports the attempt incomplete; recovery never invents a terminal outcome. |
-| Corrupt fact, receipt or audit row | Mutation, replay and successful inspection all fail closed. |
+| Corrupt fact, receipt or audit row | Mutation, replay and successful inspection all fail closed. *Amended 2026-09-17 (lot V2-R):* replay of that row and successful inspection fail closed; mutation fails closed once the row is appended since the last verification, read by the operation, or found by a first open or a periodic complete verification, and the store then stays closed for the process. |
 | Missing database during inspection | Refuse without creating any file. |
 
 ## Test inventory

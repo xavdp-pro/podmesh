@@ -1,8 +1,11 @@
 # The unbounded pre-reply verification, measured
 
-Status: **measured, not fixed.** This is the defect standing between the manager and any
-claim of long-running viability. It is not a G2 evidence problem: the G2 gate passes. It is
-a property of the candidate, and it gets worse on its own.
+Status: **shape 2 chosen and implemented on 2026-09-17 (lot V2-R, branch
+`claude/v2-manager`); not yet qualified on the laboratory.** The integrity model and its
+trade-off are in [the last section](#the-chosen-shape-2026-09-17-full-verification-leaves-the-reply-path).
+Everything before it is the original measurement of the candidate, kept as measured: the defect
+standing between the manager and any claim of long-running viability. It is not a G2 evidence
+problem: the G2 gate passes. It is a property of the candidate, and it gets worse on its own.
 
 Nothing here qualifies or disqualifies anything. It is a measurement and a reading of the
 candidate's own source.
@@ -179,3 +182,134 @@ The recommendation is the second, with the interval stated as a number the opera
 because the first is a manager that stops answering. Neither is built here: this addendum
 exists so that the lot starts from the true shape of the problem rather than from a digest
 that would have been refused by the same test as attempt one.
+
+## The chosen shape, 2026-09-17: full verification leaves the reply path
+
+**Decision.** Shape 2, taken by the operator to make the manager healthy — vital target V2: the
+replicas boot, exchange, and keep a majority when one host is lost. Measured on 2026-09-17 on every
+laboratory replica: 12,710 to 21,663 audit rows (26 to 44 MB) against 26 facts, replication links
+failing for about 23 hours, appends answering `uncertain` or `busy`, and a replica unable to boot
+because its boot fact append missed its window. Shape 1 is that manager. Shape 2 is implemented on
+branch `claude/v2-manager`; schema version 3, the wire protocol and the G2 attempt accounting are
+unchanged. It is a new candidate: a new binary digest and a requalification, as stated above.
+
+### The integrity model
+
+Each process keeps, for each database file it opens — device, inode and birth time, with replica
+and topology — the last verified row of each append-only table (`facts`, `receipts`,
+`exchange_audit_events`): its rowid and its stored checksum.
+
+| When | What is verified |
+| --- | --- |
+| A process first opens a database file | Everything, in a read transaction: schema shape, every receipt, every fact through the reducer, every audit row and every attempt sequence — the former `verify_all`. Later opens by the same process (the resident opens a store per connection, per append and per peer attempt) only check that the last verified row of each table is unchanged. |
+| Every transaction: a write, or the read transaction of `export`, `inspect` and `check_service` | The schema shape; the presence and stored checksum of the last verified row of each table, and if either changed, a complete verification inside that transaction; every row appended since, with the per-row checks of a complete verification, and the complete stored sequence of every attempt those rows belong to. The positions are read before the transaction takes its snapshot, so a verified row missing from the snapshot can only have been changed in place. |
+| An operation reads a stored row it relies on | A replayed receipt is verified before its response is returned. A replayed audit event is verified before it is compared. The stored rows of the attempt a new audit row extends are verified and checked as a sequence with it. |
+| Periodically | `Store::verify_full`: a complete verification in a read transaction, which does not block writers. The resident runs it every `full_verification_interval_ms`, 600,000 ms (10 minutes) by default, between 1 second and 1 day. |
+| `--inspect-store` | Unchanged: a complete verification of a private copy, with SQLite `integrity_check`. |
+
+**Fail closed.** Any verification failure — at a first open, of a transaction's appended rows or
+last verified rows, of a row read at use, or in a periodic pass — closes the store for the rest of
+the process. Every later open, append, import, audit record and export in that process returns the
+same error: `corrupt`, or `storage` when stored bytes could not be read once the snapshot was held.
+An error that prevents a transaction from taking its snapshot (a busy or unavailable store) is not
+a verification failure and closes nothing. A new process verifies the store completely at its first
+open, so a resident restarted on a corrupt store refuses to start. In the resident, a closed store
+answers appends with `append_observation_uncertain`, fails every exchange, and keeps status and
+shutdown available; a failed periodic pass is written to standard error.
+
+The candidate check of a new audit row reads the rows of its own attempt through the
+`UNIQUE(direction, attempt_id, phase)` index, in both directions, instead of the whole table. Every
+sequence rule is scoped to one attempt ID — the phase rules of one direction, and the rule that an
+attempt ID cannot span both directions — so over a verified store the candidate check gives the same
+result, with the same error, as the whole-table check did. The rules themselves are unchanged.
+
+### The trade-off, stated exactly
+
+An in-place edit of a row at or before the last verified row of its table, made by an actor who
+bypasses the store, and read by no later operation, is detected **at the next complete
+verification** — the periodic pass of each process that has the store open, the first open by any
+new process (a restart, the one-request executables), or `--inspect-store` — and not before the
+next transaction. In a running resident that is at most the configured interval, plus the length of
+one pass. Until then that process keeps serving: a mutation or a reply made in that window is not
+refused because of that edit. The same holds for an edit of the last verified row that keeps its
+stored checksum column unchanged.
+
+Not weakened:
+
+- a row appended by any writer — another process, or a direct SQL insert — is verified by the next
+  transaction of every process that has the store open, before that transaction reads or writes;
+- a schema change, including a dropped trigger, is refused by the next transaction;
+- a store replaced or truncated in place so that the last verified row of a table is missing or
+  carries another checksum is verified completely again by the next transaction;
+- a replayed receipt or audit event is verified before it is returned, so a checksum refusal still
+  precedes that replay (HA-14);
+- the per-attempt sequence rules are exactly as strict;
+- the G2 accounting: every attempt leaves the same prepared and terminal rows on both hosts.
+
+**Why the operator accepts it.** The SQL triggers already refuse `UPDATE` and `DELETE`: an old row
+can only change if an actor with write access to the database file drops a trigger, edits the row
+and recreates the trigger. The store's checksums detect corruption; they never authenticated such
+an actor, who can rewrite rows and checksums together (see `experiments/manager-ha/README.md`). The
+detection interval is a number the operator chooses. Against that, shape 1 measured, on the test
+below, a receiver needing 7.46 s before its first reply byte at 30,004 audit rows, against a
+sender that waits 2 s: a manager that cannot exchange at all, and whose failures add the rows that
+slow it down.
+
+### Three more costs removed
+
+- **Export under a read transaction.** `export`, `inspect` and `check_service` no longer take the
+  write lock.
+- **The preflight copy after the process's own checkpoints.** The read-only preflight copies the
+  whole database, WAL and SHM whenever the database file's size or times differ from a state the
+  process already preflighted, and every checkpoint changes them. A write operation now records the
+  state its own commit and checkpoint left, when the state before the operation was already
+  preflighted by the process; a change by anyone else between two operations still requires a new
+  preflight, and an in-place replacement is still refused. Without it, 3,000 in-process exchanges
+  made two full copies per exchange and grew from 14.6 to 56.7 ms per exchange.
+- **Unchanged snapshots are not exchanged every interval.** The resident pushes its snapshot to a
+  peer when it differs from the digest that peer last acknowledged with an authenticated receipt,
+  and otherwise every `unchanged_snapshot_refresh_ms`, 60,000 ms by default. An idle three-replica
+  manager no longer adds six audit rows per ordered pair per interval. Every exchange that does
+  happen keeps the same audit accounting.
+
+### Measured
+
+`experiments/manager-ha/tests/bounded_cost.rs` times the resident's store work on stores seeded
+with realistic attempts (inbound replayed imports, accepted and unavailable outbound attempts); the
+first open verifies every seeded row. The candidate column is the unmodified tree at `e7a536a`
+(identical in these crates to the deployed `ff77b1f`) run with the same test, 5 repetitions; V2-R
+ran 25. Medians, one workstation, stores on tmpfs so the numbers are the work that depends on the
+tables rather than the device's fsync latency.
+
+| Resident store work | candidate, 1,004 rows | candidate, 30,004 rows | V2-R, 1,004 rows | V2-R, 30,004 rows |
+| --- | ---: | ---: | ---: | ---: |
+| append: open and observe | 29.9 ms | 907 ms | 0.82 ms | 0.80 ms |
+| one audit insertion | 57.6 ms | 1,858 ms | 0.48 ms | 0.47 ms |
+| receiver before its first reply byte: open, observed, import, reply prepared | 235 ms | 7,462 ms | 2.49 ms | 2.53 ms |
+| export: open and export | 30.1 ms | 913 ms | 1.04 ms | 1.04 ms |
+| first open by a process | 5 ms | 140 ms | 40 ms | 1,064 ms |
+
+With the stores on the ext4 build volume (about 5.7 ms per fsync'd commit), V2-R at 1,004 and
+30,004 rows: append 5.09 and 6.22 ms, audit insertion 4.94 and 5.43 ms, receiver before its first
+reply byte 18.5 and 17.9 ms (slowest 139 and 125 ms), export 1.07 and 1.08 ms, first open 38 ms and
+1.05 s.
+
+`experiments/manager-network/tests/bounded_exchange.rs` runs 3,000 authenticated exchanges between
+two stores in one process, each side keeping one store open and opening it for every exchange as
+the resident does, a new fact every hundred exchanges. On tmpfs the median time per exchange is
+5.06 ms over exchanges 300–599 and 6.00 ms over the last 300, while the receiver's audit table grows
+to 12,000 rows; with a single fact it is 4.96 and 5.00 ms, so the remaining drift is the snapshot
+growing from 4 to 30 facts, not the audit table. On the ext4 build volume, where each exchange
+pays six fsync'd commits, it is 34.8 and 31.2 ms (slowest 257 ms).
+
+### What this does not settle
+
+- **The first open is still linear in the store.** A new resident verifies everything before it binds
+  its control socket: about 1.05 s at 30,004 audit rows on this workstation (about 31 µs per row), to
+  be measured on the laboratory hosts. The universe entrypoint waits 5 s for the socket before its
+  first boot-fact attempt; a store that keeps growing will cross that budget. Change-driven pushes
+  slow the growth; they do not bound the table.
+- **The table still only grows.** Retention, sealing or rotation remains a separate design.
+- **A preflight copy remains after a change by another process**, and at a process's first open.
+- **Laboratory qualification**: a soak of the three replicas on this candidate, with the incomplete
+  attempt counts, exchange latencies and restart times measured there.

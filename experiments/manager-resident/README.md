@@ -20,13 +20,23 @@ attempt; hostile admission fairness is not guaranteed.
 
 Operation IDs and nonces use OS randomness. The same observed snapshot reuses an
 operation ID, avoiding a new receipt for each unchanged poll. After restart, IDs
-are fresh. The transport exports again inside its call: an incoming import between
+are fresh. The outgoing worker records the digest of the snapshot each peer last
+acknowledged with an authenticated receipt: it exchanges again when the local snapshot
+differs, and otherwise only after the unchanged-snapshot refresh delay, so idle replicas
+add no audit rows at every interval. The acknowledgement state restarts empty, and a
+peer restored from an older store receives the local facts at the latest after that
+delay. The transport exports again inside its call: an incoming import between
 the scheduler's snapshot digest and that export can cause a transient replay
 binding refusal. A changed digest creates a fresh ID on the next attempt. The
 transaction refuses mismatches rather than making an unsafe mutation.
 
 SQLite retains the dependency's WAL/FULL, immutable history and receipt checks,
-identity binding and atomic import. A held lock file prevents two residents on the
+identity binding and atomic import. The resident's first store open verifies the whole
+store before the listener and control socket exist; a background worker repeats that
+complete verification, in a read transaction, every full-verification interval, and
+writes a failed pass to standard error. Any failed verification closes the store for the
+process: appends answer `append_observation_uncertain`, exchanges fail, status and
+shutdown stay available, and a restarted resident refuses to start on that store. A held lock file prevents two residents on the
 same configured database path. It does not fence copied databases, path aliases
 or a privileged actor. No history/receipt compaction or disk quota exists yet.
 
@@ -82,7 +92,9 @@ before opting into real networking.
 Unknown JSON fields are refused. The required configuration has `network` (the
 complete transport `ConfigurationFile`), `control_socket`,
 `observation_writer_uid`, `interval_ms`, `max_backoff_ms`, and
-`incoming_workers`. `observation_writer_uid` fails closed when absent. The
+`incoming_workers`. `observation_writer_uid` fails closed when absent. Two fields
+are optional and omitted when serialized unset: `full_verification_interval_ms`
+(default 600,000) and `unchanged_snapshot_refresh_ms` (default 60,000). The
 private socket is `0600`, so the current package-facing boundary normally makes
 UID 0 or the service account its only reachable writer. Shared group/ACL writer
 admission is deferred to Stage P; this service does not weaken the socket mode.
@@ -102,15 +114,19 @@ endpoints, commands or topology. Protect local config/DB; never commit secrets.
 | Connection retry | 2 seconds |
 | Periodic interval | 100–60,000 ms |
 | Maximum backoff | At least interval, at most 300,000 ms |
+| Complete store verification | Optional, 1,000–86,400,000 ms; default 600,000 ms |
+| Unchanged snapshot refresh | Optional, at least interval, at most 3,600,000 ms; default 60,000 ms |
 | Control request frame | 32,768 bytes within the shared 250 ms control deadline |
 | Observation value | Nonempty UTF-8, at most 4,096 bytes |
 | Control response | 32,768 bytes within the shared 250 ms control deadline |
 | Socket path | Absolute, at most 100 bytes, private parent directory |
 
-SQLite uses a five-second busy timeout. These are not hard real-time guarantees:
-serialization/verification and each append Store open scale with local history,
-so growing stores can increasingly produce busy or uncertain replies until an
-incremental design replaces the full verification path. Storage/OS can stall.
+SQLite uses a five-second busy timeout. These are not hard real-time guarantees.
+A transaction verifies only the rows appended since the previous one, so an append, an
+exchange and every store open after the first cost the same whatever the number of
+retained audit rows; they still grow with retained facts, which every snapshot carries. The first open of a
+resident, and each background verification, remain linear in the whole store. Storage/OS
+can stall.
 Oversize snapshots fail to exchange; history is never truncated into a success.
 
 ## Private control and observation
