@@ -1,9 +1,11 @@
 //! Bounded resident replication laboratory. No executable control authority.
 use fs2::FileExt;
 use podmesh_manager_ha_lab::durable::{
-    DurableError, Request, Response, Store, DEFAULT_FULL_VERIFICATION_INTERVAL,
+    DurableError, RefusalReason, Request, Response, Store, DEFAULT_FULL_VERIFICATION_INTERVAL,
 };
-use podmesh_manager_network_lab::{ConfigurationFile, ErrorSource, ServedImport};
+use podmesh_manager_network_lab::{
+    ConfigurationFile, ErrorSource, ServedDecision, ServedImport, ServedRefusal,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -186,6 +188,31 @@ pub struct PeerStatus {
     /// facts this replica holds, so its acknowledgement was forgotten and the
     /// attempt made due at once.
     pub push_backs: u64,
+    /// Pushes to this peer that it refused with a signed reason.
+    pub authenticated_refusals: u64,
+    /// The closed reason of the last of them.
+    pub last_refusal_reason: Option<RefusalReason>,
+    /// Authenticated imports from this peer that this replica refused.
+    pub refused_imports: u64,
+    /// Event identity collisions between this peer's history and this replica's.
+    pub identity_collisions: IdentityCollisions,
+}
+
+/// Facts that this replica's history and one peer's hold under one event ID with
+/// other bytes. Each side then refuses the other's imports for good, and the
+/// signed refusal names only `policy_violation`: the receiving side finds the
+/// collision in the refused snapshot, and the sending side can tell that a
+/// refusal is one only once it has found a collision in the peer's own pushes.
+#[derive(Clone, Serialize, Default)]
+pub struct IdentityCollisions {
+    /// Imports from the peer refused while its snapshot held an event ID this
+    /// replica holds with other bytes.
+    pub imports_refused: u64,
+    /// Pushes to the peer that it refused with `policy_violation` once such a
+    /// collision was found: the peer still holds the fact it refused ours for.
+    pub pushes_refused: u64,
+    /// The smallest colliding event ID of the latest such import.
+    pub event_id: Option<String>,
 }
 
 /// What caught this process up with its peers.
@@ -594,6 +621,14 @@ fn start_append_observation(
     Ok((receiver, worker))
 }
 
+/// Accounts for what this replica durably decided on an authenticated request.
+fn record_served_decision(shared: &Shared, decision: &ServedDecision) {
+    match decision {
+        ServedDecision::Imported(import) => record_served_import(shared, import),
+        ServedDecision::Refused(refusal) => record_refused_import(shared, refusal),
+    }
+}
+
 /// Accounts for an authenticated import from a peer. That peer is caught up
 /// with, and when it lacked facts this replica holds, a push to it is due at once.
 fn record_served_import(shared: &Shared, import: &ServedImport) {
@@ -615,6 +650,40 @@ fn record_served_import(shared: &Shared, import: &ServedImport) {
             state.push_back_requested = true;
             state.push_back_requests = state.push_back_requests.saturating_add(1);
         }
+    }
+}
+
+/// Counts an authenticated import from a peer that this replica refused and,
+/// when the refused snapshot held an event ID this replica holds with other
+/// bytes, the collision, named once on standard error for each new colliding
+/// event ID from that peer.
+fn record_refused_import(shared: &Shared, refusal: &ServedRefusal) {
+    let newly_named = {
+        let Ok(mut peers) = shared.peers.lock() else {
+            return;
+        };
+        let Some(state) = peers.get_mut(&refusal.source_replica_id) else {
+            return;
+        };
+        state.status.refused_imports = state.status.refused_imports.saturating_add(1);
+        if refusal.identity_collisions == 0 {
+            return;
+        }
+        let collisions = &mut state.status.identity_collisions;
+        collisions.imports_refused = collisions.imports_refused.saturating_add(1);
+        let newly_named = collisions.event_id != refusal.first_identity_collision;
+        collisions
+            .event_id
+            .clone_from(&refusal.first_identity_collision);
+        newly_named
+    };
+    if newly_named {
+        eprintln!(
+            "resident refused an import from {}: event identity collision on {} ({} of its facts held here with other bytes)",
+            refusal.source_replica_id,
+            refusal.first_identity_collision.as_deref().unwrap_or("an event"),
+            refusal.identity_collisions
+        );
     }
 }
 
@@ -746,10 +815,10 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
                         state.peak.fetch_max(count, Ordering::SeqCst);
                         workers.push(thread::spawn(move || {
                             if let Ok(mut node) = conf.network.open() {
-                                // Recorded as soon as the import is durable, before
-                                // its reply: the local snapshot has already changed.
-                                let _ = node.serve_connection_reporting(stream, |import| {
-                                    record_served_import(&state, import);
+                                // Recorded as soon as the decision is durable, before
+                                // its reply: an import has already changed the snapshot.
+                                let _ = node.serve_connection_reporting(stream, |decision| {
+                                    record_served_decision(&state, decision);
                                 });
                             }
                             state.active.fetch_sub(1, Ordering::SeqCst);
@@ -1134,6 +1203,17 @@ fn synchronize(config: &Configuration, shared: &Shared) -> Result<()> {
                     // it to a fresh local count as if the failed peer were current.
                     state.status.history_count_delta = None;
                     state.status.failures = state.status.failures.saturating_add(1);
+                    if let Some(reason) = error.refusal_reason() {
+                        state.status.authenticated_refusals =
+                            state.status.authenticated_refusals.saturating_add(1);
+                        state.status.last_refusal_reason = Some(reason);
+                        let collisions = &mut state.status.identity_collisions;
+                        if reason == RefusalReason::PolicyViolation
+                            && collisions.imports_refused > 0
+                        {
+                            collisions.pushes_refused = collisions.pushes_refused.saturating_add(1);
+                        }
+                    }
                     state.status.outcome = match error.source() {
                         ErrorSource::UnauthenticatedRemoteDiagnostic => {
                             "unauthenticated_remote_diagnostic"

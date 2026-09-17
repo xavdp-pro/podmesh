@@ -101,15 +101,24 @@ Inbound order is fixed:
 6. append exact full, partial, or zero-write terminal evidence.
 
 `Node::serve_connection_reporting` serves one accepted connection like
-`serve_connection` and reports the authenticated import it committed or replayed
-to a callback: the authenticated source replica, the fact count of the snapshot it
-sent, the inserted count and local history length (those of the original commit
-for a replay), and the replay flag. The callback runs once, as soon as step 4 has
-committed or replayed the import and before step 5, so an import is reported even
-when its reply is lost; a refusal, a diagnostic or a failure before step 4 reports
-none. The resident uses it to catch up with its peers, to push its snapshot back to
-a peer that lacks facts, and to know at once that its own snapshot changed. It adds
-nothing to the wire protocol or the audit sequence.
+`serve_connection` and reports the durable decision it made on an authenticated
+request to a callback. An import reports the authenticated source replica, the fact
+count of the snapshot it sent, the inserted count and local history length (those of
+the original commit for a replay), and the replay flag. A refusal reports the source
+replica and its closed reason and, for a refused import, how many facts of the refused
+snapshot this node holds under the same event ID with other bytes, and the smallest
+such event ID: the signed refusal carries only its reason, so the collision is found
+again by comparing the snapshot with the local history. The callback runs once, as soon
+as step 4 has committed, replayed or recorded the decision and before step 5, so a
+decision is reported even when its reply is lost; a diagnostic or a failure before step
+4 reports none. The resident uses it to catch up with its peers, to push its snapshot
+back to a peer that lacks facts, to know at once that its own snapshot changed, and to
+name identity collisions. It adds nothing to the wire protocol or the audit sequence.
+
+On the sending side, `ImportResult` also returns `snapshot_facts`, the fact count of the
+snapshot actually sent, so a caller can compare it with the peer's signed history
+length, and `Error::refusal_reason` returns the closed reason of a verified signed
+refusal.
 
 A pre-authentication attempt never changes nonce and carries no authenticated
 peer, operation, receipt, or replay authority. Unsigned diagnostics cannot follow

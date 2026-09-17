@@ -2061,6 +2061,13 @@ fn status_reports_catch_up_and_what_the_health_of_a_link_needs() {
         assert_eq!(link["push_backs"], 0);
         assert!(link["last_success_age_ms"].is_u64());
         assert_eq!(link["last_attempt_age_ms"], link["last_success_age_ms"]);
+        assert_eq!(link["authenticated_refusals"], 0);
+        assert_eq!(link["last_refusal_reason"], Value::Null);
+        assert_eq!(link["refused_imports"], 0);
+        assert_eq!(
+            link["identity_collisions"],
+            json!({"imports_refused": 0, "pushes_refused": 0, "event_id": null})
+        );
     }
 
     // r1 stops answering: the next push to it fails after its last success.
@@ -2209,4 +2216,76 @@ fn a_replica_without_peers_is_caught_up_at_once() {
     assert_eq!(catch_up["caught_up_after_ms"], 0);
     assert_eq!(catch_up["peers_missing"], json!([]));
     lab.stop(0);
+}
+
+#[test]
+fn an_identity_collision_is_counted_on_both_sides_and_named_once() {
+    let mut lab = Lab::new();
+    // Refused exchanges are retried at the backoff and refreshed every second,
+    // so both sides see many refusals.
+    for config in &mut lab.configs {
+        config.unchanged_snapshot_refresh_ms = Some(1_000);
+    }
+    let logs: Vec<_> = (0..3)
+        .map(|i| lab._dir.path().join(format!("r{i}.stderr")))
+        .collect();
+    for (i, log) in logs.iter().enumerate() {
+        lab.start_with_stderr(i, Stdio::from(fs::File::create(log).unwrap()));
+    }
+    lab.append(2, "boot-1", "s2", "boot", "boot-1 value");
+    assert_converged(&lab, 1);
+    // The fork the catch-up rule prevents, made directly in the store: r2 loses
+    // its store and appends another first fact before its resident runs again.
+    lab.stop(2);
+    lab.delete_store(2);
+    lab.observe(2, "forked", None);
+    let log = fs::OpenOptions::new().append(true).open(&logs[2]).unwrap();
+    lab.start_with_stderr(2, Stdio::from(log));
+    let collisions =
+        |i: usize, peer: &str| lab.status(i)["peers"][peer]["identity_collisions"].clone();
+    until(
+        || {
+            [(0, "r2"), (1, "r2"), (2, "r0"), (2, "r1")]
+                .into_iter()
+                .all(|(i, peer)| collisions(i, peer)["imports_refused"].as_u64().unwrap() >= 2)
+                && collisions(2, "r0")["pushes_refused"].as_u64().unwrap() >= 1
+                && collisions(0, "r2")["pushes_refused"].as_u64().unwrap() >= 1
+        },
+        Duration::from_secs(20),
+    );
+    thread::sleep(Duration::from_secs(2));
+    for (i, peer) in [(0, "r2"), (1, "r2"), (2, "r0"), (2, "r1")] {
+        let link = lab.status(i)["peers"][peer].clone();
+        assert_eq!(
+            link["identity_collisions"]["event_id"],
+            "r2:00000000000000000001"
+        );
+        assert_eq!(
+            link["outcome"], "authenticated_remote_refusal",
+            "r{i} to {peer}"
+        );
+        assert_eq!(link["last_refusal_reason"], "policy_violation");
+        assert!(
+            link["refused_imports"].as_u64().unwrap()
+                >= link["identity_collisions"]["imports_refused"]
+                    .as_u64()
+                    .unwrap()
+        );
+    }
+    // One line on standard error per peer names the collision, however many
+    // refusals repeat it.
+    let named = |i: usize, peer: &str| {
+        fs::read_to_string(&logs[i])
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                line.contains(&format!("refused an import from {peer}: event identity collision on r2:00000000000000000001"))
+            })
+            .count()
+    };
+    assert_eq!(named(0, "r2"), 1);
+    assert_eq!(named(1, "r2"), 1);
+    assert_eq!(named(2, "r0"), 1);
+    assert_eq!(named(2, "r1"), 1);
+    lab.stop_all();
 }
