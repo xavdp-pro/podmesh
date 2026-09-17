@@ -14,7 +14,7 @@ use std::{
     os::unix::{fs::PermissionsExt, net::UnixStream},
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc,
     },
     thread,
@@ -94,8 +94,63 @@ impl Drop for Proxy {
     }
 }
 
+/// A loopback network of one laboratory, `127.b.c.0/24` with one fixed port: the
+/// three replicas bind `127.b.c.10`, `.11` and `.12`, the claim holds
+/// `127.b.c.1` on that port for as long as the laboratory lives, and each
+/// replica's own address stays bound here until that replica is first spawned.
+///
+/// Reserving ephemeral ports and releasing them before the residents bind them
+/// is a race: between the two, the kernel can hand the same port to anything
+/// else on the machine, and a resident then refuses to start with `Address
+/// already in use`. It is lost rarely, and more often the more laboratories run
+/// at once -- in this process, in another suite beside it, or any other program.
+/// A network nobody else holds removes the window: a bind of `127.b.c.1` that
+/// succeeds is exclusive of every other laboratory, this laboratory's own
+/// addresses are never free between its reservation and its first start, and
+/// outgoing sockets take their source address from `lo` (`127.0.0.1`), never
+/// from these.
+struct LoopbackNetwork {
+    addresses: Vec<SocketAddr>,
+    /// Held until each replica is first spawned, then dropped for it to bind.
+    reserved: Vec<Option<TcpListener>>,
+    _claim: TcpListener,
+}
+
+fn private_loopback_network() -> LoopbackNetwork {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    // Two laboratories of one process take different candidates; two processes
+    // start from different ones.
+    let seed = std::process::id()
+        .wrapping_mul(2_654_435_761)
+        .wrapping_add(NEXT.fetch_add(1, Ordering::SeqCst).wrapping_mul(7_919));
+    for attempt in 0..4_096 {
+        let candidate = seed.wrapping_add(attempt);
+        let b = u8::try_from(candidate / 251 % 251).unwrap() + 2;
+        let c = u8::try_from(candidate % 251).unwrap() + 2;
+        // Below the ephemeral range, so no outgoing connection is ever given it.
+        let port = 10_000 + u16::try_from(candidate % 10_000).unwrap();
+        let address = |last: u8| SocketAddr::from((std::net::Ipv4Addr::new(127, b, c, last), port));
+        let Ok(claim) = TcpListener::bind(address(1)) else {
+            continue;
+        };
+        // The replicas' addresses are taken here and held until they are spawned:
+        // a bind that fails leaves this network to whoever holds it.
+        let reserved: Vec<_> = (0..3).map(|i| TcpListener::bind(address(10 + i))).collect();
+        if reserved.iter().any(Result::is_err) {
+            continue;
+        }
+        return LoopbackNetwork {
+            addresses: (0..3).map(|i| address(10 + i)).collect(),
+            reserved: reserved.into_iter().map(Result::ok).collect(),
+            _claim: claim,
+        };
+    }
+    panic!("no free private loopback network for this laboratory");
+}
+
 struct Lab {
     _dir: tempfile::TempDir,
+    _network: LoopbackNetwork,
     configs: Vec<Configuration>,
     children: Vec<Option<Child>>,
 }
@@ -103,21 +158,8 @@ impl Lab {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        // Reserve the exact endpoint tuples that each child will bind, rather
-        // than selecting a port on another loopback address and reusing it.
-        let listeners: Vec<_> = (0..3)
-            .map(|i| {
-                TcpListener::bind((
-                    std::net::Ipv4Addr::new(127, 0, 0, u8::try_from(i + 10).unwrap()),
-                    0,
-                ))
-                .unwrap()
-            })
-            .collect();
-        let addresses: Vec<_> = listeners
-            .iter()
-            .map(|listener| listener.local_addr().unwrap())
-            .collect();
+        let network = private_loopback_network();
+        let addresses = network.addresses.clone();
         let manager = Manager {
             logical_manager_id: "resident-test".into(),
             replicas: (0..3)
@@ -160,9 +202,9 @@ impl Lab {
                 catch_up_window_ms: None,
             })
             .collect();
-        drop(listeners);
         Self {
             _dir: dir,
+            _network: network,
             configs,
             children: vec![None, None, None],
         }
@@ -183,33 +225,108 @@ impl Lab {
             })
             .unwrap();
     }
-    fn start(&mut self, i: usize) {
-        self.start_with_stderr(i, Stdio::inherit());
+    /// Where a replica's standard error is kept. Every start of that replica
+    /// appends to it, and a start that fails quotes its last lines: a resident
+    /// that exits says why on standard error, and nothing else does.
+    fn stderr_log(&self, i: usize) -> std::path::PathBuf {
+        self._dir.path().join(format!("r{i}.stderr"))
     }
-    fn start_with_stderr(&mut self, i: usize, stderr: Stdio) {
-        let path = self._dir.path().join(format!("r{i}.json"));
+    fn config_path(&self, i: usize) -> std::path::PathBuf {
+        self._dir.path().join(format!("r{i}.json"))
+    }
+    /// The end of a replica's standard error, for a failure message.
+    fn stderr_tail(&self, i: usize) -> String {
+        let path = self.stderr_log(i);
+        match fs::read_to_string(&path) {
+            Ok(text) if !text.trim().is_empty() => text
+                .lines()
+                .rev()
+                .take(20)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|line| format!("    | {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Ok(_) => format!("    | (nothing on standard error in {})", path.display()),
+            Err(error) => format!("    | ({}: {error})", path.display()),
+        }
+    }
+    /// What a replica was given, for a failure message: a start that fails on a
+    /// path, a socket or an address names the one it was handed.
+    fn spawn_description(&self, i: usize) -> String {
+        let config = &self.configs[i];
+        format!(
+            "config {}, store {}, control socket {} (exists: {}), bind {}, peers [{}]",
+            self.config_path(i).display(),
+            config.network.database_path.display(),
+            config.control_socket.display(),
+            config.control_socket.exists(),
+            config.network.bind,
+            config
+                .network
+                .peers
+                .iter()
+                .map(|peer| format!("{} at {}", peer.replica_id, peer.endpoint))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    }
+    /// The laboratory's own reservation of a replica's address, to hold or to
+    /// bind in place of that replica. Binding that address afresh would race
+    /// whatever else runs on this machine; this cannot. The replica must not be
+    /// started while it is held.
+    fn take_address(&mut self, i: usize) -> TcpListener {
+        self._network.reserved[i]
+            .take()
+            .unwrap_or_else(|| panic!("r{i}'s address was already released by a start"))
+    }
+    /// Releases a replica's address for a resident this laboratory does not spawn
+    /// itself.
+    fn release_address(&mut self, i: usize) {
+        drop(self._network.reserved[i].take());
+    }
+    fn start(&mut self, i: usize) {
+        // This replica's address was held from the laboratory's first moment so
+        // that nothing could take it in between; the resident binds it now.
+        self.release_address(i);
+        let path = self.config_path(i);
         fs::write(&path, serde_json::to_vec(&self.configs[i]).unwrap()).unwrap();
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.stderr_log(i))
+            .unwrap();
         self.children[i] = Some(
             Command::new(env!("CARGO_BIN_EXE_podmesh-manager-resident-lab"))
                 .env("PODMESH_MANAGER_NETWORK_MODE", "authenticated-static-peers")
                 .arg(path)
                 .stdout(Stdio::null())
-                .stderr(stderr)
+                .stderr(Stdio::from(log))
                 .spawn()
                 .unwrap(),
         );
         let (bound, allowance) = readiness_bound();
         let started = Instant::now();
         loop {
-            if let Some(exit) = self.children[i].as_mut().unwrap().try_wait().unwrap() {
-                panic!("resident r{i} exited while starting: {exit}");
+            let exited = self.children[i].as_mut().unwrap().try_wait().unwrap();
+            if let Some(exit) = exited {
+                panic!(
+                    "resident r{i} exited while starting: {exit}\n  it was given {}\n  \
+                     the end of its standard error:\n{}",
+                    self.spawn_description(i),
+                    self.stderr_tail(i)
+                );
             }
             if self.control(i, "status").is_some() {
                 break;
             }
             assert!(
                 started.elapsed() < bound + allowance,
-                "resident r{i} did not answer status within {bound:?} (load allowance {allowance:?})"
+                "resident r{i} did not answer status within {bound:?} (load allowance \
+                 {allowance:?})\n  it was given {}\n  the end of its standard error:\n{}",
+                self.spawn_description(i),
+                self.stderr_tail(i)
             );
             thread::sleep(Duration::from_millis(25));
         }
@@ -225,7 +342,10 @@ impl Lab {
             }
             assert!(
                 start.elapsed() < bound + allowance,
-                "status did not become available within {bound:?} (load allowance {allowance:?})"
+                "status of r{i} did not become available within {bound:?} (load allowance \
+                 {allowance:?})\n  {}\n  the end of its standard error:\n{}",
+                self.resident_state(i),
+                self.stderr_tail(i)
             );
             thread::sleep(Duration::from_millis(25));
         }
@@ -252,14 +372,64 @@ impl Lab {
     fn control_raw(&self, i: usize, request: &[u8]) -> Option<Value> {
         serde_json::from_slice(&self.control_bytes(i, request)?).ok()
     }
+    /// What the operating system says of a replica's process, for a failure
+    /// message: a control request without an answer means one thing while the
+    /// resident runs and another once it has exited.
+    fn resident_state(&self, i: usize) -> String {
+        let Some(child) = self.children[i].as_ref() else {
+            return format!("r{i} has no process");
+        };
+        let pid = child.id();
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                let state = stat
+                    .rsplit(") ")
+                    .next()
+                    .and_then(|rest| rest.split(' ').next())
+                    .unwrap_or("?");
+                let meaning = match state {
+                    "Z" => " (exited, not reaped)",
+                    "R" | "S" | "D" => " (running)",
+                    _ => "",
+                };
+                format!("r{i} is pid {pid} in state {state}{meaning}")
+            }
+            Err(_) => format!("r{i} is pid {pid}, gone"),
+        }
+    }
+    /// One control request that must be answered. A failure says what the socket
+    /// did, what the resident's process is doing and what it last said, rather
+    /// than unwrapping nothing.
+    #[track_caller]
+    fn control_expect(&self, i: usize, request: Value) -> Value {
+        let body = serde_json::to_vec(&request).unwrap();
+        let bytes = self.control_io(i, &body).unwrap_or_else(|error| {
+            panic!(
+                "control request {request} to r{i} was not answered: {error}\n  {}\n  \
+                 it was given {}\n  the end of its standard error:\n{}",
+                self.resident_state(i),
+                self.spawn_description(i),
+                self.stderr_tail(i)
+            )
+        });
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "r{i} answered {} to {request}, which is not a typed reply: {error}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
+    }
     fn control_bytes(&self, i: usize, request: &[u8]) -> Option<Vec<u8>> {
-        let mut s = UnixStream::connect(&self.configs[i].control_socket).ok()?;
-        s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-        s.write_all(request).ok()?;
-        s.shutdown(Shutdown::Write).ok()?;
+        self.control_io(i, request).ok()
+    }
+    fn control_io(&self, i: usize, request: &[u8]) -> std::io::Result<Vec<u8>> {
+        let mut s = UnixStream::connect(&self.configs[i].control_socket)?;
+        s.set_read_timeout(Some(Duration::from_secs(5)))?;
+        s.write_all(request)?;
+        s.shutdown(Shutdown::Write)?;
         let mut bytes = Vec::new();
-        s.read_to_end(&mut bytes).ok()?;
-        Some(bytes)
+        s.read_to_end(&mut bytes)?;
+        Ok(bytes)
     }
     fn append(
         &self,
@@ -269,6 +439,21 @@ impl Lab {
         subject: &str,
         value: &str,
     ) -> Value {
+        self.append_counting_uncertain(i, operation_id, scope, subject, value)
+            .0
+    }
+    /// Appends and says how many answers were `uncertain`: such an answer may
+    /// have committed, so the retry that follows it can be answered with the
+    /// original receipt, `replayed`. Under load that is the contract working,
+    /// not a surprise.
+    fn append_counting_uncertain(
+        &self,
+        i: usize,
+        operation_id: &str,
+        scope: &str,
+        subject: &str,
+        value: &str,
+    ) -> (Value, usize) {
         let request = json!({
             "operation": "append_observation",
             "operation_id": operation_id,
@@ -277,10 +462,11 @@ impl Lab {
             "value": value,
         });
         let start = Instant::now();
+        let mut uncertain = 0;
         loop {
-            let reply = self.control_value(i, request.clone()).unwrap();
+            let reply = self.control_expect(i, request.clone());
             if reply["response"]["result"] == "observed" {
-                return reply;
+                return (reply, uncertain);
             }
             assert!(
                 matches!(
@@ -293,6 +479,9 @@ impl Lab {
                 ),
                 "unexpected append reply: {reply}"
             );
+            if reply["error"] == "append_observation_uncertain" {
+                uncertain += 1;
+            }
             assert!(
                 start.elapsed() < Duration::from_secs(5),
                 "append remained unavailable"
@@ -318,7 +507,7 @@ impl Lab {
     }
     fn stop(&mut self, i: usize) {
         assert_eq!(
-            self.control(i, "shutdown").unwrap()["shutdown_requested"],
+            self.control_expect(i, json!({"operation": "shutdown"}))["shutdown_requested"],
             true
         );
         let mut child = self.children[i].take().unwrap();
@@ -585,16 +774,48 @@ fn wrong_key_and_oversized_frames_do_not_import() {
     assert_eq!(catch_up["peers_missing"], json!(["r0"]));
     assert_eq!(catch_up["caught_up"], false);
     assert_eq!(
-        lab.control_value(
+        lab.control_expect(
             1,
             json!({"operation":"append_observation","operation_id":"refused-peer","scope":"s1","subject":"subject","value":"value"}),
-        )
-        .unwrap()["error"],
+        )["error"],
         "append_observation_catching_up"
     );
     for i in 0..3 {
         lab.stop(i);
     }
+}
+
+/// A start that fails says what happened. The harness quotes the resident's exit
+/// status, what it was given and the end of its own standard error: a start that
+/// lost a race to its address, to its socket path or to its store is otherwise
+/// reported as "exited while starting" and nothing else.
+#[test]
+fn a_resident_that_exits_while_starting_says_why() {
+    let mut lab = Lab::new();
+    // Something else holds the address this replica is configured to bind: the
+    // laboratory's own reservation of it, which a start would otherwise release.
+    let occupied = lab.take_address(1);
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lab.start(1)));
+    std::panic::set_hook(previous);
+    let message = *failure.unwrap_err().downcast::<String>().unwrap();
+    for expected in [
+        "resident r1 exited while starting: exit status: 1",
+        "resident refused: Address already in use",
+        &format!("bind {}", lab.configs[1].network.bind),
+        "control socket",
+        "the end of its standard error",
+    ] {
+        assert!(
+            message.contains(expected),
+            "{expected:?} missing from {message}"
+        );
+    }
+    // Nothing else was broken: the replica starts once the address is free.
+    drop(occupied);
+    lab.start(1);
+    lab.stop(1);
 }
 
 #[test]
@@ -670,9 +891,7 @@ fn unknown_control_fields_are_refused_without_shutdown() {
     let mut lab = Lab::new();
     lab.start(0);
     for operation in ["status", "shutdown"] {
-        let reply = lab
-            .control_value(0, json!({"operation":operation,"unexpected":true}))
-            .unwrap();
+        let reply = lab.control_expect(0, json!({"operation":operation,"unexpected":true}));
         assert_eq!(reply["error"], "invalid typed control request");
         assert!(lab.children[0]
             .as_mut()
@@ -690,12 +909,15 @@ fn append_observation_is_uid_bound_nonexclusive_and_idempotent() {
     let mut lab = Lab::new();
     // An empty store appends only after every peer caught it up.
     lab.start_all();
-    let first = lab.append(0, "append.1:local", "s0", "subject-1", "value");
+    let (first, uncertain) =
+        lab.append_counting_uncertain(0, "append.1:local", "s0", "subject-1", "value");
     assert_eq!(first["response"]["result"], "observed");
     assert_eq!(first["response"]["fact"]["exclusive_resource"], Value::Null);
     assert_eq!(first["response"]["fact"]["active_claim"], false);
     assert_eq!(first["receipt"]["kind"], "observe");
-    assert_eq!(first["replayed"], false);
+    // A first append is answered `replayed` only when an uncertain answer, whose
+    // append had in fact committed, was retried.
+    assert_eq!(first["replayed"], uncertain > 0, "{first}");
     let replay = lab.append(0, "append.1:local", "s0", "subject-1", "value");
     assert_eq!(replay["replayed"], true);
     assert_eq!(replay["receipt"], first["receipt"]);
@@ -712,7 +934,7 @@ fn append_observation_is_uid_bound_nonexclusive_and_idempotent() {
         json!({"operation":"append_observation","operation_id":"other","scope":"s0","subject":"subject-1","value":"value","exclusive_resource":"ip:test"}),
         json!({"operation":"append_observation","operation_id":"other","scope":"s0","subject":"subject-1","value":"value","active_claim":true}),
     ] {
-        let reply = lab.control_value(0, request).unwrap();
+        let reply = lab.control_expect(0, request);
         assert!(matches!(
             reply["error"].as_str(),
             Some("append_observation_refused" | "invalid typed control request")
@@ -739,11 +961,10 @@ fn append_observation_refuses_another_uid_before_store_access_and_stays_live() {
     };
     lab.start(0);
     let reply = lab
-        .control_value(
+        .control_expect(
             0,
             json!({"operation":"append_observation","operation_id":"uid-refusal","scope":"s0","subject":"subject","value":"value"}),
-        )
-        .unwrap();
+        );
     assert_eq!(reply["error"], "append_observation_refused");
     assert_eq!(lab.count(0), 0);
     assert_eq!(lab.status(0)["kind"], "resident_observation");
@@ -812,11 +1033,10 @@ fn append_observation_disconnect_replays_after_restart() {
     let replay = lab.append(0, "disconnect-replay", "s0", "subject", "value");
     assert_eq!(replay["replayed"], true);
     let changed = lab
-        .control_value(
+        .control_expect(
             0,
             json!({"operation":"append_observation","operation_id":"disconnect-replay","scope":"s0","subject":"subject","value":"changed"}),
-        )
-        .unwrap();
+        );
     assert_eq!(changed["error"], "append_observation_refused");
     assert_eq!(lab.count(0), 1);
     lab.stop_all();
@@ -908,14 +1128,17 @@ fn append_busy_deadline_keeps_shutdown_responsive_and_retry_recovers_commit() {
         "subject":"subject",
         "value":"value",
     });
+    // The resident answers within its 250 ms control deadline; the bound here adds
+    // the load allowance, since a loaded machine can delay the client's own wake.
+    let answer_bound = Duration::from_millis(300) + readiness_bound().1;
     let started = Instant::now();
-    let reply = lab.control_value(0, request.clone()).unwrap();
+    let reply = lab.control_expect(0, request.clone());
     assert_eq!(reply["error"], "append_observation_uncertain");
-    assert!(started.elapsed() < Duration::from_millis(300));
+    assert!(started.elapsed() < answer_bound, "{:?}", started.elapsed());
     let started = Instant::now();
-    let retry = lab.control_value(0, request.clone()).unwrap();
+    let retry = lab.control_expect(0, request.clone());
     assert_eq!(retry["error"], "append_observation_busy");
-    assert!(started.elapsed() < Duration::from_millis(300));
+    assert!(started.elapsed() < answer_bound, "{:?}", started.elapsed());
     let second = json!({
         "operation":"append_observation",
         "operation_id":"busy-second-operation",
@@ -924,15 +1147,15 @@ fn append_busy_deadline_keeps_shutdown_responsive_and_retry_recovers_commit() {
         "value":"second",
     });
     assert_eq!(
-        lab.control_value(0, second.clone()).unwrap()["error"],
+        lab.control_expect(0, second.clone())["error"],
         "append_observation_busy"
     );
     let started = Instant::now();
     assert_eq!(
-        lab.control(0, "shutdown").unwrap()["shutdown_requested"],
+        lab.control_expect(0, json!({"operation": "shutdown"}))["shutdown_requested"],
         true
     );
-    assert!(started.elapsed() < Duration::from_millis(300));
+    assert!(started.elapsed() < answer_bound, "{:?}", started.elapsed());
     holder.stdin.take().unwrap().write_all(b"release").unwrap();
     assert!(holder.wait().unwrap().success());
     let mut child = lab.children[0].take().unwrap();
@@ -944,9 +1167,9 @@ fn append_busy_deadline_keeps_shutdown_responsive_and_retry_recovers_commit() {
     assert_eq!(lab.count(0), 1);
     lab.start(0);
     lab.wait_caught_up(0);
-    let replay = lab.control_value(0, request).unwrap();
+    let replay = lab.control_expect(0, request);
     assert_eq!(replay["replayed"], true);
-    let observed = lab.control_value(0, second).unwrap();
+    let observed = lab.control_expect(0, second);
     assert_eq!(observed["response"]["result"], "observed");
     assert_eq!(lab.count(0), 2);
     lab.stop_all();
@@ -955,7 +1178,13 @@ fn append_busy_deadline_keeps_shutdown_responsive_and_retry_recovers_commit() {
 #[test]
 fn status_remains_available_during_stalled_inbound_and_down_peer_attempts() {
     let mut lab = Lab::new();
-    let passive = TcpListener::bind(lab.configs[0].network.peers[0].endpoint).unwrap();
+    // r1 is never started here: this listener answers on its address, and it is
+    // the laboratory's own reservation of it.
+    assert_eq!(
+        lab.configs[0].network.peers[0].endpoint,
+        lab.configs[1].network.bind
+    );
+    let passive = lab.take_address(1);
     let (accepted_tx, accepted_rx) = std::sync::mpsc::sync_channel(1);
     let passive_worker = thread::spawn(move || {
         let (_stream, _) = passive.accept().unwrap();
@@ -1355,6 +1584,9 @@ fn package_directory_modes_validate_without_creating_state() {
 #[test]
 fn candidate_flag_mode_runs_and_shuts_down_with_explicit_network_mode() {
     let mut lab = Lab::new();
+    // The resident is spawned here rather than by the laboratory, so it releases
+    // r0's address itself.
+    lab.release_address(0);
     lab.children[0] = Some(
         candidate(&lab, &lab.configs[0])
             .env("PODMESH_MANAGER_NETWORK_MODE", "authenticated-static-peers")
@@ -1626,8 +1858,8 @@ fn periodic_full_verification_fails_the_store_closed_after_an_old_row_is_edited(
         lab.configs[i].catch_up_window_ms = Some(1_000);
         lab.observe(i, "seed", None);
     }
-    let log = lab._dir.path().join("r0.stderr");
-    lab.start_with_stderr(0, Stdio::from(fs::File::create(&log).unwrap()));
+    let log = lab.stderr_log(0);
+    lab.start(0);
     lab.start(1);
     lab.append(0, "before-edit", "s0", "subject", "value");
     lab.append(1, "before-edit", "s1", "subject", "value");
@@ -1657,16 +1889,13 @@ fn periodic_full_verification_fails_the_store_closed_after_an_old_row_is_edited(
         Duration::from_secs(10),
     );
     until(
-        || {
-            lab.control_value(0, request.clone()).unwrap()["error"]
-                == "append_observation_uncertain"
-        },
+        || lab.control_expect(0, request.clone())["error"] == "append_observation_uncertain",
         Duration::from_secs(10),
     );
     // Failed closed for the rest of the process, while status stays available.
     for _ in 0..5 {
         assert_eq!(
-            lab.control_value(0, request.clone()).unwrap()["error"],
+            lab.control_expect(0, request.clone())["error"],
             "append_observation_uncertain"
         );
         thread::sleep(Duration::from_millis(100));
@@ -1789,7 +2018,7 @@ fn append_when_caught_up(
     let mut catching_up = 0;
     let mut past_gate = false;
     loop {
-        let reply = lab.control_value(i, request.clone()).unwrap();
+        let reply = lab.control_expect(i, request.clone());
         if reply["response"]["result"] == "observed" {
             return (reply, catching_up);
         }
@@ -1894,7 +2123,7 @@ fn an_emptied_replica_imports_its_own_facts_before_it_appends_and_takes_the_next
     let refused_until = Instant::now() + Duration::from_secs(2);
     while Instant::now() < refused_until {
         assert_eq!(
-            lab.control_value(2, boot_append("boot-4")).unwrap()["error"],
+            lab.control_expect(2, boot_append("boot-4"))["error"],
             "append_observation_catching_up"
         );
         thread::sleep(Duration::from_millis(100));
@@ -1953,7 +2182,7 @@ fn assert_catching_up_for(lab: &Lab, i: usize, operation: &str, duration: Durati
     let until = Instant::now() + duration;
     while Instant::now() < until {
         assert_eq!(
-            lab.control_value(i, boot_append(operation)).unwrap()["error"],
+            lab.control_expect(i, boot_append(operation))["error"],
             "append_observation_catching_up"
         );
         thread::sleep(Duration::from_millis(200));
@@ -2348,9 +2577,9 @@ fn an_idle_replica_adds_at_most_twelve_audit_rows_per_refresh() {
 fn a_periodic_verification_that_could_not_run_is_retried_at_the_exchange_interval() {
     let mut lab = Lab::new();
     lab.configs[0].full_verification_interval_ms = Some(8_000);
-    let log = lab._dir.path().join("r0.stderr");
+    let log = lab.stderr_log(0);
     let spawned = Instant::now();
-    lab.start_with_stderr(0, Stdio::from(fs::File::create(&log).unwrap()));
+    lab.start(0);
     lab.start(1);
     lab.start(2);
     lab.append(0, "before-edit", "s0", "subject", "value");
@@ -2402,11 +2631,10 @@ fn a_periodic_verification_that_could_not_run_is_retried_at_the_exchange_interva
         .count();
     assert!(not_run >= 2, "{not_run}");
     assert_eq!(
-        lab.control_value(
+        lab.control_expect(
             0,
             json!({"operation":"append_observation","operation_id":"after-edit","scope":"s0","subject":"subject","value":"value"}),
-        )
-        .unwrap()["error"],
+        )["error"],
         "append_observation_uncertain"
     );
     println!(
@@ -2427,11 +2655,10 @@ fn a_replica_without_peers_is_caught_up_at_once() {
     config.network.peers.clear();
     lab.start(0);
     let reply = lab
-        .control_value(
+        .control_expect(
             0,
             json!({"operation":"append_observation","operation_id":"alone","scope":"s0","subject":"subject","value":"value"}),
-        )
-        .unwrap();
+        );
     assert_eq!(reply["response"]["result"], "observed", "{reply}");
     let catch_up = lab.status(0)["catch_up"].clone();
     assert_eq!(catch_up["caught_up_by"], "no_peers");
@@ -2473,8 +2700,8 @@ COMMIT;
 fn a_store_closed_by_a_storage_failure_is_reported_closed_and_not_retried() {
     let mut lab = Lab::new();
     lab.configs[0].full_verification_interval_ms = Some(1_000);
-    let log = lab._dir.path().join("r0.stderr");
-    lab.start_with_stderr(0, Stdio::from(fs::File::create(&log).unwrap()));
+    let log = lab.stderr_log(0);
+    lab.start(0);
     lab.start(1);
     lab.start(2);
     lab.append(0, "before-tamper", "s0", "subject", "value");
@@ -2494,11 +2721,10 @@ fn a_store_closed_by_a_storage_failure_is_reported_closed_and_not_retried() {
     let still_closed = lines("resident store is still closed for this process");
     assert!((2..=5).contains(&still_closed), "{still_closed}");
     assert_eq!(
-        lab.control_value(
+        lab.control_expect(
             0,
             json!({"operation":"append_observation","operation_id":"after-tamper","scope":"s0","subject":"subject","value":"value"}),
-        )
-        .unwrap()["error"],
+        )["error"],
         "append_observation_uncertain"
     );
     lab.stop_all();
@@ -2512,11 +2738,9 @@ fn an_identity_collision_is_counted_on_both_sides_and_named_once() {
     for config in &mut lab.configs {
         config.unchanged_snapshot_refresh_ms = Some(1_000);
     }
-    let logs: Vec<_> = (0..3)
-        .map(|i| lab._dir.path().join(format!("r{i}.stderr")))
-        .collect();
-    for (i, log) in logs.iter().enumerate() {
-        lab.start_with_stderr(i, Stdio::from(fs::File::create(log).unwrap()));
+    let logs: Vec<_> = (0..3).map(|i| lab.stderr_log(i)).collect();
+    for i in 0..3 {
+        lab.start(i);
     }
     lab.append(2, "boot-1", "s2", "boot", "boot-1 value");
     assert_converged(&lab, 1);
@@ -2525,8 +2749,7 @@ fn an_identity_collision_is_counted_on_both_sides_and_named_once() {
     lab.stop(2);
     lab.delete_store(2);
     lab.observe(2, "forked", None);
-    let log = fs::OpenOptions::new().append(true).open(&logs[2]).unwrap();
-    lab.start_with_stderr(2, Stdio::from(log));
+    lab.start(2);
     let collisions =
         |i: usize, peer: &str| lab.status(i)["peers"][peer]["identity_collisions"].clone();
     until(
@@ -2697,9 +2920,7 @@ fn a_receipt_that_shows_a_peer_ahead_counts_before_the_window_is_weighed() {
     while spawned.elapsed() < Duration::from_millis(4_500) {
         thread::sleep(Duration::from_millis(20));
     }
-    let reply = lab
-        .control_value(2, boot_append("boot-after-window"))
-        .unwrap();
+    let reply = lab.control_expect(2, boot_append("boot-after-window"));
     assert_eq!(reply["error"], "append_observation_catching_up", "{reply}");
     let catch_up = lab.status(2)["catch_up"].clone();
     assert_eq!(catch_up["caught_up"], false);
@@ -2807,14 +3028,20 @@ fn the_window_weighs_only_evidence_taken_after_its_end() {
 
 /// Spawns a resident without waiting for it to answer.
 fn spawn_only(lab: &mut Lab, i: usize) {
-    let path = lab._dir.path().join(format!("r{i}.json"));
+    lab.release_address(i);
+    let path = lab.config_path(i);
     fs::write(&path, serde_json::to_vec(&lab.configs[i]).unwrap()).unwrap();
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(lab.stderr_log(i))
+        .unwrap();
     lab.children[i] = Some(
         Command::new(env!("CARGO_BIN_EXE_podmesh-manager-resident-lab"))
             .env("PODMESH_MANAGER_NETWORK_MODE", "authenticated-static-peers")
             .arg(path)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(log))
             .spawn()
             .unwrap(),
     );
