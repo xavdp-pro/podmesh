@@ -28,9 +28,8 @@ ALLOWED = [
     #     them; a compatible rename at the manager image roll removes these entries.
     ('*', r'\bgovernor_mark\b', "the mark's effect kind in the network effects ledger and publisher_status's field"),
     ('src/publisher.rs', r'/run/podmesh-manager/governor\.json', "the mark's path, read by the origin in running manager images"),
-    ('tools/roll-manager-image.py', r'\bPODMESH_GOVERNOR_ALIAS\b', 'the environment variable the tool is run with'),
+    ('tools/roll-manager-image.py', r'\bPODMESH_GOVERNOR_ALIAS\b', 'the former name of the environment variable, still read'),
     ('tools/arm-publisher-follow.py', r"'governor': G,", "a key of the state the tool prints and stores (state.json, refresh.json)"),
-    ('tools/roll-manager-image.py', r"'governor': G}", 'a key of the report the tool prints'),
     ('*', r'\bcheck-manager-governor-managed\.py\b', "a suite's file name, cited by other suites and documents"),
     ('tests/check-manager-governor-managed.py', r"'disposable-lab-m-u2-governor'", "the authorization reference in the hosts' journals and the HA ledger"),
     # (b) The Shaper OS governor and maker, where PodMesh speaks about its integration with Shaper OS.
