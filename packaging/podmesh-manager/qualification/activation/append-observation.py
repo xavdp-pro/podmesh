@@ -61,7 +61,12 @@ def main():
                 "identical_request_retried": attempts > 1,
             }, sort_keys=True))
             return 0
-        if response.get("error") not in ("append_observation_busy", "append_observation_uncertain"):
+        # A resident that has not caught up with its peers yet touched nothing: retry it as busy.
+        if response.get("error") not in (
+            "append_observation_busy",
+            "append_observation_uncertain",
+            "append_observation_catching_up",
+        ):
             print("observation refused by typed local API", file=sys.stderr)
             return 1
         time.sleep(0.05)

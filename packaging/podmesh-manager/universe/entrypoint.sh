@@ -98,12 +98,23 @@ scope=$(python3 -c 'import json,sys; c=json.load(open("/etc/podmesh-manager/conf
 # restarted right after its typed stop answered `append_observation_uncertain` once, and this
 # entrypoint refused to run -- correctly, on that contract, and needlessly. The retries stop at the
 # start's budget, not at a count.
+#
+# `catching_up` is retried the same way. The resident appends nothing before it has caught up with
+# its peers -- an import from each, or a receipt showing that the peer holds nothing it lacks -- so
+# that a store which lost some of this replica's own facts gets them back before the boot fact
+# takes the next sequence number, instead of reusing one its peers hold with other bytes, which
+# they would refuse for good. It touched nothing, so the retry is safe. With every peer up this
+# takes a few exchanges; a store that already held facts of its own also appends once its catch-up
+# window has elapsed, 15 s by default after the resident starts exchanging, which fits the budget
+# when the control socket was bound within about ten seconds. A store with no fact of its own and a
+# peer that stays unreachable is refused a start at the budget, visibly, rather than forking its
+# history.
 observed=no; attempt=0
 while :; do
   attempt=$((attempt + 1))
   reply=$(control "$boot_socket" "{\"operation\":\"append_observation\",\"operation_id\":\"$opid\",\"scope\":\"$scope\",\"subject\":\"boot\",\"value\":\"boot-$boot\"}" 2>&1) || true
   if printf '%s' "$reply" | grep -q '"result":"observed"'; then observed=yes; break; fi
-  if printf '%s' "$reply" | grep -q 'append_observation_uncertain\|append_observation_busy' && [ "$(elapsed)" -lt "$budget_seconds" ]; then
+  if printf '%s' "$reply" | grep -q 'append_observation_uncertain\|append_observation_busy\|append_observation_catching_up' && [ "$(elapsed)" -lt "$budget_seconds" ]; then
     echo "manager-universe: boot fact attempt $attempt: $(printf '%s' "$reply" | tail -1 | cut -c1-80); retrying the same operation"
     sleep 0.5; continue
   fi
