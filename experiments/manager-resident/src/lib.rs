@@ -3,11 +3,11 @@ use fs2::FileExt;
 use podmesh_manager_ha_lab::durable::{
     DurableError, Request, Response, Store, DEFAULT_FULL_VERIFICATION_INTERVAL,
 };
-use podmesh_manager_network_lab::{ConfigurationFile, ErrorSource};
+use podmesh_manager_network_lab::{ConfigurationFile, ErrorSource, ServedImport};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::{Read, Write},
     net::TcpListener,
@@ -17,7 +17,7 @@ use std::{
     },
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -35,6 +35,7 @@ type AppendJob = (mpsc::Receiver<AppendCompletion>, thread::JoinHandle<()>);
 enum AppendStartError {
     Refused,
     Busy,
+    CatchingUp,
 }
 
 pub mod cli;
@@ -42,6 +43,11 @@ pub mod cli;
 /// Default delay after which a snapshot that a peer already acknowledged is
 /// pushed to that peer again although it has not changed.
 pub const DEFAULT_UNCHANGED_SNAPSHOT_REFRESH: Duration = Duration::from_secs(60);
+
+/// Default catch-up window: how long after it starts exchanging a process whose
+/// store held facts of its own origin waits for peers it has not caught up with
+/// before it appends local facts anyway.
+pub const DEFAULT_CATCH_UP_WINDOW: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -60,6 +66,10 @@ pub struct Configuration {
     /// means `DEFAULT_UNCHANGED_SNAPSHOT_REFRESH`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unchanged_snapshot_refresh_ms: Option<u64>,
+    /// Catch-up window of a store that held facts of this replica's own origin
+    /// at start; absent means `DEFAULT_CATCH_UP_WINDOW`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catch_up_window_ms: Option<u64>,
 }
 
 impl Configuration {
@@ -81,6 +91,14 @@ impl Configuration {
                 .is_some_and(|refresh| !(self.interval_ms..=3_600_000).contains(&refresh))
         {
             return Err("invalid full verification interval or unchanged snapshot refresh".into());
+        }
+        // The universe entrypoint gives a start 25 seconds, the store's first
+        // open included, so the window stays well below that budget.
+        if self
+            .catch_up_window_ms
+            .is_some_and(|window| !(1_000..=20_000).contains(&window))
+        {
+            return Err("invalid catch-up window".into());
         }
         if !self.network.database_path.is_absolute() {
             return Err("database requires a bounded absolute local path".into());
@@ -119,6 +137,13 @@ impl Configuration {
             .map_or(DEFAULT_UNCHANGED_SNAPSHOT_REFRESH, Duration::from_millis)
     }
 
+    /// Catch-up window of a store that held facts of its own origin at start.
+    #[must_use]
+    pub fn catch_up_window(&self) -> Duration {
+        self.catch_up_window_ms
+            .map_or(DEFAULT_CATCH_UP_WINDOW, Duration::from_millis)
+    }
+
     pub(crate) fn validate_inspection(&self) -> Result<()> {
         validate_control_token(&self.network.manager.logical_manager_id)?;
         for replica in &self.network.manager.replicas {
@@ -140,11 +165,50 @@ pub struct PeerStatus {
     pub authenticated_successes: u64,
     pub failures: u64,
     pub last_success_age_ms: Option<u64>,
+    /// Age of the end of the last exchange attempt with this peer, whatever its
+    /// outcome; equal to `last_success_age_ms` when that attempt succeeded.
+    pub last_attempt_age_ms: Option<u64>,
     pub acknowledged_history_len: Option<usize>,
     pub local_history_len_at_attempt: Option<usize>,
     pub history_count_delta: Option<i128>,
     pub outcome: String,
     pub next_attempt_in_ms: u64,
+    /// The peer's authenticated receipt acknowledges the local snapshot, which
+    /// has not changed since, the refresh has not elapsed and no push is due.
+    pub acknowledged_unchanged: bool,
+    /// Effective delay before an acknowledged, unchanged snapshot is pushed again.
+    pub refresh_ms: u64,
+    /// Longest delay between two attempts after failures.
+    pub max_backoff_ms: u64,
+    /// Attempts to this peer that served a push-back: an import from it lacked
+    /// facts this replica holds, so its acknowledgement was forgotten and the
+    /// attempt made due at once.
+    pub push_backs: u64,
+}
+
+/// What caught this process up with its peers.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CaughtUpBy {
+    /// The topology declares no peer.
+    NoPeers,
+    /// Every peer was imported from or matched.
+    EveryPeer,
+    /// The store held facts of this replica's own origin at start, and the
+    /// catch-up window elapsed.
+    Window,
+}
+
+#[derive(Serialize)]
+struct CatchUpStatus {
+    caught_up: bool,
+    caught_up_by: Option<CaughtUpBy>,
+    caught_up_after_ms: Option<u64>,
+    peers_imported: Vec<String>,
+    peers_matched: Vec<String>,
+    peers_missing: Vec<String>,
+    own_facts_at_start: usize,
+    window_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -153,6 +217,7 @@ struct Status {
     replica_id: String,
     canonical_inspection_available_via: &'static str,
     peers: BTreeMap<String, PeerStatus>,
+    catch_up: CatchUpStatus,
     active_incoming: usize,
     peak_incoming: usize,
     rejected_connections: usize,
@@ -162,7 +227,135 @@ struct Status {
     activation_authority: bool,
 }
 
-type PeerStates = BTreeMap<String, (PeerStatus, Option<Instant>, Instant)>;
+/// Whether this process has caught up with its peers, which it must have before
+/// its first local append. A store that lacks some facts of this replica's own
+/// origin, deleted or restored from an older copy, would otherwise append under
+/// producer sequences its peers already hold with other bytes, and both sides
+/// would then refuse every import from the other. Importing those facts back
+/// from the peers first makes the next local fact take the next sequence.
+///
+/// A peer is caught up with once this process has committed or replayed an
+/// authenticated import from it, or once that peer's authenticated receipt for
+/// a push of this process counted exactly the pushed facts, so that it held no
+/// fact this replica lacked. The state latches: it never reverts in a process.
+struct CatchUp {
+    /// When this process started exchanging.
+    started: Instant,
+    window: Duration,
+    own_facts_at_start: usize,
+    peers: BTreeSet<String>,
+    imported: BTreeSet<String>,
+    matched: BTreeSet<String>,
+    caught_up: Option<(CaughtUpBy, Instant)>,
+}
+
+impl CatchUp {
+    fn new(peers: BTreeSet<String>, own_facts_at_start: usize, window: Duration) -> Self {
+        let started = Instant::now();
+        Self {
+            caught_up: peers.is_empty().then_some((CaughtUpBy::NoPeers, started)),
+            started,
+            window,
+            own_facts_at_start,
+            peers,
+            imported: BTreeSet::new(),
+            matched: BTreeSet::new(),
+        }
+    }
+
+    fn missing(&self) -> impl Iterator<Item = &String> {
+        self.peers
+            .iter()
+            .filter(|peer| !self.imported.contains(*peer) && !self.matched.contains(*peer))
+    }
+
+    /// Whether this process may append, latching the first condition that held.
+    /// Only a store that held facts of its own origin at start may append
+    /// before every peer is caught up with, and only after the window: a store
+    /// without any never appends before every peer, so it cannot fork its own
+    /// history.
+    fn evaluate(&mut self, now: Instant) -> bool {
+        if self.caught_up.is_none() {
+            let window_end = self.started + self.window;
+            if self.own_facts_at_start > 0 && now >= window_end {
+                self.caught_up = Some((CaughtUpBy::Window, window_end));
+            } else if self.missing().next().is_none() {
+                self.caught_up = Some((CaughtUpBy::EveryPeer, now));
+            }
+        }
+        self.caught_up.is_some()
+    }
+
+    fn record_import(&mut self, peer: &str, now: Instant) {
+        if self.peers.contains(peer) {
+            self.imported.insert(peer.into());
+        }
+        self.evaluate(now);
+    }
+
+    fn record_match(&mut self, peer: &str, now: Instant) {
+        if self.peers.contains(peer) {
+            self.matched.insert(peer.into());
+        }
+        self.evaluate(now);
+    }
+
+    fn status(&mut self, now: Instant) -> CatchUpStatus {
+        self.evaluate(now);
+        CatchUpStatus {
+            caught_up: self.caught_up.is_some(),
+            caught_up_by: self.caught_up.map(|(by, _)| by),
+            caught_up_after_ms: self
+                .caught_up
+                .map(|(_, at)| millis(at.saturating_duration_since(self.started))),
+            peers_imported: self.imported.iter().cloned().collect(),
+            peers_matched: self.matched.iter().cloned().collect(),
+            peers_missing: self.missing().cloned().collect(),
+            own_facts_at_start: self.own_facts_at_start,
+            window_ms: millis(self.window),
+        }
+    }
+}
+
+/// A local snapshot digest that a peer acknowledged with an authenticated receipt.
+struct Acknowledgement {
+    digest: Vec<u8>,
+    at: Instant,
+    /// The local snapshot generation at which the digest was last found current.
+    generation: u64,
+}
+
+struct PeerState {
+    status: PeerStatus,
+    last_success: Option<Instant>,
+    last_attempt: Option<Instant>,
+    next_attempt: Instant,
+    acknowledged: Option<Acknowledgement>,
+    /// An import from this peer lacked facts this replica holds, and no attempt
+    /// to this peer has started since.
+    push_back_requested: bool,
+    /// When an attempt last served a push-back.
+    last_push_back: Option<Instant>,
+    /// Push-back requests so far. An attempt that overlapped one does not record
+    /// its acknowledgement: the peer may lack facts that attempt did not carry.
+    push_back_requests: u64,
+}
+
+impl PeerState {
+    /// When the next attempt is due: at the scheduled time, or at once after a
+    /// push-back, at most once per interval.
+    fn due(&self, now: Instant, interval: Duration) -> Instant {
+        if !self.push_back_requested {
+            return self.next_attempt;
+        }
+        let push_back = self
+            .last_push_back
+            .map_or(now, |at| (at + interval).max(now));
+        self.next_attempt.min(push_back)
+    }
+}
+
+type PeerStates = BTreeMap<String, PeerState>;
 
 struct Shared {
     stopping: AtomicBool,
@@ -172,6 +365,11 @@ struct Shared {
     peers: Mutex<PeerStates>,
     append_job_active: AtomicBool,
     append_worker_failures: AtomicUsize,
+    catch_up: Mutex<CatchUp>,
+    /// Counts the changes this process made to its local snapshot: appends and
+    /// imports that inserted facts. An acknowledgement recorded at an older
+    /// generation no longer describes the current snapshot.
+    snapshot_generation: AtomicU64,
 }
 
 struct AppendJobGuard(Arc<Shared>);
@@ -192,24 +390,45 @@ fn store(config: &Configuration) -> Result<Store> {
 
 fn status(config: &Configuration, shared: &Shared) -> Result<Status> {
     let now = Instant::now();
+    let refresh = config.unchanged_snapshot_refresh();
+    let interval = Duration::from_millis(config.interval_ms);
+    let generation = shared.snapshot_generation.load(Ordering::SeqCst);
     let peers = shared
         .peers
         .lock()
         .map_err(|_| "status lock poisoned")?
         .iter()
-        .map(|(id, (status, success, next))| {
-            let mut status = status.clone();
-            status.last_success_age_ms =
-                success.map(|at| millis(now.saturating_duration_since(at)));
-            status.next_attempt_in_ms = millis(next.saturating_duration_since(now));
+        .map(|(id, state)| {
+            let mut status = state.status.clone();
+            status.last_success_age_ms = state
+                .last_success
+                .map(|at| millis(now.saturating_duration_since(at)));
+            status.last_attempt_age_ms = state
+                .last_attempt
+                .map(|at| millis(now.saturating_duration_since(at)));
+            status.next_attempt_in_ms =
+                millis(state.due(now, interval).saturating_duration_since(now));
+            status.acknowledged_unchanged = !state.push_back_requested
+                && state.acknowledged.as_ref().is_some_and(|acknowledgement| {
+                    acknowledgement.generation == generation
+                        && now.saturating_duration_since(acknowledgement.at) < refresh
+                });
+            status.refresh_ms = millis(refresh);
+            status.max_backoff_ms = config.max_backoff_ms;
             (id.clone(), status)
         })
         .collect();
+    let catch_up = shared
+        .catch_up
+        .lock()
+        .map_err(|_| "catch-up lock poisoned")?
+        .status(now);
     Ok(Status {
         kind: "resident_observation",
         replica_id: config.network.replica_id.clone(),
         canonical_inspection_available_via: "--inspect-store",
         peers,
+        catch_up,
         active_incoming: shared.active.load(Ordering::SeqCst),
         peak_incoming: shared.peak.load(Ordering::SeqCst),
         rejected_connections: shared.rejected.load(Ordering::SeqCst),
@@ -298,6 +517,7 @@ fn authorize_append_observation(
 
 fn append_observation_store(
     config: &Configuration,
+    shared: &Shared,
     operation_id: String,
     scope: String,
     subject: String,
@@ -321,6 +541,9 @@ fn append_observation_store(
             DurableError::Corrupt(_) | DurableError::Storage(_) | DurableError::InvalidAudit(_),
         ) => return AppendCompletion::Uncertain,
     };
+    if !executed.replayed {
+        shared.snapshot_generation.fetch_add(1, Ordering::SeqCst);
+    }
     match serde_json::to_vec(&executed) {
         Ok(response) => AppendCompletion::Observed(response),
         Err(_) => AppendCompletion::Uncertain,
@@ -341,6 +564,15 @@ fn start_append_observation(
     // behind a slow SQLite transaction, so the control loop remains responsive.
     authorize_append_observation(config, stream, &operation_id, &scope, &subject, &value)
         .map_err(|_| AppendStartError::Refused)?;
+    // Until this process has caught up with its peers, an append is answered
+    // without touching the store.
+    if !shared
+        .catch_up
+        .lock()
+        .is_ok_and(|mut catch_up| catch_up.evaluate(Instant::now()))
+    {
+        return Err(AppendStartError::CatchingUp);
+    }
     if shared
         .append_job_active
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -352,11 +584,36 @@ fn start_append_observation(
     let config = config.clone();
     let state = Arc::clone(shared);
     let worker = thread::spawn(move || {
-        let _active = AppendJobGuard(state);
-        let completion = append_observation_store(&config, operation_id, scope, subject, value);
+        let _active = AppendJobGuard(Arc::clone(&state));
+        let completion =
+            append_observation_store(&config, &state, operation_id, scope, subject, value);
         let _ = sender.send(completion);
     });
     Ok((receiver, worker))
+}
+
+/// Accounts for an authenticated import from a peer. That peer is caught up
+/// with, and when it lacked facts this replica holds, a push to it is due at once.
+fn record_served_import(shared: &Shared, import: &ServedImport) {
+    if !import.replayed && import.inserted > 0 {
+        shared.snapshot_generation.fetch_add(1, Ordering::SeqCst);
+    }
+    if let Ok(mut catch_up) = shared.catch_up.lock() {
+        catch_up.record_import(&import.source_replica_id, Instant::now());
+    }
+    // After a committed import this replica holds every fact of the snapshot, so
+    // a longer history holds facts the peer lacks. A replay reports the counts of
+    // its original commit, which say nothing about what the peer lacks now.
+    if import.replayed || import.history_len <= import.snapshot_facts {
+        return;
+    }
+    if let Ok(mut peers) = shared.peers.lock() {
+        if let Some(state) = peers.get_mut(&import.source_replica_id) {
+            state.acknowledged = None;
+            state.push_back_requested = true;
+            state.push_back_requests = state.push_back_requests.saturating_add(1);
+        }
+    }
 }
 
 /// Runs until the private typed control interface requests graceful shutdown.
@@ -372,6 +629,16 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
         .open(config.network.database_path.with_extension("resident-lock"))?;
     lock.try_lock_exclusive()?;
     let _validated = config.network.open()?;
+    // How this process catches up with its peers depends on whether its store
+    // already held facts of this replica's own origin.
+    let own_facts_at_start = match store(&config)?.execute(&Request::Export {})? {
+        Response::Snapshot { snapshot } => snapshot
+            .facts
+            .iter()
+            .filter(|fact| fact.origin_replica_id == config.network.replica_id)
+            .count(),
+        _ => return Err("durable manager returned an unexpected export response".into()),
+    };
     let listener = TcpListener::bind(config.network.bind)?;
     listener.set_nonblocking(true)?;
     // Existing paths, including stale sockets after a crash, are refused.
@@ -393,18 +660,34 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
                 .map(|peer| {
                     (
                         peer.replica_id.clone(),
-                        (
-                            PeerStatus {
+                        PeerState {
+                            status: PeerStatus {
                                 outcome: "unknown".into(),
                                 ..PeerStatus::default()
                             },
-                            None,
-                            Instant::now(),
-                        ),
+                            last_success: None,
+                            last_attempt: None,
+                            next_attempt: Instant::now(),
+                            acknowledged: None,
+                            push_back_requested: false,
+                            last_push_back: None,
+                            push_back_requests: 0,
+                        },
                     )
                 })
                 .collect(),
         ),
+        catch_up: Mutex::new(CatchUp::new(
+            config
+                .network
+                .peers
+                .iter()
+                .map(|peer| peer.replica_id.clone())
+                .collect(),
+            own_facts_at_start,
+            config.catch_up_window(),
+        )),
+        snapshot_generation: AtomicU64::new(0),
     });
     let outgoing_config = config.clone();
     let outgoing_shared = Arc::clone(&shared);
@@ -456,7 +739,10 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
                         state.peak.fetch_max(count, Ordering::SeqCst);
                         workers.push(thread::spawn(move || {
                             if let Ok(mut node) = conf.network.open() {
-                                let _ = node.serve_connection(stream);
+                                if let Some(import) = node.serve_connection_reporting(stream).import
+                                {
+                                    record_served_import(&state, &import);
+                                }
                             }
                             state.active.fetch_sub(1, Ordering::SeqCst);
                         }));
@@ -529,6 +815,9 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
                                 }
                                 Err(AppendStartError::Busy) => {
                                     b"{\"error\":\"append_observation_busy\"}".to_vec()
+                                }
+                                Err(AppendStartError::CatchingUp) => {
+                                    b"{\"error\":\"append_observation_catching_up\"}".to_vec()
                                 }
                                 Err(AppendStartError::Refused) => {
                                     b"{\"error\":\"append_observation_refused\"}".to_vec()
@@ -650,36 +939,50 @@ fn record_local_failure(
     local_history_len: Option<usize>,
 ) -> Result<()> {
     let mut peers = shared.peers.lock().map_err(|_| "status lock poisoned")?;
-    let (state, _, next) = peers.get_mut(peer_id).ok_or("unknown peer")?;
-    state.local_history_len_at_attempt = local_history_len;
-    state.history_count_delta = None;
-    state.failures = state.failures.saturating_add(1);
-    state.outcome = "local_exchange_failure".into();
+    let state = peers.get_mut(peer_id).ok_or("unknown peer")?;
+    let now = Instant::now();
+    state.status.local_history_len_at_attempt = local_history_len;
+    state.status.history_count_delta = None;
+    state.status.failures = state.status.failures.saturating_add(1);
+    state.status.outcome = "local_exchange_failure".into();
+    state.last_attempt = Some(now);
     let backoff = backoffs.entry(peer_id.into()).or_insert(config.interval_ms);
     *backoff = backoff.saturating_mul(2).min(config.max_backoff_ms);
-    *next = Instant::now() + Duration::from_millis(*backoff);
+    state.next_attempt = now + Duration::from_millis(*backoff);
     Ok(())
 }
 
 fn synchronize(config: &Configuration, shared: &Shared) -> Result<()> {
     let mut backoffs = BTreeMap::new();
     let refresh = config.unchanged_snapshot_refresh();
+    let interval = Duration::from_millis(config.interval_ms);
     // Reuse one operation ID for an unchanged observed snapshot. Fresh IDs after
     // restart are safe but receipts are not compacted by this laboratory.
     let mut operations: BTreeMap<String, (Vec<u8>, String)> = BTreeMap::new();
-    // The snapshot digest each peer last acknowledged with an authenticated
-    // receipt, and when. An unchanged snapshot is not exchanged again before the
-    // refresh delay, so an idle replica adds no audit rows every interval.
-    let mut acknowledged: BTreeMap<String, (Vec<u8>, Instant)> = BTreeMap::new();
     while !shared.stopping.load(Ordering::SeqCst) {
         for peer in &config.network.peers {
             if shared.stopping.load(Ordering::SeqCst) {
                 break;
             }
-            let due = shared.peers.lock().map_err(|_| "status lock poisoned")?[&peer.replica_id].2;
-            if Instant::now() < due {
-                continue;
-            }
+            let push_back_requests = {
+                let mut peers = shared.peers.lock().map_err(|_| "status lock poisoned")?;
+                let state = peers.get_mut(&peer.replica_id).ok_or("unknown peer")?;
+                let now = Instant::now();
+                if now < state.due(now, interval) {
+                    continue;
+                }
+                // This attempt serves a requested push-back, whether or not it was
+                // due anyway: the forgotten acknowledgement makes it push.
+                if state.push_back_requested {
+                    state.push_back_requested = false;
+                    state.last_push_back = Some(now);
+                    state.status.push_backs = state.status.push_backs.saturating_add(1);
+                }
+                state.push_back_requests
+            };
+            // Read before the export, so that a change racing it leaves the
+            // acknowledgement at an older generation rather than a newer one.
+            let generation = shared.snapshot_generation.load(Ordering::SeqCst);
             // A live SQLite snapshot can transiently refuse an open while another
             // bounded operation is committing. That is a peer-attempt failure, not
             // a resident-fatal condition: leave the control service available and
@@ -694,14 +997,22 @@ fn synchronize(config: &Configuration, shared: &Shared) -> Result<()> {
                 }
             };
             let digest = Sha256::digest(serde_json::to_vec(&local)?).to_vec();
-            if acknowledged
-                .get(&peer.replica_id)
-                .is_some_and(|(peer_digest, at)| *peer_digest == digest && at.elapsed() < refresh)
             {
+                // The digest each peer last acknowledged with an authenticated
+                // receipt, and when. An unchanged snapshot is not exchanged again
+                // before the refresh delay, so an idle replica adds no audit rows
+                // every interval.
                 let mut peers = shared.peers.lock().map_err(|_| "status lock poisoned")?;
-                let (_, _, next) = peers.get_mut(&peer.replica_id).ok_or("unknown peer")?;
-                *next = Instant::now() + Duration::from_millis(config.interval_ms);
-                continue;
+                let state = peers.get_mut(&peer.replica_id).ok_or("unknown peer")?;
+                if let Some(acknowledgement) = state
+                    .acknowledged
+                    .as_mut()
+                    .filter(|known| known.digest == digest && known.at.elapsed() < refresh)
+                {
+                    acknowledgement.generation = generation;
+                    state.next_attempt = Instant::now() + interval;
+                    continue;
+                }
             }
             let operation = operations
                 .entry(peer.replica_id.clone())
@@ -723,28 +1034,44 @@ fn synchronize(config: &Configuration, shared: &Shared) -> Result<()> {
                 }
             };
             let mut peers = shared.peers.lock().map_err(|_| "status lock poisoned")?;
-            let (state, success, next) = peers.get_mut(&peer.replica_id).ok_or("unknown peer")?;
-            state.local_history_len_at_attempt = Some(local.facts.len());
+            let state = peers.get_mut(&peer.replica_id).ok_or("unknown peer")?;
+            let finished = Instant::now();
+            state.last_attempt = Some(finished);
+            state.status.local_history_len_at_attempt = Some(local.facts.len());
             let backoff = backoffs
                 .entry(peer.replica_id.clone())
                 .or_insert(config.interval_ms);
+            let mut matched = false;
             match outcome {
                 Ok(receipt) => {
-                    state.authenticated_successes = state.authenticated_successes.saturating_add(1);
-                    state.acknowledged_history_len = Some(receipt.history_len);
-                    state.history_count_delta =
+                    state.status.authenticated_successes =
+                        state.status.authenticated_successes.saturating_add(1);
+                    state.status.acknowledged_history_len = Some(receipt.history_len);
+                    state.status.history_count_delta =
                         Some(receipt.history_len as i128 - local.facts.len() as i128);
-                    state.outcome = "authenticated_import_receipt".into();
-                    *success = Some(Instant::now());
+                    state.status.outcome = "authenticated_import_receipt".into();
+                    state.last_success = Some(finished);
                     *backoff = config.interval_ms;
-                    acknowledged.insert(peer.replica_id.clone(), (digest, Instant::now()));
+                    // A push-back requested while this attempt ran leaves the
+                    // acknowledgement unrecorded, so the requested push follows.
+                    state.acknowledged = (state.push_back_requests == push_back_requests)
+                        .then_some(Acknowledgement {
+                            digest,
+                            at: finished,
+                            generation,
+                        });
+                    // A peer that imported the pushed facts and counts exactly as
+                    // many held no fact this replica lacked. The transport exports
+                    // again, and a history only grows, so a count equal to this
+                    // export's proves both exports and the peer's history equal.
+                    matched = receipt.history_len == local.facts.len();
                 }
                 Err(error) => {
                     // The last acknowledgement is historical. Do not compare
                     // it to a fresh local count as if the failed peer were current.
-                    state.history_count_delta = None;
-                    state.failures = state.failures.saturating_add(1);
-                    state.outcome = match error.source() {
+                    state.status.history_count_delta = None;
+                    state.status.failures = state.status.failures.saturating_add(1);
+                    state.status.outcome = match error.source() {
                         ErrorSource::UnauthenticatedRemoteDiagnostic => {
                             "unauthenticated_remote_diagnostic"
                         }
@@ -755,7 +1082,15 @@ fn synchronize(config: &Configuration, shared: &Shared) -> Result<()> {
                     *backoff = backoff.saturating_mul(2).min(config.max_backoff_ms);
                 }
             }
-            *next = Instant::now() + Duration::from_millis(*backoff);
+            state.next_attempt = finished + Duration::from_millis(*backoff);
+            drop(peers);
+            if matched {
+                shared
+                    .catch_up
+                    .lock()
+                    .map_err(|_| "catch-up lock poisoned")?
+                    .record_match(&peer.replica_id, finished);
+            }
         }
         thread::sleep(Duration::from_millis(10));
     }
