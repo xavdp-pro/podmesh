@@ -412,6 +412,7 @@ pub struct Store {
     configuration: Configuration,
     topology: Topology,
     replica_id: String,
+    path: PathBuf,
     integrity: Arc<StoreIntegrityEntry>,
 }
 
@@ -465,11 +466,7 @@ impl Store {
             Ok(metadata) => {
                 require_regular_nonsymlink(path)?;
                 let key = preflight_key(&metadata, &topology, replica_id)?;
-                let known = PREFLIGHTED_STORES
-                    .get_or_init(|| Mutex::new(BTreeSet::new()))
-                    .lock()
-                    .map_err(|_| DurableError::Storage("preflight cache lock poisoned".into()))?
-                    .contains(&key);
+                let known = preflighted_stores()?.contains(&key);
                 if !known {
                     preflight_existing_store(path, &topology, replica_id)?;
                 }
@@ -520,16 +517,13 @@ impl Store {
             .pragma_update(None, "synchronous", "FULL")
             .map_err(error)?;
         let metadata = fs::symlink_metadata(path).map_err(error)?;
-        PREFLIGHTED_STORES
-            .get_or_init(|| Mutex::new(BTreeSet::new()))
-            .lock()
-            .map_err(|_| DurableError::Storage("preflight cache lock poisoned".into()))?
-            .insert(preflight_key(&metadata, &topology, replica_id)?);
+        remember_preflighted(preflight_key(&metadata, &topology, replica_id)?)?;
         let mut store = Self {
             connection,
             configuration,
             topology,
             replica_id: replica_id.into(),
+            path: path.to_path_buf(),
             integrity,
         };
         if !unchanged {
@@ -622,6 +616,34 @@ impl Store {
         })
     }
 
+    /// Runs one write operation. When this process had already preflighted the
+    /// database file as it was before the operation, the file as this process's
+    /// own commit (and any checkpoint it ran) left it is preflighted too, so the
+    /// next open does not copy the whole store again. A change by anyone else
+    /// between two write operations still requires a new preflight.
+    fn guarded_write<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> DurableResult<T>,
+    ) -> DurableResult<T> {
+        let trusted = self
+            .current_preflight_key()
+            .is_some_and(|key| preflighted_stores().is_ok_and(|stores| stores.contains(&key)));
+        let result = self.guarded(operation);
+        if trusted && result.is_ok() {
+            // The operation has committed; a failure to record the file state
+            // only costs a later preflight, so it cannot turn into an error.
+            if let Some(key) = self.current_preflight_key() {
+                let _ = remember_preflighted(key);
+            }
+        }
+        result
+    }
+
+    fn current_preflight_key(&self) -> Option<PreflightKey> {
+        let metadata = fs::symlink_metadata(&self.path).ok()?;
+        preflight_key(&metadata, &self.topology, &self.replica_id).ok()
+    }
+
     /// Applies one request atomically, acknowledging mutations only after commit.
     /// Mutation operation IDs replay the original result; incompatible reuse fails.
     ///
@@ -640,13 +662,13 @@ impl Store {
     /// # Errors
     /// Rejects corrupt state, incompatible operation-ID reuse and failed commits.
     pub fn execute_with_receipt(&mut self, request: &Request) -> DurableResult<Executed> {
-        let behavior = match request {
-            Request::Observe { .. } | Request::Import { .. } => TransactionBehavior::Immediate,
-            Request::Export {} | Request::Inspect {} | Request::CheckService { .. } => {
-                TransactionBehavior::Deferred
-            }
+        let writes = matches!(request, Request::Observe { .. } | Request::Import { .. });
+        let behavior = if writes {
+            TransactionBehavior::Immediate
+        } else {
+            TransactionBehavior::Deferred
         };
-        self.guarded(|store| {
+        let operation = |store: &mut Self| {
             let transaction = begin_verified(
                 &mut store.connection,
                 &store.integrity,
@@ -664,7 +686,12 @@ impl Store {
             )?;
             transaction.commit().map_err(error)?;
             Ok(executed)
-        })
+        };
+        if writes {
+            self.guarded_write(operation)
+        } else {
+            self.guarded(operation)
+        }
     }
 
     /// Imports an authenticated peer snapshot and atomically commits its facts,
@@ -706,7 +733,7 @@ impl Store {
             operation_id: local_operation_id.clone(),
             snapshot: snapshot.clone(),
         };
-        self.guarded(|store| {
+        self.guarded_write(|store| {
             let transaction = begin_verified(
                 &mut store.connection,
                 &store.integrity,
@@ -768,7 +795,7 @@ impl Store {
                 "inbound import audit must use the atomic authenticated-import API".into(),
             ));
         }
-        self.guarded(|store| {
+        self.guarded_write(|store| {
             let transaction = begin_verified(
                 &mut store.connection,
                 &store.integrity,
@@ -1102,6 +1129,22 @@ fn initialize_or_check_identity(
         return Err(DurableError::Refused(RefusalReason::IdentityMismatch));
     }
     verify_immutable_schema(transaction)
+}
+
+fn preflighted_stores() -> DurableResult<MutexGuard<'static, BTreeSet<PreflightKey>>> {
+    lock(
+        PREFLIGHTED_STORES.get_or_init(|| Mutex::new(BTreeSet::new())),
+        "preflight cache lock",
+    )
+}
+
+/// Records a preflighted file state and forgets earlier states of the same file
+/// identity, which a file cannot return to.
+fn remember_preflighted(key: PreflightKey) -> DurableResult<()> {
+    let mut stores = preflighted_stores()?;
+    stores.retain(|known| (known.0, known.1, &known.7, &known.8) != (key.0, key.1, &key.7, &key.8));
+    stores.insert(key);
+    Ok(())
 }
 
 fn preflight_key(

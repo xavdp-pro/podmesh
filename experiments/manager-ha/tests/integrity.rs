@@ -3,8 +3,9 @@
 //! every transaction, and a store that fails closed for the rest of the process
 //! once any verification fails.
 use std::{
-    fs,
+    env, fs,
     io::Write,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
@@ -442,4 +443,82 @@ fn copy_store(lab: &Lab) -> PathBuf {
         .unwrap();
     assert!(Path::new(&copy).exists());
     copy
+}
+
+#[test]
+fn a_store_kept_open_trusts_its_own_checkpoints_but_not_changes_made_by_others() {
+    let lab = Lab::new();
+    // The child's temporary directory does not exist, so any read-only preflight
+    // copy of an existing store fails instead of silently copying the store.
+    let output = Command::new(env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "preflight_cache_worker",
+            "--nocapture",
+        ])
+        .env(
+            "TMPDIR",
+            lab.directory.path().join("missing-temporary-directory"),
+        )
+        .env("MANAGER_INTEGRITY_STORE", lab.database())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "invoked as a child process by a_store_kept_open_trusts_its_own_checkpoints_but_not_changes_made_by_others"]
+fn preflight_cache_worker() {
+    let path = PathBuf::from(env::var_os("MANAGER_INTEGRITY_STORE").unwrap());
+    let state = |path: &Path| {
+        let metadata = fs::metadata(path).unwrap();
+        (metadata.len(), metadata.mtime(), metadata.mtime_nsec())
+    };
+    // A new file needs no preflight; this store stays open like a resident's.
+    let mut store = Store::open(&path, configuration(), "r1").unwrap();
+    let before = state(&path);
+    for index in 0..600 {
+        store
+            .record_exchange_audit(&prepared(&format!("checkpoint-{index}")))
+            .unwrap();
+    }
+    assert_ne!(
+        state(&path),
+        before,
+        "no checkpoint changed the database file"
+    );
+    // The file changed only through this process's own commits and checkpoints:
+    // later opens need no private copy.
+    for index in 0..3 {
+        let mut again = Store::open(&path, configuration(), "r1").unwrap();
+        again.execute(&Request::Export {}).unwrap();
+        again
+            .execute_with_receipt(&observation(&format!("reopened-{index}"), "value"))
+            .unwrap();
+    }
+    // A checkpoint by another connection changes the file outside the Store; the
+    // next open must preflight it again, which cannot copy it here.
+    store
+        .record_exchange_audit(&prepared("pending-frames"))
+        .unwrap();
+    let trusted = state(&path);
+    Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+        .unwrap();
+    assert_ne!(
+        state(&path),
+        trusted,
+        "the external checkpoint changed nothing"
+    );
+    assert!(matches!(
+        Store::open(&path, configuration(), "r1"),
+        Err(DurableError::Storage(_))
+    ));
 }
