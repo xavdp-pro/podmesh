@@ -5,7 +5,7 @@
 use std::{
     env, fs,
     io::Write,
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -148,6 +148,66 @@ impl Lab {
     }
 }
 
+/// Another replica's store in the same laboratory, with one fact of its own
+/// origin and the receipt of that observation. Both rows verify in the first
+/// replica's store too: the fact is one an import would carry, and the receipt
+/// binds the same logical manager.
+fn other_replica_store(lab: &Lab) -> PathBuf {
+    let path = lab.directory.path().join("r2.sqlite");
+    Store::open(&path, configuration(), "r2")
+        .unwrap()
+        .execute(&Request::Observe {
+            operation_id: "other-observation".into(),
+            scope: "scope2".into(),
+            subject: "other".into(),
+            exclusive_resource: None,
+            active_claim: false,
+            value: "other value".into(),
+        })
+        .unwrap();
+    path
+}
+
+/// Copies one row of another replica's store into this one, at a rowid three
+/// beyond the last: a row that any writer could add, after a gap.
+fn insert_row_after_a_gap(lab: &Lab, table: &str) {
+    let other = other_replica_store(lab);
+    let columns = match table {
+        "facts" => "event_id, fact_json, sha256",
+        _ => RECEIPT_COLUMNS,
+    };
+    let source = Connection::open(&other).unwrap();
+    let mut statement = source
+        .prepare(&format!(
+            "SELECT {columns} FROM {table} ORDER BY rowid LIMIT 1"
+        ))
+        .unwrap();
+    let values: Vec<rusqlite::types::Value> = statement
+        .query_row([], |row| {
+            (0..columns.split(',').count())
+                .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap();
+    drop(statement);
+    drop(source);
+    let placeholders: Vec<_> = (1..=values.len()).map(|n| format!("?{n}")).collect();
+    let destination = Connection::open(lab.database()).unwrap();
+    destination
+        .execute(
+            &format!(
+                "INSERT INTO {table} (rowid, {columns}) VALUES (
+                     (SELECT max(rowid) + 3 FROM {table}), {})",
+                placeholders.join(", ")
+            ),
+            rusqlite::params_from_iter(values),
+        )
+        .unwrap();
+}
+
+const RECEIPT_COLUMNS: &str =
+    "operation_id, kind, source_replica_id, wire_operation_id, request_json, response_json, sha256";
+
 fn configuration() -> Configuration {
     Configuration {
         logical_manager_id: "manager".into(),
@@ -205,6 +265,46 @@ fn prepared(label: &str) -> ExchangeAuditEvent {
         remote_receipt_sha256: None,
         replayed: false,
     }
+}
+
+/// An accepted inbound request observation of one attempt, with its request bytes.
+fn inbound_observed(label: &str, operation: &str) -> ExchangeAuditEvent {
+    let hash = format!("{:x}", Sha256::digest(label.as_bytes()));
+    ExchangeAuditEvent {
+        audit_event_id: format!("audit-{label}-observed"),
+        attempt_id: format!("attempt:{hash}"),
+        wire_nonce: format!("nonce-{}", &hash[..16]),
+        direction: AuditDirection::Inbound,
+        phase: AuditPhase::InboundRequestObserved,
+        authenticated_peer_id: Some("r2".into()),
+        peer_claim: Some("r2".into()),
+        operation_id: Some(operation.into()),
+        request_frame_bytes: 132,
+        request_announced_body_bytes: Some(128),
+        request_sha256: Some(format!("{:064x}", 1)),
+        reply_frame_bytes: 0,
+        reply_announced_body_bytes: None,
+        reply_sha256: None,
+        outcome: AuditOutcome::Accepted,
+        error_category: None,
+        reason_code: None,
+        local_receipt_operation_id: None,
+        local_receipt_sha256: None,
+        remote_receipt_operation_id: None,
+        remote_receipt_sha256: None,
+        replayed: false,
+    }
+}
+
+/// The accepted import decision of that attempt, as the atomic API takes it.
+fn inbound_import(label: &str, operation: &str) -> ExchangeAuditEvent {
+    let mut event = inbound_observed(label, operation);
+    event.audit_event_id = format!("audit-{label}-imported");
+    event.phase = AuditPhase::InboundImportCommitted;
+    event.request_frame_bytes = 0;
+    event.request_announced_body_bytes = None;
+    event.request_sha256 = None;
+    event
 }
 
 fn edited_prepared_row_error() -> DurableError {
@@ -975,6 +1075,196 @@ fn no_transaction_commits_after_the_store_is_closed() {
     assert_eq!(lab.audit_rows(), rows);
 }
 
+/// The rowid rule covers every append-only table: a row that any writer adds
+/// after a gap is refused by the next transaction, whichever table it is in.
+#[test]
+fn rows_added_after_a_gap_are_refused_in_every_table() {
+    for table in ["facts", "receipts", "exchange_audit_events"] {
+        let lab = Lab::new();
+        let mut store = lab.open();
+        store
+            .execute_with_receipt(&observation("own", "value"))
+            .unwrap();
+        store.record_exchange_audit(&prepared("own")).unwrap();
+        store.execute(&Request::Export {}).unwrap();
+        if table == "exchange_audit_events" {
+            insert_audit_row_at(&lab, 4, &prepared("after-a-gap"));
+        } else {
+            insert_row_after_a_gap(&lab, table);
+        }
+        let expected = rowid_gap(table);
+        assert_eq!(
+            store.execute(&Request::Export {}).unwrap_err(),
+            expected,
+            "{table}"
+        );
+        assert_failed_closed(&lab, &mut store, &expected);
+    }
+}
+
+/// A row whose rowid alone moves keeps every checksum it had: only the rowid rule
+/// of a complete verification finds the gap, in every table.
+#[test]
+fn a_row_moved_to_another_rowid_is_refused_by_the_complete_verification() {
+    for table in ["facts", "receipts", "exchange_audit_events"] {
+        let lab = Lab::new();
+        let mut store = lab.open();
+        for index in 0..2 {
+            store
+                .execute_with_receipt(&observation(&format!("own-{index}"), "value"))
+                .unwrap();
+            store
+                .record_exchange_audit(&prepared(&format!("own-{index}")))
+                .unwrap();
+        }
+        store.execute(&Request::Export {}).unwrap();
+        lab.edit_row(
+            table,
+            "rowid = rowid + 5",
+            &format!("rowid = (SELECT max(rowid) FROM {table})"),
+        );
+        let expected = rowid_gap(table);
+        assert_eq!(store.verify_full().unwrap_err(), expected, "{table}");
+        assert_failed_closed(&lab, &mut store, &expected);
+    }
+}
+
+/// The complete verification of `--inspect-store` applies the rowid rule too,
+/// which SQLite's own integrity check knows nothing about.
+#[test]
+fn the_full_inspection_refuses_a_rowid_gap_that_sqlite_accepts() {
+    let lab = Lab::new();
+    {
+        let mut store = lab.open();
+        for index in 0..2 {
+            store
+                .execute_with_receipt(&observation(&format!("own-{index}"), "value"))
+                .unwrap();
+            store
+                .record_exchange_audit(&prepared(&format!("own-{index}")))
+                .unwrap();
+        }
+    }
+    for table in ["facts", "receipts", "exchange_audit_events"] {
+        assert!(inspect_read_only(&lab.database(), &configuration(), "r1").is_ok());
+        lab.edit_row(
+            table,
+            "rowid = rowid + 5",
+            &format!("rowid = (SELECT max(rowid) FROM {table})"),
+        );
+        let connection = Connection::open(lab.database()).unwrap();
+        let sqlite: String = connection
+            .pragma_query_value(None, "integrity_check", |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        assert_eq!(sqlite, "ok");
+        assert_eq!(
+            inspect_read_only(&lab.database(), &configuration(), "r1").unwrap_err(),
+            rowid_gap(table)
+        );
+        lab.edit_row(
+            table,
+            "rowid = rowid - 5",
+            &format!("rowid = (SELECT max(rowid) FROM {table})"),
+        );
+    }
+}
+
+/// The stored rows an authenticated import reads before it commits — the audit
+/// event it may replay and the rows of its attempt — are read at use: bytes that
+/// cannot be read there close the store.
+#[test]
+fn unreadable_audit_rows_met_by_an_authenticated_import_close_the_store() {
+    let lab = Lab::new();
+    let peer = other_replica_store(&lab);
+    let Response::Snapshot { snapshot } = Store::open(&peer, configuration(), "r2")
+        .unwrap()
+        .execute(&Request::Export {})
+        .unwrap()
+    else {
+        panic!("export returned another response");
+    };
+    let mut store = lab.open();
+    store
+        .record_exchange_audit(&inbound_observed("import", "peer-sync"))
+        .unwrap();
+    // A later row, so that the row this import reads is not the last verified one.
+    store.record_exchange_audit(&prepared("later")).unwrap();
+    store.execute(&Request::Export {}).unwrap();
+    lab.edit_row(
+        "exchange_audit_events",
+        "record_json=X'00'",
+        "audit_event_id='audit-import-observed'",
+    );
+
+    let error = store
+        .execute_authenticated_import(
+            "peer-sync",
+            &snapshot,
+            inbound_import("import", "peer-sync"),
+        )
+        .unwrap_err();
+    assert!(matches!(error, DurableError::Storage(_)), "{error:?}");
+    assert_failed_closed(&lab, &mut store, &error);
+}
+
+/// A database file this process closed is refused before anything reads it: no
+/// copy of it is made for a preflight. The file is unreadable here, so a copy
+/// would fail with another error.
+#[test]
+fn a_closed_database_file_is_refused_before_it_is_read() {
+    let lab = Lab::new();
+    let expected = {
+        let mut store = lab.open();
+        store.record_exchange_audit(&prepared("stored")).unwrap();
+        store.record_exchange_audit(&prepared("next")).unwrap();
+        store.execute(&Request::Export {}).unwrap();
+        lab.edit_audit_row("audit-stored");
+        let error = store.verify_full().unwrap_err();
+        assert_eq!(error, edited_prepared_row_error());
+        error
+    };
+    // No store of this process has the file open, and its state is one this
+    // process has not preflighted, so an open would copy it.
+    assert!(Command::new("touch")
+        .args(["-m", "-d", "2020-01-01"])
+        .arg(lab.database())
+        .status()
+        .unwrap()
+        .success());
+    fs::set_permissions(lab.database(), fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(
+        Store::open(&lab.database(), configuration(), "r1")
+            .err()
+            .unwrap(),
+        expected
+    );
+    fs::set_permissions(lab.database(), fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// The last verified rows an open reads are read at use: bytes that cannot be
+/// read there close the store, as they do in any other transaction.
+#[test]
+fn unreadable_last_verified_rows_met_by_an_open_close_the_store() {
+    let lab = Lab::new();
+    let mut kept = lab.open();
+    kept.record_exchange_audit(&prepared("first")).unwrap();
+    kept.record_exchange_audit(&prepared("last")).unwrap();
+    kept.execute(&Request::Export {}).unwrap();
+    lab.edit_row(
+        "exchange_audit_events",
+        "sha256=X'00'",
+        "audit_event_id='audit-last'",
+    );
+
+    let error = Store::open(&lab.database(), configuration(), "r1")
+        .err()
+        .unwrap();
+    assert!(matches!(error, DurableError::Storage(_)), "{error:?}");
+    assert_eq!(kept.integrity().unwrap().failure, Some(error.clone()));
+    assert_failed_closed(&lab, &mut kept, &error);
+}
+
 /// The facts-only inspection returns the facts of the full inspection, verified,
 /// without reading a receipt or an audit row.
 #[test]
@@ -1050,8 +1340,12 @@ fn copy_store(lab: &Lab) -> PathBuf {
     copy
 }
 
+/// While this process has a store open, no open of it copies its files, whatever
+/// changed them: reading them around SQLite would release the locks of the
+/// connections this process holds on them. The child runs with a temporary
+/// directory that does not exist, so any copy fails.
 #[test]
-fn a_store_kept_open_trusts_its_own_checkpoints_but_not_changes_made_by_others() {
+fn a_store_this_process_has_open_is_never_copied_again() {
     let lab = Lab::new();
     // The child's temporary directory does not exist, so any read-only preflight
     // copy of an existing store fails instead of silently copying the store.
@@ -1078,7 +1372,7 @@ fn a_store_kept_open_trusts_its_own_checkpoints_but_not_changes_made_by_others()
 }
 
 #[test]
-#[ignore = "invoked as a child process by a_store_kept_open_trusts_its_own_checkpoints_but_not_changes_made_by_others"]
+#[ignore = "invoked as a child process by a_store_this_process_has_open_is_never_copied_again"]
 fn preflight_cache_worker() {
     let path = PathBuf::from(env::var_os("MANAGER_INTEGRITY_STORE").unwrap());
     let state = |path: &Path| {
@@ -1098,8 +1392,8 @@ fn preflight_cache_worker() {
         before,
         "no checkpoint changed the database file"
     );
-    // The file changed only through this process's own commits and checkpoints:
-    // later opens need no private copy.
+    // The file changed through this process's own commits and checkpoints: later
+    // opens copy nothing.
     for index in 0..3 {
         let mut again = Store::open(&path, configuration(), "r1").unwrap();
         again.execute(&Request::Export {}).unwrap();
@@ -1107,8 +1401,8 @@ fn preflight_cache_worker() {
             .execute_with_receipt(&observation(&format!("reopened-{index}"), "value"))
             .unwrap();
     }
-    // A checkpoint by another connection changes the file outside the Store; the
-    // next open must preflight it again, which cannot copy it here.
+    // A checkpoint by another connection changes the file outside the Store; while
+    // this process has the store open, its next open copies nothing either.
     store
         .record_exchange_audit(&prepared("pending-frames"))
         .unwrap();
@@ -1122,8 +1416,61 @@ fn preflight_cache_worker() {
         trusted,
         "the external checkpoint changed nothing"
     );
+    let mut again = Store::open(&path, configuration(), "r1").unwrap();
+    again.execute(&Request::Export {}).unwrap();
+
+    // An inspection of a store this process has open reads it through SQLite,
+    // in one read transaction, rather than copying it.
+    let inspected = inspect_read_only(&path, &configuration(), "r1").unwrap();
+    assert_eq!(inspected.history_count, 3);
+    assert_eq!(
+        inspect_facts_read_only(&path, &configuration(), "r1")
+            .unwrap()
+            .ordered_facts,
+        inspected.ordered_facts
+    );
+
+    // Once no store of this process has the file open, its files are copied again,
+    // which cannot copy them here.
+    drop(again);
+    drop(store);
     assert!(matches!(
         Store::open(&path, configuration(), "r1"),
         Err(DurableError::Storage(_))
     ));
+    assert!(matches!(
+        inspect_read_only(&path, &configuration(), "r1"),
+        Err(DurableError::Storage(_))
+    ));
+}
+
+/// Another database file at the path of a store this process has open is refused,
+/// and nothing of this process reads or opens it: its sidecars may be those of the
+/// file that is open.
+#[test]
+fn another_file_at_the_path_of_an_open_store_is_refused_untouched() {
+    let lab = Lab::new();
+    let mut kept = lab.open();
+    kept.record_exchange_audit(&prepared("one")).unwrap();
+    let copy = copy_store(&lab);
+    let copy_bytes = fs::read(&copy).unwrap();
+    fs::rename(&copy, lab.database()).unwrap();
+
+    let expected = DurableError::Storage(
+        "manager store path no longer names the database file this process has open".into(),
+    );
+    assert_eq!(
+        Store::open(&lab.database(), configuration(), "r1")
+            .err()
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        inspect_read_only(&lab.database(), &configuration(), "r1").unwrap_err(),
+        expected
+    );
+    assert_eq!(fs::read(lab.database()).unwrap(), copy_bytes);
+    // The store this process has open keeps serving from the file it opened.
+    kept.record_exchange_audit(&prepared("two")).unwrap();
+    assert!(kept.integrity().unwrap().failure.is_none());
 }

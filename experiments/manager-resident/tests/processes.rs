@@ -1671,7 +1671,16 @@ fn periodic_full_verification_fails_the_store_closed_after_an_old_row_is_edited(
         );
         thread::sleep(Duration::from_millis(100));
     }
-    assert_eq!(lab.status(0)["kind"], "resident_observation");
+    // The status carries the closed state and its reason: what fails closed with
+    // the store, the administration app's origin first, reads it there.
+    let status = lab.status(0);
+    assert_eq!(status["kind"], "resident_observation");
+    assert_eq!(status["store_closed"], true);
+    let reason = status["store_closed_reason"].as_str().unwrap();
+    assert!(reason.starts_with("corrupt: "), "{reason}");
+    // r1 serves the same edit without meeting it: its store is not closed.
+    assert_eq!(lab.status(1)["store_closed"], false);
+    assert_eq!(lab.status(1)["store_closed_reason"], Value::Null);
     let c = &lab.configs[0].network;
     assert!(matches!(
         inspect_read_only(&c.database_path, &c.manager, &c.replica_id),
@@ -2486,6 +2495,12 @@ fn a_store_closed_by_a_storage_failure_is_reported_closed_and_not_retried() {
         Duration::from_secs(10),
     );
     assert_eq!(lines("the store is closed for this process"), 1);
+    // The store logs its closure where it records it, naming the file.
+    let closure = format!(
+        "manager store {} is closed for this process: storage",
+        lab.configs[0].network.database_path.display()
+    );
+    assert_eq!(lines(&closure), 1);
     let not_run = lines("resident store verification could not run");
     thread::sleep(Duration::from_millis(3_500));
     // Later passes keep the one-second interval and say the store is still
@@ -2501,6 +2516,10 @@ fn a_store_closed_by_a_storage_failure_is_reported_closed_and_not_retried() {
         .unwrap()["error"],
         "append_observation_uncertain"
     );
+    let status = lab.status(0);
+    assert_eq!(status["store_closed"], true);
+    let reason = status["store_closed_reason"].as_str().unwrap();
+    assert!(reason.starts_with("storage: "), "{reason}");
     lab.stop_all();
 }
 

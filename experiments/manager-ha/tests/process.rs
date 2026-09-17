@@ -2999,6 +2999,18 @@ fn canonical_read_only_inspection_preserves_live_wal_and_rejects_missing_or_mism
             .len()
             > 0
     );
+    // While this process has the store open, the inspection reads it through
+    // SQLite in one read transaction: copying its files would release this
+    // process's locks on them. It writes nothing to the database or its WAL; the
+    // WAL index (-shm), which every reader of a WAL database updates, is excluded.
+    let live_before = store_state(&path);
+    let live = inspect_read_only(&path, &configuration, "r1").unwrap();
+    assert_eq!(live.history_count, 1);
+    assert_eq!(live_before, store_state(&path));
+
+    // With no store of this process open, it reads a stable private copy and
+    // leaves the directory exactly as it was.
+    drop(store);
     let before = directory_state(lab.directory.path());
     let inspection = inspect_read_only(&path, &configuration, "r1").unwrap();
     assert_eq!(inspection.schema_version, 3);
@@ -3937,6 +3949,26 @@ fn audit_checksum(record_json: &str) -> String {
 
 fn store_configuration(lab: &Lab) -> Configuration {
     serde_json::from_slice(&fs::read(&lab.config_path).unwrap()).unwrap()
+}
+
+/// The database and its WAL, by length and content: what an inspection of a store
+/// this process has open must leave untouched. The WAL index (-shm) is excluded:
+/// every reader of a WAL database updates it.
+fn store_state(path: &Path) -> Vec<(String, u64, String)> {
+    ["", "-wal"]
+        .into_iter()
+        .filter_map(|suffix| {
+            let candidate = PathBuf::from(format!("{}{suffix}", path.display()));
+            candidate.exists().then(|| {
+                let bytes = fs::read(&candidate).unwrap();
+                (
+                    suffix.into(),
+                    bytes.len() as u64,
+                    format!("{:x}", Sha256::digest(&bytes)),
+                )
+            })
+        })
+        .collect()
 }
 
 fn directory_state(path: &Path) -> Vec<(String, u64, String, u64)> {

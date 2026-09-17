@@ -3,7 +3,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import request from 'supertest'
 import { createApp, administrators } from '../server/app.mjs'
-import { factsReader, hashPassword, markReader, observer } from '../server/resident.mjs'
+import { factsReader, hashPassword, markReader, observer, storeState } from '../server/resident.mjs'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
@@ -12,7 +12,7 @@ import fs from 'node:fs'
 const identity = { logical_manager_id: 'logical', replica_id: 'replica-one' }
 const SCOPE = 'm-u2/lab-a/observations'
 const OTHER = 'm-u2/lab-b/observations'
-let mark, facts, appended, app
+let mark, facts, appended, app, storeClosed
 const stored = hashPassword('podmesh', Buffer.from('00112233445566778899aabbccddeeff', 'hex'))
 const fact = (subject, value, revision = 1, scope = SCOPE) => ({ scope, subject, value, subject_revision: revision })
 const cookieOf = res => (res.headers['set-cookie'] || [])[0] || ''
@@ -21,11 +21,13 @@ beforeEach(() => {
   mark = { epoch: 7, marked_at: 1 }
   facts = []
   appended = []
+  storeClosed = null
   app = createApp({
     identity, scope: SCOPE, dist: '/nonexistent',
     activeManager: () => mark,
     facts: async () => facts,
     append: async (subject, value) => { appended.push({ subject, value }); return 'observed' },
+    storeState: async () => (storeClosed ? { closed: true, reason: storeClosed } : { closed: false }),
     secret: Buffer.alloc(32, 7),
   })
 })
@@ -56,6 +58,80 @@ describe('fail-closed', () => {
     mark = null
     expect((await request(app).get('/admin/api/state').set('Cookie', cookie)).status).toBe(503)
   })
+})
+
+describe('fail-closed with the store', () => {
+  it('refuses administration with a named reason while the resident reports its store closed', async () => {
+    storeClosed = 'corrupt: stored audit is invalid'
+    for (const p of ['/admin', '/admin/', '/admin/api/state']) {
+      const res = await request(app).get(p)
+      expect(res.status, p).toBe(503)
+      expect(res.body.reason).toBe('the manager store is closed')
+      expect(res.body.detail).toBe('corrupt: stored audit is invalid')
+      expect(res.body.replica_id).toBe(identity.replica_id)
+    }
+    expect((await request(app).post('/admin/api/login').send({ login: 'admin', password: 'podmesh' })).status).toBe(503)
+  })
+  it('keeps serving what the mark published: the page and the contract JSON', async () => {
+    storeClosed = 'corrupt: stored fact hash mismatch'
+    expect((await request(app).get('/')).status).toBe(200)
+    expect((await request(app).get('/ready')).body).toEqual({ ready: true, ...identity, epoch: 7, marked_at: 1 })
+  })
+  it('closes mid-session and writes nothing while the store is closed', async () => {
+    facts = [fact('admin.user.admin', stored), fact('admin.flag.admin', 'changed')]
+    const cookie = await signIn()
+    expect((await request(app).get('/admin/api/state').set('Cookie', cookie)).body.view).toBe('admin')
+    storeClosed = 'corrupt: stored audit is invalid'
+    const res = await request(app).post('/admin/api/users').set('Cookie', cookie).send({ login: 'second', password: 'a-good-new-password' })
+    expect(res.status).toBe(503)
+    expect(res.body.reason).toBe('the manager store is closed')
+    expect(appended).toEqual([])
+  })
+  it('refuses administration when the resident does not answer, and when the origin was built without a store state', async () => {
+    const silent = createApp({
+      identity, scope: SCOPE, dist: '/nonexistent',
+      activeManager: () => mark, facts: async () => facts, append: async () => 'observed',
+      storeState: async () => { throw new Error('connect ENOENT') },
+      secret: Buffer.alloc(32, 7),
+    })
+    let res = await request(silent).get('/admin/api/state')
+    expect(res.status).toBe(503)
+    expect(res.body.reason).toBe('the manager store is closed')
+    expect(res.body.detail).toBe('the resident did not answer')
+    const unbuilt = createApp({
+      identity, scope: SCOPE, dist: '/nonexistent',
+      activeManager: () => mark, facts: async () => facts, append: async () => 'observed',
+      secret: Buffer.alloc(32, 7),
+    })
+    res = await request(unbuilt).get('/admin/api/state')
+    expect(res.status).toBe(503)
+    expect(res.body.detail).toBe('the origin was started without a store state')
+  })
+})
+
+describe("the resident's store state", () => {
+  async function control(answer) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'podmesh-state-'))
+    const sock = path.join(dir, 'control.sock')
+    const server = net.createServer(s => { s.on('data', () => {}); s.on('end', () => { if (answer === null) return; s.end(answer) }) })
+    await new Promise(r => server.listen(sock, r))
+    return { sock, close: () => server.close() }
+  }
+  it('is read from the resident status: open, closed with its reason, unreported, unanswered', async () => {
+    const open = await control(JSON.stringify({ kind: 'resident_observation', store_closed: false, store_closed_reason: null }))
+    expect(await storeState({ control: open.sock })()).toEqual({ closed: false })
+    open.close()
+    const shut = await control(JSON.stringify({ store_closed: true, store_closed_reason: 'corrupt: stored fact hash mismatch' }))
+    expect(await storeState({ control: shut.sock })()).toEqual({ closed: true, reason: 'corrupt: stored fact hash mismatch' })
+    shut.close()
+    const unreported = await control('{"error":"status_unavailable"}')
+    expect(await storeState({ control: unreported.sock })()).toEqual({ closed: true, reason: 'the resident did not report the state of its store' })
+    unreported.close()
+    const silent = await control(null)
+    expect(await storeState({ control: silent.sock, timeout: 300 })()).toEqual({ closed: true, reason: 'the resident did not answer' })
+    silent.close()
+    expect(await storeState({ control: path.join(os.tmpdir(), 'podmesh-no-such-socket'), timeout: 300 })()).toEqual({ closed: true, reason: 'the resident did not answer' })
+  }, 20000)
 })
 
 describe('no form posts', () => {
