@@ -1684,9 +1684,9 @@ fn optional_verification_and_refresh_settings_are_bounded() {
     assert!(serialized.get("catch_up_window_ms").is_none());
     for (window, valid) in [
         (Some(1_000), true),
-        (Some(20_000), true),
+        (Some(15_000), true),
         (Some(999), false),
-        (Some(20_001), false),
+        (Some(15_001), false),
     ] {
         config.catch_up_window_ms = window;
         assert_eq!(config.validate().is_ok(), valid, "{window:?}");
@@ -1885,8 +1885,21 @@ fn an_emptied_replica_imports_its_own_facts_before_it_appends_and_takes_the_next
     lab.stop_all();
 }
 
+/// Answers catching up, typed, to every append for a while.
+#[track_caller]
+fn assert_catching_up_for(lab: &Lab, i: usize, operation: &str, duration: Duration) {
+    let until = Instant::now() + duration;
+    while Instant::now() < until {
+        assert_eq!(
+            lab.control_value(i, boot_append(operation)).unwrap()["error"],
+            "append_observation_catching_up"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
 #[test]
-fn with_a_peer_down_only_a_store_that_held_its_own_facts_appends_after_the_window() {
+fn with_a_peer_down_only_a_store_whose_latest_own_fact_it_appended_appends_after_the_window() {
     let mut lab = Lab::new();
     for config in &mut lab.configs {
         config.catch_up_window_ms = Some(2_000);
@@ -1910,14 +1923,7 @@ fn with_a_peer_down_only_a_store_that_held_its_own_facts_appends_after_the_windo
     lab.delete_store(2);
     lab.start(2);
     until(|| lab.count(2) == 2, Duration::from_secs(10));
-    let refused_until = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < refused_until {
-        assert_eq!(
-            lab.control_value(2, boot_append("boot-3")).unwrap()["error"],
-            "append_observation_catching_up"
-        );
-        thread::sleep(Duration::from_millis(200));
-    }
+    assert_catching_up_for(&lab, 2, "boot-3", Duration::from_secs(3));
     let catch_up = lab.status(2)["catch_up"].clone();
     assert_eq!(catch_up["caught_up"], false);
     assert_eq!(catch_up["peers_imported"], json!(["r0"]));
@@ -1926,26 +1932,162 @@ fn with_a_peer_down_only_a_store_that_held_its_own_facts_appends_after_the_windo
     assert_eq!(catch_up["window_ms"], 2_000);
     assert_eq!(lab.count(2), 2);
 
-    // The same store now holds its own two facts: after a restart it appends
-    // once the window has elapsed, with the next sequence.
+    // Restarted, the store holds its two facts, imported rather than appended:
+    // this process too waits for r1.
+    lab.stop(2);
+    lab.start(2);
+    assert_catching_up_for(&lab, 2, "boot-3", Duration::from_secs(3));
+    let catch_up = lab.status(2)["catch_up"].clone();
+    assert_eq!(catch_up["own_facts_at_start"], 2);
+    assert_eq!(catch_up["latest_own_fact_appended_locally"], false);
+    assert_eq!(catch_up["peers_missing"], json!(["r1"]));
+
+    // r1 returns: r2 catches up with both peers and appends its next fact itself.
+    lab.start(1);
+    let (reply, _) =
+        append_when_caught_up(&lab, 2, &boot_append("boot-3"), Duration::from_secs(10));
+    assert_eq!(
+        reply["response"]["fact"]["event_id"],
+        "r2:00000000000000000003"
+    );
+    assert_converged(&lab, 3);
+
+    // With r1 down again, the store whose latest own fact it appended itself
+    // appends once the window has elapsed, having reached r0 and tried r1.
+    lab.stop(1);
     lab.stop(2);
     let spawned = Instant::now();
     lab.start(2);
     let (reply, catching_up) =
-        append_when_caught_up(&lab, 2, &boot_append("boot-3"), Duration::from_secs(10));
+        append_when_caught_up(&lab, 2, &boot_append("boot-4"), Duration::from_secs(10));
     assert!(spawned.elapsed() >= Duration::from_secs(2));
     assert!(catching_up > 0);
+    assert_eq!(
+        reply["response"]["fact"]["event_id"],
+        "r2:00000000000000000004"
+    );
+    let catch_up = lab.status(2)["catch_up"].clone();
+    assert_eq!(catch_up["caught_up_by"], "window");
+    assert!(catch_up["caught_up_after_ms"].as_u64().unwrap() >= 2_000);
+    assert_eq!(catch_up["own_facts_at_start"], 3);
+    assert_eq!(catch_up["latest_own_fact_appended_locally"], true);
+    assert_eq!(catch_up["peers_matched"], json!(["r0"]));
+    assert_eq!(catch_up["peers_missing"], json!(["r1"]));
+    assert_eq!(catch_up["peers_not_attempted"], json!([]));
+
+    // r1 comes back and nothing collides.
+    lab.start(1);
+    assert_converged(&lab, 4);
+    lab.stop_all();
+}
+
+#[test]
+fn an_emptied_store_that_imported_its_own_facts_back_waits_for_every_peer_at_its_next_start() {
+    let mut lab = Lab::new();
+    for config in &mut lab.configs {
+        config.catch_up_window_ms = Some(1_000);
+    }
+    lab.start_all();
+    lab.append(2, "boot-1", "s2", "boot", "boot-1 value");
+    assert_converged(&lab, 1);
+    // r0 goes down holding r2:1 only; r1 receives r2:2 and r2:3.
+    lab.stop(0);
+    lab.append(2, "boot-2", "s2", "boot", "boot-2 value");
+    lab.append(2, "boot-3", "s2", "boot", "boot-3 value");
+    until(|| lab.count(1) == 3, Duration::from_secs(10));
+    // r1, the only other holder of r2:2 and r2:3, goes down, and r2 loses its store.
+    lab.stop(1);
+    lab.stop(2);
+    lab.delete_store(2);
+    lab.start(0);
+    lab.start(2);
+    // The first start gets r2:1 back from r0 and refuses while r1 is down, until
+    // the universe entrypoint ends it at its budget.
+    until(|| lab.count(2) == 1, Duration::from_secs(10));
+    assert_catching_up_for(&lab, 2, "boot-after-loss", Duration::from_millis(1_500));
+    lab.stop(2);
+    // The second start holds r2:1, of its own origin but imported: it does not
+    // take r2:2, which r1 holds with other bytes, when its window elapses.
+    lab.start(2);
+    assert_catching_up_for(&lab, 2, "boot-after-loss", Duration::from_secs(3));
+    let catch_up = lab.status(2)["catch_up"].clone();
+    assert_eq!(catch_up["caught_up"], false);
+    assert_eq!(catch_up["own_facts_at_start"], 1);
+    assert_eq!(catch_up["latest_own_fact_appended_locally"], false);
+    assert_eq!(catch_up["peers_missing"], json!(["r1"]));
+    // r1 returns: r2 gets r2:2 and r2:3 back, and its next fact takes the fourth
+    // sequence; every replica converges on one history.
+    lab.start(1);
+    let (reply, _) = append_when_caught_up(
+        &lab,
+        2,
+        &boot_append("boot-after-loss"),
+        Duration::from_secs(15),
+    );
+    assert_eq!(
+        reply["response"]["fact"]["event_id"],
+        "r2:00000000000000000004"
+    );
+    assert_converged(&lab, 4);
+    lab.stop_all();
+}
+
+#[test]
+fn a_short_window_waits_until_every_peer_was_tried_and_one_caught_up() {
+    let mut lab = Lab::new();
+    lab.start_all();
+    lab.append(2, "boot-1", "s2", "boot", "boot-1 value");
+    assert_converged(&lab, 1);
+    lab.stop(2);
+    let saved: Vec<_> = lab
+        .store_files(2)
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).ok();
+            (path, bytes)
+        })
+        .collect();
+    lab.start(2);
+    lab.append(2, "boot-2", "s2", "boot", "boot-2 value");
+    assert_converged(&lab, 2);
+    // r1's resident stops, so an attempt to it lasts its 2 s connect deadline;
+    // r0, which holds r2:2, stays up.
+    lab.stop(1);
+    lab.stop(2);
+    for (path, bytes) in &saved {
+        match bytes {
+            Some(bytes) => fs::write(path, bytes).unwrap(),
+            None => {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    assert_eq!(lab.count(2), 1);
+    // r2 restarts on its older copy with a 1 s window, r1 listed first.
+    lab.configs[2].catch_up_window_ms = Some(1_000);
+    lab.configs[2].network.peers.swap(0, 1);
+    assert_eq!(lab.configs[2].network.peers[0].replica_id, "r1");
+    lab.start(2);
+    let (reply, _) = append_when_caught_up(
+        &lab,
+        2,
+        &boot_append("boot-restored"),
+        Duration::from_secs(15),
+    );
+    // It did not append at the 1 s mark: it first reached r0, which pushed r2:2
+    // back, then took the next sequence.
     assert_eq!(
         reply["response"]["fact"]["event_id"],
         "r2:00000000000000000003"
     );
     let catch_up = lab.status(2)["catch_up"].clone();
     assert_eq!(catch_up["caught_up_by"], "window");
-    assert_eq!(catch_up["caught_up_after_ms"], 2_000);
-    assert_eq!(catch_up["own_facts_at_start"], 2);
+    assert!(catch_up["caught_up_after_ms"].as_u64().unwrap() >= 2_000);
+    assert_eq!(catch_up["peers_imported"], json!(["r0"]));
     assert_eq!(catch_up["peers_missing"], json!(["r1"]));
-
-    // r1 comes back and nothing collides.
+    assert_eq!(catch_up["peers_ahead"], json!([]));
+    assert_eq!(catch_up["latest_own_fact_appended_locally"], true);
+    until(|| lab.count(0) == 3, Duration::from_secs(10));
     lab.start(1);
     assert_converged(&lab, 3);
     lab.stop_all();
@@ -2048,8 +2190,11 @@ fn status_reports_catch_up_and_what_the_health_of_a_link_needs() {
     assert_eq!(catch_up["caught_up_by"], "every_peer");
     assert!(catch_up["caught_up_after_ms"].is_u64());
     assert_eq!(catch_up["own_facts_at_start"], 0);
+    assert_eq!(catch_up["latest_own_fact_appended_locally"], false);
     assert_eq!(catch_up["window_ms"], 15_000);
     assert_eq!(catch_up["peers_missing"], json!([]));
+    assert_eq!(catch_up["peers_ahead"], json!([]));
+    assert_eq!(catch_up["peers_not_attempted"], json!([]));
     let refresh =
         u64::try_from(podmesh_manager_resident_lab::DEFAULT_UNCHANGED_SNAPSHOT_REFRESH.as_millis())
             .unwrap();
