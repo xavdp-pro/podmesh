@@ -145,6 +145,8 @@ impl Lab {
                 interval_ms: 100,
                 max_backoff_ms: 400,
                 incoming_workers: 2,
+                full_verification_interval_ms: None,
+                unchanged_snapshot_refresh_ms: None,
             })
             .collect();
         drop(listeners);
@@ -1335,4 +1337,242 @@ fn authenticated_invalid_batch_commits_no_partial_import() {
     assert_eq!(reply["mac_hex"], expected_mac);
     assert_eq!(lab.count(1), 0);
     lab.stop(1);
+}
+
+fn audit_counts(lab: &Lab, replicas: &[usize]) -> Vec<usize> {
+    replicas
+        .iter()
+        .map(|&i| {
+            let c = &lab.configs[i].network;
+            inspect_read_only(&c.database_path, &c.manager, &c.replica_id)
+                .unwrap()
+                .audit_event_count
+        })
+        .collect()
+}
+
+/// Waits until no replica's audit table changes for one second.
+fn settled_audit_counts(lab: &Lab, replicas: &[usize]) -> Vec<usize> {
+    let start = Instant::now();
+    let mut counts = audit_counts(lab, replicas);
+    let mut unchanged_since = Instant::now();
+    while unchanged_since.elapsed() < Duration::from_secs(1) {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "audit tables never settled: {counts:?}"
+        );
+        thread::sleep(Duration::from_millis(100));
+        let now = audit_counts(lab, replicas);
+        if now != counts {
+            counts = now;
+            unchanged_since = Instant::now();
+        }
+    }
+    counts
+}
+
+fn peer_successes(lab: &Lab, i: usize, peer: &str) -> u64 {
+    lab.status(i)["peers"][peer]["authenticated_successes"]
+        .as_u64()
+        .unwrap()
+}
+
+#[test]
+fn acknowledged_unchanged_snapshots_are_not_exchanged_every_interval() {
+    let mut lab = Lab::new();
+    for i in 0..3 {
+        lab.start(i);
+    }
+    lab.append(0, "idle-first", "s0", "idle", "value");
+    until(
+        || (0..3).all(|i| lab.count(i) == 1),
+        Duration::from_secs(10),
+    );
+    // Once every peer has acknowledged each replica's current snapshot, idle
+    // replicas exchange nothing: at a 100 ms interval the previous scheduler
+    // added six audit rows per ordered pair every interval.
+    let settled = settled_audit_counts(&lab, &[0, 1, 2]);
+    let successes = peer_successes(&lab, 0, "r1");
+    thread::sleep(Duration::from_millis(1_500));
+    assert_eq!(audit_counts(&lab, &[0, 1, 2]), settled);
+    assert_eq!(peer_successes(&lab, 0, "r1"), successes);
+    assert_eq!(
+        lab.status(0)["peers"]["r1"]["outcome"],
+        "authenticated_import_receipt"
+    );
+    // A changed snapshot is still pushed at the next interval.
+    lab.append(1, "idle-change", "s1", "idle", "value");
+    until(
+        || (0..3).all(|i| lab.count(i) == 2),
+        Duration::from_secs(10),
+    );
+    for i in 0..3 {
+        lab.stop(i);
+    }
+}
+
+#[test]
+fn acknowledged_unchanged_snapshot_is_refreshed_after_the_configured_delay() {
+    let mut lab = Lab::new();
+    for config in &mut lab.configs {
+        config.unchanged_snapshot_refresh_ms = Some(1_000);
+    }
+    // All peers run: a down peer's two-second connect budget would space the
+    // sequential outgoing worker's visits further apart than the refresh.
+    for i in 0..3 {
+        lab.start(i);
+    }
+    until(
+        || peer_successes(&lab, 0, "r1") > 0,
+        Duration::from_secs(10),
+    );
+    let first = peer_successes(&lab, 0, "r1");
+    thread::sleep(Duration::from_millis(3_500));
+    let later = peer_successes(&lab, 0, "r1");
+    // About one refresh per second, not one exchange per 100 ms interval.
+    assert!(
+        (first + 2..=first + 5).contains(&later),
+        "{first} then {later} authenticated exchanges"
+    );
+    for i in 0..3 {
+        lab.stop(i);
+    }
+}
+
+/// Edits the oldest audit row of a replica's store with the no-update trigger
+/// dropped, in one SQLite transaction, while its resident runs.
+fn edit_oldest_audit_row(lab: &Lab, i: usize) {
+    let script = r"
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1], timeout=5, isolation_level=None)
+connection.executescript('''
+BEGIN IMMEDIATE;
+DROP TRIGGER exchange_audit_events_no_update;
+UPDATE exchange_audit_events SET request_frame_bytes = request_frame_bytes + 1
+  WHERE rowid = (SELECT min(rowid) FROM exchange_audit_events);
+CREATE TRIGGER exchange_audit_events_no_update BEFORE UPDATE ON exchange_audit_events BEGIN SELECT RAISE(ABORT, 'immutable exchange audit event'); END;
+COMMIT;
+''')
+";
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(&lab.configs[i].network.database_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn periodic_full_verification_fails_the_store_closed_after_an_old_row_is_edited() {
+    let mut lab = Lab::new();
+    lab.configs[0].full_verification_interval_ms = Some(1_000);
+    // r1 keeps the default ten-minute interval; r2 stays down, so both keep
+    // appending failed-attempt audit rows after the edited one.
+    lab.start(0);
+    lab.start(1);
+    lab.append(0, "before-edit", "s0", "subject", "value");
+    lab.append(1, "before-edit", "s1", "subject", "value");
+    until(
+        || audit_counts(&lab, &[0, 1]).iter().all(|count| *count >= 8),
+        Duration::from_secs(10),
+    );
+    edit_oldest_audit_row(&lab, 0);
+    edit_oldest_audit_row(&lab, 1);
+    let edited = Instant::now();
+
+    let request = json!({
+        "operation": "append_observation",
+        "operation_id": "after-edit",
+        "scope": "s0",
+        "subject": "subject",
+        "value": "value",
+    });
+    until(
+        || {
+            lab.control_value(0, request.clone()).unwrap()["error"]
+                == "append_observation_uncertain"
+        },
+        Duration::from_secs(10),
+    );
+    // Failed closed for the rest of the process, while status stays available.
+    for _ in 0..5 {
+        assert_eq!(
+            lab.control_value(0, request.clone()).unwrap()["error"],
+            "append_observation_uncertain"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(lab.status(0)["kind"], "resident_observation");
+    let c = &lab.configs[0].network;
+    assert!(matches!(
+        inspect_read_only(&c.database_path, &c.manager, &c.replica_id),
+        Err(podmesh_manager_ha_lab::durable::DurableError::Corrupt(_))
+    ));
+
+    // The same edit on r1 is not read by any of its transactions, so it waits
+    // for r1's own complete verification: appends keep succeeding meanwhile.
+    thread::sleep(Duration::from_millis(1_000).saturating_sub(edited.elapsed()));
+    let reply = lab.append(1, "after-edit", "s1", "subject", "value");
+    assert_eq!(reply["response"]["result"], "observed");
+
+    // A new resident process verifies the whole store before serving it.
+    lab.stop(0);
+    let path = lab._dir.path().join("r0.json");
+    let mut restarted = Command::new(env!("CARGO_BIN_EXE_podmesh-manager-resident-lab"))
+        .env("PODMESH_MANAGER_NETWORK_MODE", "authenticated-static-peers")
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    until(
+        || restarted.try_wait().unwrap().is_some(),
+        Duration::from_secs(10),
+    );
+    let output = restarted.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("corrupt"));
+    assert!(!lab.configs[0].control_socket.exists());
+    lab.stop(1);
+}
+
+#[test]
+fn optional_verification_and_refresh_settings_are_bounded() {
+    let lab = Lab::new();
+    let mut config = lab.configs[0].clone();
+    assert_eq!(
+        config.full_verification_interval(),
+        podmesh_manager_ha_lab::durable::DEFAULT_FULL_VERIFICATION_INTERVAL
+    );
+    assert_eq!(
+        config.unchanged_snapshot_refresh(),
+        podmesh_manager_resident_lab::DEFAULT_UNCHANGED_SNAPSHOT_REFRESH
+    );
+    let serialized = serde_json::to_value(&config).unwrap();
+    assert!(serialized.get("full_verification_interval_ms").is_none());
+    assert!(serialized.get("unchanged_snapshot_refresh_ms").is_none());
+    for (full, refresh, valid) in [
+        (Some(1_000), Some(100), true),
+        (Some(86_400_000), Some(3_600_000), true),
+        (Some(999), None, false),
+        (Some(86_400_001), None, false),
+        (None, Some(99), false),
+        (None, Some(3_600_001), false),
+    ] {
+        config.full_verification_interval_ms = full;
+        config.unchanged_snapshot_refresh_ms = refresh;
+        assert_eq!(config.validate().is_ok(), valid, "{full:?} {refresh:?}");
+    }
+    config.unchanged_snapshot_refresh_ms = Some(2_500);
+    config.full_verification_interval_ms = Some(5_000);
+    assert_eq!(
+        config.unchanged_snapshot_refresh(),
+        Duration::from_millis(2_500)
+    );
+    assert_eq!(config.full_verification_interval(), Duration::from_secs(5));
 }

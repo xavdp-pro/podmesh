@@ -1,6 +1,8 @@
 //! Bounded resident replication laboratory. No executable control authority.
 use fs2::FileExt;
-use podmesh_manager_ha_lab::durable::{DurableError, Request, Response, Store};
+use podmesh_manager_ha_lab::durable::{
+    DurableError, Request, Response, Store, DEFAULT_FULL_VERIFICATION_INTERVAL,
+};
 use podmesh_manager_network_lab::{ConfigurationFile, ErrorSource};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -37,6 +39,10 @@ enum AppendStartError {
 
 pub mod cli;
 
+/// Default delay after which a snapshot that a peer already acknowledged is
+/// pushed to that peer again although it has not changed.
+pub const DEFAULT_UNCHANGED_SNAPSHOT_REFRESH: Duration = Duration::from_secs(60);
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
@@ -46,6 +52,14 @@ pub struct Configuration {
     pub interval_ms: u64,
     pub max_backoff_ms: u64,
     pub incoming_workers: usize,
+    /// Interval of the background complete store verification; absent means
+    /// `DEFAULT_FULL_VERIFICATION_INTERVAL`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_verification_interval_ms: Option<u64>,
+    /// Delay before re-pushing a snapshot the peer already acknowledged; absent
+    /// means `DEFAULT_UNCHANGED_SNAPSHOT_REFRESH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unchanged_snapshot_refresh_ms: Option<u64>,
 }
 
 impl Configuration {
@@ -58,6 +72,15 @@ impl Configuration {
             || self.network.peers.len() > 15
         {
             return Err("invalid interval, backoff, workers or peer count".into());
+        }
+        if self
+            .full_verification_interval_ms
+            .is_some_and(|interval| !(1_000..=86_400_000).contains(&interval))
+            || self
+                .unchanged_snapshot_refresh_ms
+                .is_some_and(|refresh| !(self.interval_ms..=3_600_000).contains(&refresh))
+        {
+            return Err("invalid full verification interval or unchanged snapshot refresh".into());
         }
         if !self.network.database_path.is_absolute() {
             return Err("database requires a bounded absolute local path".into());
@@ -80,6 +103,20 @@ impl Configuration {
             return Err("control socket parent must be a private directory".into());
         }
         Ok(())
+    }
+
+    /// Interval between two background complete verifications of the store.
+    #[must_use]
+    pub fn full_verification_interval(&self) -> Duration {
+        self.full_verification_interval_ms
+            .map_or(DEFAULT_FULL_VERIFICATION_INTERVAL, Duration::from_millis)
+    }
+
+    /// Delay after which an acknowledged, unchanged snapshot is pushed again.
+    #[must_use]
+    pub fn unchanged_snapshot_refresh(&self) -> Duration {
+        self.unchanged_snapshot_refresh_ms
+            .map_or(DEFAULT_UNCHANGED_SNAPSHOT_REFRESH, Duration::from_millis)
     }
 
     pub(crate) fn validate_inspection(&self) -> Result<()> {
@@ -372,6 +409,12 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
     let outgoing_config = config.clone();
     let outgoing_shared = Arc::clone(&shared);
     let outgoing = thread::spawn(move || synchronize(&outgoing_config, &outgoing_shared));
+    // The open above verified the whole store once for this process; this worker
+    // repeats that verification in the background at the configured interval.
+    let integrity_config = config.clone();
+    let integrity_shared = Arc::clone(&shared);
+    let integrity =
+        thread::spawn(move || verify_store_periodically(&integrity_config, &integrity_shared));
     let mut workers = Vec::new();
     let mut append_workers = Vec::new();
     let result = (|| -> Result<()> {
@@ -528,6 +571,7 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
         }
     }
     let outgoing_result = outgoing.join();
+    join_failed |= integrity.join().is_err();
     cleanup?;
     if join_failed {
         return Err("incoming worker panicked".into());
@@ -580,6 +624,24 @@ fn write_control(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -
     Ok(())
 }
 
+/// Repeats the complete store verification at the configured interval, in a read
+/// transaction that does not block writers. A failed verification fails the store
+/// closed for this process: every later store open, append, import, audit and
+/// export returns that failure, while status and shutdown stay available.
+fn verify_store_periodically(config: &Configuration, shared: &Shared) {
+    let interval = config.full_verification_interval();
+    let mut next = Instant::now() + interval;
+    while !shared.stopping.load(Ordering::SeqCst) {
+        if Instant::now() >= next {
+            if let Err(problem) = store(config).and_then(|mut store| Ok(store.verify_full()?)) {
+                eprintln!("resident store verification failed: {problem}");
+            }
+            next = Instant::now() + interval;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn record_local_failure(
     config: &Configuration,
     shared: &Shared,
@@ -601,9 +663,14 @@ fn record_local_failure(
 
 fn synchronize(config: &Configuration, shared: &Shared) -> Result<()> {
     let mut backoffs = BTreeMap::new();
+    let refresh = config.unchanged_snapshot_refresh();
     // Reuse one operation ID for an unchanged observed snapshot. Fresh IDs after
     // restart are safe but receipts are not compacted by this laboratory.
     let mut operations: BTreeMap<String, (Vec<u8>, String)> = BTreeMap::new();
+    // The snapshot digest each peer last acknowledged with an authenticated
+    // receipt, and when. An unchanged snapshot is not exchanged again before the
+    // refresh delay, so an idle replica adds no audit rows every interval.
+    let mut acknowledged: BTreeMap<String, (Vec<u8>, Instant)> = BTreeMap::new();
     while !shared.stopping.load(Ordering::SeqCst) {
         for peer in &config.network.peers {
             if shared.stopping.load(Ordering::SeqCst) {
@@ -627,11 +694,20 @@ fn synchronize(config: &Configuration, shared: &Shared) -> Result<()> {
                 }
             };
             let digest = Sha256::digest(serde_json::to_vec(&local)?).to_vec();
+            if acknowledged
+                .get(&peer.replica_id)
+                .is_some_and(|(peer_digest, at)| *peer_digest == digest && at.elapsed() < refresh)
+            {
+                let mut peers = shared.peers.lock().map_err(|_| "status lock poisoned")?;
+                let (_, _, next) = peers.get_mut(&peer.replica_id).ok_or("unknown peer")?;
+                *next = Instant::now() + Duration::from_millis(config.interval_ms);
+                continue;
+            }
             let operation = operations
                 .entry(peer.replica_id.clone())
                 .or_insert_with(|| (Vec::new(), String::new()));
             if operation.0 != digest {
-                *operation = (digest, random_token()?);
+                *operation = (digest.clone(), random_token()?);
             }
             let outcome = match config.network.open() {
                 Ok(mut node) => node.sync_to(&peer.replica_id, &operation.1, &random_token()?),
@@ -661,6 +737,7 @@ fn synchronize(config: &Configuration, shared: &Shared) -> Result<()> {
                     state.outcome = "authenticated_import_receipt".into();
                     *success = Some(Instant::now());
                     *backoff = config.interval_ms;
+                    acknowledged.insert(peer.replica_id.clone(), (digest, Instant::now()));
                 }
                 Err(error) => {
                     // The last acknowledgement is historical. Do not compare
