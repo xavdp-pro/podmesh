@@ -400,13 +400,14 @@ lease. `stop` is never gated.
   running, so their cost does not grow with the number of policy rows the journal has accumulated.
 
 **Epochs, from the fencing laboratory.** `experiments/manager-fencing` in the web tree models exclusion as an
-epoch issued by one external gate, rotated only by an explicit trusted action, with each maker keeping a durable
-screen that refuses epochs it has seen superseded. A policy with an `authority_id` puts PodMesh in the maker's
-role. A `permit` is the laboratory's exact form — `authority_id`, `resource`, `epoch`, `replica_id`,
-`instance_id`, `grant_id`, no other field; identifiers `[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}`; epoch 1 to 2³¹−1 —
-and is bound to the universe (`resource`), this host (`replica_id`) and **this boot** (`instance_id` is the
-kernel's `boot_id`, so a rebooted host must be authorised again). The screen, `highest_epoch_seen`, is reported
-by `activation_status` with `superseded`. The gate's fourth refusal is "superseded by epoch N".
+epoch issued by one external gate, rotated only by an explicit trusted action, with each node (the model's
+"maker") keeping a durable screen that refuses epochs it has seen superseded. A policy with an `authority_id`
+puts PodMesh in the node's role. A `permit` is the laboratory's exact form — `authority_id`,
+`resource`, `epoch`, `replica_id`, `instance_id`, `grant_id`, no other field; identifiers
+`[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}`; epoch 1 to 2³¹−1 — and is bound to the universe (`resource`), this host
+(`replica_id`) and **this boot** (`instance_id` is the kernel's `boot_id`, so a rebooted host must be authorised
+again). The screen, `highest_epoch_seen`, is reported by `activation_status` with `superseded`. The gate's
+fourth refusal is "superseded by epoch N".
 
 **The takeover document, signed.** The authority's account of a rotation (`takeover_proof`, consumed by
 `publisher_start`) comes in two kinds. Under a policy that names an `authority_key`, only

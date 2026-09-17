@@ -386,15 +386,15 @@ decides *when* the standby begins its wait, and the lease replicated as a fact s
 margin is measured against the previous holder's clock rather than a fixture. Until then the
 standby's wait is measured against its own journal, and the design says so.
 
-**Lot H8, the epoch half: PodMesh as the fencing laboratory's maker.** The lab in
+**Lot H8, the epoch half: PodMesh as the fencing laboratory's node.** The lab in
 `experiments/manager-fencing` (Codex, 2026-09-12) models exclusion the other way round from
 the leases above: not a lease that expires, but an **epoch** issued by one external gate,
 rotated only by an explicit trusted action — never by a timeout, a stale observation or a
-host's absence — with each maker keeping a durable screen that refuses any epoch it has
-already seen superseded. It deliberately exposes no `start` adapter, because a Podman start
-after a gate check leaves a gap the gate cannot close. The two designs compose, and the
-composition is the operator's sentence "I choose the host with my agent": **the agent is the
-lab's rotation controller, and PodMesh is its maker.**
+host's absence — with each node (the model's "maker") keeping a durable screen that refuses
+any epoch it has already seen superseded. It deliberately exposes no `start` adapter,
+because a Podman start after a gate check leaves a gap the gate cannot close. The two
+designs compose, and the composition is the operator's sentence "I choose the host with my
+agent": **the agent is the lab's rotation controller, and PodMesh is its node.**
 
 A policy may name an `authority_id`. Acquisition then requires a permit in the lab's exact
 six-field form, bound to the universe, to this host and to this **boot** — a rebooted host
@@ -407,7 +407,7 @@ red with "accepted" at its own case.
 
 **What this changes about safety, and what it does not.** With epochs, two standbys cannot
 both activate for one rotation: the gate's compare-and-swap issues one permit per epoch, and
-that is the lab's proof, not PodMesh's. What remains PodMesh's is the maker's discipline —
+that is the lab's proof, not PodMesh's. What remains PodMesh's is the node's discipline —
 refuse what the screen says is stale — and the honest gap: PodMesh cannot verify a permit's
 origin (no signature, no gate call), so a permit is provenance from a root-only channel, and
 a forged **higher** epoch can stop a universe here but never start a second one. The margin
