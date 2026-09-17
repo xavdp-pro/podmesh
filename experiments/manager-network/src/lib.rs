@@ -334,12 +334,11 @@ impl Node {
                 }
             };
             let mut authenticated = false;
-            let mut import = None;
             let result = self.serve_connection_inner(
                 stream,
                 drop_after_decision,
                 &mut authenticated,
-                &mut import,
+                &mut |_| {},
             );
             if authenticated {
                 return result;
@@ -358,18 +357,31 @@ impl Node {
     /// # Errors
     /// Returns a local I/O error when the bounded request/reply cannot complete.
     pub fn serve_connection(&mut self, stream: TcpStream) -> Result<(), Error> {
-        self.serve_connection_reporting(stream).result
+        self.serve_connection_reporting(stream, |_| {})
     }
 
     /// Handles exactly one bounded authenticated exchange on an accepted stream,
-    /// like [`Node::serve_connection`], and also reports the authenticated import
-    /// the exchange committed or replayed. The import is reported even when the
-    /// reply could not be sent after it.
-    pub fn serve_connection_reporting(&mut self, stream: TcpStream) -> ServedConnection {
+    /// like [`Node::serve_connection`], and reports the authenticated import it
+    /// committed or replayed: `on_import` runs once, as soon as the import is
+    /// durable and before the reply is prepared, so it is reported whatever
+    /// happens to the reply. A refusal, a diagnostic or a failure before the
+    /// import never calls it.
+    ///
+    /// # Errors
+    /// Returns a local I/O error when the bounded request/reply cannot complete,
+    /// including after an import that was reported.
+    pub fn serve_connection_reporting(
+        &mut self,
+        stream: TcpStream,
+        on_import: impl FnOnce(&ServedImport),
+    ) -> Result<(), Error> {
         let mut authenticated = false;
-        let mut import = None;
-        let result = self.serve_connection_inner(stream, false, &mut authenticated, &mut import);
-        ServedConnection { import, result }
+        let mut on_import = Some(on_import);
+        self.serve_connection_inner(stream, false, &mut authenticated, &mut |import| {
+            if let Some(report) = on_import.take() {
+                report(import);
+            }
+        })
     }
 
     /// Sends one locally exported snapshot to one exact configured peer.
@@ -751,7 +763,7 @@ impl Node {
         mut stream: TcpStream,
         drop_after_decision: bool,
         authenticated: &mut bool,
-        import: &mut Option<ServedImport>,
+        on_import: &mut dyn FnMut(&ServedImport),
     ) -> Result<(), Error> {
         let preauth_nonce = new_preauth_nonce();
         let received = match metered_read_frame(&mut stream, Instant::now() + IO_TIMEOUT) {
@@ -905,7 +917,7 @@ impl Node {
             ));
         };
         // The import is durable from here on, whatever happens to the reply.
-        *import = Some(ServedImport {
+        on_import(&ServedImport {
             source_replica_id: peer.replica_id.clone(),
             snapshot_facts: request.snapshot.facts.len(),
             inserted,
@@ -1366,15 +1378,6 @@ pub struct ServedImport {
     pub history_len: usize,
     /// Whether the durable receipt was replayed rather than committed by this connection.
     pub replayed: bool,
-}
-
-/// The outcome of serving one accepted connection.
-#[derive(Debug)]
-pub struct ServedConnection {
-    /// The authenticated import this connection committed or replayed, if any.
-    pub import: Option<ServedImport>,
-    /// The bounded request/reply result that [`Node::serve_connection`] returns.
-    pub result: Result<(), Error>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2580,23 +2583,28 @@ mod tests {
         );
     }
 
+    type Served = (Option<ServedImport>, Result<(), Error>);
+
     /// Serves one connection on a fresh listener through the public reporting
     /// seam, or, with `drop_after_decision`, loses the reply after the decision.
     fn spawn_reporting_server(
         configuration: ConfigurationFile,
         drop_after_decision: bool,
-    ) -> (SocketAddr, thread::JoinHandle<ServedConnection>) {
+    ) -> (SocketAddr, thread::JoinHandle<Served>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let worker = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut node = configuration.open().unwrap();
-            if !drop_after_decision {
-                return node.serve_connection_reporting(stream);
-            }
-            let mut import = None;
-            let result = node.serve_connection_inner(stream, true, &mut false, &mut import);
-            ServedConnection { import, result }
+            let mut reported = None;
+            let result = if drop_after_decision {
+                node.serve_connection_inner(stream, true, &mut false, &mut |import| {
+                    reported = Some(import.clone());
+                })
+            } else {
+                node.serve_connection_reporting(stream, |import| reported = Some(import.clone()))
+            };
+            (reported, result)
         });
         (address, worker)
     }
@@ -2628,9 +2636,9 @@ mod tests {
         };
 
         // A committed import: the destination holds a fact the snapshot lacked.
-        let (sent, report) = exchange(&mut r1, "served-operation", false);
+        let (sent, (import, result)) = exchange(&mut r1, "served-operation", false);
         assert!(!sent.unwrap().replayed);
-        assert!(report.result.is_ok());
+        assert!(result.is_ok());
         let committed = ServedImport {
             source_replica_id: "r1".into(),
             snapshot_facts: 1,
@@ -2638,14 +2646,14 @@ mod tests {
             history_len: 2,
             replayed: false,
         };
-        assert_eq!(report.import, Some(committed.clone()));
+        assert_eq!(import, Some(committed.clone()));
 
         // An identical retry replays the receipt and reports the original counts.
-        let (sent, report) = exchange(&mut r1, "served-operation", false);
+        let (sent, (import, result)) = exchange(&mut r1, "served-operation", false);
         assert!(sent.unwrap().replayed);
-        assert!(report.result.is_ok());
+        assert!(result.is_ok());
         assert_eq!(
-            report.import,
+            import,
             Some(ServedImport {
                 replayed: true,
                 ..committed
@@ -2654,13 +2662,13 @@ mod tests {
 
         // An authenticated refusal imports nothing and reports nothing.
         observe(&r1, "served-changed");
-        let (sent, report) = exchange(&mut r1, "served-operation", false);
+        let (sent, (import, result)) = exchange(&mut r1, "served-operation", false);
         assert_eq!(
             sent.unwrap_err().source(),
             ErrorSource::AuthenticatedRemoteRefusal
         );
-        assert!(report.result.is_ok());
-        assert_eq!(report.import, None);
+        assert!(result.is_ok());
+        assert_eq!(import, None);
 
         // An unauthenticated request imports nothing and reports nothing.
         let mut wrong_key = r1.clone();
@@ -2669,17 +2677,17 @@ mod tests {
                 peer.shared_key_hex = WRONG_KEY.into();
             }
         });
-        let (sent, report) = exchange(&mut wrong_key, "served-wrong-key", false);
+        let (sent, (import, _)) = exchange(&mut wrong_key, "served-wrong-key", false);
         assert!(sent.is_err());
-        assert_eq!(report.import, None);
+        assert_eq!(import, None);
         assert_eq!(history_len(&r2), 2);
 
         // A reply lost after the commit still reports the durable import.
-        let (sent, report) = exchange(&mut r1, "served-after-change", true);
+        let (sent, (import, result)) = exchange(&mut r1, "served-after-change", true);
         assert!(sent.is_err());
-        assert!(report.result.is_err());
+        assert!(result.is_err());
         assert_eq!(
-            report.import,
+            import,
             Some(ServedImport {
                 source_replica_id: "r1".into(),
                 snapshot_facts: 2,

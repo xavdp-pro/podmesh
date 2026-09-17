@@ -741,10 +741,11 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
                         state.peak.fetch_max(count, Ordering::SeqCst);
                         workers.push(thread::spawn(move || {
                             if let Ok(mut node) = conf.network.open() {
-                                if let Some(import) = node.serve_connection_reporting(stream).import
-                                {
-                                    record_served_import(&state, &import);
-                                }
+                                // Recorded as soon as the import is durable, before
+                                // its reply: the local snapshot has already changed.
+                                let _ = node.serve_connection_reporting(stream, |import| {
+                                    record_served_import(&state, import);
+                                });
                             }
                             state.active.fetch_sub(1, Ordering::SeqCst);
                         }));

@@ -1935,19 +1935,19 @@ fn a_replica_restored_from_an_older_store_is_pushed_back_to_within_a_few_interva
     lab.append(1, "third", "s1", "subject", "third");
     assert_converged(&lab, 3);
     // Every link now holds an acknowledgement of the current snapshot, which
-    // nobody pushes again before ten minutes.
-    until(
-        || {
-            (0..3).all(|i| {
-                lab.status(i)["peers"]
-                    .as_object()
-                    .unwrap()
-                    .values()
-                    .all(|link| link["acknowledged_unchanged"] == true)
-            })
-        },
-        Duration::from_secs(15),
-    );
+    // nobody pushes again before ten minutes, and no exchange is under way.
+    let all_acknowledged = || {
+        (0..3).all(|i| {
+            lab.status(i)["peers"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|link| link["acknowledged_unchanged"] == true)
+        })
+    };
+    until(all_acknowledged, Duration::from_secs(15));
+    settled_audit_counts(&lab, &[0, 1, 2]);
+    assert!(all_acknowledged());
     let before = push_backs(&lab, 0, "r2") + push_backs(&lab, 1, "r2");
 
     // r2 comes back on its older copy, which lacks two facts its peers believe
@@ -1968,7 +1968,9 @@ fn a_replica_restored_from_an_older_store_is_pushed_back_to_within_a_few_interva
     let converged = bound.elapsed();
     assert!(
         push_backs(&lab, 0, "r2") + push_backs(&lab, 1, "r2") > before,
-        "convergence did not come from a push-back"
+        "convergence did not come from a push-back: before {before}, r0 {} r1 {}",
+        lab.status(0)["peers"]["r2"],
+        lab.status(1)["peers"]["r2"],
     );
     // Interval 100 ms: a few intervals, not the ten-minute refresh.
     assert!(converged < Duration::from_secs(3), "{converged:?}");
