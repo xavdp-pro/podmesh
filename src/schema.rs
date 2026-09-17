@@ -136,7 +136,7 @@ pub fn all() -> Value {
         f("takeover_proof", "object", true, "the gate's document for this epoch, signed when the policy names a key"),
         f("previous", "object", false, "the agent's account of the previous publisher, recorded as provenance"),
     ])));
-    put("publisher_stop", op("host", "none", "stops the connector and removes the governor mark", Some(vec![uuid("resource", "the resource")])));
+    put("publisher_stop", op("host", "none", "stops the connector and removes the active manager's mark (governor_mark)", Some(vec![uuid("resource", "the resource")])));
     put("publisher_status", op("read", "none", "the declaration, the unit, the connector's identity, the lease, the origin's readiness and eligibility", Some(vec![uuid("resource", "the resource")])));
     put("publisher_observed", op("host", "none", "records what the public hostname answered, as provenance", Some(vec![
         uuid("resource", "the resource"), f("observation", "object", true, "what was observed"),
