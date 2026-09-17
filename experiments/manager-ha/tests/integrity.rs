@@ -8,6 +8,7 @@ use std::{
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    thread,
     time::Duration,
 };
 
@@ -211,6 +212,12 @@ fn edited_prepared_row_error() -> DurableError {
             .into(),
     )
 }
+
+fn schema_mismatch() -> DurableError {
+    DurableError::Corrupt("manager store schema shape mismatch".into())
+}
+
+const AUDIT_NO_UPDATE_TRIGGER: &str = "CREATE TRIGGER exchange_audit_events_no_update BEFORE UPDATE ON exchange_audit_events BEGIN SELECT RAISE(ABORT, 'immutable exchange audit event'); END;";
 
 fn rowid_gap(table: &str) -> DurableError {
     DurableError::Corrupt(format!("stored {table} rowids are not contiguous from 1"))
@@ -847,6 +854,124 @@ fn a_store_that_fails_verification_at_first_open_stays_closed() {
         Store::open(&copy, configuration(), "r1").err().unwrap(),
         edited_prepared_row_error()
     );
+}
+
+/// Review of lot V2-R, probe P4: a schema found corrupt when a process opened a
+/// store again closed nothing, so restoring the dropped trigger let the next open
+/// serve the store. The failure is now recorded whether the open's own
+/// transaction or its read-only preflight finds it.
+#[test]
+fn a_schema_found_corrupt_at_open_closes_the_store() {
+    // The process keeps the store open: the next open trusts the file state it
+    // already preflighted, and its own transaction checks the schema.
+    let lab = Lab::new();
+    let mut kept = lab.open();
+    kept.record_exchange_audit(&prepared("one")).unwrap();
+    let connection = Connection::open(lab.database()).unwrap();
+    connection
+        .execute_batch("DROP TRIGGER exchange_audit_events_no_update")
+        .unwrap();
+    assert_eq!(
+        Store::open(&lab.database(), configuration(), "r1")
+            .err()
+            .unwrap(),
+        schema_mismatch()
+    );
+    connection.execute_batch(AUDIT_NO_UPDATE_TRIGGER).unwrap();
+    assert_failed_closed(&lab, &mut kept, &schema_mismatch());
+
+    // Nothing keeps the store open, and the checkpoint of the last connection
+    // changed the file: the next open copies it for its preflight, which checks
+    // the schema before SQLite opens the store read-write.
+    let lab = Lab::new();
+    lab.open().record_exchange_audit(&prepared("one")).unwrap();
+    Connection::open(lab.database())
+        .unwrap()
+        .execute_batch("DROP TRIGGER exchange_audit_events_no_update")
+        .unwrap();
+    assert_eq!(
+        Store::open(&lab.database(), configuration(), "r1")
+            .err()
+            .unwrap(),
+        schema_mismatch()
+    );
+    Connection::open(lab.database())
+        .unwrap()
+        .execute_batch(AUDIT_NO_UPDATE_TRIGGER)
+        .unwrap();
+    assert_eq!(
+        Store::open(&lab.database(), configuration(), "r1")
+            .err()
+            .unwrap(),
+        schema_mismatch()
+    );
+}
+
+/// Probe P5: the closed state belongs to a database file, not to its path. A
+/// clean copy renamed over the path is another database file, which the process
+/// verifies completely at its first open before serving it; the closed file stays
+/// closed for the handles that still have it open.
+#[test]
+fn another_database_file_at_a_closed_store_path_is_verified_completely_before_it_serves() {
+    let lab = Lab::new();
+    let mut closed = lab.open();
+    closed.record_exchange_audit(&prepared("one")).unwrap();
+    let copy = copy_store(&lab);
+    insert_malformed_audit_row_at(&lab, 2, "forged-tail");
+    let error = closed.execute(&Request::Export {}).unwrap_err();
+    assert!(matches!(error, DurableError::Corrupt(_)), "{error:?}");
+    assert_eq!(
+        Store::open(&lab.database(), configuration(), "r1")
+            .err()
+            .unwrap(),
+        error
+    );
+
+    for suffix in ["-wal", "-shm"] {
+        let _ = fs::remove_file(format!("{}{suffix}", lab.database().display()));
+    }
+    fs::rename(&copy, lab.database()).unwrap();
+    assert_eq!(closed.execute(&Request::Export {}).unwrap_err(), error);
+    drop(closed);
+    let mut replaced = lab.open();
+    let integrity = replaced.integrity().unwrap();
+    assert_eq!(integrity.full_verifications, 1);
+    assert!(integrity.failure.is_none());
+    replaced.execute(&Request::Export {}).unwrap();
+    replaced.record_exchange_audit(&prepared("two")).unwrap();
+}
+
+/// Review of lot V2-R: an operation that had passed its check of the closed
+/// state still committed after another operation of the process closed the
+/// store. Here the operation waits for another connection's write lock, after that
+/// check, while the periodic pass of the same process finds an edited old row; it
+/// then rolls back and returns that failure.
+#[test]
+fn no_transaction_commits_after_the_store_is_closed() {
+    let lab = Lab::new();
+    let mut writer = lab.open();
+    for label in ["old", "newer"] {
+        writer.record_exchange_audit(&prepared(label)).unwrap();
+    }
+    writer.execute(&Request::Export {}).unwrap();
+    let mut verifier = lab.open();
+    lab.edit_audit_row("audit-old");
+    let rows = lab.audit_rows();
+
+    let blocker = Connection::open(lab.database()).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let pending = thread::spawn(move || writer.record_exchange_audit(&prepared("pending")).err());
+    thread::sleep(Duration::from_millis(500));
+    // Without the lock the operation takes milliseconds: it is waiting in BEGIN
+    // IMMEDIATE, the only step that blocks, after its check of the closed state.
+    assert!(!pending.is_finished());
+    assert_eq!(
+        verifier.verify_full().unwrap_err(),
+        edited_prepared_row_error()
+    );
+    blocker.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(pending.join().unwrap(), Some(edited_prepared_row_error()));
+    assert_eq!(lab.audit_rows(), rows);
 }
 
 /// A byte copy of a closed store is a different file, first opened by this

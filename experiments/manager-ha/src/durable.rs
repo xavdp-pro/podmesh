@@ -118,11 +118,13 @@ type IntegrityKey = (u64, u64, Option<(u64, u32)>, String, String);
 /// Rows the operation reads or extends (a replayed receipt, a replayed audit
 /// event, the audit rows of the attempt it appends to, the facts it loads) are
 /// verified when read. Any failure to read or verify a stored row once the
-/// transaction holds its snapshot fails the file closed for the rest of the
-/// process: every later open, write and export returns that same error. An
-/// in-place change to an older row that no operation reads, including a removed
-/// or replaced row, is detected by the next complete verification, not by the
-/// next transaction.
+/// transaction holds its snapshot, and a schema found corrupt when the file is
+/// opened, fails the file closed for the rest of the process: every later open,
+/// write and export of that file returns that same error, and no transaction of
+/// the process commits on it afterwards. Another file at the same path is another
+/// database file. An in-place change to an older row that no operation reads,
+/// including a removed or replaced row, is detected by the next complete
+/// verification, not by the next transaction.
 #[derive(Default)]
 struct StoreIntegrityEntry {
     state: Mutex<IntegrityState>,
@@ -461,23 +463,30 @@ impl Store {
     ///
     /// # Errors
     /// Rejects invalid configuration, mismatched identity, unknown schema, I/O
-    /// errors, and a store whose verification failed in this process.
+    /// errors, and a database file whose verification failed in this process,
+    /// including a schema found corrupt by this open's preflight or transaction.
     pub fn open(
         path: &Path,
         configuration: Configuration,
         replica_id: &str,
     ) -> DurableResult<Self> {
         let topology = validate_local_configuration(&configuration, replica_id)?;
-        let mut preflight_identity = None;
+        // The integrity entry of an existing file is known before its preflight:
+        // a file this process closed is refused without being copied, and a
+        // preflight that finds a corrupt schema closes the file.
+        let mut existing = None;
         match fs::symlink_metadata(path) {
             Ok(metadata) => {
                 require_regular_nonsymlink(path)?;
+                let integrity = integrity_entry(&metadata, &topology, replica_id)?;
+                integrity.refuse_if_failed()?;
                 let key = preflight_key(&metadata, &topology, replica_id)?;
                 let known = preflighted_stores()?.contains(&key);
                 if !known {
-                    preflight_existing_store(path, &topology, replica_id)?;
+                    preflight_existing_store(path, &topology, replica_id)
+                        .map_err(|problem| integrity.fail_closed_if_corrupt(problem))?;
                 }
-                preflight_identity = Some(key);
+                existing = Some((key, integrity));
             }
             Err(problem) if problem.kind() == std::io::ErrorKind::NotFound => {}
             Err(problem) => return Err(error(problem)),
@@ -490,18 +499,25 @@ impl Store {
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
         .map_err(error)?;
-        if let Some(expected) = preflight_identity {
-            let current = fs::symlink_metadata(path).map_err(error)?;
-            if preflight_key(&current, &topology, replica_id)? != expected {
-                return Err(DurableError::Storage(
-                    "manager store path changed after read-only preflight".into(),
-                ));
+        let integrity = match existing {
+            Some((expected, integrity)) => {
+                let current = fs::symlink_metadata(path).map_err(error)?;
+                if preflight_key(&current, &topology, replica_id)? != expected {
+                    return Err(DurableError::Storage(
+                        "manager store path changed after read-only preflight".into(),
+                    ));
+                }
+                integrity
             }
-        }
+            None => integrity_entry(
+                &fs::symlink_metadata(path).map_err(error)?,
+                &topology,
+                replica_id,
+            )?,
+        };
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(error)?;
-        let integrity = integrity_entry(path, &topology, replica_id)?;
         integrity.refuse_if_failed()?;
         // Read before the transaction takes its snapshot: every row named by these
         // positions was committed before that snapshot.
@@ -509,14 +525,16 @@ impl Store {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(error)?;
-        initialize_or_check_identity(&transaction, &topology, replica_id)?;
+        initialize_or_check_identity(&transaction, &topology, replica_id)
+            .map_err(|problem| integrity.fail_closed_if_corrupt(problem))?;
         // A verified row that is missing or different in this snapshot was changed
         // in place, and the store is then verified completely again.
         let unchanged = match &positions {
-            Some(positions) => positions_unchanged(&transaction, positions)?,
+            Some(positions) => positions_unchanged(&transaction, positions)
+                .map_err(|problem| integrity.fail_closed(problem))?,
             None => false,
         };
-        transaction.commit().map_err(error)?;
+        integrity.commit(transaction)?;
         connection
             .pragma_update(None, "journal_mode", "WAL")
             .map_err(error)?;
@@ -617,10 +635,7 @@ impl Store {
     ) -> DurableResult<T> {
         self.integrity.refuse_if_failed()?;
         let integrity = Arc::clone(&self.integrity);
-        operation(self).map_err(|problem| match problem {
-            DurableError::Corrupt(_) => integrity.fail_closed(problem),
-            _ => problem,
-        })
+        operation(self).map_err(|problem| integrity.fail_closed_if_corrupt(problem))
     }
 
     /// Runs one write operation. When this process had already preflighted the
@@ -692,7 +707,7 @@ impl Store {
                 request,
                 receipt_metadata_for_request(request),
             )?;
-            transaction.commit().map_err(error)?;
+            store.integrity.commit(transaction)?;
             Ok(executed)
         };
         if writes {
@@ -784,7 +799,7 @@ impl Store {
                 &audit,
                 true,
             )?;
-            transaction.commit().map_err(error)?;
+            store.integrity.commit(transaction)?;
             Ok(AuthenticatedImport {
                 executed,
                 audit: evidence,
@@ -822,7 +837,7 @@ impl Store {
                 audit,
                 false,
             )?;
-            transaction.commit().map_err(error)?;
+            store.integrity.commit(transaction)?;
             Ok(evidence)
         })
     }
@@ -855,6 +870,29 @@ impl StoreIntegrityEntry {
             state.failure.get_or_insert_with(|| problem.clone());
         }
         problem
+    }
+
+    /// Records a corrupt stored state as a verification failure and returns any
+    /// other error unchanged.
+    fn fail_closed_if_corrupt(&self, problem: DurableError) -> DurableError {
+        match problem {
+            DurableError::Corrupt(_) => self.fail_closed(problem),
+            _ => problem,
+        }
+    }
+
+    /// Commits a transaction on this database file unless the file has failed
+    /// closed. The integrity state stays locked while SQLite commits, so a
+    /// failure is recorded either before the commit, which then rolls back and
+    /// returns that failure, or once the commit has completed: no transaction of
+    /// the process commits after the file is closed, including one that began,
+    /// or waited for the write lock, before the failure was recorded.
+    fn commit(&self, transaction: Transaction<'_>) -> DurableResult<()> {
+        let state = integrity_state(self)?;
+        if let Some(failure) = &state.failure {
+            return Err(failure.clone());
+        }
+        transaction.commit().map_err(error)
     }
 
     /// Returns stored rows an operation read at use, inside a transaction that
@@ -931,11 +969,10 @@ impl TablePosition {
 }
 
 fn integrity_entry(
-    path: &Path,
+    metadata: &fs::Metadata,
     topology: &Topology,
     replica_id: &str,
 ) -> DurableResult<Arc<StoreIntegrityEntry>> {
-    let metadata = fs::symlink_metadata(path).map_err(error)?;
     let birth = metadata
         .created()
         .ok()
@@ -1020,7 +1057,7 @@ fn run_full_verification(
     acquire_snapshot(&transaction)?;
     let verified = full_verification(&transaction, topology, replica_id)
         .map_err(|problem| integrity.fail_closed(problem))?;
-    transaction.commit().map_err(error)?;
+    integrity.commit(transaction)?;
     integrity.record_full_verification(verified, started, replace_positions)
 }
 
