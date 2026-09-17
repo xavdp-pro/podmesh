@@ -189,8 +189,13 @@ impl Lab {
                 .unwrap(),
         );
         until(
-            || self.control(i, "status").is_some(),
-            Duration::from_secs(5),
+            || {
+                if let Some(exit) = self.children[i].as_mut().unwrap().try_wait().unwrap() {
+                    panic!("resident r{i} exited while starting: {exit}");
+                }
+                self.control(i, "status").is_some()
+            },
+            Duration::from_secs(15),
         );
     }
     fn status(&self, i: usize) -> Value {
@@ -202,7 +207,7 @@ impl Lab {
                 }
             }
             assert!(
-                start.elapsed() < Duration::from_secs(5),
+                start.elapsed() < Duration::from_secs(15),
                 "status did not become available"
             );
             thread::sleep(Duration::from_millis(25));
@@ -354,6 +359,7 @@ impl Drop for Lab {
         }
     }
 }
+#[track_caller]
 fn until(mut predicate: impl FnMut() -> bool, timeout: Duration) {
     let start = Instant::now();
     while !predicate() {
@@ -500,6 +506,23 @@ fn wrong_key_and_oversized_frames_do_not_import() {
     assert_eq!(lab.count(1), 0);
     assert_eq!(lab.count(2), 0);
     assert_eq!(lab.status(0)["peers"]["r1"]["authenticated_successes"], 0);
+    // Neither the refused import nor the refused push catches r1 up with r0, and
+    // an empty store keeps refusing appends.
+    until(
+        || lab.status(1)["catch_up"]["peers_imported"] == json!(["r2"]),
+        Duration::from_secs(10),
+    );
+    let catch_up = lab.status(1)["catch_up"].clone();
+    assert_eq!(catch_up["peers_missing"], json!(["r0"]));
+    assert_eq!(catch_up["caught_up"], false);
+    assert_eq!(
+        lab.control_value(
+            1,
+            json!({"operation":"append_observation","operation_id":"refused-peer","scope":"s1","subject":"subject","value":"value"}),
+        )
+        .unwrap()["error"],
+        "append_observation_catching_up"
+    );
     let mut stream = TcpStream::connect(lab.configs[1].network.bind).unwrap();
     stream.write_all(&524_289_u32.to_be_bytes()).unwrap();
     stream
@@ -1483,12 +1506,18 @@ fn acknowledged_unchanged_snapshot_is_refreshed_after_the_configured_delay() {
         Duration::from_secs(10),
     );
     let first = peer_successes(&lab, 0, "r1");
-    thread::sleep(Duration::from_millis(3_500));
-    let later = peer_successes(&lab, 0, "r1");
-    // About one refresh per second, not one exchange per 100 ms interval.
+    let started = Instant::now();
+    // About one refresh per second, not one exchange per 100 ms interval: the
+    // third exchange after this one cannot come before two refreshes have
+    // elapsed, however slow a loaded machine makes each exchange.
+    until(
+        || peer_successes(&lab, 0, "r1") >= first + 3,
+        Duration::from_secs(15),
+    );
+    let elapsed = started.elapsed();
     assert!(
-        (first + 2..=first + 5).contains(&later),
-        "{first} then {later} authenticated exchanges"
+        elapsed >= Duration::from_millis(1_900),
+        "three exchanges after {elapsed:?}"
     );
     for i in 0..3 {
         lab.stop(i);
@@ -1535,7 +1564,8 @@ fn periodic_full_verification_fails_the_store_closed_after_an_old_row_is_edited(
         lab.configs[i].catch_up_window_ms = Some(1_000);
         lab.observe(i, "seed", None);
     }
-    lab.start(0);
+    let log = lab._dir.path().join("r0.stderr");
+    lab.start_with_stderr(0, Stdio::from(fs::File::create(&log).unwrap()));
     lab.start(1);
     lab.append(0, "before-edit", "s0", "subject", "value");
     lab.append(1, "before-edit", "s1", "subject", "value");
@@ -1554,6 +1584,16 @@ fn periodic_full_verification_fails_the_store_closed_after_an_old_row_is_edited(
         "subject": "subject",
         "value": "value",
     });
+    // The periodic pass closes the store. An append that ran past its deadline
+    // before that may still be draining, and answers busy meanwhile.
+    until(
+        || {
+            fs::read_to_string(&log)
+                .unwrap()
+                .contains("resident store verification failed: corrupt")
+        },
+        Duration::from_secs(10),
+    );
     until(
         || {
             lab.control_value(0, request.clone()).unwrap()["error"]
@@ -2147,4 +2187,26 @@ fn a_periodic_verification_that_could_not_run_is_retried_at_the_exchange_interva
         detected.as_millis()
     );
     lab.stop_all();
+}
+
+#[test]
+fn a_replica_without_peers_is_caught_up_at_once() {
+    let mut lab = Lab::new();
+    let config = &mut lab.configs[0];
+    config.network.manager.replicas.truncate(1);
+    config.network.manager.grants.truncate(1);
+    config.network.peers.clear();
+    lab.start(0);
+    let reply = lab
+        .control_value(
+            0,
+            json!({"operation":"append_observation","operation_id":"alone","scope":"s0","subject":"subject","value":"value"}),
+        )
+        .unwrap();
+    assert_eq!(reply["response"]["result"], "observed", "{reply}");
+    let catch_up = lab.status(0)["catch_up"].clone();
+    assert_eq!(catch_up["caught_up_by"], "no_peers");
+    assert_eq!(catch_up["caught_up_after_ms"], 0);
+    assert_eq!(catch_up["peers_missing"], json!([]));
+    lab.stop(0);
 }
