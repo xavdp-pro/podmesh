@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The readiness gate of `publisher_start`, alone (the publisher contract, item 8): one lab host,
-the daemon restarted with the lab fault `publisher-stale-mark` (the governor mark written one epoch
+the daemon restarted with the lab fault `publisher-stale-mark` (the active manager's mark one epoch
 behind), so that the origin answers ready with the wrong epoch; the start must be refused, its mark
 compensated (the origin back to 503), no connector unit left; then, without the fault, the same
 start succeeds and is stopped. Environment: PODMESH_SOURCE_SSH (the host), the transient service
@@ -108,12 +108,12 @@ try:
 
     daemon('publisher-stale-mark')
     r = pub('publisher_start', takeover_proof=proof)
-    assert not r.get('ok') and 'not ready for this governor at epoch' in r['error'] and '"gone":true' in r['error'].replace(' ', ''), r
+    assert not r.get('ok') and 'not ready for this active manager at epoch' in r['error'] and '"gone":true' in r['error'].replace(' ', ''), r
     assert origin()[0] == '503', 'the stale mark was not compensated'
     assert A.ssh(f'systemctl is-active podmesh-publisher-{LOGICAL}.service', check=False).stdout.decode().strip() != 'active'
     st = pub('publisher_status')['data']
     assert st['governor_mark'] is False and st['unit']['state'] != 'active', st
-    checks.append('under a stale governor mark (one epoch behind), the start was refused by the readiness check, the mark compensated (origin back to 503), no connector unit')
+    checks.append('under the active manager\'s mark written one epoch behind, the start was refused by the readiness check, the mark compensated (origin back to 503), no connector unit')
 
     daemon()
     A.ok(request('activation_renew', LOGICAL, reference))

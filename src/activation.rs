@@ -15,13 +15,13 @@
 //! the manager's job and a later lot. Until then a partitioned host is restrained only by its
 //! own copy of this record.
 //!
-//! THE EPOCH HALF (lot H8). `experiments/manager-fencing` in the web tree models exclusion
-//! the other way round: not a lease that expires, but an EPOCH issued by one external gate,
-//! rotated only by an explicit trusted action, with each maker keeping a durable screen that
-//! refuses any epoch it has already seen superseded. A policy may name that gate's
+//! THE EPOCH HALF (lot H8). `experiments/manager-fencing` in the web tree models exclusion the
+//! other way round: not a lease that expires, but an EPOCH issued by one external gate, rotated
+//! only by an explicit trusted action, with each node (the model's "maker") keeping a durable
+//! screen that refuses any epoch it has already seen superseded. A policy may name that gate's
 //! `authority_id`; acquisition then requires a permit in the laboratory's exact form, bound to
 //! this host and to this boot, and the screen below refuses stale ones. The agent that names
-//! the host is the laboratory's rotation controller; PodMesh is its maker. What PodMesh cannot
+//! the host is the laboratory's rotation controller; PodMesh is its node. What PodMesh cannot
 //! do is verify a permit's origin -- there is no signature and it never contacts the gate --
 //! so a permit is provenance from a root-only channel, and the asymmetry is stated: a forged
 //! HIGHER epoch can stop a universe here (availability), never start a second one (safety).
@@ -117,7 +117,7 @@ fn permit(request: &serde_json::Value) -> Result<Permit, Error> {
     })
 }
 
-/// The highest epoch this host has seen for a universe: the maker's durable screen.
+/// The highest epoch this host has seen for a universe: the node's durable epoch screen.
 fn highest_epoch_seen(db: &Connection, uuid: &str) -> Result<Option<i64>, Error> {
     Ok(db
         .query_row("SELECT epoch FROM activation_epochs WHERE universe_uuid=?1", [uuid], |r| r.get(0))
@@ -294,7 +294,7 @@ pub fn lease(db: &Connection, uuid: &str) -> Result<Option<Lease>, Error> {
         .optional()?)
 }
 
-/// Whether this host's lease has been overtaken by an epoch it has seen: the maker's screen
+/// Whether this host's lease has been overtaken by an epoch it has seen: the node's epoch screen
 /// says a newer grant exists, so whatever this lease says, this host is no longer entitled.
 fn superseded(db: &Connection, uuid: &str, l: &Lease) -> Result<Option<i64>, Error> {
     Ok(highest_epoch_seen(db, uuid)?.filter(|&seen| seen > l.epoch))
@@ -334,7 +334,7 @@ pub fn refuse_if_not_activated(db: &Connection, uuid: &str, operation: &str) -> 
         )
         .into()),
         // The fourth reason, from the epoch screen: a newer grant has been seen here, so this
-        // host's lease, live or not, no longer entitles it. This is the maker's refusal.
+        // host's lease, live or not, no longer entitles it. This is the node's refusal.
         Some(ref l) if superseded(db, uuid, l)?.is_some() => Err(format!(
             "{operation} refused: this host's activation was superseded by epoch {}",
             superseded(db, uuid, l)?.unwrap_or_default()
@@ -878,8 +878,8 @@ fn fence(db: &Connection, id: &str, timeout: u64) -> Result<serde_json::Value, E
     // no longer holds a live, unsuperseded lease for is withdrawn, verified from the kernel -- after
     // reconciliation has undone whatever a crash left half-made, so that nothing is unowned.
     let network_reconciliation = crate::network::reconcile(db)?;
-    // The publishing connector of a role this host no longer holds goes first -- stopped, its
-    // governor mark removed -- so that nothing publishes an address about to be withdrawn.
+    // The publishing connector of a role this host no longer holds goes first -- stopped, the
+    // active manager's mark removed -- so that nothing publishes an address about to be withdrawn.
     let mut publishers_withdrawn = crate::publisher::withdraw_unentitled(db, &|resource: &str| {
         lease(db, resource).ok().flatten().is_some_and(|l| {
             l.holder_host_uuid == this_host && l.expires_at > now && superseded(db, resource, &l).ok().flatten().is_none()

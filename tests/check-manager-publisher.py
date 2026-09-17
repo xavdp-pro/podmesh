@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""The publishing connector follows the governor (docs/MANAGER-PUBLISHER-CONTRACT.md), measured
-on two or three lab hosts (PODMESH_SOURCE_SSH is the first governor; PODMESH_DESTINATION_SSH the
-standby that takes over; PODMESH_THIRD_SSH, optional, a second standby), with a real Cloudflare
-tunnel: PODMESH_TUNNEL_CREDENTIALS (the private credentials JSON on the workstation),
-PODMESH_TUNNEL_ID and PODMESH_PUBLIC_HOSTNAME. Same environment otherwise as the manager suites.
+"""The publishing connector follows the active manager (docs/MANAGER-PUBLISHER-CONTRACT.md),
+measured on two or three lab hosts (PODMESH_SOURCE_SSH is the first active manager;
+PODMESH_DESTINATION_SSH the standby that takes over; PODMESH_THIRD_SSH, optional, a second
+standby), with a real Cloudflare tunnel: PODMESH_TUNNEL_CREDENTIALS (the private credentials JSON
+on the workstation), PODMESH_TUNNEL_ID and PODMESH_PUBLIC_HOSTNAME. Same environment otherwise as
+the manager suites.
 
-Verified from outside: the standby's connector is refused by the lease gate; the governor's start
-is refused without an account of the previous publisher; started, its unit is active, cloudflared
-registered a connection (its identity from the unit's journal), the origin at the service address
-answers ready with the logical manager, the carrier's replica and the epoch, and an external
-request through the public hostname answers the same; on the rotation the old governor's fence
-stops its connector and removes its mark BEFORE its alias and route go (the fence's report, in
-that order), its replica then answers 503 at its own address; the new governor publishes and
-starts, the public hostname answers with the new epoch and the new replica; the old governor is no
-longer eligible and says why. Cleanup stops the connector, withdraws everything and removes the
-secrets; the laboratory tunnel and hostname stay as fixtures. The credential never leaves Podman's
-store except into the connector's root-only runtime copy, removed with it.
+Verified from outside: the standby's connector is refused by the lease gate; the active manager's
+start is refused without an account of the previous publisher; started, its unit is active,
+cloudflared registered a connection (its identity from the unit's journal), the origin at the
+service address answers ready with the logical manager, the carrier's replica and the epoch, and
+an external request through the public hostname answers the same; on the rotation the old active
+manager's fence stops its connector and removes its mark BEFORE its alias and route go (the
+fence's report, in that order), its replica then answers 503 at its own address; the new active
+manager publishes and starts, the public hostname answers with the new epoch and the new replica;
+the old active manager is no longer eligible and says why. Cleanup stops the connector, withdraws
+everything and removes the secrets; the laboratory tunnel and hostname stay as fixtures. The
+credential never leaves Podman's store except into the connector's root-only runtime copy, removed
+with it.
 """
 import io, json, os, pathlib, subprocess, sys, tarfile, tempfile, time, uuid, hashlib, urllib.request, urllib.error
 
@@ -37,7 +39,7 @@ HOSTNAME = os.environ['PODMESH_PUBLIC_HOSTNAME']
 CREDENTIALS = open(os.environ['PODMESH_TUNNEL_CREDENTIALS'], 'rb').read()
 control = tempfile.mkdtemp(prefix='podmesh-pub-')
 # PODMESH_PUBLISHER_HOSTS="lab-b=lab@…,lab-c=lab@…" names the aliases in play and their order (the first is the
-# first governor, the second takes over), so that a host out of reach can be left out; otherwise the usual three.
+# first active manager, the second takes over), so that a host out of reach can be left out; otherwise the usual three.
 targets = (dict(kv.split('=', 1) for kv in os.environ['PODMESH_PUBLISHER_HOSTS'].split(',')) if os.environ.get('PODMESH_PUBLISHER_HOSTS')
            else {a: os.environ[v] for a, v in (('lab-a', 'PODMESH_SOURCE_SSH'), ('lab-b', 'PODMESH_DESTINATION_SSH'), ('lab-c', 'PODMESH_THIRD_SSH')) if os.environ.get(v)})
 hosts = {alias: Host(alias, target, control, socket_path, state_dir, unit) for alias, target in targets.items()}
@@ -177,7 +179,7 @@ try:
         assert r.get('ok'), (a, r)
     checks.append(f'{len(aliases)} replicas running with their credential declared on every host, the publisher declared on every host, the role on {G} under epoch {e1}; takeover proof {proof1["method"]} ({how})')
 
-    # a standby may not publish; the governor may not without the service address, nor without the authority's proof
+    # a standby may not publish; the active manager may not without the service address, nor without the authority's proof
     refused(pub('publisher_start', S, takeover_proof=proof1), LEASE_GATE_REASONS, f'{S} starting a connector without the lease')
     refused(pub('publisher_start', G, takeover_proof=proof1), 'no effective exclusive route', f'{G} starting a connector before publishing the service address')
     hosts[G].ok(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=addresses[G], exclusive_resource=LOGICAL))
@@ -192,7 +194,7 @@ try:
     refused(pub('publisher_start', G, takeover_proof=resigned(dict(proof1, method='lease_barrier', eligible_after=int(time.time()) + 600))), 'barrier', 'a barrier not yet reached')
     st = pub('publisher_status', G)['data']
     assert st['publisher_eligible'] is True and st['origin_readiness']['status'] == 503, st
-    checks.append('before the start: the governor eligible, its origin answering 503 (no governor mark yet)')
+    checks.append('before the start: the active manager eligible, its origin answering 503 (the active manager\'s mark not written yet)')
     r = pub('publisher_start', G, takeover_proof=proof1, previous={'none': True})
     assert r.get('ok') and r['data']['published'] is True and r['data']['connector_id'], r
     st = wait_connector(G)
@@ -205,7 +207,7 @@ try:
     pub('publisher_observed', G, observation={'hostname': HOSTNAME, 'status': status, 'body': body, 'from': 'workstation'})
     checks.append(f'an external request to https://{HOSTNAME}/ready answered 200 with the logical manager, {G}\'s replica and epoch {e1}; recorded')
 
-    # the rotation: the old governor's fence stops the connector and removes the mark before the address goes
+    # the rotation: the old active manager's fence stops the connector and removes the mark before the address goes
     rot2 = tool('rotate', '--universe', LOGICAL, '--host', targets[S], '--lease', '20', '--margin', '5')  # short: the permit gate is tested alone at the end
     e2 = rot2['epoch']
     assert rot2['takeover_proof']['method'] == 'lease_barrier' and rot2['takeover_proof']['previous_holder'] == hosts[G].identity, rot2['takeover_proof']
@@ -261,7 +263,7 @@ try:
     refused(pub('publisher_start', S, takeover_proof=proof2), 'expired', f'{S} starting a connector under a lapsed lease while its route and alias are still effective')
     checks.append('the permit gate alone refused: the service address still effective, the lease lapsed, no fence run')
     print(json.dumps({'result': 'PASS', 'checks': checks, 'hostname': HOSTNAME, 'tunnel': TUNNEL_ID[:8], 'epochs': [e1, e2], 'gate': gate_state,
-                      'not_proven': ['the partition that cuts the old governor from peers and agent while it keeps its Internet egress: its own suite',
+                      'not_proven': ['the partition that cuts the old active manager from peers and agent while it keeps its Internet egress: its own suite',
                                      'the manager\'s web interface behind the origin: the origin is the readiness responder',
                                      'a request that reached a standby through Cloudflare: one connector only in this candidate']}, indent=2))
 finally:

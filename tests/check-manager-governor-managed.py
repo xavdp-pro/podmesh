@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Steps 5 and 6 of M-U2: the governor role under the epoch gate while all three replicas keep
+"""Steps 5 and 6 of M-U2: the active manager role under the epoch gate while all three replicas keep
 running; exactly one exclusive route before and after a takeover; withdrawal observed before the
 new publication; stale permit and old active refused; duplicate address refused; a peer lost and
 reconnected. Same environment as check-manager-replicas-managed.py, plus PODMESH_FENCING_LAB; PODMESH_GATE and
@@ -11,11 +11,11 @@ behind what the hosts have seen (a lost gate) is brought forward by explicit tra
 recovery replica id, and the report says so; the epochs of one run are relative to its start.
 
 The exclusive effect is the publication of the logical manager's service route -- a /32 of an
-address of the prefix outside every pool, announced by the governor's host only, under the
+address of the prefix outside every pool, announced by the active manager's host only, under the
 activation lease on the resource "logical manager UUID". Answering traffic at that address
 inside the replica is not built (an address alias in the container is a later step); what is
 proven is that the announcement exists on exactly one host at every moment, that the old
-host's fence withdraws it before the new governor publishes, and that no replica stops.
+host's fence withdraws it before the new active manager publishes, and that no replica stops.
 """
 import io, json, os, pathlib, subprocess, sys, tarfile, tempfile, time, uuid, hashlib
 
@@ -166,7 +166,7 @@ try:
     converged(3)
     checks.append('three replicas running and converged on the managed network (step 4 reproduced)')
 
-    # 5a. no governor yet: no host may publish the service route
+    # 5a. no active manager yet: no host may publish the service route
     A, B, C = hosts['lab-a'], hosts['lab-b'], hosts['lab-c']
     refused(A, hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=addresses['lab-a'], exclusive_resource=str(uuid.uuid4())),
             'under no activation policy', 'exclusive route for a resource under no policy')
@@ -182,10 +182,10 @@ try:
     pub = A.ok(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=addresses['lab-a'], exclusive_resource=LOGICAL))
     assert any(r['ip'] == SERVICE and r['effective'] and r['exclusive_resource'] == LOGICAL for r in pub['effective']['published_routes']), pub
     assert service_announced() == ['lab-a'], service_announced()
-    checks.append(f'exactly one governor: the service route is announced on lab-a only, under epoch {e1}, and refused elsewhere')
+    checks.append(f'exactly one active manager: the service route is announced on lab-a only, under epoch {e1}, and refused elsewhere')
 
     # 5c. takeover to lab-b while every replica keeps running: rotation, supersession, withdrawal
-    # observed on the old governor BEFORE the new publication, then the new announcement.
+    # observed on the old active manager BEFORE the new publication, then the new announcement.
     rot2 = tool('rotate', '--universe', LOGICAL, '--host', targets['lab-b'], '--lease', '30', '--margin', '5')
     assert rot2['epoch'] == e1 + 1, rot2
     over = A.ok(request('activation_supersede', LOGICAL, reference, permit=rot2['permit']))
@@ -194,17 +194,17 @@ try:
     fence = A.ok({'operation': 'activation_fence', 'operation_id': str(uuid.uuid4()), 'authorization_ref': reference, 'timeout_seconds': 10})
     w = [r for r in fence['routes_withdrawn'] if r['ip'] == SERVICE]
     assert w and w[0]['withdrawn'] is True, fence
-    assert service_announced() == [], 'the old governor still announces the service address after its fence'
+    assert service_announced() == [], 'the old active manager still announces the service address after its fence'
     assert all(running(h, universes[a]) for a, h in hosts.items()), 'a replica stopped during the takeover'
     refused(A, hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=addresses['lab-a'], exclusive_resource=LOGICAL),
-            'superseded', 'the old governor publishing again under its superseded lease')
+            'superseded', 'the old active manager publishing again under its superseded lease')
     pub2 = B.ok(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=addresses['lab-b'], exclusive_resource=LOGICAL))
     assert service_announced() == ['lab-b'], service_announced()
     stale = dict(rot['permit'], replica_id=C.identity, instance_id=C.call('boot_id')['boot_id'], grant_id='forged-stale')
     refused(C, request('activation_acquire', LOGICAL, reference, permit=stale), 'superseded', f'a stale epoch-{e1} permit bound to the third host')
     refused(C, hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=addresses['lab-c'], exclusive_resource=LOGICAL),
             LEASE_GATE_REASONS, 'the third host publishing without the role')
-    checks.append('takeover with all three replicas running: superseded, the old governor\'s fence withdrew the service route before lab-b published it; exactly one announcement at every observed moment; stale permit and the old governor refused')
+    checks.append('takeover with all three replicas running: superseded, the old active manager\'s fence withdrew the service route before lab-b published it; exactly one announcement at every observed moment; stale permit and the old active manager refused')
     converged(3)
     checks.append('facts still converged after the takeover: replication was never interrupted')
 

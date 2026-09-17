@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """Host-side publisher follow, under a written mandate -- and under nothing else.
 
-The daemon still does not elect a governor or mint a takeover proof. This tick reads
+The daemon still does not elect an active manager or mint a takeover proof. This tick reads
 publisher_status, starts the connector only with the installed proof when this host is
 eligible at that epoch, and stops it when this host is not eligible. See
 docs/PUBLISHER-FOLLOW-LAB.md.
 
 A mandate that renews is BOUNDED, and refused otherwise. An unbounded renewal would push the
-holder's lease forward for ever, and lease expiry is the only thing that withdraws a governor
-nobody can reach: with it gone, a partitioned host keeps publishing while a standby takes the
-role at the barrier, which is the two-connector case the contract forbids. So `renew=1`
-requires `not_after` (the wall-clock second the mandate dies) and `renew_below` (renew only
-inside that many seconds of the lease's end, which also keeps the journal from growing by one
-row every tick). After `not_after` the tick grants nothing more and renews nothing: what is
-published runs out its lease and the tick's own stop branch withdraws it.
+holder's lease forward for ever, and lease expiry is the only thing that withdraws an active
+manager nobody can reach: with it gone, a partitioned host keeps publishing while a standby
+takes the role at the barrier, which is the two-connector case the contract forbids. So
+`renew=1` requires `not_after` (the wall-clock second the mandate dies) and `renew_below`
+(renew only inside that many seconds of the lease's end, which also keeps the journal from
+growing by one row every tick). After `not_after` the tick grants nothing more and renews
+nothing: what is published runs out its lease and the tick's own stop branch withdraws it.
 """
 import json, os, subprocess, sys, tempfile, time, uuid
 

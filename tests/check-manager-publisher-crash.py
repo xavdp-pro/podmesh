@@ -3,7 +3,7 @@
 reported failed never stays active. One lab host, the daemon restarted under a lab fault at each
 point of `publisher_start` -- after the mark, after the connector, before the transition is
 recorded effective, and during the compensation -- as a storage failure (refused) or a crash. After
-each, from outside: no connector unit active, no governor mark (the origin answers 503), no
+each, from outside: no connector unit active, no active manager's mark (the origin answers 503), no
 transition recorded, and the restart's reconciliation reporting what it withdrew; then a fault-free
 start publishes and is stopped. Also: an effective publisher whose lease is superseded is withdrawn
 by reconciliation at the next restart.

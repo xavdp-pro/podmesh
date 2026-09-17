@@ -28,7 +28,7 @@ assert "renew must be 0 or 1" in p.stderr
 checks.append('refuses a mandate whose renew is not 0 or 1')
 
 # The bound on renewal: a mandate that renews for ever would make the holder's lease immortal,
-# and lease expiry is what withdraws a governor nobody can reach.
+# and lease expiry is what withdraws an active manager nobody can reach.
 bad.write_text(f'authorization_ref=ok\nresource={UUID}\nproof=/tmp/x\nrenew=1\nrenew_below=900\n')
 p = run({'PODMESH_PUBLISHER_FOLLOW_MANDATE': str(bad)}, 3)
 assert 'not_after' in p.stderr

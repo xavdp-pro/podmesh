@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""The governor's replica answers at the logical manager's service address, from every host, and
-only the governor's does. Three replicas run on the managed network (step 4); the gate rotates
-the role to lab-a; lab-a publishes the exclusive route, which gives its replica the service
-address as an alias inside the universe's network namespace; lab-b and lab-c publish the plain
-route that follows the role (the address via the governor's host). Verified from outside: a TCP
-connection to the service address and port from lab-b and from lab-c is accepted; the address is
-carried by lab-a's replica only (read inside each universe's namespace from the host); the
-resident's status on lab-a counts the connections. Then the role moves to lab-b with all three
-running: lab-a's fence withdraws the route and the alias, the follow routes are withdrawn and
-republished, lab-b publishes the exclusive route and its replica carries the address; the
-connection from lab-a and lab-c now lands on lab-b's replica, lab-a's replica carries nothing.
-Between the two, with nothing announced, the connection fails at once. Cleanup returns the hosts
-to their initial state.
+"""The active manager's replica answers at the logical manager's service address, from every
+host, and only the active manager's does. Three replicas run on the managed network (step 4);
+the gate rotates the role to lab-a; lab-a publishes the exclusive route, which gives its replica
+the service address as an alias inside the universe's network namespace; lab-b and lab-c publish
+the plain route that follows the role (the address via the active manager's host). Verified from
+outside: a TCP connection to the service address and port from lab-b and from lab-c is accepted;
+the address is carried by lab-a's replica only (read inside each universe's namespace from the
+host); the resident's status on lab-a counts the connections. Then the role moves to lab-b with
+all three running: lab-a's fence withdraws the route and the alias, the follow routes are
+withdrawn and republished, lab-b publishes the exclusive route and its replica carries the
+address; the connection from lab-a and lab-c now lands on lab-b's replica, lab-a's replica
+carries nothing. Between the two, with nothing announced, the connection fails at once. Cleanup
+returns the hosts to their initial state.
 
 Same environment as check-manager-governor-managed.py. The images must be built from configurations
 whose replicas listen on every address (bind 0.0.0.0): a replica bound to its own address alone
@@ -109,9 +109,9 @@ def gate_ready():
     gate.close()
     return state
 
-def follow(alias, governor):
-    """On a host that is not the governor's: the plain route to the service address via the governor's host."""
-    return hosts[alias].ok(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=lab_hosts[governor]))
+def follow(alias, active_manager):
+    """On a host that is not the active manager's: the plain route to the service address via the active manager's host."""
+    return hosts[alias].ok(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=lab_hosts[active_manager]))
 
 def withdraw(alias):
     hosts[alias].ok(hostwide('network_route_withdraw', universe_uuid=LOGICAL))
@@ -133,7 +133,7 @@ try:
     assert carriers() == [] and connect_from(B).startswith('failed'), (carriers(), connect_from(B))
     checks.append('three replicas running; nothing announced: no replica carries the service address and a connection to it fails at once')
 
-    # the governor on lab-a: exclusive route + alias; the two others follow
+    # the active manager on lab-a: exclusive route + alias; the two others follow
     rot = tool('rotate', '--universe', LOGICAL, '--host', targets['lab-a'], '--lease', '120', '--margin', '5')
     for other in ('lab-b', 'lab-c'):
         hosts[other].ok(request('activation_require', LOGICAL, reference, lease_seconds=120, takeover_margin_seconds=5, desired_standbys=2, authority_id=rot['permit']['authority_id']))
@@ -149,7 +149,7 @@ try:
     assert b.startswith('accepted') and c.startswith('accepted'), (b, c)
     after = A.ok(request('manager_status', universes['lab-a'], reference))['resident_status']
     counted = {k: (before.get(k), after.get(k)) for k in ('peak_incoming', 'rejected_connections', 'active_incoming')}
-    checks.append(f'the governor\'s replica carries the service address (verified inside its namespace) and accepts a connection to it from lab-b and from lab-c; resident counters before/after: {counted}')
+    checks.append(f'the active manager\'s replica carries the service address (verified inside its namespace) and accepts a connection to it from lab-b and from lab-c; resident counters before/after: {counted}')
 
     # the role moves to lab-b with all three running: withdrawal before publication, everywhere
     rot2 = tool('rotate', '--universe', LOGICAL, '--host', targets['lab-b'], '--lease', '120', '--margin', '5')
@@ -168,10 +168,10 @@ try:
     a, c = connect_from(A), connect_from(C)
     assert a.startswith('accepted') and c.startswith('accepted'), (a, c)
     assert all(running(h, universes[x]) for x, h in hosts.items())
-    checks.append('the new governor\'s replica carries the address and accepts the connection from lab-a and from lab-c; lab-a\'s replica carries nothing; all three still running')
+    checks.append('the new active manager\'s replica carries the address and accepts the connection from lab-a and from lab-c; lab-a\'s replica carries nothing; all three still running')
     withdraw('lab-b')
     assert carriers() == [], 'the alias outlived the route\'s withdrawal'
-    checks.append('a plain withdrawal on the governor takes the alias with the route')
+    checks.append('a plain withdrawal on the active manager takes the alias with the route')
     print(json.dumps({'result': 'PASS', 'checks': checks, 'service': f'{SERVICE}:{PORT}', 'gate': gate_state, 'epochs': [rot['epoch'], rot2['epoch']],
                       'not_proven': ['an authenticated exchange at the service address: the connection is accepted by the resident\'s listener, its protocol then needs a peer key',
                                      'a real partition or host loss']}, indent=2))

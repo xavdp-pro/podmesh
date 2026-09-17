@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""The hard test of the publisher contract (item 6) and of the operator's decision 4: the governor's
-host cut from its peer and from the agent while it keeps its Internet egress, so that its connector
-stays reachable by Cloudflare; its lease lapses on its own clock; its own timer stops the
-connector, removes the governor mark, withdraws the alias and the route -- BEFORE the standby,
-which waited lease plus margin, publishes and starts its connector; and the public hostname then
-answers with the standby's replica and the new epoch. After the dead man's switch reconnects the
-old governor, its journal shows the timer's fence in that order and at a time before the standby's
-start; it is superseded, follows the role, converges as a standby and its connector stays stopped.
+"""The hard test of the publisher contract (item 6) and of the operator's decision 4: the active
+manager's host cut from its peer and from the agent while it keeps its Internet egress, so that its
+connector stays reachable by Cloudflare; its lease lapses on its own clock; its own timer stops the
+connector, removes the active manager's mark, withdraws the alias and the route -- BEFORE the
+standby, which waited lease plus margin, publishes and starts its connector; and the public
+hostname then answers with the standby's replica and the new epoch. After the dead man's switch
+reconnects the old active manager, its journal shows the timer's fence in that order and at a time
+before the standby's start; it is superseded, follows the role, converges as a standby and its
+connector stays stopped.
 
-Environment: PODMESH_PUBLISHER_HOSTS="<governor alias>=<ssh>,<standby alias>=<ssh>", the
-transient service variables, PODMESH_CLI (the CLI beside the daemon on the governor's host),
-PODMESH_MANAGER_CANDIDATE, PODMESH_REPLICA_SET, PODMESH_REPLICA_CONFIGS, PODMESH_LAB_HOSTS,
-PODMESH_FENCING_LAB, PODMESH_TUNNEL_CREDENTIALS, PODMESH_TUNNEL_ID, PODMESH_PUBLIC_HOSTNAME.
-The cut drops only the standby's host, its pool and the workstation: Cloudflare's edge stays
-reachable. The dead man's switch is armed and verified BEFORE the cut.
+Environment: PODMESH_PUBLISHER_HOSTS="<active manager alias>=<ssh>,<standby alias>=<ssh>", the
+transient service variables, PODMESH_CLI (the CLI beside the daemon on the active manager's
+host), PODMESH_MANAGER_CANDIDATE, PODMESH_REPLICA_SET, PODMESH_REPLICA_CONFIGS,
+PODMESH_LAB_HOSTS, PODMESH_FENCING_LAB, PODMESH_TUNNEL_CREDENTIALS, PODMESH_TUNNEL_ID,
+PODMESH_PUBLIC_HOSTNAME. The cut drops only the standby's host, its pool and the workstation:
+Cloudflare's edge stays reachable. The dead man's switch is armed and verified BEFORE the cut.
 """
 import io, json, os, pathlib, subprocess, sys, tarfile, tempfile, time, uuid, hashlib, urllib.request, urllib.error
 
@@ -243,11 +244,11 @@ try:
     assert status == 200 and body['replica_id'] == replica_ids[G] and body['epoch'] == e1, (status, body)
     timer_start(A, mandate)
     time.sleep(4)
-    assert pub('publisher_status', G)['data']['unit']['state'] == 'active', 'the timer stopped a live governor\'s connector'
+    assert pub('publisher_status', G)['data']['unit']['state'] == 'active', 'the timer stopped a live active manager\'s connector'
     lease_expires = A.ok(request('activation_status', LOGICAL, reference))['expires_at']
-    checks.append(f'{G} the governor under epoch {e1}, its connector registered, the public hostname answering with its replica; its self-withdrawal timer running under a mandate; lease to expire at {lease_expires}')
+    checks.append(f'{G} the active manager under epoch {e1}, its connector registered, the public hostname answering with its replica; its self-withdrawal timer running under a mandate; lease to expire at {lease_expires}')
 
-    # the cut: the governor alone with the Internet -- the standby, its pool and the workstation dropped
+    # the cut: the active manager alone with the Internet -- the standby, its pool and the workstation dropped
     agent = A.ssh('echo $SSH_CLIENT').stdout.decode().split()[0]
     clock_g_at_cut = A.call('time')['time']
     cut(A, [lab_hosts[S], POOLS[S], agent], CUT_SECONDS)
@@ -255,9 +256,9 @@ try:
     checks.append(f'{G} cut from {S}, its pool and the agent for {CUT_SECONDS} s, its Internet egress kept; the dead man\'s switch armed first')
     wait = LEASE + MARGIN + 1
     time.sleep(wait)
-    # by now the governor's own timer must have stopped its connector: the public hostname answers nothing usable
+    # by now the active manager's own timer must have stopped its connector: the public hostname answers nothing usable
     status, body = public_ready(20)
-    assert status != 200 or body.get('ready') is not True, f'the cut governor still publishes after its lease lapsed: {status} {body}'
+    assert status != 200 or body.get('ready') is not True, f'the cut active manager still publishes after its lease lapsed: {status} {body}'
     checks.append(f'{wait} s after the cut, without reaching {G}: the public hostname no longer answers ready ({status}) -- its own timer withdrew the connector')
     rot2 = tool('rotate', '--universe', LOGICAL, '--host', targets[S], '--lease', str(LEASE), '--margin', str(MARGIN))
     e2 = rot2['epoch']
@@ -316,7 +317,7 @@ try:
     checks.append(f'{G} reconnected: superseded, following the role, converged as a standby, its connector still stopped')
     print(json.dumps({'result': 'PASS', 'checks': checks, 'hostname': HOSTNAME, 'epochs': [e1, e2], 'gate': gate_state,
                       'clocks': {'cut_at_g': clock_g_at_cut, 'lease_expires_g': lease_expires, 'withdrawn_at_g': withdrawn_at_g, 'publish_at_s': publish_at_s},
-                      'not_proven': ['clocks that lie: the lapse on the governor\'s clock, the wait on the agent\'s, compared with a one-second allowance',
+                      'not_proven': ['clocks that lie: the lapse on the active manager\'s clock, the wait on the agent\'s, compared with a one-second allowance',
                                      'a wedged daemon on the cut side: lease-expiry self-withdrawal needs the daemon alive']}, indent=2))
 finally:
     try:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Epoch-bound activation: the maker's screen, as the fencing laboratory defines it.
+"""Epoch-bound activation: the node's epoch screen, as the fencing laboratory defines it.
 
 Runs against a daemon over the local socket; no Podman, no root. The permits are minted here,
 because the gate is the laboratory's fixture and PodMesh never contacts it: what is under test

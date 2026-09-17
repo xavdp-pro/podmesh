@@ -8,11 +8,12 @@ the lease and the installed proof stay. Replicas go one at a time so the fact se
 replication -- the counter-review of 2026-09-16 recorded that recreating all three at once would
 lose every fact, administrators included.
 
-Coupure: the public hostname answers 503 (not the governor) from the governor's replacement until
-`tools/arm-publisher-follow.py --refresh` puts the mark back -- run it right after, and warn anyone
-looking at the page first. Environment: PODMESH_SOCKET, PODMESH_STATE_DIR, PODMESH_UNIT,
-PODMESH_REPLICA_CONFIGS, PODMESH_REPLICA_SET, PODMESH_PUBLISHER_HOSTS (alias=ssh-target pairs,
-comma-separated) and PODMESH_WEB_TREE (the web tree holding packaging/podmesh-manager).
+Outage: the public hostname answers 503 (not the active manager) from the active manager's
+replacement until `tools/arm-publisher-follow.py --refresh` puts the mark back -- run it right
+after, and warn anyone looking at the page first. Environment: PODMESH_SOCKET, PODMESH_STATE_DIR,
+PODMESH_UNIT, PODMESH_REPLICA_CONFIGS, PODMESH_REPLICA_SET, PODMESH_PUBLISHER_HOSTS
+(alias=ssh-target pairs, comma-separated) and PODMESH_WEB_TREE (the web tree holding
+packaging/podmesh-manager).
 """
 import json, os, subprocess, sys, tempfile, uuid
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -48,13 +49,13 @@ origin_tar = open(os.path.join(UNIVERSE, 'origin.tar'), 'rb').read()
 # 1. the ticks stand down while the replicas are replaced
 for a, h in hosts.items():
     h.ssh('sudo -n systemctl stop podmesh-publisher-follow-lab.timer 2>/dev/null', check=False)
-say('ticks arrêtés')
+say('ticks stopped')
 
 # 2 & 3. the connector and the service address go before their carrier does
 r = hosts[G].api(dict(operation='publisher_stop', operation_id=str(uuid.uuid4()), authorization_ref=ref, resource=LOGICAL))
 say(f'publisher_stop: {r.get("ok")} {r.get("error", "")[:80]}')
 r = hosts[G].api(hostwide('network_route_withdraw', universe_uuid=LOGICAL))
-say(f'route retirée: {r.get("ok")} {r.get("error", "")[:80]}')
+say(f'route withdrawn: {r.get("ok")} {r.get("error", "")[:80]}')
 
 # 4. the image, then the replica, host by host
 universes = {}
@@ -65,7 +66,7 @@ for a, h in hosts.items():
         h.api(request('stop', u, ref, timeout_seconds=20, on_timeout='kill'))
         h.api(request('delete', u, ref))
         h.call('podman_run', args=['rm', '--force', '--time', '0', name], check=False)
-    say(f'{a}: ancienne réplique retirée')
+    say(f'{a}: old replica removed')
     h.ssh(f'sudo -n install -m 0644 /dev/stdin {BUILD_DIR}/entrypoint.sh', input_bytes=open(os.path.join(UNIVERSE, 'entrypoint.sh'), 'rb').read())
     h.ssh(f'sudo -n install -m 0644 /dev/stdin {BUILD_DIR}/Containerfile.generic', input_bytes=open(os.path.join(UNIVERSE, 'Containerfile.alpine'), 'rb').read())
     h.ssh(f'sudo -n rm -rf {BUILD_DIR}/origin {BUILD_DIR}/origin.py && sudo -n tar -xf - -C {BUILD_DIR}', input_bytes=origin_tar)
@@ -74,18 +75,18 @@ for a, h in hosts.items():
     build = h.ssh('sudo -n sh -c "cd ' + BUILD_DIR + ' && podman build --quiet -f Containerfile.generic -t localhost/podmesh-manager-universe:m-u2-generic ." 2>&1 | tail -2', check=False)
     image = build.stdout.decode().strip()
     assert len(image) >= 12 and 'rror' not in image, (a, 'image build failed', image[-300:])
-    say(f'{a}: image reconstruite {image[-12:]}')
+    say(f'{a}: image rebuilt {image[-12:]}')
     declare_replica_config(h, a, ref, state_dir)
     u = str(uuid.uuid4())
     universes[a] = u
     replica_create(h, u, a, ref, addresses[a], request)
     started = h.ok(request('start', u, ref, observe_seconds=4))
     assert started['application_outcome'] == 'running_when_observed', (a, started['application_outcome'])
-    say(f'{a}: réplique {u[:8]} démarrée à {addresses[a]}')
+    say(f'{a}: replica {u[:8]} started at {addresses[a]}')
 
-# 5. the service address back on the governor's new carrier
+# 5. the service address back on the active manager's new carrier
 hosts[G].ok(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=addresses[G], exclusive_resource=LOGICAL))
-say('adresse de service republiée sur le gouverneur')
+say('service address published again on the active manager')
 
 # 6. the ticks again, same bounded mandate, same proof
 for a, h in hosts.items():
@@ -95,5 +96,5 @@ for a, h in hosts.items():
           f'--setenv=PODMESH_SOCKET={os.environ["PODMESH_SOCKET"]} --setenv=PODMESH_CLI={d}/podmesh '
           f'--setenv=PODMESH_PUBLISHER_FOLLOW_MANDATE=/run/podmesh-publisher-follow/mandate '
           f'/usr/local/lib/podmesh-publisher-follow-lab/podmesh-publisher-follow')
-say('ticks réarmés')
+say('ticks re-armed')
 print(json.dumps({'universes': universes, 'governor': G}, indent=2))

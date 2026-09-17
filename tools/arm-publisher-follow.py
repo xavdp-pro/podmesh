@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Arm laboratory publisher-follow on podmesh-dev-ha: replicas, governor, declared publisher,
+"""Arm laboratory publisher-follow on podmesh-dev-ha: replicas, active manager, declared publisher,
 installed proof, host-side timer. Does not package, push, or touch podmesh.service.
 
 Environment: same as the manager publisher suites, plus the private Cloudflare files.
@@ -136,7 +136,7 @@ def install_follow(h, cli, proof):
     h.ssh(f'sudo -n install -m 0600 /dev/stdin {PROOF_REMOTE}', input_bytes=json.dumps(proof).encode())
     # Bounded: the mandate dies on its own clock, and renewal happens near the lease's end, not
     # every tick. An unbounded renewal would make the holder's lease immortal, and lease expiry
-    # is what withdraws a governor nobody can reach (docs/PUBLISHER-FOLLOW-LAB.md).
+    # is what withdraws an active manager nobody can reach (docs/PUBLISHER-FOLLOW-LAB.md).
     mandate = (f'authorization_ref={REFERENCE}\nresource={LOGICAL}\nproof={PROOF_REMOTE}\nrenew=1\n'
                f'not_after={int(time.time()) + MANDATE_SECONDS}\nrenew_below={RENEW_BELOW}\n')
     h.ssh(f'sudo -n install -m 0600 /dev/stdin {MANDATE_REMOTE}', input_bytes=mandate.encode())
@@ -204,8 +204,8 @@ def ensure_administrator(alias, universe):
     return json.loads(p.stdout)
 
 
-def follow_route(alias, governor):
-    r = hosts[alias].api(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=lab_hosts[governor]))
+def follow_route(alias, active_manager):
+    r = hosts[alias].api(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=lab_hosts[active_manager]))
     if r.get('ok'):
         return r
     err = r.get('error') or ''

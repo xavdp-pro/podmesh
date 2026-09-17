@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""A real partition of the universe network: the governor's host is cut from the two other hosts
-(every packet between them dropped by an nftables rule on the governor's host, both directions),
-while the agent -- this suite, from the workstation -- still reaches every host. What is shown,
-from outside: the three replicas diverge (the two connected ones converge on a fact the cut one
-never sees), the service address is unreachable from the cut side, the agent moves the role to a
-connected host (rotation, supersession delivered to the cut host, its fence withdrawing route and
-alias), the connected hosts reach the service address again, and on reconnection the cut host's
-replica converges as a simple replica and reaches the service address through the follow route.
-Cleanup removes the rule -- and a dead man's switch on the host removes it anyway after ten
-minutes, in case this suite dies with the cut in place.
+"""A real partition of the universe network: the active manager's host is cut from the two other
+hosts (every packet between them dropped by an nftables rule on the active manager's host, both
+directions), while the agent -- this suite, from the workstation -- still reaches every host.
+What is shown, from outside: the three replicas diverge (the two connected ones converge on a
+fact the cut one never sees), the service address is unreachable from the cut side, the agent
+moves the role to a connected host (rotation, supersession delivered to the cut host, its fence
+withdrawing route and alias), the connected hosts reach the service address again, and on
+reconnection the cut host's replica converges as a simple replica and reaches the service address
+through the follow route. Cleanup removes the rule -- and a dead man's switch on the host removes
+it anyway after ten minutes, in case this suite dies with the cut in place.
 
-What it does NOT show, and says so: a partition that also cuts the agent from the governor's host.
-PodMesh acts on nothing by itself, so a host no agent can reach keeps its alias until an agent
-reaches it -- the self-fence is an operation, and whether it may run on a timer is the operator's
-decision (UNIVERSE-HIGH-AVAILABILITY.md). The takeover margin bounds what a correct agent does,
-not what an unreachable host does.
+What it does NOT show, and says so: a partition that also cuts the agent from the active manager's
+host. PodMesh acts on nothing by itself, so a host no agent can reach keeps its alias until an
+agent reaches it -- the self-fence is an operation, and whether it may run on a timer is the
+operator's decision (UNIVERSE-HIGH-AVAILABILITY.md). The takeover margin bounds what a correct
+agent does, not what an unreachable host does.
 
 Same environment as check-manager-service-address.py; nftables on the hosts.
 """
@@ -104,8 +104,8 @@ def gate_ready():
     gate.close()
     return state
 
-def follow(alias, governor):
-    return hosts[alias].ok(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=lab_hosts[governor]))
+def follow(alias, active_manager):
+    return hosts[alias].ok(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=lab_hosts[active_manager]))
 
 def withdraw(alias):
     hosts[alias].ok(hostwide('network_route_withdraw', universe_uuid=LOGICAL))
@@ -199,7 +199,7 @@ try:
     A.ok(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=addresses['lab-a'], exclusive_resource=LOGICAL))
     follow('lab-b', 'lab-a'); follow('lab-c', 'lab-a')
     assert carriers() == ['lab-a'] and connect_from(B).startswith('accepted')
-    checks.append('three replicas converged, the governor on lab-a carrying the service address, reachable from lab-b')
+    checks.append('three replicas converged, the active manager on lab-a carrying the service address, reachable from lab-b')
 
     # the cut: lab-a's host from the two others, both directions; the agent still reaches lab-a
     # The other hosts' addresses AND their pools: with the source NAT off inside the prefix, the
@@ -242,7 +242,7 @@ try:
     checks.append('reconnection: the cut replica converged on the fourth fact as a simple replica, lab-a reaches the service address on lab-b through the follow route, and the address is carried by lab-b\'s replica only')
     print(json.dumps({'result': 'PASS', 'checks': checks, 'facts_during_cut': {'connected': connected, 'cut_side': cut_side}, 'facts_after': healed,
                       'gate': gate_state, 'epochs': [rot['epoch'], rot2['epoch']],
-                      'not_proven': ['a partition that also cuts the agent from the governor\'s host: the cut host then keeps its alias until an agent reaches it, since the self-fence is an operation and PodMesh runs no timer',
+                      'not_proven': ['a partition that also cuts the agent from the active manager\'s host: the cut host then keeps its alias until an agent reaches it, since the self-fence is an operation and PodMesh runs no timer',
                                      'a host loss', 'an authenticated exchange at the service address']}, indent=2))
 finally:
     reconnect(A)

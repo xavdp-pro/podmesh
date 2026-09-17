@@ -4,7 +4,7 @@ agent calling anything, withdraws the role's route and the address its replica c
 host (PODMESH_SOURCE_SSH), the transient service variables, PODMESH_NETWORK_PEER_VIAS, and the
 `podmesh` CLI installed beside the daemon (PODMESH_CLI on the host; default /usr/bin/podmesh).
 
-The shape is the governor's: a universe on the managed network (an Alpine `sleep`, under no
+The shape is the active manager's: a universe on the managed network (an Alpine `sleep`, under no
 policy of its own, so it is never stopped), a resource under an activation policy with a short
 lease (leases alone, no authority), the lease acquired here, and the exclusive route published
 so that the universe carries the address. The packaged script `packaging/podmesh-fence` is run

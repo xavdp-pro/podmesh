@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Step 7 of M-U2: a recovery point combined with the running replica set -- rescue, not the only
-copy. Three replicas run on the managed network with a governor announced; one replica (lab-c's)
-is stopped through the typed stop, a recovery point is prepared from it, and the replica is then
-DELETED, its address released. While it is gone the set moves on (lab-b's replica restarts and
-appends a boot fact the lost replica never saw). The point is restored on lab-c into quarantine
-(isolated, as every restore is), promoted into the replica's own identity under the managed
-profile at the address the restore reported as the source's, and started: it comes back with the
-facts of the point, imports the one it missed from its peers, appends its own new boot fact, and
-the three replicas converge again -- all while the governor's announcement never moved.
+copy. Three replicas run on the managed network with an active manager announced; one replica
+(lab-c's) is stopped through the typed stop, a recovery point is prepared from it, and the
+replica is then DELETED, its address released. While it is gone the set moves on (lab-b's replica
+restarts and appends a boot fact the lost replica never saw). The point is restored on lab-c into
+quarantine (isolated, as every restore is), promoted into the replica's own identity under the
+managed profile at the address the restore reported as the source's, and started: it comes back
+with the facts of the point, imports the one it missed from its peers, appends its own new boot
+fact, and the three replicas converge again -- all while the active manager's announcement never
+moved.
 
 Same environment as check-manager-governor-managed.py. Verified from outside: the promoted
 container's address from Podman, the fact sets from `podman cp` copies inspected by the attested
@@ -165,7 +166,7 @@ try:
     rot = tool('rotate', '--universe', LOGICAL, '--host', targets['lab-a'], '--lease', '120', '--margin', '5')
     A.ok(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=addresses['lab-a'], exclusive_resource=LOGICAL))
     assert service_announced() == ['lab-a']
-    checks.append(f'three replicas running and converged, the governor on lab-a under epoch {rot["epoch"]} with the service route announced there only')
+    checks.append(f'three replicas running and converged, the active manager on lab-a under epoch {rot["epoch"]} with the service route announced there only')
 
     # 1. the replica on lab-c is stopped through the typed stop, a point is prepared, and the replica is deleted
     stopped = C.ok(request('stop', universes['lab-c'], reference, timeout_seconds=20, on_timeout='kill'))
@@ -186,7 +187,7 @@ try:
     before = converged(4)
     assert set(before) == {'lab-a', 'lab-b'}, before
     assert service_announced() == ['lab-a']
-    checks.append('with the replica gone, the two others converged on a fourth fact it never saw; the governor\'s announcement did not move')
+    checks.append('with the replica gone, the two others converged on a fourth fact it never saw; the active manager\'s announcement did not move')
 
     # 3. rescue: the point restored on lab-c into quarantine (isolated), then promoted into the replica's own identity
     #    under the managed profile at the address the restore reported, under a lease on that universe
@@ -215,7 +216,7 @@ try:
     after = converged(5)
     assert set(after) == {'lab-a', 'lab-b', 'lab-c'} and after['lab-c']['import_sources'] == 2 and after['lab-c']['integrity'] == 'ok', after
     assert service_announced() == ['lab-a']
-    checks.append('the rescued replica came back at its address, imported the fact it had missed from both peers, appended its own boot fact, and the three converged on five facts; the governor unchanged throughout')
+    checks.append('the rescued replica came back at its address, imported the fact it had missed from both peers, appended its own boot fact, and the three converged on five facts; the active manager unchanged throughout')
     print(json.dumps({'result': 'PASS', 'checks': checks, 'recovery_point': point, 'facts_before_rescue': before, 'facts_after_rescue': after, 'gate': gate_state,
                       'not_proven': ['a host loss: the rescue is on the same host, a replica\'s address living in its host\'s pool',
                                      'a real partition', 'a signed manifest', 'the replica serving at the service address']}, indent=2))

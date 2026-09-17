@@ -1,8 +1,8 @@
-//! The publishing connector that follows the governor role (the operator's decision of
+//! The publishing connector that follows the active manager role (the operator's decision of
 //! 2026-09-15, `CLOUDFLARE-TUNNEL-MANAGER-HA-DECISION`).
 //!
 //! The logical manager has one public hostname, one logical Cloudflare tunnel and, in this first
-//! candidate, exactly one publishing `cloudflared`, co-located with the governor replica and
+//! candidate, exactly one publishing `cloudflared`, co-located with the active manager replica and
 //! governed by the same resource, epoch and fence. `cloudflared` is transport: it decides nothing.
 //!
 //! What this module does, all journaled and all recorded in the network effects ledger before
@@ -13,9 +13,9 @@
 //! - `publisher_start`: refused unless, in this order, the resource's lease is live and
 //!   unsuperseded here (the epoch gate), the exclusive route and the alias are effective on this
 //!   host, the previous publisher is accounted for (fenced, or the lease plus margin waited: the
-//!   agent's word, recorded as provenance and refused when absent), the governor mark is written
-//!   inside the carrier universe, and the origin answers ready at the service address with the
-//!   expected logical manager, replica and epoch. Then the connector runs as a transient unit
+//!   agent's word, recorded as provenance and refused when absent), the active manager's mark is
+//!   written inside the carrier universe, and the origin answers ready at the service address with
+//!   the expected logical manager, replica and epoch. Then the connector runs as a transient unit
 //!   from a root-only runtime copy of the credential, and the unit's activity is verified.
 //! - `publisher_stop`: the connector stopped and the mark removed, verified.
 //! - the fence (`withdraw_unentitled`): for a resource this host no longer holds, the connector
@@ -26,9 +26,9 @@
 //!   refusal reasons, the last start, stop, fence and externally observed request.
 //! - `publisher_observed`: the agent records an external request's result, as provenance.
 //!
-//! What it does not decide: which replica is governor (the gate does), whether the hostname
-//! resolves (Cloudflare's), and the manager's web interface (the origin here is the universe's
-//! epoch-qualified readiness responder).
+//! What it does not decide: which replica is the active manager (the gate does), whether the
+//! hostname resolves (Cloudflare's), and the manager's web interface (the origin here is the
+//! universe's epoch-qualified readiness responder).
 use crate::lifecycle as lc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -37,6 +37,8 @@ use std::io::{Read, Write};
 type Error = Box<dyn std::error::Error>;
 
 pub const KIND_PUBLISHER: &str = "publisher";
+// The active manager's mark. Its effect kind and its path inside the universe keep the names that
+// journals and running manager images already use; a later, compatible rename changes both.
 pub const KIND_MARK: &str = "governor_mark";
 const MARK_PATH: &str = "/run/podmesh-manager/governor.json";
 
@@ -318,7 +320,8 @@ fn origin_ready(ip: &str, port: u16) -> Result<(u16, Value), String> {
     Ok((status, serde_json::from_str(body).unwrap_or(json!({"raw": body}))))
 }
 
-/// The governor mark inside the carrier universe: written and removed with `podman exec`, root-only.
+/// The active manager's mark inside the carrier universe: written and removed with
+/// `podman exec`, root-only.
 pub(crate) fn mark_write(carrier: &str, resource: &str, epoch: i64) -> Result<(), Error> {
     // Lab-only: a mark one epoch behind, so that the readiness check has a lie to catch.
     let epoch = if std::env::var("PODMESH_FAULT").as_deref() == Ok("publisher-stale-mark") { epoch - 1 } else { epoch };
@@ -561,7 +564,7 @@ fn perform(db: &Connection, request: &Value, resource: &str) -> Result<Value, Er
                             }
                         }
                         Ok((status, body)) => {
-                            failure = Some(format!("the origin at {ip}:{} is not ready for this governor at epoch {epoch}: HTTP {status} {body}", p.origin_port));
+                            failure = Some(format!("the origin at {ip}:{} is not ready for this active manager at epoch {epoch}: HTTP {status} {body}", p.origin_port));
                             break;
                         }
                         Err(e) => {

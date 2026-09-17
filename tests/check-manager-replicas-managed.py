@@ -151,7 +151,7 @@ try:
     checks.append('the digests are %s' % views['lab-a']['logical_history_sha256'][:16])
     print(json.dumps({'result': 'PASS', 'checks': checks, 'report': report,
                       'not_proven': ['agent access to the control API: the resident exposes none; the only writer inside is the entrypoint',
-                                     'exclusive governor role, takeover, partition, route withdrawal and publication across hosts: steps 5 and 6',
+                                     'exclusive active manager role, takeover, partition, route withdrawal and publication across hosts: steps 5 and 6',
                                      'the source NAT of Podman\'s firewall on inter-host traffic: identity is the HMAC pair key, not the address']}, indent=2))
 finally:
     for a, h in hosts.items():

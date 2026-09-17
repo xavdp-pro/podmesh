@@ -25,8 +25,8 @@
 //!   operation ID, so a request the journal re-evaluates after a crash between the resident's
 //!   append and the journal's record is a replay for the resident too, and appends nothing twice.
 //!
-//! What this does not decide: whether an observation is exclusive to the governor (it is not:
-//! every replica appends in its own scopes and replication carries them), and who may hold
+//! What this does not decide: whether an observation is exclusive to the active manager (it is
+//! not: every replica appends in its own scopes and replication carries them), and who may hold
 //! `authorization_ref` (provenance, recorded, not verified, as everywhere in PodMesh).
 use crate::lifecycle as lc;
 type Error = Box<dyn std::error::Error>;

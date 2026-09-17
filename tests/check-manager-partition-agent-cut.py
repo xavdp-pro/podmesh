@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""The partition that also cuts the agent from the governor's host, with the packaged timer on that
-host: the host withdraws itself once its lease lapses on its own clock, before the standby that
-waited lease plus margin takes the role (Codex's decision 4, the takeover margin's assumption
+"""The partition that also cuts the agent from the active manager's host, with the packaged timer
+on that host: the host withdraws itself once its lease lapses on its own clock, before the standby
+that waited lease plus margin takes the role (Codex's decision 4, the takeover margin's assumption
 measured). Same environment as check-manager-partition.py plus PODMESH_CLI (the CLI beside the
 daemon on lab-a) and PODMESH_REPLICA_CONFIGS.
 
 Timeline, all from the workstation's clock unless said: the three replicas converge, lab-a is the
-governor under a 20-second lease with a 5-second margin, its self-withdrawal timer runs every
+active manager under a 20-second lease with a 5-second margin, its self-withdrawal timer runs every
 two seconds under a mandate; then an nftables table on lab-a drops every packet to and from lab-b,
 lab-c, their pools AND this workstation -- lab-a is alone, and nothing can reach it for 100 seconds,
 when a dead man's switch on the host removes the table. The suite waits lease + margin + 1 second,
@@ -101,8 +101,8 @@ def gate_ready():
     gate.close()
     return state
 
-def follow(alias, governor):
-    return hosts[alias].ok(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=lab_hosts[governor]))
+def follow(alias, active_manager):
+    return hosts[alias].ok(hostwide('network_route_publish', universe_uuid=LOGICAL, ip=SERVICE, via=lab_hosts[active_manager]))
 
 def inspect_running(h, u):
     d = tempfile.mkdtemp(prefix='podmesh-mu2ac-store-'); os.chmod(d, 0o700)
@@ -226,7 +226,7 @@ try:
     time.sleep(4)
     assert carries(A, universes['lab-a']) and connect_from(B).startswith('accepted')
     lease_expires = A.ok(request('activation_status', LOGICAL, reference))['expires_at']
-    checks.append(f'three replicas converged, lab-a the governor under a {LEASE}-second lease (margin {MARGIN}), its self-withdrawal timer running under a mandate, the service address reachable from lab-b')
+    checks.append(f'three replicas converged, lab-a the active manager under a {LEASE}-second lease (margin {MARGIN}), its self-withdrawal timer running under a mandate, the service address reachable from lab-b')
 
     # the cut: lab-a alone -- the other hosts, their pools, and this workstation; back only by the dead man's switch
     agent = workstation_address_seen_by(A)
