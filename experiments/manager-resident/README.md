@@ -78,17 +78,19 @@ writes a failed pass to standard error. A pass that could not run, because the s
 not open or the pass could not take its snapshot, verified and closed nothing: it is
 retried after a backoff that starts at `interval_ms` and doubles up to
 `max_backoff_ms`, never later than the verification interval, and each attempt is
-written to standard error. A failure that closed the store, `corrupt` or `storage`, is
-told apart by the store's integrity state: later passes keep the verification interval
-and write that the store is still closed. The main loop supervises that worker like the
-outgoing one: a resident whose verification or replication worker stopped exits with an
-error. Any
-failed verification closes the store for the process: appends answer
+written to standard error. A failure that closed the store is told apart by the store's
+integrity state: later passes keep the verification interval and write that the store is
+still closed. The main loop supervises that worker like the outgoing one: a resident
+whose verification or replication worker stopped exits with an error. Any failure to
+read or verify a stored row, in a pass or in any transaction, closes that database file
+for the process, and no later transaction of the process commits on it: appends answer
 `append_observation_uncertain`, exchanges fail, status and shutdown stay available, and
-a restarted resident refuses to start on that store. A held lock file prevents two
-residents on the same configured database path. It does not fence copied databases,
-path aliases or a privileged actor. No history/receipt compaction or disk quota exists
-yet.
+a restarted resident refuses to start on that store. The closed state belongs to the
+database file, not to its path: a different file placed at the configured path is
+verified completely at its next open by the process before it is served. A held lock
+file prevents two residents on the same configured database path. It does not fence
+copied databases, path aliases or a privileged actor. No history/receipt compaction or
+disk quota exists yet.
 
 ## Configuration and bounds
 
@@ -101,14 +103,15 @@ The package candidate accepts exactly:
 
 ```text
 podmesh-managerd --config /etc/podmesh-manager/config.json --state-dir /var/lib/podmesh-manager --runtime-dir /run/podmesh-manager [--validate-config]
-podmesh-managerd --inspect-store --config /etc/podmesh-manager/config.json --state-dir /var/lib/podmesh-manager
+podmesh-managerd --inspect-store [--facts-only] --config /etc/podmesh-manager/config.json --state-dir /var/lib/podmesh-manager
 podmesh-managerd --version
 ```
 
 The runtime and validation forms require all three path flags; `--inspect-store`
 requires only `--config` and `--state-dir`, and rejects `--runtime-dir` and
-`--validate-config`. Flags can appear in any order. Unknown, repeated, mixed
-positional, missing-value and missing-required flags are refused. The one
+`--validate-config`; `--facts-only` is accepted only with `--inspect-store`. Flags can
+appear in any order. Unknown, repeated, mixed positional, missing-value and
+missing-required flags are refused. The one
 positional `CONFIG.json` laboratory form remains available;
 its absolute state/runtime boundaries are derived from the configured DB/socket
 parents and undergo the same checks. All runtime forms require the explicit
@@ -235,7 +238,13 @@ serializes the durable store, and returns
 receipts, audits, integrity verification and source-copy behavior are exclusively
 provided by `--inspect-store`; status remains bounded as audit retention grows.
 `--inspect-store` performs this read-only inspection without network mode,
-listener, socket, worker, interval or peer-key validation. It validates only
+listener, socket, worker, interval or peer-key validation. Its output carries every
+receipt and audit row, 21 MB at 21,700 audit rows and 96 MB at 100,000. `--inspect-store
+--facts-only` makes the same private copy, verifies only the schema, identity and
+facts, and prints `history_count`, `ordered_facts` and `logical_history_sha256`, with
+the full inspection's values: its output and verification do not grow with the audit
+table, and the administration app's origin reads facts through it. It reads no receipt
+or audit row, so it is not an integrity verdict on the store. It validates only
 config parsing, bounded manager/topology identities, local replica membership and
 the declared existing state-store path; it never creates, migrates, repairs or opens the store
 read-write. The durable inspector writes a private full source copy below

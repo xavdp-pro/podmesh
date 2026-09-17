@@ -9,7 +9,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs::{self, OpenOptions},
-    io::Read,
+    io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{
@@ -107,18 +107,26 @@ pub const DEFAULT_FULL_VERIFICATION_INTERVAL: Duration = Duration::from_secs(600
 /// new file that reuses the inode of a deleted one.
 type IntegrityKey = (u64, u64, Option<(u64, u32)>, String, String);
 
-/// The integrity model of one store within one process.
+/// The integrity model of one database file within one process.
 ///
 /// A complete verification of every fact, receipt and audit row runs when the
-/// process first opens the store and whenever [`Store::verify_full`] runs (the
-/// periodic pass). Every transaction verifies the schema shape and only the rows
-/// appended after the last verified row of each table, and checks that this last
-/// verified row is unchanged. Rows the operation reads or extends (a replayed
-/// receipt, a replayed audit event, the audit rows of the attempt it appends to)
-/// are verified when read. Any verification failure fails the store closed for
-/// the rest of the process: every later open, write and export returns that same
-/// error. An edit to an older row that no operation reads is detected by the next
-/// complete verification, not by the next transaction.
+/// process first opens the file and whenever [`Store::verify_full`] runs (the
+/// periodic pass). Every transaction verifies the schema shape, checks that the
+/// last verified row of each table is unchanged and that no row precedes the
+/// first, and verifies the rows appended after the last verified row, which must
+/// continue the table's rowids without a gap (see [`verify_contiguous_rowids`]).
+/// Rows the operation reads or extends (a replayed receipt, a replayed audit
+/// event, the audit rows of the attempt it appends to, the facts it loads) are
+/// verified when read. Any failure to read or verify a stored row once the
+/// transaction holds its snapshot, and a schema found corrupt when the file is
+/// opened, fails the file closed for the rest of the process: every later open,
+/// write and export of that file returns that same error, and no transaction of
+/// the process commits on it afterwards. Another file at the same path is another
+/// database file. An in-place change to an older row that no operation reads,
+/// including a replaced row or a removed row that leaves a gap, is detected by the
+/// next complete verification, not by the next transaction; a table whose last
+/// rows were removed is shorter and still verifies when no remaining row depends
+/// on them.
 #[derive(Default)]
 struct StoreIntegrityEntry {
     state: Mutex<IntegrityState>,
@@ -141,8 +149,9 @@ struct VerifiedPositions {
     audits: TablePosition,
 }
 
-/// A verified table prefix: every row with a rowid at or below `rowid` has been
-/// verified, and `sha256` is the stored checksum of the row at `rowid`.
+/// A verified table prefix: the table's rows were exactly the rowids 1 to
+/// `rowid` (none when `rowid` is 0) and every one of them was verified; `sha256`
+/// is the stored checksum of the row at `rowid`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct TablePosition {
     rowid: i64,
@@ -157,6 +166,8 @@ enum AppendOnlyTable {
 }
 
 impl AppendOnlyTable {
+    const ALL: [Self; 3] = [Self::Facts, Self::Receipts, Self::Audits];
+
     const fn name(self) -> &'static str {
         match self {
             Self::Facts => "facts",
@@ -395,6 +406,16 @@ pub struct CanonicalStoreInspection {
     pub sqlite_integrity_result: String,
 }
 
+/// The facts of a store as [`inspect_facts_read_only`] verifies them: the same
+/// values as the fields of [`CanonicalStoreInspection`] with these names.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FactsInspection {
+    pub history_count: usize,
+    pub ordered_facts: Vec<Fact>,
+    pub logical_history_sha256: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IncompleteAttempt {
@@ -454,23 +475,30 @@ impl Store {
     ///
     /// # Errors
     /// Rejects invalid configuration, mismatched identity, unknown schema, I/O
-    /// errors, and a store whose verification failed in this process.
+    /// errors, and a database file whose verification failed in this process,
+    /// including a schema found corrupt by this open's preflight or transaction.
     pub fn open(
         path: &Path,
         configuration: Configuration,
         replica_id: &str,
     ) -> DurableResult<Self> {
         let topology = validate_local_configuration(&configuration, replica_id)?;
-        let mut preflight_identity = None;
+        // The integrity entry of an existing file is known before its preflight:
+        // a file this process closed is refused without being copied, and a
+        // preflight that finds a corrupt schema closes the file.
+        let mut existing = None;
         match fs::symlink_metadata(path) {
             Ok(metadata) => {
                 require_regular_nonsymlink(path)?;
+                let integrity = integrity_entry(&metadata, &topology, replica_id)?;
+                integrity.refuse_if_failed()?;
                 let key = preflight_key(&metadata, &topology, replica_id)?;
                 let known = preflighted_stores()?.contains(&key);
                 if !known {
-                    preflight_existing_store(path, &topology, replica_id)?;
+                    preflight_existing_store(path, &topology, replica_id)
+                        .map_err(|problem| integrity.fail_closed_if_corrupt(problem))?;
                 }
-                preflight_identity = Some(key);
+                existing = Some((key, integrity));
             }
             Err(problem) if problem.kind() == std::io::ErrorKind::NotFound => {}
             Err(problem) => return Err(error(problem)),
@@ -483,18 +511,25 @@ impl Store {
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
         .map_err(error)?;
-        if let Some(expected) = preflight_identity {
-            let current = fs::symlink_metadata(path).map_err(error)?;
-            if preflight_key(&current, &topology, replica_id)? != expected {
-                return Err(DurableError::Storage(
-                    "manager store path changed after read-only preflight".into(),
-                ));
+        let integrity = match existing {
+            Some((expected, integrity)) => {
+                let current = fs::symlink_metadata(path).map_err(error)?;
+                if preflight_key(&current, &topology, replica_id)? != expected {
+                    return Err(DurableError::Storage(
+                        "manager store path changed after read-only preflight".into(),
+                    ));
+                }
+                integrity
             }
-        }
+            None => integrity_entry(
+                &fs::symlink_metadata(path).map_err(error)?,
+                &topology,
+                replica_id,
+            )?,
+        };
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(error)?;
-        let integrity = integrity_entry(path, &topology, replica_id)?;
         integrity.refuse_if_failed()?;
         // Read before the transaction takes its snapshot: every row named by these
         // positions was committed before that snapshot.
@@ -502,14 +537,16 @@ impl Store {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(error)?;
-        initialize_or_check_identity(&transaction, &topology, replica_id)?;
+        initialize_or_check_identity(&transaction, &topology, replica_id)
+            .map_err(|problem| integrity.fail_closed_if_corrupt(problem))?;
         // A verified row that is missing or different in this snapshot was changed
         // in place, and the store is then verified completely again.
         let unchanged = match &positions {
-            Some(positions) => positions_unchanged(&transaction, positions)?,
+            Some(positions) => positions_unchanged(&transaction, positions)
+                .map_err(|problem| integrity.fail_closed(problem))?,
             None => false,
         };
-        transaction.commit().map_err(error)?;
+        integrity.commit(transaction)?;
         connection
             .pragma_update(None, "journal_mode", "WAL")
             .map_err(error)?;
@@ -610,10 +647,7 @@ impl Store {
     ) -> DurableResult<T> {
         self.integrity.refuse_if_failed()?;
         let integrity = Arc::clone(&self.integrity);
-        operation(self).map_err(|problem| match problem {
-            DurableError::Corrupt(_) => integrity.fail_closed(problem),
-            _ => problem,
-        })
+        operation(self).map_err(|problem| integrity.fail_closed_if_corrupt(problem))
     }
 
     /// Runs one write operation. When this process had already preflighted the
@@ -678,13 +712,14 @@ impl Store {
             )?;
             let executed = execute_transaction(
                 &transaction,
+                &store.integrity,
                 &store.configuration,
                 &store.topology,
                 &store.replica_id,
                 request,
                 receipt_metadata_for_request(request),
             )?;
-            transaction.commit().map_err(error)?;
+            store.integrity.commit(transaction)?;
             Ok(executed)
         };
         if writes {
@@ -743,6 +778,7 @@ impl Store {
             )?;
             prevalidate_authenticated_import_audit(
                 &transaction,
+                &store.integrity,
                 &store.topology,
                 &store.replica_id,
                 &audit,
@@ -750,6 +786,7 @@ impl Store {
             )?;
             let executed = execute_transaction(
                 &transaction,
+                &store.integrity,
                 &store.configuration,
                 &store.topology,
                 &store.replica_id,
@@ -768,12 +805,13 @@ impl Store {
             audit.replayed = executed.replayed;
             let evidence = insert_audit(
                 &transaction,
+                &store.integrity,
                 &store.topology,
                 &store.replica_id,
                 &audit,
                 true,
             )?;
-            transaction.commit().map_err(error)?;
+            store.integrity.commit(transaction)?;
             Ok(AuthenticatedImport {
                 executed,
                 audit: evidence,
@@ -805,12 +843,13 @@ impl Store {
             )?;
             let evidence = insert_audit(
                 &transaction,
+                &store.integrity,
                 &store.topology,
                 &store.replica_id,
                 audit,
                 false,
             )?;
-            transaction.commit().map_err(error)?;
+            store.integrity.commit(transaction)?;
             Ok(evidence)
         })
     }
@@ -843,6 +882,42 @@ impl StoreIntegrityEntry {
             state.failure.get_or_insert_with(|| problem.clone());
         }
         problem
+    }
+
+    /// Records a corrupt stored state as a verification failure and returns any
+    /// other error unchanged.
+    fn fail_closed_if_corrupt(&self, problem: DurableError) -> DurableError {
+        match problem {
+            DurableError::Corrupt(_) => self.fail_closed(problem),
+            _ => problem,
+        }
+    }
+
+    /// Commits a transaction on this database file unless the file has failed
+    /// closed. The integrity state stays locked while SQLite commits, so a
+    /// failure is recorded either before the commit, which then rolls back and
+    /// returns that failure, or once the commit has completed: no transaction of
+    /// the process commits after the file is closed, including one that began,
+    /// or waited for the write lock, before the failure was recorded.
+    fn commit(&self, transaction: Transaction<'_>) -> DurableResult<()> {
+        let state = integrity_state(self)?;
+        if let Some(failure) = &state.failure {
+            return Err(failure.clone());
+        }
+        transaction.commit().map_err(error)
+    }
+
+    /// Returns stored rows an operation read at use, inside a transaction that
+    /// [`begin_verified`] opened. That transaction already holds its snapshot
+    /// (and a write transaction its write lock), and SQLite reports a busy or
+    /// locked database only while a transaction takes those, never on a read
+    /// inside a snapshot it holds. A failure here therefore concerns the stored
+    /// rows themselves: bytes that could not be read (`storage`) or rows that do
+    /// not verify (`corrupt`), and it closes the store as a failed verification of
+    /// those rows does. The operation's own writes and commit are not read
+    /// through this, so a full disk closes nothing.
+    fn read_at_use<T>(&self, read: DurableResult<T>) -> DurableResult<T> {
+        read.map_err(|problem| self.fail_closed(problem))
     }
 
     fn record_full_verification(
@@ -906,11 +981,10 @@ impl TablePosition {
 }
 
 fn integrity_entry(
-    path: &Path,
+    metadata: &fs::Metadata,
     topology: &Topology,
     replica_id: &str,
 ) -> DurableResult<Arc<StoreIntegrityEntry>> {
-    let metadata = fs::symlink_metadata(path).map_err(error)?;
     let birth = metadata
         .created()
         .ok()
@@ -995,7 +1069,7 @@ fn run_full_verification(
     acquire_snapshot(&transaction)?;
     let verified = full_verification(&transaction, topology, replica_id)
         .map_err(|problem| integrity.fail_closed(problem))?;
-    transaction.commit().map_err(error)?;
+    integrity.commit(transaction)?;
     integrity.record_full_verification(verified, started, replace_positions)
 }
 
@@ -1034,6 +1108,73 @@ fn table_tail(connection: &Connection, table: AppendOnlyTable) -> DurableResult<
         .unwrap_or_default())
 }
 
+/// The rowid rule of the append-only tables, checked by a complete verification.
+///
+/// The Store never names a rowid, never deletes a row, and the triggers refuse
+/// `DELETE`, so SQLite numbers the rows of each table 1, 2, 3, … in insertion
+/// order: a plain insert takes the largest rowid plus one, and a failed statement
+/// or a rolled-back transaction removes its row, so the next insert reuses that
+/// rowid. A table whose rows are not exactly the rowids 1 to their count was
+/// written by something other than the Store, and a verified prefix of it would
+/// no longer be every row at or below its last verified row.
+fn verify_contiguous_rowids(connection: &Connection, table: AppendOnlyTable) -> DurableResult<()> {
+    let (count, first, last) = connection
+        .query_row(
+            &format!(
+                "SELECT count(*), min(rowid), max(rowid) FROM {}",
+                table.name()
+            ),
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .map_err(error)?;
+    if count > 0 && (first != Some(1) || last != Some(count)) {
+        return Err(rowid_gap(table));
+    }
+    Ok(())
+}
+
+/// The rowid rule checked by every transaction: no row precedes rowid 1. With
+/// the rows up to the last verified row known to be exactly 1 to its rowid, a row
+/// that any writer adds without removing a stored row either has a rowid at or
+/// below 0, refused here in one seek of the table, or follows the last verified
+/// row, where [`next_rowid`] refuses a gap before the row is verified.
+fn verify_first_rowid(connection: &Connection, table: AppendOnlyTable) -> DurableResult<()> {
+    let first: Option<i64> = connection
+        .query_row(
+            &format!("SELECT min(rowid) FROM {}", table.name()),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(error)?;
+    if first.is_some_and(|first| first != 1) {
+        return Err(rowid_gap(table));
+    }
+    Ok(())
+}
+
+/// Requires an appended row to continue its table's rowids without a gap.
+fn next_rowid(table: AppendOnlyTable, previous: &TablePosition, rowid: i64) -> DurableResult<()> {
+    if previous.rowid.checked_add(1) == Some(rowid) {
+        Ok(())
+    } else {
+        Err(rowid_gap(table))
+    }
+}
+
+fn rowid_gap(table: AppendOnlyTable) -> DurableError {
+    DurableError::Corrupt(format!(
+        "stored {} rowids are not contiguous from 1",
+        table.name()
+    ))
+}
+
 /// Whether the last verified row of every table is still present with the same
 /// stored checksum.
 fn positions_unchanged(
@@ -1061,13 +1202,17 @@ fn positions_unchanged(
 
 /// Verifies only the rows appended after the verified positions, with the same
 /// per-row checks as a complete verification, and the complete audit sequence of
-/// every exchange attempt those rows belong to.
+/// every exchange attempt those rows belong to. No table may have a row before
+/// rowid 1, and the appended rows must continue each table's rowids.
 fn verify_appended_rows(
     connection: &Connection,
     topology: &Topology,
     replica_id: &str,
     positions: &VerifiedPositions,
 ) -> DurableResult<VerifiedPositions> {
+    for table in AppendOnlyTable::ALL {
+        verify_first_rowid(connection, table)?;
+    }
     let receipts = verify_appended_receipts(
         connection,
         topology.logical_manager_id(),
@@ -1208,6 +1353,7 @@ fn preflight_existing_store(
 
 fn execute_transaction(
     transaction: &Transaction<'_>,
+    integrity: &StoreIntegrityEntry,
     configuration: &Configuration,
     topology: &Topology,
     replica_id: &str,
@@ -1218,17 +1364,13 @@ fn execute_transaction(
     let operation_id = mutation_operation_id(request)?;
     if let Some(id) = operation_id {
         validate_receipt_operation_id(id, receipt_metadata.kind)?;
-        let prior = transaction
-            .query_row(
-                &format!("SELECT {RECEIPT_COLUMNS} FROM receipts WHERE operation_id=?1"),
-                [id],
-                read_receipt_row,
-            )
-            .optional()
-            .map_err(error)?;
+        // A replay returns stored bytes, so that receipt row is verified first.
+        let prior = integrity.read_at_use(stored_receipt(
+            transaction,
+            topology.logical_manager_id(),
+            id,
+        ))?;
         if let Some(prior) = prior {
-            // A replay returns stored bytes, so that receipt row is verified first.
-            verify_receipt_row(topology.logical_manager_id(), &prior)?;
             if prior.request_json != request_json
                 || prior.kind != enum_text(&receipt_metadata.kind)?
                 || prior.source_replica_id != receipt_metadata.source_replica_id
@@ -1249,7 +1391,7 @@ fn execute_transaction(
             });
         }
     }
-    let mut replica = load(transaction, topology, replica_id)?;
+    let mut replica = integrity.read_at_use(load(transaction, topology, replica_id))?;
     let before = replica.history.clone();
     let response = apply(configuration, &mut replica, request)?;
     for (id, fact) in &replica.history {
@@ -1387,7 +1529,9 @@ impl Store {
                 &store.replica_id,
                 TransactionBehavior::Deferred,
             )?;
-            let highest = {
+            // The observe receipts are rows read at use: one that cannot be read or does
+            // not verify closes the store, as for every other read at use.
+            let highest = store.integrity.read_at_use((|| {
                 let mut statement = transaction
                     .prepare(&format!(
                         "SELECT {RECEIPT_COLUMNS} FROM receipts WHERE kind = ?1"
@@ -1411,9 +1555,9 @@ impl Store {
                         highest = highest.max(Some(fact.producer_sequence));
                     }
                 }
-                highest
-            };
-            transaction.commit().map_err(error)?;
+                Ok(highest)
+            })())?;
+            store.integrity.commit(transaction)?;
             Ok(highest)
         })
     }
@@ -1608,6 +1752,7 @@ fn verify_appended_facts(
     let mut position = from.clone();
     for row in rows {
         let (rowid, id, encoded, hash) = row.map_err(error)?;
+        next_rowid(AppendOnlyTable::Facts, &position, rowid)?;
         replica
             .ingest(decode_fact_row(&id, &encoded, &hash)?)
             .map_err(corrupt_model)?;
@@ -1727,6 +1872,26 @@ fn verify_receipt_row(logical_manager_id: &str, receipt: &StoredReceipt) -> Dura
     Ok(())
 }
 
+/// Reads the stored receipt of one operation ID, if there is one, and verifies it.
+fn stored_receipt(
+    connection: &Connection,
+    logical_manager_id: &str,
+    operation_id: &str,
+) -> DurableResult<Option<StoredReceipt>> {
+    let receipt = connection
+        .query_row(
+            &format!("SELECT {RECEIPT_COLUMNS} FROM receipts WHERE operation_id=?1"),
+            [operation_id],
+            read_receipt_row,
+        )
+        .optional()
+        .map_err(error)?;
+    if let Some(receipt) = &receipt {
+        verify_receipt_row(logical_manager_id, receipt)?;
+    }
+    Ok(receipt)
+}
+
 fn verify_receipts(connection: &Connection, logical_manager_id: &str) -> DurableResult<()> {
     let mut statement = connection
         .prepare(&format!(
@@ -1758,6 +1923,7 @@ fn verify_appended_receipts(
     let mut position = from.clone();
     for row in rows {
         let (receipt, rowid) = row.map_err(error)?;
+        next_rowid(AppendOnlyTable::Receipts, &position, rowid)?;
         verify_receipt_row(logical_manager_id, &receipt)?;
         position = TablePosition {
             rowid,
@@ -1824,6 +1990,9 @@ fn validate_receipt_metadata(
 
 fn verify_all(connection: &Connection, topology: &Topology, replica_id: &str) -> DurableResult<()> {
     verify_immutable_schema(connection)?;
+    for table in AppendOnlyTable::ALL {
+        verify_contiguous_rowids(connection, table)?;
+    }
     verify_receipts(connection, topology.logical_manager_id())?;
     load(connection, topology, replica_id)?;
     verify_audits(connection, topology, replica_id)?;
@@ -2531,13 +2700,27 @@ fn verify_audit_receipt_link(
     connection: &Connection,
     event: &ExchangeAuditEvent,
 ) -> DurableResult<()> {
-    let (Some(operation_id), Some(sha256)) = (
-        event.local_receipt_operation_id.as_deref(),
-        event.local_receipt_sha256.as_deref(),
-    ) else {
+    let Some((operation_id, sha256)) = local_receipt_reference(event) else {
         return Ok(());
     };
-    let Some(metadata) = receipt_metadata(connection, operation_id, sha256)? else {
+    check_audit_receipt_link(event, receipt_metadata(connection, operation_id, sha256)?)
+}
+
+/// The local receipt an audit event references: its identity and digest.
+fn local_receipt_reference(event: &ExchangeAuditEvent) -> Option<(&str, &str)> {
+    event
+        .local_receipt_operation_id
+        .as_deref()
+        .zip(event.local_receipt_sha256.as_deref())
+}
+
+/// Checks an audit event's local receipt reference against the metadata of the
+/// stored receipt with that identity and digest, `None` when there is none.
+fn check_audit_receipt_link(
+    event: &ExchangeAuditEvent,
+    metadata: Option<ReceiptMetadata>,
+) -> DurableResult<()> {
+    let Some(metadata) = metadata else {
         return Err(DurableError::InvalidAudit(
             "local receipt reference is missing or has a mismatched digest".into(),
         ));
@@ -2571,35 +2754,31 @@ fn verify_audit_receipt_link(
     Ok(())
 }
 
-/// Checks a candidate against the stored rows of its own attempt only. Every
-/// sequence rule is scoped to one attempt ID (per direction, plus the rule that
-/// an attempt ID cannot span both directions), so over a verified store this
-/// gives the same result as checking the candidate against the whole table.
+/// Checks a candidate against the stored rows of its own attempt only, as read
+/// and verified by [`load_attempt_audits`]. Every sequence rule is scoped to one
+/// attempt ID (per direction, plus the rule that an attempt ID cannot span both
+/// directions), so over a verified store this gives the same result as checking
+/// the candidate against the whole table.
 fn validate_candidate_audit_sequence(
-    connection: &Connection,
-    topology: &Topology,
-    replica_id: &str,
+    attempt: &[ExchangeAuditEvidence],
     event: &ExchangeAuditEvent,
 ) -> DurableResult<()> {
-    let existing = load_attempt_audits(connection, topology, replica_id, &event.attempt_id)?;
-    let mut events: Vec<_> = existing.iter().map(|entry| &entry.event).collect();
+    let mut events: Vec<_> = attempt.iter().map(|entry| &entry.event).collect();
     events.push(event);
     audit_sequence_problem(events).map_or(Ok(()), |detail| Err(DurableError::InvalidAudit(detail)))
 }
 
-fn prevalidate_authenticated_import_audit(
-    transaction: &Transaction<'_>,
+/// The checks of a candidate audit event that read no stored row: its fields and
+/// semantics, its receipt identities and its authenticated peer, which must be
+/// another configured replica.
+fn validate_candidate_audit(
     topology: &Topology,
     replica_id: &str,
-    audit: &ExchangeAuditEvent,
-    local_operation_id: &str,
+    event: &ExchangeAuditEvent,
 ) -> DurableResult<()> {
-    let mut candidate = audit.clone();
-    candidate.local_receipt_operation_id = Some(local_operation_id.into());
-    candidate.local_receipt_sha256 = Some(format!("{:064x}", 0));
-    validate_audit(&candidate)?;
-    validate_audit_identity(topology, replica_id, &candidate)?;
-    if let Some(peer_id) = candidate.authenticated_peer_id.as_deref() {
+    validate_audit(event)?;
+    validate_audit_identity(topology, replica_id, event)?;
+    if let Some(peer_id) = event.authenticated_peer_id.as_deref() {
         topology.instantiate(peer_id).map_err(|_| {
             DurableError::InvalidAudit("authenticated peer is not configured".into())
         })?;
@@ -2609,7 +2788,27 @@ fn prevalidate_authenticated_import_audit(
             ));
         }
     }
-    let existing = load_audit_by_id(transaction, topology, replica_id, &candidate.audit_event_id)?;
+    Ok(())
+}
+
+fn prevalidate_authenticated_import_audit(
+    transaction: &Transaction<'_>,
+    integrity: &StoreIntegrityEntry,
+    topology: &Topology,
+    replica_id: &str,
+    audit: &ExchangeAuditEvent,
+    local_operation_id: &str,
+) -> DurableResult<()> {
+    let mut candidate = audit.clone();
+    candidate.local_receipt_operation_id = Some(local_operation_id.into());
+    candidate.local_receipt_sha256 = Some(format!("{:064x}", 0));
+    validate_candidate_audit(topology, replica_id, &candidate)?;
+    let existing = integrity.read_at_use(load_audit_by_id(
+        transaction,
+        topology,
+        replica_id,
+        &candidate.audit_event_id,
+    ))?;
     if let Some(existing) = existing {
         let mut comparable = existing.event;
         comparable
@@ -2625,7 +2824,13 @@ fn prevalidate_authenticated_import_audit(
             ));
         }
     } else {
-        validate_candidate_audit_sequence(transaction, topology, replica_id, &candidate)?;
+        let attempt = integrity.read_at_use(load_attempt_audits(
+            transaction,
+            topology,
+            replica_id,
+            &candidate.attempt_id,
+        ))?;
+        validate_candidate_audit_sequence(&attempt, &candidate)?;
     }
     Ok(())
 }
@@ -2888,29 +3093,25 @@ fn validate_inbound_close(
 
 fn insert_audit(
     transaction: &Transaction<'_>,
+    integrity: &StoreIntegrityEntry,
     topology: &Topology,
     replica_id: &str,
     event: &ExchangeAuditEvent,
     allow_atomic_import_replay_normalization: bool,
 ) -> DurableResult<ExchangeAuditEvidence> {
-    validate_audit(event)?;
-    validate_audit_identity(topology, replica_id, event)?;
-    if let Some(peer_id) = event.authenticated_peer_id.as_deref() {
-        topology.instantiate(peer_id).map_err(|_| {
-            DurableError::InvalidAudit("authenticated peer is not configured".into())
-        })?;
-        if peer_id == replica_id {
-            return Err(DurableError::InvalidAudit(
-                "authenticated peer must be a distinct configured replica".into(),
-            ));
-        }
-    }
+    validate_candidate_audit(topology, replica_id, event)?;
     let record_json = json(event)?;
     let sha256 = audit_digest(&record_json)?;
-    if let Some(evidence) = replay_existing_audit(
+    // A replay returns stored evidence, so that row is verified before comparison;
+    // its canonical record JSON then equals the stored one.
+    let prior = integrity.read_at_use(load_audit_by_id(
         transaction,
         topology,
         replica_id,
+        &event.audit_event_id,
+    ))?;
+    if let Some(evidence) = replay_existing_audit(
+        prior,
         event,
         &record_json,
         &sha256,
@@ -2918,8 +3119,18 @@ fn insert_audit(
     )? {
         return Ok(evidence);
     }
-    validate_candidate_audit_sequence(transaction, topology, replica_id, event)?;
-    verify_audit_receipt_link(transaction, event)?;
+    let attempt = integrity.read_at_use(load_attempt_audits(
+        transaction,
+        topology,
+        replica_id,
+        &event.attempt_id,
+    ))?;
+    validate_candidate_audit_sequence(&attempt, event)?;
+    if let Some((operation_id, receipt_sha256)) = local_receipt_reference(event) {
+        let receipt =
+            integrity.read_at_use(receipt_metadata(transaction, operation_id, receipt_sha256))?;
+        check_audit_receipt_link(event, receipt)?;
+    }
     let inserted = transaction
         .execute(
             "INSERT INTO exchange_audit_events (
@@ -2987,18 +3198,17 @@ fn insert_audit(
     })
 }
 
+/// Compares a candidate audit event with the verified stored row of the same
+/// audit event ID, if there is one, and returns the evidence of an identical
+/// replay.
 fn replay_existing_audit(
-    transaction: &Transaction<'_>,
-    topology: &Topology,
-    replica_id: &str,
+    prior: Option<ExchangeAuditEvidence>,
     event: &ExchangeAuditEvent,
     record_json: &str,
     sha256: &str,
     allow_atomic_import_replay_normalization: bool,
 ) -> DurableResult<Option<ExchangeAuditEvidence>> {
-    // A replay returns stored evidence, so that row is verified before comparison;
-    // its canonical record JSON then equals the stored one.
-    let prior = load_audit_by_id(transaction, topology, replica_id, &event.audit_event_id)?
+    let prior = prior
         .map(|evidence| Ok::<_, DurableError>((json(&evidence.event)?, evidence.sha256)))
         .transpose()?;
     if let Some((prior_json, prior_sha256)) = prior {
@@ -3283,6 +3493,7 @@ fn verify_appended_audits(
     let mut attempts = BTreeSet::new();
     for row in rows {
         let (stored, rowid) = row.map_err(error)?;
+        next_rowid(AppendOnlyTable::Audits, &position, rowid)?;
         let (event, record_json, sha256) = decode_audit_row(stored)?;
         let evidence = verify_loaded_audit(
             connection,
@@ -3393,7 +3604,8 @@ fn phase_rank(phase: AuditPhase) -> u8 {
 ///
 /// # Errors
 /// Rejects missing/non-regular stores, schema or identity mismatch, SQLite
-/// integrity failure and any corrupt fact, receipt, audit or receipt link.
+/// integrity failure, a table whose rowids are not contiguous from 1, and any
+/// corrupt fact, receipt, audit or receipt link.
 pub fn inspect_read_only(
     path: &Path,
     configuration: &Configuration,
@@ -3402,29 +3614,7 @@ pub fn inspect_read_only(
     require_regular_nonsymlink(path)?;
     let topology = validate_local_configuration(configuration, replica_id)?;
     let (_snapshot, mut connection) = open_read_only_snapshot(path)?;
-    connection
-        .busy_timeout(Duration::from_secs(5))
-        .map_err(error)?;
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Deferred)
-        .map_err(error)?;
-    let version: u32 = transaction
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(error)?;
-    if version != 3 {
-        return Err(DurableError::Refused(RefusalReason::UnsupportedSchema));
-    }
-    verify_immutable_schema(&transaction)?;
-    let identity: (String, String) = transaction
-        .query_row(
-            "SELECT replica_id, topology_json FROM identity WHERE singleton=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(error)?;
-    if identity != (replica_id.to_string(), json(&topology)?) {
-        return Err(DurableError::Refused(RefusalReason::IdentityMismatch));
-    }
+    let (transaction, version) = begin_inspection(&mut connection, &topology, replica_id)?;
     let integrity: String = transaction
         .pragma_query_value(None, "integrity_check", |row| row.get(0))
         .map_err(error)?;
@@ -3433,18 +3623,15 @@ pub fn inspect_read_only(
             "SQLite integrity check failed".into(),
         ));
     }
+    for table in AppendOnlyTable::ALL {
+        verify_contiguous_rowids(&transaction, table)?;
+    }
     verify_receipts(&transaction, topology.logical_manager_id())?;
     let replica = load(&transaction, &topology, replica_id)?;
     let audits = load_audits(&transaction, &topology, replica_id)?;
     let receipts = load_receipt_evidence(&transaction)?;
     let ordered_facts: Vec<_> = replica.history.values().cloned().collect();
-    let topology_sha256 = digest(&json(&topology)?);
-    let logical_history_sha256 = digest(&json(&(
-        "podmesh-manager-ha-logical-history/1",
-        topology.logical_manager_id(),
-        &topology_sha256,
-        &ordered_facts,
-    ))?);
+    let logical_history_sha256 = logical_history_sha256(&topology, &ordered_facts)?;
     let receipt_set_sha256 = digest(&json(&("podmesh-manager-ha-receipt-set/1", &receipts))?);
     let audit_set_sha256 = digest(&json(&("podmesh-manager-ha-audit-set/1", &audits))?);
     let incomplete_attempts = incomplete_attempts(&audits)?;
@@ -3488,33 +3675,200 @@ pub fn inspect_read_only(
     Ok(inspection)
 }
 
+/// Verifies and returns the facts of an existing manager store through the same
+/// stable private copy as [`inspect_read_only`]: schema version and shape, the
+/// replica and topology identity, the rowid rule of the facts table, and every
+/// fact's checksum, JSON, event identity and validation by the reducer. It reads
+/// no receipt and no audit row and runs no SQLite `integrity_check`, so neither
+/// its verification nor its result grows with the exchange audit table; capturing
+/// the private copy still reads the whole database file twice. It is a read of
+/// the facts, not a verdict on the store: corrupt receipts or audit rows leave its
+/// result unchanged.
+///
+/// # Errors
+/// Rejects missing/non-regular stores, schema or identity mismatch, a facts
+/// table whose rowids are not contiguous from 1, and any corrupt fact.
+pub fn inspect_facts_read_only(
+    path: &Path,
+    configuration: &Configuration,
+    replica_id: &str,
+) -> DurableResult<FactsInspection> {
+    require_regular_nonsymlink(path)?;
+    let topology = validate_local_configuration(configuration, replica_id)?;
+    let (_snapshot, mut connection) = open_read_only_snapshot(path)?;
+    let (transaction, _) = begin_inspection(&mut connection, &topology, replica_id)?;
+    verify_contiguous_rowids(&transaction, AppendOnlyTable::Facts)?;
+    let replica = load(&transaction, &topology, replica_id)?;
+    transaction.commit().map_err(error)?;
+    let ordered_facts: Vec<_> = replica.history.into_values().collect();
+    Ok(FactsInspection {
+        history_count: ordered_facts.len(),
+        logical_history_sha256: logical_history_sha256(&topology, &ordered_facts)?,
+        ordered_facts,
+    })
+}
+
+/// Opens the read transaction of a read-only inspection of a private copy and
+/// checks what every inspection rests on: schema version 3, the exact schema
+/// shape, and the configured replica and topology identity. Returns the schema
+/// version with the transaction.
+fn begin_inspection<'c>(
+    connection: &'c mut Connection,
+    topology: &Topology,
+    replica_id: &str,
+) -> DurableResult<(Transaction<'c>, u32)> {
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(error)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Deferred)
+        .map_err(error)?;
+    let version: u32 = transaction
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(error)?;
+    if version != 3 {
+        return Err(DurableError::Refused(RefusalReason::UnsupportedSchema));
+    }
+    verify_immutable_schema(&transaction)?;
+    let identity: (String, String) = transaction
+        .query_row(
+            "SELECT replica_id, topology_json FROM identity WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(error)?;
+    if identity != (replica_id.to_string(), json(topology)?) {
+        return Err(DurableError::Refused(RefusalReason::IdentityMismatch));
+    }
+    Ok((transaction, version))
+}
+
+/// The domain-separated digest of a replica's ordered facts, comparable across
+/// converged replicas of one logical manager and topology.
+fn logical_history_sha256(topology: &Topology, ordered_facts: &[Fact]) -> DurableResult<String> {
+    let topology_sha256 = digest(&json(topology)?);
+    Ok(digest(&json(&(
+        "podmesh-manager-ha-logical-history/1",
+        topology.logical_manager_id(),
+        &topology_sha256,
+        ordered_facts,
+    ))?))
+}
+
 struct ReadOnlySnapshot {
     directory: PathBuf,
     database: PathBuf,
 }
 
+/// The database file and its sidecars, in the order a capture reads them.
+const STORE_FILE_SUFFIXES: [&str; 3] = ["", "-wal", "-shm"];
+
+/// A store whose files total at most this many bytes is captured in memory.
+const CAPTURE_IN_MEMORY_BYTES: u64 = 16 << 20;
+
+/// The buffers through which a larger capture streams its files.
+const CAPTURE_CHUNK_BYTES: usize = 1 << 20;
+
 impl ReadOnlySnapshot {
+    /// Captures a stable private copy of the database, WAL and SHM: the files are
+    /// read twice and kept only when both reads are equal, so no writer changed
+    /// them between the two reads. A store whose files total at most
+    /// `CAPTURE_IN_MEMORY_BYTES` is read twice into memory, which keeps the two
+    /// reads of a small store closest together. A larger one is copied into the
+    /// private directory, then read again and compared with that copy through
+    /// fixed buffers, so that no capture holds memory proportional to the store;
+    /// the two reads of a large store are closer together that way too. A capture
+    /// whose reads differ starts again, three times at most.
     fn capture(path: &Path) -> DurableResult<Self> {
-        require_regular_nonsymlink(path)?;
-        let files = stable_store_files(path)?;
-        let directory = secure_snapshot_directory(path)?;
-        let database = directory.join("store.sqlite");
-        for (suffix, bytes) in files {
-            let destination = if suffix.is_empty() {
-                database.clone()
+        let size = store_files_size(path)?;
+        for _ in 0..3 {
+            let captured = if size <= CAPTURE_IN_MEMORY_BYTES {
+                capture_in_memory(path)?
             } else {
-                directory.join(format!("store.sqlite{suffix}"))
+                capture_by_copy(path)?
             };
-            if let Err(problem) = fs::write(&destination, bytes) {
-                let _ = fs::remove_dir_all(&directory);
-                return Err(error(problem));
+            if let Some(snapshot) = captured {
+                return Ok(snapshot);
             }
         }
+        Err(DurableError::Storage(
+            "manager store changed while capturing a read-only inspection snapshot".into(),
+        ))
+    }
+
+    fn in_new_directory(path: &Path) -> DurableResult<Self> {
+        let directory = secure_snapshot_directory(path)?;
         Ok(Self {
+            database: directory.join("store.sqlite"),
             directory,
-            database,
         })
     }
+
+    /// Creates the private file of one store file, named by its suffix.
+    fn create_file(&self, suffix: &str) -> DurableResult<(PathBuf, fs::File)> {
+        let copy = self.directory.join(format!("store.sqlite{suffix}"));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&copy)
+            .map_err(error)?;
+        Ok((copy, file))
+    }
+}
+
+/// Reads the store files twice into memory, and writes them into a new private
+/// directory when both reads are equal.
+fn capture_in_memory(path: &Path) -> DurableResult<Option<ReadOnlySnapshot>> {
+    let files = read_store_files(path)?;
+    if read_store_files(path)? != files {
+        return Ok(None);
+    }
+    let snapshot = ReadOnlySnapshot::in_new_directory(path)?;
+    for (suffix, bytes) in files {
+        snapshot
+            .create_file(suffix)?
+            .1
+            .write_all(&bytes)
+            .map_err(error)?;
+    }
+    Ok(Some(snapshot))
+}
+
+/// Copies the store files into a new private directory, whose files are created
+/// before the first read, then reads the source again and compares it with the
+/// copy.
+fn capture_by_copy(path: &Path) -> DurableResult<Option<ReadOnlySnapshot>> {
+    let snapshot = ReadOnlySnapshot::in_new_directory(path)?;
+    let mut copies = STORE_FILE_SUFFIXES
+        .iter()
+        .map(|suffix| {
+            snapshot
+                .create_file(suffix)
+                .map(|(copy, file)| (*suffix, copy, file))
+        })
+        .collect::<DurableResult<Vec<_>>>()?;
+    let mut chunks = (
+        vec![0_u8; CAPTURE_CHUNK_BYTES],
+        vec![0_u8; CAPTURE_CHUNK_BYTES],
+    );
+    let mut present = Vec::with_capacity(copies.len());
+    for (suffix, _, file) in &mut copies {
+        present.push(copy_store_file(path, suffix, file, &mut chunks.0)?);
+    }
+    for ((suffix, _, file), present) in copies.iter_mut().zip(&present) {
+        if !same_store_file(path, suffix, file, *present, &mut chunks)? {
+            return Ok(None);
+        }
+    }
+    // A sidecar absent from both reads has no copy either.
+    for ((_, copy, _), present) in copies.iter().zip(&present) {
+        if !present {
+            fs::remove_file(copy).map_err(error)?;
+        }
+    }
+    Ok(Some(snapshot))
 }
 
 fn secure_snapshot_directory(path: &Path) -> DurableResult<PathBuf> {
@@ -3595,36 +3949,125 @@ impl Drop for ReadOnlySnapshot {
     }
 }
 
-fn stable_store_files(path: &Path) -> DurableResult<Vec<(&'static str, Vec<u8>)>> {
-    for _ in 0..3 {
-        let before = read_store_files(path)?;
-        let after = read_store_files(path)?;
-        if before == after {
-            return Ok(after);
+/// Checks the database and sidecar paths before a capture creates anything, and
+/// returns the size of the files present. A missing database, or a database or
+/// sidecar path that is not a regular file, is refused; each file is checked again
+/// when the capture opens it.
+fn store_files_size(path: &Path) -> DurableResult<u64> {
+    let mut size = 0_u64;
+    for suffix in STORE_FILE_SUFFIXES {
+        match fs::symlink_metadata(sidecar_path(path, suffix)) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                size = size.saturating_add(metadata.len());
+            }
+            Ok(_) => return Err(DurableError::Refused(RefusalReason::UnsafeStore)),
+            Err(problem)
+                if problem.kind() == std::io::ErrorKind::NotFound && !suffix.is_empty() => {}
+            Err(problem) if problem.kind() == std::io::ErrorKind::NotFound => {
+                return Err(DurableError::Refused(RefusalReason::MissingStore));
+            }
+            Err(problem) => return Err(error(problem)),
         }
     }
-    Err(DurableError::Storage(
-        "manager store changed while capturing a read-only inspection snapshot".into(),
-    ))
+    Ok(size)
 }
 
+/// Reads the database and each existing sidecar into memory.
 fn read_store_files(path: &Path) -> DurableResult<Vec<(&'static str, Vec<u8>)>> {
-    let database = read_regular_file_nofollow(path, false)?
-        .ok_or(DurableError::Refused(RefusalReason::MissingStore))?;
-    let mut files = vec![("", database)];
-    for suffix in ["-wal", "-shm"] {
-        let sidecar = sidecar_path(path, suffix);
-        if let Some(bytes) = read_regular_file_nofollow(&sidecar, true)? {
-            files.push((suffix, bytes));
-        }
+    let mut files = Vec::with_capacity(STORE_FILE_SUFFIXES.len());
+    for suffix in STORE_FILE_SUFFIXES {
+        let source_path = sidecar_path(path, suffix);
+        let Some((mut source, opened)) =
+            open_regular_file_nofollow(&source_path, !suffix.is_empty())?
+        else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        source.read_to_end(&mut bytes).map_err(error)?;
+        confirm_same_file(&source_path, &opened)?;
+        files.push((suffix, bytes));
     }
     Ok(files)
 }
 
-fn read_regular_file_nofollow(
+/// Copies one store file, the database or a sidecar named by its suffix, into
+/// its private copy. Returns `false` for an absent sidecar, whose copy stays
+/// empty.
+fn copy_store_file(
+    path: &Path,
+    suffix: &str,
+    copy: &mut fs::File,
+    chunk: &mut [u8],
+) -> DurableResult<bool> {
+    let source_path = sidecar_path(path, suffix);
+    let Some((mut source, opened)) = open_regular_file_nofollow(&source_path, !suffix.is_empty())?
+    else {
+        return Ok(false);
+    };
+    loop {
+        let read = fill_chunk(&mut source, chunk)?;
+        if read == 0 {
+            break;
+        }
+        copy.write_all(&chunk[..read]).map_err(error)?;
+    }
+    confirm_same_file(&source_path, &opened)?;
+    Ok(true)
+}
+
+/// Reads one store file again and compares it with its private copy: the same
+/// presence, the same length and the same bytes.
+fn same_store_file(
+    path: &Path,
+    suffix: &str,
+    copy: &mut fs::File,
+    copied: bool,
+    (read_again, copied_bytes): &mut (Vec<u8>, Vec<u8>),
+) -> DurableResult<bool> {
+    let source_path = sidecar_path(path, suffix);
+    let Some((mut source, opened)) = open_regular_file_nofollow(&source_path, !suffix.is_empty())?
+    else {
+        return Ok(!copied);
+    };
+    if !copied {
+        return Ok(false);
+    }
+    copy.seek(SeekFrom::Start(0)).map_err(error)?;
+    let same = loop {
+        let read = fill_chunk(&mut source, read_again)?;
+        if fill_chunk(copy, copied_bytes)? != read || read_again[..read] != copied_bytes[..read] {
+            break false;
+        }
+        if read == 0 {
+            break true;
+        }
+    };
+    confirm_same_file(&source_path, &opened)?;
+    Ok(same)
+}
+
+/// Reads into `chunk` until it is full or the file ends; returns the bytes read.
+fn fill_chunk(file: &mut fs::File, chunk: &mut [u8]) -> DurableResult<usize> {
+    let mut filled = 0;
+    while filled < chunk.len() {
+        match file.read(&mut chunk[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(problem) if problem.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(problem) => return Err(error(problem)),
+        }
+    }
+    Ok(filled)
+}
+
+/// Opens a regular file without following a symlink, with the metadata of the
+/// opened descriptor, refusing a path that is not a regular file or whose
+/// identity changed between its `lstat` and its open. A missing file is absent
+/// when `missing_is_absent`, and a missing store otherwise.
+fn open_regular_file_nofollow(
     path: &Path,
     missing_is_absent: bool,
-) -> DurableResult<Option<Vec<u8>>> {
+) -> DurableResult<Option<(fs::File, fs::Metadata)>> {
     // PodMesh targets Linux hosts. These are the Linux ABI values for
     // O_NOFOLLOW and O_NONBLOCK; no unsafe code or additional dependency is used.
     const O_NOFOLLOW_NONBLOCK: i32 = 0o404_000;
@@ -3639,7 +4082,7 @@ fn read_regular_file_nofollow(
         }
         Err(problem) => return Err(error(problem)),
     };
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .custom_flags(O_NOFOLLOW_NONBLOCK)
         .open(path)
@@ -3654,13 +4097,16 @@ fn read_regular_file_nofollow(
     {
         return Err(DurableError::Refused(RefusalReason::UnsafeStore));
     }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(error)?;
+    Ok(Some((file, opened)))
+}
+
+/// Refuses a path that no longer names the regular file that was opened.
+fn confirm_same_file(path: &Path, opened: &fs::Metadata) -> DurableResult<()> {
     let after = fs::symlink_metadata(path).map_err(error)?;
     if !after.file_type().is_file() || after.dev() != opened.dev() || after.ino() != opened.ino() {
         return Err(DurableError::Refused(RefusalReason::UnsafeStore));
     }
-    Ok(Some(bytes))
+    Ok(())
 }
 
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
@@ -3743,3 +4189,74 @@ CREATE TRIGGER exchange_audit_events_no_update BEFORE UPDATE ON exchange_audit_e
 CREATE TRIGGER exchange_audit_events_no_delete BEFORE DELETE ON exchange_audit_events BEGIN SELECT RAISE(ABORT, 'immutable exchange audit event'); END;
 PRAGMA user_version=3;
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bytes(length: usize, seed: usize) -> Vec<u8> {
+        (0..length)
+            .map(|index| u8::try_from((index + seed) % 251).unwrap())
+            .collect()
+    }
+
+    /// The stores of the other tests are small, so their captures run in memory:
+    /// the capture by copy of a larger store is exercised here, over several chunks.
+    #[test]
+    fn a_capture_by_copy_keeps_the_bytes_of_the_files_present() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store.sqlite");
+        let database = bytes(3 * CAPTURE_CHUNK_BYTES + 17, 0);
+        let wal = bytes(CAPTURE_CHUNK_BYTES, 7);
+        fs::write(&path, &database).unwrap();
+        fs::write(sidecar_path(&path, "-wal"), &wal).unwrap();
+        let snapshot = capture_by_copy(&path).unwrap().unwrap();
+        assert_eq!(fs::read(&snapshot.database).unwrap(), database);
+        assert_eq!(
+            fs::read(snapshot.directory.join("store.sqlite-wal")).unwrap(),
+            wal
+        );
+        assert!(!snapshot.directory.join("store.sqlite-shm").exists());
+        let private = snapshot.directory.clone();
+        drop(snapshot);
+        assert!(!private.exists());
+    }
+
+    /// The second read of a capture by copy keeps the copy only when the source
+    /// file still holds the same bytes, and a sidecar is present in both reads or
+    /// in neither.
+    #[test]
+    fn a_capture_by_copy_refuses_a_file_that_changed_between_its_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store.sqlite");
+        let original = bytes(2 * CAPTURE_CHUNK_BYTES + 5, 0);
+        let copy_path = directory.path().join("copy");
+        let mut chunks = (
+            vec![0_u8; CAPTURE_CHUNK_BYTES],
+            vec![0_u8; CAPTURE_CHUNK_BYTES],
+        );
+        let mut compare = |source: &[u8], copied: bool| {
+            fs::write(&copy_path, &original).unwrap();
+            let mut copy = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&copy_path)
+                .unwrap();
+            fs::write(&path, source).unwrap();
+            same_store_file(&path, "", &mut copy, copied, &mut chunks).unwrap()
+        };
+        assert!(compare(&original, true));
+        let mut changed = original.clone();
+        changed[CAPTURE_CHUNK_BYTES + 3] ^= 1;
+        assert!(!compare(&changed, true));
+        assert!(!compare(&original[..original.len() - 1], true));
+        let mut longer = original.clone();
+        longer.push(0);
+        assert!(!compare(&longer, true));
+        assert!(!compare(&original, false));
+
+        let mut copy = fs::File::open(&copy_path).unwrap();
+        assert!(same_store_file(&path, "-wal", &mut copy, false, &mut chunks).unwrap());
+        assert!(!same_store_file(&path, "-wal", &mut copy, true, &mut chunks).unwrap());
+    }
+}
