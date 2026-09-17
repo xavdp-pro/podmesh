@@ -15,7 +15,7 @@ test('public /ready when cloudflared publisher is active', async ({request}) => 
   if (tunnelDown) {
     test.skip(
       true,
-      `No active connector on ${HOSTNAME} (HTTP ${response.status()}). Start publisher_start on the governor lab host, then rerun.`,
+      `No active connector on ${HOSTNAME} (HTTP ${response.status()}). Start publisher_start on the active manager lab host, then rerun.`,
     );
   }
 

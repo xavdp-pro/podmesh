@@ -116,5 +116,5 @@ every pair key and identity.
 Measured on 2026-09-14 (`tests/check-manager-replicas-managed.py`, main tree): three replicas
 running concurrently across three hosts converged their facts — three boot facts, byte-identical
 sets, authenticated imports from both peers on each replica, exchange audit rows — verified from
-outside with all three running. What it does not prove: the governor role, takeover, partitions,
+outside with all three running. What it does not prove: the active manager role, takeover, partitions,
 and agent access to the control API.
