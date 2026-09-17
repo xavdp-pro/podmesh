@@ -12,7 +12,7 @@ inbox copy) mounted into the universe at creation -- never baked into a layer (C
       --replica lab-a:<host-uuid>:10.86.1.10 --replica lab-b:<host-uuid>:10.86.2.10 --replica lab-c:<host-uuid>:10.86.3.10
 
 Each replica listens on every address of its universe (`bind` 0.0.0.0, port 9443): its own managed
-address, and the logical manager's service address when PodMesh gives it to the governor's replica
+address, and the logical manager's service address when PodMesh gives it to the active manager's replica
 as an alias (docs/UNIVERSE-NETWORK-CONTRACT.md). Its peers are the two others, by explicit address.
 The scopes are `m-u2/<alias>/observations`, owned by that alias's replica. The entrypoint
 appends one boot fact per start in the replica's own scope; convergence is then three facts,

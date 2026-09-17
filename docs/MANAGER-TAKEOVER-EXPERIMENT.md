@@ -12,7 +12,7 @@ priority.*
 | requirement | exists | where | measured |
 | --- | --- | --- | --- |
 | external authority / fencing decision | the fencing laboratory's `Authority` gate (one SQLite compare-and-swap, explicit rotation, 22 tests); the self-fence with a takeover margin | `experiments/manager-fencing`; PodMesh `activation_fence` | two- and three-host checks in the main tree |
-| durable epoch screening | PodMesh is the maker: `activation_epochs` screen, permit bound to universe, host and boot, one grant per epoch | main tree `src/activation.rs` (H8) | ten rules mutated; lab runs |
+| durable epoch screening | PodMesh is the node (the model's "maker"): `activation_epochs` screen, permit bound to universe, host and boot, one grant per epoch | main tree `src/activation.rs` (H8) | ten rules mutated; lab runs |
 | old-active exclusion proof | supersession voids the lease in the gate, the renewal and the fence; a stale grant, a fresh permit at the old epoch and a second grant at the new epoch are all refused | `activation_supersede`, `check-ha-three-hosts.py` | HA-10 shape on three hosts, without a real partition |
 | bootstrap independent of manager DNS | the G2 configuration is static IPv4 peers under `IPAddressAllow`; nothing resolves a name | `activation/README.md`, G2 drop-in | six campaigns |
 | reconciliation rule after a partition | `Reconciliation::after_full_exchange`: only after every declared replica holds the identical history; the coordinator is the lowest replica ID **of that agreed set**, and it decides nothing about which data is true; a permit dies with the history it names | `manager-ha/src/lib.rs` | model only (G0); no partition campaign |
@@ -95,14 +95,14 @@ and three Alpine manager universes ran **concurrently** on it across the three h
 replicas of one logical manager, with explicit authenticated endpoints: their facts converged
 while all three kept running. The replicated manager exists inside universes.
 
-**M-U2, steps 5 and 6 (the same night):** the governor role, under the same epoch gate as any
+**M-U2, steps 5 and 6 (the same night):** the active manager role, under the same epoch gate as any
 universe, with all three replicas running. The activation resource is the logical manager's
 UUID; the exclusive effect is the announcement of its service address, a `/32` route that only
 the host holding a live, unsuperseded lease on that resource may publish, and that the host's
 self-fence withdraws once the lease is gone. Measured on the three hosts
-(`tests/check-manager-governor-managed.py` in the main tree): one announcement at every
-observed moment; on the rotation from epoch 1 to epoch 2 the old governor's fence withdrew the
-route before the new governor published it; the old governor was refused when it tried to
+(`tests/check-manager-active-manager-managed.py` in the main tree): one announcement at every
+observed moment; on the rotation from epoch 1 to epoch 2 the old active manager's fence withdrew the
+route before the new active manager published it; the old active manager was refused when it tried to
 publish again, a forged stale permit was refused on the third host, which was also refused
 without the role; the three replicas never stopped, and their facts were still converged after
 the takeover; a duplicate address was refused; a replica stopped and restarted rejoined with a
@@ -114,7 +114,7 @@ the loss exercised is a stop, not a cut.
 stopped, captured, deleted with its address released; the two others moved on to a fact it never
 saw; the point restored into quarantine on its host, promoted into the replica's own identity at
 its managed address and started: it caught up the missed fact from both peers, appended its own
-boot fact, and the three converged again, the governor's announcement never moving. The rescue is
+boot fact, and the three converged again, the active manager's announcement never moving. The rescue is
 on the same host, since a replica's address lives in its host's pool; a host loss is not shown.
 
 **The agent's door (2026-09-15):** PodMesh now carries two typed operations to a manager
@@ -124,32 +124,32 @@ relays the request from inside the universe's PID namespace. An observation name
 lands in the replica's owned scope beside the boot fact and is carried by replication; the only
 writer inside is no longer the entrypoint. The resident's protocol is unchanged.
 
-**The service address answers (2026-09-15):** the exclusive route now gives the governor's
+**The service address answers (2026-09-15):** the exclusive route now gives the active manager's
 replica the logical manager's service address as an alias inside its network namespace, and
 the replicas listen on every address of their universe (the replica set's generator writes
 `bind` 0.0.0.0). Measured on the three hosts: a TCP connection to the service address from the
-other hosts is accepted by the governor's replica only — before and after the role moves with
+other hosts is accepted by the active manager's replica only — before and after the role moves with
 all three running — and fails at once when nothing is announced; the fence withdraws the alias
 with the route. An authenticated exchange at that address is the next thing to show; the
 listener accepts, the protocol then needs a peer key.
 
-**A real partition (2026-09-15):** the governor's host cut from the two others by an nftables
+**A real partition (2026-09-15):** the active manager's host cut from the two others by an nftables
 table (prerouting and output, both directions, with a dead man's switch), the agent still
 reaching every host. The connected replicas converged on a fact the cut one never saw; the
 service address was unreachable across the cut; the agent moved the role, the cut host fenced
-on request, the connected hosts reached the new governor; on reconnection the cut replica
+on request, the connected hosts reached the new active manager; on reconnection the cut replica
 converged as a simple replica. Not shown: the partition that also cuts the agent from the
-governor's host — that host keeps its alias until an agent reaches it, because the self-fence
+active manager's host — that host keeps its alias until an agent reaches it, because the self-fence
 is an operation and nothing in PodMesh runs on a timer; that is decision 4 of the operator's
 list.
 
-**The publishing connector follows the governor (2026-09-15, the operator's decision):** the
+**The publishing connector follows the active manager (2026-09-15, the operator's decision):** the
 manager's public hostname is served through one Cloudflare tunnel by exactly one `cloudflared`,
-co-located with the governor replica, started only under its live unsuperseded lease with the
+co-located with the active manager replica, started only under its live unsuperseded lease with the
 service address effective and the origin answering ready at the epoch, stopped by the fence before
 the address goes (`docs/MANAGER-PUBLISHER-CONTRACT.md` in the main tree). Measured with a real
-laboratory tunnel: an external request answered with the governor's replica and epoch, then the
-new governor's after the rotation; and, the hard test, the governor's host cut from its peer and
+laboratory tunnel: an external request answered with the active manager's replica and epoch, then the
+new active manager's after the rotation; and, the hard test, the active manager's host cut from its peer and
 the agent with its Internet kept withdrew its connector by its own timer 5.8 s after its lease
 lapsed, 30.5 s before the standby published. Decision 4 is thereby measured, not only prepared.
 

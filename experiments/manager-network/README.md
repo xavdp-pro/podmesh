@@ -108,17 +108,22 @@ the original commit for a replay), and the replay flag. A refusal reports the so
 replica and its closed reason and, for a refused import, how many facts of the refused
 snapshot this node holds under the same event ID with other bytes, and the smallest
 such event ID: the signed refusal carries only its reason, so the collision is found
-again by comparing the snapshot with the local history. The callback runs once, as soon
-as step 4 has committed, replayed or recorded the decision and before step 5, so a
-decision is reported even when its reply is lost; a diagnostic or a failure before step
-4 reports none. The resident uses it to catch up with its peers, to push its snapshot
+again by comparing the snapshot with the local history. The callback runs once, after
+step 4 has committed, replayed or recorded the decision, so a decision is reported even
+when its reply is lost; a diagnostic or a failure before step 4 reports none. An import
+is reported before step 5; a refusal is reported after the signed reply has been written,
+because the search for a collision is a full export of the local history and the sender's
+answer never waits for it. The resident uses it to catch up with its peers, to push its snapshot
 back to a peer that lacks facts, to know at once that its own snapshot changed, and to
 name identity collisions. It adds nothing to the wire protocol or the audit sequence.
 
 On the sending side, `ImportResult` also returns `snapshot_facts`, the fact count of the
 snapshot actually sent, so a caller can compare it with the peer's signed history
 length, and `Error::refusal_reason` returns the closed reason of a verified signed
-refusal.
+refusal. `Error::connection_attempted` tells whether `sync_to` had begun connecting to
+the peer when the error ended the exchange: a failure to export, to sign or to record
+the prepared attempt happens before any connection and says nothing about the peer, so a
+caller counting what it knows of its peers can leave it out.
 
 A pre-authentication attempt never changes nonce and carries no authenticated
 peer, operation, receipt, or replay authority. Unsigned diagnostics cannot follow

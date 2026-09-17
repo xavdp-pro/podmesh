@@ -14,7 +14,7 @@ use std::{
     os::unix::{fs::PermissionsExt, net::UnixStream},
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     thread,
@@ -24,6 +24,9 @@ use std::{
 struct Proxy {
     address: SocketAddr,
     blocked: Arc<AtomicBool>,
+    /// How long a new connection is held before it is relayed: a peer that
+    /// answers, late, rather than one that is unreachable.
+    hold_ms: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -33,9 +36,11 @@ impl Proxy {
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
         let blocked = Arc::new(AtomicBool::new(false));
+        let hold_ms = Arc::new(AtomicU64::new(0));
         let stopping = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stopping);
         let block = Arc::clone(&blocked);
+        let hold = Arc::clone(&hold_ms);
         let worker = thread::spawn(move || {
             let mut workers = Vec::new();
             while !stop.load(Ordering::SeqCst) {
@@ -43,9 +48,13 @@ impl Proxy {
                     if block.load(Ordering::SeqCst) {
                         drop(source);
                     } else {
+                        let held = hold.load(Ordering::SeqCst);
                         workers.push(thread::spawn(move || {
+                            if held > 0 {
+                                thread::sleep(Duration::from_millis(held));
+                            }
                             if let Ok(mut destination) =
-                                TcpStream::connect_timeout(&target, Duration::from_millis(100))
+                                TcpStream::connect_timeout(&target, Duration::from_millis(500))
                             {
                                 let _ = source.set_read_timeout(Some(Duration::from_secs(3)));
                                 let _ = destination.set_read_timeout(Some(Duration::from_secs(3)));
@@ -72,6 +81,7 @@ impl Proxy {
         Self {
             address,
             blocked,
+            hold_ms,
             stopping,
             worker: Some(worker),
         }
@@ -366,9 +376,9 @@ impl Drop for Lab {
         }
     }
 }
-/// How long a resident may take to answer status. The universe gives a whole
-/// start 25 seconds, the catch-up window included, so a resident must bind its
-/// control socket within a few seconds. `PODMESH_RESIDENT_TEST_LOAD_ALLOWANCE_MS`
+/// How long a resident may take to answer status. The universe's 25-second start
+/// budget bounds the control socket's bind (catching up is not bounded by it), so
+/// a resident must bind that socket within a few seconds. `PODMESH_RESIDENT_TEST_LOAD_ALLOWANCE_MS`
 /// adds an explicit allowance for a machine known to be loaded; a failure names
 /// the bound and the allowance apart.
 fn readiness_bound() -> (Duration, Duration) {
@@ -541,7 +551,19 @@ fn wrong_key_and_oversized_frames_do_not_import() {
             .unwrap();
         let mut reply = Vec::new();
         match stream.read_to_end(&mut reply) {
-            Ok(_) => break,
+            Ok(_) => {
+                // The answer is a framed, unsigned diagnostic: the sender learns
+                // that its frame was refused as malformed, it is not left to a
+                // closed connection.
+                assert!(reply.len() > 4, "oversized frame answered with {reply:?}");
+                let announced = u32::from_be_bytes(reply[..4].try_into().unwrap());
+                assert_eq!(usize::try_from(announced).unwrap(), reply.len() - 4);
+                let diagnostic: Value = serde_json::from_slice(&reply[4..]).unwrap();
+                assert_eq!(diagnostic["result"], "diagnostic", "{diagnostic}");
+                assert_eq!(diagnostic["server_replica_id"], "r1");
+                assert_eq!(diagnostic["category"], "malformed");
+                break;
+            }
             Err(error)
                 if error.kind() == std::io::ErrorKind::ConnectionReset
                     && attempts < 5
@@ -2018,6 +2040,14 @@ fn with_a_peer_down_only_a_store_whose_latest_own_fact_it_appended_appends_after
     let catch_up = lab.status(2)["catch_up"].clone();
     assert_eq!(catch_up["caught_up_by"], "window");
     assert!(catch_up["caught_up_after_ms"].as_u64().unwrap() >= 2_000);
+    println!(
+        "MEASURED window with one peer down (window 2,000 ms, the attempt to the stopped peer \
+         costing its 2 s connect deadline): caught up {} ms after the resident started exchanging, \
+         its boot fact observed {} ms after the process was spawned, after {catching_up} \
+         answer(s) of catching up",
+        catch_up["caught_up_after_ms"],
+        spawned.elapsed().as_millis()
+    );
     assert_eq!(catch_up["own_facts_at_start"], 3);
     assert_eq!(catch_up["latest_own_fact_appended_locally"], true);
     assert_eq!(catch_up["peers_matched"], json!(["r0"]));
@@ -2200,6 +2230,13 @@ fn a_replica_restored_from_an_older_store_is_pushed_back_to_within_a_few_interva
     let bound = Instant::now();
     until(|| lab.count(2) == 3, Duration::from_secs(10));
     let converged = bound.elapsed();
+    // A push-back requested while an attempt is already past its due check is
+    // served by that attempt, which leaves its acknowledgement unrecorded, and
+    // counted at the next one: wait for the counter rather than read it once.
+    until(
+        || push_backs(&lab, 0, "r2") + push_backs(&lab, 1, "r2") > before,
+        Duration::from_secs(5),
+    );
     assert!(
         push_backs(&lab, 0, "r2") + push_backs(&lab, 1, "r2") > before,
         "convergence did not come from a push-back: before {before}, r0 {} r1 {}",
@@ -2555,5 +2592,453 @@ fn an_identity_collision_is_counted_on_both_sides_and_named_once() {
     assert_eq!(named(1, "r2"), 1);
     assert_eq!(named(2, "r0"), 1);
     assert_eq!(named(2, "r1"), 1);
+    lab.stop_all();
+}
+
+/// The files of a stopped replica's store and their bytes, to put back later.
+type SavedStore = Vec<(std::path::PathBuf, Option<Vec<u8>>)>;
+
+fn save_store(lab: &Lab, i: usize) -> SavedStore {
+    lab.store_files(i)
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).ok();
+            (path, bytes)
+        })
+        .collect()
+}
+
+fn restore_store(saved: &SavedStore) {
+    for (path, bytes) in saved {
+        match bytes {
+            Some(bytes) => fs::write(path, bytes).unwrap(),
+            None => {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
+/// The value one replica holds under an event ID, read without its resident.
+fn fact_value(lab: &Lab, i: usize, event_id: &str) -> Option<String> {
+    inspection(lab, i)
+        .ordered_facts
+        .iter()
+        .find(|fact| fact.event_id == event_id)
+        .map(|fact| fact.value.clone())
+}
+
+/// Leaves the laboratory in the state both window tests start from: r2 restored
+/// from an older copy of its store, whose latest own fact it appended itself,
+/// and r2:2, the fact that copy lacks, held by r0 alone. Every resident is
+/// stopped; r0 holds r2:1 and r2:2, r1 and r2 hold r2:1.
+fn older_copy_with_one_holder(lab: &mut Lab) {
+    lab.start_all();
+    lab.append(2, "boot-1", "s2", "boot", "boot-1 value");
+    assert_converged(lab, 1);
+    lab.stop(2);
+    let saved = save_store(lab, 2);
+    lab.stop(1);
+    lab.configs[2].catch_up_window_ms = Some(1_000);
+    lab.start(2);
+    let (reply, _) = append_when_caught_up(lab, 2, &boot_append("boot-2"), Duration::from_secs(15));
+    assert_eq!(
+        reply["response"]["fact"]["event_id"],
+        "r2:00000000000000000002"
+    );
+    until(|| lab.count(0) == 2, Duration::from_secs(10));
+    lab.stop(2);
+    lab.stop(0);
+    restore_store(&saved);
+    assert_eq!(lab.count(0), 2);
+    assert_eq!(lab.count(1), 1);
+    assert_eq!(lab.count(2), 1);
+}
+
+/// The window is evaluated after the event it learns, never before it. A receipt
+/// that shows a peer ahead can arrive as the first thing this process learns
+/// after the window's end: it must count, and refuse the append, rather than let
+/// the window latch on what was known before it.
+#[test]
+fn a_receipt_that_shows_a_peer_ahead_counts_before_the_window_is_weighed() {
+    let mut lab = Lab::new();
+    older_copy_with_one_holder(&mut lab);
+    // r2 and r1 exchange directly. r2 -> r0 passes through a relay that first
+    // drops every connection, then holds each one; r0 -> r2 and r0 <-> r1 are
+    // dropped, so r1 never receives r2:2 and r0 never pushes it back.
+    let r2_to_r0 = Proxy::new(lab.configs[0].network.bind);
+    let r0_to_r2 = Proxy::new(lab.configs[2].network.bind);
+    let r0_to_r1 = Proxy::new(lab.configs[1].network.bind);
+    let r1_to_r0 = Proxy::new(lab.configs[0].network.bind);
+    for proxy in [&r2_to_r0, &r0_to_r2, &r0_to_r1, &r1_to_r0] {
+        proxy.blocked.store(true, Ordering::SeqCst);
+    }
+    peer_mut(&mut lab.configs[2], "r0").endpoint = r2_to_r0.address;
+    peer_mut(&mut lab.configs[0], "r2").endpoint = r0_to_r2.address;
+    peer_mut(&mut lab.configs[0], "r1").endpoint = r0_to_r1.address;
+    peer_mut(&mut lab.configs[1], "r0").endpoint = r1_to_r0.address;
+    lab.start(0);
+    lab.start(1);
+    lab.configs[2].catch_up_window_ms = Some(3_000);
+    let spawned = Instant::now();
+    lab.start(2);
+    until(
+        || {
+            let catch_up = lab.status(2)["catch_up"].clone();
+            catch_up["peers_matched"] == json!(["r1"])
+                && catch_up["peers_missing"] == json!(["r0"])
+                && catch_up["peers_ahead"] == json!([])
+        },
+        Duration::from_secs(5),
+    );
+    // Two seconds in, r0 starts answering, 1.5 s late: the attempt that carries
+    // the window's end is the one whose receipt tells that r0 holds r2:2.
+    while spawned.elapsed() < Duration::from_millis(2_000) {
+        thread::sleep(Duration::from_millis(10));
+    }
+    r2_to_r0.hold_ms.store(1_500, Ordering::SeqCst);
+    r2_to_r0.blocked.store(false, Ordering::SeqCst);
+    let learnt = Instant::now();
+    loop {
+        let catch_up = lab.status(2)["catch_up"].clone();
+        if catch_up["peers_ahead"] == json!(["r0"]) {
+            break;
+        }
+        assert!(
+            learnt.elapsed() < Duration::from_secs(6),
+            "r2 never learnt that r0 holds facts it lacks; a held attempt may have outlasted \
+             the two-second read deadline on a loaded machine: {catch_up}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    // Well past the window's end, r2 still refuses to append: it knows r0 holds
+    // a fact it lacks.
+    while spawned.elapsed() < Duration::from_millis(4_500) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let reply = lab
+        .control_value(2, boot_append("boot-after-window"))
+        .unwrap();
+    assert_eq!(reply["error"], "append_observation_catching_up", "{reply}");
+    let catch_up = lab.status(2)["catch_up"].clone();
+    assert_eq!(catch_up["caught_up"], false);
+    assert_eq!(catch_up["caught_up_by"], Value::Null);
+    assert_eq!(catch_up["peers_ahead"], json!(["r0"]));
+
+    // Once r0 can push r2:2 back, r2 imports it and its next fact takes the
+    // sequence after it. Nothing forked.
+    r0_to_r2.blocked.store(false, Ordering::SeqCst);
+    let (reply, _) = append_when_caught_up(
+        &lab,
+        2,
+        &boot_append("boot-after-window"),
+        Duration::from_secs(15),
+    );
+    assert_eq!(
+        reply["response"]["fact"]["event_id"],
+        "r2:00000000000000000003"
+    );
+    assert_eq!(lab.status(2)["catch_up"]["caught_up_by"], "every_peer");
+    assert_eq!(
+        fact_value(&lab, 2, "r2:00000000000000000002"),
+        fact_value(&lab, 0, "r2:00000000000000000002")
+    );
+    lab.stop_all();
+}
+
+/// The window counts only what this process learnt after its end. A peer it
+/// caught up with earlier can receive, from the peer the window would forgive,
+/// the very facts this store lacks; the fresh round at the window's end sees
+/// that peer ahead and the append waits.
+#[test]
+fn the_window_weighs_only_evidence_taken_after_its_end() {
+    let mut lab = Lab::new();
+    older_copy_with_one_holder(&mut lab);
+    // r2 -> r1 direct; r1 -> r2 through a relay that is closed later. r2 <-> r0
+    // is dropped both ways: r0 is the peer the window would forgive. r0 -> r1 is
+    // opened later, so that r1 receives r2:2 from r0 alone.
+    let r1_to_r2 = Proxy::new(lab.configs[2].network.bind);
+    let r2_to_r0 = Proxy::new(lab.configs[0].network.bind);
+    let r0_to_r2 = Proxy::new(lab.configs[2].network.bind);
+    let r0_to_r1 = Proxy::new(lab.configs[1].network.bind);
+    let r1_to_r0 = Proxy::new(lab.configs[0].network.bind);
+    for proxy in [&r2_to_r0, &r0_to_r2, &r0_to_r1, &r1_to_r0] {
+        proxy.blocked.store(true, Ordering::SeqCst);
+    }
+    peer_mut(&mut lab.configs[1], "r2").endpoint = r1_to_r2.address;
+    peer_mut(&mut lab.configs[2], "r0").endpoint = r2_to_r0.address;
+    peer_mut(&mut lab.configs[0], "r2").endpoint = r0_to_r2.address;
+    peer_mut(&mut lab.configs[0], "r1").endpoint = r0_to_r1.address;
+    peer_mut(&mut lab.configs[1], "r0").endpoint = r1_to_r0.address;
+    lab.start(0);
+    lab.start(1);
+    lab.configs[2].catch_up_window_ms = Some(4_000);
+    let spawned = Instant::now();
+    lab.start(2);
+    until(
+        || {
+            let catch_up = lab.status(2)["catch_up"].clone();
+            catch_up["peers_matched"] == json!(["r1"]) && catch_up["peers_missing"] == json!(["r0"])
+        },
+        Duration::from_secs(5),
+    );
+    // r1 can no longer reach r2 and receives r2:2 from r0, well before r2's
+    // window ends: what r2 knows of r1 is now out of date.
+    r1_to_r2.blocked.store(true, Ordering::SeqCst);
+    r0_to_r1.blocked.store(false, Ordering::SeqCst);
+    until(|| lab.count(1) == 2, Duration::from_secs(10));
+    let received_after = spawned.elapsed();
+    assert!(
+        received_after < Duration::from_secs(4),
+        "r1 received r2:2 after r2's window had ended ({received_after:?}): inconclusive"
+    );
+    // Past the window's end, the fresh round finds r1 ahead and r2 keeps refusing.
+    assert_catching_up_for(&lab, 2, "boot-after-window", Duration::from_secs(4));
+    let catch_up = lab.status(2)["catch_up"].clone();
+    assert_eq!(catch_up["caught_up"], false, "{catch_up}");
+    assert_eq!(catch_up["peers_ahead"], json!(["r1"]));
+    assert_eq!(catch_up["peers_missing"], json!(["r0", "r1"]));
+    assert_eq!(catch_up["latest_own_fact_appended_locally"], true);
+
+    // r1 can push again: r2 imports r2:2, counts r1 caught up on a receipt taken
+    // after the window's end, and takes the next sequence with r0 still out of
+    // reach. The fact r1 holds is the one r2 holds.
+    r1_to_r2.blocked.store(false, Ordering::SeqCst);
+    let (reply, _) = append_when_caught_up(
+        &lab,
+        2,
+        &boot_append("boot-after-window"),
+        Duration::from_secs(20),
+    );
+    assert_eq!(
+        reply["response"]["fact"]["event_id"],
+        "r2:00000000000000000003"
+    );
+    let catch_up = lab.status(2)["catch_up"].clone();
+    assert_eq!(catch_up["caught_up_by"], "window");
+    assert_eq!(catch_up["peers_missing"], json!(["r0"]));
+    assert_eq!(
+        fact_value(&lab, 2, "r2:00000000000000000002"),
+        fact_value(&lab, 1, "r2:00000000000000000002")
+    );
+    lab.stop_all();
+}
+
+/// Spawns a resident without waiting for it to answer.
+fn spawn_only(lab: &mut Lab, i: usize) {
+    let path = lab._dir.path().join(format!("r{i}.json"));
+    fs::write(&path, serde_json::to_vec(&lab.configs[i]).unwrap()).unwrap();
+    lab.children[i] = Some(
+        Command::new(env!("CARGO_BIN_EXE_podmesh-manager-resident-lab"))
+            .env("PODMESH_MANAGER_NETWORK_MODE", "authenticated-static-peers")
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+}
+
+/// One control request on a socket path, without the laboratory's harness: what
+/// the entrypoint's helper does.
+fn control_at(socket: &std::path::Path, request: &Value) -> Option<Value> {
+    let mut stream = UnixStream::connect(socket).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream
+        .write_all(&serde_json::to_vec(request).unwrap())
+        .ok()?;
+    stream.shutdown(Shutdown::Write).ok()?;
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+#[derive(Debug)]
+struct EntrypointStart {
+    replica: usize,
+    bound_ms: Option<u128>,
+    observed_ms: Option<u128>,
+    catching_up: usize,
+    attempts: usize,
+    last: String,
+    event_id: Option<String>,
+}
+
+/// The start of packaging/podmesh-manager/universe/entrypoint.sh, played here:
+/// the control socket must be bound within the 25-second budget, then one
+/// operation ID is appended until it is observed. `catching_up` is not a failure
+/// and has no deadline, `uncertain` and `busy` are retried within a budget that
+/// restarts after each catching-up answer, and any other answer is terminal.
+/// `guard` bounds this test alone; the entrypoint has no such bound.
+fn entrypoint_start(
+    replica: usize,
+    socket: std::path::PathBuf,
+    operation: String,
+    guard: Duration,
+) -> EntrypointStart {
+    let spawned = Instant::now();
+    let budget = Duration::from_secs(25);
+    let mut start = EntrypointStart {
+        replica,
+        bound_ms: None,
+        observed_ms: None,
+        catching_up: 0,
+        attempts: 0,
+        last: String::new(),
+        event_id: None,
+    };
+    while !socket.exists() {
+        if spawned.elapsed() >= budget {
+            start.last = "control socket not bound".into();
+            return start;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    start.bound_ms = Some(spawned.elapsed().as_millis());
+    let request = json!({
+        "operation": "append_observation",
+        "operation_id": operation,
+        "scope": format!("s{replica}"),
+        "subject": "boot",
+        "value": format!("{operation} value"),
+    });
+    let mut retry_since = Instant::now();
+    loop {
+        start.attempts += 1;
+        let reply = control_at(&socket, &request);
+        if let Some(reply) = &reply {
+            if reply["response"]["result"] == "observed" {
+                start.observed_ms = Some(spawned.elapsed().as_millis());
+                start.event_id = reply["response"]["fact"]["event_id"]
+                    .as_str()
+                    .map(str::to_owned);
+                return start;
+            }
+        }
+        start.last = reply.map_or_else(|| "no answer".into(), |reply| reply.to_string());
+        if start.last.contains("append_observation_catching_up") {
+            start.catching_up += 1;
+            retry_since = Instant::now();
+        } else if !(start.last.contains("append_observation_uncertain")
+            || start.last.contains("append_observation_busy"))
+            || retry_since.elapsed() >= budget
+        {
+            return start;
+        }
+        if spawned.elapsed() >= guard {
+            start.last = format!("test guard of {guard:?} reached: {}", start.last);
+            return start;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn seed_every_replica_then_stop(lab: &mut Lab) {
+    lab.start_all();
+    for i in 0..3 {
+        lab.append(
+            i,
+            &format!("seed-{i}"),
+            &format!("s{i}"),
+            "seed",
+            "seed value",
+        );
+    }
+    assert_converged(lab, 3);
+    lab.stop_all();
+}
+
+/// A replica that is catching up is running, not failed: it keeps exchanging, so
+/// that the replicas started after it catch up with it, and its start waits for
+/// its own boot fact however long that takes. Three starts thirty seconds apart,
+/// each played by the universe entrypoint's contract, all end observed.
+#[test]
+fn staggered_starts_keep_exchanging_while_they_catch_up_and_all_are_observed() {
+    // The start played below must not drift from the shipped entrypoint: its
+    // boot loop keeps retrying a catching-up answer outside the start's budget,
+    // which still bounds the uncertain and busy ones.
+    let script = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packaging/podmesh-manager/universe/entrypoint.sh"),
+    )
+    .unwrap();
+    assert!(
+        script.contains("`catching_up` is retried with no deadline"),
+        "the entrypoint no longer states the readiness contract this test plays"
+    );
+    assert!(
+        !script.contains("append_observation_busy\\|append_observation_catching_up"),
+        "the entrypoint bounds catching up by the start's budget again"
+    );
+    assert!(script.contains("append_observation_uncertain\\|append_observation_busy"));
+    let mut lab = Lab::new();
+    seed_every_replica_then_stop(&mut lab);
+    // The universe's settings: an exchange every second, a backoff to thirty
+    // seconds, one incoming worker, the default fifteen-second window.
+    for config in &mut lab.configs {
+        config.interval_ms = 1_000;
+        config.max_backoff_ms = 30_000;
+        config.incoming_workers = 1;
+    }
+    let begin = Instant::now();
+    let mut starts = Vec::new();
+    for (i, offset) in [(0_usize, 0_u64), (1, 30_000), (2, 60_000)] {
+        while begin.elapsed() < Duration::from_millis(offset) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = fs::remove_file(&lab.configs[i].control_socket);
+        spawn_only(&mut lab, i);
+        let socket = lab.configs[i].control_socket.clone();
+        starts.push(thread::spawn(move || {
+            entrypoint_start(i, socket, format!("boot-r{i}"), Duration::from_secs(150))
+        }));
+    }
+    let starts: Vec<_> = starts
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    for start in &starts {
+        println!("MEASURED staggered start (30 s apart, 15 s window): {start:?}");
+    }
+    for (i, start) in starts.iter().enumerate() {
+        assert_eq!(start.replica, i);
+        assert!(start.observed_ms.is_some(), "{start:?}");
+        assert_eq!(
+            start.event_id.as_deref(),
+            Some(format!("r{i}:00000000000000000002").as_str()),
+            "{start:?}"
+        );
+    }
+    // The first two waited past the 25-second budget for a peer to come up, and
+    // were still running and exchanging when it did.
+    assert!(starts[0].observed_ms.unwrap() > 25_000, "{:?}", starts[0]);
+    assert!(starts[0].catching_up > 0, "{:?}", starts[0]);
+    assert!(starts[1].catching_up > 0, "{:?}", starts[1]);
+    for i in 0..3 {
+        assert!(
+            lab.children[i]
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_none(),
+            "resident r{i} is no longer running"
+        );
+        assert_eq!(lab.status(i)["catch_up"]["appends_observed"], 1);
+    }
+    until(
+        || (0..3).all(|i| lab.count(i) == 6),
+        Duration::from_secs(60),
+    );
+    let digests: Vec<_> = (0..3)
+        .map(|i| inspection(&lab, i).logical_history_sha256)
+        .collect();
+    assert!(digests.iter().all(|digest| *digest == digests[0]));
+    for i in 0..3 {
+        println!(
+            "MEASURED staggered start r{i} catch-up: {}",
+            lab.status(i)["catch_up"]
+        );
+    }
     lab.stop_all();
 }

@@ -449,9 +449,9 @@ at the interval while another inspects it:
 
 - **The first open is still linear in the store.** A new resident verifies everything before it binds
   its control socket: about 1.05 s at 30,004 audit rows on this workstation (about 31 µs per row), to
-  be measured on the laboratory hosts. The universe entrypoint gives the whole start 25 s, the socket
-  wait and the boot fact's catch-up included (see the exchange lot below); a store that keeps growing
-  will cross that budget. The complete verification also holds every audit row in memory, 103 MiB at
+  be measured on the laboratory hosts. The universe entrypoint gives the socket's bind 25 s (catching
+  up is outside that budget since the exchange lot's readiness contract below); a store that keeps
+  growing will cross it. The complete verification also holds every audit row in memory, 103 MiB at
   100,004 rows. Change-driven pushes and the ten-minute refresh slow the growth; they do not bound the
   table.
 - **The table still only grows.** Retention, sealing or rotation remains a separate design.
@@ -584,18 +584,41 @@ moves the next sequence past it.
   - at least one peer has been caught up with;
   - every other peer has been attempted by this process and is not known to be ahead.
 
-  The window thus forgives only peers the process tried and could not catch up with. A replica that
-  reaches no peer at all never appends, whatever its store: accepted, since it cannot tell a lost
-  network from a lost history.
+  When the window ends, every peer is made due again at once, with a fresh operation ID, its
+  acknowledgement forgotten and its backoff restarted: the evidence the window weighs is then taken
+  after its end. Evidence is dated by receipts, not by imports. A receipt counts the peer's history
+  at a moment no earlier than the attempt that drew it (for a replayed receipt, no earlier than the
+  operation ID this process created for it), while a snapshot this replica imported was exported by
+  the peer at a moment this process cannot date. A peer is therefore caught up with *as of* the
+  latest receipt from it that counted exactly the pushed facts, or that counted a history an import
+  from it has since carried in full.
 
-  Only this replica creates facts of its origin, so the peers holding ones its store lacks already
-  held them when the process started, and keep them. Such a peer can neither match a push (its history
-  would count more) nor send a snapshot without them: every peer caught up with therefore means every
-  such fact is back, in whatever order imports and receipts arrive.
+  The window forgives only peers this process attempted after the window's end and could not reach. A
+  peer that answers an authenticated refusal is reached, not forgiven: its exchange service works and
+  its history stays unknown, so the process keeps waiting for it. A replica that reaches no peer at
+  all never appends, whatever its store: accepted, since it cannot tell a lost network from a lost
+  history.
+
+  Why the evidence has to be fresh: only this replica creates facts of its origin, but the peers
+  holding ones its store lacks do not keep them to themselves. A peer caught up with early in the
+  window can receive them, relayed, from the very peer the window would forgive, and its earlier
+  match says nothing about that. With the fresh round that peer answers a receipt counting more facts
+  than were pushed, the window does not apply, and the append waits for the import that carries
+  them.
 - A topology without peers is caught up at once.
+- The evaluation follows what an event teaches, never precedes it: a receipt that shows a peer ahead
+  counts before the window is weighed again, not after it has latched.
 - `status` reports `catch_up`: `caught_up`, `caught_up_by` (`every_peer`, `window` or `no_peers`),
   `caught_up_after_ms`, `peers_imported`, `peers_matched`, `peers_missing`, `peers_ahead`,
-  `peers_not_attempted`, `own_facts_at_start`, `latest_own_fact_appended_locally` and `window_ms`.
+  `peers_not_attempted`, `own_facts_at_start`, `latest_own_fact_appended_locally`, `window_ms` and
+  `appends_observed`, the appends this process answered observed — one of them, for a universe
+  replica, is its boot fact.
+
+A second adversarial review reproduced two more forks, both now regression tests. The window latched
+on what was known before the event being learnt, so a receipt showing a peer ahead, arriving as the
+first thing learnt after the window's end, was applied too late to stop it; and a peer caught up with
+early in the window received the missing fact, relayed by the peer the window forgave, before the
+window elapsed. The first is fixed by evaluating after applying, the second by the fresh round above.
 
 The first rule, counting own facts at start, was refused by an adversarial review of this lot with two
 reproduced forks. An emptied store that got some of its own facts back from one peer during a start
@@ -610,13 +633,51 @@ previous process, which it does not push again before the refresh. A replica tha
 peers on a fresh manager would likewise wait for their backoff, up to 30 s with the laboratory
 settings, past the start budget. The receipt rule catches both up within their own first pushes.
 
-The universe entrypoint retries a `catching_up` boot fact like `busy` and `uncertain`, with the same
-operation ID, within its 25-second start budget. That budget is counted in whole seconds, so the last
-attempt is certain only 24 s after the entrypoint started, and attempts are about 0.6 s apart (a 0.5 s
-pause and a python start). A window runs from the moment the control socket is bound: a start that
-waits for its window stays within the budget while the socket is bound within about 24 − 0.6 − window
-seconds, about 8 s at the 15,000 ms cap, and while one peer is caught up with and every other attempted
-by then (a stopped or unreachable peer costs its 2 s connect deadline).
+### The readiness contract of a universe start
+
+**Running** means the resident is up and exchanging with its peers. **Ready** means this boot's fact
+is observed. A replica that has not caught up is running and not ready: it keeps exchanging, which is
+what lets the replicas started after it catch up with it, and the entrypoint keeps asking for the boot
+fact with the same operation ID and no deadline, writing one line of the resident's catch-up state to
+the log every 30 seconds. Readiness is visible in that log (`boot fact observed`) and in the
+resident's status (`catch_up.appends_observed`, `catch_up.caught_up`); whoever waits for a replica
+waits for that, not for the container to be up. The laboratory's roll tool already requires the boot
+fact in the log.
+
+The 25-second start budget still bounds the control socket's bind and the retries of an `uncertain`
+or `busy` answer, so a start that is about to fail still fails within the 30 seconds PodMesh observes
+it for; the budget of those retries restarts after each `catching_up` answer, which can come first and
+for a long time. Any other answer is still terminal, and the start then exits 2 with the resident
+killed. The entrypoint takes the stop signal from the moment the control socket is bound, so a replica
+that is still catching up stops as honestly as a ready one.
+
+Before this contract, catching up had to fit inside the budget. That was a fork of its own kind: an
+adversarial review restarted three replicas 30 seconds apart with the laboratory settings and none of
+the three ever became ready — each was killed at its budget while waiting for a peer that was itself
+being killed at its own. The same schedule now ends with the three observed (measured below). The old
+bound was also tighter than it was stated to be: at the window's end both early replicas answered one
+`uncertain` before their append landed, so the socket had to bind within about 7 s, not 8, for a start
+that used its 15,000 ms window.
+
+### What a client does with `catching_up`
+
+It is not a refusal, and a client that treats it as one turns a replica that is about to be ready
+into a failed operation. The origin's administration API now retries the same operation ID while that
+is the answer, for up to ten seconds (`CATCHING_UP_WAIT_MS`), and only then answers that this replica
+has not caught up with its peers, is exchanging, and that the same request can be repeated — a 503
+the operator can read. The resident's store is untouched by those answers, so nothing is appended
+twice.
+
+Two clients of the public tree still treat it as a refusal, and are not changed here (they belong to
+the main tree):
+
+- `src/manager.rs` (`manager_observe`) returns an error naming the answer. It should treat
+  `append_observation_catching_up` as a typed, retryable outcome: keep the same operation ID, retry
+  within the caller's deadline, and report the replica as running and not ready rather than failed.
+- `tools/manager-admin.py` (`observe`) waits up to 60 s but builds a **new** UUID for each attempt,
+  so each retry is a different operation. It should keep one operation ID for the whole wait, make
+  the deadline an argument rather than a constant, and print the resident's `catch_up` status while
+  it waits.
 
 ### Push-back
 
@@ -629,6 +690,11 @@ requested push follows. The transport reports the import through
 replica, the snapshot's fact count and the resulting history length. The resident also learns there
 that its own snapshot changed, so its status stops calling an acknowledgement current as soon as an
 import made a push due, not once the connection has ended.
+
+While a process has not caught up, an authenticated import from a peer also makes its own next
+attempt to that peer due at once: the import shows the peer is exchanging again, and the process needs
+a receipt of its own, which no import gives. That is what lets a replica waiting for a peer catch up
+within one exchange of its return instead of one backoff.
 
 A restarted process holds no acknowledgement and pushes to every peer at once; every live peer that
 holds facts the restarted store lacks pushes them back at once. The expected catch-up of a restarted
@@ -670,7 +736,8 @@ the same reason as a topology mismatch. The wire is unchanged; the collision is 
 - the transport reports every refusal it recorded on an authenticated request through the callback of
   `Node::serve_connection_reporting`, and after a refused import it compares the refused snapshot with
   the local history, reporting how many of its facts this node holds under the same event ID with
-  other bytes and the smallest such event ID;
+  other bytes and the smallest such event ID. That comparison runs once the signed refusal is
+  written: the sender's answer never waits for a search whose size is the peer's snapshot;
 - the resident counts, for each peer, `refused_imports` and, under `identity_collisions`,
   `imports_refused` (refused imports that carried a collision) and `event_id`, and writes one line to
   standard error naming the event ID, once for each new colliding event ID from that peer, however
@@ -715,6 +782,10 @@ two of the third.
 | store deleted, both peers live | 106–912 ms, median 140 ms | 187–973 ms |
 | store with facts of its own, one peer down | 15,000 ms (window) | 15,026–15,030 ms |
 
+The third row was measured before the window required evidence taken after its end. It now costs, in
+addition, the round of attempts that follows the end: one connect deadline (2 s) for each peer that
+does not answer, plus the exchange with the peer that does.
+
 A replica restarted on an older copy of its store, whose peers each held an acknowledgement of their
 current snapshot and a refresh of ten minutes, held every fact again 83–425 ms after its spawn. The
 slowest samples are consistent with a peer's outgoing worker still inside an attempt towards the
@@ -736,20 +807,55 @@ second at a one-second refresh (at most twelve per refresh: each visit waits up 
 the refresh), and an edited row was detected 100–175 ms after a store that had been unreadable during
 the periodic pass became readable again.
 
+After the second review's fixes, four full runs of the same suite (debug, four test threads, same
+workstation) gave: an emptied replica caught up 229–457 ms after it started exchanging and its first
+append was observed 328–581 ms after its spawn; a replica on an older store held every fact 119–173 ms
+after its control socket answered; an idle replica added 10.0–10.8 audit rows per second at a
+one-second refresh; an edited row was detected 100–150 ms after the store became readable again; and a
+store with facts of its own, with one peer stopped and a 2,000 ms window, caught up 4,193–4,441 ms
+after it started exchanging — the window, then the fresh round, whose attempt to the stopped peer
+spends its 2 s connect deadline — with its boot fact observed 4,255–4,506 ms after the spawn.
+
+The staggered restart the review used, three replicas started 30 seconds apart with the laboratory
+settings (interval 1 s, maximum backoff 30 s, 15,000 ms window) and the new readiness contract, ended
+with the three boot facts observed, over four runs: the first replica, alone for 30 s, was observed
+30,461–30,503 ms after its spawn (caught up by its window 30,188–30,268 ms in, within 300 ms of the
+second replica's first exchange), the second 17,352–17,366 ms after its own spawn (its window plus the
+fresh round), and the third, with both peers up, 1,722–1,729 ms after its spawn (every peer). Under
+the previous contract the same schedule observed none of the three: each was killed at its 25-second
+budget.
+
 ### What this does not settle
 
 - **A store whose latest own fact it appended itself, restored from an older copy, while the only
-  peer holding its later facts is down.** After the window it appends, and the collision above happens
-  when that peer returns: both sides refuse the other's imports, visibly (authenticated refusals,
-  degraded links, `identity_collisions` and one standard-error line naming the event ID), and nothing
-  repairs it. Nothing in the store tells such a copy from a current store; a longer window moves the
-  boundary, it does not remove it.
+  peer holding its later facts is out of reach.** This is the accepted hazard, and these are its
+  bounds. It needs, together: a store that is an older copy of itself whose latest own fact it
+  appended itself — any file copy inherits the `observe` receipts, so a recovery-point restore, a
+  rollback and a lost fsync all qualify, and nothing in the store tells such a copy from a current
+  one; later own facts held only by replicas this process cannot reach through the whole window and
+  the round that follows it; and those replicas staying out of reach until the append. A holder that
+  answers before the fresh round ends prevents it: measured with a 15,000 ms window and one holder
+  down, a holder that came back 14.0 s and 17.0 s after the start gave no fork, one that came back at
+  19.0 s and 21.0 s did, and the window latched 17,127–17,150 ms in — the end of the window plus the
+  2 s connect deadline of the attempt that found the holder absent. Before the fresh round the same
+  boundary was the window itself (14.5 s no fork, 15.5 s fork).
+
+  When it does happen, the fork spreads as far as the facts do and no further: the replica that
+  lacked the fact imports the forked version and keeps exchanging with the replica that made it,
+  while the holder of the first version is refused by both and refuses both. Measured end to end,
+  all four links carry the same `identity_collisions.event_id` (`r2:…02`), each of the three
+  residents names it once on standard error per peer however often the refusal repeats, and the
+  three stores hold two facts each. The holder is then reachable and refusing, so it is not forgiven
+  by any window: it never catches up, appends nothing more, stays running and exchanging, and says
+  so in its status (`catch_up.caught_up: false`, `identity_collisions`). Nothing repairs this; an
+  operator has to.
 - **An emptied store with a peer down**, including one that imported some of its own facts back in an
-  earlier process, does not boot within the entrypoint's budget: the universe start fails, visibly,
-  until that peer answers. So does a replica that reaches no peer. This is chosen: the alternative is a
-  fork.
-- **The start budget.** A store that may use its window, with a peer down, boots after its first open
-  plus the window; the 25-second budget holds while the control socket binds within about 8 s.
+  earlier process, never becomes ready while that peer stays out of reach: it runs, exchanges, and
+  answers `catching_up` to every append, visibly, for as long as it takes. So does a replica that
+  reaches no peer. This is chosen: the alternative is a fork.
+- **The start budget.** It bounds the control socket's bind and the `uncertain`/`busy` retries, not
+  catching up. A replica that is catching up is running and not ready, which whoever starts it has to
+  act on: PodMesh sees a universe that is up, and the boot fact appears in the log later, or never.
 - **An idle link between two live replicas** is confirmed once per refresh: a partition between them
   shows within one refresh plus the margin above, not sooner.
 - **Laboratory qualification**: catch-up, push-back and first-open times on the laboratory hosts, and
