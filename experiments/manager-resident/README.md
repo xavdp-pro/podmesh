@@ -234,7 +234,13 @@ waits for an admitted append worker.
 Live `status` is a bounded resident diagnostic: replica identity, peer diagnostics,
 admission counters and `activation_authority=false`. It never opens, copies or
 serializes the durable store, and returns
-`canonical_inspection_available_via: "--inspect-store"`. Full canonical facts,
+`canonical_inspection_available_via: "--inspect-store"`. It also carries
+`store_closed` and `store_closed_reason`: whether the store is closed for this
+process and the failure that closed it, read from the store's closed state rather
+than from the store itself, so status stays available while the store serves
+operations elsewhere. It is what fails closed with the store: the administration
+app's origin refuses everything under `/admin` with `503` while `store_closed` is
+true, and refuses it too when this status does not arrive. Full canonical facts,
 receipts, audits, integrity verification and source-copy behavior are exclusively
 provided by `--inspect-store`; status remains bounded as audit retention grows.
 `--inspect-store` performs this read-only inspection without network mode,

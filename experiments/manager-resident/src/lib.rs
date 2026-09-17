@@ -1,7 +1,8 @@
 //! Bounded resident replication laboratory. No executable control authority.
 use fs2::FileExt;
 use podmesh_manager_ha_lab::durable::{
-    DurableError, RefusalReason, Request, Response, Store, DEFAULT_FULL_VERIFICATION_INTERVAL,
+    DurableError, RefusalReason, Request, Response, Store, StoreClosedState,
+    DEFAULT_FULL_VERIFICATION_INTERVAL,
 };
 use podmesh_manager_network_lab::{
     ConfigurationFile, ErrorSource, ServedDecision, ServedImport, ServedRefusal,
@@ -263,6 +264,11 @@ struct Status {
     incoming_limit: usize,
     outgoing_limit: usize,
     activation_authority: bool,
+    /// Whether the store is closed for this process, and why. What reads this
+    /// status fails closed with the store: an administration surface refuses
+    /// while it is true, and refuses too when this status does not arrive.
+    store_closed: bool,
+    store_closed_reason: Option<String>,
 }
 
 /// What this process has learnt about one peer while it catches up.
@@ -495,6 +501,9 @@ struct Shared {
     append_job_active: AtomicBool,
     append_worker_failures: AtomicUsize,
     catch_up: Mutex<CatchUp>,
+    /// The closed state of the store's database file, read here rather than from
+    /// the store itself: the store serves operations in another thread.
+    store_closed_state: StoreClosedState,
     /// Counts the changes this process made to its local snapshot: appends and
     /// imports that inserted facts. An acknowledgement recorded at an older
     /// generation no longer describes the current snapshot.
@@ -552,6 +561,12 @@ fn status(config: &Configuration, shared: &Shared) -> Result<Status> {
         .lock()
         .map_err(|_| "catch-up lock poisoned")?
         .status(now);
+    // A closed state that cannot be read counts as closed: a store whose state is
+    // unknown is not an open one.
+    let store_closed = match shared.store_closed_state.failure() {
+        Ok(failure) => failure,
+        Err(problem) => Some(problem),
+    };
     Ok(Status {
         kind: "resident_observation",
         replica_id: config.network.replica_id.clone(),
@@ -565,6 +580,8 @@ fn status(config: &Configuration, shared: &Shared) -> Result<Status> {
         incoming_limit: config.incoming_workers,
         outgoing_limit: 1,
         activation_authority: false,
+        store_closed: store_closed.is_some(),
+        store_closed_reason: store_closed.map(|failure| failure.to_string()),
     })
 }
 
@@ -870,6 +887,7 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
             config.catch_up_window(),
         )),
         snapshot_generation: AtomicU64::new(0),
+        store_closed_state: startup_store.closed_state(),
     });
     let outgoing_config = config.clone();
     let outgoing_shared = Arc::clone(&shared);

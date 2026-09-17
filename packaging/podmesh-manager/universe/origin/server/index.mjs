@@ -1,5 +1,5 @@
 import { createApp } from './app.mjs'
-import { factsReader, markReader, observer, readConfig } from './resident.mjs'
+import { factsReader, markReader, observer, readConfig, storeState } from './resident.mjs'
 
 const CONFIG = process.env.PODMESH_MANAGER_CONFIG || '/etc/podmesh-manager/config.json'
 const STATE = process.env.PODMESH_MANAGER_STATE || '/var/lib/podmesh-manager'
@@ -19,6 +19,7 @@ const app = createApp({
   activeManager: markReader(MARKS),
   facts,
   append: observer({ control, scope, facts }),
+  storeState: storeState({ control }),
   secure: process.env.PODMESH_ORIGIN_INSECURE_COOKIE !== '1',
 })
 app.listen(PORT, '0.0.0.0', () => console.log(`manager origin listening on ${PORT} (fail-closed until PodMesh marks this replica as the active manager)`))

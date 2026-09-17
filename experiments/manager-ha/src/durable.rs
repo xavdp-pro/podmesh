@@ -247,6 +247,26 @@ pub struct StoreIntegrity {
     pub failure: Option<DurableError>,
 }
 
+/// A handle on the closed state of one database file, readable from any thread
+/// while the [`Store`] itself stays where its operations run. The state belongs
+/// to the database file rather than to the `Store` opened on it, so a handle
+/// taken before that store is dropped still reports the failure that closed the
+/// file for this process.
+#[derive(Clone)]
+pub struct StoreClosedState(Arc<StoreIntegrityEntry>);
+
+impl StoreClosedState {
+    /// The failure that closed this database file for the process, if any.
+    ///
+    /// # Errors
+    /// Reports a poisoned closed-state lock, which a caller that fails closed
+    /// with the store treats as a closed file: a state that cannot be read is
+    /// not an open one.
+    pub fn failure(&self) -> DurableResult<Option<DurableError>> {
+        Ok(closed_state(&self.0)?.clone())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
@@ -636,6 +656,15 @@ impl Store {
             self.verify_full()?;
         }
         Ok(due)
+    }
+
+    /// Returns a handle on the closed state of this store's database file. It
+    /// outlives this store and is read from any thread, so a process that serves
+    /// its store from one thread can answer, from another, whether the file is
+    /// closed and why.
+    #[must_use]
+    pub fn closed_state(&self) -> StoreClosedState {
+        StoreClosedState(Arc::clone(&self.integrity))
     }
 
     /// Reports the integrity state of this store in this process.

@@ -470,8 +470,9 @@ of at most 4096 bytes. Every bound is checked before store access. The
 successful response returns the typed fact, receipt evidence and replay flag.
 
 Live `status` is a bounded diagnostic response: it reports the replica identity,
-peer counters, worker bounds and `activation_authority: false`, but never embeds
-facts, receipts or audit history. Peer counters reset on restart. Canonical
+peer counters, worker bounds, `activation_authority: false` and, since lot V2-S,
+whether the store is closed for this process and why (`store_closed`,
+`store_closed_reason`), but never embeds facts, receipts or audit history. Peer counters reset on restart. Canonical
 durable evidence is obtained separately through the read-only `--inspect-store`
 interface, so retained history cannot make live status unbounded or couple it to
 network I/O. `shutdown` retains its existing behavior.
@@ -606,10 +607,13 @@ success.
   reconnection;
 - accepted/refused exchanges contain the required audit phases and byte counts;
 - worker/admission bounds and existing framing deadlines still pass;
-- `activation_authority` remains false in every status result; and
+- `activation_authority` remains false in every status result;
 - *(lot V2-S)* `--inspect-store --facts-only` prints the full inspection's facts,
   reads no audit row, refuses a corrupt fact and is refused without
-  `--inspect-store`.
+  `--inspect-store`; and
+- *(lot V2-S)* a store closed for the resident is reported closed in `status`, with
+  its reason, and the administration app's origin refuses `/admin` with `503`
+  while it is, or while the resident does not answer.
 
 Run locked tests, clippy with warnings denied and formatting checks for all three
 crates. Re-run packaging tests and the complete manager qualification harness.

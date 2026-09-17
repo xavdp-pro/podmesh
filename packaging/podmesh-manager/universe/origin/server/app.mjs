@@ -57,7 +57,7 @@ export function flags(facts) {
 
 const cookies = req => Object.fromEntries((req.headers.cookie || '').split(';').map(p => p.trim().split('=')).filter(([k]) => k).map(([k, ...v]) => [k, v.join('=')]))
 
-export function createApp({ identity, scope, activeManager, facts, append, dist = path.resolve(import.meta.dirname, '../dist'), secret = randomBytes(32), secure = true, now = () => Date.now() }) {
+export function createApp({ identity, scope, activeManager, facts, append, storeState = async () => ({ closed: true, reason: 'the origin was started without a store state' }), dist = path.resolve(import.meta.dirname, '../dist'), secret = randomBytes(32), secure = true, now = () => Date.now() }) {
   const app = express()
   app.disable('x-powered-by')
   app.set('trust proxy', 1)
@@ -88,6 +88,23 @@ export function createApp({ identity, scope, activeManager, facts, append, dist 
   }
   // Fail-closed first: nothing is served without the mark, the administration app included.
   app.use((req, res, next) => { req.mark = activeManager(); if (!req.mark) return closed(req, res); next() })
+
+  // Fail-closed with the store: the administration reads and writes replicated facts, so it is
+  // refused while the resident reports its store closed for its process, and refused too when the
+  // resident does not answer. The mark and /ready are unchanged: they say what PodMesh published,
+  // which a closed store does not withdraw.
+  app.use('/admin', async (req, res, next) => {
+    let state
+    try {
+      state = await storeState()
+    } catch {
+      state = { closed: true, reason: 'the resident did not answer' }
+    }
+    if (!state || state.closed) {
+      return res.status(503).json({ ready: false, reason: 'the manager store is closed', detail: state?.reason || 'the resident did not answer', ...identity })
+    }
+    next()
+  })
 
   app.get(['/', '/index.html'], (req, res) => {
     res.type('html').send(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>PodMesh manager</title><style>body{margin:0;background:#f4efe4;color:#1c1916;font-family:ui-sans-serif,system-ui,sans-serif}main{max-width:40rem;margin:12vh auto;padding:0 1.5rem}h1{font-size:1.6rem;font-weight:600}p,dd{line-height:1.45;color:#4a433b}dl{display:grid;grid-template-columns:8rem 1fr;gap:.35rem 1rem}dt{color:#7a7268}a{color:#215547}</style><main><p>PODMESH / MANAGER ORIGIN</p><h1>This replica is the active manager.</h1><p>The public hostname reaches the replica that currently holds the exclusive role. Machine JSON stays at <a href="/ready"><code>/ready</code></a>, administration at <a href="/admin/">/admin</a>.</p><dl><dt>epoch</dt><dd><code>${Number(req.mark.epoch) || ''}</code></dd><dt>replica</dt><dd><code>${identity.replica_id}</code></dd><dt>logical</dt><dd><code>${identity.logical_manager_id}</code></dd></dl></main></html>`)

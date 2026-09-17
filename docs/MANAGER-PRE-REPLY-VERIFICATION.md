@@ -247,6 +247,17 @@ a resident restarted on a corrupt store refuses to start. In the resident, a clo
 appends with `append_observation_uncertain`, fails every exchange, and keeps status and shutdown
 available; a failed periodic pass is written to standard error.
 
+**What fails closed with the store.** The resident's `status` carries `store_closed` and
+`store_closed_reason`: the closed state of the database file for that process, and the failure that
+closed it (`corrupt: …`, `storage: …`). A closed state the resident cannot read is reported closed —
+an unknown state is not an open one. The administration app's origin asks the resident for it before
+every request under `/admin`, the API included, and answers `503` with the reason `the manager store
+is closed` and the resident's own reason as `detail` when the store is closed, when the resident does
+not answer, or when it answers without the state. Nothing under `/admin` is served meanwhile: no
+administrator is read, named or revoked over a store that no longer verifies. The active manager's
+mark is a separate gate and keeps its own reason (`not the active manager`), and `/` and `/ready`
+still answer with the mark: a closed store does not withdraw what PodMesh published.
+
 The candidate check of a new audit row reads the rows of its own attempt through the
 `UNIQUE(direction, attempt_id, phase)` index, in both directions, instead of the whole table. Every
 sequence rule is scoped to one attempt ID — the phase rules of one direction, and the rule that an

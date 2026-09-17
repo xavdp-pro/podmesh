@@ -45,16 +45,32 @@ export const factsReader = ({ binary, config, state }) => () => new Promise((res
   })
 })
 
-function once(control, request) {
+function once(control, request, timeout = 20000) {
   return new Promise((resolve, reject) => {
     const chunks = []
     const s = net.createConnection(control)
-    s.setTimeout(20000, () => { s.destroy(new Error('the resident did not answer in time')) })
+    s.setTimeout(timeout, () => { s.destroy(new Error('the resident did not answer in time')) })
     s.on('connect', () => { s.write(request); s.end() })
     s.on('data', c => chunks.push(c))
     s.on('error', reject)
     s.on('close', () => resolve(Buffer.concat(chunks).toString('utf8').trim()))
   })
+}
+
+// What the resident says about the store it serves: closed for its process, and why. A store closes
+// when a stored row does not verify, and it stays closed until the resident is restarted on a store
+// that verifies. The administration reads and writes replicated facts, so it fails closed with the
+// store: this answer is what the origin refuses on. An answer that does not arrive, or that does not
+// carry the state, is treated as closed -- an unknown state is not an open one.
+export const storeState = ({ control, timeout = 2000 }) => async () => {
+  let answer
+  try {
+    answer = JSON.parse(await once(control, JSON.stringify({ operation: 'status' }), timeout))
+  } catch {
+    return { closed: true, reason: 'the resident did not answer' }
+  }
+  if (typeof answer?.store_closed !== 'boolean') return { closed: true, reason: 'the resident did not report the state of its store' }
+  return answer.store_closed ? { closed: true, reason: answer.store_closed_reason || 'the store is closed for the resident' } : { closed: false }
 }
 
 // One typed observation in this replica's scope. The resident answers within a 250 ms control
