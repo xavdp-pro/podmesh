@@ -14,8 +14,9 @@ use std::{
 
 use podmesh_manager_ha_lab::{
     durable::{
-        AuditDirection, AuditErrorCategory, AuditOutcome, AuditPhase, Configuration, DurableError,
-        ExchangeAuditEvent, RefusalReason, Request, Response, Store,
+        inspect_facts_read_only, inspect_read_only, AuditDirection, AuditErrorCategory,
+        AuditOutcome, AuditPhase, Configuration, DurableError, ExchangeAuditEvent, RefusalReason,
+        Request, Response, Store,
     },
     ReplicaConfig, ScopeGrant,
 };
@@ -972,6 +973,69 @@ fn no_transaction_commits_after_the_store_is_closed() {
     blocker.execute_batch("ROLLBACK").unwrap();
     assert_eq!(pending.join().unwrap(), Some(edited_prepared_row_error()));
     assert_eq!(lab.audit_rows(), rows);
+}
+
+/// The facts-only inspection returns the facts of the full inspection, verified,
+/// without reading a receipt or an audit row.
+#[test]
+fn facts_only_inspection_verifies_the_facts_and_reads_no_audit_row() {
+    let lab = Lab::new();
+    {
+        let mut store = lab.open();
+        for index in 0..3 {
+            store
+                .execute_with_receipt(&observation(&format!("fact-{index}"), "value"))
+                .unwrap();
+        }
+        for label in ["one", "two"] {
+            store.record_exchange_audit(&prepared(label)).unwrap();
+        }
+    }
+    let full = inspect_read_only(&lab.database(), &configuration(), "r1").unwrap();
+    let facts = inspect_facts_read_only(&lab.database(), &configuration(), "r1").unwrap();
+    assert_eq!(facts.history_count, 3);
+    assert_eq!(facts.history_count, full.history_count);
+    assert_eq!(facts.ordered_facts, full.ordered_facts);
+    assert_eq!(facts.logical_history_sha256, full.logical_history_sha256);
+
+    // An audit row that the full inspection refuses is not read.
+    insert_malformed_audit_row_at(&lab, 3, "forged");
+    assert!(matches!(
+        inspect_read_only(&lab.database(), &configuration(), "r1"),
+        Err(DurableError::Corrupt(_))
+    ));
+    assert_eq!(
+        inspect_facts_read_only(&lab.database(), &configuration(), "r1").unwrap(),
+        facts
+    );
+
+    // The facts table keeps the rowid rule, and every fact is verified.
+    let connection = Connection::open(lab.database()).unwrap();
+    connection
+        .execute(
+            "INSERT INTO facts(rowid, event_id, fact_json, sha256) VALUES (0, 'forged-fact', '{}', 'x')",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        inspect_facts_read_only(&lab.database(), &configuration(), "r1").unwrap_err(),
+        rowid_gap("facts")
+    );
+    let lab = Lab::new();
+    lab.open()
+        .execute_with_receipt(&observation("fact", "value"))
+        .unwrap();
+    Connection::open(lab.database())
+        .unwrap()
+        .execute(
+            "INSERT INTO facts(event_id, fact_json, sha256) VALUES ('r1:00000000000000000002', '{}', 'not the checksum')",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        inspect_facts_read_only(&lab.database(), &configuration(), "r1").unwrap_err(),
+        DurableError::Corrupt("stored fact hash mismatch".into())
+    );
 }
 
 /// A byte copy of a closed store is a different file, first opened by this

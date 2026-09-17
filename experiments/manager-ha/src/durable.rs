@@ -404,6 +404,16 @@ pub struct CanonicalStoreInspection {
     pub sqlite_integrity_result: String,
 }
 
+/// The facts of a store as [`inspect_facts_read_only`] verifies them: the same
+/// values as the fields of [`CanonicalStoreInspection`] with these names.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FactsInspection {
+    pub history_count: usize,
+    pub ordered_facts: Vec<Fact>,
+    pub logical_history_sha256: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IncompleteAttempt {
@@ -3549,29 +3559,7 @@ pub fn inspect_read_only(
     require_regular_nonsymlink(path)?;
     let topology = validate_local_configuration(configuration, replica_id)?;
     let (_snapshot, mut connection) = open_read_only_snapshot(path)?;
-    connection
-        .busy_timeout(Duration::from_secs(5))
-        .map_err(error)?;
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Deferred)
-        .map_err(error)?;
-    let version: u32 = transaction
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(error)?;
-    if version != 3 {
-        return Err(DurableError::Refused(RefusalReason::UnsupportedSchema));
-    }
-    verify_immutable_schema(&transaction)?;
-    let identity: (String, String) = transaction
-        .query_row(
-            "SELECT replica_id, topology_json FROM identity WHERE singleton=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(error)?;
-    if identity != (replica_id.to_string(), json(&topology)?) {
-        return Err(DurableError::Refused(RefusalReason::IdentityMismatch));
-    }
+    let (transaction, version) = begin_inspection(&mut connection, &topology, replica_id)?;
     let integrity: String = transaction
         .pragma_query_value(None, "integrity_check", |row| row.get(0))
         .map_err(error)?;
@@ -3588,13 +3576,7 @@ pub fn inspect_read_only(
     let audits = load_audits(&transaction, &topology, replica_id)?;
     let receipts = load_receipt_evidence(&transaction)?;
     let ordered_facts: Vec<_> = replica.history.values().cloned().collect();
-    let topology_sha256 = digest(&json(&topology)?);
-    let logical_history_sha256 = digest(&json(&(
-        "podmesh-manager-ha-logical-history/1",
-        topology.logical_manager_id(),
-        &topology_sha256,
-        &ordered_facts,
-    ))?);
+    let logical_history_sha256 = logical_history_sha256(&topology, &ordered_facts)?;
     let receipt_set_sha256 = digest(&json(&("podmesh-manager-ha-receipt-set/1", &receipts))?);
     let audit_set_sha256 = digest(&json(&("podmesh-manager-ha-audit-set/1", &audits))?);
     let incomplete_attempts = incomplete_attempts(&audits)?;
@@ -3636,6 +3618,86 @@ pub fn inspect_read_only(
     };
     transaction.commit().map_err(error)?;
     Ok(inspection)
+}
+
+/// Verifies and returns the facts of an existing manager store through the same
+/// stable private copy as [`inspect_read_only`]: schema version and shape, the
+/// replica and topology identity, the rowid rule of the facts table, and every
+/// fact's checksum, JSON, event identity and validation by the reducer. It reads
+/// no receipt and no audit row and runs no SQLite `integrity_check`, so neither
+/// its verification nor its result grows with the exchange audit table; capturing
+/// the private copy still reads the whole database file twice. It is a read of
+/// the facts, not a verdict on the store: corrupt receipts or audit rows leave its
+/// result unchanged.
+///
+/// # Errors
+/// Rejects missing/non-regular stores, schema or identity mismatch, a facts
+/// table whose rowids are not contiguous from 1, and any corrupt fact.
+pub fn inspect_facts_read_only(
+    path: &Path,
+    configuration: &Configuration,
+    replica_id: &str,
+) -> DurableResult<FactsInspection> {
+    require_regular_nonsymlink(path)?;
+    let topology = validate_local_configuration(configuration, replica_id)?;
+    let (_snapshot, mut connection) = open_read_only_snapshot(path)?;
+    let (transaction, _) = begin_inspection(&mut connection, &topology, replica_id)?;
+    verify_contiguous_rowids(&transaction, AppendOnlyTable::Facts)?;
+    let replica = load(&transaction, &topology, replica_id)?;
+    transaction.commit().map_err(error)?;
+    let ordered_facts: Vec<_> = replica.history.into_values().collect();
+    Ok(FactsInspection {
+        history_count: ordered_facts.len(),
+        logical_history_sha256: logical_history_sha256(&topology, &ordered_facts)?,
+        ordered_facts,
+    })
+}
+
+/// Opens the read transaction of a read-only inspection of a private copy and
+/// checks what every inspection rests on: schema version 3, the exact schema
+/// shape, and the configured replica and topology identity. Returns the schema
+/// version with the transaction.
+fn begin_inspection<'c>(
+    connection: &'c mut Connection,
+    topology: &Topology,
+    replica_id: &str,
+) -> DurableResult<(Transaction<'c>, u32)> {
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(error)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Deferred)
+        .map_err(error)?;
+    let version: u32 = transaction
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(error)?;
+    if version != 3 {
+        return Err(DurableError::Refused(RefusalReason::UnsupportedSchema));
+    }
+    verify_immutable_schema(&transaction)?;
+    let identity: (String, String) = transaction
+        .query_row(
+            "SELECT replica_id, topology_json FROM identity WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(error)?;
+    if identity != (replica_id.to_string(), json(topology)?) {
+        return Err(DurableError::Refused(RefusalReason::IdentityMismatch));
+    }
+    Ok((transaction, version))
+}
+
+/// The domain-separated digest of a replica's ordered facts, comparable across
+/// converged replicas of one logical manager and topology.
+fn logical_history_sha256(topology: &Topology, ordered_facts: &[Fact]) -> DurableResult<String> {
+    let topology_sha256 = digest(&json(topology)?);
+    Ok(digest(&json(&(
+        "podmesh-manager-ha-logical-history/1",
+        topology.logical_manager_id(),
+        &topology_sha256,
+        ordered_facts,
+    ))?))
 }
 
 struct ReadOnlySnapshot {

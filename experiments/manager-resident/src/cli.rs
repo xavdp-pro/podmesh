@@ -1,6 +1,6 @@
 //! Strict offline validation and explicit network opt-in for the package candidate.
 use crate::{Configuration, Result};
-use podmesh_manager_ha_lab::durable::inspect_read_only;
+use podmesh_manager_ha_lab::durable::{inspect_facts_read_only, inspect_read_only};
 use std::{
     ffi::{OsStr, OsString},
     fs,
@@ -19,6 +19,7 @@ struct Options {
     runtime: Option<PathBuf>,
     validate: bool,
     inspect_store: bool,
+    facts_only: bool,
 }
 
 pub fn require_network_mode() -> Result<()> {
@@ -54,14 +55,23 @@ pub fn execute(arguments: impl Iterator<Item = OsString>) -> Result<()> {
     if options.inspect_store {
         validate_inspection_paths(&config, state)?;
         config.validate_inspection()?;
-        println!(
-            "{}",
-            serde_json::to_string(&inspect_read_only(
-                &config.network.database_path,
-                &config.network.manager,
-                &config.network.replica_id,
+        let network = &config.network;
+        // The facts alone, verified: an output and a verification that do not grow
+        // with the exchange audit table, for readers that need nothing else.
+        let inspection = if options.facts_only {
+            serde_json::to_string(&inspect_facts_read_only(
+                &network.database_path,
+                &network.manager,
+                &network.replica_id,
             )?)?
-        );
+        } else {
+            serde_json::to_string(&inspect_read_only(
+                &network.database_path,
+                &network.manager,
+                &network.replica_id,
+            )?)?
+        };
+        println!("{inspection}");
         return Ok(());
     }
     let runtime = options
@@ -90,6 +100,7 @@ fn parse(args: &[OsString]) -> Result<Options> {
             runtime: None,
             validate: false,
             inspect_store: false,
+            facts_only: false,
         });
     }
     let mut config = None;
@@ -97,6 +108,7 @@ fn parse(args: &[OsString]) -> Result<Options> {
     let mut runtime = None;
     let mut validate = false;
     let mut inspect_store = false;
+    let mut facts_only = false;
     let mut index = 0;
     while index < args.len() {
         let name = args[index].to_str().ok_or("invalid flag")?;
@@ -113,6 +125,14 @@ fn parse(args: &[OsString]) -> Result<Options> {
                 return Err("duplicate --inspect-store".into());
             }
             inspect_store = true;
+            index += 1;
+            continue;
+        }
+        if name == "--facts-only" {
+            if facts_only {
+                return Err("duplicate --facts-only".into());
+            }
+            facts_only = true;
             index += 1;
             continue;
         }
@@ -139,6 +159,9 @@ fn parse(args: &[OsString]) -> Result<Options> {
     if inspect_store && runtime.is_some() {
         return Err("--inspect-store does not accept --runtime-dir".into());
     }
+    if facts_only && !inspect_store {
+        return Err("--facts-only requires --inspect-store".into());
+    }
     Ok(Options {
         config: config.ok_or("--config required")?,
         state: Some(state.ok_or("--state-dir required")?),
@@ -149,6 +172,7 @@ fn parse(args: &[OsString]) -> Result<Options> {
         },
         validate,
         inspect_store,
+        facts_only,
     })
 }
 
