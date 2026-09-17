@@ -45,19 +45,30 @@ lacks some facts of its own origin, deleted or restored from an older copy, woul
 otherwise number its next fact with a producer sequence its peers already hold with
 other bytes, and each side would refuse every later import from the other, for good.
 A peer is caught up with once this process has committed or replayed an authenticated
-import from it, or once that peer's authenticated receipt for a push of this process
-reported a history exactly as long as the pushed snapshot: having imported it, the peer
-held nothing this replica lacked. Without that second rule a clean restart would wait
-for the window, since its peers have nothing to push back and still hold an
-acknowledgement of their own snapshot. A refused import or push counts for nothing. A
-process whose store held at least one fact of its own origin when it started also
-appends once the catch-up window has elapsed since it started exchanging, which bounds
-a start while a peer is down, at the price of the collision above if that peer held
-facts the store lacks. A store without any such fact never appends before every peer
-is caught up with, and keeps refusing, typed, while one is unreachable. A replica
-without peers is caught up at once. Until it is caught up, `append_observation` answers
-`append_observation_catching_up` without touching the store. The state latches for the
-process.
+import from it that carried every fact the peer was known to hold, or once that peer's
+latest authenticated receipt for a push of this process counted exactly the pushed facts:
+having imported them, the peer held nothing this replica lacked. Without that second
+rule a clean restart would wait for the window, since its peers have nothing to push
+back and still hold an acknowledgement of their own snapshot. A receipt counting more
+facts than were pushed marks the peer ahead until an import from it carries at least as
+many. A refused import or push counts for nothing. Every peer caught up with catches the
+process up. The catch-up window forgives the other peers only to a store whose latest
+fact of its own origin was appended by the store itself (its `observe` receipts say so;
+an emptied store that imported its own facts back never qualifies, in any later
+process), once the window has elapsed since the process started exchanging, one peer has
+been caught up with, and every other peer has been attempted and is not known to be
+ahead. This bounds a start while a peer is down, at the price of the collision above if
+that peer alone held later facts of a restored older copy. A replica that reaches no peer
+never appends. A replica without peers is caught up at once. Until it is caught up,
+`append_observation` answers `append_observation_catching_up` without touching the store.
+The state latches for the process.
+
+A refused authenticated import is reported too. After a refused import the transport
+compares the refused snapshot with the local history; the resident counts refused
+imports per peer and, when the snapshot carried an event ID this replica holds with
+other bytes, an identity collision, named once on standard error for each new colliding
+event ID from that peer. A push refused with `policy_violation` counts as a collision
+once one was found in that peer's own pushes.
 
 SQLite retains the dependency's WAL/FULL, immutable history and receipt checks,
 identity binding and atomic import. The resident's first store open verifies the whole
@@ -67,8 +78,11 @@ writes a failed pass to standard error. A pass that could not run, because the s
 not open or the pass could not take its snapshot, verified and closed nothing: it is
 retried after a backoff that starts at `interval_ms` and doubles up to
 `max_backoff_ms`, never later than the verification interval, and each attempt is
-written to standard error. The main loop supervises that worker like the outgoing one:
-a resident whose verification or replication worker stopped exits with an error. Any
+written to standard error. A failure that closed the store, `corrupt` or `storage`, is
+told apart by the store's integrity state: later passes keep the verification interval
+and write that the store is still closed. The main loop supervises that worker like the
+outgoing one: a resident whose verification or replication worker stopped exits with an
+error. Any
 failed verification closes the store for the process: appends answer
 `append_observation_uncertain`, exchanges fail, status and shutdown stay available, and
 a restarted resident refuses to start on that store. A held lock file prevents two
@@ -153,7 +167,7 @@ endpoints, commands or topology. Protect local config/DB; never commit secrets.
 | Maximum backoff | At least interval, at most 300,000 ms |
 | Complete store verification | Optional, 1,000–86,400,000 ms; default 600,000 ms |
 | Unchanged snapshot refresh | Optional, at least interval, at most 3,600,000 ms; default 600,000 ms |
-| Catch-up window | Optional, 1,000–20,000 ms; default 15,000 ms, well within the universe's 25-second start budget |
+| Catch-up window | Optional, 1,000–15,000 ms; default 15,000 ms: the universe's 25-second start budget, counted in whole seconds, holds while the control socket binds within about 8 s |
 | Control request frame | 32,768 bytes within the shared 250 ms control deadline |
 | Observation value | Nonempty UTF-8, at most 4,096 bytes |
 | Control response | 32,768 bytes within the shared 250 ms control deadline |
@@ -241,7 +255,9 @@ end of the last attempt whatever its outcome (equal to `last_success_age_ms` whe
 attempt succeeded, smaller once one failed after it); `acknowledged_unchanged`, true
 when that peer's receipt acknowledges the current local snapshot, the refresh has not
 elapsed and no push is due; the effective `refresh_ms` and `max_backoff_ms`; and
-`push_backs`. An idle link is confirmed once per refresh. A live link's last success is
+`push_backs`; `authenticated_refusals` and `last_refusal_reason` for its pushes;
+`refused_imports`; and `identity_collisions` (`imports_refused`, `pushes_refused`,
+`event_id`). An idle link is confirmed once per refresh. A live link's last success is
 never older than the refresh plus one interval plus one exchange with each peer, since
 the outgoing worker visits them in turn (an exchange is bounded by connect, write and
 read deadlines of 2 seconds each); a link whose attempt failed is retried within the
@@ -252,7 +268,8 @@ link is reported by the first attempt after it, at most one refresh plus that sa
 margin after the last success.
 `catch_up` reports `caught_up`, `caught_up_by` (`every_peer`, `window` or `no_peers`),
 `caught_up_after_ms` since the process started exchanging, `peers_imported`,
-`peers_matched`, `peers_missing`, `own_facts_at_start` and `window_ms`. None of this is
+`peers_matched`, `peers_missing`, `peers_ahead`, `peers_not_attempted`,
+`own_facts_at_start`, `latest_own_fact_appended_locally` and `window_ms`. None of this is
 exact causal lag or convergence proof: equal counts can differ, and replayed receipts describe a
 historical committed result. Unknown values remain null. Unsigned diagnostics
 and failed exchanges clear `history_count_delta` to null; the previous acknowledged

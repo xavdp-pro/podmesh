@@ -342,18 +342,42 @@ moves the next sequence past it.
   `append_observation_catching_up`, after its authorization checks and without touching the store.
   The state latches: once caught up, a process stays caught up.
 - A peer is caught up with when this process has committed or replayed an authenticated import from
-  it, or when that peer's authenticated receipt for a push of this process reported a history exactly
-  as long as the pushed snapshot. A peer that imported a snapshot holds every fact of it, so an equal
-  count means it held nothing this replica lacked; the receipt binds that count under the pair key. A
-  refused import or push counts for nothing.
-- A process whose store held at least one fact of its own origin when it started may also append once
-  the catch-up window has elapsed since it started exchanging: `catch_up_window_ms`, 15,000 ms by
-  default, between 1,000 and 20,000.
-- A store without any fact of its own never appends before every peer is caught up with: it keeps
-  refusing, typed, while one is unreachable. A topology without peers is caught up at once.
+  it that carried every fact the peer was known to hold, or when that peer's latest authenticated
+  receipt for a push of this process counted exactly the pushed facts. A peer that imported a snapshot
+  holds every fact of it, so an equal count means it held nothing this replica lacked; a larger count
+  means it held facts this replica lacked, and the peer stays *ahead* until an import from it carries
+  at least that many facts (a history only grows, so such an import carried all of them). The receipt
+  binds those counts under the pair key, and the transport now returns the count it pushed. A refused
+  import or push counts for nothing.
+- Every peer caught up with catches the process up. The catch-up window, `catch_up_window_ms`
+  (15,000 ms by default, between 1,000 and 15,000), forgives the others only when all of these hold:
+  - the latest fact of this replica's origin in the store at start was appended by that store itself,
+    as its `observe` receipts record (`Store::highest_local_observation`), not imported back from a
+    peer. An emptied store, or one whose latest own facts were only imported back, never qualifies,
+    however many later processes start on it;
+  - the window has elapsed since the process started exchanging;
+  - at least one peer has been caught up with;
+  - every other peer has been attempted by this process and is not known to be ahead.
+
+  The window thus forgives only peers the process tried and could not catch up with. A replica that
+  reaches no peer at all never appends, whatever its store: accepted, since it cannot tell a lost
+  network from a lost history.
+
+  Only this replica creates facts of its origin, so the peers holding ones its store lacks already
+  held them when the process started, and keep them. Such a peer can neither match a push (its history
+  would count more) nor send a snapshot without them: every peer caught up with therefore means every
+  such fact is back, in whatever order imports and receipts arrive.
+- A topology without peers is caught up at once.
 - `status` reports `catch_up`: `caught_up`, `caught_up_by` (`every_peer`, `window` or `no_peers`),
-  `caught_up_after_ms`, `peers_imported`, `peers_matched`, `peers_missing`, `own_facts_at_start` and
-  `window_ms`.
+  `caught_up_after_ms`, `peers_imported`, `peers_matched`, `peers_missing`, `peers_ahead`,
+  `peers_not_attempted`, `own_facts_at_start`, `latest_own_fact_appended_locally` and `window_ms`.
+
+The first rule, counting own facts at start, was refused by an adversarial review of this lot with two
+reproduced forks. An emptied store that got some of its own facts back from one peer during a start
+that could not catch up held own facts at its next start, whose window then let it reuse a sequence
+the missing peer held. And a 1-second window elapsed while the outgoing worker was still inside its
+2-second connect attempt to a stopped peer, before it reached the live peer holding the later fact.
+Both are regression tests of the resident suite.
 
 Counting imports alone would make every clean restart wait the whole window: its peers hold exactly
 its facts, so none has anything to push back, and each still holds its acknowledgement from the
@@ -362,7 +386,12 @@ peers on a fresh manager would likewise wait for their backoff, up to 30 s with 
 settings, past the start budget. The receipt rule catches both up within their own first pushes.
 
 The universe entrypoint retries a `catching_up` boot fact like `busy` and `uncertain`, with the same
-operation ID, within its 25-second start budget.
+operation ID, within its 25-second start budget. That budget is counted in whole seconds, so the last
+attempt is certain only 24 s after the entrypoint started, and attempts are about 0.6 s apart (a 0.5 s
+pause and a python start). A window runs from the moment the control socket is bound: a start that
+waits for its window stays within the budget while the socket is bound within about 24 − 0.6 − window
+seconds, about 8 s at the 15,000 ms cap, and while one peer is caught up with and every other attempted
+by then (a stopped or unreachable peer costs its 2 s connect deadline).
 
 ### Push-back
 
@@ -407,6 +436,27 @@ waiting for the bound would hide a dead peer for up to one more backoff. It is f
 or when it never succeeded. A resident that reports neither figure is judged on a 60 s refresh and a
 300 s backoff.
 
+### Naming an identity collision
+
+When the hazard above has happened anyway, every import that carries both versions of the event is
+refused as a `policy_violation`, the only reason the durable import and the signed refusal carry, and
+the same reason as a topology mismatch. The wire is unchanged; the collision is named locally:
+
+- the transport reports every refusal it recorded on an authenticated request through the callback of
+  `Node::serve_connection_reporting`, and after a refused import it compares the refused snapshot with
+  the local history, reporting how many of its facts this node holds under the same event ID with
+  other bytes and the smallest such event ID;
+- the resident counts, for each peer, `refused_imports` and, under `identity_collisions`,
+  `imports_refused` (refused imports that carried a collision) and `event_id`, and writes one line to
+  standard error naming the event ID, once for each new colliding event ID from that peer, however
+  often the refusal repeats;
+- on the sending side the transport now returns the reason of a verified signed refusal
+  (`Error::refusal_reason`); the resident counts `authenticated_refusals` and `last_refusal_reason` per
+  peer, and counts a `policy_violation` refusal under `identity_collisions.pushes_refused` once it has
+  found a collision in that peer's own pushes: facts are immutable, so the peer still holds the fact it
+  refused ours for. A sender whose peer never reaches it cannot tell a collision from another policy
+  refusal.
+
 ### The periodic verification does not silently stop
 
 A periodic complete verification that could not run, because the store did not open or the pass
@@ -417,6 +467,15 @@ up to `max_backoff_ms`, never later than the verification interval. A verificati
 for the next regular pass, since the store is already closed. The resident's main loop supervises
 the verification worker like the outgoing one: if it stops, the resident exits with an error instead
 of serving without its detection interval.
+
+A verification failure need not be `corrupt`: a stored row that cannot be read once the snapshot is
+held fails as `storage` and closes the store too, and every later open returns that same failure. The
+worker keeps the last store it opened and asks its integrity state whether the store is closed, so a
+closed store is not retried as a pass that could not run: the pass that closed it writes
+`resident store verification failed: …; the store is closed for this process`, and each later pass
+keeps the verification interval and writes that the store is still closed. A database file replaced
+at the path by another that fails at its first open is the one case still classified as a pass that
+could not run.
 
 ### Measured
 
@@ -436,6 +495,14 @@ current snapshot and a refresh of ten minutes, held every fact again 83–425 ms
 slowest samples are consistent with a peer's outgoing worker still inside an attempt towards the
 restarted replica, whose connect retries last up to 2 s; this was not isolated.
 
+After the review fixes described above, on the same workstation under a higher load (load average 3
+to 6), the same scenarios gave: clean restarts caught up in 84–226 ms, deleted stores in 144–333 ms,
+push-back in 137–241 ms, and the restart with a peer down caught up by its window at 15,000 ms, its
+boot fact observed 15,030–15,034 ms after the spawn (the stopped peer's attempt ended after 2 s, well
+within the window). Run in alternation with the tip before the fixes, the clean restart took 84–161 ms
+against 76–175 ms and the deleted store 169–307 ms against 175–359 ms: the difference from the table
+is load, not the fixes.
+
 The resident suite measures the same paths at a 100 ms interval, debug build, `/tmp` on the root
 volume, with the whole suite running in parallel beside another lot's benchmarks, over eight runs:
 an emptied replica caught up 221–438 ms after it started exchanging, a replica on an older store held
@@ -446,15 +513,18 @@ the periodic pass became readable again.
 
 ### What this does not settle
 
-- **A store with facts of its own, while the peer holding its later facts is down.** After the
-  window it appends, and the collision above happens when that peer returns: both sides refuse the
-  other's imports, visibly (authenticated refusals, degraded links), and nothing repairs it. A longer
-  window moves the boundary; it does not remove it.
-- **An emptied store with a peer down** does not boot within the entrypoint's budget: the universe
-  start fails, visibly, until that peer answers. This is chosen: the alternative is a fork.
-- **The start budget.** A store that already held facts of its own, with a peer down, boots after
-  its first open plus the window; the 25-second budget holds while the control socket binds within
-  about ten seconds.
+- **A store whose latest own fact it appended itself, restored from an older copy, while the only
+  peer holding its later facts is down.** After the window it appends, and the collision above happens
+  when that peer returns: both sides refuse the other's imports, visibly (authenticated refusals,
+  degraded links, `identity_collisions` and one standard-error line naming the event ID), and nothing
+  repairs it. Nothing in the store tells such a copy from a current store; a longer window moves the
+  boundary, it does not remove it.
+- **An emptied store with a peer down**, including one that imported some of its own facts back in an
+  earlier process, does not boot within the entrypoint's budget: the universe start fails, visibly,
+  until that peer answers. So does a replica that reaches no peer. This is chosen: the alternative is a
+  fork.
+- **The start budget.** A store that may use its window, with a peer down, boots after its first open
+  plus the window; the 25-second budget holds while the control socket binds within about 8 s.
 - **An idle link between two live replicas** is confirmed once per refresh: a partition between them
   shows within one refresh plus the margin above, not sooner.
 - **Laboratory qualification**: catch-up, push-back and first-open times on the laboratory hosts, and
