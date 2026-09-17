@@ -190,6 +190,9 @@ struct StoreIntegrityEntry {
     closed: RwLock<Option<DurableError>>,
     state: Mutex<IntegrityState>,
     full_pass: Mutex<()>,
+    /// The path this process first opened the file at, named in the message
+    /// logged when the file closes. The file is the same whatever path names it.
+    path: OnceLock<PathBuf>,
 }
 
 #[derive(Default)]
@@ -918,10 +921,21 @@ impl StoreIntegrityEntry {
 
     /// Records the first verification failure; every later operation returns it.
     /// Taking the closure exclusively waits for the commits in flight, so none of
-    /// them completes after this failure is recorded.
+    /// them completes after this failure is recorded. The closure is written to
+    /// standard error where it is recorded: it is a fact of the process from that
+    /// instant, while the operation that met it may answer with nothing else (an
+    /// append answers `uncertain`) and the periodic pass that reports it can be a
+    /// whole interval away.
     fn fail_closed(&self, problem: DurableError) -> DurableError {
         if let Ok(mut closed) = self.closed.write() {
-            closed.get_or_insert_with(|| problem.clone());
+            if closed.is_none() {
+                *closed = Some(problem.clone());
+                let path = self.path.get().map_or_else(
+                    || "(unknown path)".into(),
+                    |path| path.display().to_string(),
+                );
+                eprintln!("manager store {path} is closed for this process: {problem}");
+            }
         }
         problem
     }
@@ -958,8 +972,12 @@ impl StoreIntegrityEntry {
     /// inside a snapshot it holds. A failure here therefore concerns the stored
     /// rows themselves: bytes that could not be read (`storage`) or rows that do
     /// not verify (`corrupt`), and it closes the store as a failed verification of
-    /// those rows does. The operation's own writes and commit are not read
-    /// through this, so a full disk closes nothing.
+    /// those rows does. A failed write or commit is not read through this and
+    /// closes nothing, but a read an operation makes after its own writes can still
+    /// meet a full disk or an I/O error, since SQLite may have to spill the pages
+    /// that operation dirtied before it can serve the read: an authenticated import
+    /// appends its facts and receipts before it reads the rows its audit row
+    /// extends, and a full disk there closes the store.
     fn read_at_use<T>(&self, read: DurableResult<T>) -> DurableResult<T> {
         read.map_err(|problem| self.fail_closed(problem))
     }
@@ -1062,7 +1080,7 @@ fn open_counted_connection(
     let existing = match &before {
         Some(metadata) => {
             require_regular_nonsymlink(path)?;
-            let integrity = integrity_entry(metadata, topology, replica_id)?;
+            let integrity = integrity_entry(path, metadata, topology, replica_id)?;
             integrity.refuse_if_failed()?;
             if first_connection {
                 let key = preflight_key(metadata, topology, replica_id)?;
@@ -1109,7 +1127,7 @@ fn open_counted_connection(
     drop(open_file);
     let integrity = match existing {
         Some(integrity) => integrity,
-        None => integrity_entry(&current, topology, replica_id)?,
+        None => integrity_entry(path, &current, topology, replica_id)?,
     };
     Ok(OpenedFile {
         connection,
@@ -1155,6 +1173,7 @@ fn changed_live_file() -> DurableError {
 }
 
 fn integrity_entry(
+    path: &Path,
     metadata: &fs::Metadata,
     topology: &Topology,
     replica_id: &str,
@@ -1171,7 +1190,9 @@ fn integrity_entry(
         VERIFIED_STORES.get_or_init(|| Mutex::new(BTreeMap::new())),
         "verified store registry lock",
     )?;
-    Ok(Arc::clone(stores.entry(key).or_default()))
+    let entry = Arc::clone(stores.entry(key).or_default());
+    let _ = entry.path.set(path.to_path_buf());
+    Ok(entry)
 }
 
 /// Takes the transaction's read snapshot with a statement that cannot fail on

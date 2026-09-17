@@ -234,18 +234,27 @@ use, or in a periodic pass — closes the database file for the rest of the proc
 found corrupt when the process opens the file again, by its read-only preflight or by the open's own
 transaction. Every later open, append, import, audit record and export of that file in that process
 returns the same error: `corrupt`, or `storage` when stored bytes could not be read. No transaction
-of the process commits on a closed file: every commit holds the lock that records a failure, so a
-failure is recorded either before a commit, which then rolls back and returns it — also when the
-operation began, or waited for the write lock, before the failure — or after that commit has
-completed. An error that prevents a transaction from taking its snapshot or its write lock (a busy
-or locked store) is not a verification failure and closes nothing: SQLite reports busy and locked
-only while a transaction takes those, never on a read inside a snapshot it holds. Neither is a failed
-write or commit, such as a full disk. The closed state belongs to the database file, not to its path:
-another file renamed over the path is another database file, which the process verifies completely at
-its first open before it serves it. A new process verifies the store completely at its first open, so
-a resident restarted on a corrupt store refuses to start. In the resident, a closed store answers
-appends with `append_observation_uncertain`, fails every exchange, and keeps status and shutdown
-available; a failed periodic pass is written to standard error.
+of the process commits on a closed file: every commit holds the closed state shared while SQLite
+commits, and recording a failure takes it exclusively, so a failure is recorded either before a
+commit, which then rolls back and returns it — also when the operation began, or waited for the write
+lock, before the failure — or once the commits in flight have finished. An error that prevents a
+transaction from taking its snapshot or its write lock (a busy or locked store) is not a verification
+failure and closes nothing: SQLite reports busy and locked only while a transaction takes those,
+never on a read inside a snapshot it holds. Neither is a failed write or commit. **A full disk is not
+guaranteed to close nothing**, though: a read an operation makes after its own writes goes through
+the same read-at-use rule, and SQLite may have to spill the pages that operation dirtied before it
+can serve that read — an authenticated import appends its facts and its receipt before it reads the
+rows its audit row extends — so `SQLITE_FULL` or an I/O error there closes the store. It is a storage
+failure reported as one (`storage: …`), and the store reopens on a disk with room, since a new
+process verifies it completely and finds it sound. The closed state belongs to the database file, not
+to its path: another file renamed over the path is another database file, which the process verifies
+completely at its first open before it serves it. A new process verifies the store completely at its
+first open, so a resident restarted on a corrupt store refuses to start. In the resident, a closed
+store answers appends with `append_observation_uncertain`, fails every exchange, and keeps status and
+shutdown available. **The closure is written to standard error at the moment it is recorded**, naming
+the store path and the failure, whichever operation met it: the operation itself may answer with
+nothing else, and the periodic pass that reports it is up to one interval away. A failed periodic
+pass is written to standard error too.
 
 **What fails closed with the store.** The resident's `status` carries `store_closed` and
 `store_closed_reason`: the closed state of the database file for that process, and the failure that
@@ -347,13 +356,15 @@ that cannot exchange at all, and whose failures add the rows that slow it down.
   whole database, WAL and SHM whenever the database file's size or times differ from a state the
   process already preflighted, and every checkpoint changes them. A write operation now records the
   state its own commit and checkpoint left, when the state before the operation was already
-  preflighted by the process; a change by anyone else between two operations still requires a new
-  preflight, and an in-place replacement is still refused. Without it, 3,000 in-process exchanges
-  made two full copies per exchange and grew from 14.6 to 56.7 ms per exchange.
+  preflighted by the process. Without it, 3,000 in-process exchanges made two full copies per
+  exchange and grew from 14.6 to 56.7 ms per exchange. *Superseded by the second review's correction
+  below*: a preflight now runs only at an open made while this process holds no connection on the
+  file, so a process that keeps a store open never copies it again, and the state a write operation
+  records serves the next open by a process that holds no connection on it.
 - **Unchanged snapshots are not exchanged every interval.** The resident pushes its snapshot to a
   peer when it differs from the digest that peer last acknowledged with an authenticated receipt,
-  and otherwise every `unchanged_snapshot_refresh_ms`, 60,000 ms by default in this lot and
-  600,000 ms since the exchange lot below. An idle three-replica manager no longer adds six audit
+  and otherwise every `unchanged_snapshot_refresh_ms`. This lot introduced it at 60,000 ms; the
+  default is 600,000 ms since the exchange lot below, which is what a resident runs. An idle three-replica manager no longer adds six audit
   rows per ordered pair per interval. Every exchange that does happen keeps the same audit
   accounting.
 
@@ -448,9 +459,12 @@ at the interval while another inspects it:
 - **The facts-only inspection still copies the store.** Its verification and its output do not grow
   with the audit table, but its capture reads the whole database file twice, and the private copy
   needs the file's size in `$TMPDIR`.
-- **A busy store can refuse an inspection.** With a writer every 50 ms, 7 of 20 inspections of a
-  44 MB store failed their three captures (11 of 20 before this lot). The administration app reads
-  facts this way; a resident that writes that often makes its pages fail about as often.
+- **A busy store can refuse an inspection taken from another process.** With a writer every 50 ms,
+  7 of 20 inspections of a 44 MB store failed their three captures (11 of 20 before this lot). The
+  administration app reads facts this way — its origin runs the inspection as a separate process, so
+  it captures a copy — and a resident that writes that often makes its pages fail about as often. An
+  inspection made inside a process that has the store open reads it through SQLite instead and does
+  not fail this way.
 - **An old row can change without a trigger being dropped**, through `REPLACE`; it is detected at the
   next complete verification. Refusing it at the moment it is written needs a new schema version.
 - **Opening a store takes the write lock**, briefly, before every export, exchange and pass of the
@@ -459,6 +473,76 @@ at the interval while another inspects it:
   store before this build is deployed.
 - **Laboratory qualification**: a soak of the three replicas on this candidate, with the incomplete
   attempt counts, exchange latencies and restart times measured there.
+
+### Correction after the second review, 2026-09-17: the capture, the closed state, the administration
+
+A second adversarial review of lot V2-S found three things wrong and two documents overstated.
+
+**The capture released the process's own SQLite locks.** The read-only preflight and every
+inspection read the live database, WAL and SHM with plain file reads, and a process that holds SQLite
+connections on a file must never do that: POSIX advisory locks are per process and per inode, so
+closing *any* descriptor on that inode drops *all* of that process's locks on it ("How To Corrupt An
+SQLite Database File", §2.2). SQLite keeps its own descriptors open for exactly this reason; an
+`open`/`close` pair around it, from the same process, undoes that. Measured at `b8cb600`: a second
+open of a store this process already had open deleted the live WAL and SHM of another process's
+connection (a torn "hot journal" recovery), an append this process had acknowledged was lost after a
+crash, and a store closed with `disk I/O error` while another process read it and checkpointed it.
+It was latent since `e3251f2` and is in the laboratory's deployed build.
+
+The store now reads a file's bytes only while **this process holds no SQLite connection on it**. Each
+database file has a live-file entry, keyed by the directory's device and inode and the file name,
+counting the connections this process holds on it, with a gate held while a connection is opened or a
+capture starts; the connection count drops when the last `Store` on the file is dropped. A first open
+(no connection held) preflights as before, on a private copy, so the protection against a swapped or
+foreign file at the path is unchanged. A later open, while the process holds a connection, copies
+nothing: it compares the file identity (device, inode, birth time) with the file this process opened
+and refuses `manager store path no longer names the database file this process has open` — reading
+neither the file nor its sidecars, since the sidecars at those names may belong to the open file —
+and the open's own `IMMEDIATE` transaction still checks the schema, the identity and the last
+verified rows. An inspection of a file this process has open reads it through a read-only SQLite
+connection in one read transaction instead of copying it; an inspection of a file no connection holds
+copies it as before. A child process for the capture was considered and refused: a library cannot
+re-execute an arbitrary host binary (or a test harness) safely, and the design above removes the
+plain reads entirely rather than moving them.
+
+**The closed state under a lock shared by commits.** Commit `f2f34d4` held the integrity state, a
+plain mutex, across `COMMIT`, and claimed that this "adds no contention between writers" and that "a
+reader or a failing verification waits at most for one commit". The first half was right — SQLite's
+write lock already serialises the commits — but the second was wrong: every read of the verified
+positions took the same mutex, so same-process readers queued behind the whole write pipeline. The
+closed state is now a read-write lock of its own, held **shared** by commits and taken exclusively
+only to record a failure, with the verified positions under a separate mutex. `commit_lock.rs` (the
+review's probe: one writer recording an audit row with a 2 ms pause, one exporter in a loop, one
+appender opening a store every 50 ms, on a 21,700-row, 42 MB store, 60 s per run, release build):
+
+| exports in 60 s | `87690e1` (before the lot) | `b8cb600` (reviewed) | this branch |
+| --- | ---: | ---: | ---: |
+| count | 18,515 / 19,130 / 19,696 | 6,706 / 6,771 | 17,574 / 20,050 / 20,490 |
+| p50 | 1.88 / 1.72 / 1.60 ms | 6.59 / 6.63 ms | 2.05 / 1.62 / 1.58 ms |
+| p99 | 5.10 / 4.82 / 5.17 ms | 50.9 / 49.9 ms | 5.21 / 4.57 / 4.35 ms |
+| max | 7.87 / 5.83 / 13.4 ms | 349 / 297 ms | 7.93 / 9.29 / 8.67 ms |
+| write transaction p99 | 49.0 / 60.0 ms | 63.4 ms | 73.7 / 59.2 ms |
+| appends refused by a capture race | 6 / 9 / 14 | 47 / 42 | 0 / 0 / 0 |
+
+Readers are back at the cost they had before the lot, writers are unchanged, and the appending opens
+still wait for SQLite's write lock (p99 0.74–1.34 s in every column, the cost already listed above as
+"opening a store takes the write lock"). The last row is the capture fix: an open by a process that
+already holds the store open no longer copies it, so it can no longer lose the race against the
+writer.
+
+**The administration app no longer failed closed with the store**, since it reads facts through a
+separate inspection process. It does again: see "what fails closed with the store" above.
+
+**Inspecting a store in the laboratory.** Inspect a **stopped** universe's store, or the live one
+through the replica's own CLI (`podmesh-managerd --inspect-store [--facts-only]`), which captures the
+file by reading it twice and keeping it only when both reads agree, and retries when they do not.
+Never inspect a `podman cp` (or `cp`, or `rsync`) of a live store: a plain copy of a database and its
+WAL, taken file after file while a writer commits, is torn. The review copied both files in each
+order while a writer appended, sixteen times: not one copy matched the store. Two were unreadable
+(`database disk image is malformed`), five had a gap in the rowids, most were short of committed rows
+(1,412, 1,500 or 2,500 of 4,500), and fourteen failed SQLite's own `integrity_check` — including
+copies whose rows looked contiguous. A torn copy is not the replica's state, and the rowid rule
+refuses it, so what such an inspection reports says nothing about the store it was taken from.
 
 ## Rejoining and idling, 2026-09-17: the exchange lot
 

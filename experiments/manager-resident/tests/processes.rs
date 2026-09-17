@@ -2458,6 +2458,12 @@ fn a_store_closed_by_a_storage_failure_is_reported_closed_and_not_retried() {
         Duration::from_secs(10),
     );
     assert_eq!(lines("the store is closed for this process"), 1);
+    // The store logs its closure where it records it, naming the file.
+    let closure = format!(
+        "manager store {} is closed for this process: storage",
+        lab.configs[0].network.database_path.display()
+    );
+    assert_eq!(lines(&closure), 1);
     let not_run = lines("resident store verification could not run");
     thread::sleep(Duration::from_millis(3_500));
     // Later passes keep the one-second interval and say the store is still

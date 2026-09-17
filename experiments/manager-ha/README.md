@@ -62,10 +62,10 @@ The model follows these rules:
 | MH-14 | Process API reconciliation and conflict gating | Three independent stores exchange JSON facts, block divergence/conflicts, and report at most one eligible replica for one reconciled history | Tested locally; not activation/fencing |
 | MH-15 | Typed bounded local process interface | Unknown fields and input larger than 1 MiB fail before database creation | Tested locally |
 | MH-16 | Append-only exchange audit | Typed phase rows, predecessor rules, checksums and immutable triggers fail closed | Tested locally |
-| MH-17 | Authenticated-import receipt separation | Source plus wire operation map to a bounded destination-local `network:<sha256>` receipt ID; laboratory imports remain visible as unaudited | Tested locally; network wiring pending |
+| MH-17 | Authenticated-import receipt separation | Source plus wire operation map to a bounded destination-local `network:<sha256>` receipt ID; laboratory imports remain visible as unaudited | Tested locally; wired into the network crate's authenticated served path, not qualified on the laboratory hosts |
 | MH-18 | Non-mutating preflight and inspection | v2 WAL files and mismatched stores retain their bytes; symlinks and unexpected schema objects refuse | Tested locally |
 | MH-19 | Typed incomplete attempts | Locally allocated attempts remain distinct when a peer reuses a wire nonce; inbound and outbound unfinished phases are ordered and typed | Tested locally |
-| MH-20 | Durable inbound decisions | Accepted imports and authenticated refusals follow separate checked signed chains; unsigned diagnostic writes and no-reply closes are distinct terminals and cannot become authenticated outcomes | Tested locally; network wiring pending |
+| MH-20 | Durable inbound decisions | Accepted imports and authenticated refusals follow separate checked signed chains; unsigned diagnostic writes and no-reply closes are distinct terminals and cannot become authenticated outcomes | Tested locally; wired into the network crate's authenticated served path, not qualified on the laboratory hosts |
 | MH-21 | Bounded per-transaction verification | A process verifies a store completely at its first open and at each periodic pass; a transaction verifies the schema, the last verified rows, the rowids and the appended rows; any failure to read or verify a stored row closes the database file for the process, and no transaction commits on it afterwards; append, audit insertion, receiver pre-reply and export cost the same at 1,000 and 30,000 audit rows | Tested locally; laboratory soak pending |
 
 Run:
@@ -193,13 +193,33 @@ materialization, SQLite opens and rewrites only a second private copy. A
 process-local cache includes device, inode, size, modification time, change time,
 replica and topology; in-place replacement and different identities do not match
 the cache. A write operation that starts from a preflighted file state also records
-the state its own commit and checkpoint left, so a process that keeps a store open does
-not copy it again after its own checkpoints; a change made by anyone else still requires
-a new preflight. A capture reads the files twice and keeps them only when both reads are
+the state its own commit and checkpoint left, so the next first open of that file by
+a process finds it preflighted; a change made by anyone else still requires a new
+preflight. A capture reads the files twice and keeps them only when both reads are
 equal: into memory for a store whose files total at most 16 MiB, and above that by
 copying them into the private directory and comparing a second read with the copy
 through 1 MiB buffers, so a first open no longer holds twice the store in memory. The later source open uses SQLite `NOFOLLOW` and rechecks the path
-metadata identity. Tests preserve a killed-child v2 store with live
+metadata identity.
+
+**Those file reads happen only while this process holds no SQLite connection on the
+file.** POSIX advisory locks belong to a process and an inode: closing any
+descriptor on that inode releases every lock the process holds on it, so a plain
+read of a live database, WAL or SHM from a process that has it open through SQLite
+drops that process's own locks (`How To Corrupt An SQLite Database File`, §2.2) and
+lets another process delete the WAL under it, lose an acknowledged append or meet a
+`disk I/O error`. Each database file therefore has a live-file entry — keyed by the
+parent directory's device and inode and the file name — counting the connections
+this process holds, with a gate held while a connection opens or a capture begins.
+An open made while the process holds no connection preflights on a private copy as
+above. An open made while it does copies nothing: it compares the file identity
+(device, inode, birth time) with the file this process opened, refuses the open
+untouched when it differs (`manager store path no longer names the database file
+this process has open`, since the sidecars at those names may belong to the open
+file), and otherwise checks the schema, identity and last verified rows in its own
+`IMMEDIATE` transaction. A read-only inspection of a file this process has open
+reads it through a read-only SQLite connection, in one read transaction, instead of
+capturing it; a file no connection of this process holds is captured as before
+(`tests/sqlite_locks.rs`). Tests preserve a killed-child v2 store with live
 uncheckpointed WAL frames and a mismatched live v3 WAL store byte for byte.
 Inspection and preflight reject symlinked or non-regular database and sidecar
 paths through `lstat` before opening them. The subsequent regular-file open uses
@@ -223,7 +243,11 @@ It opens a stable private copy and never creates or changes the canonical store.
 resident's installed form also offers `--inspect-store --facts-only`, the durable
 `inspect_facts_read_only`: the same private copy, verified only for the schema,
 identity and facts, printing `history_count`, `ordered_facts` and
-`logical_history_sha256`. There is no shell
+`logical_history_sha256`. Inspect a stopped store, or a live one through this
+command, which captures the file by reading it twice and keeps the capture only when
+both reads agree; never inspect a `podman cp` or `cp` of a live store, whose
+database and WAL are copied one after the other while a writer commits and which is
+torn (missing rows, rowid gaps, `database disk image is malformed`). There is no shell
 execution, daemon, network listener, or implicit remote connection.
 
 Example using a disposable operator-owned directory:
@@ -288,8 +312,9 @@ replicated. Restoring an old backup may lose newer receipts even after peer fact
 catch up, so deduplication across rollback of the local database is **not proven**.
 An offline copied database cannot be rebound to a different configured replica,
 but a second copy using the same identity is not fenced. Live SQLite files must
-never be copied as a replication mechanism; tests copy only closed databases as
-explicit stale-backup fixtures.
+never be copied as a replication mechanism, nor read as files by a process that has
+them open through SQLite; tests copy only closed databases as explicit stale-backup
+fixtures, and `tests/sqlite_locks.rs` holds the regressions for the locks.
 
 ## What this proves
 
@@ -304,7 +329,17 @@ the primary key leaving a refused gap; unreadable facts, receipts and audit rows
 use closing the store, while a busy store stays open; a schema found corrupt at open
 closing the store; another file at a closed store's path verified completely before it
 serves; and an operation waiting for the write lock while the store closes, which then
-commits nothing. Two unit tests cover the capture by copy of a larger store. A bounded-cost test times append, audit insertion, receiver
+commits nothing. Added after the second review: rows added after a gap and rows moved
+to another rowid, refused in every table; a rowid gap refused by the full inspection
+where SQLite's integrity check reports `ok`; unreadable rows met by an authenticated
+import and by an open; a closed file refused before anything reads it; a store this
+process has open never copied again; another file at its path refused untouched. Four
+unit tests cover the capture by copy of a larger store, a failure recorded only once
+the commits in flight have finished, and a complete verification of a closed file that
+does not count. Three lock tests (`tests/sqlite_locks.rs`) run child processes against
+a store this process has open: commits stay visible to another process across a second
+open, appends acknowledged around one survive a crash, and external readers and
+`TRUNCATE` checkpoints close nothing. A bounded-cost test times append, audit insertion, receiver
 pre-reply and export at 1,000 and 30,000 audit rows. The 69 executed process
 acceptance tests exercise real compiled child processes and separate temporary
 SQLite stores: restart, retry, sequence allocation, concurrent writers, disjoint
@@ -328,7 +363,10 @@ instruction in the CLI transaction or a physical power-loss test. See
 
 ## What remains unproven
 
-The authenticated-import API is implemented but not yet wired into the network crate.
+The authenticated-import API is wired into the network crate: its served path commits
+an authenticated import and its inbound decision in one transaction
+(`experiments/manager-network/src/lib.rs`). What that proves is a loopback
+laboratory with static keys, not a deployment.
 No complete authenticated origin or network transport, WireGuard integration, discovery,
 DNS, Podman control, real service IP, leases, clocks, failure detector, fencing,
 physical power-loss survival, installed host deployment, Logger integration or

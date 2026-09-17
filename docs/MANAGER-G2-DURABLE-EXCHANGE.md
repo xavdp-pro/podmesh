@@ -356,6 +356,16 @@ or audit row and runs no SQLite integrity check, so neither its output nor its
 verification grows with the audit table. It is the administration app's facts
 reader, not an integrity verdict on the store.
 
+*Corrected 2026-09-17 (lot V2-S, second review):* an inspection reads the store's
+files only when the process running it holds no SQLite connection on them, which is
+the case of both CLI forms. Inside a process that has the store open — the resident
+— the inspection reads it through a read-only SQLite connection in one read
+transaction instead, since reading a live database file with plain file reads from a
+process that has it open releases that process's own POSIX locks on it. Either way
+the store is opened read-only and nothing is created or changed. Inspect a stopped
+store, or a live one through this command; a `podman cp` of a live store is torn and
+is not the replica's state.
+
 Inspection does not require network opt-in or a runtime directory. It must not
 create a missing database, lock, socket, WAL or SHM file. It exits nonzero on a
 missing store, incompatible schema, identity mismatch, integrity error, checksum
