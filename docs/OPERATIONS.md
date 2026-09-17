@@ -28,6 +28,21 @@ sides, destination preflight and restore, completion and source retirement. Only
 universes are qualified. A step that fails leaves the universe where the protocol leaves it, and the report names the
 recovery operations.
 
+## Restoring universes after a boot
+
+A host that reboots brings back, by itself, the universes its journal says should run, once the operator has armed it:
+
+    sudo install -m 0600 /dev/stdin /etc/podmesh/restore-mandate <<'EOF'
+    authorization_ref=mandate:<name>
+    observe_seconds=2
+    EOF
+    sudo systemctl enable podmesh-restore.service      # runs once at each boot; disable it to disarm
+
+At each boot the unit calls `boot_restore` under that reference, and `podmesh boot_restore_status` shows the pass and
+what a pass would decide now. Nothing without a lease restarts elsewhere, and nothing under a lease restarts on the
+returning host until whoever decides where it runs has acquired or renewed its lease during this boot. The rules,
+decisions and refusals are in [LOCAL-API.md](LOCAL-API.md), "Restoring after a boot".
+
 ## Replicating a universe to standby hosts
 
     tools/replicate-universe.py configure --universe <uuid> --active user@host-a --hosts user@host-a,user@host-b,user@host-c \

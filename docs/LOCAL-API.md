@@ -495,6 +495,60 @@ copy; a quarantined copy becomes the universe itself, under the lease.
 How the two files reach the inbox is the transport controller's, as for migrations: PodMesh reads
 `inbox/` and never writes it. The two-host suite's controller carries an outbox to an inbox over SSH.
 
+## Experimental: restoring after a boot (development tree, not packaged)
+
+A host that reboots finds its universes stopped: Podman restarts nothing, and PodMesh acts on nothing by itself.
+`boot_restore` is the operation that brings back, on this host alone and without any peer, manager or workstation,
+the universes this host's journal says should run. It is called at boot by `podmesh-restore.service`, a oneshot unit
+shipped disabled that runs only while a mandate file exists (`/etc/podmesh/restore-mandate`: `authorization_ref`,
+optional `observe_seconds`), exactly as the self-fence; or by an operator or agent at any time. Enabling the unit is
+the operator's decision.
+
+- `boot_restore` (host-wide, journaled; `authorization_ref`, optional `observe_seconds` 0-30, default 2; no
+  `universe_uuid`). A universe is considered only when its **last intent** is to run: the latest, by the attempt
+  that last expressed it, of the operations that name it and either leave it running once verified (`start`,
+  `resume`, `migration_restore`, `migration_restore_local`, `recovery_point_resume`, a live
+  `recovery_point_promote`) or say it should not run (`create`, `clone`, `stop`, `pause`, `delete`, a final live
+  capture, `migration_checkpoint`, `migration_release`, `migration_abandon`, `migration_complete_transfer`,
+  `migration_retire_source`, `migration_restore_abort`, a fence) -- verified, interrupted, or failed with the universe
+  observed not running; a refusal before any effect expresses nothing. Each considered universe gets one decision:
+  `already_running`; `restored` or `started_not_running` (its start was issued by this pass and observed once, after
+  `observe_seconds`, with every other start of the pass); `restored_earlier_this_boot` (its start was issued by an
+  earlier pass of this boot and is replayed, never repeated); or `not_restored` with a reason. A universe whose
+  container is gone is listed in `absent_containers`. One universe's error is that universe's `decision_failed`, never
+  the pass's.
+- Every start it issues has the operation ID `boot-<boot_id without hyphens>-<universe UUID without hyphens>` and
+  passes the same gates as any `start`: ownership, the migration reservation and the activation lease. The first pass
+  that issues it records the caller's `authorization_ref`; a later pass of the same boot sends that saved request
+  again, whatever its own parameters. A universe is therefore started at most once per boot, whatever the number of
+  passes.
+- Never restored, whatever the last intent says:
+  - `managed_network`: its routes, NAT table and alias are not re-applied at boot yet;
+  - `quarantined_copy`: a restore copy is evidence, not a service;
+  - `epoch_gated`: a policy bound to an external authority's epoch; a rebooted host must be authorised again;
+  - `lease_not_renewed_since_boot`: a universe under a lease comes back only once its lease has been acquired or
+    renewed during this boot, by whoever decides where it runs. A host that was down cannot know whether its universe
+    was taken over elsewhere while its lease still ran, and a takeover of a lost host waits only for that lease to
+    lapse. Never either while the clock is not known synchronized (`clock_not_synchronized`);
+  - `recovery_points_without_policy`: a universe with recovery points and no activation policy may have been promoted
+    elsewhere, and nothing says where it may run;
+  - `migration_<state>`: a reservation that still holds the universe, and `restore_claim`: an unresolved restore
+    claim. A released or collected reservation holds nothing: a verified start after it is the caller's explicit
+    choice, and it counts;
+  - `interrupted_live_capture` and `unfinished_live_promotion`: a live capture still dumping, or a live promotion
+    launched and never recorded, after the last intent; retrying that operation settles it;
+  - through the start gate, a lease this host does not hold live or holds under an overtaken epoch (`start_refused`,
+    with the gate's reason).
+- `boot_restore_status` (read-only, not journaled; no fields): this boot's identity and passes, what a pass would
+  decide now for every universe intended to run (`would`, a prediction), and the operations a previous run of the
+  service left `pending`, which are re-evaluated only when their operation ID is sent again.
+
+The packaged script `/usr/bin/podmesh-restore` waits for the service's socket (60 seconds at most) and, for 90 seconds
+at most, for the clock to be synchronized, then sends one request whose operation ID is `boot-restore-<boot_id without
+hyphens>`, so a second run in the same boot replays the first pass. Not covered: a manager universe on the isolated
+profile is not recognised as one while it is stopped, and an operation written without an attempt row (a journal
+rolled back to experimental3) is not ordered.
+
 ## Experimental: the universe network (development tree, not packaged)
 
 The contract is `UNIVERSE-NETWORK-CONTRACT.md`; the operations are journaled like every other and verified from

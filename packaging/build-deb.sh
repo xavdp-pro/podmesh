@@ -11,8 +11,8 @@ trap 'rm -rf "$work"' EXIT
 chmod 755 "$work"
 mkdir -p "$work/DEBIAN" "$work/usr/bin" "$work/usr/lib/systemd/system"
 install -m755 target/release/podmesh target/release/podmeshd "$work/usr/bin/"
-install -m644 packaging/podmesh.service packaging/podmesh-fence.service packaging/podmesh-fence.timer "$work/usr/lib/systemd/system/"
-install -m755 packaging/podmesh-fence "$work/usr/bin/"
+install -m644 packaging/podmesh.service packaging/podmesh-fence.service packaging/podmesh-fence.timer packaging/podmesh-restore.service "$work/usr/lib/systemd/system/"
+install -m755 packaging/podmesh-fence packaging/podmesh-restore "$work/usr/bin/"
 cat > "$work/DEBIAN/control" <<CONTROL
 Package: podmesh
 Version: $version
@@ -32,8 +32,9 @@ Description: Experimental local Podman lifecycle and manager engine
  service only; this package does not by itself install or qualify production HA.
  Migration still requires the separately packaged podmesh-vzcriu runtime.
  Volumes, join/leave occupied hosts, Backup Server and control-services
- universe are out of scope. The self-fence timer (podmesh-fence.timer) is
- shipped disabled and runs nothing without the operator's mandate file.
+ universe are out of scope. The self-fence timer (podmesh-fence.timer) and
+ the restore-after-boot unit (podmesh-restore.service) are shipped disabled
+ and run nothing without the operator's mandate files.
  See docs/EXPERIMENTAL-SCOPE.md for the experimental boundary.
 CONTROL
 cat > "$work/DEBIAN/postinst" <<'SCRIPT'
@@ -45,6 +46,8 @@ if [ "$1" = configure ] && [ -d /run/systemd/system ]; then
  systemctl restart podmesh.service
  # podmesh-fence.timer is deliberately NOT enabled here: whether the host may fence itself on a
  # schedule is the operator's decision, taken by writing /etc/podmesh/fence-mandate and enabling it.
+ # podmesh-restore.service neither: whether the host restores its universes at boot is the operator's
+ # decision, taken by writing /etc/podmesh/restore-mandate and enabling it.
 fi
 SCRIPT
 cat > "$work/DEBIAN/prerm" <<'SCRIPT'
@@ -53,7 +56,7 @@ set -e
 if [ -d /run/systemd/system ]; then
  systemctl stop podmesh-fence.timer 2>/dev/null || true
  systemctl stop podmesh.service
- if [ "$1" = remove ]; then systemctl disable podmesh-fence.timer 2>/dev/null || true; systemctl disable podmesh.service; fi
+ if [ "$1" = remove ]; then systemctl disable podmesh-fence.timer podmesh-restore.service 2>/dev/null || true; systemctl disable podmesh.service; fi
 fi
 SCRIPT
 cat > "$work/DEBIAN/postrm" <<'SCRIPT'

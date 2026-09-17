@@ -95,6 +95,10 @@ pub fn all() -> Value {
         int("timeout_seconds", true, 0, Some(300), "the graceful wait for each stop"),
     ])));
     put("activation_fence_preview", op("read", "none", "what a fence would do now, without journaling anything", Some(vec![])));
+    put("boot_restore", op("host", "lease,reservation", "starts, at most once per boot each, the universes this host's journal says should run, through the start gates; called at boot by the local unit under the operator's mandate", Some(vec![
+        int("observe_seconds", false, 0, Some(30), "how long each start is observed; default 2"),
+    ])));
+    put("boot_restore_status", op("read", "none", "this boot's restore passes, what a pass would decide now, and operations left pending", Some(vec![])));
 
     put("network_declare", op("host", "none", "the host's managed network: its bridge, its pool inside the prefix, its peers' pools and the NAT exemption", Some(vec![
         uuid("network_uuid", "the declaration's identity"),

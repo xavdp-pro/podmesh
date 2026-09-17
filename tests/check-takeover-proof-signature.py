@@ -18,7 +18,7 @@ from podmesh_manager_lab import declare_replica_config, remove_replica_config, r
 socket_path = os.environ.get('PODMESH_SOCKET', '/run/podmesh/api.sock')
 state_dir = os.environ.get('PODMESH_STATE_DIR', '/var/lib/podmesh')
 unit = os.environ.get('PODMESH_UNIT', 'podmesh.service')
-BINARY = os.environ['PODMESH_DAEMON_BINARY']
+BINARY = os.environ.get('PODMESH_DAEMON_BINARY')  # needed only for a transient unit systemd has already forgotten
 PREFIX = os.environ.get('PODMESH_NETWORK_PREFIX', '10.86.0.0/16')
 SERVICE = os.environ.get('PODMESH_MANAGER_SERVICE_ADDRESS', '10.86.0.100')
 VIAS = os.environ['PODMESH_NETWORK_PEER_VIAS'].split(',')
@@ -78,10 +78,9 @@ def pub(operation, **extra):
     return A.api(dict(operation=operation, operation_id=str(uuid.uuid4()), authorization_ref=reference, resource=LOGICAL, **extra))
 
 def daemon():
-    A.ssh(f'sudo -n systemctl stop {unit} 2>/dev/null; sudo -n systemctl reset-failed {unit} 2>/dev/null; for i in $(seq 1 100); do systemctl is-active --quiet {unit} || [ -d {os.path.dirname(socket_path)} ] || break; sleep 0.1; done', check=False)
-    A.ssh(f'sudo -n systemd-run --quiet --unit={unit} --property=RuntimeDirectory={os.path.basename(os.path.dirname(socket_path))} --property=RuntimeDirectoryMode=0700 '
-          f'--property=StateDirectory={os.path.basename(state_dir)} --property=StateDirectoryMode=0700 --property=UMask=0077 '
-          f'--setenv=PODMESH_STATE_DIR={state_dir} --setenv=PODMESH_SOCKET={socket_path} {BINARY}')
+    # Through the harness: an installed unit gets a runtime drop-in that carries the fault and turns systemd's own
+    # restart off; a transient unit is stopped completely and launched again.
+    A.call('restart_with_fault', binary=BINARY)
     for _ in range(50):
         if A.ssh(f'sudo -n test -S {socket_path}', check=False).returncode == 0 and A.call('ready', seconds=20).get('ready'):
             return

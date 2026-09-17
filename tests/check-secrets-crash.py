@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Crash and storage-failure safety of secrets (Codex, P1). One lab host, PODMESH_SOURCE_SSH, the
-transient service variables and PODMESH_DAEMON_BINARY. Verified from Podman's store and the
+service variables and, for a transient unit only, PODMESH_DAEMON_BINARY. Verified from Podman's store and the
 daemon's status: a declaration failing after the store was written is refused and the uncommitted
 secret is removed; one crashing after the store was written is finished by the restart when the
 store holds the intended content (state effective); one crashing before the record became
@@ -16,7 +16,7 @@ from podmesh_two_hosts import Host  # noqa: E402
 socket_path = os.environ.get('PODMESH_SOCKET', '/run/podmesh/api.sock')
 state_dir = os.environ.get('PODMESH_STATE_DIR', '/var/lib/podmesh')
 unit = os.environ.get('PODMESH_UNIT', 'podmesh.service')
-BINARY = os.environ['PODMESH_DAEMON_BINARY']
+BINARY = os.environ.get('PODMESH_DAEMON_BINARY')  # needed only for a transient unit systemd has already forgotten
 control = tempfile.mkdtemp(prefix='podmesh-secrash-')
 A = Host('host', os.environ['PODMESH_SOURCE_SSH'], control, socket_path, state_dir, unit)
 reference = 'disposable-lab-secrets-crash'
@@ -26,14 +26,9 @@ def hostwide(operation, **extra):
     return dict(operation=operation, operation_id=str(uuid.uuid4()), authorization_ref=reference, **extra)
 
 def daemon(fault=None):
-    # The stop must be complete -- the unit gone and its runtime directory removed -- before the new
-    # unit of the same name starts, or the old unit's cleanup removes the new daemon's socket.
-    A.ssh(f'sudo -n systemctl stop {unit} 2>/dev/null; sudo -n systemctl reset-failed {unit} 2>/dev/null; for i in $(seq 1 100); do systemctl is-active --quiet {unit} || [ -d {os.path.dirname(socket_path)} ] || break; sleep 0.1; done', check=False)
-    mark = A.ssh('date +%s').stdout.decode().strip()
-    env_ = f'--setenv=PODMESH_FAULT={fault} ' if fault else ''
-    A.ssh(f'sudo -n systemd-run --quiet --unit={unit} --property=RuntimeDirectory={os.path.basename(os.path.dirname(socket_path))} --property=RuntimeDirectoryMode=0700 '
-          f'--property=StateDirectory={os.path.basename(state_dir)} --property=StateDirectoryMode=0700 --property=UMask=0077 '
-          f'--setenv=PODMESH_STATE_DIR={state_dir} --setenv=PODMESH_SOCKET={socket_path} {env_}{BINARY}')
+    # Through the harness: an installed unit gets a runtime drop-in that carries the fault and turns systemd's own
+    # restart off; a transient unit is stopped completely and launched again.
+    mark = A.call('restart_with_fault', fault=fault, binary=BINARY)['mark']
     for _ in range(50):
         if A.ssh(f'sudo -n test -S {socket_path}', check=False).returncode == 0 and A.call('ready', seconds=20).get('ready'):
             break

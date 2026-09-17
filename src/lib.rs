@@ -1,5 +1,6 @@
 mod cleanup;
 mod activation;
+mod boot_restore;
 mod recovery_point;
 mod retention;
 mod network;
@@ -134,6 +135,7 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
             | "activation_supersede" | "activation_status" | "activation_fence" | "activation_fence_preview" => activation::execute(db, request)?,
             "recovery_point_prepare" | "recovery_point_status" | "recovery_point_restore" | "recovery_point_promote"
             | "recovery_point_stage" | "recovery_point_discard" | "recovery_point_resume" => recovery_point::execute(db, request)?,
+            "boot_restore" | "boot_restore_status" => boot_restore::execute(db, request)?,
             "migration_status" => migration::status(db, request)?,
             "storage_status" => storage::status()?,
             "host_status" => health::host_status()?,
@@ -146,7 +148,7 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
                 "experimental_operations":["migration_preflight","migration_checkpoint","migration_status","migration_authorize_transfer",
                     "migration_complete_transfer","migration_retire_source","migration_release","migration_abandon","migration_restore_local",
                     "migration_destination_preflight","migration_restore","migration_restore_abort",
-                    "garbage_collect_plan","garbage_collect_apply","collection_retention_declare","collection_hold_declare","collection_hold_release","collection_status","network_declare","network_undeclare","network_route_publish","network_route_withdraw","network_status","manager_status","manager_observe","secret_declare","secret_remove","secret_status","publisher_declare","publisher_start","publisher_stop","publisher_status","publisher_observed"],
+                    "garbage_collect_plan","garbage_collect_apply","collection_retention_declare","collection_hold_declare","collection_hold_release","collection_status","network_declare","network_undeclare","network_route_publish","network_route_withdraw","network_status","boot_restore","boot_restore_status","manager_status","manager_observe","secret_declare","secret_remove","secret_status","publisher_declare","publisher_start","publisher_stop","publisher_status","publisher_observed"],
                 "experimental_contracts":{
                     "migration_preflight":"read-only compatibility report bound to universe UUID, container ID, image ID, source and destination host UUIDs; no reservation, suspension or artifact",
                     "migration_checkpoint":"source: fresh checks before suspension, durable reservation, checkpoint with the packaged podmesh-vzcriu runtime in its own scope, archive/manifest/hashes under the state directory; never an authorization to restore",
@@ -164,7 +166,9 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
                     "garbage_collect_plan":"host-wide and read-only: enumerates a bounded set of reservations and unresolved restore claims, their class, every proof fact observed and every blocker, and proposes an effect for each. No Podman mutation, no signal, no deletion, no state change beyond its own immutable run record. Age never justifies collection: proof does",
                     "garbage_collect_apply":"separately authorized: names the plan it applies, the candidates it may act on, and its own bounds (max_effects, max_runtime_reclaims, reclaim_processes). It repeats every proof immediately before each effect, stops at the first mismatch, and verifies each result from outside. Terminal reservation classes 1 and 2 become a collected reservation with a tombstone; a failed restore claim is delegated to migration_restore_abort. There is no timer and no artifact collection in this version",
                     "tombstone":"a collected universe UUID keeps refusing create and clone into that identity for good; a container proven absent at collection never regains ownership through its original creation. Only a verified handoff restore, or an explicit replacement procedure, gives that identity a meaning again",
-                    "reservation":"a reservation or an unresolved restore claim blocks create, start, delete and clone for the universe; stop remains available, and a released or collected reservation blocks nothing"
+                    "reservation":"a reservation or an unresolved restore claim blocks create, start, delete and clone for the universe; stop remains available, and a released or collected reservation blocks nothing",
+                    "boot_restore":"host-wide, journaled, called at boot by a local unit under the operator's mandate or by an operator or agent: starts, at most once per boot each, the universes whose last journaled intent is to run, through the start gates, under the caller's authorization_ref; never a managed-network universe, an epoch-gated one, a lease-gated one while the clock is not known synchronized, a migration reservation in any state, an unresolved restore claim, or a universe with an interrupted live capture or unfinished live promotion recorded after its last intent",
+                    "boot_restore_status":"read-only: this boot's passes, what a pass would decide now for every universe intended to run, and the operations a previous run of the service left pending"
                 },
                 "scope":"local rootful Podman; network-disabled universes created or cloned by this host's PodMesh journal; one request at a time",
                 "contracts":{

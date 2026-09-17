@@ -1,0 +1,13 @@
+[Unit]
+Description=PodMesh restore after boot, once, under the operator's mandate (disabled unless the operator enables it)
+Documentation=file:/usr/share/doc/podmesh/LOCAL-API.md
+After=podmesh.service time-sync.target
+Requires=podmesh.service
+ConditionPathExists=/etc/podmesh/restore-mandate
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/podmesh-restore
+UMask=0077
+TimeoutStartSec=15min
+[Install]
+WantedBy=multi-user.target

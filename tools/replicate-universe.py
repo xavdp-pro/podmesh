@@ -335,6 +335,12 @@ def takeover_once(args):
     while time.time() < until:
         time.sleep(min(1.0, max(0.0, until - time.time())))
     waited = time.time() - began
+    # Look at the old host again, after the wait and right before promoting: a host that came back during the wait
+    # may be running the universe again, and a second instance is never this tool's decision.
+    seen_after_wait = observe_container(rep['active'], u)
+    report['old_active_observed_before_promotion'] = seen_after_wait
+    if seen_after_wait in ('running', 'unknown'):
+        raise Refused(f'the old active host is back and the universe there is {seen_after_wait} after the wait; nothing was promoted')
     copy = newest_copy(ledger, B.identity)
     if copy is None:
         raise Refused('the standby holds no copy of this universe; run a replication to it first')

@@ -1,0 +1,73 @@
+#!/bin/sh
+# Restoring after a boot, under a written mandate -- and under nothing else.
+#
+# PodMesh acts on nothing by itself: `boot_restore` is an operation. After a reboot nobody may be
+# there to call it -- no peer, no manager, no workstation -- and a host that should keep serving
+# its universes has to bring them back on its own. This script is what a oneshot unit runs once
+# at boot so that the host does: it refuses to run without the operator's mandate file, waits for
+# the service's socket and, for a bounded time, for the clock to be synchronized (a lease is judged
+# on the wall clock), then sends one typed request whose operation ID is derived from this boot, so
+# a second run in the same boot replays the first pass. It decides nothing; the daemon's
+# `boot_restore` does, through the same gates as any start, and its report goes to the journal.
+# Enabling the unit is the operator's decision (LOCAL-API.md, "Restoring after a boot").
+#
+# Mandate file (default /etc/podmesh/restore-mandate), root-only, shell-free key=value lines:
+#   authorization_ref=<the mandate's name, recorded as provenance in every start it causes>
+#   observe_seconds=<how long each start is observed, 0 to 30; default 2>
+set -eu
+umask 077
+mandate=${PODMESH_RESTORE_MANDATE:-/etc/podmesh/restore-mandate}
+cli=${PODMESH_CLI:-/usr/bin/podmesh}
+socket=${PODMESH_SOCKET:-/run/podmesh/api.sock}
+if [ ! -f "$mandate" ]; then
+  echo "podmesh-restore: no mandate at $mandate; nothing is restored without one" >&2
+  exit 3
+fi
+ref=$(sed -n 's/^authorization_ref=//p' "$mandate" | head -1)
+observe=$(sed -n 's/^observe_seconds=//p' "$mandate" | head -1)
+[ -n "$observe" ] || observe=2
+case "$ref" in
+  ''|*[!A-Za-z0-9_.:-]*) echo "podmesh-restore: the mandate names no usable authorization_ref; nothing is restored" >&2; exit 3 ;;
+esac
+case "$observe" in
+  ''|*[!0-9]*) echo "podmesh-restore: the mandate's observe_seconds is not a number; nothing is restored" >&2; exit 3 ;;
+esac
+# A JSON number has no leading zero, and the daemon accepts 0 to 30.
+observe=$(printf '%s' "$observe" | sed 's/^0*//')
+[ -n "$observe" ] || observe=0
+if [ "${#observe}" -gt 2 ] || [ "$observe" -gt 30 ]; then
+  echo "podmesh-restore: the mandate's observe_seconds is above 30; nothing is restored" >&2
+  exit 3
+fi
+# The service reconciles its network ledger before it opens its socket: wait for it, bounded.
+i=0
+while [ ! -S "$socket" ]; do
+  i=$((i + 1))
+  if [ "$i" -gt 120 ]; then
+    echo "podmesh-restore: $socket did not appear within 60 seconds; nothing is restored" >&2
+    exit 4
+  fi
+  sleep 0.5
+done
+# A universe under a lease is not restored while the clock is not known to be synchronized; give the
+# clock a bounded chance first, then let the daemon decide and report what it could not restore.
+i=0
+while [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" != yes ] && [ "$i" -lt 90 ]; do
+  i=$((i + 1))
+  sleep 1
+done
+boot=$(tr -d '-' < /proc/sys/kernel/random/boot_id)
+request=$(mktemp)
+trap 'rm -f "$request"' EXIT
+printf '{"operation_id":"boot-restore-%s","authorization_ref":"%s","observe_seconds":%s}\n' "$boot" "$ref" "$observe" > "$request"
+# The same operation ID is sent again at most twice: a verified pass is replayed, an interrupted one
+# re-evaluated, and a start it already verified is never repeated.
+n=1
+while ! PODMESH_SOCKET="$socket" "$cli" boot_restore "$request"; do
+  if [ "$n" -ge 3 ]; then
+    echo "podmesh-restore: boot_restore did not succeed after $n attempts" >&2
+    exit 1
+  fi
+  n=$((n + 1))
+  sleep 5
+done

@@ -414,6 +414,57 @@ def n_kill_service():
 def n_restart_service():
     subprocess.run(['systemctl', 'restart', _unit()], check=True)
     return n_ready()
+_TEST_DROPIN = 'podmesh-test.conf'
+def _unit_show(unit, prop):
+    return subprocess.run(['systemctl', 'show', f'--property={prop}', '--value', unit], capture_output=True, text=True).stdout.strip()
+def _installed(unit):
+    """An installed unit has a unit file; a transient one does not, and a transient unit systemd has already
+    garbage-collected after a crash has neither."""
+    return _unit_show(unit, 'Transient') != 'yes' and bool(_unit_show(unit, 'FragmentPath'))
+def _hold(unit, fault=None):
+    """A runtime drop-in on an installed unit: systemd's own restart turned off, so a killed or crashed daemon
+    stays dead for the suite to observe, and the lab fault when one is named. It lives under /run: a reboot removes
+    it as well as `_release`."""
+    path = f'/run/systemd/system/{unit}.d/{_TEST_DROPIN}'
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        f.write('[Service]\nRestart=no\n' + (f'Environment=PODMESH_FAULT={fault}\n' if fault else ''))
+    subprocess.run(['systemctl', 'daemon-reload'], check=True)
+def _release(unit):
+    path = f'/run/systemd/system/{unit}.d/{_TEST_DROPIN}'
+    if os.path.exists(path):
+        os.unlink(path)
+        subprocess.run(['systemctl', 'daemon-reload'], check=True)
+def n_restart_with_fault(fault=None, binary=None):
+    """Restarts the service with or without a lab fault (PODMESH_FAULT) and returns the host's second taken just
+    before the start, for journal windows. An installed unit is restarted under the runtime drop-in of `_hold` when
+    a fault is named, and without it otherwise. A transient development unit is stopped completely -- the unit gone
+    and its runtime directory removed, or the old unit's cleanup removes the new daemon's socket -- and launched
+    again with its own executable and environment; `binary` is needed only when systemd has already forgotten it."""
+    unit = _unit()
+    if _installed(unit):
+        _hold(unit, fault) if fault else _release(unit)
+        subprocess.run(['systemctl', 'reset-failed', unit], capture_output=True)
+        mark = int(time.time())
+        subprocess.run(['systemctl', 'restart', unit], check=True)
+        return {'mark': mark, 'installed': True}
+    exec_start = _unit_show(unit, 'ExecStart')
+    path = exec_start.split('path=', 1)[1].split(' ', 1)[0].strip(';') if 'path=' in exec_start else binary
+    assert path and os.path.isfile(path), ('no executable for the transient unit', exec_start, binary)
+    socket_path = os.environ.get('PODMESH_SOCKET', '/run/podmesh/api.sock')
+    runtime, state = os.path.basename(os.path.dirname(socket_path)), os.path.basename(_state())
+    subprocess.run(['systemctl', 'stop', unit], capture_output=True)
+    subprocess.run(['systemctl', 'reset-failed', unit], capture_output=True)
+    deadline = time.time() + 10
+    while time.time() < deadline and (subprocess.run(['systemctl', 'is-active', '--quiet', unit]).returncode == 0 or os.path.isdir(f'/run/{runtime}')):
+        time.sleep(.1)
+    mark = int(time.time())
+    argv = ['systemd-run', '--quiet', f'--unit={unit}', f'--property=RuntimeDirectory={runtime}', '--property=RuntimeDirectoryMode=0700',
+            f'--property=StateDirectory={state}', '--property=StateDirectoryMode=0700', '--property=UMask=0077',
+            f'--setenv=PODMESH_STATE_DIR={_state()}', f'--setenv=PODMESH_SOCKET={socket_path}']
+    argv += ([f'--setenv=PODMESH_FAULT={fault}'] if fault else []) + [path]
+    subprocess.run(argv, check=True, capture_output=True)
+    return {'mark': mark, 'installed': False}
 def n_processes(*needles):
     found = []
     for pid in filter(str.isdigit, os.listdir('/proc')):
@@ -455,6 +506,9 @@ def n_interrupt_live(request, needles, unit, seconds=300):
         pids = matching()
         time.sleep(.002)
     at_kill = {'command_pids': pids, 'seen_after_seconds': round(time.time() - began, 3), 'scope_before_kill': n_scope(unit)['active_state']}
+    # An installed unit would be restarted by systemd while the command still runs: held dead until relaunch_service.
+    if _installed(_unit()):
+        _hold(_unit())
     subprocess.run(['systemctl', 'kill', '--signal=SIGKILL', _unit()], check=True)
     at_kill['command_alive_after_kill'] = bool(matching())
     thread.join(30)
@@ -470,6 +524,7 @@ def n_relaunch_service(seconds=60):
     unit = _unit()
     show = lambda prop: subprocess.run(['systemctl', 'show', f'--property={prop}', '--value', unit], capture_output=True, text=True).stdout.strip()
     if show('Transient') != 'yes':
+        _release(unit)
         subprocess.run(['systemctl', 'restart', unit], check=True)
         return n_ready(seconds)
     exec_start = show('ExecStart')
@@ -623,6 +678,53 @@ class Host:
     def cleanup(self):
         for name in list(self.fixtures):
             self.remove_fixture(name)
+
+    def reboot(self, seconds=600):
+        """Reboots this host and waits for it: its boot identity changed, read over a fresh SSH connection, then the
+        service answering. The multiplexed SSH connection dies with the host, so it is closed first and every probe
+        opens its own. Returns both boot identities and when each phase ended, in seconds after the reboot order."""
+        before = self.ssh('cat /proc/sys/kernel/random/boot_id').stdout.decode().strip()
+        subprocess.run(['ssh', '-o', f'ControlPath={self.control}/%C', '-O', 'exit', self.target], capture_output=True)
+        began = time.time()
+        try:
+            subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ControlMaster=no', '-o', 'ConnectTimeout=10', self.target,
+                            'sudo -n systemctl reboot'], capture_output=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+
+        def probe():
+            try:
+                p = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ControlMaster=no', '-o', 'ConnectTimeout=5', self.target,
+                                    'cat /proc/sys/kernel/random/boot_id'], capture_output=True, timeout=15)
+            except subprocess.TimeoutExpired:
+                return None
+            return p.stdout.decode().strip() if p.returncode == 0 else None
+
+        phases = {}
+        while 'down' not in phases:
+            assert time.time() < began + seconds, f'{self.role} never went down after the reboot order'
+            if probe() != before:
+                phases['down'] = round(time.time() - began, 1)
+            else:
+                time.sleep(1)
+        after = None
+        while not after:
+            assert time.time() < began + seconds, f'{self.role} did not come back with a new boot identity'
+            seen = probe()
+            if seen and seen != before:
+                after, phases['ssh'] = seen, round(time.time() - began, 1)
+            else:
+                time.sleep(2)
+        while 'service' not in phases:
+            assert time.time() < began + seconds, f'{self.role} came back but its service never answered'
+            try:
+                if self.call('ready', seconds=5).get('ready'):
+                    phases['service'] = round(time.time() - began, 1)
+                    continue
+            except (RuntimeError, ValueError):
+                pass
+            time.sleep(2)
+        return {'boot_id_before': before, 'boot_id_after': after, 'seconds_after_order': phases}
 
 
 def _difference(before, after):
