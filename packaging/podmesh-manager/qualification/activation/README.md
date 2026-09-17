@@ -179,10 +179,17 @@ activation/append-observation.py \
   --value <frozen-non-secret-value>
 ~~~
 
-Busy, uncertain or catching-up responses retry the identical serialized request,
-for 25 seconds by default: a resident that has not caught up with its peers yet
-answers catching up and touches nothing. A failure prints the last answer. A
-changed operation needs a new operation ID. After the external campaign has observed
+Busy and uncertain responses retry the identical serialized request for 25
+seconds; the resident replays an operation ID it has already appended rather than
+appending it twice, so the fact lands once. A catching-up response is not a
+failure and has no deadline: the resident has not caught up with its peers yet,
+it touches nothing and it keeps exchanging, so the tool keeps asking and prints
+one line of its catch-up state on standard error every 30 seconds (the same
+contract as the universe entrypoint). Two things end that wait: `--timeout-seconds`,
+when the caller wants a bound, and a catch-up blocked by an event identity
+collision, which no amount of waiting resolves -- the tool then names the peer and
+the event ID and fails. A failure prints the last answer. A changed operation
+needs a new operation ID. After the external campaign has observed
 stable canonical equality, capture each host separately:
 
 ~~~sh

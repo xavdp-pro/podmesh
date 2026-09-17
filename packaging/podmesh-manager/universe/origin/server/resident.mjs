@@ -80,9 +80,11 @@ export const CATCHING_UP_WAIT_MS = 10000
 // deadline (its design): `observed` when the store committed in time, `append_observation_uncertain`
 // or `_busy` when it could not say -- and measured on 2026-09-16 the store then holds the fact
 // anyway, more often than not. Uncertain is therefore not failed: the same operation ID is retried
-// (the resident refuses an ID it already has, so the fact lands once), and when every answer stays
+// (the store replays it rather than appending twice, so the fact lands once), and when every answer stays
 // uncertain the store itself is read back for that exact subject and value. Only a fact absent from
-// the store after that is a refusal.
+// the store after that is a refusal. A retry is safe because the store replays an operation ID it
+// already holds, returning that operation's original result rather than appending a second fact;
+// only the same ID with a different request is refused (`operation_id_reused`).
 //
 // `append_observation_catching_up` is not a refusal either: the resident appends nothing before it
 // holds every fact of its own its peers hold, and it touched nothing, so the same operation ID is
