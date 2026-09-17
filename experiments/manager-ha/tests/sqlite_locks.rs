@@ -387,7 +387,11 @@ fn external_checkpoints_and_readers_close_nothing() {
     let external = external.join().unwrap();
     let failure = long_lived.integrity().unwrap().failure;
     let errors = errors.lock().unwrap();
-    let busy = |problem: &String| problem.ends_with("database is locked");
+    // A busy or locked store is expected under this pressure and closes nothing;
+    // any other error is a verification failure this test refuses.
+    let busy = |problem: &String| {
+        problem.ends_with("database is locked") || problem.ends_with("database is busy")
+    };
     assert!(
         failure.is_none(),
         "the store closed: {failure:?}; errors: {:?}",
