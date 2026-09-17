@@ -9,7 +9,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs::{self, OpenOptions},
-    io::Read,
+    io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{
@@ -3643,28 +3643,115 @@ struct ReadOnlySnapshot {
     database: PathBuf,
 }
 
+/// The database file and its sidecars, in the order a capture reads them.
+const STORE_FILE_SUFFIXES: [&str; 3] = ["", "-wal", "-shm"];
+
+/// A store whose files total at most this many bytes is captured in memory.
+const CAPTURE_IN_MEMORY_BYTES: u64 = 16 << 20;
+
+/// The buffers through which a larger capture streams its files.
+const CAPTURE_CHUNK_BYTES: usize = 1 << 20;
+
 impl ReadOnlySnapshot {
+    /// Captures a stable private copy of the database, WAL and SHM: the files are
+    /// read twice and kept only when both reads are equal, so no writer changed
+    /// them between the two reads. A store whose files total at most
+    /// `CAPTURE_IN_MEMORY_BYTES` is read twice into memory, which keeps the two
+    /// reads of a small store closest together. A larger one is copied into the
+    /// private directory, then read again and compared with that copy through
+    /// fixed buffers, so that no capture holds memory proportional to the store;
+    /// the two reads of a large store are closer together that way too. A capture
+    /// whose reads differ starts again, three times at most.
     fn capture(path: &Path) -> DurableResult<Self> {
-        require_regular_nonsymlink(path)?;
-        let files = stable_store_files(path)?;
-        let directory = secure_snapshot_directory(path)?;
-        let database = directory.join("store.sqlite");
-        for (suffix, bytes) in files {
-            let destination = if suffix.is_empty() {
-                database.clone()
+        let size = store_files_size(path)?;
+        for _ in 0..3 {
+            let captured = if size <= CAPTURE_IN_MEMORY_BYTES {
+                capture_in_memory(path)?
             } else {
-                directory.join(format!("store.sqlite{suffix}"))
+                capture_by_copy(path)?
             };
-            if let Err(problem) = fs::write(&destination, bytes) {
-                let _ = fs::remove_dir_all(&directory);
-                return Err(error(problem));
+            if let Some(snapshot) = captured {
+                return Ok(snapshot);
             }
         }
+        Err(DurableError::Storage(
+            "manager store changed while capturing a read-only inspection snapshot".into(),
+        ))
+    }
+
+    fn in_new_directory(path: &Path) -> DurableResult<Self> {
+        let directory = secure_snapshot_directory(path)?;
         Ok(Self {
+            database: directory.join("store.sqlite"),
             directory,
-            database,
         })
     }
+
+    /// Creates the private file of one store file, named by its suffix.
+    fn create_file(&self, suffix: &str) -> DurableResult<(PathBuf, fs::File)> {
+        let copy = self.directory.join(format!("store.sqlite{suffix}"));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&copy)
+            .map_err(error)?;
+        Ok((copy, file))
+    }
+}
+
+/// Reads the store files twice into memory, and writes them into a new private
+/// directory when both reads are equal.
+fn capture_in_memory(path: &Path) -> DurableResult<Option<ReadOnlySnapshot>> {
+    let files = read_store_files(path)?;
+    if read_store_files(path)? != files {
+        return Ok(None);
+    }
+    let snapshot = ReadOnlySnapshot::in_new_directory(path)?;
+    for (suffix, bytes) in files {
+        snapshot
+            .create_file(suffix)?
+            .1
+            .write_all(&bytes)
+            .map_err(error)?;
+    }
+    Ok(Some(snapshot))
+}
+
+/// Copies the store files into a new private directory, whose files are created
+/// before the first read, then reads the source again and compares it with the
+/// copy.
+fn capture_by_copy(path: &Path) -> DurableResult<Option<ReadOnlySnapshot>> {
+    let snapshot = ReadOnlySnapshot::in_new_directory(path)?;
+    let mut copies = STORE_FILE_SUFFIXES
+        .iter()
+        .map(|suffix| {
+            snapshot
+                .create_file(suffix)
+                .map(|(copy, file)| (*suffix, copy, file))
+        })
+        .collect::<DurableResult<Vec<_>>>()?;
+    let mut chunks = (
+        vec![0_u8; CAPTURE_CHUNK_BYTES],
+        vec![0_u8; CAPTURE_CHUNK_BYTES],
+    );
+    let mut present = Vec::with_capacity(copies.len());
+    for (suffix, _, file) in &mut copies {
+        present.push(copy_store_file(path, suffix, file, &mut chunks.0)?);
+    }
+    for ((suffix, _, file), present) in copies.iter_mut().zip(&present) {
+        if !same_store_file(path, suffix, file, *present, &mut chunks)? {
+            return Ok(None);
+        }
+    }
+    // A sidecar absent from both reads has no copy either.
+    for ((_, copy, _), present) in copies.iter().zip(&present) {
+        if !present {
+            fs::remove_file(copy).map_err(error)?;
+        }
+    }
+    Ok(Some(snapshot))
 }
 
 fn secure_snapshot_directory(path: &Path) -> DurableResult<PathBuf> {
@@ -3745,36 +3832,125 @@ impl Drop for ReadOnlySnapshot {
     }
 }
 
-fn stable_store_files(path: &Path) -> DurableResult<Vec<(&'static str, Vec<u8>)>> {
-    for _ in 0..3 {
-        let before = read_store_files(path)?;
-        let after = read_store_files(path)?;
-        if before == after {
-            return Ok(after);
+/// Checks the database and sidecar paths before a capture creates anything, and
+/// returns the size of the files present. A missing database, or a database or
+/// sidecar path that is not a regular file, is refused; each file is checked again
+/// when the capture opens it.
+fn store_files_size(path: &Path) -> DurableResult<u64> {
+    let mut size = 0_u64;
+    for suffix in STORE_FILE_SUFFIXES {
+        match fs::symlink_metadata(sidecar_path(path, suffix)) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                size = size.saturating_add(metadata.len());
+            }
+            Ok(_) => return Err(DurableError::Refused(RefusalReason::UnsafeStore)),
+            Err(problem)
+                if problem.kind() == std::io::ErrorKind::NotFound && !suffix.is_empty() => {}
+            Err(problem) if problem.kind() == std::io::ErrorKind::NotFound => {
+                return Err(DurableError::Refused(RefusalReason::MissingStore));
+            }
+            Err(problem) => return Err(error(problem)),
         }
     }
-    Err(DurableError::Storage(
-        "manager store changed while capturing a read-only inspection snapshot".into(),
-    ))
+    Ok(size)
 }
 
+/// Reads the database and each existing sidecar into memory.
 fn read_store_files(path: &Path) -> DurableResult<Vec<(&'static str, Vec<u8>)>> {
-    let database = read_regular_file_nofollow(path, false)?
-        .ok_or(DurableError::Refused(RefusalReason::MissingStore))?;
-    let mut files = vec![("", database)];
-    for suffix in ["-wal", "-shm"] {
-        let sidecar = sidecar_path(path, suffix);
-        if let Some(bytes) = read_regular_file_nofollow(&sidecar, true)? {
-            files.push((suffix, bytes));
-        }
+    let mut files = Vec::with_capacity(STORE_FILE_SUFFIXES.len());
+    for suffix in STORE_FILE_SUFFIXES {
+        let source_path = sidecar_path(path, suffix);
+        let Some((mut source, opened)) =
+            open_regular_file_nofollow(&source_path, !suffix.is_empty())?
+        else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        source.read_to_end(&mut bytes).map_err(error)?;
+        confirm_same_file(&source_path, &opened)?;
+        files.push((suffix, bytes));
     }
     Ok(files)
 }
 
-fn read_regular_file_nofollow(
+/// Copies one store file, the database or a sidecar named by its suffix, into
+/// its private copy. Returns `false` for an absent sidecar, whose copy stays
+/// empty.
+fn copy_store_file(
+    path: &Path,
+    suffix: &str,
+    copy: &mut fs::File,
+    chunk: &mut [u8],
+) -> DurableResult<bool> {
+    let source_path = sidecar_path(path, suffix);
+    let Some((mut source, opened)) = open_regular_file_nofollow(&source_path, !suffix.is_empty())?
+    else {
+        return Ok(false);
+    };
+    loop {
+        let read = fill_chunk(&mut source, chunk)?;
+        if read == 0 {
+            break;
+        }
+        copy.write_all(&chunk[..read]).map_err(error)?;
+    }
+    confirm_same_file(&source_path, &opened)?;
+    Ok(true)
+}
+
+/// Reads one store file again and compares it with its private copy: the same
+/// presence, the same length and the same bytes.
+fn same_store_file(
+    path: &Path,
+    suffix: &str,
+    copy: &mut fs::File,
+    copied: bool,
+    (read_again, copied_bytes): &mut (Vec<u8>, Vec<u8>),
+) -> DurableResult<bool> {
+    let source_path = sidecar_path(path, suffix);
+    let Some((mut source, opened)) = open_regular_file_nofollow(&source_path, !suffix.is_empty())?
+    else {
+        return Ok(!copied);
+    };
+    if !copied {
+        return Ok(false);
+    }
+    copy.seek(SeekFrom::Start(0)).map_err(error)?;
+    let same = loop {
+        let read = fill_chunk(&mut source, read_again)?;
+        if fill_chunk(copy, copied_bytes)? != read || read_again[..read] != copied_bytes[..read] {
+            break false;
+        }
+        if read == 0 {
+            break true;
+        }
+    };
+    confirm_same_file(&source_path, &opened)?;
+    Ok(same)
+}
+
+/// Reads into `chunk` until it is full or the file ends; returns the bytes read.
+fn fill_chunk(file: &mut fs::File, chunk: &mut [u8]) -> DurableResult<usize> {
+    let mut filled = 0;
+    while filled < chunk.len() {
+        match file.read(&mut chunk[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(problem) if problem.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(problem) => return Err(error(problem)),
+        }
+    }
+    Ok(filled)
+}
+
+/// Opens a regular file without following a symlink, with the metadata of the
+/// opened descriptor, refusing a path that is not a regular file or whose
+/// identity changed between its `lstat` and its open. A missing file is absent
+/// when `missing_is_absent`, and a missing store otherwise.
+fn open_regular_file_nofollow(
     path: &Path,
     missing_is_absent: bool,
-) -> DurableResult<Option<Vec<u8>>> {
+) -> DurableResult<Option<(fs::File, fs::Metadata)>> {
     // PodMesh targets Linux hosts. These are the Linux ABI values for
     // O_NOFOLLOW and O_NONBLOCK; no unsafe code or additional dependency is used.
     const O_NOFOLLOW_NONBLOCK: i32 = 0o404_000;
@@ -3789,7 +3965,7 @@ fn read_regular_file_nofollow(
         }
         Err(problem) => return Err(error(problem)),
     };
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .custom_flags(O_NOFOLLOW_NONBLOCK)
         .open(path)
@@ -3804,13 +3980,16 @@ fn read_regular_file_nofollow(
     {
         return Err(DurableError::Refused(RefusalReason::UnsafeStore));
     }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(error)?;
+    Ok(Some((file, opened)))
+}
+
+/// Refuses a path that no longer names the regular file that was opened.
+fn confirm_same_file(path: &Path, opened: &fs::Metadata) -> DurableResult<()> {
     let after = fs::symlink_metadata(path).map_err(error)?;
     if !after.file_type().is_file() || after.dev() != opened.dev() || after.ino() != opened.ino() {
         return Err(DurableError::Refused(RefusalReason::UnsafeStore));
     }
-    Ok(Some(bytes))
+    Ok(())
 }
 
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
@@ -3893,3 +4072,74 @@ CREATE TRIGGER exchange_audit_events_no_update BEFORE UPDATE ON exchange_audit_e
 CREATE TRIGGER exchange_audit_events_no_delete BEFORE DELETE ON exchange_audit_events BEGIN SELECT RAISE(ABORT, 'immutable exchange audit event'); END;
 PRAGMA user_version=3;
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bytes(length: usize, seed: usize) -> Vec<u8> {
+        (0..length)
+            .map(|index| u8::try_from((index + seed) % 251).unwrap())
+            .collect()
+    }
+
+    /// The stores of the other tests are small, so their captures run in memory:
+    /// the capture by copy of a larger store is exercised here, over several chunks.
+    #[test]
+    fn a_capture_by_copy_keeps_the_bytes_of_the_files_present() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store.sqlite");
+        let database = bytes(3 * CAPTURE_CHUNK_BYTES + 17, 0);
+        let wal = bytes(CAPTURE_CHUNK_BYTES, 7);
+        fs::write(&path, &database).unwrap();
+        fs::write(sidecar_path(&path, "-wal"), &wal).unwrap();
+        let snapshot = capture_by_copy(&path).unwrap().unwrap();
+        assert_eq!(fs::read(&snapshot.database).unwrap(), database);
+        assert_eq!(
+            fs::read(snapshot.directory.join("store.sqlite-wal")).unwrap(),
+            wal
+        );
+        assert!(!snapshot.directory.join("store.sqlite-shm").exists());
+        let private = snapshot.directory.clone();
+        drop(snapshot);
+        assert!(!private.exists());
+    }
+
+    /// The second read of a capture by copy keeps the copy only when the source
+    /// file still holds the same bytes, and a sidecar is present in both reads or
+    /// in neither.
+    #[test]
+    fn a_capture_by_copy_refuses_a_file_that_changed_between_its_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store.sqlite");
+        let original = bytes(2 * CAPTURE_CHUNK_BYTES + 5, 0);
+        let copy_path = directory.path().join("copy");
+        let mut chunks = (
+            vec![0_u8; CAPTURE_CHUNK_BYTES],
+            vec![0_u8; CAPTURE_CHUNK_BYTES],
+        );
+        let mut compare = |source: &[u8], copied: bool| {
+            fs::write(&copy_path, &original).unwrap();
+            let mut copy = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&copy_path)
+                .unwrap();
+            fs::write(&path, source).unwrap();
+            same_store_file(&path, "", &mut copy, copied, &mut chunks).unwrap()
+        };
+        assert!(compare(&original, true));
+        let mut changed = original.clone();
+        changed[CAPTURE_CHUNK_BYTES + 3] ^= 1;
+        assert!(!compare(&changed, true));
+        assert!(!compare(&original[..original.len() - 1], true));
+        let mut longer = original.clone();
+        longer.push(0);
+        assert!(!compare(&longer, true));
+        assert!(!compare(&original, false));
+
+        let mut copy = fs::File::open(&copy_path).unwrap();
+        assert!(same_store_file(&path, "-wal", &mut copy, false, &mut chunks).unwrap());
+        assert!(!same_store_file(&path, "-wal", &mut copy, true, &mut chunks).unwrap());
+    }
+}
