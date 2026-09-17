@@ -707,6 +707,11 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
             if outgoing.is_finished() {
                 return Err("replication worker stopped unexpectedly".into());
             }
+            // The periodic verification is what bounds the detection of an edited
+            // old row; a resident whose verification worker stopped must not serve.
+            if integrity.is_finished() {
+                return Err("store verification worker stopped unexpectedly".into());
+            }
             let mut index = 0;
             while index < workers.len() {
                 if thread::JoinHandle::is_finished(&workers[index]) {
@@ -863,11 +868,12 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
         }
     }
     let outgoing_result = outgoing.join();
-    join_failed |= integrity.join().is_err();
+    let integrity_result = integrity.join();
     cleanup?;
     if join_failed {
         return Err("incoming worker panicked".into());
     }
+    integrity_result.map_err(|_| "store verification worker panicked")?;
     outgoing_result.map_err(|_| "outgoing worker panicked")??;
     result
 }
@@ -916,19 +922,73 @@ fn write_control(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -
     Ok(())
 }
 
+/// Why a periodic pass did not verify the store.
+enum PassFailure {
+    /// The store failed verification, now or earlier in this process, and stays
+    /// closed for the rest of the process.
+    Verification(DurableError),
+    /// The pass could not run: the store did not open, or the pass could not
+    /// take its snapshot. Nothing was verified and nothing was closed.
+    NotRun(DurableError),
+}
+
+fn verify_store_once(config: &Configuration) -> std::result::Result<(), PassFailure> {
+    let mut store = Store::open(
+        &config.network.database_path,
+        config.network.manager.clone(),
+        &config.network.replica_id,
+    )
+    .map_err(|problem| match problem {
+        DurableError::Corrupt(_) => PassFailure::Verification(problem),
+        other => PassFailure::NotRun(other),
+    })?;
+    store.verify_full().map_err(|problem| {
+        // A storage failure once the snapshot was held also closes the store.
+        let closed = matches!(problem, DurableError::Corrupt(_))
+            || store
+                .integrity()
+                .is_ok_and(|integrity| integrity.failure.is_some());
+        if closed {
+            PassFailure::Verification(problem)
+        } else {
+            PassFailure::NotRun(problem)
+        }
+    })
+}
+
 /// Repeats the complete store verification at the configured interval, in a read
 /// transaction that does not block writers. A failed verification fails the store
 /// closed for this process: every later store open, append, import, audit and
-/// export returns that failure, while status and shutdown stay available.
+/// export returns that failure, while status and shutdown stay available. A pass
+/// that could not run is retried after a backoff that starts at the exchange
+/// interval and doubles up to the maximum backoff, never later than the next
+/// regular pass would have run, so the detection interval does not silently grow.
 fn verify_store_periodically(config: &Configuration, shared: &Shared) {
     let interval = config.full_verification_interval();
+    let first_retry = Duration::from_millis(config.interval_ms).min(interval);
+    let last_retry = Duration::from_millis(config.max_backoff_ms).min(interval);
+    let mut retry = first_retry;
     let mut next = Instant::now() + interval;
     while !shared.stopping.load(Ordering::SeqCst) {
         if Instant::now() >= next {
-            if let Err(problem) = store(config).and_then(|mut store| Ok(store.verify_full()?)) {
-                eprintln!("resident store verification failed: {problem}");
+            match verify_store_once(config) {
+                Ok(()) => {
+                    retry = first_retry;
+                    next = Instant::now() + interval;
+                }
+                Err(PassFailure::Verification(problem)) => {
+                    eprintln!("resident store verification failed: {problem}");
+                    next = Instant::now() + interval;
+                }
+                Err(PassFailure::NotRun(problem)) => {
+                    eprintln!(
+                        "resident store verification could not run: {problem}; retrying in {} ms",
+                        millis(retry)
+                    );
+                    next = Instant::now() + retry;
+                    retry = retry.saturating_mul(2).min(last_retry);
+                }
             }
-            next = Instant::now() + interval;
         }
         thread::sleep(Duration::from_millis(50));
     }

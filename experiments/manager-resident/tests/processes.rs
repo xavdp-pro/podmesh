@@ -174,6 +174,9 @@ impl Lab {
             .unwrap();
     }
     fn start(&mut self, i: usize) {
+        self.start_with_stderr(i, Stdio::inherit());
+    }
+    fn start_with_stderr(&mut self, i: usize, stderr: Stdio) {
         let path = self._dir.path().join(format!("r{i}.json"));
         fs::write(&path, serde_json::to_vec(&self.configs[i]).unwrap()).unwrap();
         self.children[i] = Some(
@@ -181,7 +184,7 @@ impl Lab {
                 .env("PODMESH_MANAGER_NETWORK_MODE", "authenticated-static-peers")
                 .arg(path)
                 .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
+                .stderr(stderr)
                 .spawn()
                 .unwrap(),
         );
@@ -2068,6 +2071,80 @@ fn an_idle_replica_adds_at_most_twelve_audit_rows_per_refresh() {
     assert!(
         per_refresh.iter().all(|rows| *rows <= 13.0),
         "{per_refresh:?}"
+    );
+    lab.stop_all();
+}
+
+#[test]
+fn a_periodic_verification_that_could_not_run_is_retried_at_the_exchange_interval() {
+    let mut lab = Lab::new();
+    lab.configs[0].full_verification_interval_ms = Some(8_000);
+    let log = lab._dir.path().join("r0.stderr");
+    let spawned = Instant::now();
+    lab.start_with_stderr(0, Stdio::from(fs::File::create(&log).unwrap()));
+    lab.start(1);
+    lab.start(2);
+    lab.append(0, "before-edit", "s0", "subject", "value");
+    assert_converged(&lab, 1);
+    until(
+        || {
+            lab.status(0)["peers"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|link| link["acknowledged_unchanged"] == true)
+        },
+        Duration::from_secs(10),
+    );
+    // No transaction reads the oldest audit row: only a complete pass notices it.
+    edit_oldest_audit_row(&lab, 0);
+    // r0's first periodic pass, eight seconds after it started, cannot open its
+    // store: a directory stands at its path. Removing the file's permissions would
+    // not do: while one connection of the process holds the file, SQLite keeps
+    // the descriptor of a closed one and reuses it for the next open.
+    assert!(
+        spawned.elapsed() < Duration::from_secs(6),
+        "setup outlasted the first pass"
+    );
+    let database = lab.configs[0].network.database_path.clone();
+    let retained = database.with_extension("retained");
+    fs::rename(&database, &retained).unwrap();
+    fs::create_dir(&database).unwrap();
+    let logged = |line: &str| fs::read_to_string(&log).unwrap().contains(line);
+    until(
+        || logged("resident store verification could not run"),
+        Duration::from_secs(10),
+    );
+    thread::sleep(Duration::from_secs(1));
+    fs::remove_dir(&database).unwrap();
+    fs::rename(&retained, &database).unwrap();
+    let readable = Instant::now();
+    until(
+        || logged("resident store verification failed: corrupt"),
+        Duration::from_secs(10),
+    );
+    let detected = readable.elapsed();
+    // The pass was retried within the maximum backoff, not eight seconds after
+    // the pass that could not run.
+    assert!(detected < Duration::from_secs(3), "{detected:?}");
+    let not_run = fs::read_to_string(&log)
+        .unwrap()
+        .matches("resident store verification could not run")
+        .count();
+    assert!(not_run >= 2, "{not_run}");
+    assert_eq!(
+        lab.control_value(
+            0,
+            json!({"operation":"append_observation","operation_id":"after-edit","scope":"s0","subject":"subject","value":"value"}),
+        )
+        .unwrap()["error"],
+        "append_observation_uncertain"
+    );
+    println!(
+        "MEASURED periodic pass retry: {not_run} passes could not run; the edited row was \
+         detected {} ms after the store became readable again (interval 100 ms, maximum \
+         backoff 400 ms, verification interval 8 s)",
+        detected.as_millis()
     );
     lab.stop_all();
 }
