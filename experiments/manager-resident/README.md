@@ -77,9 +77,11 @@ import gives.
 A refused authenticated import is reported too. After a refused import the transport
 compares the refused snapshot with the local history; the resident counts refused
 imports per peer and, when the snapshot carried an event ID this replica holds with
-other bytes, an identity collision, named once on standard error for each new colliding
-event ID from that peer. A push refused with `policy_violation` counts as a collision
-once one was found in that peer's own pushes.
+other bytes, an identity collision, named on standard error the first time that event
+ID is seen from that peer and never again for it, in whatever order and however often
+the refusals repeat. A push refused with `policy_violation` counts as a collision once
+one was found in that peer's own pushes; it names nothing by itself, since a signed
+refusal carries only its reason.
 
 SQLite retains the dependency's WAL/FULL, immutable history and receipt checks,
 identity binding and atomic import. The resident's first store open verifies the whole
@@ -290,9 +292,12 @@ link is reported by the first attempt after it, at most one refresh plus that sa
 margin after the last success.
 `catch_up` reports `caught_up`, `caught_up_by` (`every_peer`, `window` or `no_peers`),
 `caught_up_after_ms` since the process started exchanging, `peers_imported`,
-`peers_matched`, `peers_missing`, `peers_ahead`, `peers_not_attempted`,
-`own_facts_at_start`, `latest_own_fact_appended_locally`, `window_ms` and
-`appends_observed`, the appends this process answered observed. None of this is
+`peers_matched`, `peers_missing`, `peers_ahead`, `peers_not_attempted` (neither caught
+up with nor attempted),
+`own_facts_at_start`, `latest_own_fact_appended_locally`, `window_ms`,
+`appends_observed` (the appends this process answered observed) and `blocked_by`, why
+it is not ready: `waiting_for_peers`, `refused_by_peer`, or `identity_collision` with
+the peer and the colliding event ID, which waiting never resolves. None of this is
 exact causal lag or convergence proof: equal counts can differ, and replayed receipts describe a
 historical committed result. Unknown values remain null. Unsigned diagnostics
 and failed exchanges clear `history_count_delta` to null; the previous acknowledged

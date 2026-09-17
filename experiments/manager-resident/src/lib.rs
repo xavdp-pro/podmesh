@@ -9,7 +9,7 @@ use podmesh_manager_network_lab::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::{Read, Write},
     net::TcpListener,
@@ -96,13 +96,18 @@ impl Configuration {
         {
             return Err("invalid full verification interval or unchanged snapshot refresh".into());
         }
-        // The universe entrypoint gives a start 25 seconds, the store's first open
-        // included, on a whole-second clock: its last boot-fact attempt is certain
-        // only 24 s after it started, and its attempts are about 0.6 s apart (a
-        // 0.5 s pause and a python start). A window runs from the moment the
-        // control socket is bound, so a start that waits for its window stays
-        // within the budget while the socket is bound within about
-        // 24 - 0.6 - window seconds: about 8 s at the 15,000 ms allowed here.
+        // The window is not bounded by the universe's 25-second start budget any
+        // more: that budget covers the store's first open and the control socket's
+        // bind, and a replica that is catching up is running and not ready, waited
+        // for with no deadline. What the cap bounds is how long a replica whose
+        // peer is down stays unready: it appends its boot fact about one window
+        // plus one round of attempts after it began exchanging (that round spends
+        // a 2-second connect deadline on each peer that does not answer), so at
+        // 15,000 ms it is ready some 17 to 19 seconds after its first open, inside
+        // the 30 seconds PodMesh observes a start for. A longer window would push a
+        // readiness that is going to come out of that observation; a shorter one
+        // forgives an unreachable peer sooner, which is the hazard this window
+        // trades against.
         if self
             .catch_up_window_ms
             .is_some_and(|window| !(1_000..=15_000).contains(&window))
@@ -249,6 +254,70 @@ struct CatchUpStatus {
     latest_own_fact_appended_locally: bool,
     window_ms: u64,
     appends_observed: u64,
+    /// Why this process is not ready, when it can tell. Absent once it is.
+    blocked_by: Option<ReadinessBlocker>,
+}
+
+/// What keeps a process from catching up, as far as its own evidence says. It
+/// separates a replica that is waiting for a peer, and will be ready when that
+/// peer answers, from one that never will be: an event identity collision is a
+/// forked history, and no amount of waiting resolves it.
+#[derive(Serialize)]
+struct ReadinessBlocker {
+    /// `identity_collision`: an import from one of the peers this process lacks
+    /// was refused because its snapshot held an event ID this replica holds with
+    /// other bytes, so no import from it will ever carry the facts this process
+    /// needs. `refused_by_peer`: such a peer answers authenticated refusals
+    /// without a collision found here, a policy question an operator settles.
+    /// `waiting_for_peers`: the ordinary case, peers not reached or not caught
+    /// up with yet.
+    reason: &'static str,
+    /// The peers the reason is about.
+    peers: Vec<String>,
+    /// The colliding event ID, for `identity_collision`.
+    event_id: Option<String>,
+}
+
+/// Reads the blocker from a catch-up state and the links of the peers it lacks.
+fn readiness_blocker(
+    catch_up: &CatchUpStatus,
+    peers: &BTreeMap<String, PeerStatus>,
+) -> Option<ReadinessBlocker> {
+    if catch_up.caught_up {
+        return None;
+    }
+    let missing = |keep: &dyn Fn(&PeerStatus) -> bool| -> Vec<String> {
+        catch_up
+            .peers_missing
+            .iter()
+            .filter(|peer| peers.get(*peer).is_some_and(keep))
+            .cloned()
+            .collect()
+    };
+    let collided = missing(&|link| link.identity_collisions.imports_refused > 0);
+    if !collided.is_empty() {
+        let event_id = collided
+            .iter()
+            .find_map(|peer| peers.get(peer)?.identity_collisions.event_id.clone());
+        return Some(ReadinessBlocker {
+            reason: "identity_collision",
+            peers: collided,
+            event_id,
+        });
+    }
+    let refused = missing(&|link| link.last_refusal_reason.is_some());
+    if !refused.is_empty() {
+        return Some(ReadinessBlocker {
+            reason: "refused_by_peer",
+            peers: refused,
+            event_id: None,
+        });
+    }
+    Some(ReadinessBlocker {
+        reason: "waiting_for_peers",
+        peers: catch_up.peers_missing.clone(),
+        event_id: None,
+    })
 }
 
 #[derive(Serialize)]
@@ -548,6 +617,8 @@ impl CatchUp {
             latest_own_fact_appended_locally: self.latest_own_fact_appended_locally,
             window_ms: millis(self.window),
             appends_observed: self.appends_observed,
+            // Filled by the status, which also reads the peers' links.
+            blocked_by: None,
         }
     }
 }
@@ -574,6 +645,9 @@ struct PeerState {
     /// Push-back requests so far. An attempt that overlapped one does not record
     /// its acknowledgement: the peer may lack facts that attempt did not carry.
     push_back_requests: u64,
+    /// The colliding event IDs this process has already named on standard error
+    /// for this peer.
+    named_collisions: BTreeSet<String>,
 }
 
 impl PeerState {
@@ -653,11 +727,12 @@ fn status(config: &Configuration, shared: &Shared) -> Result<Status> {
             (id.clone(), status)
         })
         .collect();
-    let catch_up = shared
+    let mut catch_up = shared
         .catch_up
         .lock()
         .map_err(|_| "catch-up lock poisoned")?
         .status(now);
+    catch_up.blocked_by = readiness_blocker(&catch_up, &peers);
     Ok(Status {
         kind: "resident_observation",
         replica_id: config.network.replica_id.clone(),
@@ -891,13 +966,23 @@ fn record_refused_import(shared: &Shared, refusal: &ServedRefusal) {
         if refusal.identity_collisions == 0 {
             return;
         }
-        let collisions = &mut state.status.identity_collisions;
-        collisions.imports_refused = collisions.imports_refused.saturating_add(1);
-        let newly_named = collisions.event_id != refusal.first_identity_collision;
-        collisions
+        state.status.identity_collisions.imports_refused = state
+            .status
+            .identity_collisions
+            .imports_refused
+            .saturating_add(1);
+        state
+            .status
+            .identity_collisions
             .event_id
             .clone_from(&refusal.first_identity_collision);
-        newly_named
+        // One line for each colliding event ID this peer has shown, however often
+        // its refusals repeat and whichever order they come in: the set is what
+        // makes that true, since the status keeps only the latest ID.
+        refusal
+            .first_identity_collision
+            .as_ref()
+            .is_some_and(|event_id| state.named_collisions.insert(event_id.clone()))
     };
     if newly_named {
         eprintln!(
@@ -972,6 +1057,7 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
                             push_back_requested: false,
                             last_push_back: None,
                             push_back_requests: 0,
+                            named_collisions: BTreeSet::new(),
                         },
                     )
                 })

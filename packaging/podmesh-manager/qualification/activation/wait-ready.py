@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Wait for the exact manager process and typed local control interface."""
+"""Wait for the exact manager process and typed local control interface.
+
+This is the running check: the unit is active, its main PID is the packaged binary, and the
+typed status answers. It is not the readiness of the exchange lot -- a replica that has not
+caught up with its peers answers status while it appends nothing. Readiness is the boot fact
+observed (`catch_up.appends_observed`), which append-observation.py waits for.
+"""
 import argparse
 import json
 import os

@@ -11,6 +11,11 @@
 # the resident's status (`catch_up.appends_observed`, `catch_up.caught_up`). Whoever waits for a
 # replica to be ready waits for that line, not for the container to be up.
 #
+# One catch-up never ends and is therefore terminal too: a replica whose history already forked from
+# a peer's is refused every import from it and refused by it, so it is reached and never caught up
+# with. The resident names that in its status, and this start exits 2 with the event ID and the peer
+# in the log rather than running for ever without being ready.
+#
 # Every other failure is terminal and visible from outside: a boot fact refused for any other reason
 # exits 2 (the universe is then "not running when observed"), a stop whose typed shutdown is not
 # acknowledged exits 3 (an honest failed stop, never a silent wait for escalation). The optional
@@ -114,7 +119,10 @@ shutdown() {
 }
 trap shutdown TERM INT
 
-# One line of the resident's catch-up state, for the log of a replica that is running and not ready.
+# The resident's catch-up state, in two lines: what it holds of its peers, then what blocks its
+# readiness (`reason=waiting_for_peers`, `reason=refused_by_peer`, `reason=identity_collision`, or
+# `reason=none` once it is caught up). The first line goes to the log; the second decides whether
+# waiting can end in readiness at all.
 catch_up_state() {
   control "$socket_path" '{"operation":"status"}' 2>/dev/null | python3 -c '
 import json, sys
@@ -122,8 +130,10 @@ try:
     c = json.loads(sys.stdin.read().strip().splitlines()[-1])["catch_up"]
 except Exception:
     print("catch-up state unavailable")
+    print("reason=unknown event_id=- peers=-")
     sys.exit(0)
-names = lambda key: ",".join(c.get(key) or []) or "-"
+def names(key):
+    return ",".join(c.get(key) or []) or "-"
 print(
     "imported=%s matched=%s missing=%s ahead=%s not_attempted=%s own_facts_at_start=%s"
     " latest_own_fact_appended_locally=%s window_ms=%s"
@@ -131,7 +141,13 @@ print(
        names("peers_not_attempted"), c.get("own_facts_at_start"),
        c.get("latest_own_fact_appended_locally"), c.get("window_ms"))
 )
-' 2>/dev/null || echo "catch-up state unavailable"
+blocked = c.get("blocked_by") or {}
+print(
+    "reason=%s event_id=%s peers=%s"
+    % (blocked.get("reason", "none"), blocked.get("event_id") or "-",
+       ",".join(blocked.get("peers") or []) or "-")
+)
+' 2>/dev/null || printf '%s\n%s\n' "catch-up state unavailable" "reason=unknown event_id=- peers=-"
 }
 
 # Readiness requirement: the start is not a start until the resident has observed this boot's fact.
@@ -154,14 +170,23 @@ scope=$(python3 -c 'import json,sys; c=json.load(open("/etc/podmesh-manager/conf
 # fact takes the next sequence number, instead of reusing one its peers hold with other bytes,
 # which they would refuse for good. It touched nothing, so the retry is safe. With every peer up
 # this takes a few exchanges. A store whose latest fact of its own it appended itself also appends
-# once its catch-up window has elapsed (15 s by default, from the moment the resident started) and
-# a fresh round of attempts, taken after that end, has reached one peer and reached no other. An
-# emptied store, one that only imported its own facts back, and a replica that reaches no peer wait
-# here for as long as it takes: they stay running and keep exchanging, which is what lets the other
-# replicas catch up with them, and they are never ready until their boot fact is observed.
+# once its catch-up window has elapsed (15 s by default, counted from the moment the resident
+# began exchanging, that is after its store's first complete verification) and a fresh round of
+# attempts, taken after that end, has caught it up with at least one peer and left every other one
+# unreached. An emptied store, one that only imported its own facts back, and a replica that
+# reaches no peer wait here for as long as it takes: they stay running and keep exchanging, which
+# is what lets the other replicas catch up with them, and they are never ready until their boot
+# fact is observed.
+#
+# One catch-up never ends: a history that already forked from a peer's. Every import from that peer
+# is refused as an event identity collision and every push to it is refused too, so it is reached
+# and never caught up with, and no window forgives a peer that answers. The resident says so in its
+# status (`catch_up.blocked_by.reason` is `identity_collision`), and this start is then terminal:
+# waiting would leave a container running for ever without ever being ready, where PodMesh must
+# record a universe that is not running when observed. It needs an operator, not time.
 #
 # Any other answer is terminal.
-observed=no; attempt=0; catching_up=0; reported_at=0; retry_since=$started_at
+observed=no; attempt=0; catching_up=0; reported_at=0; checked_at=0; retry_since=$started_at
 while :; do
   attempt=$((attempt + 1))
   reply=$(control "$boot_socket" "{\"operation\":\"append_observation\",\"operation_id\":\"$opid\",\"scope\":\"$scope\",\"subject\":\"boot\",\"value\":\"boot-$boot\"}" 2>&1) || true
@@ -170,9 +195,24 @@ while :; do
   if printf '%s' "$reply" | grep -q 'append_observation_catching_up'; then
     now=$(date +%s)
     retry_since=$now
-    if [ "$catching_up" -eq 0 ] || [ $(( now - reported_at )) -ge 30 ]; then
-      reported_at=$now
-      echo "manager-universe: running, not ready: the resident is catching up with its peers ($(elapsed)s after the start, attempt $attempt); $(catch_up_state)"
+    # The state is read every five seconds -- a collision is only known once an exchange has carried
+    # it -- and one line is logged every thirty.
+    if [ "$catching_up" -eq 0 ] || [ $(( now - checked_at )) -ge 5 ]; then
+      checked_at=$now
+      state=$(catch_up_state)
+      summary=$(printf '%s\n' "$state" | sed -n 1p)
+      blocked=$(printf '%s\n' "$state" | sed -n 2p)
+      case "$blocked" in
+        reason=identity_collision*)
+          echo "manager-universe: CATCH-UP BLOCKED BY AN EVENT IDENTITY COLLISION ($blocked): this replica's history forked from its peer's, no import can carry the facts it lacks, and no waiting resolves it; refusing to run"
+          kill -KILL "$child" 2>/dev/null || true
+          exit 2
+          ;;
+      esac
+      if [ "$catching_up" -eq 0 ] || [ $(( now - reported_at )) -ge 30 ]; then
+        reported_at=$now
+        echo "manager-universe: running, not ready: the resident is catching up with its peers ($(elapsed)s after the start, attempt $attempt); $summary; $blocked"
+      fi
     fi
     catching_up=$((catching_up + 1))
     # Poll closely at first, so that a catch-up of a few exchanges is not delayed, then slowly: a

@@ -3070,13 +3070,20 @@ struct EntrypointStart {
     attempts: usize,
     last: String,
     event_id: Option<String>,
+    /// The readiness blockers this start read while it waited, in order.
+    blockers: Vec<Value>,
+    /// The start ended because the catch-up cannot end: a forked history.
+    blocked_by_collision: bool,
 }
 
 /// The start of packaging/podmesh-manager/universe/entrypoint.sh, played here:
 /// the control socket must be bound within the 25-second budget, then one
 /// operation ID is appended until it is observed. `catching_up` is not a failure
 /// and has no deadline, `uncertain` and `busy` are retried within a budget that
-/// restarts after each catching-up answer, and any other answer is terminal.
+/// restarts after each catching-up answer, and any other answer is terminal. The
+/// resident's catch-up state is read every five seconds while it waits, and a
+/// catch-up blocked by an event identity collision ends the start: no import can
+/// carry what that replica lacks, so waiting would never end.
 /// `guard` bounds this test alone; the entrypoint has no such bound.
 fn entrypoint_start(
     replica: usize,
@@ -3094,7 +3101,10 @@ fn entrypoint_start(
         attempts: 0,
         last: String::new(),
         event_id: None,
+        blockers: Vec::new(),
+        blocked_by_collision: false,
     };
+    let mut checked: Option<Instant> = None;
     while !socket.exists() {
         if spawned.elapsed() >= budget {
             start.last = "control socket not bound".into();
@@ -3127,6 +3137,19 @@ fn entrypoint_start(
         if start.last.contains("append_observation_catching_up") {
             start.catching_up += 1;
             retry_since = Instant::now();
+            if checked.is_none_or(|at| at.elapsed() >= Duration::from_secs(5)) {
+                checked = Some(Instant::now());
+                let blocker = control_at(&socket, &json!({"operation": "status"}))
+                    .map_or(Value::Null, |status| {
+                        status["catch_up"]["blocked_by"].clone()
+                    });
+                start.blockers.push(blocker.clone());
+                if blocker["reason"] == "identity_collision" {
+                    start.blocked_by_collision = true;
+                    start.last = format!("catch-up blocked by an identity collision: {blocker}");
+                    return start;
+                }
+            }
         } else if !(start.last.contains("append_observation_uncertain")
             || start.last.contains("append_observation_busy"))
             || retry_since.elapsed() >= budget
@@ -3249,4 +3272,103 @@ fn staggered_starts_keep_exchanging_while_they_catch_up_and_all_are_observed() {
         );
     }
     lab.stop_all();
+}
+
+/// A replica whose history forked from a peer's never catches up: every import
+/// from that peer is refused as an event identity collision and every push to it
+/// is refused too, so it is reached and never caught up with, and no window
+/// forgives a peer that answers. The resident names that in its status, and the
+/// start ends instead of running for ever without being ready -- while a replica
+/// whose peer is merely down waits, says so, and becomes ready.
+#[test]
+fn a_forked_replica_names_what_blocks_it_and_its_start_ends() {
+    // The entrypoint played below must not drift from the shipped one on this
+    // either: a catch-up blocked by a collision is terminal there too.
+    let script = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packaging/podmesh-manager/universe/entrypoint.sh"),
+    )
+    .unwrap();
+    assert!(script.contains("reason=identity_collision*)"), "{script}");
+    assert!(script.contains("CATCH-UP BLOCKED BY AN EVENT IDENTITY COLLISION"));
+    let mut lab = Lab::new();
+    older_copy_with_one_holder(&mut lab);
+
+    // r2 restarts on its older copy while r0, the only holder of r2:2, is down:
+    // it waits for a peer, says so, and its window makes it ready -- with the
+    // fork this whole gate exists to bound.
+    lab.configs[2].catch_up_window_ms = Some(2_000);
+    lab.start(1);
+    let _ = fs::remove_file(&lab.configs[2].control_socket);
+    spawn_only(&mut lab, 2);
+    let waiting = entrypoint_start(
+        2,
+        lab.configs[2].control_socket.clone(),
+        "boot-late-peer".into(),
+        Duration::from_secs(60),
+    );
+    println!("MEASURED start with a peer down: {waiting:?}");
+    assert_eq!(
+        waiting.event_id.as_deref(),
+        Some("r2:00000000000000000002"),
+        "{waiting:?}"
+    );
+    assert!(!waiting.blocked_by_collision, "{waiting:?}");
+    assert_eq!(
+        waiting.blockers.first().unwrap()["reason"],
+        "waiting_for_peers",
+        "{waiting:?}"
+    );
+    assert!(
+        waiting.blockers.first().unwrap()["peers"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("r0")),
+        "{waiting:?}"
+    );
+    assert_eq!(lab.status(2)["catch_up"]["blocked_by"], Value::Null);
+
+    // r1 takes that fact, r0 comes back holding the other version of it, and the
+    // two histories are now irreconcilable.
+    until(|| lab.count(1) == 2, Duration::from_secs(15));
+    lab.start(0);
+    until(
+        || {
+            lab.status(0)["peers"]["r2"]["identity_collisions"]["imports_refused"]
+                .as_u64()
+                .unwrap()
+                >= 1
+        },
+        Duration::from_secs(20),
+    );
+
+    // Restarted against peers that are both up, r2 cannot catch up with r0 and
+    // says so; its start ends rather than waiting for ever.
+    lab.stop(2);
+    let _ = fs::remove_file(&lab.configs[2].control_socket);
+    spawn_only(&mut lab, 2);
+    let blocked = entrypoint_start(
+        2,
+        lab.configs[2].control_socket.clone(),
+        "boot-forked".into(),
+        Duration::from_secs(60),
+    );
+    println!("MEASURED start of a forked replica: {blocked:?}");
+    assert!(blocked.observed_ms.is_none(), "{blocked:?}");
+    assert!(blocked.blocked_by_collision, "{blocked:?}");
+    let catch_up = lab.status(2)["catch_up"].clone();
+    assert_eq!(catch_up["caught_up"], false);
+    assert_eq!(catch_up["blocked_by"]["reason"], "identity_collision");
+    assert_eq!(catch_up["blocked_by"]["peers"], json!(["r0"]));
+    assert_eq!(
+        catch_up["blocked_by"]["event_id"],
+        "r2:00000000000000000002"
+    );
+    assert_eq!(catch_up["appends_observed"], 0);
+    // The entrypoint kills the resident it refuses to run; so does this test.
+    let mut child = lab.children[2].take().unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+    lab.stop(0);
+    lab.stop(1);
 }

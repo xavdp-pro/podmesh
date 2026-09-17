@@ -63,6 +63,13 @@ there runs the HA-10 shape on three hosts and proves, by the frozen candidate's 
   socket bind and the `uncertain`/`busy` retries, and its clock for those restarts after each
   `catching_up` answer. The injected boot fault (a socket that does not exist) still exits 2 at
   once, and the stop signal is honoured from the moment the socket is bound, catching up or not.
+- **One catch-up never ends, and that start is terminal.** A replica whose history already forked
+  from a peer's is refused every import from that peer and refused by it, so the peer is reached and
+  never caught up with, and no window forgives a peer that answers. The resident says so
+  (`catch_up.blocked_by.reason` is `identity_collision`, with the peer and the event ID); the
+  entrypoint reads that state every five seconds while it waits and, on that reason, logs the event
+  ID and exits 2. PodMesh then records a universe that is not running when observed instead of a
+  container that runs for ever without being ready. It needs an operator, not time.
 - **Attested binary.** The check exports `/usr/lib/podmesh-manager/podmesh-managerd` from the
   universe and refuses any inspection unless its SHA-256 equals the inspector's on the
   workstation; both digests are recorded in the result.
@@ -77,8 +84,12 @@ there runs the HA-10 shape on three hosts and proves, by the frozen candidate's 
   copied up on its first write, which changes its device and inode between the resident's
   read-only preflight and its open; the resident refuses that as a swapped store
   (`manager store path changed after read-only preflight`). The entrypoint rewrites the store
-  into the writable layer once before the resident starts. A stale control socket file from the
-  previous incarnation is removed for the same reason.
+  into the writable layer once before the resident starts.
+- **A stale control socket file.** A universe restored from a capture can carry the previous
+  incarnation's socket file, and the resident refuses a path that already exists rather than
+  unlinking it (`UnixListener::bind`), so the entrypoint removes it — there, as PID 1 before
+  anything else has started, it is known to belong to no running process. This has nothing to do
+  with the copy-up above.
 
 ## Measured on three lab hosts (2026-09-14, rerun after Codex's review; then again on the Alpine image)
 

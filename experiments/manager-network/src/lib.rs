@@ -363,10 +363,13 @@ impl Node {
 
     /// Handles exactly one bounded authenticated exchange on an accepted stream,
     /// like [`Node::serve_connection`], and reports the durable decision it made
-    /// on an authenticated request: `on_decision` runs once, as soon as the
-    /// import is committed or replayed, or the refusal recorded, and before the
-    /// reply is prepared, so the decision is reported whatever happens to the
-    /// reply. A diagnostic, or a failure before a decision, never calls it.
+    /// on an authenticated request. `on_decision` runs once, after the decision
+    /// is durable, so it is reported whatever happens to the reply: an import as
+    /// soon as it is committed or replayed and before its reply is prepared, a
+    /// refusal once its signed reply has been written, because the collisions a
+    /// refused import carries are found by exporting the whole local history and
+    /// the sender's answer never waits for that. A diagnostic, or a failure
+    /// before a decision, never calls it.
     ///
     /// # Errors
     /// Returns a local I/O error when the bounded request/reply cannot complete,

@@ -485,9 +485,13 @@ moves the next sequence past it.
     as its `observe` receipts record (`Store::highest_local_observation`), not imported back from a
     peer. An emptied store, or one whose latest own facts were only imported back, never qualifies,
     however many later processes start on it;
-  - the window has elapsed since the process started exchanging;
-  - at least one peer has been caught up with;
-  - every other peer has been attempted by this process and is not known to be ahead.
+  - the window has elapsed since the process started exchanging (that clock starts when the
+    resident begins exchanging, after its store's first complete verification, not at the process's
+    first instruction);
+  - at least one peer is caught up with on evidence no older than the window's end;
+  - every other peer was attempted after that end and drew no authenticated answer, and none of
+    them is known to be ahead. A peer that answered an authenticated refusal was reached, not
+    forgiven.
 
   When the window ends, every peer is made due again at once, with a fresh operation ID, its
   acknowledgement forgotten and its backoff restarted: the evidence the window weighs is then taken
@@ -515,9 +519,16 @@ moves the next sequence past it.
   counts before the window is weighed again, not after it has latched.
 - `status` reports `catch_up`: `caught_up`, `caught_up_by` (`every_peer`, `window` or `no_peers`),
   `caught_up_after_ms`, `peers_imported`, `peers_matched`, `peers_missing`, `peers_ahead`,
-  `peers_not_attempted`, `own_facts_at_start`, `latest_own_fact_appended_locally`, `window_ms` and
-  `appends_observed`, the appends this process answered observed — one of them, for a universe
-  replica, is its boot fact.
+  `peers_not_attempted` (those it has neither caught up with nor attempted),
+  `own_facts_at_start`, `latest_own_fact_appended_locally`, `window_ms`, `appends_observed` (the
+  appends this process answered observed — one of them, for a universe replica, is its boot fact)
+  and `blocked_by`, which says why it is not ready when it can tell: `waiting_for_peers` with the
+  peers it lacks, `refused_by_peer` when one of those answers authenticated refusals, or
+  `identity_collision` with that peer and the colliding event ID. The last one never resolves by
+  waiting: every import from that peer is refused and every push to it is refused, so it is reached,
+  never caught up with and never forgiven by a window. The universe start ends on it (exit 2, the
+  event ID in the log) instead of running for ever without being ready; the qualification helper
+  `append-observation.py` stops on it too.
 
 A second adversarial review reproduced two more forks, both now regression tests. The window latched
 on what was known before the event being learnt, so a receipt showing a peer ahead, arriving as the
@@ -555,6 +566,18 @@ it for; the budget of those retries restarts after each `catching_up` answer, wh
 for a long time. Any other answer is still terminal, and the start then exits 2 with the resident
 killed. The entrypoint takes the stop signal from the moment the control socket is bound, so a replica
 that is still catching up stops as honestly as a ready one.
+
+**One catch-up never ends, and that start is terminal.** A replica whose history already forked from a
+peer's is refused every import from that peer, and refused by it: the peer is reached, never caught up
+with, and never forgiven by a window, so the gate would hold for ever and a no-deadline wait would
+turn that into a container running for ever without being ready. The resident therefore says what
+blocks it — `catch_up.blocked_by`, with `identity_collision`, the peer and the colliding event ID —
+and the entrypoint reads that state every five seconds while it waits and exits 2 on that reason, with
+the event ID in the log. PodMesh then records a universe that is not running when observed. The other
+reasons, `waiting_for_peers` and `refused_by_peer`, keep waiting: the first resolves when the peer
+answers, the second is a policy question an operator settles and can be transient. A forked replica
+restarted against healthy peers ends this way in the process tests, while a replica whose peer is
+merely down waits, says `waiting_for_peers`, and becomes ready at its window.
 
 Before this contract, catching up had to fit inside the budget. That was a fork of its own kind: an
 adversarial review restarted three replicas 30 seconds apart with the laboratory settings and none of
@@ -644,9 +667,12 @@ the same reason as a topology mismatch. The wire is unchanged; the collision is 
   other bytes and the smallest such event ID. That comparison runs once the signed refusal is
   written: the sender's answer never waits for a search whose size is the peer's snapshot;
 - the resident counts, for each peer, `refused_imports` and, under `identity_collisions`,
-  `imports_refused` (refused imports that carried a collision) and `event_id`, and writes one line to
-  standard error naming the event ID, once for each new colliding event ID from that peer, however
-  often the refusal repeats;
+  `imports_refused` (refused imports that carried a collision) and `event_id`, the latest one; it
+  writes one line to standard error naming a colliding event ID the first time it sees that ID from
+  that peer, and never again for it, however often the refusals repeat and in whatever order the
+  colliding IDs arrive. A replica whose own pushes are refused names nothing: the signed refusal
+  carries only its reason, so it counts the refusal and waits to refuse an import of its own to know
+  which event collided;
 - on the sending side the transport now returns the reason of a verified signed refusal
   (`Error::refusal_reason`); the resident counts `authenticated_refusals` and `last_refusal_reason` per
   peer, and counts a `policy_violation` refusal under `identity_collisions.pushes_refused` once it has
@@ -696,13 +722,14 @@ current snapshot and a refresh of ten minutes, held every fact again 83–425 ms
 slowest samples are consistent with a peer's outgoing worker still inside an attempt towards the
 restarted replica, whose connect retries last up to 2 s; this was not isolated.
 
-After the review fixes described above, on the same workstation under a higher load (load average 3
-to 6), the same scenarios gave: clean restarts caught up in 84–226 ms, deleted stores in 144–333 ms,
-push-back in 137–241 ms, and the restart with a peer down caught up by its window at 15,000 ms, its
-boot fact observed 15,030–15,034 ms after the spawn (the stopped peer's attempt ended after 2 s, well
-within the window). Run in alternation with the tip before the fixes, the clean restart took 84–161 ms
-against 76–175 ms and the deleted store 169–307 ms against 175–359 ms: the difference from the table
-is load, not the fixes.
+After the first review's fixes, on the same workstation under a higher load (load average 3 to 6),
+the same scenarios gave: clean restarts caught up in 84–226 ms, deleted stores in 144–333 ms,
+push-back in 137–241 ms, and the restart with a peer down caught up at its window, 15,000 ms, its
+boot fact observed 15,030–15,034 ms after the spawn. That last figure was measured under the rule of
+the time, where the window latched at its end; the second review replaced it by the fresh round, and
+the same restart now costs the window plus that round (below). Run in alternation with the tip before
+the fixes, the clean restart took 84–161 ms against 76–175 ms and the deleted store 169–307 ms
+against 175–359 ms: the difference from the table is load, not the fixes.
 
 The resident suite measures the same paths at a 100 ms interval, debug build, `/tmp` on the root
 volume, with the whole suite running in parallel beside another lot's benchmarks, over eight runs:
@@ -749,11 +776,27 @@ budget.
   lacked the fact imports the forked version and keeps exchanging with the replica that made it,
   while the holder of the first version is refused by both and refuses both. Measured end to end,
   all four links carry the same `identity_collisions.event_id` (`r2:…02`), each of the three
-  residents names it once on standard error per peer however often the refusal repeats, and the
-  three stores hold two facts each. The holder is then reachable and refusing, so it is not forgiven
-  by any window: it never catches up, appends nothing more, stays running and exchanging, and says
-  so in its status (`catch_up.caught_up: false`, `identity_collisions`). Nothing repairs this; an
-  operator has to.
+  residents names that event once per peer on standard error, and the three stores hold two facts
+  each. The holder is then reachable and refusing, so no window forgives it: it never catches up and
+  appends nothing more. It says which it is — `catch_up.blocked_by.reason` is `identity_collision`,
+  with the peer and the event ID — and its universe start ends on that rather than running for ever
+  without being ready. Nothing repairs the fork; an operator has to.
+
+  **The way out, recorded and not promised.** Nothing inside the store tells a copy of itself from
+  the original: a file copy carries the `observe` receipts that make `latest_own_fact_appended_locally`
+  true, so a recovery-point restore, a rollback and a lost fsync all look like a store that appended
+  its own latest fact. The witness has to come from outside the store, and PodMesh holds it: the node
+  knows whether it is starting a universe from its own writable layer or from a recovery point, a
+  rollback or a migration restore. Passing that to the replica — one typed fact of the start, an
+  environment variable of the universe's start or a root-only file in the runtime directory that the
+  entrypoint reads — would let a replica that knows its store is a restored copy require **every**
+  peer, with no window, while a replica that knows its store is its own keeps the window; the
+  resident would read it beside its configuration, at validation, and hand it to the catch-up gate
+  as `latest_own_fact_appended_locally` is handed today. A third adversarial review proposed removing
+  the window instead; that is refused, because a replica whose peer is down must still be able to
+  boot, which is the availability V2 requires. This paragraph is the shape of the answer, not a
+  commitment: what PodMesh knows, and how reliably it knows it, has to be settled before the lot
+  that would build it.
 - **An emptied store with a peer down**, including one that imported some of its own facts back in an
   earlier process, never becomes ready while that peer stays out of reach: it runs, exchanges, and
   answers `catching_up` to every append, visibly, for as long as it takes. So does a replica that
