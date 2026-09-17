@@ -2804,3 +2804,222 @@ fn the_window_weighs_only_evidence_taken_after_its_end() {
     );
     lab.stop_all();
 }
+
+/// Spawns a resident without waiting for it to answer.
+fn spawn_only(lab: &mut Lab, i: usize) {
+    let path = lab._dir.path().join(format!("r{i}.json"));
+    fs::write(&path, serde_json::to_vec(&lab.configs[i]).unwrap()).unwrap();
+    lab.children[i] = Some(
+        Command::new(env!("CARGO_BIN_EXE_podmesh-manager-resident-lab"))
+            .env("PODMESH_MANAGER_NETWORK_MODE", "authenticated-static-peers")
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+}
+
+/// One control request on a socket path, without the laboratory's harness: what
+/// the entrypoint's helper does.
+fn control_at(socket: &std::path::Path, request: &Value) -> Option<Value> {
+    let mut stream = UnixStream::connect(socket).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream
+        .write_all(&serde_json::to_vec(request).unwrap())
+        .ok()?;
+    stream.shutdown(Shutdown::Write).ok()?;
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+#[derive(Debug)]
+struct EntrypointStart {
+    replica: usize,
+    bound_ms: Option<u128>,
+    observed_ms: Option<u128>,
+    catching_up: usize,
+    attempts: usize,
+    last: String,
+    event_id: Option<String>,
+}
+
+/// The start of packaging/podmesh-manager/universe/entrypoint.sh, played here:
+/// the control socket must be bound within the 25-second budget, then one
+/// operation ID is appended until it is observed. `catching_up` is not a failure
+/// and has no deadline, `uncertain` and `busy` are retried within a budget that
+/// restarts after each catching-up answer, and any other answer is terminal.
+/// `guard` bounds this test alone; the entrypoint has no such bound.
+fn entrypoint_start(
+    replica: usize,
+    socket: std::path::PathBuf,
+    operation: String,
+    guard: Duration,
+) -> EntrypointStart {
+    let spawned = Instant::now();
+    let budget = Duration::from_secs(25);
+    let mut start = EntrypointStart {
+        replica,
+        bound_ms: None,
+        observed_ms: None,
+        catching_up: 0,
+        attempts: 0,
+        last: String::new(),
+        event_id: None,
+    };
+    while !socket.exists() {
+        if spawned.elapsed() >= budget {
+            start.last = "control socket not bound".into();
+            return start;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    start.bound_ms = Some(spawned.elapsed().as_millis());
+    let request = json!({
+        "operation": "append_observation",
+        "operation_id": operation,
+        "scope": format!("s{replica}"),
+        "subject": "boot",
+        "value": format!("{operation} value"),
+    });
+    let mut retry_since = Instant::now();
+    loop {
+        start.attempts += 1;
+        let reply = control_at(&socket, &request);
+        if let Some(reply) = &reply {
+            if reply["response"]["result"] == "observed" {
+                start.observed_ms = Some(spawned.elapsed().as_millis());
+                start.event_id = reply["response"]["fact"]["event_id"]
+                    .as_str()
+                    .map(str::to_owned);
+                return start;
+            }
+        }
+        start.last = reply.map_or_else(|| "no answer".into(), |reply| reply.to_string());
+        if start.last.contains("append_observation_catching_up") {
+            start.catching_up += 1;
+            retry_since = Instant::now();
+        } else if !(start.last.contains("append_observation_uncertain")
+            || start.last.contains("append_observation_busy"))
+            || retry_since.elapsed() >= budget
+        {
+            return start;
+        }
+        if spawned.elapsed() >= guard {
+            start.last = format!("test guard of {guard:?} reached: {}", start.last);
+            return start;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn seed_every_replica_then_stop(lab: &mut Lab) {
+    lab.start_all();
+    for i in 0..3 {
+        lab.append(
+            i,
+            &format!("seed-{i}"),
+            &format!("s{i}"),
+            "seed",
+            "seed value",
+        );
+    }
+    assert_converged(lab, 3);
+    lab.stop_all();
+}
+
+/// A replica that is catching up is running, not failed: it keeps exchanging, so
+/// that the replicas started after it catch up with it, and its start waits for
+/// its own boot fact however long that takes. Three starts thirty seconds apart,
+/// each played by the universe entrypoint's contract, all end observed.
+#[test]
+fn staggered_starts_keep_exchanging_while_they_catch_up_and_all_are_observed() {
+    // The start played below must not drift from the shipped entrypoint: its
+    // boot loop keeps retrying a catching-up answer outside the start's budget,
+    // which still bounds the uncertain and busy ones.
+    let script = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packaging/podmesh-manager/universe/entrypoint.sh"),
+    )
+    .unwrap();
+    assert!(
+        script.contains("`catching_up` is retried with no deadline"),
+        "the entrypoint no longer states the readiness contract this test plays"
+    );
+    assert!(
+        !script.contains("append_observation_busy\\|append_observation_catching_up"),
+        "the entrypoint bounds catching up by the start's budget again"
+    );
+    assert!(script.contains("append_observation_uncertain\\|append_observation_busy"));
+    let mut lab = Lab::new();
+    seed_every_replica_then_stop(&mut lab);
+    // The universe's settings: an exchange every second, a backoff to thirty
+    // seconds, one incoming worker, the default fifteen-second window.
+    for config in &mut lab.configs {
+        config.interval_ms = 1_000;
+        config.max_backoff_ms = 30_000;
+        config.incoming_workers = 1;
+    }
+    let begin = Instant::now();
+    let mut starts = Vec::new();
+    for (i, offset) in [(0_usize, 0_u64), (1, 30_000), (2, 60_000)] {
+        while begin.elapsed() < Duration::from_millis(offset) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = fs::remove_file(&lab.configs[i].control_socket);
+        spawn_only(&mut lab, i);
+        let socket = lab.configs[i].control_socket.clone();
+        starts.push(thread::spawn(move || {
+            entrypoint_start(i, socket, format!("boot-r{i}"), Duration::from_secs(150))
+        }));
+    }
+    let starts: Vec<_> = starts
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    for start in &starts {
+        println!("MEASURED staggered start (30 s apart, 15 s window): {start:?}");
+    }
+    for (i, start) in starts.iter().enumerate() {
+        assert_eq!(start.replica, i);
+        assert!(start.observed_ms.is_some(), "{start:?}");
+        assert_eq!(
+            start.event_id.as_deref(),
+            Some(format!("r{i}:00000000000000000002").as_str()),
+            "{start:?}"
+        );
+    }
+    // The first two waited past the 25-second budget for a peer to come up, and
+    // were still running and exchanging when it did.
+    assert!(starts[0].observed_ms.unwrap() > 25_000, "{:?}", starts[0]);
+    assert!(starts[0].catching_up > 0, "{:?}", starts[0]);
+    assert!(starts[1].catching_up > 0, "{:?}", starts[1]);
+    for i in 0..3 {
+        assert!(
+            lab.children[i]
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_none(),
+            "resident r{i} is no longer running"
+        );
+        assert_eq!(lab.status(i)["catch_up"]["appends_observed"], 1);
+    }
+    until(
+        || (0..3).all(|i| lab.count(i) == 6),
+        Duration::from_secs(60),
+    );
+    let digests: Vec<_> = (0..3)
+        .map(|i| inspection(&lab, i).logical_history_sha256)
+        .collect();
+    assert!(digests.iter().all(|digest| *digest == digests[0]));
+    for i in 0..3 {
+        println!(
+            "MEASURED staggered start r{i} catch-up: {}",
+            lab.status(i)["catch_up"]
+        );
+    }
+    lab.stop_all();
+}

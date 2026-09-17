@@ -232,6 +232,39 @@ describe('an uncertain answer from the resident', () => {
   }, 20000)
 })
 
+describe('a replica that has not caught up with its peers', () => {
+  async function control(answers, seen) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'podmesh-origin-'))
+    const sock = path.join(dir, 'control.sock')
+    const server = net.createServer(s => {
+      let buf = ''
+      s.on('data', d => { buf += d })
+      s.on('end', () => { seen.push(JSON.parse(buf)); s.end(answers[Math.min(seen.length - 1, answers.length - 1)]) })
+    })
+    await new Promise(r => server.listen(sock, r))
+    return { sock, close: () => server.close() }
+  }
+  const catching = '{"error":"append_observation_catching_up"}'
+  const observed = JSON.stringify({ response: { result: 'observed', fact: { event_id: 'replica-one:00000000000000000002' } } })
+  it('is retried with the same operation ID, past the attempts an uncertain answer is given', async () => {
+    const seen = []
+    const { sock, close } = await control([catching, catching, catching, catching, catching, observed], seen)
+    const append = observer({ control: sock, scope: SCOPE, facts: async () => [] })
+    expect(await append('admin.user.x', 'v')).toBe('observed')
+    expect(seen.length).toBe(6)
+    expect(new Set(seen.map(s => s.operation_id)).size).toBe(1)
+    close()
+  }, 20000)
+  it('answers, after the wait, that it is catching up and that the request can be repeated', async () => {
+    const seen = []
+    const { sock, close } = await control([catching], seen)
+    const append = observer({ control: sock, scope: SCOPE, facts: async () => [], catchingUpWaitMs: 800 })
+    await expect(append('admin.user.y', 'v')).rejects.toThrow(/has not caught up with its peers/)
+    expect(seen.length).toBeGreaterThan(1)
+    close()
+  }, 20000)
+})
+
 describe("the active manager's mark on disk", () => {
   const dir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'podmesh-mark-'))
   it('is read from the first path that holds one, the previous path only when the new one is absent', () => {

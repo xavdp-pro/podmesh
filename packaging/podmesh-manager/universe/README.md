@@ -37,22 +37,32 @@ there runs the HA-10 shape on three hosts and proves, by the frozen candidate's 
   that ignores SIGTERM makes every PodMesh stop escalate, which refuses every capture), and it
   records each start as a `boot` fact in the replica's own scope, so the store has content to
   move. Both are logged to the container's output, the only channel out. **Both are terminal:**
-  a boot fact that is not observed ends the universe with exit 2 before PodMesh's observation
-  window closes, so the start is "not running when observed"; a typed shutdown that is not
-  acknowledged ends it with exit 3 within the stop timeout, so PodMesh reports an honest failed
-  stop with no escalation, and the capture cycle refuses to take a point after it. The check
-  injects both (`--fault boot`, `--fault shutdown`). One bounded exception, added on 2026-09-15
-  after a replica restarted right after its typed stop answered `append_observation_uncertain`
-  once and was refused a start it could have had: an `uncertain` or `busy` answer is retried
-  with the **same** operation ID, half a second apart, within the start's 25-second budget — the
-  resident replays an operation ID it has already appended rather than appending it twice, so
-  the fact is observed once or the start fails as before. Since 2026-09-17 a
-  `catching_up` answer is retried the same way: the resident appends nothing before it has
-  caught up with its peers, so that a store which lost some of this replica's own facts gets
-  them back before the boot fact takes the next sequence number. An emptied store, or one that
-  only imported its own facts back, is therefore refused a start at the budget while a peer
-  stays unreachable, and so is a replica that reaches no peer. Any other answer stays terminal,
-  and the injected boot fault (a socket that does not exist) still exits 2 at once.
+  a boot fact refused for any reason but the two below ends the universe with exit 2 before
+  PodMesh's observation window closes, so the start is "not running when observed"; a typed
+  shutdown that is not acknowledged ends it with exit 3 within the stop timeout, so PodMesh
+  reports an honest failed stop with no escalation, and the capture cycle refuses to take a point
+  after it. The check injects both (`--fault boot`, `--fault shutdown`). One bounded exception,
+  added on 2026-09-15 after a replica restarted right after its typed stop answered
+  `append_observation_uncertain` once and was refused a start it could have had: an `uncertain`
+  or `busy` answer is retried with the **same** operation ID, half a second apart, within the
+  start's 25-second budget — the resident replays an operation ID it has already appended rather
+  than appending it twice, so the fact is observed once or the start fails as before.
+- **Running is not ready** (the readiness contract, corrected 2026-09-17). **Running** means the
+  resident is up and exchanging with its peers; **ready** means this boot's fact is observed. The
+  resident appends nothing before it has caught up with its peers, so that a store which lost some
+  of this replica's own facts gets them back before the boot fact takes the next sequence number;
+  while it answers `catching_up` the entrypoint keeps asking, with the same operation ID and **no
+  deadline**, and writes one line of the resident's catch-up state (peers imported, matched,
+  missing, ahead) to the log every 30 seconds. The replica stays up and keeps exchanging, which is
+  what lets the replicas started after it catch up with it — three replicas started 30 seconds
+  apart all become ready, where the previous contract killed each of them at its budget. An emptied
+  store, one that only imported its own facts back, and a replica that reaches no peer wait here
+  for as long as it takes, visibly, rather than forking their history. Readiness is in the log
+  (`boot fact observed`) and in the resident's status (`catch_up.appends_observed`,
+  `catch_up.caught_up`); the roll tool waits for that line. The 25-second budget still bounds the
+  socket bind and the `uncertain`/`busy` retries, and its clock for those restarts after each
+  `catching_up` answer. The injected boot fault (a socket that does not exist) still exits 2 at
+  once, and the stop signal is honoured from the moment the socket is bound, catching up or not.
 - **Attested binary.** The check exports `/usr/lib/podmesh-manager/podmesh-managerd` from the
   universe and refuses any inspection unless its SHA-256 equals the inspector's on the
   workstation; both digests are recorded in the result.
