@@ -2912,14 +2912,31 @@ fn audit_rows_are_immutable_idempotent_bounded_and_fail_closed() {
             "CREATE TRIGGER exchange_audit_events_no_update BEFORE UPDATE ON exchange_audit_events BEGIN SELECT RAISE(ABORT, 'immutable exchange audit event'); END;",
         )
         .unwrap();
+    let expected = DurableError::Corrupt(
+        "stored audit is invalid: invalid_audit: outbound request preparation records intent with zero transferred bytes"
+            .into(),
+    );
     assert_eq!(
         inspect_read_only(&database_path, &configuration, "r1").unwrap_err(),
-        DurableError::Corrupt(
-            "stored audit is invalid: invalid_audit: outbound request preparation records intent with zero transferred bytes"
-                .into()
-        )
+        expected
     );
-    assert!(store.execute(&Request::Inspect {}).is_err());
+    // Integrity model: the edited row is old, so the store detects it at a
+    // complete verification rather than in the next transaction. A process that
+    // opens the store for the first time verifies every row and refuses.
+    let output = lab.output("r1", &Request::Inspect {});
+    assert!(!output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["error"],
+        expected.to_string()
+    );
+    // The periodic pass of the process that already had the store open detects
+    // it too, and the store then fails closed for the rest of that process.
+    assert_eq!(store.verify_full().unwrap_err(), expected);
+    assert_eq!(store.execute(&Request::Inspect {}).unwrap_err(), expected);
+    assert_eq!(
+        store.record_exchange_audit(&prepared).unwrap_err(),
+        expected
+    );
 }
 
 #[test]
