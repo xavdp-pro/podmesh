@@ -27,7 +27,8 @@ import hashlib, json, os, subprocess, sys, tempfile, time, uuid
 MANDATE = os.environ.get("PODMESH_PUBLISHER_FOLLOW_MANDATE", "/etc/podmesh/publisher-follow-mandate")
 CLI = os.environ.get("PODMESH_CLI", "/usr/bin/podmesh")
 SOCKET = os.environ.get("PODMESH_SOCKET", "/run/podmesh/api.sock")
-# What one tick leaves the next, under /run: gone with the boot, as the mandate and the proof are.
+# What one tick leaves the next, under /run: gone with the boot, as the mandate and the proof are. One
+# file, keyed inside by resource.
 STATE = os.environ.get("PODMESH_PUBLISHER_FOLLOW_STATE", "/run/podmesh-publisher-follow/tick-state.json")
 # A running connector is stopped at once on a positive mismatch, and on a reading that could not be
 # made only when it could not be made this many ticks in a row: one podman exec that fails, one
@@ -127,24 +128,67 @@ def only_the_address_missing(data):
             and all(gates.get(g) is True for g in ("lease", "policy", "credential")))
 
 
-def load_state():
-    try:
-        with open(STATE, encoding="utf-8") as f:
-            state = json.load(f)
-        return state if isinstance(state, dict) else {}
-    except (OSError, ValueError):
-        return {}
+class State:
+    """What one tick leaves the next for one resource, in a file shared by every resource the host
+    follows (second review of V3-1: one resource's good reading reset another's count). Read tolerantly:
+    a file that cannot be read is empty, and a value that is not what it should be is judged toward
+    stopping or waiting, never a crash before a stop."""
+
+    def __init__(self, resource):
+        self.resource = resource
+        try:
+            with open(STATE, encoding="utf-8") as f:
+                whole = json.load(f)
+        except (OSError, ValueError):
+            whole = {}
+        self.whole = whole if isinstance(whole, dict) else {}
+        mine = self.whole.get(resource)
+        self.mine = mine if isinstance(mine, dict) else {}
+
+    def count(self, key, unreadable):
+        value = self.mine.get(key, 0)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else unreadable
+
+    def save(self):
+        """True when kept. A caller that relies on the count must fail closed when it is not."""
+        self.whole[self.resource] = self.mine
+        try:
+            os.makedirs(os.path.dirname(STATE) or ".", mode=0o700, exist_ok=True)
+            tmp = STATE + ".partial"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.whole, f)
+            os.replace(tmp, STATE)
+            return True
+        except OSError as e:
+            print(f"podmesh-publisher-follow: the tick's state could not be kept at {STATE}: {e}", file=sys.stderr)
+            return False
 
 
-def save_state(state):
-    try:
-        os.makedirs(os.path.dirname(STATE), mode=0o700, exist_ok=True)
-        tmp = STATE + ".partial"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-        os.replace(tmp, STATE)
-    except OSError as e:
-        print(f"podmesh-publisher-follow: the tick's state could not be kept at {STATE}: {e}", file=sys.stderr)
+def unknown_reading(state, active, ref, resource, why):
+    """A reading that could not be made, on a running connector: counted, and the connector stopped on
+    the third in a row. When the count cannot be kept, the tick stops now rather than never reaching
+    three (fail closed). A count that is not a count is taken as the last before a stop."""
+    if not active:
+        return
+    n = state.count("unknown_ticks", UNKNOWN_TICKS - 1) + 1
+    if n >= UNKNOWN_TICKS:
+        state.mine.pop("unknown_ticks", None)
+        state.save()
+        stop(ref, resource, f"{why} ({UNKNOWN_TICKS} ticks in a row)")
+        return
+    state.mine["unknown_ticks"] = n
+    if not state.save():
+        stop(ref, resource, f"{why}; and the tick's state cannot be kept, so unknown readings cannot be counted: stopping rather than never reaching {UNKNOWN_TICKS}")
+        return
+    print(f"podmesh-publisher-follow: {why} (tick {n} of {UNKNOWN_TICKS} before a stop)", file=sys.stderr)
+
+
+def address_unknown(data):
+    """Eligible but for a service address whose state could not be read (`gates.service_address` null):
+    neither a resume nor a stop, but an unknown reading."""
+    gates = data.get("gates") or {}
+    return ("gates" in data and "service_address" in gates and gates.get("service_address") is None
+            and all(gates.get(g) is True for g in ("lease", "policy", "credential")))
 
 
 def check_running(data):
@@ -187,6 +231,7 @@ def installed_proof(proof_path, epoch, state):
     """The installed proof when it is a document for the lease's epoch, else None: the node then
     resumes under the proof it already verified, or refuses. A file that cannot be read or is not a
     document (a partial copy, say) is reported once per content, never a crash."""
+    state = state.mine
     if not os.path.isfile(proof_path):
         return None
     raw = b""
@@ -230,7 +275,7 @@ def main():
     active = unit_state in ("active", "activating")
     eligible = data.get("publisher_eligible") is True
     epoch = data.get("epoch")
-    state = load_state()
+    state = State(resource)
     # Renew only inside the window the mandate names, and never once the mandate has died: the
     # lease must be able to lapse, both at the end of the demonstration and on a host nobody can
     # reach.
@@ -239,41 +284,39 @@ def main():
         if expires_at - now <= renew_below:
             maybe_renew(ref, resource)
     if not eligible:
-        state.pop("unknown_ticks", None)
-        save_state(state)
+        if address_unknown(data):
+            unknown_reading(state, active, ref, resource, "whether the service address is effective could not be read")
+            sys.exit(0)
+        state.mine.pop("unknown_ticks", None)
+        state.save()
         if active or data.get("transition"):
             stop(ref, resource, "this host is not eligible: " + "; ".join(data.get("reasons") or []))
         sys.exit(0)
     if active:
         verdict = check_running(data)
-        if verdict is None:
-            state.pop("unknown_ticks", None)
-        elif verdict[0] == "mismatch":
-            state.pop("unknown_ticks", None)
-            save_state(state)
+        if verdict is not None and verdict[0] == "unknown":
+            unknown_reading(state, active, ref, resource, verdict[1])
+            sys.exit(0)
+        state.mine.pop("unknown_ticks", None)
+        state.save()
+        if verdict is not None:
             stop(ref, resource, verdict[1])
-        else:
-            state["unknown_ticks"] = state.get("unknown_ticks", 0) + 1
-            if state["unknown_ticks"] >= UNKNOWN_TICKS:
-                state.pop("unknown_ticks", None)
-                save_state(state)
-                stop(ref, resource, f"{verdict[1]} ({UNKNOWN_TICKS} ticks in a row)")
-            else:
-                print(f"podmesh-publisher-follow: {verdict[1]} (tick {state['unknown_ticks']} of {UNKNOWN_TICKS} before a stop)", file=sys.stderr)
-        save_state(state)
         sys.exit(0)
-    state.pop("unknown_ticks", None)
+    state.mine.pop("unknown_ticks", None)
     if expired:
-        save_state(state)
+        state.save()
         fail(f"the mandate died at {not_after}; nothing is started under it (what is published runs out its lease)", 0)
     # A failed start holds the daemon for up to a minute: the next one waits, doubling, and a new
-    # epoch starts the count again.
-    if state.get("start_epoch") != epoch:
+    # epoch starts the count again. A wait that is not a time is taken as the longest; none is ever
+    # longer than the ceiling from now.
+    if state.mine.get("start_epoch") != epoch:
         for k in ("start_failures", "next_start_at"):
-            state.pop(k, None)
-    if now < state.get("next_start_at", 0):
-        save_state(state)
-        fail(f"a start failed {state.get('start_failures')} time(s); the next is not before {state['next_start_at']}", 0)
+            state.mine.pop(k, None)
+    next_start = min(state.count("next_start_at", now + BACKOFF_CEILING), now + BACKOFF_CEILING)
+    if now < next_start:
+        state.mine["next_start_at"] = next_start
+        state.save()
+        fail(f"a start failed {state.mine.get('start_failures')} time(s); the next is not before {next_start}", 0)
     fields = {"resource": resource, "previous": {"source": "publisher-follow"}}
     proof = installed_proof(proof_path, epoch, state)
     if proof is not None:
@@ -282,16 +325,16 @@ def main():
     if sc or not start.get("ok"):
         err = start.get("error") or ""
         if "already recorded or active" in err:
-            save_state(state)
+            state.save()
             sys.exit(0)
-        failures = state.get("start_failures", 0) + 1
-        state.update(start_failures=failures, start_epoch=epoch,
-                     next_start_at=now + min(BACKOFF_CEILING, BACKOFF_FIRST * 2 ** (failures - 1)))
-        save_state(state)
+        failures = min(state.count("start_failures", 16), 16) + 1
+        state.mine.update(start_failures=failures, start_epoch=epoch,
+                          next_start_at=now + min(BACKOFF_CEILING, BACKOFF_FIRST * 2 ** (failures - 1)))
+        state.save()
         fail(f"publisher_start refused: {err or start}", 1)
     for k in ("start_failures", "next_start_at", "start_epoch"):
-        state.pop(k, None)
-    save_state(state)
+        state.mine.pop(k, None)
+    state.save()
     sys.exit(0)
 
 

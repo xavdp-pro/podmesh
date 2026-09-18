@@ -2,7 +2,8 @@
 """The follow tick refuses without a mandate and does not invent a proof (docs/PUBLISHER-FOLLOW-LAB.md); and,
 against a stubbed CLI that answers as a node would and records every call, it takes the branches of V3-1:
 the route resumed when only the service address is missing, a running connector stopped at once on a
-positive mismatch and on a reading that could not be made only three ticks in a row, a start without the
+positive mismatch and on a reading that could not be made only three ticks in a row (at once when that count cannot
+be kept), a service address that could not be read counted the same way, a start without the
 installed proof when that proof is for another epoch or cannot be read, a failed start backed off, and
 nothing renewed, resumed or started after the mandate's not_after. Purely local:
 no daemon, no host. Run: python3 -B tests/check-publisher-follow-script.py"""
@@ -86,7 +87,7 @@ OK = {'ok': True, 'data': {}}
 MISSING = status(eligible=False, address=False)
 
 
-def tick(scenario, not_after=4102444800, proof=None, state=None, expect=0):
+def tick(scenario, not_after=4102444800, proof=None, state=None, expect=0, state_file=None, resource=UUID):
     """One tick against the stub: the operations it called, in order, with their requests. `state` is a
     directory kept across ticks for the tick's own state file; each tick gets a fresh one otherwise."""
     with tempfile.TemporaryDirectory(prefix='podmesh-follow-stub-') as d:
@@ -98,11 +99,11 @@ def tick(scenario, not_after=4102444800, proof=None, state=None, expect=0):
         proof_path = d / 'proof.json'
         if proof is not None:
             proof_path.write_text(proof if isinstance(proof, str) else json.dumps(proof))
-        (d / 'mandate').write_text(f'authorization_ref=ok\nresource={UUID}\nproof={proof_path}\nrenew=1\nnot_after={not_after}\nrenew_below=900\n')
+        (d / 'mandate').write_text(f'authorization_ref=ok\nresource={resource}\nproof={proof_path}\nrenew=1\nnot_after={not_after}\nrenew_below=900\n')
         log = d / 'calls'
         log.touch()
         p = run({'PODMESH_PUBLISHER_FOLLOW_MANDATE': str(d / 'mandate'), 'PODMESH_CLI': str(cli),
-                 'PODMESH_PUBLISHER_FOLLOW_STATE': str(pathlib.Path(state or d) / 'tick-state.json'),
+                 'PODMESH_PUBLISHER_FOLLOW_STATE': str(state_file or pathlib.Path(state or d) / 'tick-state.json'),
                  'STUB_LOG': str(log), 'STUB_SCENARIO': str(d / 'scenario.json')}, expect)
         calls = [json.loads(line) for line in log.read_text().splitlines()]
     return [c['op'] for c in calls], {c['op']: c['request'] for c in calls}, p
@@ -183,19 +184,68 @@ with tempfile.TemporaryDirectory(prefix='podmesh-follow-state-') as kept:
     assert ops == ['publisher_status', 'publisher_start'], ops
     ops, _, p = tick({'publisher_status': [status()], 'publisher_start': [OK]}, state=kept)
     assert ops == ['publisher_status'] and 'not before' in p.stderr, (ops, p.stderr)
-    st = json.loads((pathlib.Path(kept) / 'tick-state.json').read_text())
+    st = json.loads((pathlib.Path(kept) / 'tick-state.json').read_text())[UUID]
     assert st['start_failures'] == 1 and 15 <= st['next_start_at'] - int(time.time()) <= 20, st
     # Doubling up to the ceiling.
     st.update(start_failures=9, next_start_at=0)
-    (pathlib.Path(kept) / 'tick-state.json').write_text(json.dumps(st))
+    (pathlib.Path(kept) / 'tick-state.json').write_text(json.dumps({UUID: st}))
     tick({'publisher_status': [status()], 'publisher_start': [refused]}, state=kept, expect=1)
-    st = json.loads((pathlib.Path(kept) / 'tick-state.json').read_text())
+    st = json.loads((pathlib.Path(kept) / 'tick-state.json').read_text())[UUID]
     assert st['start_failures'] == 10 and 295 <= st['next_start_at'] - int(time.time()) <= 300, st
     # Another epoch starts the count again, and a success clears it.
     ops, _, _ = tick({'publisher_status': [status(epoch=EPOCH + 1)], 'publisher_start': [OK]}, state=kept)
     assert ops == ['publisher_status', 'publisher_start'], ops
-    assert 'start_failures' not in json.loads((pathlib.Path(kept) / 'tick-state.json').read_text())
+    assert 'start_failures' not in json.loads((pathlib.Path(kept) / 'tick-state.json').read_text())[UUID]
 checks.append('a failed start is not tried again before its backoff (20 s, doubling to 300 s); a new epoch or a success clears it')
+
+# ---------------------------------------------------------------- the second review's probes, kept
+UNKNOWN = status(unit='active', origin=None)
+with tempfile.TemporaryDirectory(prefix='podmesh-follow-state-') as kept:
+    # The state cannot be kept (its directory is a file): the first unknown reading stops, rather than a
+    # count that never reaches three.
+    blocker = pathlib.Path(kept) / 'blocker'
+    blocker.write_text('')
+    ops, _, p = tick({'publisher_status': [UNKNOWN], 'publisher_stop': [OK]}, state_file=blocker / 'tick-state.json')
+    assert ops == ['publisher_status', 'publisher_stop'] and 'cannot be kept' in p.stderr, (ops, p.stderr)
+checks.append('an unknown reading whose count cannot be kept stops the connector at once (fail closed)')
+
+with tempfile.TemporaryDirectory(prefix='podmesh-follow-state-') as kept:
+    path = pathlib.Path(kept) / 'tick-state.json'
+    for poisoned in [{UUID: {'unknown_ticks': '2'}}, {UUID: {'unknown_ticks': -1}}, {UUID: 'not a record'}, ['not', 'a', 'record']]:
+        path.write_text(json.dumps(poisoned))
+        ops, _, p = tick({'publisher_status': [UNKNOWN], 'publisher_stop': [OK]}, state_file=path)
+        expected = ['publisher_status', 'publisher_stop'] if isinstance(poisoned, dict) and isinstance(poisoned[UUID], dict) else ['publisher_status']
+        assert ops == expected, (poisoned, ops, p.stderr)
+    path.write_text('{not json')
+    ops, _, _ = tick({'publisher_status': [UNKNOWN]}, state_file=path)
+    assert ops == ['publisher_status'], ops
+    for poisoned in [{UUID: {'next_start_at': 'soon', 'start_epoch': EPOCH}}, {UUID: {'next_start_at': NOW + 10 ** 9, 'start_epoch': EPOCH}}]:
+        path.write_text(json.dumps(poisoned))
+        ops, _, p = tick({'publisher_status': [status()], 'publisher_start': [OK]}, state_file=path)
+        assert ops == ['publisher_status'], (poisoned, ops)
+        assert json.loads(path.read_text())[UUID]['next_start_at'] <= int(time.time()) + 300, path.read_text()
+checks.append('a state value that is not what it should be never crashes the tick: an unknown count taken as the last before a stop, '
+              'a wait that is not a time taken as the longest, and no wait longer than 300 s from now')
+
+UUID2 = '0a0a0a0a-5489-405b-b77a-53105b0aff7a'
+with tempfile.TemporaryDirectory(prefix='podmesh-follow-state-') as kept:
+    path = pathlib.Path(kept) / 'tick-state.json'
+    seen = []
+    for n in range(3):
+        ops, _, _ = tick({'publisher_status': [UNKNOWN], 'publisher_stop': [OK]}, state_file=path)
+        seen.append(ops[1:])
+        tick({'publisher_status': [status(unit='active')]}, state_file=path, resource=UUID2)
+    assert seen == [[], [], ['publisher_stop']], seen
+checks.append("two resources in one state file keep their own counts: one's good readings do not reset the other's")
+
+with tempfile.TemporaryDirectory(prefix='podmesh-follow-state-') as kept:
+    unread = status(eligible=False, address=None, unit='active')
+    seen = [tick({'publisher_status': [unread], 'publisher_stop': [OK]}, state=kept)[0][1:] for _ in range(3)]
+    assert seen == [[], [], ['publisher_stop']], seen
+    ops, _, _ = tick({'publisher_status': [status(eligible=False, address=None)]})
+    assert ops == ['publisher_status'], ops
+checks.append('a service address that could not be read is neither resumed nor stopped on: an unknown, stopped on the third tick in a row, '
+              'and nothing started')
 
 PAST = NOW - 60
 for label, scenario in [('only the address missing', {'publisher_status': [MISSING]}),
