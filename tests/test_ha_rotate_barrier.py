@@ -5,7 +5,10 @@ its replica returns; a barrier of `lease + margin from now` let the new holder p
 fake gate answer as the API and the fencing laboratory would, and the tool's own functions are driven: the
 supersession is delivered to the previous holder, when it is named and reached, before the new holder acquires and
 before any proof is made; when it is not, the barrier is no earlier than the recorded follow mandate's not_after plus
-the lease plus the margin; and what cannot be known is refused before the gate moves.
+the lease plus the margin; and what cannot be known is refused before the gate moves. The second review's probes are
+kept as regressions: every rotation carries the current epoch's barrier forward (a same-holder rotation and a holder
+told later shorten nothing), the barrier counts the previous holder's lease, the proof outlives its barrier, and what
+fails after the gate moved leaves a record a rerun carries.
 Run: python3 -B tests/test_ha_rotate_barrier.py"""
 import importlib.util, json, os, pathlib, sys, tempfile, time, types, unittest
 
@@ -72,16 +75,31 @@ class Rotation(unittest.TestCase):
         self.dir.cleanup()
 
     def ledger(self, **fields):
+        """The ledger as a rotation to epoch 5 left it (its proof recorded, nothing carried), with `fields` over it."""
         path = pathlib.Path(self.dir.name) / f'{R}.json'
-        path.write_text(json.dumps({'universe': R, 'cycles': [], 'rotations': [], 'policy': {'lease_seconds': LEASE, 'takeover_margin_seconds': MARGIN}, **fields}))
+        base = {'universe': R, 'cycles': [], 'rotations': [], 'policy': {'lease_seconds': LEASE, 'takeover_margin_seconds': MARGIN},
+                'proofs': {'5': {'method': 'same_holder', 'eligible_after': 0, 'new_epoch': 5}}}
+        path.write_text(json.dumps({**base, **fields}))
 
-    def rotate(self, previous=None, previous_host=None, stated=None):
+    def recorded(self):
+        return json.loads((pathlib.Path(self.dir.name) / f'{R}.json').read_text())
+
+    def rotate(self, previous=None, previous_host=None, stated=None, lease=None, barrier=None):
         tool.try_host = lambda role, target: previous
-        args = types.SimpleNamespace(universe=R, host='lab@new', reference='unit-test', lease=None, margin=None, standbys=None,
-                                     previous_host=previous_host, follow_mandate_not_after=stated)
+        args = types.SimpleNamespace(universe=R, host='lab@new', reference='unit-test', lease=lease, margin=None, standbys=None,
+                                     previous_host=previous_host, follow_mandate_not_after=stated, barrier_not_before=barrier)
         with self.assertRaises(Reported) as caught:
             tool.cmd_rotate(args)
         return caught.exception.args[0]
+
+    def to(self, holder):
+        """The next rotation goes to `holder`."""
+        self.new = FakeHost(holder, self.events)
+        tool.hosts = lambda args, *roles: [self.new]
+
+    def at(self, holder, epoch):
+        """The gate names `holder` at `epoch`, as it does after a rotation there."""
+        self.gate.inspect = lambda universe: {'epoch': epoch, 'replica_id': holder}
 
     def test_the_supersession_is_delivered_before_the_new_holder_acquires_and_before_any_proof(self):
         not_after = int(time.time()) + 86400
@@ -153,6 +171,163 @@ class Rotation(unittest.TestCase):
         report = self.rotate()
         self.assertIsNone(report['supersession'])
         self.assertEqual(report['takeover_proof']['method'], 'same_holder')
+
+
+    # ------------------------------------------------------------ the second review's probes, kept
+
+    def test_the_proof_outlives_its_barrier(self):
+        not_after = int(time.time()) + 86400
+        for mandates in [{}, {PREV: {'not_after': not_after, 'renew': 1}}]:
+            self.ledger(follow_mandates=mandates)
+            p = self.rotate()['takeover_proof']
+            self.assertGreaterEqual(p['expires_at'], p['eligible_after'] + 3600, mandates)
+
+    def test_a_same_holder_rotation_carries_the_barrier_it_follows(self):
+        not_after = int(time.time()) + 86400
+        self.ledger(follow_mandates={PREV: {'not_after': not_after, 'renew': 1}})
+        first = self.rotate()                                   # PREV not reached: the barrier is pushed
+        pushed = first['takeover_proof']['eligible_after']
+        self.assertEqual(pushed, not_after + LEASE + MARGIN)
+        self.at(NEW, 6)                                         # the operator rotates to NEW again, a minute later
+        second = self.rotate()
+        p = second['takeover_proof']
+        self.assertEqual((p['method'], p['eligible_after'], p['carried_eligible_after']), ('same_holder', pushed, pushed))
+        self.assertGreaterEqual(p['expires_at'], pushed + 3600)
+
+    def test_a_holder_never_told_is_carried_to_the_next_rotation(self):
+        not_after = int(time.time()) + 86400
+        self.ledger(follow_mandates={PREV: {'not_after': not_after, 'renew': 1}})
+        first = self.rotate()                                   # PREV never superseded
+        self.assertFalse(first['supersession']['delivered'])
+        self.at(NEW, 6)
+        self.to('host-c')
+        told = FakeHost(NEW, self.events)
+        second = self.rotate(previous=told, previous_host='lab@new')   # NEW told this time
+        self.assertTrue(second['supersession']['delivered'])
+        self.assertGreaterEqual(second['takeover_proof']['eligible_after'], not_after + LEASE + MARGIN)
+
+    def test_the_barrier_counts_the_lease_the_previous_holder_renews_under(self):
+        self.ledger()                                           # the previous holder renews a 3600 s lease
+        before = int(time.time())
+        p = self.rotate(lease=20)['takeover_proof']
+        self.assertGreaterEqual(p['eligible_after'], before + LEASE + MARGIN)
+        self.assertEqual(self.recorded()['policy']['lease_seconds'], 20)   # the new policy is still this call's
+
+    def test_a_dropped_session_with_the_previous_holder_is_reported_not_raised(self):
+        not_after = int(time.time()) + 86400
+        self.ledger(follow_mandates={PREV: {'not_after': not_after, 'renew': 1}})
+
+        class Dropping(FakeHost):
+            def api(self, req):
+                raise RuntimeError('previous ssh failed (255)')
+        report = self.rotate(previous=Dropping(PREV, self.events), previous_host='lab@previous')
+        self.assertFalse(report['supersession']['delivered'])
+        self.assertIn('could not be asked', report['supersession']['why'])
+        self.assertEqual(report['takeover_proof']['eligible_after'], not_after + LEASE + MARGIN)
+        self.assertEqual(self.recorded()['rotations'][-1]['state'], 'complete')
+
+    def test_a_failure_after_the_gate_moved_leaves_what_a_rerun_carries(self):
+        not_after = int(time.time()) + 86400
+        self.ledger(follow_mandates={PREV: {'not_after': not_after, 'renew': 1}})
+
+        class Failing(FakeHost):
+            def api(self, req):
+                if req['operation'] == 'activation_acquire':
+                    raise RuntimeError('new host ssh failed (255)')
+                return super().api(req)
+        self.new = Failing(NEW, self.events)
+        tool.hosts = lambda args, *roles: [self.new]
+        tool.try_host = lambda role, target: None
+        args = types.SimpleNamespace(universe=R, host='lab@new', reference='unit-test', lease=None, margin=None, standbys=None,
+                                     previous_host=None, follow_mandate_not_after=None, barrier_not_before=None)
+        with self.assertRaises(RuntimeError):
+            tool.cmd_rotate(args)
+        ledger = self.recorded()
+        self.assertIn(('gate', 'transfer'), self.events)
+        self.assertEqual(ledger['rotations'][-1]['state'], 'gate_moved')
+        self.assertEqual(ledger['proofs']['6']['eligible_after'], not_after + LEASE + MARGIN)
+        # The rerun: the gate names NEW at 6; a rotation to NEW carries the barrier recorded before the failure.
+        self.to(NEW)
+        self.at(NEW, 6)
+        p = self.rotate()['takeover_proof']
+        self.assertEqual((p['method'], p['eligible_after']), ('same_holder', not_after + LEASE + MARGIN))
+
+    def test_a_rotation_without_the_current_epochs_proof_is_refused_unless_the_barrier_is_stated(self):
+        for holder in (NEW, PREV):
+            self.events.clear()
+            self.at(holder, 5)
+            self.ledger(proofs={})
+            with self.assertRaises(tool.Refusal) as refused:
+                self.rotate()
+            self.assertIn('no_proof_for_current_epoch', str(refused.exception))
+            self.assertEqual(self.events, [])
+        stated = int(time.time()) + 50_000
+        self.at(NEW, 5)
+        p = self.rotate(barrier=stated)['takeover_proof']
+        self.assertEqual((p['method'], p['eligible_after']), ('same_holder', stated))
+        # A universe activated there (tools/ha-standby.py activate) set no barrier to carry.
+        self.ledger(proofs={}, rotations=[{'epoch': 5, 'to': NEW, 'by': 'activate'}])
+        self.assertEqual(self.rotate()['takeover_proof']['method'], 'same_holder')
+
+    def test_a_fence_receipt_carries_only_what_it_carried(self):
+        self.assertEqual(tool.carried_barrier(None), 0)
+        self.assertEqual(tool.carried_barrier({'method': 'lease_barrier', 'eligible_after': 900}), 900)
+        self.assertEqual(tool.carried_barrier({'method': 'same_holder', 'eligible_after': 900, 'carried_eligible_after': 800}), 900)
+        self.assertEqual(tool.carried_barrier({'method': 'fence_receipt', 'eligible_after': 900}), 0)
+        self.assertEqual(tool.carried_barrier({'method': 'fence_receipt', 'eligible_after': 900, 'carried_eligible_after': 800}), 800)
+
+    def test_an_attested_fence_is_eligible_at_the_barrier_it_carried(self):
+        carried = int(time.time()) + 40_000
+        self.at(NEW, 6)
+        proof = {'method': 'lease_barrier', 'previous_holder': PREV, 'new_holder': NEW, 'eligible_after': carried + 10,
+                 'carried_eligible_after': carried, 'expires_at': int(time.time()) + 100, 'new_epoch': 6}
+        self.ledger(proofs={'6': proof})
+        receipt = pathlib.Path(self.dir.name) / 'receipt.json'
+        receipt.write_text(json.dumps({'host': PREV, 'operation_id': 'f', 'fence': {'unentitled': [R], 'publishers_withdrawn': [], 'routes_withdrawn': []}}))
+        with self.assertRaises(Reported) as caught:
+            tool.cmd_attest_fence(types.SimpleNamespace(universe=R, receipt=str(receipt)))
+        p = caught.exception.args[0]['takeover_proof']
+        self.assertEqual((p['method'], p['eligible_after']), ('fence_receipt', carried))
+        self.assertGreaterEqual(p['expires_at'], carried + 3600)
+
+    def test_the_supersession_visit_stops_the_previous_connector(self):
+        self.ledger()
+        previous = FakeHost(PREV, self.events, {'publisher_status': {'ok': True, 'data': {'unit': {'state': 'inactive'}}}})
+        report = self.rotate(previous=previous, previous_host='lab@previous')
+        self.assertIn((PREV, 'publisher_stop'), self.events)
+        self.assertEqual(report['supersession']['previous_connector'], {'stop': 'done', 'unit_after': 'inactive', 'stopped': True})
+
+    def test_the_mandate_record_never_says_less_than_the_host_may_hold(self):
+        now = int(time.time())
+        self.ledger()
+        tool.record_follow_mandate(R, PREV, 'lab-a', now + 86400, 900, 'r', confirmed=True)
+        # A shorter mandate recorded before its installation: the longer one stands until the host's copy is read back.
+        pending = tool.record_follow_mandate(R, PREV, 'lab-a', now + 3600, 900, 'r', confirmed=False)
+        self.assertEqual((pending['not_after'], pending['installing_not_after'], pending['installed']), (now + 86400, now + 3600, False))
+        confirmed = tool.record_follow_mandate(R, PREV, 'lab-a', now + 3600, 900, 'r', confirmed=True)
+        self.assertEqual((confirmed['not_after'], confirmed['installed']), (now + 3600, True))
+        self.assertEqual(self.recorded()['follow_mandates'][PREV]['not_after'], now + 3600)
+
+    def test_the_ledger_has_one_writer_at_a_time(self):
+        self.ledger()
+        with tool.locked(R):
+            with self.assertRaises(tool.Refusal) as refused:
+                with tool.locked(R, wait_seconds=0.6):
+                    pass
+        self.assertIn('ledger_locked', str(refused.exception))
+        taken = []
+        real = tool.locked
+
+        def recording(universe, wait_seconds=30):
+            taken.append(universe)
+            return real(universe, wait_seconds)
+        tool.locked = recording
+        try:
+            self.rotate()
+            tool.record_follow_mandate(R, PREV, 'lab-a', int(time.time()) + 60, 900, 'r', confirmed=True)
+        finally:
+            tool.locked = real
+        self.assertEqual(taken, [R, R])
 
 
 if __name__ == '__main__':

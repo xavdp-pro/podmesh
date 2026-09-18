@@ -33,7 +33,7 @@ Subcommands:
   attest-fence  --universe R --receipt FILE   bind the previous holder's fence answer to the current epoch's
                                  takeover proof (method fence_receipt); FILE = {host, operation_id, fence}
   rotate        --universe R --host SSH [--previous-host SSH] [--follow-mandate-not-after T]
-                [--lease S --margin S --standbys N]
+                [--barrier-not-before T] [--lease S --margin S --standbys N]
                                  rotate the epoch of a resource (a universe, or a role such as a logical
                                  manager whose replicas all keep running) to a host and acquire it there;
                                  nothing promoted or started; prints the permit, which the agent delivers
@@ -41,7 +41,10 @@ Subcommands:
                                  holder, the supersession is delivered to the previous holder named by
                                  --previous-host, when it is reachable, before any proof is made; when it is
                                  not, the barrier covers whatever that host may still renew by itself under a
-                                 follow mandate recorded in the ledger (or stated by --follow-mandate-not-after)
+                                 follow mandate recorded in the ledger (or stated by --follow-mandate-not-after).
+                                 Every rotation carries the current epoch's barrier forward, and is refused
+                                 (no_proof_for_current_epoch) when the ledger lacks that epoch's proof, unless
+                                 --barrier-not-before states it
   activate      --universe U --host SSH [--lease S --margin S --standbys N]
                                  declare the policy on the host under the gate's authority, rotate the
                                  epoch to it, acquire; starting is the operator's (the API's `start`)
@@ -64,7 +67,7 @@ Subcommands:
                                  acquires, promotes the newest quarantined copy, starts, and
                                  supersedes the active host if it can be reached
 """
-import argparse, json, os, pathlib, sys, tempfile, time, uuid
+import argparse, contextlib, fcntl, json, os, pathlib, sys, tempfile, time, uuid
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tests'))
@@ -120,6 +123,46 @@ def save_ledger(universe, ledger):
     tmp = p.with_suffix('.json.partial')
     tmp.write_text(json.dumps(ledger, indent=2, sort_keys=True))
     os.replace(tmp, p)
+
+
+@contextlib.contextmanager
+def locked(universe, wait_seconds=30):
+    """One writer of a resource's ledger at a time: a rotation, an attestation and the record of a follow
+    mandate never interleave, and neither does a replication run or a takeover of tools/replicate-universe.py,
+    which takes the same lock file. A caller that cannot take it within the wait is refused, having done nothing."""
+    path = ledger_path(universe).with_suffix('.lock')
+    with open(path, 'a+') as f:
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise Refusal(f'ledger_locked: another rotation, record or run holds the ledger of {universe[:8]} for more than {wait_seconds} s; nothing was done')
+                time.sleep(0.5)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def record_follow_mandate(universe, host_identity, role, not_after, renew_below, reference, confirmed):
+    """The follow mandate a host holds, in the resource's ledger (no secret in it), under the ledger's lock.
+    Recorded before it is installed (`confirmed` false) and again once the host's copy is read back
+    (`confirmed` true). Until then the record keeps the larger of the previous and the new `not_after`: an
+    installation that fails after the record must not leave the ledger saying less than what the host may
+    still hold -- a rotation that cannot reach the host computes its barrier from this."""
+    with locked(universe):
+        ledger = load_ledger(universe)
+        mandates = ledger.setdefault('follow_mandates', {})
+        before = mandates.get(host_identity)
+        held = before['not_after'] if isinstance(before, dict) and isinstance(before.get('not_after'), int) and before.get('renew') else 0
+        mandates[host_identity] = {'host': role, 'not_after': not_after if confirmed else max(held, not_after), 'renew': 1,
+                                   'renew_below': renew_below, 'issued_at': int(time.time()), 'reference': reference,
+                                   'installed': bool(confirmed), **({} if confirmed else {'installing_not_after': not_after})}
+        save_ledger(universe, ledger)
+        return mandates[host_identity]
 
 
 def save_current_proof(universe, proof):
@@ -298,16 +341,42 @@ def follow_mandate_bound(ledger, holder, now, stated=None):
     return m['not_after'], f'the follow mandate recorded for the previous holder at {m.get("issued_at")}, renewing until {m["not_after"]}'
 
 
+def carried_barrier(proof):
+    """What a recorded proof leaves the next rotation to respect: its own `eligible_after`, since whoever it
+    barred may still renew and resume until then -- unless it was upgraded to `fence_receipt`, whose fence took
+    the previous holder out, and then only what it carried from earlier rotations."""
+    if not proof:
+        return 0
+    if proof.get('method') == 'fence_receipt':
+        return int(proof.get('carried_eligible_after') or 0)
+    return int(proof.get('eligible_after') or 0)
+
+
 def deliver_supersession(previous, universe, permit, reference):
     """The rotation's permit delivered to the previous holder as `activation_supersede`: its screen
     advances, its own lease is marked overtaken, and it can no longer renew it, resume a route or
-    resume a start (its tick then stops its connector). A dict saying whether it was delivered."""
+    resume a start. On the same visit its connector is stopped (`publisher_stop`) and observed, when the
+    resource has one there. A dict saying what happened; an unreachable host or a dropped SSH session is
+    a fact to report, never an exception after the gate has moved."""
     if previous is None:
         return {'delivered': False, 'why': 'the previous holder was not named or not reached (--previous-host)'}
-    r = previous.api(request('activation_supersede', universe, reference, permit=permit))
+    try:
+        r = previous.api(request('activation_supersede', universe, reference, permit=permit))
+    except Exception as e:  # noqa: BLE001 -- the gate has moved: report, never raise
+        return {'delivered': False, 'host': previous.identity, 'why': f'activation_supersede could not be asked: {e}'}
     if not r.get('ok'):
         return {'delivered': False, 'host': previous.identity, 'why': f'activation_supersede refused: {r.get("error")}'}
-    return {'delivered': True, 'host': previous.identity, 'screen': r['data'].get('highest_epoch_seen'), 'superseded': r['data'].get('superseded')}
+    result = {'delivered': True, 'host': previous.identity, 'screen': r['data'].get('highest_epoch_seen'), 'superseded': r['data'].get('superseded')}
+    visit = {'operation_id': str(uuid.uuid4()), 'authorization_ref': reference, 'resource': universe}
+    try:
+        stopped = previous.api(dict(visit, operation='publisher_stop'))
+        seen = previous.api(dict(visit, operation='publisher_status', operation_id=str(uuid.uuid4())))
+        unit = ((seen.get('data') or {}).get('unit') or {}).get('state')
+        result['previous_connector'] = {'stop': 'done' if stopped.get('ok') else f'refused: {stopped.get("error")}', 'unit_after': unit,
+                                        'stopped': unit not in ('active', 'activating') if unit is not None else None}
+    except Exception as e:  # noqa: BLE001
+        result['previous_connector'] = {'stop': f'could not be asked: {e}', 'stopped': None}
+    return result
 
 
 def cmd_rotate(args):
@@ -315,72 +384,107 @@ def cmd_rotate(args):
     nothing is promoted or started -- the running replicas keep running. The permit is printed
     so that the agent can deliver it to the other hosts as a supersession.
 
-    To ANOTHER holder (review of V3-1): the previous holder may still believe itself entitled, renew
-    its lease under a follow mandate, and -- since V3-1 -- resume its route and its connector when its
-    replica comes back; the barrier `lease + margin from now` did not cover that. So the supersession
-    is delivered to it (--previous-host) before any proof is made, when it can be reached; and when it
-    cannot, the barrier is pushed to what that host may still renew by itself: the recorded follow
-    mandate's `not_after` plus the lease plus the margin. Refused, before the gate moves, when that
-    cannot be known."""
+    To ANOTHER holder (reviews of V3-1): the previous holder may still believe itself entitled, renew
+    its lease under a follow mandate and -- since V3-1 -- resume its route and its connector when its
+    replica comes back. So the supersession is delivered to it (--previous-host) before the new holder
+    acquires or any usable proof is printed, and its connector stopped on the same visit; when it cannot
+    be, the barrier is pushed to what that host may still renew by itself: the recorded follow mandate's
+    `not_after` plus the lease plus the margin. The lease counted is the longer of this call's and the
+    one the previous holder renews under (the ledger's policy before this call).
+
+    To ANY holder, the same one included: the barrier of the gate's current epoch is carried forward (a
+    holder that was never told does not become harmless because the role moved again), so the ledger must
+    hold the current epoch's proof -- refused (`no_proof_for_current_epoch`) otherwise, unless the operator
+    states the barrier (--barrier-not-before). The rotation and a proof as long as it could need to be are
+    recorded as soon as the gate moves, before any step that can fail, so that a rerun carries it."""
     gate = gate_or_refuse()
     (host,) = hosts(args, ('host', args.host))
     u = args.universe
-    ledger = load_ledger(u)
-    policy = dict(ledger.get('policy') or {})
-    if args.lease is not None:
-        policy['lease_seconds'] = args.lease
-    if args.margin is not None:
-        policy['takeover_margin_seconds'] = args.margin
-    if args.standbys is not None:
-        policy['desired_standbys'] = args.standbys
-    policy.setdefault('lease_seconds', 20)
-    policy.setdefault('takeover_margin_seconds', 5)
-    policy.setdefault('desired_standbys', 2)
-    policy['authority_id'] = gate.authority_id
-    current = gate.inspect(u)
-    previous_holder = current.get('replica_id') or None
-    handover = current['epoch'] != 0 and previous_holder not in (None, host.identity)
-    # Everything that can refuse is decided before the gate moves: the previous holder named and
-    # reached is the one the gate knows, and the follow mandate that host may renew under is known.
-    previous, bound = None, None
-    if handover:
-        if args.previous_host:
-            previous = try_host('previous', args.previous_host)
-            if previous is not None and previous.identity != previous_holder:
-                raise Refusal(f'previous_host_mismatch: {args.previous_host} is host {previous.identity}, the gate\'s previous holder is {previous_holder}')
-        bound = follow_mandate_bound(ledger, previous_holder, int(time.time()), args.follow_mandate_not_after)
-    ok(host, request('activation_require', u, args.reference, lease_seconds=policy['lease_seconds'], takeover_margin_seconds=policy['takeover_margin_seconds'],
-                     desired_standbys=policy['desired_standbys'], authority_id=gate.authority_id, **key_fields(gate)), 'activation_require')
-    permit = permit_for(gate, u, host, current['epoch'])
-    supersession = deliver_supersession(previous, u, permit, args.reference) if handover else None
-    lease = ok(host, request('activation_acquire', u, args.reference, permit=permit), 'activation_acquire')
-    covered = bound if handover and not supersession['delivered'] else None
-    proof = takeover_proof(gate, u, current, host.identity, permit['epoch'], policy, renewable_until=covered)
-    ledger['policy'] = dict(policy, authority_id=gate.authority_id, declared_on=host.identity, declared_at=int(time.time()))
-    ledger['rotations'].append({'epoch': permit['epoch'], 'to': host.identity, 'at': int(time.time()), 'by': 'rotate',
-                                'supersession': supersession, 'barrier_covers_follow_mandate': covered})
-    ledger.setdefault('proofs', {})[str(permit['epoch'])] = proof
-    save_ledger(u, ledger)
-    proof_path = save_current_proof(u, proof)
+    with locked(u):
+        ledger = load_ledger(u)
+        prior = dict(ledger.get('policy') or {})
+        policy = dict(prior)
+        if args.lease is not None:
+            policy['lease_seconds'] = args.lease
+        if args.margin is not None:
+            policy['takeover_margin_seconds'] = args.margin
+        if args.standbys is not None:
+            policy['desired_standbys'] = args.standbys
+        policy.setdefault('lease_seconds', 20)
+        policy.setdefault('takeover_margin_seconds', 5)
+        policy.setdefault('desired_standbys', 2)
+        policy['authority_id'] = gate.authority_id
+        # The barrier counts the lease the previous holder renews under, not only this call's.
+        barrier = {'lease_seconds': max(int(policy['lease_seconds']), int(prior.get('lease_seconds') or 0)),
+                   'takeover_margin_seconds': max(int(policy['takeover_margin_seconds']), int(prior.get('takeover_margin_seconds') or 0))}
+        current = gate.inspect(u)
+        previous_holder = current.get('replica_id') or None
+        first = current['epoch'] == 0 or previous_holder is None
+        handover = not first and previous_holder != host.identity
+        recorded = (ledger.get('proofs') or {}).get(str(current['epoch']))
+        activated = any(r.get('epoch') == current['epoch'] and r.get('by') == 'activate' for r in ledger.get('rotations') or [])
+        if not first and recorded is None and not activated and args.barrier_not_before is None:
+            raise Refusal(f'no_proof_for_current_epoch: this ledger holds no takeover proof for the gate\'s epoch {current["epoch"]} (a rotation made '
+                          'elsewhere, or one interrupted before this record existed), so the barrier it set cannot be carried forward; state it '
+                          'with --barrier-not-before <unix time> -- that proof\'s eligible_after, or the latest second any earlier holder may still '
+                          'renew by itself plus its lease and margin')
+        carried = max(carried_barrier(recorded), args.barrier_not_before or 0)
+        # Everything that can refuse is decided before the gate moves: the previous holder named and
+        # reached is the one the gate knows, and the follow mandate that host may renew under is known.
+        previous, bound = None, None
+        if handover:
+            if args.previous_host:
+                previous = try_host('previous', args.previous_host)
+                if previous is not None and previous.identity != previous_holder:
+                    raise Refusal(f'previous_host_mismatch: {args.previous_host} is host {previous.identity}, the gate\'s previous holder is {previous_holder}')
+            bound = follow_mandate_bound(ledger, previous_holder, int(time.time()), args.follow_mandate_not_after)
+        ok(host, request('activation_require', u, args.reference, lease_seconds=policy['lease_seconds'], takeover_margin_seconds=policy['takeover_margin_seconds'],
+                         desired_standbys=policy['desired_standbys'], authority_id=gate.authority_id, **key_fields(gate)), 'activation_require')
+        permit = permit_for(gate, u, host, current['epoch'])
+        # The gate has moved. Recorded at once, with the proof as long as it could need to be (as if the
+        # supersession will not be delivered): whatever fails from here, a rerun finds this epoch's proof
+        # and carries its barrier.
+        rotation = {'epoch': permit['epoch'], 'to': host.identity, 'at': int(time.time()), 'by': 'rotate', 'state': 'gate_moved'}
+        ledger['policy'] = dict(policy, authority_id=gate.authority_id, declared_on=host.identity, declared_at=int(time.time()))
+        ledger['rotations'].append(rotation)
+        proof = takeover_proof(gate, u, current, host.identity, permit['epoch'], barrier, renewable_until=bound, carried=carried)
+        ledger.setdefault('proofs', {})[str(permit['epoch'])] = proof
+        save_ledger(u, ledger)
+        supersession = deliver_supersession(previous, u, permit, args.reference) if handover else None
+        rotation['supersession'] = supersession
+        save_ledger(u, ledger)
+        lease = ok(host, request('activation_acquire', u, args.reference, permit=permit), 'activation_acquire')
+        covered = bound if handover and not supersession['delivered'] else None
+        if handover and supersession['delivered']:
+            proof = takeover_proof(gate, u, current, host.identity, permit['epoch'], barrier, renewable_until=None, carried=carried)
+            ledger['proofs'][str(permit['epoch'])] = proof
+        rotation.update(state='complete', barrier_covers_follow_mandate=covered, carried_eligible_after=carried or None)
+        save_ledger(u, ledger)
+        proof_path = save_current_proof(u, proof)
     out({'resource': u, 'host': host.identity, 'epoch': permit['epoch'], 'permit': permit, 'takeover_proof': proof,
          'current_proof_path': proof_path,
          'lease': {k: lease[k] for k in ('generation', 'expires_at', 'live')},
          'previous_holder': previous_holder if handover else None,
          'supersession': supersession,
          'barrier_covers_follow_mandate': {'not_after': covered[0], 'source': covered[1]} if covered else None,
+         'carried_eligible_after': carried or None,
          'note': 'the role moved; no universe was promoted or started, and the other hosts learn the epoch only when the permit is delivered to them '
                  '(the previous holder already has it when supersession.delivered); '
                  'the takeover proof is what an exclusive publication needs, upgraded by attest-fence once the previous holder is fenced'})
 
 
-def takeover_proof(gate, universe, before, new_holder, new_epoch, policy, renewable_until=None):
+def takeover_proof(gate, universe, before, new_holder, new_epoch, policy, renewable_until=None, carried=0):
     """The authority's account of the transition, bound to the resource, both epochs and both
     holders (Codex, P0). Its method says what makes the new holder eligible: `first` when no
     epoch existed, `same_holder` when this host held the previous one, else `lease_barrier` --
     the previous lease plus the margin from now, on this gate's clock, since the previous
     holder may have renewed right up to this rotation; and, when that holder was not told of the
     rotation and may renew by itself under a follow mandate (`renewable_until`: its not_after and
-    where that was read), no earlier than that not_after plus the lease plus the margin. `attest-fence`
+    where that was read), no earlier than that not_after plus the lease plus the margin. Whatever the
+    method, never earlier than the barrier carried from the previous epoch (`carried`): a holder barred
+    then may still renew and resume until it, and the node holds every method until `eligible_after`.
+    The proof lives an hour past its barrier, never less: a proof that expired before it could be used
+    would leave only a rotation to the same holder, which must not shorten anything. `attest-fence`
     turns it into a `fence_receipt` once the previous holder's fence is in hand. Signed with the
     authority's Ed25519 key over its canonical form; a laboratory proof, unsigned and labelled so,
     only under PODMESH_HA_UNSIGNED=1 (the host then accepts it on its binding alone)."""
@@ -400,10 +504,15 @@ def takeover_proof(gate, universe, before, new_holder, new_epoch, policy, renewa
         if renewable_until is not None and renewable_until[0] + lease + margin > eligible:
             eligible = renewable_until[0] + lease + margin
             basis = f'the previous holder may renew by itself until {renewable_until[0]} ({renewable_until[1]}), then its lease and the margin'
+    if carried > eligible:
+        eligible = carried
+        basis = f'the barrier carried from epoch {previous_epoch}, which a holder barred then may still renew and resume until'
     proof = {'kind': 'podmesh-takeover-proof/lab-unsigned', 'authority_id': gate.authority_id, 'resource': universe,
              'previous_epoch': previous_epoch, 'new_epoch': new_epoch, 'previous_holder': previous_holder, 'new_holder': new_holder,
-             'method': method, 'eligible_after': eligible, 'issued_at': now, 'expires_at': now + 3600,
+             'method': method, 'eligible_after': eligible, 'issued_at': now, 'expires_at': max(now, eligible) + 3600,
              'note': 'laboratory proof, unsigned: binding checked by the host, origin not verified'}
+    if carried:
+        proof['carried_eligible_after'] = carried
     if basis:
         proof['barrier_basis'] = basis
     key = signing_key(gate.authority_id)
@@ -413,9 +522,15 @@ def takeover_proof(gate, universe, before, new_holder, new_epoch, policy, renewa
 def cmd_attest_fence(args):
     """Upgrade the current epoch's takeover proof with the previous holder's fence: the fence's
     answer (as the host returned it, with the host's identity) is bound to the transition and the
-    method becomes `fence_receipt`, eligible at once."""
+    method becomes `fence_receipt`, eligible at once -- or at the barrier the proof carried from an
+    earlier epoch, which this fence says nothing about."""
     gate = gate_or_refuse()
     u = args.universe
+    with locked(u):
+        attest_fence(gate, u, args)
+
+
+def attest_fence(gate, u, args):
     ledger = load_ledger(u)
     current = gate.inspect(u)
     proof = (ledger.get('proofs') or {}).get(str(current['epoch']))
@@ -434,7 +549,9 @@ def cmd_attest_fence(args):
         [r for r in (answer.get('routes_withdrawn') or []) if r.get('exclusive_resource') == u]
     if any(r.get('withdrawn') is not True for r in attempted):
         raise Refusal('the fence answer records a withdrawal for this resource that did not take')
-    proof = dict(proof, method='fence_receipt', eligible_after=int(time.time()), issued_at=int(time.time()),
+    now = int(time.time())
+    eligible = max(now, int(proof.get('carried_eligible_after') or 0))
+    proof = dict(proof, method='fence_receipt', eligible_after=eligible, issued_at=now, expires_at=max(int(proof.get('expires_at') or 0), eligible + 3600),
                  receipt={'host': host, 'operation_id': receipt.get('operation_id'), 'resource': u, 'withdrawn': True})
     key = signing_key(gate.authority_id)
     proof = sign(proof, key) if key else {k: v for k, v in proof.items() if k not in ('signature', 'signer')}
@@ -658,6 +775,8 @@ def main():
     ro.add_argument('--lease', type=int, default=None, help='seconds; when omitted, the ledger policy is kept (else 20)')
     ro.add_argument('--margin', type=int, default=None); ro.add_argument('--standbys', type=int, default=None)
     ro.add_argument('--previous-host', help='SSH target of the previous holder: the supersession is delivered to it before any proof is made')
+    ro.add_argument('--barrier-not-before', type=int, default=None,
+                    help='the barrier the ledger cannot carry (its proof for the current epoch is missing): the earliest unix time the new holder may publish')
     ro.add_argument('--follow-mandate-not-after', type=int, default=None,
                     help='the not_after of a follow mandate the previous holder may renew under that the ledger does not record (0: none stands)')
     c = sub.add_parser('cycle'); c.add_argument('--universe', required=True); c.add_argument('--active', required=True); c.add_argument('--standby', required=True)

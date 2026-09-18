@@ -130,18 +130,22 @@ def current_proof():
     raise SystemExit(f'no current takeover proof at {path}; rotate first')
 
 
-def record_mandate(h, not_after):
-    """The follow mandate issued to a host, recorded in the resource's ledger (the one
-    tools/ha-standby.py keeps, no secret in it) BEFORE it is installed, so that the ledger never
-    knows less than the hosts: a rotation to another holder that cannot reach this one computes its
-    barrier from it, since this host may renew its own lease by itself until not_after."""
-    path = pathlib.Path(LEDGER) / f'{LOGICAL}.json'
-    ledger = json.loads(path.read_text()) if path.is_file() else {'universe': LOGICAL, 'cycles': [], 'rotations': []}
-    ledger.setdefault('follow_mandates', {})[h.identity] = {'host': h.role, 'not_after': not_after, 'renew': 1, 'renew_below': RENEW_BELOW,
-                                                            'issued_at': int(time.time()), 'reference': REFERENCE}
-    tmp = path.with_suffix('.json.partial')
-    tmp.write_text(json.dumps(ledger, indent=2, sort_keys=True))
-    os.replace(tmp, path)
+def ha_tool():
+    """tools/ha-standby.py as a module, for its ledger helpers (the same ledger, the same lock)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('ha_standby', TOOL)
+    ha = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ha)
+    os.environ['PODMESH_HA_LEDGER'] = LEDGER
+    return ha
+
+
+def record_mandate(h, not_after, confirmed):
+    """The follow mandate issued to a host, recorded in the resource's ledger under its lock (no secret
+    in it): before it is installed, keeping the larger of the previous and the new not_after, and again
+    once the host's copy is read back. A rotation to another holder that cannot reach this one computes
+    its barrier from it, since this host may renew its own lease by itself until not_after."""
+    return ha_tool().record_follow_mandate(LOGICAL, h.identity, h.role, not_after, RENEW_BELOW, REFERENCE, confirmed)
 
 
 def install_follow(h, cli, proof):
@@ -152,10 +156,13 @@ def install_follow(h, cli, proof):
     # every tick. An unbounded renewal would make the holder's lease immortal, and lease expiry
     # is what withdraws an active manager nobody can reach (docs/PUBLISHER-FOLLOW-LAB.md).
     not_after = int(time.time()) + MANDATE_SECONDS
-    record_mandate(h, not_after)
+    record_mandate(h, not_after, confirmed=False)
     mandate = (f'authorization_ref={REFERENCE}\nresource={LOGICAL}\nproof={PROOF_REMOTE}\nrenew=1\n'
                f'not_after={not_after}\nrenew_below={RENEW_BELOW}\n')
     h.ssh(f'sudo -n install -m 0600 /dev/stdin {MANDATE_REMOTE}', input_bytes=mandate.encode())
+    # Confirmed only on the host's own copy: until then the ledger keeps what the host may still hold.
+    if h.ssh(f'sudo -n cat {MANDATE_REMOTE}').stdout.decode() == mandate:
+        record_mandate(h, not_after, confirmed=True)
     h.ssh(f'sudo -n systemctl stop {TIMER}.timer {TIMER}.service 2>/dev/null; sudo -n systemctl reset-failed {TIMER}.timer {TIMER}.service 2>/dev/null', check=False)
     h.ssh(
         f'sudo -n systemd-run --quiet --unit={TIMER} --on-active=2 --on-unit-active=10 --timer-property=AccuracySec=1s '
