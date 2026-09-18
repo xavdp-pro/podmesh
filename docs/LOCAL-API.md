@@ -441,18 +441,32 @@ signer that promises once per resource and epoch keep two decisions apart. A 2-o
   recovery point, a restore or a clone of the replica carries neither the key nor a new identity for it; the
   policy carries only the public half. Replacing a host's key is a change of the authority set (below).
 - **The policy digest.** SHA-256, lowercase hex, of the canonical JSON (keys sorted, compact, no floating-point
-  number) of `{"form": "podmesh-authority-quorum/1", "authority_id", "single_key", "threshold", "keys"}`, the keys
-  in `key_id` order, so the order they were declared in does not matter. `activation_status` reports it as
-  `authority_policy_digest` for every keyed policy, with `authority_quorum` under a quorum. The resource is not in
-  it (one quorum may govern many resources); every certificate binds the resource separately.
+  number) of `{"form": "podmesh-authority-quorum/1", "authority_id", "single_key", "serial", "threshold", "keys"}`,
+  the keys in `key_id` order, so the order they were declared in does not matter. `activation_status` reports it
+  as `authority_policy_digest` for every keyed policy, with `authority_serial`, and `authority_quorum` under a
+  quorum. The resource is not in it (one quorum may govern many resources); every certificate binds the resource
+  separately.
+- **The serial.** The authority set carries a monotonic serial, and the digest covers it: the same keys at
+  another serial are another policy. A policy declared before the field existed, single key included, is at
+  serial 0. The serial never decreases, and rises by exactly one at every change from one authority set to
+  another, whoever authorised it — the operator's re-declaration too, and a change between single keys. A
+  declaration that leaves the set as it is keeps it (stating another `authority_serial` then is refused). The
+  first authority set of a host (none before) takes the serial the operator states in `authority_serial`, never
+  below the one stored, the stored one by default: a host joining late is declared at the serial its peers
+  reached, and shares their digest and therefore their certificates. A stated serial that skips or repeats is
+  refused.
 - **The certificate.** One document, `kind` `podmesh-takeover-proof/quorum-ed25519`, and `signatures`, a list of
   `{"key_id", "signature"}` (64 bytes, 128 lowercase hex characters), each over the same bytes: the canonical form
   of the document without `signatures`. The payload binds `authority_id`, `policy_digest`, `resource`, `new_epoch`
   and `previous_epoch` (exactly one before), `new_holder` and `previous_holder` (null for a first epoch),
-  `holder_boot_id` (the new holder's `boot_id`: a rebooted host must be decided for again), `grant_id`, `method`
+  `holder_boot_id` (the new holder's `boot_id`), `grant_id`, `method`
   (`first`, `same_holder`, `fence_receipt` with its `receipt`, `lease_barrier`), `eligible_after`, `issued_at` and
   `expires_at`; any other field it carries is covered by the signatures too. A certificate made under another
   policy names another digest and is refused, so it cannot be replayed across policies, nor across resources.
+  **The holder's boot is intended:** a certificate entitles one boot of its holder. After the holder's host
+  reboots, the majority decides again and issues a new certificate for the new boot — the rule V3-1 already
+  applies to the same-epoch resume (`boot_changed`) and the permit to its `instance_id`. A candidate therefore
+  names its `boot_id` in what it proposes.
 - **Counting.** Checked in this order, each refusal named in the error as `certificate refused (<code>)`: the kind
   (`certificate_kind`); no single-key `signer` or `signature` beside `signatures` (`mixed_forms`); the authority
   (`authority_mismatch`); the digest (`policy_mismatch`); every bound field present with its type, no
@@ -465,7 +479,10 @@ signer that promises once per resource and epoch keep two decisions apart. A 2-o
 - **Where it is required.** Under a quorum, `activation_acquire` takes `certificate` and no `permit`: verified,
   bound to this universe, this host, this boot, live on this host's clock (issued no more than 30 seconds ahead,
   not expired), its `eligible_after` passed, its method's binding holding; the grant it carries then goes through
-  every check a permit goes through (the screen, one grant per epoch, a takeover needing a newer epoch).
+  every check a permit goes through (the screen, one grant per epoch, a takeover needing a newer epoch). **The
+  barrier is intended on this path:** a certificate's `eligible_after` holds the acquisition itself until then, on
+  this host's clock, whatever the method — not only the connector's start, as for the gate's documents. A permit
+  carries no barrier and keeps none.
   `activation_supersede` takes a certificate naming any holder; its signatures and epoch are checked, not its
   life, since learning one is overtaken can only stop things — and under a quorum a forged higher epoch can no
   longer stop anything either. `publisher_start` takes the certificate as its `takeover_proof`, bound in addition
@@ -480,11 +497,15 @@ signer that promises once per resource and epoch keep two decisions apart. A 2-o
 - **Changing the authority set.** When the policy in place or the one declared is a quorum, a change of the
   authority set (its digest) is accepted only with one of: `policy_change_certificate`, a certificate of kind
   `podmesh-policy-change/quorum-ed25519` from the policy **in place** (its keys, its threshold, its digest as
-  `policy_digest`) binding `resource`, `new_policy_digest`, `issued_at` and `expires_at`, live, and never applied
-  on this host before; or `replaces_policy_digest`, the operator's explicit re-declaration, naming the digest it
-  replaces, which must still be current (a stale one is refused). Dropping the quorum is the operator's only. The
-  first authority set of a universe replaces nothing; a declaration that leaves the set as it is needs neither; a
-  change between single keys, or from none, keeps today's behaviour. Each change is recorded in
+  `policy_digest`) binding `resource`, `from_serial` (this host's serial now), `new_serial` (one more),
+  `new_policy_digest` (the new set's digest at that serial), `issued_at` and `expires_at`, live; or
+  `replaces_policy_digest`, the operator's explicit re-declaration, naming the digest it replaces, which must
+  still be current (a stale one is refused). Because the digest in place covers the serial, a live certificate
+  cannot be replayed on a host that has moved on since, even one that never applied it: that host's serial,
+  and so its digest, is no longer the one the certificate names. Dropping the quorum is the operator's only.
+  The first authority set of a universe replaces nothing; a declaration that leaves the set as it is needs
+  neither; a change between single keys, or from none, keeps today's behaviour (the serial still moves). Each
+  change is recorded in
   `activation_policy_changes` (from, to, how, the certificate's payload digest, the `authorization_ref`).
 - **What it does not prove.** That two certificates cannot exist for one epoch: that is the signers' promise (one
   per resource and epoch, durably, even across a restored store), which the node cannot see. Renewal

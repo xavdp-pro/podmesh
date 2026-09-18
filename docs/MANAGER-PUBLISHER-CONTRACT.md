@@ -94,7 +94,7 @@ with it (`UNIVERSE-NETWORK-CONTRACT.md`, "Failure and cleanup states"), all with
   recorded beside it and decides nothing.
   **Same-epoch resume (V3-1).** A proof that verifies is recorded with the lease incarnation it was
   verified against (epoch, generation, `acquired_at`), this host's boot, and the policy's authority,
-  key and quorum. A later start without a proof, or with one refused (expired, say), resumes under that
+  key and quorum, and its digest (serial included), which a certificate's resume must still match. A later start without a proof, or with one refused (expired, say), resumes under that
   record — method `resume_same_epoch`, journaled as the event `takeover_resumed` with the original
   proof's identity (the verifying operation, its method, issue, expiry and signature) — only while
   every one of these holds, and is refused naming the first that does not: the lease is held
@@ -425,3 +425,20 @@ moving only on a verified certificate, over a seeded sequence of 400 mixed attem
 set changing only under a certificate of the policy in place or the operator's re-declaration naming
 its digest. What it does not do yet: produce certificates (the manager's promise rule, signed votes
 and resident operations are the next lots), extend a lease by majority, or run on a laboratory host.
+
+**2026-09-18, V3-2's decisions, taken for the operator:**
+- **Changes between single keys keep today's behaviour.** Moving a policy from one single
+  `authority_key` to another, or from no key to one, needs no certificate and no named digest, so
+  that the tools deployed today keep working. It is recorded (`activation_policy_changes`,
+  `redeclared_single_key`) and moves the serial. **V3-10, retiring the gate, closes it:** once no
+  resource is under a single key, every change of an authority set is a change to or from a quorum.
+- **The holder's boot in every certificate is intended.** A certificate entitles one boot of its
+  holder; after a reboot the majority decides again (the V3-1 rule, `boot_changed`).
+- **A strict majority at declaration.** A threshold with 2k <= n is refused.
+- **A monotonic policy serial.** The authority set carries a serial its digest covers; a
+  policy-change certificate binds `from_serial` (the current one) and `new_serial` (one more), and
+  the operator's re-declaration moves it too. A live change can no longer be replayed on a host that
+  has moved on since, whether or not it ever applied it. Existing policies start at 0. A host joining
+  late is declared at its peers' serial (`authority_serial`) so that it shares their digest.
+- **The barrier on the certificate path is kept:** a certificate's `eligible_after` holds the
+  acquisition itself, whatever the method.
