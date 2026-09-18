@@ -253,6 +253,9 @@ impl Quorum {
     /// The 1-of-1 quorum of a policy that names a single `authority_key`: the migration's starting point.
     pub fn single(authority_id: &str, key_hex: &str) -> Result<Quorum, Error> {
         let key = verifying_key(key_hex)?;
+        if key.is_weak() {
+            return Err("authority_key: a public key of small order is refused: anyone can sign for it".into());
+        }
         Ok(Quorum {
             authority_id: authority_id.to_string(),
             threshold: 1,
@@ -785,6 +788,9 @@ mod quorum_tests {
         assert!(refused(policy(2, &[(&"a".repeat(33), 1), ABC[1], ABC[2]])).contains("key_id must be"));
         let weak = json!({"threshold": 1, "keys": [{"key_id": "weak", "public_key": "00".repeat(32)}]});
         assert!(refused(weak).contains("small order"));
+        // The single key of today's policies is held to the same refusal (contre-regard of V3-2).
+        let single_weak = Quorum::single("lab-gate", &"00".repeat(32)).err().expect("a small-order single key is refused");
+        assert!(single_weak.to_string().contains("small order"));
         let off = json!({"threshold": 1, "keys": [{"key_id": "off", "public_key": format!("02{}", "00".repeat(31))}]});
         assert!(refused(off).contains("not a valid Ed25519 public key"));
         let mut extra = policy(2, ABC);
