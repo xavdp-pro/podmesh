@@ -96,6 +96,16 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             operation_id TEXT NOT NULL,
             PRIMARY KEY(resource, epoch));",
     )?;
+    // The quorum a proof was verified under (V3-2). A row written before the field existed was verified
+    // under a single key or none, which is what the empty default says.
+    let present: bool = db.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('publisher_takeover_verified') WHERE name='authority_quorum'",
+        [],
+        |r| Ok(r.get::<_, i64>(0)? > 0),
+    )?;
+    if !present {
+        db.execute_batch("ALTER TABLE publisher_takeover_verified ADD COLUMN authority_quorum TEXT NOT NULL DEFAULT '';")?;
+    }
     Ok(())
 }
 
@@ -167,6 +177,12 @@ fn wait_registered(resource: &str, seconds: u64) -> Result<String, Error> {
 /// authority and verified here when the policy names its key (`src/signing.rs`); a laboratory
 /// proof, unsigned and labelled so, only under a policy that names none. The agent's
 /// `previous` narrative is kept beside it and decides nothing.
+///
+/// Under a quorum (V3-2) the proof is a certificate (`podmesh-takeover-proof/quorum-ed25519`): k
+/// distinct keys of the policy's quorum signed it under the policy's digest, and it is bound, beyond
+/// what every proof binds, to this boot of the new holder and to the grant the lease was acquired
+/// under. A single-key policy accepts such a certificate too, under its 1-of-1 digest, beside its own
+/// signed kind.
 fn verify_takeover_proof(db: &Connection, resource: &str, proof: &Value, epoch: i64, this_host: &str) -> Result<Value, Error> {
     let now = crate::now() as i64;
     let policy = crate::activation::policy(db, resource)?.ok_or("no activation policy")?;
@@ -175,14 +191,34 @@ fn verify_takeover_proof(db: &Connection, resource: &str, proof: &Value, epoch: 
     // must be the signed kind and its signature must verify over its canonical form (altered,
     // unknown-key and unsigned documents are refused here, before any field is read); under a
     // policy without a key, only the laboratory kind is accepted, on its binding alone.
-    let signed = !policy.authority_key.is_empty();
+    let authority = policy.authority()?;
+    let signed = authority.is_some();
     let kind = text("kind")?;
-    let origin = if signed {
-        if kind != crate::signing::SIGNED_PROOF_KIND {
-            return Err(format!("takeover_proof is {kind}; this resource's policy names the authority's key and requires {}", crate::signing::SIGNED_PROOF_KIND).into());
+    let mut signers = None;
+    let origin = if let Some(quorum) = authority.as_ref() {
+        let certificate = kind == crate::signing::QUORUM_PROOF_KIND;
+        if quorum.single_key && kind != crate::signing::SIGNED_PROOF_KIND && !certificate {
+            return Err(format!("takeover_proof is {kind}; this resource's policy names the authority's key and requires {} (or a certificate, {}, under its 1-of-1 digest)",
+                               crate::signing::SIGNED_PROOF_KIND, crate::signing::QUORUM_PROOF_KIND).into());
         }
-        crate::signing::verify(proof, &policy.authority_key).map_err(|e| format!("takeover_proof: {e}"))?;
-        "signed by the authority's key named in the policy; the signature verified over the document's canonical form"
+        if !quorum.single_key && !certificate {
+            return Err(format!("takeover_proof is {kind}; this resource's policy names a quorum of {} keys and requires {}", quorum.keys.len(), crate::signing::QUORUM_PROOF_KIND).into());
+        }
+        let who = crate::signing::verify_takeover(proof, quorum).map_err(|e| format!("takeover_proof: {e}"))?;
+        if certificate {
+            // What a certificate binds beyond the gate's document: the holder's boot and the grant.
+            if text("holder_boot_id")? != crate::activation::boot_id()? {
+                return Err("takeover_proof is bound to another boot of this host; a rebooted host must be decided for again".into());
+            }
+            let grant = crate::activation::lease(db, resource)?.map(|l| l.grant_id).unwrap_or_default();
+            if text("grant_id")? != grant {
+                return Err(format!("takeover_proof is for grant {}, this host's lease was acquired under grant {grant}", text("grant_id")?).into());
+            }
+            signers = Some(json!({"signers": who, "threshold": quorum.threshold, "keys": quorum.keys.len(), "policy_digest": quorum.digest()}));
+            "a certificate: the threshold's number of distinct keys of the policy's quorum signed its canonical form under the policy's digest"
+        } else {
+            "signed by the authority's key named in the policy; the signature verified over the document's canonical form"
+        }
     } else {
         if kind != crate::signing::UNSIGNED_PROOF_KIND {
             return Err(format!("takeover_proof is {kind}; this resource's policy names no authority key, and only a laboratory proof is accepted without one").into());
@@ -225,38 +261,13 @@ fn verify_takeover_proof(db: &Connection, resource: &str, proof: &Value, epoch: 
         }
     }
     let previous_holder = proof["previous_holder"].as_str();
-    match text("method")?.as_str() {
-        "first" => {
-            if previous_epoch != 0 || previous_holder.is_some() {
-                return Err("takeover_proof says first, but a previous epoch or holder exists".into());
-            }
-        }
-        "same_holder" => {
-            if previous_holder != Some(this_host) {
-                return Err("takeover_proof says same_holder, but the previous holder is not this host".into());
-            }
-        }
-        "fence_receipt" => {
-            let receipt = &proof["receipt"];
-            let host = receipt["host"].as_str().ok_or("the fence receipt names no host")?;
-            if Some(host) != previous_holder {
-                return Err("the fence receipt is from a host that is not the previous holder".into());
-            }
-            if receipt["withdrawn"] != json!(true) || receipt["operation_id"].as_str().is_none() {
-                return Err("the fence receipt does not record a verified withdrawal".into());
-            }
-            if receipt["resource"].as_str() != Some(resource) {
-                return Err("the fence receipt is for another resource".into());
-            }
-        }
-        "lease_barrier" => {
-            // Held above like every method; a lease barrier without one is not a barrier.
-            proof["eligible_after"].as_i64().ok_or("takeover_proof lacks eligible_after")?;
-        }
-        other => return Err(format!("takeover_proof method {other} is unknown").into()),
+    crate::activation::takeover_method(proof, resource, this_host, previous_epoch, "takeover_proof")?;
+    let mut verified = json!({"method": proof["method"], "previous_epoch": previous_epoch, "new_epoch": new_epoch, "previous_holder": previous_holder,
+              "verified_at": now, "signed": signed, "note": origin});
+    if let Some(q) = signers {
+        verified["quorum"] = q;
     }
-    Ok(json!({"method": proof["method"], "previous_epoch": previous_epoch, "new_epoch": new_epoch, "previous_holder": previous_holder,
-              "verified_at": now, "signed": signed, "note": origin}))
+    Ok(verified)
 }
 
 /// A takeover proof this host verified, with the lease and the boot it was verified under: what a
@@ -269,6 +280,8 @@ pub(crate) struct Verified {
     boot_id: String,
     authority_id: String,
     authority_key: String,
+    /// The policy's quorum when the proof was verified (V3-2); empty for a single key or none.
+    authority_quorum: String,
     proof: Value,
     verified: Value,
     verified_at: i64,
@@ -281,12 +294,13 @@ pub(crate) struct Verified {
 #[allow(clippy::too_many_arguments)]
 fn record_verified(db: &Connection, resource: &str, l: &crate::activation::Lease, boot: &str, policy: &crate::activation::Policy, proof: &Value, verified: &Value, id: &str) -> Result<(), Error> {
     db.execute(
-        "INSERT INTO publisher_takeover_verified VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+        "INSERT INTO publisher_takeover_verified(resource,epoch,generation,acquired_at,boot_id,authority_id,authority_key,proof,verified,
+           verified_at,operation_id,authority_quorum) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
          ON CONFLICT(resource,epoch) DO UPDATE SET generation=excluded.generation, acquired_at=excluded.acquired_at, boot_id=excluded.boot_id,
            authority_id=excluded.authority_id, authority_key=excluded.authority_key, proof=excluded.proof, verified=excluded.verified,
-           verified_at=excluded.verified_at, operation_id=excluded.operation_id",
+           verified_at=excluded.verified_at, operation_id=excluded.operation_id, authority_quorum=excluded.authority_quorum",
         params![resource, l.epoch, l.generation, l.acquired_at, boot, policy.authority_id, policy.authority_key, proof.to_string(), verified.to_string(),
-                crate::now() as i64, id],
+                crate::now() as i64, id, policy.authority_quorum],
     )?;
     Ok(())
 }
@@ -295,13 +309,14 @@ fn record_verified(db: &Connection, resource: &str, l: &crate::activation::Lease
 fn last_verified(db: &Connection, resource: &str) -> Result<Option<Verified>, Error> {
     Ok(db
         .query_row(
-            "SELECT epoch,generation,acquired_at,boot_id,authority_id,authority_key,proof,verified,verified_at,operation_id
+            "SELECT epoch,generation,acquired_at,boot_id,authority_id,authority_key,proof,verified,verified_at,operation_id,authority_quorum
              FROM publisher_takeover_verified WHERE resource=?1 ORDER BY epoch DESC LIMIT 1",
             [resource],
             |r| {
                 let json = |s: String| serde_json::from_str::<Value>(&s).unwrap_or(Value::Null);
                 Ok(Verified { epoch: r.get(0)?, generation: r.get(1)?, acquired_at: r.get(2)?, boot_id: r.get(3)?, authority_id: r.get(4)?,
-                              authority_key: r.get(5)?, proof: json(r.get(6)?), verified: json(r.get(7)?), verified_at: r.get(8)?, operation_id: r.get(9)? })
+                              authority_key: r.get(5)?, proof: json(r.get(6)?), verified: json(r.get(7)?), verified_at: r.get(8)?, operation_id: r.get(9)?,
+                              authority_quorum: r.get(10)? })
             },
         )
         .optional()?)
@@ -316,8 +331,8 @@ pub(crate) struct ResumeFacts {
     now: i64,
     superseded_by: Option<i64>,
     boot_id: String,
-    /// The resource's policy now: its authority and that authority's key.
-    authority: Option<(String, String)>,
+    /// The resource's policy now: its authority, that authority's key, and its quorum.
+    authority: Option<(String, String, String)>,
 }
 
 fn resume_facts(db: &Connection, resource: &str, this_host: &str, boot: &str) -> Result<ResumeFacts, Error> {
@@ -330,7 +345,7 @@ fn resume_facts(db: &Connection, resource: &str, this_host: &str, boot: &str) ->
         now: crate::now() as i64,
         superseded_by,
         boot_id: boot.into(),
-        authority: crate::activation::policy(db, resource)?.map(|p| (p.authority_id, p.authority_key)),
+        authority: crate::activation::policy(db, resource)?.map(|p| (p.authority_id, p.authority_key, p.authority_quorum)),
     })
 }
 
@@ -380,11 +395,12 @@ fn resume_refusal(f: &ResumeFacts) -> Result<&Verified, (&'static str, String)> 
     if r.boot_id != f.boot_id {
         return Err(("boot_changed", "the proof was verified during another boot of this host; after a boot the entitlement is decided again".into()));
     }
-    // Same authority and key: the proof's origin was checked under the policy as it stood; a policy
-    // naming another authority or another key would have refused that very document.
+    // Same authority, key and quorum: the proof's origin was checked under the policy as it stood; a
+    // policy naming another authority, another key or another quorum would have refused that very
+    // document (a certificate names its policy's digest).
     match &f.authority {
-        Some((id, key)) if *id == r.authority_id && *key == r.authority_key => {}
-        _ => return Err(("authority_changed", "the resource's policy no longer names the authority and key the proof was verified under".into())),
+        Some((id, key, quorum)) if *id == r.authority_id && *key == r.authority_key && *quorum == r.authority_quorum => {}
+        _ => return Err(("authority_changed", "the resource's policy no longer names the authority, key and quorum the proof was verified under".into())),
     }
     Ok(r)
 }
@@ -1607,5 +1623,108 @@ mod review_regressions {
         start(&db, Some(proof(157, "same_holder")), 157).unwrap();
         assert!(last_verified(&db, R).unwrap().is_some());
         assert_eq!(code(&db), "resumes");
+    }
+}
+
+#[cfg(test)]
+mod quorum_proofs {
+    //! V3-2 at `publisher_start`: the takeover proof as a quorum certificate, and the gate's signed
+    //! document still accepted, byte for byte, under a single-key policy.
+    use super::*;
+    use crate::signing::testkit::{self, public, sign};
+    const R: &str = "91eeb6bf-5489-405b-b77a-53105b0aff7a";
+    const HOST: &str = "5d1c0b8e-3f59-4d0e-9d7a-2a1e7c4b9f10";
+    const ABC: &[(&str, u8)] = &[("replica-a", 1), ("replica-b", 2), ("replica-c", 3)];
+
+    fn next() -> u64 { use std::sync::atomic::{AtomicU64, Ordering}; static N: AtomicU64 = AtomicU64::new(1); N.fetch_add(1, Ordering::SeqCst) }
+    fn db() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
+        db.execute("INSERT INTO metadata VALUES('host_uuid',?1)", [HOST]).unwrap();
+        lc::ensure_schema(&db).unwrap();
+        crate::network::ensure_schema(&db).unwrap();
+        crate::activation::ensure_schema(&db).unwrap();
+        ensure_schema(&db).unwrap();
+        db
+    }
+    fn act(db: &Connection, op: &str, extra: Value) -> Result<Value, String> {
+        let mut r = json!({"operation": op, "universe_uuid": R, "operation_id": format!("qp-{}", next()), "authorization_ref": "probe"});
+        for (k, v) in extra.as_object().unwrap() { r[k] = v.clone(); }
+        crate::activation::execute(db, &r).map_err(|e| e.to_string())
+    }
+    fn boot() -> String { crate::activation::boot_id().unwrap() }
+    fn start(db: &Connection, proof: &Value, epoch: i64) -> Result<Value, String> {
+        takeover(db, R, &json!({"takeover_proof": proof}), epoch, HOST, &boot(), &format!("qp-{}", next())).map_err(|e| e.to_string())
+    }
+    fn digest(db: &Connection) -> String {
+        crate::activation::policy(db, R).unwrap().unwrap().authority_digest().unwrap().unwrap()
+    }
+    fn certificate(db: &Connection, epoch: i64, signers: &[(&str, u8)]) -> Value {
+        sign(&testkit::takeover("replicas", &digest(db), R, epoch, HOST, &boot()), signers)
+    }
+
+    /// Proves: under a quorum, the connector starts on a certificate k of the keys signed -- the same
+    /// document the lease was acquired under -- and the answer names who signed; one replica's
+    /// certificate, the gate's single-key document, a certificate for another grant at this epoch or
+    /// for another boot are each refused; after the quorum is replaced, the resume under the recorded
+    /// certificate is refused (`authority_changed`).
+    #[test]
+    fn under_a_quorum_the_takeover_proof_is_a_certificate() {
+        let db = db();
+        act(&db, "activation_require", json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "replicas", "authority_quorum": testkit::policy(2, ABC)})).unwrap();
+        let decided = certificate(&db, 157, &ABC[..2]);
+        act(&db, "activation_acquire", json!({"certificate": decided})).unwrap();
+        let e = start(&db, &certificate(&db, 157, &ABC[2..]), 157).unwrap_err();
+        assert!(e.contains("(below_threshold)") && e.contains("(no_verified_proof)"), "{e}");
+        let mut single = testkit::takeover("replicas", &digest(&db), R, 157, HOST, &boot());
+        single["kind"] = json!(crate::signing::SIGNED_PROOF_KIND);
+        let e = start(&db, &single, 157).unwrap_err();
+        assert!(e.contains("names a quorum of 3 keys and requires podmesh-takeover-proof/quorum-ed25519"), "{e}");
+        let mut regranted = testkit::takeover("replicas", &digest(&db), R, 157, HOST, &boot());
+        regranted["grant_id"] = json!("another-grant");
+        let e = start(&db, &sign(&regranted, &ABC[1..]), 157).unwrap_err();
+        assert!(e.contains("for grant another-grant, this host's lease was acquired under grant g157"), "{e}");
+        let mut rebooted = testkit::takeover("replicas", &digest(&db), R, 157, HOST, "00000000-0000-4000-8000-0000000000bb");
+        rebooted["grant_id"] = json!("g157");
+        let e = start(&db, &sign(&rebooted, &ABC[1..]), 157).unwrap_err();
+        assert!(e.contains("another boot of this host"), "{e}");
+        let v = start(&db, &certificate(&db, 157, &[ABC[2], ABC[0]]), 157).unwrap();
+        assert_eq!((v["method"].clone(), v["signed"].clone()), (json!("lease_barrier"), json!(true)));
+        assert_eq!(v["quorum"]["signers"], json!(["replica-c", "replica-a"]));
+        assert_eq!((v["quorum"]["threshold"].clone(), v["quorum"]["keys"].clone()), (json!(2), json!(3)));
+        let boot = boot();
+        assert!(resume_refusal(&resume_facts(&db, R, HOST, &boot).unwrap()).is_ok());
+        let mut replaced = json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "replicas",
+                                  "authority_quorum": testkit::policy(2, &[ABC[0], ABC[1], ("replica-d", 4)])});
+        replaced["replaces_policy_digest"] = json!(digest(&db));
+        act(&db, "activation_require", replaced).unwrap();
+        assert!(matches!(resume_refusal(&resume_facts(&db, R, HOST, &boot).unwrap()), Err(("authority_changed", _))));
+    }
+
+    /// Proves: nothing deployed changes. Under the gate's single key, the document `tools/ha-standby.py`
+    /// signs today (the vector of `signing::quorum_tests`) starts the connector through the unchanged
+    /// path, and its verified answer carries exactly the fields it carried before V3-2 (no `quorum`); a
+    /// certificate under the key's 1-of-1 digest is accepted beside it.
+    #[test]
+    fn under_the_single_key_todays_signed_document_is_accepted_unchanged() {
+        let db = db();
+        act(&db, "activation_require", json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "lab-gate", "authority_key": public(42)})).unwrap();
+        let permit = json!({"authority_id": "lab-gate", "resource": R, "epoch": 158, "replica_id": HOST, "instance_id": boot(), "grant_id": "g158"});
+        act(&db, "activation_acquire", json!({"permit": permit})).unwrap();
+        let tool_signed: Value = serde_json::from_str(r#"{"kind": "podmesh-takeover-proof/ed25519", "authority_id": "lab-gate", "resource": "91eeb6bf-5489-405b-b77a-53105b0aff7a", "new_holder": "5d1c0b8e-3f59-4d0e-9d7a-2a1e7c4b9f10", "previous_holder": "00000000-0000-4000-8000-00000000000b", "new_epoch": 158, "previous_epoch": 157, "method": "lease_barrier", "eligible_after": 1700000600, "issued_at": 1700000000, "expires_at": 4102444800, "barrier_basis": "the previous lease plus the margin — naïve clocks", "signer": "197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61", "note": "signed by the authority: the host verifies the signature under the key its policy names, then the binding", "signature": "9e9e9f25c1ee813e95827a0b81ed4c8bf0c963d80c6e7762958a91d3c4dc731391f82e5d1f4639920b3b2636ba7c1d5f6cac0b89de15a814025cb7b800c3a30e"}"#).unwrap();
+        let v = start(&db, &tool_signed, 158).unwrap();
+        let mut fields: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        fields.sort_unstable();
+        assert_eq!(fields, ["method", "new_epoch", "note", "previous_epoch", "previous_holder", "signed", "verified_at"]);
+        assert_eq!(v["signed"], json!(true));
+        let mut altered = tool_signed.clone();
+        altered["issued_at"] = json!(1_700_000_001);
+        // Refused, and the start falls back to the resume under the document just verified (V3-1).
+        let v = start(&db, &altered, 158).unwrap();
+        assert!(v["method"] == json!("resume_same_epoch") && v["presented_proof_refused"].as_str().unwrap().contains("does not verify"), "{v}");
+        let mut cert = testkit::takeover("lab-gate", &digest(&db), R, 158, HOST, &boot());
+        cert["grant_id"] = json!("g158");
+        let v = start(&db, &sign(&cert, &[(crate::signing::SINGLE_KEY_ID, 42)]), 158).unwrap();
+        assert_eq!(v["quorum"]["signers"], json!([crate::signing::SINGLE_KEY_ID]));
     }
 }

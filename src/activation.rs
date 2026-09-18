@@ -26,6 +26,15 @@
 //! so a permit is provenance from a root-only channel, and the asymmetry is stated: a forged
 //! HIGHER epoch can stop a universe here (availability), never start a second one (safety).
 //!
+//! THE QUORUM (V3-2). A policy may instead name its authority as a quorum of replica keys
+//! (`authority_quorum`, `signing::Quorum`). Every grant is then a certificate that a strict majority
+//! of those keys signed under the policy's digest, verified here with no network: acquisition,
+//! supersession and the takeover proof all take one, and no permit is accepted, so the durable
+//! screen moves forward on certificates only and never backwards. What the node still cannot see
+//! is whether the signers kept their promise of one decision per epoch; that is the manager's.
+//! The authority set itself changes only under a certificate of the set in place or the operator's
+//! explicit re-declaration naming the digest it replaces (`authority_change`).
+//!
 //! The takeover margin is what keeps two honest hosts apart. A different holder may acquire
 //! only after the previous lease's expiry PLUS the margin, so the window in which the previous
 //! holder still believes it is entitled and the window in which the new one starts cannot
@@ -136,6 +145,198 @@ fn screen(db: &Connection, uuid: &str, p: &Permit, id: &str) -> Result<(), Error
     Ok(())
 }
 
+/// The binding of a takeover document's method, whatever its form (the gate's document at
+/// `publisher_start`, a quorum certificate at acquisition): `first` (no previous epoch or holder),
+/// `same_holder` (this host held the previous epoch), `fence_receipt` (the previous holder's fence,
+/// its receipt bound to this resource) or `lease_barrier` (an `eligible_after` is named). `name` is
+/// what the refusal calls the document.
+pub(crate) fn takeover_method(proof: &serde_json::Value, resource: &str, this_host: &str, previous_epoch: i64, name: &str) -> Result<(), Error> {
+    let previous_holder = proof["previous_holder"].as_str();
+    match proof["method"].as_str().ok_or_else(|| format!("{name} lacks method"))? {
+        "first" => {
+            if previous_epoch != 0 || previous_holder.is_some() {
+                return Err(format!("{name} says first, but a previous epoch or holder exists").into());
+            }
+        }
+        "same_holder" => {
+            if previous_holder != Some(this_host) {
+                return Err(format!("{name} says same_holder, but the previous holder is not this host").into());
+            }
+        }
+        "fence_receipt" => {
+            let receipt = &proof["receipt"];
+            let host = receipt["host"].as_str().ok_or("the fence receipt names no host")?;
+            if Some(host) != previous_holder {
+                return Err("the fence receipt is from a host that is not the previous holder".into());
+            }
+            if receipt["withdrawn"] != serde_json::json!(true) || receipt["operation_id"].as_str().is_none() {
+                return Err("the fence receipt does not record a verified withdrawal".into());
+            }
+            if receipt["resource"].as_str() != Some(resource) {
+                return Err("the fence receipt is for another resource".into());
+            }
+        }
+        "lease_barrier" => {
+            // Held by the caller like every method; a lease barrier without one is not a barrier.
+            proof["eligible_after"].as_i64().ok_or_else(|| format!("{name} lacks eligible_after"))?;
+        }
+        other => return Err(format!("{name} method {other} is unknown").into()),
+    }
+    Ok(())
+}
+
+/// What a quorum certificate decides, as the grant the screen and the lease record (V3-2). Its origin
+/// first -- k distinct keys of the policy's quorum signed this very payload, under this very policy
+/// (`signing::Quorum::verify`, each refusal named) -- then its binding: this universe, an epoch that
+/// follows the previous one it names, a grant. With `holder` (this host and this boot, at acquisition)
+/// also: the new holder is this host in this boot, the certificate is live on this clock and its barrier
+/// has passed, and its method binds. Without it (a supersession, delivered to any host), only origin and
+/// epoch matter: learning that one is overtaken can stop things here, never start them, so an expired
+/// certificate still teaches it.
+fn certificate_grant(policy: &Policy, uuid: &str, document: &serde_json::Value, holder: Option<(&str, &str)>, now: i64) -> Result<Permit, Error> {
+    let quorum = policy.authority()?.ok_or("This universe's policy names no key; a certificate here would be checked against nothing")?;
+    quorum.verify(document, crate::signing::QUORUM_PROOF_KIND, crate::signing::TAKEOVER_FIELDS)?;
+    let text = |f: &str| document[f].as_str().unwrap_or_default().to_string();
+    let int = |f: &str| document[f].as_i64().unwrap_or_default();
+    if text("resource") != uuid {
+        return Err("The certificate is for a different resource than this universe".into());
+    }
+    let epoch = int("new_epoch");
+    if !(1..=MAX_EPOCH).contains(&epoch) {
+        return Err(format!("certificate.new_epoch must be from 1 to {MAX_EPOCH}").into());
+    }
+    let previous_epoch = int("previous_epoch");
+    if previous_epoch != epoch - 1 {
+        return Err(format!("The certificate names previous epoch {previous_epoch}, not the one before {epoch}").into());
+    }
+    for field in ["new_holder", "holder_boot_id", "grant_id"] {
+        identifier(&text(field), &format!("certificate.{field}"))?;
+    }
+    if let Some((host, boot)) = holder {
+        if text("new_holder") != host {
+            return Err("The certificate names another host as the new holder".into());
+        }
+        if text("holder_boot_id") != boot {
+            return Err("The certificate is bound to another incarnation of this host; a rebooted host must be decided for again".into());
+        }
+        if int("issued_at") > now + 30 {
+            return Err("The certificate is issued in the future beyond the clock allowance".into());
+        }
+        if int("expires_at") < now {
+            return Err(format!("The certificate expired {} seconds ago", now - int("expires_at")).into());
+        }
+        let eligible = int("eligible_after");
+        if now < eligible {
+            return Err(format!("The certificate's barrier is at {eligible}, {} seconds from now on this clock; refusing before it", eligible - now).into());
+        }
+        takeover_method(document, uuid, host, previous_epoch, "the certificate")?;
+    }
+    Ok(Permit {
+        authority_id: quorum.authority_id,
+        resource: uuid.to_string(),
+        epoch,
+        replica_id: text("new_holder"),
+        instance_id: text("holder_boot_id"),
+        grant_id: text("grant_id"),
+    })
+}
+
+/// The grant a request presents: a quorum certificate (`certificate`) under any keyed policy, or the
+/// gate's permit under a policy that is not a quorum. Under a quorum the screen moves on certificates
+/// only, so a permit is refused there however well formed.
+fn grant_of(request: &serde_json::Value, policy: &Policy, uuid: &str, holder: Option<(&str, &str)>, now: i64) -> Result<Permit, Error> {
+    match (request.get("permit"), request.get("certificate")) {
+        (Some(_), Some(_)) => Err("A request presents a permit or a certificate, not both".into()),
+        (_, Some(c)) => certificate_grant(policy, uuid, c, holder, now),
+        (_, None) if policy.quorum_form() => Err(
+            "This universe's authority is a quorum: its epoch moves on a certificate its keys signed (certificate), never on a permit".into(),
+        ),
+        _ => permit(request),
+    }
+}
+
+/// A change of a universe's authority set at `activation_require` (V3-2), and how it was authorised.
+///
+/// When neither the policy in place nor the one declared is a quorum, nothing is required: that is
+/// today's behaviour for a single key or none, kept for the migration, and the change is recorded. When
+/// either is a quorum, a change of the authority set (its digest: form, authority, threshold and keys)
+/// needs one of two things, and nothing else moves it:
+/// - `policy_change_certificate`, a certificate of the policy IN PLACE (k of its keys, or the single
+///   key's 1-of-1) binding this universe and the new policy's digest, live on this clock, and never
+///   applied here before;
+/// - `replaces_policy_digest`, the operator's explicit re-declaration, naming the digest of the policy it
+///   replaces, which must still be the current one: a stale re-declaration is refused, not applied.
+///
+/// The first authority set of a universe replaces nothing and is the operator's declaration. A
+/// declaration that leaves the authority set as it is needs neither and records nothing. The epoch
+/// screen is never touched by any of this: a new policy does not reset what this host has seen.
+fn authority_change(
+    db: &Connection,
+    uuid: &str,
+    request: &serde_json::Value,
+    current: Option<&Policy>,
+    proposed: &Policy,
+    now: i64,
+) -> Result<Option<(String, String, &'static str, String)>, Error> {
+    let from = match current { Some(p) => p.authority_digest()?, None => None };
+    let to = proposed.authority_digest()?;
+    if from == to {
+        return Ok(None);
+    }
+    let (from_text, to_text) = (from.clone().unwrap_or_default(), to.clone().unwrap_or_default());
+    let quorum_involved = proposed.quorum_form() || current.is_some_and(Policy::quorum_form);
+    let Some(from) = from.filter(|_| quorum_involved) else {
+        let how = if from_text.is_empty() { "declared" } else { "redeclared_single_key" };
+        return Ok(Some((from_text, to_text, how, String::new())));
+    };
+    match (request.get("replaces_policy_digest"), request.get("policy_change_certificate")) {
+        (Some(_), Some(_)) => Err("A change of the authority set is authorised by a certificate or by the operator's re-declaration, not both".into()),
+        (Some(named), None) => {
+            if named.as_str() != Some(from.as_str()) {
+                return Err(format!(
+                    "replaces_policy_digest names {named}, but this universe's authority set is {from}: a re-declaration replaces the policy it names, and that one is not current"
+                )
+                .into());
+            }
+            Ok(Some((from_text, to_text, "operator_redeclaration", String::new())))
+        }
+        (None, Some(c)) => {
+            let in_place = current.and_then(|p| p.authority().transpose()).transpose()?.ok_or("no authority in place")?;
+            in_place.verify(c, crate::signing::POLICY_CHANGE_KIND, crate::signing::POLICY_CHANGE_FIELDS)?;
+            if c["resource"].as_str() != Some(uuid) {
+                return Err("The policy change certificate is for a different resource than this universe".into());
+            }
+            if to.is_none() {
+                return Err("A certificate moves an authority set to another one; dropping the key is the operator's re-declaration".into());
+            }
+            if c["new_policy_digest"].as_str() != to.as_deref() {
+                return Err(format!("The policy change certificate moves to {}, not to the policy declared here ({to_text})", c["new_policy_digest"]).into());
+            }
+            if c["issued_at"].as_i64().unwrap_or_default() > now + 30 {
+                return Err("The policy change certificate is issued in the future beyond the clock allowance".into());
+            }
+            let expires = c["expires_at"].as_i64().unwrap_or_default();
+            if expires < now {
+                return Err(format!("The policy change certificate expired {} seconds ago", now - expires).into());
+            }
+            let digest = crate::signing::payload_digest(c)?;
+            let used: i64 = db.query_row(
+                "SELECT COUNT(*) FROM activation_policy_changes WHERE universe_uuid=?1 AND certificate_digest=?2",
+                params![uuid, digest],
+                |r| r.get(0),
+            )?;
+            if used > 0 {
+                return Err("This policy change certificate was already applied here; a change it authorised once is not replayed".into());
+            }
+            Ok(Some((from_text, to_text, "certificate", digest)))
+        }
+        (None, None) => Err(format!(
+            "This universe's authority set is {from}; changing it requires a certificate of that policy (policy_change_certificate) or the operator's explicit re-declaration (replaces_policy_digest: \"{from}\")"
+        )
+        .into()),
+    }
+}
+
 /// What this host has, for a caller deciding where a standby can go.
 ///
 /// PodMesh measured disk and nothing else, so "does this host have room for a standby" could
@@ -198,6 +399,16 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             grant_id TEXT NOT NULL,
             replica_id TEXT NOT NULL,
             seen_at INTEGER NOT NULL,
+            operation_id TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS activation_policy_changes(
+            id INTEGER PRIMARY KEY,
+            universe_uuid TEXT NOT NULL,
+            from_digest TEXT NOT NULL,
+            to_digest TEXT NOT NULL,
+            how TEXT NOT NULL,
+            certificate_digest TEXT NOT NULL,
+            authorization_ref TEXT NOT NULL,
+            at INTEGER NOT NULL,
             operation_id TEXT NOT NULL);",
     )?;
     // A table created by an earlier version lacks the later columns, and CREATE TABLE IF NOT
@@ -209,6 +420,8 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
         ("activation_policy", "authorization_ref TEXT NOT NULL DEFAULT ''"),
         ("activation_policy", "authority_id TEXT NOT NULL DEFAULT ''"),
         ("activation_policy", "authority_key TEXT NOT NULL DEFAULT ''"),
+        // The authority as a quorum (V3-2): the stored `{threshold, keys}`, empty for a single key or none.
+        ("activation_policy", "authority_quorum TEXT NOT NULL DEFAULT ''"),
         ("activation_leases", "epoch INTEGER NOT NULL DEFAULT 0"),
         ("activation_leases", "grant_id TEXT NOT NULL DEFAULT ''"),
         // The boot a history row was written in; NULL for the rows written before the field existed,
@@ -249,18 +462,45 @@ pub struct Policy {
     /// binding alone and labelled so. Named, it makes every takeover document's signature
     /// required and verified here -- PodMesh holds no key of its own.
     pub authority_key: String,
+    /// The authority as a quorum (V3-2): `{threshold, keys}` as stored, empty when the policy names a
+    /// single key or none. Named, every exclusive decision is a certificate k of its n keys signed, and
+    /// the epoch screen moves on certificates only: no permit is accepted.
+    pub authority_quorum: String,
 }
 
 impl Policy {
     pub fn gated(&self) -> bool {
         !self.authority_id.is_empty()
     }
+
+    /// Whether the authority is a declared quorum rather than a single key or none.
+    pub fn quorum_form(&self) -> bool {
+        !self.authority_quorum.is_empty()
+    }
+
+    /// The authority as a quorum: the declared one, or the 1-of-1 of a single key; none without a key.
+    pub fn authority(&self) -> Result<Option<crate::signing::Quorum>, Error> {
+        if self.quorum_form() {
+            let v: serde_json::Value = serde_json::from_str(&self.authority_quorum)?;
+            return Ok(Some(crate::signing::Quorum::declared(&self.authority_id, &v)?));
+        }
+        if !self.authority_key.is_empty() {
+            return Ok(Some(crate::signing::Quorum::single(&self.authority_id, &self.authority_key)?));
+        }
+        Ok(None)
+    }
+
+    /// The digest of the authority set: what a certificate under it names, and what a change of it
+    /// replaces. None for a policy without a key.
+    pub fn authority_digest(&self) -> Result<Option<String>, Error> {
+        Ok(self.authority()?.map(|q| q.digest()))
+    }
 }
 
 pub fn policy(db: &Connection, uuid: &str) -> Result<Option<Policy>, Error> {
     Ok(db
         .query_row(
-            "SELECT lease_seconds,takeover_margin_seconds,desired_standbys,eligible_hosts,authorization_ref,authority_id,authority_key FROM activation_policy WHERE universe_uuid=?1",
+            "SELECT lease_seconds,takeover_margin_seconds,desired_standbys,eligible_hosts,authorization_ref,authority_id,authority_key,authority_quorum FROM activation_policy WHERE universe_uuid=?1",
             [uuid],
             |r| {
                 let hosts: String = r.get(3)?;
@@ -272,6 +512,7 @@ pub fn policy(db: &Connection, uuid: &str) -> Result<Option<Policy>, Error> {
                     authorization_ref: r.get(4)?,
                     authority_id: r.get(5)?,
                     authority_key: r.get(6)?,
+                    authority_quorum: r.get(7)?,
                 })
             },
         )
@@ -426,7 +667,8 @@ fn view(db: &Connection, uuid: &str) -> Result<serde_json::Value, Error> {
     let now = crate::now() as i64;
     let policy = policy(db, uuid)?;
     let held = lease(db, uuid)?;
-    Ok(serde_json::json!({
+    let quorum = policy.as_ref().is_some_and(Policy::quorum_form);
+    let mut v = serde_json::json!({
         "universe_uuid": uuid,
         "this_host_uuid": host_uuid(db)?,
         "requires_lease": policy.is_some(),
@@ -467,7 +709,26 @@ fn view(db: &Connection, uuid: &str) -> Result<serde_json::Value, Error> {
         // Said in every answer, because a caller reading only this object must not mistake a
         // local self-restraint for cross-host exclusion.
         "scope": "this host's journal only; not mutual exclusion across hosts. Under an authority, an epoch screen refuses grants this host has seen superseded; the screen is fed by documents whose origin PodMesh cannot verify",
-    }))
+    });
+    // The authority as a set of keys (V3-2): its digest for every keyed policy, what a certificate names
+    // and a change replaces; and, under a quorum, the keys, the threshold and what that changes.
+    if let Some(p) = policy.as_ref() {
+        v["authority_policy_digest"] = serde_json::json!(p.authority_digest()?);
+    }
+    if quorum {
+        let p = policy.as_ref().ok_or("no policy")?;
+        v["authority_quorum"] = serde_json::from_str(&p.authority_quorum)?;
+        v["takeover_proof_verification"] = serde_json::json!(
+            "a quorum certificate: at least the threshold's number of distinct keys of the policy's quorum signed its canonical form, under this policy's digest; verified here before any binding"
+        );
+        v["permit_verification"] = serde_json::json!(
+            "no permit is accepted under a quorum: the epoch screen moves forward on certificates only, each verified here, and never backwards"
+        );
+        v["scope"] = serde_json::json!(
+            "this host's journal only; not mutual exclusion across hosts by itself. The epoch screen refuses grants this host has seen superseded and moves only on certificates the quorum signed; whether two certificates can exist for one epoch is the signers' promise, not this host's"
+        );
+    }
+    Ok(v)
 }
 
 pub fn execute(db: &Connection, request: &serde_json::Value) -> Result<serde_json::Value, Error> {
@@ -571,17 +832,51 @@ fn perform(db: &Connection, request: &serde_json::Value) -> Result<serde_json::V
                     k.to_string()
                 }
             };
+            // Or the authority as a quorum of replica keys (V3-2): n public keys under stable key ids and
+            // a threshold that is a strict majority of them. One form or the other, never both.
+            let authority_quorum = match request.get("authority_quorum") {
+                None => String::new(),
+                Some(v) => {
+                    if authority.is_empty() {
+                        return Err("authority_quorum without authority_id: a quorum belongs to a named authority".into());
+                    }
+                    if !authority_key.is_empty() {
+                        return Err("authority_key and authority_quorum are two forms of one authority; name one".into());
+                    }
+                    crate::signing::Quorum::declared(&authority, v)?.stored().to_string()
+                }
+            };
+            let proposed = Policy {
+                lease_seconds,
+                takeover_margin_seconds: margin,
+                desired_standbys: standbys,
+                eligible_hosts: hosts.clone(),
+                authorization_ref: reference.to_string(),
+                authority_id: authority.clone(),
+                authority_key: authority_key.clone(),
+                authority_quorum: authority_quorum.clone(),
+            };
+            let change = authority_change(db, uuid, request, policy(db, uuid)?.as_ref(), &proposed, now)?;
             db.execute(
-                "INSERT INTO activation_policy VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                "INSERT INTO activation_policy(universe_uuid,lease_seconds,takeover_margin_seconds,declared_at,operation_id,
+                   desired_standbys,eligible_hosts,authorization_ref,authority_id,authority_key,authority_quorum)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
                  ON CONFLICT(universe_uuid) DO UPDATE SET lease_seconds=excluded.lease_seconds,
                    takeover_margin_seconds=excluded.takeover_margin_seconds,
                    declared_at=excluded.declared_at, operation_id=excluded.operation_id,
                    desired_standbys=excluded.desired_standbys, eligible_hosts=excluded.eligible_hosts,
                    authorization_ref=excluded.authorization_ref, authority_id=excluded.authority_id,
-                   authority_key=excluded.authority_key",
+                   authority_key=excluded.authority_key, authority_quorum=excluded.authority_quorum",
                 params![uuid, lease_seconds as i64, margin as i64, now, id, standbys as i64,
-                        serde_json::to_string(&hosts)?, reference, authority, authority_key],
+                        serde_json::to_string(&hosts)?, reference, authority, authority_key, authority_quorum],
             )?;
+            if let Some((from, to, how, certificate)) = change {
+                db.execute(
+                    "INSERT INTO activation_policy_changes(universe_uuid,from_digest,to_digest,how,certificate_digest,authorization_ref,at,operation_id)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![uuid, from, to, how, certificate, reference, now, id],
+                )?;
+            }
             record(db, uuid, &this_host, 0, "policy_declared", id)?;
         }
         "activation_acquire" => {
@@ -595,7 +890,8 @@ fn perform(db: &Connection, request: &serde_json::Value) -> Result<serde_json::V
             // needs an epoch newer than the one that holder was granted -- the explicit
             // rotation the laboratory requires, never inferred from a lapse alone.
             let granted = if policy.gated() {
-                let p = permit(request)?;
+                let boot = boot_id()?;
+                let p = grant_of(request, &policy, uuid, Some((&this_host, &boot)), now)?;
                 if p.authority_id != policy.authority_id {
                     return Err("The permit names a different authority than this universe's policy".into());
                 }
@@ -637,6 +933,9 @@ fn perform(db: &Connection, request: &serde_json::Value) -> Result<serde_json::V
             } else {
                 if request.get("permit").is_some() {
                     return Err("This universe's policy names no authority; a permit here would be checked against nothing".into());
+                }
+                if request.get("certificate").is_some() {
+                    return Err("This universe's policy names no authority; a certificate here would be checked against nothing".into());
                 }
                 None
             };
@@ -682,7 +981,7 @@ fn perform(db: &Connection, request: &serde_json::Value) -> Result<serde_json::V
             if !policy.gated() {
                 return Err("This universe's policy names no authority; there is no epoch to supersede".into());
             }
-            let p = permit(request)?;
+            let p = grant_of(request, &policy, uuid, None, now)?;
             if p.authority_id != policy.authority_id {
                 return Err("The permit names a different authority than this universe's policy".into());
             }
@@ -1039,5 +1338,371 @@ mod listing_tests {
         let active = active_publisher_resources(listing);
         assert!(active.contains("91eeb6bf") && active.contains("bbbb"));
         assert!(!active.contains("aaaa") && active.len() == 2);
+    }
+}
+
+#[cfg(test)]
+mod quorum_tests {
+    //! V3-2 on the node: a quorum policy declared, its certificates at acquisition and supersession,
+    //! the epoch screen, and the rule for changing the authority set -- through `execute`, as a request
+    //! on the socket runs, journal included.
+    use super::*;
+    use crate::signing::testkit::{self, public, sign};
+    use serde_json::{json, Value};
+
+    const R: &str = "91eeb6bf-5489-405b-b77a-53105b0aff7a";
+    const OTHER_RESOURCE: &str = "00000000-0000-4000-8000-000000000001";
+    const HOST: &str = "5d1c0b8e-3f59-4d0e-9d7a-2a1e7c4b9f10";
+    const OTHER: &str = "00000000-0000-4000-8000-00000000000b";
+    const ABC: &[(&str, u8)] = &[("replica-a", 1), ("replica-b", 2), ("replica-c", 3)];
+    const GATE_SEED: u8 = 42;
+
+    fn next() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(1);
+        N.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn db() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
+        db.execute("INSERT INTO metadata VALUES('host_uuid',?1)", [HOST]).unwrap();
+        lc::ensure_schema(&db).unwrap();
+        ensure_schema(&db).unwrap();
+        db
+    }
+
+    fn act(db: &Connection, op: &str, extra: Value) -> Result<Value, String> {
+        let mut r = json!({"operation": op, "universe_uuid": R, "operation_id": format!("q-{}", next()), "authorization_ref": "probe"});
+        for (k, v) in extra.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        execute(db, &r).map_err(|e| e.to_string())
+    }
+
+    fn boot() -> String {
+        boot_id().unwrap()
+    }
+
+    fn quorum_policy(threshold: usize, keys: &[(&str, u8)]) -> Value {
+        json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "replicas", "authority_quorum": testkit::policy(threshold, keys)})
+    }
+
+    /// A journal under a 2-of-3 quorum of replica keys.
+    fn under_quorum() -> Connection {
+        let db = db();
+        act(&db, "activation_require", quorum_policy(2, ABC)).unwrap();
+        db
+    }
+
+    fn digest(db: &Connection) -> String {
+        policy(db, R).unwrap().unwrap().authority_digest().unwrap().unwrap()
+    }
+
+    /// A takeover certificate of this universe's current policy, for `epoch`, to `holder` in this boot,
+    /// signed by `signers`.
+    fn cert(db: &Connection, epoch: i64, holder: &str, signers: &[(&str, u8)]) -> Value {
+        let authority = policy(db, R).unwrap().unwrap().authority_id;
+        sign(&testkit::takeover(&authority, &digest(db), R, epoch, holder, &boot()), signers)
+    }
+
+    fn screen_of(db: &Connection) -> Option<i64> {
+        highest_epoch_seen(db, R).unwrap()
+    }
+
+    fn permit(epoch: i64, host: &str) -> Value {
+        json!({"authority_id": "replicas", "resource": R, "epoch": epoch, "replica_id": host, "instance_id": boot(), "grant_id": format!("g{epoch}")})
+    }
+
+    /// Proves: under a quorum, acquisition takes a certificate of k distinct keys and nothing less. A
+    /// permit, however well formed, is refused; a single replica's certificate is refused; two
+    /// replicas' certificate is accepted, the lease and the screen record its epoch and grant; the
+    /// status reports the quorum, its digest and what the screen now moves on.
+    #[test]
+    fn under_a_quorum_a_majority_decides_and_a_minority_does_not() {
+        let db = under_quorum();
+        let e = act(&db, "activation_acquire", json!({"permit": permit(1, HOST)})).unwrap_err();
+        assert!(e.contains("never on a permit"), "{e}");
+        let e = act(&db, "activation_acquire", json!({})).unwrap_err();
+        assert!(e.contains("never on a permit"), "{e}");
+        let e = act(&db, "activation_acquire", json!({"certificate": cert(&db, 1, HOST, &ABC[..1])})).unwrap_err();
+        assert!(e.contains("(below_threshold)"), "{e}");
+        let e = act(&db, "activation_acquire", json!({"certificate": cert(&db, 1, HOST, &ABC[..2]), "permit": permit(1, HOST)})).unwrap_err();
+        assert!(e.contains("not both"), "{e}");
+        assert_eq!(screen_of(&db), None, "nothing refused moved the screen");
+        let v = act(&db, "activation_acquire", json!({"certificate": cert(&db, 1, HOST, &ABC[1..])})).unwrap();
+        assert_eq!((v["epoch"].clone(), v["grant_id"].clone(), v["highest_epoch_seen"].clone()), (json!(1), json!("g1"), json!(1)));
+        assert_eq!(v["authority_policy_digest"], json!(digest(&db)));
+        assert_eq!(v["authority_quorum"]["threshold"], json!(2));
+        assert!(v["permit_verification"].as_str().unwrap().contains("certificates only"), "{v}");
+        // The same decision presented again, by all three this time: the same grant, accepted.
+        act(&db, "activation_acquire", json!({"certificate": cert(&db, 1, HOST, ABC)})).unwrap();
+        // A same-holder re-issue at the next epoch.
+        let mut same = cert(&db, 2, HOST, &[]);
+        same["method"] = json!("same_holder");
+        same["previous_holder"] = json!(HOST);
+        act(&db, "activation_acquire", json!({"certificate": sign(&same, &ABC[..2])})).unwrap();
+        assert_eq!(screen_of(&db), Some(2));
+    }
+
+    /// Proves: a certificate is bound to what it decides. Signed by a majority, but for another
+    /// resource, another holder, another boot of this host, an epoch that does not follow the previous
+    /// one it names, a second grant at an epoch already granted, an expired life, a barrier still ahead,
+    /// or a method whose binding fails: each refused with its reason, and the screen unmoved.
+    #[test]
+    fn a_certificate_for_another_resource_holder_boot_or_epoch_is_refused() {
+        let db = under_quorum();
+        act(&db, "activation_acquire", json!({"certificate": cert(&db, 5, HOST, &ABC[..2])})).unwrap();
+        let refused = |doc: Value, why: &str| {
+            let e = act(&db, "activation_acquire", json!({"certificate": sign(&doc, &ABC[..2])})).unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+            assert_eq!(screen_of(&db), Some(5), "{why}");
+        };
+        let base = cert(&db, 6, HOST, &[]);
+        let edit = |f: &dyn Fn(&mut Value)| { let mut v = base.clone(); f(&mut v); v };
+        refused(edit(&|v| v["resource"] = json!(OTHER_RESOURCE)), "different resource");
+        refused(edit(&|v| v["new_holder"] = json!(OTHER)), "another host as the new holder");
+        refused(edit(&|v| v["holder_boot_id"] = json!("00000000-0000-4000-8000-0000000000bb")), "another incarnation of this host");
+        refused(edit(&|v| v["previous_epoch"] = json!(4)), "not the one before 6");
+        refused(edit(&|v| { v["new_epoch"] = json!(4); v["previous_epoch"] = json!(3); }), "superseded: this host has already seen epoch 5");
+        refused(edit(&|v| { v["new_epoch"] = json!(5); v["previous_epoch"] = json!(4); v["grant_id"] = json!("another"); }), "already granted here under another grant");
+        refused(edit(&|v| { v["issued_at"] = json!(1_700_000_000); v["expires_at"] = json!(1_700_003_600); }), "expired");
+        refused(edit(&|v| v["issued_at"] = json!(crate::now() as i64 + 600)), "issued in the future");
+        refused(edit(&|v| v["eligible_after"] = json!(crate::now() as i64 + 600)), "barrier is at");
+        refused(edit(&|v| v["method"] = json!("same_holder")), "the certificate says same_holder");
+        refused(edit(&|v| v["method"] = json!("first")), "the certificate says first");
+        refused(edit(&|v| v["method"] = json!("fence_receipt")), "the fence receipt names no host");
+        refused(edit(&|v| v["method"] = json!("elected")), "method elected is unknown");
+        refused(edit(&|v| v["new_epoch"] = json!(i64::from(i32::MAX) + 1)), "new_epoch must be from 1");
+        // A certificate for another resource cannot supersede this one either.
+        let e = act(&db, "activation_supersede", json!({"certificate": sign(&edit(&|v| v["resource"] = json!(OTHER_RESOURCE)), &ABC[..2])})).unwrap_err();
+        assert!(e.contains("different resource"), "{e}");
+        assert_eq!(screen_of(&db), Some(5));
+    }
+
+    /// Proves the invariant the V3 plan states for every later lot: the durable epoch screen moves
+    /// forward on certificates only, never on anything else, and never backwards. A deterministic
+    /// sequence of 400 attempts (valid and invalid certificates at epochs around the screen, permits,
+    /// supersessions, acquisitions, policy re-declarations) is run; after each, the screen is compared
+    /// with what it was: it never decreased, and it changed only on a successful operation that
+    /// presented a certificate verified here.
+    #[test]
+    fn the_screen_never_moves_backwards_and_moves_on_certificates_only() {
+        let db = under_quorum();
+        act(&db, "activation_acquire", json!({"certificate": cert(&db, 10, HOST, &ABC[..2])})).unwrap();
+        assert_eq!(screen_of(&db), Some(10));
+        // The SQL guard itself: a lower epoch written straight to the screen changes nothing.
+        let low = Permit { authority_id: "replicas".into(), resource: R.into(), epoch: 3, replica_id: OTHER.into(), instance_id: "b".into(), grant_id: "g3".into() };
+        screen(&db, R, &low, "direct").unwrap();
+        assert_eq!(screen_of(&db), Some(10));
+        // And the operation says so rather than succeeding quietly: a valid certificate at or below the
+        // screen is refused as a supersession and as an acquisition.
+        for epoch in [9, 10] {
+            let e = act(&db, "activation_supersede", json!({"certificate": cert(&db, epoch, OTHER, &ABC[..2])})).unwrap_err();
+            assert!(e.contains(&format!("Epoch {epoch} does not supersede epoch 10")), "{e}");
+        }
+        let e = act(&db, "activation_acquire", json!({"certificate": cert(&db, 9, HOST, &ABC[..2])})).unwrap_err();
+        assert!(e.contains("superseded: this host has already seen epoch 10"), "{e}");
+        let mut seed: u64 = 0x5eed;
+        let mut rand = move |n: u64| { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) % n };
+        let mut moved = 0;
+        for _ in 0..400 {
+            let before = screen_of(&db).unwrap();
+            let epoch = (before + rand(5) as i64 - 2).max(1);
+            let signers: &[(&str, u8)] = match rand(4) { 0 => &ABC[..1], 1 => &[("replica-a", 1), ("replica-a", 1)], _ => &ABC[..2] };
+            let holder = if rand(2) == 0 { HOST } else { OTHER };
+            let (op, body, by_certificate) = match rand(6) {
+                0 => ("activation_supersede", json!({"permit": permit(epoch, holder)}), false),
+                1 => ("activation_acquire", json!({"permit": permit(epoch, HOST)}), false),
+                2 => ("activation_require", quorum_policy(2, &[ABC[2], ABC[0], ABC[1]]), false),
+                3 => ("activation_acquire", json!({"certificate": cert(&db, epoch, HOST, signers)}), true),
+                _ => ("activation_supersede", json!({"certificate": cert(&db, epoch, holder, signers)}), true),
+            };
+            let ok = act(&db, op, body).is_ok();
+            let after = screen_of(&db).unwrap();
+            assert!(after >= before, "{op} moved the screen back from {before} to {after}");
+            if after != before {
+                assert!(ok && by_certificate && signers.len() == 2 && signers[0] != signers[1], "{op} moved the screen without a valid certificate");
+                moved += 1;
+            }
+        }
+        assert!(moved >= 20, "the sequence moved the screen only {moved} times");
+    }
+
+    /// Proves: under a quorum, a supersession is a certificate of k keys too -- so a forged higher epoch
+    /// cannot even stop a universe here any more -- and it teaches the host it is overtaken even when
+    /// the certificate's own life is over, since learning it can only stop things.
+    #[test]
+    fn a_supersession_is_a_certificate_and_an_expired_one_still_teaches() {
+        let db = under_quorum();
+        act(&db, "activation_acquire", json!({"certificate": cert(&db, 1, HOST, &ABC[..2])})).unwrap();
+        let e = act(&db, "activation_supersede", json!({"permit": permit(2, OTHER)})).unwrap_err();
+        assert!(e.contains("never on a permit"), "{e}");
+        let e = act(&db, "activation_supersede", json!({"certificate": cert(&db, 2, OTHER, &ABC[2..])})).unwrap_err();
+        assert!(e.contains("(below_threshold)"), "{e}");
+        let mut old = cert(&db, 2, OTHER, &[]);
+        old["issued_at"] = json!(1_700_000_000);
+        old["expires_at"] = json!(1_700_003_600);
+        old["holder_boot_id"] = json!("00000000-0000-4000-8000-0000000000bb");
+        let v = act(&db, "activation_supersede", json!({"certificate": sign(&old, &ABC[1..])})).unwrap();
+        assert_eq!((v["highest_epoch_seen"].clone(), v["superseded"].clone()), (json!(2), json!(true)));
+        assert!(refuse_if_not_activated(&db, R, "start").unwrap_err().to_string().contains("superseded by epoch 2"));
+        let e = act(&db, "activation_renew", json!({})).unwrap_err();
+        assert!(e.contains("superseded by epoch 2"), "{e}");
+    }
+
+    /// Proves: the single key's policies behave as before -- the gate's permits still acquire and
+    /// supersede -- and accept a certificate under their 1-of-1 digest, signed by the gate's key: the
+    /// migration can move the gate to certificates before it moves the policy to the replicas.
+    #[test]
+    fn a_single_key_policy_keeps_its_permits_and_accepts_its_one_of_one_certificate() {
+        let db = db();
+        act(&db, "activation_require", json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "lab-gate", "authority_key": public(GATE_SEED)})).unwrap();
+        let mut p = permit(1, HOST);
+        p["authority_id"] = json!("lab-gate");
+        act(&db, "activation_acquire", json!({"permit": p})).unwrap();
+        let single = policy(&db, R).unwrap().unwrap().authority().unwrap().unwrap();
+        assert!(single.single_key);
+        let c = sign(&testkit::takeover("lab-gate", &single.digest(), R, 2, HOST, &boot()), &[(crate::signing::SINGLE_KEY_ID, GATE_SEED)]);
+        let v = act(&db, "activation_acquire", json!({"certificate": c})).unwrap();
+        assert_eq!(v["highest_epoch_seen"], json!(2));
+        assert!(v.get("authority_quorum").is_none() && v["permit_verification"].as_str().unwrap().contains("not verified"), "{v}");
+        let mut p = permit(3, OTHER);
+        p["authority_id"] = json!("lab-gate");
+        act(&db, "activation_supersede", json!({"permit": p})).unwrap();
+        assert_eq!(screen_of(&db), Some(3));
+        // A policy with an authority and no key takes no certificate: nothing to check it against.
+        let unkeyed = self::db();
+        act(&unkeyed, "activation_require", json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "lab-gate"})).unwrap();
+        let e = act(&unkeyed, "activation_acquire", json!({"certificate": c_unkeyed()})).unwrap_err();
+        assert!(e.contains("names no key"), "{e}");
+    }
+
+    fn c_unkeyed() -> Value {
+        sign(&testkit::takeover("lab-gate", "none", R, 1, HOST, &boot()), &[(crate::signing::SINGLE_KEY_ID, GATE_SEED)])
+    }
+
+    fn changes(db: &Connection) -> Vec<(String, String, String)> {
+        let mut s = db.prepare("SELECT from_digest,to_digest,how FROM activation_policy_changes WHERE universe_uuid=?1 ORDER BY id").unwrap();
+        s.query_map([R], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().collect::<Result<_, _>>().unwrap()
+    }
+
+    fn change_certificate(db: &Connection, to: &str, signers: &[(&str, u8)]) -> Value {
+        let p = policy(db, R).unwrap().unwrap();
+        let now = crate::now() as i64;
+        sign(&json!({"kind": crate::signing::POLICY_CHANGE_KIND, "authority_id": p.authority_id, "policy_digest": p.authority_digest().unwrap().unwrap(),
+                     "resource": R, "new_policy_digest": to, "issued_at": now, "expires_at": now + 600}), signers)
+    }
+
+    fn digest_of(authority: &str, v: &Value) -> String {
+        crate::signing::Quorum::declared(authority, v).unwrap().digest()
+    }
+
+    /// Proves the rule for changing the authority set. From the gate's single key to a 2-of-3 quorum:
+    /// refused with neither authorisation, refused under a stale digest, accepted under the operator's
+    /// explicit re-declaration naming the current digest. From that quorum to another: accepted under a
+    /// certificate two of the CURRENT keys signed; refused when signed by one of them, by the new
+    /// policy's keys, for another resource, or for another target. A certificate applied once is not
+    /// replayed after the operator moved the policy back. Re-declaring the same quorum in another key
+    /// order needs nothing. Dropping the quorum is the operator's only. Every change is recorded, and
+    /// none touches the screen.
+    #[test]
+    fn the_authority_set_changes_under_a_certificate_of_the_current_policy_or_the_operator_only() {
+        let db = db();
+        act(&db, "activation_require", json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "lab-gate", "authority_key": public(GATE_SEED)})).unwrap();
+        let mut p = permit(7, HOST);
+        p["authority_id"] = json!("lab-gate");
+        act(&db, "activation_acquire", json!({"permit": p})).unwrap();
+        let gate = digest(&db);
+        let e = act(&db, "activation_require", quorum_policy(2, ABC)).unwrap_err();
+        assert!(e.contains("requires a certificate of that policy") && e.contains(&gate), "{e}");
+        let mut stale = quorum_policy(2, ABC);
+        stale["replaces_policy_digest"] = json!("0".repeat(64));
+        let e = act(&db, "activation_require", stale).unwrap_err();
+        assert!(e.contains("is not current"), "{e}");
+        let mut by_operator = quorum_policy(2, ABC);
+        by_operator["replaces_policy_digest"] = json!(gate);
+        act(&db, "activation_require", by_operator.clone()).unwrap();
+        let first = digest(&db);
+        assert_eq!(changes(&db).last().unwrap(), &(gate.clone(), first.clone(), "operator_redeclaration".to_string()));
+        assert_eq!(screen_of(&db), Some(7), "a new policy does not reset the screen");
+        // The same quorum, keys listed in another order: not a change, nothing required.
+        act(&db, "activation_require", quorum_policy(2, &[ABC[2], ABC[1], ABC[0]])).unwrap();
+        assert_eq!(changes(&db).len(), 2);
+        // To another quorum (replica-c's key replaced by replica-d's), by certificate.
+        let next_keys: &[(&str, u8)] = &[ABC[0], ABC[1], ("replica-d", 4)];
+        let target = digest_of("replicas", &testkit::policy(2, next_keys));
+        let with_cert = |c: Value| { let mut r = quorum_policy(2, next_keys); r["policy_change_certificate"] = c; r };
+        let e = act(&db, "activation_require", with_cert(change_certificate(&db, &target, &ABC[..1]))).unwrap_err();
+        assert!(e.contains("(below_threshold)"), "{e}");
+        let e = act(&db, "activation_require", with_cert(change_certificate(&db, &target, &[("replica-a", 1), ("replica-d", 4)]))).unwrap_err();
+        assert!(e.contains("(unknown_key)"), "the new policy's keys cannot authorise their own admission: {e}");
+        let mut elsewhere = change_certificate(&db, &target, &[]);
+        elsewhere["resource"] = json!(OTHER_RESOURCE);
+        let e = act(&db, "activation_require", with_cert(sign(&elsewhere, &ABC[..2]))).unwrap_err();
+        assert!(e.contains("different resource"), "{e}");
+        let e = act(&db, "activation_require", with_cert(change_certificate(&db, &"f".repeat(64), &ABC[..2]))).unwrap_err();
+        assert!(e.contains("not to the policy declared here"), "{e}");
+        let mut late = change_certificate(&db, &target, &[]);
+        late["expires_at"] = json!(1_700_000_000);
+        let e = act(&db, "activation_require", with_cert(sign(&late, &ABC[..2]))).unwrap_err();
+        assert!(e.contains("expired"), "{e}");
+        let e = act(&db, "activation_require", {
+            let mut r = with_cert(change_certificate(&db, &target, &ABC[..2]));
+            r["replaces_policy_digest"] = json!(first);
+            r
+        })
+        .unwrap_err();
+        assert!(e.contains("not both"), "{e}");
+        assert_eq!(digest(&db), first, "no refused request changed the policy");
+        let applied = change_certificate(&db, &target, &ABC[1..]);
+        act(&db, "activation_require", with_cert(applied.clone())).unwrap();
+        assert_eq!(digest(&db), target);
+        assert_eq!(changes(&db).last().unwrap(), &(first.clone(), target.clone(), "certificate".to_string()));
+        // The operator moves it back; the certificate applied once does not move it forward again.
+        let mut back = quorum_policy(2, ABC);
+        back["replaces_policy_digest"] = json!(target);
+        act(&db, "activation_require", back).unwrap();
+        let e = act(&db, "activation_require", with_cert(applied)).unwrap_err();
+        assert!(e.contains("already applied"), "{e}");
+        // Dropping the quorum: never by certificate, by the operator's re-declaration only.
+        let lease_only = json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "replicas"});
+        let e = act(&db, "activation_require", lease_only.clone()).unwrap_err();
+        assert!(e.contains("requires a certificate"), "{e}");
+        let mut drop = lease_only.clone();
+        drop["policy_change_certificate"] = change_certificate(&db, "", &ABC[..2]);
+        let e = act(&db, "activation_require", drop).unwrap_err();
+        assert!(e.contains("dropping the key is the operator's"), "{e}");
+        let mut drop = lease_only;
+        drop["replaces_policy_digest"] = json!(first);
+        act(&db, "activation_require", drop).unwrap();
+        assert_eq!(policy(&db, R).unwrap().unwrap().authority_digest().unwrap(), None);
+        assert_eq!(screen_of(&db), Some(7), "no change of policy moved the screen");
+    }
+
+    /// Proves: the migration's starting point stays open -- the gate's single key can certify the move
+    /// to the replicas' quorum itself, in the certificate form under its 1-of-1 digest -- and that a
+    /// change between single keys, or from no key, keeps today's behaviour: the operator's declaration,
+    /// recorded, with nothing more asked.
+    #[test]
+    fn the_gate_can_certify_its_own_replacement_and_single_key_changes_keep_todays_behaviour() {
+        let db = db();
+        act(&db, "activation_require", json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "lab-gate"})).unwrap();
+        act(&db, "activation_require", json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "lab-gate", "authority_key": public(GATE_SEED)})).unwrap();
+        act(&db, "activation_require", json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "lab-gate", "authority_key": public(7)})).unwrap();
+        act(&db, "activation_require", json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "lab-gate", "authority_key": public(GATE_SEED)})).unwrap();
+        let hows: Vec<String> = changes(&db).into_iter().map(|(_, _, h)| h).collect();
+        assert_eq!(hows, ["declared", "redeclared_single_key", "redeclared_single_key"]);
+        let mut to_replicas = json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "lab-gate", "authority_quorum": testkit::policy(2, ABC)});
+        let target = digest_of("lab-gate", &testkit::policy(2, ABC));
+        to_replicas["policy_change_certificate"] = change_certificate(&db, &target, &[(crate::signing::SINGLE_KEY_ID, GATE_SEED)]);
+        act(&db, "activation_require", to_replicas).unwrap();
+        assert_eq!(digest(&db), target);
+        assert_eq!(changes(&db).last().unwrap().2, "certificate");
+        let e = act(&db, "activation_require", json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "lab-gate", "authority_key": public(GATE_SEED),
+                                                       "authority_quorum": testkit::policy(2, ABC)})).unwrap_err();
+        assert!(e.contains("name one"), "{e}");
+        let e = act(&db, "activation_require", json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_quorum": testkit::policy(2, ABC)})).unwrap_err();
+        assert!(e.contains("without authority_id"), "{e}");
     }
 }

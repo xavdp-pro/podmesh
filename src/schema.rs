@@ -81,14 +81,19 @@ pub fn all() -> Value {
         f("eligible_hosts", "uuid[]", false, "the hosts allowed to run it; absent means unstated"),
         f("authority_id", "string", false, "the external gate whose epochs bind activation"),
         f("authority_key", "string", false, "the authority's Ed25519 public key, 32 bytes as lowercase hex; makes signed takeover documents required"),
+        f("authority_quorum", "object", false, "the authority as a quorum of replica keys, instead of authority_key: {threshold, keys: [{key_id, public_key}]}, 1 to 9 keys, a threshold that is a strict majority of them; every exclusive decision is then a certificate that many distinct keys signed, and no permit is accepted"),
+        f("replaces_policy_digest", "string", false, "the operator's explicit re-declaration of the authority set: the digest of the one it replaces (activation_status's authority_policy_digest), which must be current; required, unless policy_change_certificate is given, when a quorum replaces or is replaced by another authority set"),
+        f("policy_change_certificate", "object", false, "the change certified by the policy in place: a podmesh-policy-change/quorum-ed25519 certificate binding this universe and the new policy's digest, applied once"),
     ])));
-    put("activation_acquire", op("universe", "none", "takes the lease for this host; idempotent while it holds one; needs the authority's permit when the policy names one", Some(vec![
-        f("permit", "object", false, "the gate's permit: authority_id, resource, epoch, replica_id, instance_id, grant_id"),
+    put("activation_acquire", op("universe", "none", "takes the lease for this host; idempotent while it holds one; needs the authority's permit, or a certificate, when the policy names one, and a certificate under a quorum", Some(vec![
+        f("permit", "object", false, "the gate's permit: authority_id, resource, epoch, replica_id, instance_id, grant_id; refused under a quorum"),
+        f("certificate", "object", false, "a takeover certificate (podmesh-takeover-proof/quorum-ed25519) the policy's keys signed, for this host in this boot, live and past its barrier; under a single key, its 1-of-1 certificate"),
     ])));
     put("activation_renew", op("universe", "none", "extends this host's live lease", Some(vec![])));
     put("activation_release", op("universe", "none", "gives this host's lease up", Some(vec![])));
-    put("activation_supersede", op("universe", "none", "records a higher epoch's permit: this host's lease is superseded and its screen advances", Some(vec![
-        f("permit", "object", true, "the newer permit"),
+    put("activation_supersede", op("universe", "none", "records a higher epoch's permit or certificate: this host's lease is superseded and its screen advances", Some(vec![
+        f("permit", "object", false, "the newer permit; refused under a quorum"),
+        f("certificate", "object", false, "the newer takeover certificate, whoever it names; its signatures and epoch are checked, not its life"),
     ])));
     put("activation_status", op("read", "none", "the policy, the lease, the epoch screen and the authority key of a universe", Some(vec![])));
     put("activation_fence", op("host", "none", "stops every universe this host no longer holds a lease for, and withdraws their publishers and exclusive routes", Some(vec![
@@ -136,7 +141,7 @@ pub fn all() -> Value {
     ])));
     put("publisher_start", op("host", "lease", "starts the connector, under the lease, the service address and the authority's takeover document (held, whatever its method, until its eligible_after), or resumes at the same epoch under the one this host already verified", Some(vec![
         uuid("resource", "the resource"),
-        f("takeover_proof", "object", false, "the gate's document for this epoch, signed when the policy names a key; without it, or when it is refused, the start resumes under the proof this host verified for this epoch while the lease is the same incarnation, live, held here, unsuperseded, in the same boot"),
+        f("takeover_proof", "object", false, "the gate's document for this epoch, signed when the policy names a key, a certificate of k keys under a quorum; without it, or when it is refused, the start resumes under the proof this host verified for this epoch while the lease is the same incarnation, live, held here, unsuperseded, in the same boot"),
         f("previous", "object", false, "the agent's account of the previous publisher, recorded as provenance"),
     ])));
     put("publisher_stop", op("host", "none", "stops the connector and removes the active manager's mark (active_manager_mark)", Some(vec![uuid("resource", "the resource")])));

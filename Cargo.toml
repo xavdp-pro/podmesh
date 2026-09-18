@@ -10,3 +10,6 @@ serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 # Verification of the authority's Ed25519-signed takeover documents; no key is ever held here.
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+# The digest of an authority quorum policy, which every certificate names (V3-2). Already in the build as
+# ed25519-dalek's own hash dependency; named here so the digest does not depend on a child process.
+sha2 = { version = "0.10", default-features = false }
