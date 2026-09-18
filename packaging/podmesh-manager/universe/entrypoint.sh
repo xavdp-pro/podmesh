@@ -39,6 +39,13 @@ mkdir -p /run/podmesh-manager /var/lib/podmesh-manager && chmod 700 /run/podmesh
 # resident refuses an existing path rather than unlink it, so the stale file is removed here, where
 # it is known to belong to no running process (this is PID 1, and nothing else has started).
 rm -f /run/podmesh-manager/control.sock
+# The active manager's mark is PodMesh's to write, at publisher_start under the epoch gate, and this
+# replica's /run is its overlay, not a tmpfs: a mark written before a stop is still here after the
+# start (observed on lab-a, 2026-09-18), and a withdrawal made while the replica was stopped found no
+# running universe to remove it from. Removed here at every start, at its path and at the previous
+# one, before the origin starts: the origin answers 503 until PodMesh writes the mark again, so this
+# replica never claims a role it may no longer hold.
+rm -f /run/podmesh-manager/active-manager.json /run/podmesh-manager/governor.json
 # A store that arrived in an image layer (a restored recovery point) is copied up by the overlay
 # filesystem on its first write, which changes its inode between the resident's read-only preflight
 # and its open; the resident refuses that as a swapped store. Rewriting the file here, before the

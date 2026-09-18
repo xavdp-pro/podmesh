@@ -29,6 +29,8 @@ ALLOWED = [
      "the mark's previous path, read when the current one is absent"),
     ('packaging/podmesh-manager/universe/origin/tests/app.test.mjs', r'governor\.json',
      'the same previous path, in the test that holds the reading order'),
+    ('packaging/podmesh-manager/universe/entrypoint.sh', r'/run/podmesh-manager/governor\.json',
+     'the same previous path, removed with the current one at every start of the replica'),
     # (b) The fencing laboratory model and the integrated laboratory built on it: their own component is a
     #     Python class `Maker`, with the identifiers and the prose that name it.
     ('experiments/manager-fencing/*', r'[Mm]akers?|MAKER',
