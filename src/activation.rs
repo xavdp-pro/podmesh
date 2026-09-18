@@ -404,7 +404,9 @@ fn record(db: &Connection, uuid: &str, holder: &str, generation: i64, event: &st
     db.execute(
         "INSERT INTO activation_lease_history(universe_uuid,holder_host_uuid,generation,event,at,operation_id,boot_id)
          VALUES(?1,?2,?3,?4,?5,?6,?7)",
-        params![uuid, holder, generation, event, crate::now() as i64, id, boot_id().ok()],
+        // A boot that could not be read is written as `unknown`, never NULL: NULL is how the rows written
+        // before the field existed are recognised, and judged by the clock; `unknown` never matches a boot.
+        params![uuid, holder, generation, event, crate::now() as i64, id, boot_id().unwrap_or_else(|_| "unknown".into())],
     )?;
     Ok(())
 }
@@ -975,6 +977,8 @@ mod boot_tests {
         assert!(!renewed_this_boot(&db, U, "this-boot", booted).unwrap(), "a later time under another boot counts");
         history(&db, "policy_declared", 5_000, Some("this-boot"));
         assert!(!renewed_this_boot(&db, U, "this-boot", booted).unwrap(), "an event that is not a renewal counts");
+        history(&db, "renewed", 5_000, Some("unknown"));
+        assert!(!renewed_this_boot(&db, U, "this-boot", booted).unwrap(), "a row whose boot could not be read counts");
         history(&db, "renewed", 10, Some("this-boot"));
         assert!(renewed_this_boot(&db, U, "this-boot", booted).unwrap(), "a renewal of this boot stamped before btime does not count");
         let db = Connection::open_in_memory().unwrap();

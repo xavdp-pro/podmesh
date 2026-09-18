@@ -214,6 +214,16 @@ fn verify_takeover_proof(db: &Connection, resource: &str, proof: &Value, epoch: 
     if expires < now {
         return Err(format!("takeover_proof expired {} seconds ago", now - expires).into());
     }
+    // The authority's barrier binds every method, not only the lease barrier: a rotation carries the
+    // barrier of the epoch before it (a holder barred then may still renew and resume until it), so a
+    // same-holder or fence-receipt document can name a future `eligible_after` too (second review of
+    // V3-1). Such a document is not bad: it is refused until then, on this host's clock, and the
+    // caller asks again; an expired one stays refused above.
+    if let Some(eligible) = proof.get("eligible_after").and_then(Value::as_i64) {
+        if now < eligible {
+            return Err(format!("takeover_proof: the authority's barrier is at {eligible}, {} seconds from now on this clock; refusing before it", eligible - now).into());
+        }
+    }
     let previous_holder = proof["previous_holder"].as_str();
     match text("method")?.as_str() {
         "first" => {
@@ -240,10 +250,8 @@ fn verify_takeover_proof(db: &Connection, resource: &str, proof: &Value, epoch: 
             }
         }
         "lease_barrier" => {
-            let eligible = proof["eligible_after"].as_i64().ok_or("takeover_proof lacks eligible_after")?;
-            if now < eligible {
-                return Err(format!("takeover_proof: the authority's barrier is at {eligible}, {} seconds from now on this clock; refusing before it", eligible - now).into());
-            }
+            // Held above like every method; a lease barrier without one is not a barrier.
+            proof["eligible_after"].as_i64().ok_or("takeover_proof lacks eligible_after")?;
         }
         other => return Err(format!("takeover_proof method {other} is unknown").into()),
     }
@@ -531,22 +539,38 @@ fn connector_id(resource: &str) -> Option<String> {
 }
 
 /// The route and alias the resource holds on this host, from the network tables, verified from
-/// the kernel and the universe's namespace: the service address and the carrier universe.
-fn service_here(db: &Connection, resource: &str) -> Result<Option<(String, String)>, Error> {
+/// the kernel and the universe's namespace: the service address and the carrier universe when both
+/// are effective, and the gate as three answers -- `Some(true)`, `Some(false)` when either is read
+/// absent, and `None` when neither is read absent and one could not be read. An unread alias is never
+/// an absent one (second review of V3-1): the follow tick counts it as unknown, it never resumes on it.
+fn service_here(db: &Connection, resource: &str) -> Result<(Option<(String, String)>, Option<bool>), Error> {
     let row: Option<(String, Option<String>, Option<String>)> = db
         .query_row("SELECT ip,alias_universe_uuid,state FROM network_routes WHERE exclusive_resource=?1", [resource], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .optional()?;
-    let Some((ip, alias, state)) = row else { return Ok(None) };
+    let Some((ip, alias, state)) = row else { return Ok((None, Some(false))) };
     if state.as_deref().unwrap_or("effective") != "effective" {
-        return Ok(None);
+        return Ok((None, Some(false)));
     }
-    let Some(carrier) = alias else { return Ok(None) };
+    let Some(carrier) = alias else { return Ok((None, Some(false))) };
     let status = crate::network::execute(db, &json!({"operation": "network_status"}))?;
-    let effective = status["effective"]["published_routes"]
-        .as_array()
-        .map(|rs| rs.iter().any(|r| r["ip"] == json!(ip) && r["effective"] == json!(true) && r["alias_effective"] == json!(true)))
-        .unwrap_or(false);
-    Ok(if effective { Some((ip, carrier)) } else { None })
+    let entry = status["effective"]["published_routes"].as_array().and_then(|rs| rs.iter().find(|r| r["ip"] == json!(ip)).cloned());
+    let (route, address) = match &entry {
+        Some(r) => (r["effective"].as_bool(), r["alias_effective"].as_bool()),
+        None => (None, None),
+    };
+    let gate = service_gate(route, address);
+    Ok((if gate == Some(true) { Some((ip, carrier)) } else { None }, gate))
+}
+
+/// The service address's gate from the kernel's route and the carrier's address, each read present,
+/// absent or not read: effective when both are there, not effective when either is read absent, unknown
+/// otherwise.
+fn service_gate(route: Option<bool>, address: Option<bool>) -> Option<bool> {
+    match (route, address) {
+        (Some(true), Some(true)) => Some(true),
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        _ => None,
+    }
 }
 
 /// One HTTP GET of the origin's readiness, by hand over a TCP stream: the status and the JSON
@@ -743,9 +767,11 @@ fn eligibility(db: &Connection, p: &Publisher) -> Result<Eligibility, Error> {
     if !policy_gate {
         reasons.push(format!("{} is under no activation policy on this host", p.resource));
     }
-    let service = service_here(db, &p.resource)?;
-    if service.is_none() {
-        reasons.push("no effective exclusive route and alias for the resource on this host: publish the service address first".into());
+    let (service, service_gate) = service_here(db, &p.resource)?;
+    match service_gate {
+        Some(true) => {}
+        Some(false) => reasons.push("no effective exclusive route and alias for the resource on this host: publish the service address first".into()),
+        None => reasons.push("whether the exclusive route and alias are effective could not be read (the kernel's routes or the carrier's addresses): not eligible until it can be".into()),
     }
     let credential_gate = match crate::secrets::declared(db, &p.credential) {
         Ok(()) => true,
@@ -754,7 +780,7 @@ fn eligibility(db: &Connection, p: &Publisher) -> Result<Eligibility, Error> {
             false
         }
     };
-    let gates = json!({"lease": lease_gate, "policy": policy_gate, "service_address": service.is_some(), "credential": credential_gate});
+    let gates = json!({"lease": lease_gate, "policy": policy_gate, "service_address": service_gate, "credential": credential_gate});
     Ok((reasons.is_empty(), reasons, service, epoch, gates))
 }
 
@@ -1311,6 +1337,38 @@ mod tests {
         assert_eq!(start(&db, None, BOOT, "op-resume").unwrap()["resumed_from"]["operation_id"], json!("op-verify-2"));
     }
 
+    /// Every method is held until the authority's barrier, and released at it; an expired document
+    /// stays refused whatever its barrier (second review of V3-1: a same-holder rotation carries the
+    /// barrier of the epoch before it, and the node must not start before it).
+    #[test]
+    fn every_method_is_held_until_its_barrier_and_an_expired_proof_stays_refused() {
+        let now = crate::now() as i64;
+        for method in ["same_holder", "lease_barrier", "fence_receipt"] {
+            let db = gated();
+            let mut p = proof(10);
+            p["method"] = json!(method);
+            if method == "fence_receipt" {
+                p["previous_holder"] = json!("00000000-0000-4000-8000-00000000000b");
+                p["receipt"] = json!({"host": "00000000-0000-4000-8000-00000000000b", "withdrawn": true, "operation_id": "f", "resource": R});
+            }
+            if method == "lease_barrier" {
+                p["previous_holder"] = json!("00000000-0000-4000-8000-00000000000b");
+            }
+            p["eligible_after"] = json!(now + 600);
+            p["expires_at"] = json!(now + 600 + 3600);
+            let err = verify_takeover_proof(&db, R, &p, EPOCH, HOST).unwrap_err().to_string();
+            assert!(err.contains("barrier") && err.contains("refusing before it"), "{method}: {err}");
+            // Held, not bad: nothing is recorded, and at the barrier the same document is accepted.
+            assert!(start(&db, Some(p.clone()), BOOT, "op-held").is_err());
+            assert!(last_verified(&db, R).unwrap().is_none(), "{method}");
+            p["eligible_after"] = json!(now - 1);
+            assert_eq!(verify_takeover_proof(&db, R, &p, EPOCH, HOST).unwrap()["method"], json!(method));
+            // Expired, whatever the barrier.
+            p["expires_at"] = json!(now - 1);
+            assert!(verify_takeover_proof(&db, R, &p, EPOCH, HOST).unwrap_err().to_string().contains("expired"), "{method}");
+        }
+    }
+
     #[test]
     fn a_registration_is_read_from_the_lines_given_the_last_one_first() {
         let text = "2026-09-18T06:00:00Z INF Starting tunnel\n\
@@ -1320,6 +1378,19 @@ mod tests {
         assert_eq!(registration(text).as_deref(), Some("bbbb-2"));
         assert_eq!(registration("INF Starting tunnel\n"), None);
         assert_eq!(registration(""), None);
+    }
+
+    /// The service address's gate: an address that could not be read makes it unknown, never closed,
+    /// unless the other half is read absent (second review of V3-1).
+    #[test]
+    fn the_service_gate_is_open_closed_or_unknown() {
+        assert_eq!(service_gate(Some(true), Some(true)), Some(true));
+        for (route, address) in [(Some(false), None), (None, Some(false)), (Some(false), Some(true)), (Some(true), Some(false))] {
+            assert_eq!(service_gate(route, address), Some(false), "{route:?} {address:?}");
+        }
+        for (route, address) in [(Some(true), None), (None, Some(true)), (None, None)] {
+            assert_eq!(service_gate(route, address), None, "{route:?} {address:?}");
+        }
     }
 
     /// A mark read is present with its epoch, absent, or unknown; the last is never a wrong epoch.

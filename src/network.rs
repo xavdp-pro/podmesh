@@ -303,7 +303,7 @@ fn effective(db: &Connection) -> Result<Value, Error> {
         .iter()
         .map(|(ip, u, via, resource, alias, state)| {
             let held = routes_for(&format!("{ip}/32"));
-            let alias_effective = alias.as_ref().and_then(|a| running_pid(a).ok().flatten()).and_then(|pid| alias_present(pid, ip));
+            let alias_effective = alias.as_ref().and_then(|a| alias_reading(a, ip));
             json!({"ip": ip, "universe_uuid": u, "via": via, "exclusive_resource": resource, "alias_universe_uuid": alias, "alias_effective": alias_effective,
                    "state": state.clone().unwrap_or_else(|| "effective".into()),
                    "effective": held.as_ref().map(|h| h.iter().any(|l| line_via(l, via))), "routes": held})
@@ -1140,6 +1140,11 @@ fn route_resume_plan(recorded: &RecordedRoute, kernel: Option<&[String]>, alias_
         return Err(("other_kernel_route", format!("the kernel holds a route for {} that is not this resume's: {other}", recorded.ip)));
     }
     let route_there = !kernel.is_empty();
+    // The route is there and the address could not be read: perhaps nothing is wrong. Resuming would
+    // remove a live /32 on one failed `podman inspect` or `nsenter`; refused instead, and asked again.
+    if route_there && alias_effective.is_none() {
+        return Err(("alias_unknown", format!("the kernel holds the route for {} and whether the carrier holds the address could not be read; nothing is torn down on an unknown", recorded.ip)));
+    }
     if route_there && alias_effective == Some(true) && carrier.is_some_and(|c| recorded.alias.as_deref() == Some(c)) {
         return Ok(ResumePlan::AlreadyEffective);
     }
@@ -1173,7 +1178,10 @@ fn route_resume(db: &Connection, resource: &str, id: &str) -> Result<Value, Erro
         return Err(refused(("declaration_not_effective", "this host's network declaration is not effective; the route could not be published again".into())));
     }
     let kernel = routes_for(&format!("{}/32", r.ip));
-    let alias_effective = r.alias.as_ref().and_then(|a| running_pid(a).ok().flatten()).and_then(|pid| alias_present(pid, &r.ip));
+    let alias_effective = match r.alias.as_ref() {
+        Some(a) => alias_reading(a, &r.ip),
+        None => Some(false),
+    };
     let carrier = universe_at(db, &r.via)?.map(|(c, _)| c);
     let plan = route_resume_plan(&r, kernel.as_deref(), alias_effective, carrier.as_deref()).map_err(refused)?;
     let ResumePlan::Resume { carrier } = plan else {
@@ -1298,11 +1306,13 @@ fn reapply(db: &Connection) -> Result<Value, Error> {
             None => failed.push(json!({"kind": e.kind, "key": e.key, "error": "its presence could not be read"})),
         }
     }
-    let mut s = db.prepare("SELECT ip,via FROM network_routes WHERE state IS NULL OR state='effective' ORDER BY ip")?;
-    let routes: Vec<(String, String)> = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let mut s = db.prepare("SELECT ip,via,COALESCE(state,'effective') FROM network_routes WHERE state IS NULL OR state IN ('effective','resuming') ORDER BY ip")?;
+    let routes: Vec<(String, String, String)> = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
     let mut withdrawn = vec![];
-    for (ip, via) in routes {
-        let gone = routes_for(&format!("{ip}/32")).is_some_and(|held| !held.iter().any(|l| line_via(l, &via)));
+    for (ip, via, state) in routes {
+        // A row still `resuming` (its reconciliation failed before the boot) is withdrawn whatever the
+        // kernel shows: a resume never survives a reboot, where the entitlement is decided again.
+        let gone = state == "resuming" || routes_for(&format!("{ip}/32")).is_some_and(|held| !held.iter().any(|l| line_via(l, &via)));
         if gone {
             let r = withdraw_route(db, &ip)?;
             withdrawn.push(json!({"ip": ip, "via": via, "withdrawn": r["withdrawn"], "steps": r["steps"]}));
@@ -1385,6 +1395,18 @@ fn universe_at(db: &Connection, ip: &str) -> Result<Option<(String, i64)>, Error
         .optional()?;
     let Some(uuid) = uuid else { return Ok(None) };
     Ok(running_pid(&uuid)?.map(|pid| (uuid, pid)))
+}
+
+/// Whether the carrier holds the address, as three answers: `Some(true)`, `Some(false)` -- read, or the
+/// carrier does not run, which took the address down with its namespace -- and `None` when it could not be
+/// read (Podman or nsenter failed). The last is never an absence: a resume that took it for one would tear
+/// down a healthy route (second review of V3-1).
+fn alias_reading(carrier: &str, ip: &str) -> Option<bool> {
+    match running_pid(carrier) {
+        Err(_) => None,
+        Ok(None) => Some(false),
+        Ok(Some(pid)) => alias_present(pid, ip),
+    }
 }
 
 fn running_pid(uuid: &str) -> Result<Option<i64>, Error> {
@@ -1510,6 +1532,8 @@ mod resume_tests {
         assert_eq!(route_resume_plan(&route, Some(&none), Some(false), Some("another")), Ok(ResumePlan::Resume { carrier: "another".into() }));
         // The kernel kept our route (the bridge had other users) and the alias is gone: resume.
         assert_eq!(route_resume_plan(&route, Some(&ours), Some(false), Some(CARRIER)), Ok(ResumePlan::Resume { carrier: CARRIER.into() }));
+        // No route and the address unread: nothing healthy to tear down, resume.
+        assert_eq!(route_resume_plan(&route, Some(&none), None, Some(CARRIER)), Ok(ResumePlan::Resume { carrier: CARRIER.into() }));
         // Everything there: nothing to do, whatever operation ID asks.
         assert_eq!(route_resume_plan(&route, Some(&ours), Some(true), Some(CARRIER)), Ok(ResumePlan::AlreadyEffective));
         // The address carried by the recorded carrier, but another universe now runs at via: not
@@ -1654,6 +1678,35 @@ mod resume_tests {
         assert_eq!(report["routes_dropped"], json!(["10.86.0.101"]), "{report}");
         assert_eq!(recorded_exclusive(&db, R).unwrap().map(|r| r.state), Some("effective".into()));
         assert!(effect_rows(&db, None).unwrap().is_empty());
+    }
+
+    /// The second review's probe, inverted: the recorded carrier still runs at via, the route is in the
+    /// kernel, and only the alias could not be read (nsenter or podman failed once). The plan used to tear
+    /// the healthy route down; it is refused as alias_unknown, whatever runs at via.
+    #[test]
+    fn an_unknown_alias_on_a_route_that_is_there_is_refused_never_torn_down() {
+        let r = recorded(Some(CARRIER), "effective");
+        let kernel = vec!["10.86.0.100 via 10.86.1.10 dev podman1".to_string()];
+        for carrier in [Some(CARRIER), Some("another"), None] {
+            assert_eq!(code(route_resume_plan(&r, Some(&kernel), None, carrier)), "alias_unknown", "{carrier:?}");
+        }
+    }
+
+    /// At boot, `network_reapply` withdraws a row left `resuming` as it withdraws an effective row whose
+    /// kernel route is gone (second review of V3-1): a resume never survives a reboot.
+    #[test]
+    fn a_row_left_resuming_is_withdrawn_at_boot() {
+        let db = journal();
+        db.execute("INSERT INTO network_declaration(network_uuid,prefix,pool,gateway,bridge,state,declared_at,operation_id,authorization_ref,nat_backend) VALUES('n','10.86.0.0/16','10.86.1.0/24','10.86.1.1','podmesh-managed','effective',0,'d','r','none')", []).unwrap();
+        for (ip, state) in [("10.86.0.100", "resuming"), ("10.86.0.101", "effective")] {
+            db.execute("INSERT INTO network_routes(ip,universe_uuid,via,published_at,operation_id,exclusive_resource,alias_universe_uuid,state) VALUES(?1,?2,'10.86.1.10',0,'x',?2,NULL,?3)",
+                       params![ip, R, state]).unwrap();
+        }
+        let report = reapply(&db).unwrap();
+        let withdrawn: Vec<&str> = report["routes_withdrawn"].as_array().unwrap().iter().filter(|r| r["withdrawn"] == json!(true)).map(|r| r["ip"].as_str().unwrap()).collect();
+        assert!(withdrawn.contains(&"10.86.0.100"), "{report}");
+        let left: i64 = db.query_row("SELECT COUNT(*) FROM network_routes WHERE state='resuming'", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0);
     }
 
     #[test]
