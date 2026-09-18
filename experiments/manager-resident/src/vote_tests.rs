@@ -3,8 +3,8 @@
 //!
 //! Some tests run a child process: this same test binary, re-run on `child_signs_one_vote` with a
 //! specification in its environment. A child can crash (abort) at a named point of the ledger's
-//! write, or pause after the promise check, which is how a crash between the write and the
-//! signature and two signers on one ledger are reproduced with real processes.
+//! write, or pause between reading the ledger and checking the promise: that is how a crash between
+//! the write and the signature, and two signers on one ledger, are reproduced with real processes.
 use crate::ledger::{self, HostIdentity, Signer, SigningRules};
 use crate::quorum::{
     self, testkit, Quorum, POLICY_CHANGE_FIELDS, POLICY_CHANGE_KIND, QUORUM_PROOF_KIND,
@@ -751,9 +751,10 @@ fn a_ledger_naming_another_host_or_key_signs_nothing() {
 // Two signers on one ledger.
 
 /// Proves: two processes signing on one ledger are serialized by its lock. Both are asked for epoch
-/// 9 at once, one for X and one for Y, and each pauses between the promise check and the write,
-/// long enough for the other to check too if nothing kept it out. Exactly one signs; the other is
-/// refused `epoch_already_promised`. Repeated, whichever wins.
+/// 9 at once, one for X and one for Y, and each pauses after reading the ledger and before the
+/// promise check (300 ms and 900 ms), long enough for both to read it before either writes if
+/// nothing kept them apart. Exactly one signs; the other is refused `epoch_already_promised`.
+/// Repeated three times.
 #[test]
 fn two_signers_on_one_ledger_are_serialized_by_its_lock() {
     for round in 0..3 {
@@ -761,12 +762,16 @@ fn two_signers_on_one_ledger_are_serialized_by_its_lock() {
         let dir = private_dir(root.path(), "a");
         let _signer = admitted_a(root.path(), &dir);
         let q = policy(ABC, 0);
-        let pause = [
-            ("PODMESH_VOTE_TEST_PAUSE", "after_check".to_string()),
-            ("PODMESH_VOTE_TEST_PAUSE_MS", "400".to_string()),
-        ];
-        let mut x = run_child(&dir, "x", &takeover(&q, R, 9, X, T1), T1, &pause);
-        let mut y = run_child(&dir, "y", &takeover(&q, R, 9, Y, T1), T1, &pause);
+        // Staggered: unlocked, x would write and sign while y, which read the ledger before x wrote,
+        // still waits; y would then write its own stale view over x's promise and sign too.
+        let pause = |ms: u32| {
+            [
+                ("PODMESH_VOTE_TEST_PAUSE", "after_check".to_string()),
+                ("PODMESH_VOTE_TEST_PAUSE_MS", ms.to_string()),
+            ]
+        };
+        let mut x = run_child(&dir, "x", &takeover(&q, R, 9, X, T1), T1, &pause(300));
+        let mut y = run_child(&dir, "y", &takeover(&q, R, 9, Y, T1), T1, &pause(900));
         assert!(x.wait().unwrap().success() && y.wait().unwrap().success());
         let outcomes: BTreeSet<String> = ["x", "y"]
             .iter()
