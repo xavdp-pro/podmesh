@@ -11,10 +11,13 @@
 //!
 //! If any of them cannot be read, is not what it claims to be, was collected before the ledger
 //! stopped signing, or holds a vote of a key this replica does not know, it refuses and names each
-//! one (`readmission_inputs_unreadable`). The alternatives are the operator's: wait for the input,
-//! or re-key the replica (a new key, a new ledger, an authority-set change), whose new ledger is
-//! admitted by this same operation and so gets the same floors. It also waits: until the longest
-//! life a vote may give a certificate, plus the clock skew, has passed since the ledger was marked,
+//! one (`readmission_inputs_unreadable`). The operator then waits until the input can be read:
+//! nothing replaces reading it. Re-keying (a new key and a new ledger for the replica, an
+//! authority-set change) is the way out for a ledger that cannot itself be readmitted -- lost,
+//! unreadable, or bound to another host -- and its new ledger is admitted by this same operation,
+//! from the same inputs, reading the old key's votes as a retired key's, so it gets the same floors.
+//! Readmission also waits: until the longest life a vote may give a certificate, plus the clock
+//! skew, has passed since the ledger was marked,
 //! so that a signature the ledger forgot and a proposer still holds has expired (review finding 1,
 //! "the wait stays, for live grants, not as a substitute for the floor").
 //!
@@ -68,7 +71,7 @@ impl std::fmt::Display for ReadmissionRefusal {
 impl std::error::Error for ReadmissionRefusal {}
 
 /// The operator's alternatives, said in every refusal.
-pub const ALTERNATIVE: &str = "wait until every input can be read, or re-key this replica: a new key and a new ledger (an authority-set change, serial + 1), admitted by this same operation, which then reads the old key's votes as a retired key's";
+pub const ALTERNATIVE: &str = "wait until every input can be read: nothing replaces reading it. A ledger that cannot itself be readmitted (lost, unreadable, or bound to another host) is replaced by re-keying: a new key and ledger (an authority-set change, serial + 1), admitted by this same operation from the same inputs, reading the old key's votes as a retired key's";
 
 /// One input readmission could not read, and why.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]

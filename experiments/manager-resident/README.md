@@ -402,10 +402,12 @@ signature the ledger forgot and a proposer still holds has expired. It sets, per
 epoch floor at the highest epoch anything showed (a promise, a vote, a screen) and the serial floor
 at the highest `from_serial` promised or already passed, raises the sequence above the key's own
 votes, records what it read (with digests) and what it set, and admits the ledger. Where an input
-cannot be read, the alternatives are to wait, or to re-key: a new key and ledger for the replica
-(an authority-set change at serial + 1), admitted by the same operation, which reads the old key's
-votes as a retired key's, so its floors are above them too. The node screens themselves move when
-the first certificate above them is delivered (V3-5); they never move backwards.
+cannot be read, the operator waits for it: nothing replaces reading it. Re-keying is the way out for
+a ledger that cannot itself be readmitted (lost, unreadable, or bound to another host): a new key and
+ledger for the replica (an authority-set change at serial + 1), admitted by the same operation from
+the same inputs, which reads the old key's votes as a retired key's, so its floors are above them
+too. The node screens themselves move when the first certificate above them is delivered (V3-5);
+they never move backwards.
 
 **Control operations.** Each one JSON object with an `operation_id` token:
 
