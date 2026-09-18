@@ -103,10 +103,14 @@ def gate_ready():
     while gate.inspect(LOGICAL)['epoch'] < seen:
         gate.transfer(LOGICAL, gate.inspect(LOGICAL)['epoch'], 'gate-recovery', 'gate-recovery')
         recovered = True
-    state = {'authority_id': gate.authority_id, 'epoch': gate.inspect(LOGICAL)['epoch']}
+    current = gate.inspect(LOGICAL)
+    state = {'authority_id': gate.authority_id, 'epoch': current['epoch']}
     gate.close()
     # The recovered epoch has no takeover proof; the ledger records one, with its barrier, so that the
-    # rotation that follows carries it rather than refusing (no_proof_for_current_epoch).
+    # rotation that follows carries it rather than refusing (no_proof_for_current_epoch). A run that died
+    # between moving the gate and recording it left the gate at `gate-recovery` with no proof: recorded now.
+    if not recovered and current.get('replica_id') == 'gate-recovery':
+        recovered = str(state['epoch']) not in (ha_tool().load_ledger(LOGICAL).get('proofs') or {})
     if recovered:
         state['recovery'] = ha_tool().record_recovery(LOGICAL, state['epoch'], LEASE, MARGIN, REFERENCE)
     return state
