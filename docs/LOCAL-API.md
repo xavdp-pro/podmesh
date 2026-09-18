@@ -391,7 +391,10 @@ lease. `stop` is never gated.
   shortest lease, or a lapsed lease leaves a universe running. It also withdraws every exclusive route (below)
   published under a resource this host no longer holds a live, unsuperseded lease for, verified from the
   kernel, and reports them as `routes_withdrawn`; a withdrawal that does not take is reported, never claimed.
-  It reconciles the network ledger first (`network_reconciliation`).
+  It reconciles the network ledger first (`network_reconciliation`). `unentitled` names every resource it found this
+  host not entitled to, and `unentitled_detail` says for each what it found: `superseded_by_epoch` (the epoch that
+  overtook this host's lease, null when none did), `held_by` and `expired_seconds_ago` -- what binds a fence receipt
+  to the rotation it answers (development tree).
 - `activation_fence_preview` (read-only, not journaled; no fields) says what a fence would act on now:
   `pending` (universes running without entitlement, exclusive routes without entitlement),
   `incomplete_network_effects`, and `nothing_to_fence`. A timer asks it first and journals a fence only when

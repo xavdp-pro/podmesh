@@ -357,6 +357,41 @@ A follow mandate is recorded before it is installed, keeping the larger of the p
 `not_after` until the host's copy is read back, so that an installation that fails never leaves the
 record saying less than what the host may still hold.
 
+Third review (2026-09-18):
+
+- **The nodes first.** Only a node built after 2026-09-18 holds every method until `eligible_after`;
+  an older one holds a lease barrier only, and would start a same-holder or fence-receipt document
+  carrying a barrier at once. The nodes are deployed before the first use of this tool;
+  `tests/podmesh_manager_lab.py` (`prove_takeover`) waits for `eligible_after` whatever the method.
+- **`activate` from epoch 0 only.** An activation after a rotation made a fresh epoch with no proof,
+  and the rotation that followed took it as barrier-free; `activate` is refused
+  (`activate_after_rotation`) unless the gate is at epoch 0, and `rotate` exempts from
+  `no_proof_for_current_epoch` only an activation recorded as made from epoch 0 (or, before that
+  was recorded, the one that made epoch 1).
+- **A fence receipt bound to its transition.** `attest-fence` accepts a fence answer only when it shows
+  the previous holder overtaken by the current epoch or later for this resource — in `fenced`, or in
+  `unentitled_detail`, the fence's per-resource account of what it found (the epoch that overtook the
+  lease, if any) — and refuses any other as `stale_fence_receipt`: an earlier fence, or a lease that
+  merely lapsed, says nothing about this rotation.
+- **A gate recovery is a recorded epoch.** When `tools/arm-publisher-follow.py` moves the gate past the
+  highest epoch a host has seen (`gate-recovery`), it records that epoch's proof in the ledger under
+  its lock: a `gate_recovery` record naming no holder, its barrier now plus the longest lease and
+  margin anyone may hold and never earlier than what the latest recorded proof carried. The rotation
+  that follows carries it as `lease_barrier` instead of refusing. The arming tool also forwards a
+  barrier the operator states (`--barrier-not-before`, or `PODMESH_FOLLOW_BARRIER_NOT_BEFORE`).
+- **A stated barrier is a time.** `--barrier-not-before` must be greater than 0 (else
+  `barrier_not_before_invalid`); it is recorded in the rotation, in the proof (`stated_barrier`,
+  `barrier_basis`) and in the report, carried through a fence receipt like any earlier barrier, and
+  the report warns when it is earlier than now plus the lease and the margin.
+- **Released only when stopped.** The barrier pushed for an untold holder is dropped only when the
+  supersession was delivered AND the previous holder's connector was seen stopped, or no publisher
+  is declared there; a stop refused, or a unit not observed, keeps the pushed proof.
+- **One writer.** `activate`, `rotate`, `attest-fence`, `cycle`, `takeover`, a mandate record and a
+  recovery record each hold the resource's ledger lock for their whole run — `rotate` across its SSH
+  calls included — and wait up to 30 s for it (a mandate or recovery record up to ten minutes). The
+  follow tick's state file is merged under a lock of its own, each resource through its own
+  temporary file.
+
 **What V3-1 does not do.** It never changes the holder, never acquires, never mints or extends a
 proof, and never renews past the mandate's `not_after`. After a reboot of the holder's host
 nothing resumes: the proof was verified during another boot (`boot_changed`) and the ledger's /32

@@ -120,7 +120,11 @@ plus the margin, and refuses (`follow_mandate_unknown`) before the gate moves wh
 be read. A mandate the ledger does not record (armed before 2026-09-18, or from another workstation)
 is stated with `--follow-mandate-not-after`. Every rotation, to the same host included (`--refresh`),
 also carries the barrier of the epoch before it, and its proof lives an hour past that barrier
-(`MANAGER-PUBLISHER-CONTRACT.md`, "The barrier, as it is"). The closure that needs no workstation, a
+(`MANAGER-PUBLISHER-CONTRACT.md`, "The barrier, as it is"). A gate recovered by the arming tool is
+recorded with its own barrier (now plus the longest lease and margin), so the refresh that follows
+is not refused; it then waits that barrier before the start. When the ledger has lost the proof it
+would carry, the operator states the barrier: `tools/arm-publisher-follow.py --refresh
+--barrier-not-before <unix time>` (or `PODMESH_FOLLOW_BARRIER_NOT_BEFORE`), recorded as stated. The closure that needs no workstation, a
 renewal the old holder cannot grant itself, is a later lot.
 
 A service address whose state could not be read (`gates.service_address` null) is neither resumed nor

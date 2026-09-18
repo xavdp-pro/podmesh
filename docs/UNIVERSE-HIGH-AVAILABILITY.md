@@ -475,10 +475,12 @@ Four subcommands. `gate` creates and drives the epoch gate — the fencing labor
 `Authority`, imported from its tree (reviewed candidate `0c3756fb…`) and never copied, one
 SQLite compare-and-swap file on the host the tool runs on, with the laboratory's precondition
 (one current copy, never cloned or rolled back) stated as the operator's obligation.
-`activate` declares the policy under that authority, rotates the epoch to a host and acquires;
-starting stays the operator's. `rotate` moves an exclusive role (a logical manager) with no promotion;
-its barrier, its supersession of the previous holder and its refusals (`no_proof_for_current_epoch`,
-`previous_host_mismatch`, `follow_mandate_unknown`, `ledger_locked`) are stated in
+`activate` declares the policy under that authority, rotates the epoch to a host and acquires, from
+the gate's epoch 0 only (`activate_after_rotation` otherwise); starting stays the operator's. `rotate`
+moves an exclusive role (a logical manager) with no promotion; its barrier, its supersession of the
+previous holder and its refusals (`no_proof_for_current_epoch`, `previous_host_mismatch`,
+`follow_mandate_unknown`, `barrier_not_before_invalid`, `ledger_locked`), and `attest-fence`'s
+`stale_fence_receipt`, are stated in
 `MANAGER-PUBLISHER-CONTRACT.md`, "The barrier, as it is". `cycle` is one capture: declare the collector's retention on the active host, stop,
 prepare, renew, start again, carry the two files to **one or more standbys** (`--also`),
 restore into quarantine on each, prune the older quarantined copies of each through the API
