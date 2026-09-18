@@ -133,11 +133,20 @@ def save_ledger(universe, ledger):
     os.replace(tmp, p)
 
 
+LOCK_HELD_ENV = 'PODMESH_HA_LEDGER_LOCK_HELD'
+
+
 @contextlib.contextmanager
 def locked(universe, wait_seconds=30):
     """One writer of a resource's ledger at a time: a rotation, an attestation and the record of a follow
     mandate never interleave, and neither does a replication run or a takeover of tools/replicate-universe.py,
-    which takes the same lock file. A caller that cannot take it within the wait is refused, having done nothing."""
+    which takes the same lock file. A caller that cannot take it within the wait is refused, having done nothing.
+    A process the lock's holder started itself, for the same universe (a replication run's cycle), inherits it: the
+    holder names the universe and its own pid in PODMESH_HA_LEDGER_LOCK_HELD, and waiting for one's own parent would
+    never end. Nothing else inherits it, not even a second acquisition in the holder's own process."""
+    if os.environ.get(LOCK_HELD_ENV) == f'{universe}:{os.getppid()}':
+        yield
+        return
     path = ledger_path(universe).with_suffix('.lock')
     with open(path, 'a+') as f:
         deadline = time.monotonic() + wait_seconds
@@ -149,9 +158,11 @@ def locked(universe, wait_seconds=30):
                 if time.monotonic() >= deadline:
                     raise Refusal(f'ledger_locked: another rotation, record or run holds the ledger of {universe[:8]} for more than {wait_seconds} s; nothing was done')
                 time.sleep(0.5)
+        os.environ[LOCK_HELD_ENV] = f'{universe}:{os.getpid()}'
         try:
             yield
         finally:
+            os.environ.pop(LOCK_HELD_ENV, None)
             fcntl.flock(f, fcntl.LOCK_UN)
 
 

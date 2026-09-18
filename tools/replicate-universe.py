@@ -104,6 +104,9 @@ def save(u, ledger):
     os.replace(tmp, p)
 
 
+LOCK_HELD_ENV = 'PODMESH_HA_LEDGER_LOCK_HELD'
+
+
 @contextlib.contextmanager
 def locked(u, wait_seconds=30):
     """One mutation of a universe's ledger and hosts at a time: a run, a takeover and a guardian tick never
@@ -119,9 +122,12 @@ def locked(u, wait_seconds=30):
                 if time.monotonic() >= deadline:
                     raise Refused(f'another run, takeover or guardian tick holds the universe {u[:8]} for more than {wait_seconds} s; nothing was done')
                 time.sleep(0.5)
+        # A child this holder runs (ha-standby.py cycle) inherits the lock rather than waiting for it.
+        os.environ[LOCK_HELD_ENV] = f'{u}:{os.getpid()}'
         try:
             yield
         finally:
+            os.environ.pop(LOCK_HELD_ENV, None)
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
