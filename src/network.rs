@@ -1542,11 +1542,11 @@ mod resume_tests {
         // Refusals.
         assert_eq!(code(route_resume_plan(&route, None, None, Some(CARRIER))), "kernel_unknown");
         assert_eq!(code(route_resume_plan(&route, Some(&none), None, None)), "no_carrier_at_via");
-        for other in ["10.86.0.100 via 192.168.10.156 dev vmbr0", "10.86.0.100 via 10.86.1.100 dev podman1", "10.86.0.100 dev podman1 scope link"] {
+        for other in ["10.86.0.100 via 192.0.2.156 dev vmbr0", "10.86.0.100 via 10.86.1.100 dev podman1", "10.86.0.100 dev podman1 scope link"] {
             let kernel = vec![other.to_string()];
             assert_eq!(code(route_resume_plan(&route, Some(&kernel), None, Some(CARRIER))), "other_kernel_route", "{other}");
         }
-        let mixed = vec![ours[0].clone(), "10.86.0.100 via 192.168.10.157 dev vmbr0 metric 50".to_string()];
+        let mixed = vec![ours[0].clone(), "10.86.0.100 via 192.0.2.157 dev vmbr0 metric 50".to_string()];
         assert_eq!(code(route_resume_plan(&route, Some(&mixed), Some(true), Some(CARRIER))), "other_kernel_route");
     }
 
@@ -1556,7 +1556,7 @@ mod resume_tests {
         assert!(!line_via("10.86.0.100 via 10.86.1.100 dev podman1", "10.86.1.10"));
         assert!(!line_via("10.86.0.100 via 10.86.1.1 dev podman1", "10.86.1.10"));
         assert!(!line_via("10.86.0.100 dev podman1", "10.86.1.10"));
-        assert!(line_via("10.86.2.0/24 via 192.168.10.157 dev vmbr0 proto static", "192.168.10.157"));
+        assert!(line_via("10.86.2.0/24 via 192.0.2.157 dev vmbr0 proto static", "192.0.2.157"));
     }
 
     /// Every reading of a route's gateway in this module goes through `line_via` (review of V3-1:
