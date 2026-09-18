@@ -553,7 +553,7 @@ second run in the same boot replays the first pass. Not covered: a manager unive
 profile is not recognised as one while it is stopped, and an operation written without an attempt row (a journal
 rolled back to experimental3) is not ordered.
 
-## Experimental: the universe network (packaged; carried by 0.1.0~experimental7, except `network_reapply`, which is in the development tree)
+## Experimental: the universe network (packaged; carried by 0.1.0~experimental7, except `network_reapply` and `network_route_resume`, which are in the development tree)
 
 The contract is `UNIVERSE-NETWORK-CONTRACT.md`; the operations are journaled like every other and verified from
 `podman network inspect`, `ip route` and `nft`, never from the tables alone. Every kernel or Podman mutation is
@@ -591,6 +591,22 @@ remains (`network_status`: `effects`, `incomplete_effects`).
   re-applied from the ledger, and whoever holds the role publishes it again under a live lease. Refused while
   the declaration is not effective; a second call finds nothing to re-apply. The restore unit calls it at boot
   before `boot_restore`, under the operation ID `boot-network-<boot_id without hyphens>`.
+- `network_route_resume` (host-wide; `exclusive_resource`). The alias of an exclusive route lives in its carrier's
+  network namespace and dies with it, and the /32 goes with the bridge's interface when the carrier was its only
+  user; the ledger still records both effective and the reconciliation only reports the drift. This puts back the
+  recorded exclusive route and alias of a role this host still holds: the dead row withdrawn with what it
+  recorded, then published again with the recorded ip, via and resource through every check of
+  `network_route_publish`, the address carried by the universe running at `via` now (the same replica restarted,
+  or one recreated at the same address). Refused, naming the reason, in this order: `no_policy`,
+  `no_recorded_route` (a first publication is `network_route_publish`'s), `route_incomplete` (a row left
+  `applying` or `removing` is the reconciliation's), `lease_not_entitled` (the lease gate's four reasons, quoted),
+  `lease_not_renewed_this_boot` (the lease neither acquired nor renewed during this boot: after a boot the
+  entitlement is decided again, and the ledger's /32 is never re-applied), `declaration_not_effective`,
+  `kernel_unknown`, `other_kernel_route` (the kernel holds a route for the address through anything but `via`:
+  somebody else's, never touched), `no_carrier_at_via`. Journaled like every network mutation: the same operation
+  ID replays the verified answer and repeats nothing; a route and alias already effective answer
+  `already_effective` and change nothing. It never changes the holder, never acquires and never renews. The
+  follow tick calls it once per tick when the service address is the only gate of `publisher_status` missing.
 
 ## Experimental: secrets a universe is given at creation (packaged; carried by 0.1.0~experimental7)
 
@@ -627,6 +643,20 @@ credential, waits for its registration with Cloudflare, and records `effective`;
 resource this host no longer holds (`publishers_withdrawn`); `publisher_observed` records an external request;
 `publisher_status` (read-only) reports the unit, the connector's identity, the lease, the origin's readiness and
 `publisher_eligible` with reasons. Every step is recorded in the network effects ledger before it is made.
+
+In the development tree (V3-1): `takeover_proof` is optional. A proof that verifies is recorded with the lease
+incarnation (epoch, generation, `acquired_at`), the boot, and the policy's authority and key; a start without a
+proof, or with one refused, resumes under that record (`takeover_proof.method` `resume_same_epoch`, the event
+`takeover_resumed` with the original proof's identity) only while the lease is held, here, live, unsuperseded, at
+the same epoch, generation and acquisition, during the same boot, under the same authority and key, and is
+refused otherwise naming the condition (`no_lease`, `lease_held_elsewhere`, `lease_expired`, `lease_superseded`,
+`no_verified_proof`, `epoch_changed`, `generation_changed`, `lease_reacquired`, `boot_changed`,
+`authority_changed`). `publisher_status` adds `gates` (each gate by name), `active_manager_mark_epoch`,
+`origin_ready_at_lease_epoch`, `unit.invocation_id`, `connector_registered` (the connector's identity and
+registration are read from the journal of the unit's current run only), the lease's `generation` and
+`acquired_at`, and `takeover_resume` (whether a start without a proof would resume now, or the refusal's name).
+At its start the daemon withdraws, connector then mark, every declared publisher present without a live,
+unsuperseded lease held here, in one journaled operation `publisher_startup_withdrawal` (not a request).
 
 ## Experimental: the agent's door to a manager universe (packaged; carried by 0.1.0~experimental7)
 

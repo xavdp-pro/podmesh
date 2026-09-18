@@ -48,7 +48,11 @@ The manager universe answers `GET /ready` on its origin port (8080) with its log
 and replica identities and, **only while the active manager's mark is present**, the epoch it was
 marked with — HTTP 200; without the mark, or on any other path, HTTP 503. The mark is PodMesh's:
 written at `publisher_start` under the epoch gate, removed at `publisher_stop` and by the fence.
-A connector that reaches a replica that is not the active manager gets nothing. The manager's web
+A connector that reaches a replica that is not the active manager gets nothing. The universe's
+`/run` is its overlay, not a tmpfs, so a mark would outlive a stop and a start of the carrier (a
+withdrawal while the carrier is stopped finds no running universe to remove it from): the
+entrypoint removes both of the mark's paths at every start, before the origin starts, and the
+replica claims no role until PodMesh writes the mark again at `publisher_start` (V3-1, web tree). The manager's web
 interface is not served there yet; this responder is the origin the contract requires today.
 
 ## Operations
@@ -79,6 +83,21 @@ with it (`UNIVERSE-NETWORK-CONTRACT.md`, "Failure and cleanup states"), all with
   such; under a policy without a key only the unsigned laboratory kind is accepted, on its
   binding alone, and the answer says `signed: false`. The agent's `previous` narrative is
   recorded beside it and decides nothing.
+  **Same-epoch resume (V3-1).** A proof that verifies is recorded with the lease incarnation it was
+  verified against (epoch, generation, `acquired_at`), this host's boot, and the policy's authority
+  and key. A later start without a proof, or with one refused (expired, say), resumes under that
+  record — method `resume_same_epoch`, journaled as the event `takeover_resumed` with the original
+  proof's identity (the verifying operation, its method, issue, expiry and signature) — only while
+  every one of these holds, and is refused naming the first that does not: the lease is held
+  (`no_lease`), here (`lease_held_elsewhere`), live (`lease_expired`) and unsuperseded
+  (`lease_superseded`); a proof was verified for the resource (`no_verified_proof`); for this very
+  epoch (`epoch_changed`); under the same generation (`generation_changed`) and the same
+  acquisition (`lease_reacquired`: a lapsed lease of this host's retaken keeps its generation and
+  epoch, not its `acquired_at`); during this boot (`boot_changed`); under the same authority and key
+  (`authority_changed`). Each is a condition under which a connector that never stopped is already
+  allowed to continue — the reconciliation leaves it alone only under a live, unsuperseded lease held
+  here at the transition's epoch; across a lapse it is withdrawn; it does not outlive its boot — so
+  a restart under them grants nothing that continuing did not. Anything else needs a valid new proof.
   Then: the publisher's transition recorded `starting` before any effect; the active manager's
   mark written inside the carrier universe and verified; the origin asked at the service address
   and required to answer ready with the expected logical manager, the carrier's replica (as its
@@ -92,6 +111,14 @@ with it (`UNIVERSE-NETWORK-CONTRACT.md`, "Failure and cleanup states"), all with
   holds, are withdrawn by reconciliation at the next startup, before every network mutation and
   at every fence: a publisher from an operation reported failed never stays active.
 - `publisher_stop` (`resource`): the connector stopped and the mark removed, verified.
+- At the daemon's start, before the network reconciliation and before anything is served: every
+  declared publisher with something present (a transition, a connector's or a mark's ledger row, or
+  an active connector unit, recorded or not) whose lease is no longer live, held here and
+  unsuperseded — or whose transition is at another epoch than the lease — is withdrawn, connector
+  then mark, each verified, in one journaled operation `publisher_startup_withdrawal` (its ID
+  `startup-withdrawal-<boot>-<time>`), journaled only when there is something to withdraw. A lease
+  that lapsed while the daemon was down left its connector publishing: the unit is systemd's. The
+  route and the alias stay; withdrawing them is the fence's.
 - `activation_fence`: for every resource this host no longer holds, the publisher is withdrawn
   first — connector stopped, mark removed — **before** the alias and the route go: one
   transition, each step recorded and verified, reported as `publishers_withdrawn`.
@@ -103,7 +130,22 @@ with it (`UNIVERSE-NETWORK-CONTRACT.md`, "Failure and cleanup states"), all with
   carrier; the carrier's replica identity through the control door; the origin's readiness now;
   the active manager's mark (`active_manager_mark`: true while a file is at its path or at the
   previous one; `governor_mark`, deprecated, carries the same value); `publisher_eligible` with
-  the refusal reasons; the last start, stop, fence and observed request.
+  the refusal reasons; the last start, stop, fence and observed request. Since V3-1 also: each
+  gate by name (`gates`: `lease`, `policy`, `service_address`, `credential`); the epoch the mark
+  names (`active_manager_mark_epoch`, read in the origin's order, null when absent); whether the
+  origin answers ready at the lease's epoch with this logical manager and the carrier's replica
+  (`origin_ready_at_lease_epoch`); the unit's current run (`unit.invocation_id`) and whether the
+  connector registered in that run (`connector_registered`; `connector_id` is read from that run's
+  journal only, never from an earlier run's lines); the lease's generation and `acquired_at`; and
+  what a start without a proof would decide now (`takeover_resume`: `possible`, or the refusal's
+  name).
+
+The service address has its own resume, `network_route_resume` (`UNIVERSE-NETWORK-CONTRACT.md`
+for the route itself, `LOCAL-API.md` for the operation): the recorded exclusive route and alias of a
+role this host still holds, put back after the carrier lost them — the dead row withdrawn, then
+published again with the recorded ip, via and resource through every check of a publication — only
+while the lease is live, held here, unsuperseded and was acquired or renewed during this boot, a
+universe runs at `via`, and the kernel holds no other route for the address.
 
 ## Takeover, in order
 
@@ -131,7 +173,13 @@ or refuses rather than proxying elsewhere.
 (`docs/PUBLISHER-FOLLOW-LAB.md`, `packaging/podmesh-publisher-follow`) may start the connector
 when this host is eligible **and** the gate's current takeover proof is installed on the host.
 It does not rotate, publish the exclusive route, or mint a proof. `tools/arm-publisher-follow.py`
-arms the laboratory path on `podmesh-dev-ha`.
+arms the laboratory path on `podmesh-dev-ha`. **Since V3-1 (2026-09-18)** the tick starts with the
+installed proof only when it is for the lease's epoch and otherwise without one, the node then
+resuming at the same epoch or refusing; asks for `network_route_resume` once when the service
+address is the only gate missing; and on a running connector compares the mark's epoch, the origin's
+readiness at the lease's epoch and the registration of the connector's current run, stopping it on a
+mismatch so that the next tick starts it again under the resume rule. The mandate's `not_after`
+stays the human bound: after it the tick renews nothing and resumes nothing.
 
 ## What this contract does not decide
 
@@ -191,3 +239,34 @@ a unit test on an in-memory journal holds the withdrawal's selection of them in 
 tree; an origin that reads only the previous path answers 503 to a mark at the new one, so a node
 running this build is refused at `publisher_start`'s readiness check until the manager image is
 rolled.
+
+**2026-09-18, V3-1, the entry point follows its holder — built and tested without the laboratory,
+not yet run on the hosts:** the same-epoch resume in `publisher_start`, the record of every verified
+proof, `network_route_resume`, the startup withdrawal, the new `publisher_status` fields, the
+registration read from the connector's current run, the follow tick's new branches, and the
+manager universe's entrypoint clearing the mark at every start (web tree). Held by unit tests on
+in-memory journals (`src/publisher.rs`: a verified proof recorded with its lease incarnation and
+boot; with every condition true a start resumes, journaled with the original proof's identity, with
+no proof or an expired one; each condition false is refused under its name, through the start too;
+another acquisition needs a new proof; the startup selection of what is present without
+entitlement; the registration parsed from a run's lines. `src/network.rs`: the resume's refusals, in
+order, from the journal and from the kernel's routes, through the operation itself for those the
+journal alone decides; a gateway compared whole; a verified resume replayed under its ID, repeating
+nothing) and by `tests/check-publisher-follow-script.py` against a stubbed CLI. **What only the
+laboratory proves** (a leg kept with the laboratory's evidence, not in this tree): the
+public page back with no workstation action after the active manager's replica is stopped and
+started through PodMesh, after its PodMesh service restarts, and what a reboot of its host does;
+the route and alias actually re-made in a restarted carrier's namespace; `_SYSTEMD_INVOCATION_ID`
+carried by `cloudflared`'s lines; the startup withdrawal of a connector whose lease lapsed while the
+daemon was down.
+
+**What V3-1 does not do.** It never changes the holder, never acquires, never mints or extends a
+proof, and never renews past the mandate's `not_after`. After a reboot of the holder's host
+nothing resumes: the proof was verified during another boot (`boot_changed`) and the ledger's /32
+is withdrawn at boot and never re-applied (`network_reapply`); the entitlement has to be decided
+again, by the gate today. The takeover at the barrier stays unsound while the old holder's mandate
+renews: the barrier (`rotation + lease + margin`) ignores `not_after`, and a holder cut from the
+gate but not from its own address keeps renewing its lease in its own journal; that closes with
+renewal the old holder cannot grant itself (a later lot). The resume adds no exposure of its own:
+it brings back, on the host whose own journal still entitles it, the connector that would have been
+left running had its carrier never stopped, and that connector carries the same hazard today.
