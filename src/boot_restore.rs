@@ -167,7 +167,7 @@ fn boot_id() -> Result<String, Error> {
 }
 
 /// When this boot began, in seconds since the Unix epoch, on the wall clock as it reads now.
-fn boot_time() -> Option<i64> {
+pub(crate) fn boot_time() -> Option<i64> {
     std::fs::read_to_string("/proc/stat")
         .ok()?
         .lines()

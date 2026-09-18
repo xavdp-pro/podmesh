@@ -17,6 +17,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = PathBuf::from(std::env::var("PODMESH_STATE_DIR").unwrap_or("/var/lib/podmesh".into()));
     let socket = PathBuf::from(std::env::var("PODMESH_SOCKET").unwrap_or("/run/podmesh/api.sock".into()));
     let db = podmesh::open_state(&dir)?;
+    // A connector whose lease lapsed while this daemon was down is still publishing: its unit is
+    // systemd's. It is withdrawn first, connector and mark, in one journaled operation, before the
+    // network reconciliation and before anything is served.
+    match podmesh::withdraw_unentitled_publishers_at_startup(&db) {
+        Ok(report) => eprintln!("PodMesh publisher withdrawal at startup: {report}"),
+        Err(e) => eprintln!("PodMesh publisher withdrawal at startup FAILED: {e}; the reconciliation and the fence will retry it"),
+    }
     // Whatever a crash left half-made on the network is undone before anything is served: an
     // effect that never became effective is never assumed. The report goes to the journal.
     match podmesh::reconcile_network(&db) {

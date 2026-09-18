@@ -115,6 +115,9 @@ pub fn all() -> Value {
         uuid("exclusive_resource", "the resource whose lease must be held here (optional)"),
     ])));
     put("network_route_withdraw", op("host", "none", "removes the route and the alias, verified", Some(vec![])));
+    put("network_route_resume", op("host", "lease", "puts back the recorded exclusive route and alias of a role this host still holds, after the carrier lost them: the dead row withdrawn, then published again with the recorded ip, via and resource; only under a lease live, held here, unsuperseded and acquired or renewed during this boot, a universe running at via and no other kernel route for the address", Some(vec![
+        uuid("exclusive_resource", "the resource whose recorded exclusive route is resumed"),
+    ])));
     put("network_status", op("read", "none", "the declaration, the allocations, the effects ledger and what the kernel holds now", Some(vec![])));
 
     put("secret_declare", op("host", "none", "a secret from the root-only inbox into Podman's store, its digest verified; names are immutable", Some(vec![
@@ -131,13 +134,13 @@ pub fn all() -> Value {
         f("credential", "string", true, "the declared secret holding the tunnel credential"),
         int("origin_port", false, 1, Some(65535), "the origin's port (default 8080)"),
     ])));
-    put("publisher_start", op("host", "lease", "starts the connector, under the lease, the service address and the authority's takeover document", Some(vec![
+    put("publisher_start", op("host", "lease", "starts the connector, under the lease, the service address and the authority's takeover document, or resumes at the same epoch under the one this host already verified", Some(vec![
         uuid("resource", "the resource"),
-        f("takeover_proof", "object", true, "the gate's document for this epoch, signed when the policy names a key"),
+        f("takeover_proof", "object", false, "the gate's document for this epoch, signed when the policy names a key; without it, or when it is refused, the start resumes under the proof this host verified for this epoch while the lease is the same incarnation, live, held here, unsuperseded, in the same boot"),
         f("previous", "object", false, "the agent's account of the previous publisher, recorded as provenance"),
     ])));
     put("publisher_stop", op("host", "none", "stops the connector and removes the active manager's mark (active_manager_mark)", Some(vec![uuid("resource", "the resource")])));
-    put("publisher_status", op("read", "none", "the declaration, the unit, the connector's identity, the lease, the origin's readiness, the active manager's mark (active_manager_mark; governor_mark, deprecated, carries the same value for one release) and eligibility", Some(vec![uuid("resource", "the resource")])));
+    put("publisher_status", op("read", "none", "the declaration, the unit and its current run, the connector's identity and registration from that run only, the lease, the origin's readiness and whether it is ready at the lease's epoch, the active manager's mark and its epoch (active_manager_mark, active_manager_mark_epoch; governor_mark, deprecated, carries the mark's presence for one release), eligibility with each gate by name, and whether a same-epoch resume would be accepted", Some(vec![uuid("resource", "the resource")])));
     put("publisher_observed", op("host", "none", "records what the public hostname answered, as provenance", Some(vec![
         uuid("resource", "the resource"), f("observation", "object", true, "what was observed"),
     ])));

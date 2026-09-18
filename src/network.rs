@@ -932,88 +932,18 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
             lc::token(uuid)?;
             let ip = identifier_ip(lc::text(request, "ip")?, "ip")?;
             let via = identifier_ip(lc::text(request, "via")?, "via")?;
-            let d = declared(db)?.ok_or("No network is declared on this host")?;
-            if d.state != "effective" {
-                return Err(format!("the network declaration on this host is in state {}, not effective", d.state).into());
-            }
-            if !Cidr::parse(&d.prefix, "prefix")?.contains(ip) {
-                return Err(format!("{ip} is outside the declared prefix {}", d.prefix)).map_err(|e| e.into());
-            }
-            let placed_here: i64 = db.query_row("SELECT COUNT(*) FROM network_allocations WHERE universe_uuid=?1 AND released_at IS NULL", [uuid], |r| r.get(0))?;
-            if placed_here > 0 {
-                return Err("the universe is allocated on this host; a route to elsewhere would announce it twice".into());
-            }
-            // An exclusive route -- the service address of a role only one host may hold -- is published
-            // only by the host holding that role's live activation lease under the epoch gate. The
-            // route records the resource, and the self-fence withdraws it when the lease is gone.
             let resource = match request.get("exclusive_resource") {
                 None => None,
-                Some(v) => {
-                    let r = v.as_str().ok_or("exclusive_resource must be a string")?;
-                    lc::token(r)?;
-                    if crate::activation::policy(db, r)?.is_none() {
-                        return Err(format!("exclusive_resource {r} is under no activation policy on this host; an exclusive route needs the lease of a declared resource").into());
-                    }
-                    crate::activation::refuse_if_not_activated(db, r, "network_route_publish")?;
-                    Some(r.to_string())
-                }
+                Some(v) => Some(v.as_str().ok_or("exclusive_resource must be a string")?),
             };
-            let dst = format!("{ip}/32");
-            match routes_for(&dst) {
-                None => return Err("the kernel's routes could not be read; refusing on an unknown state".into()),
-                Some(r) if !r.is_empty() => return Err(format!("a route for {ip} is already effective: {}; withdraw it first", r.join("; ")).into()),
-                _ => {}
-            }
-            let existing: i64 = db.query_row("SELECT COUNT(*) FROM network_routes WHERE ip=?1", [ip.to_string()], |r| r.get(0))?;
-            if existing > 0 {
-                return Err(format!("a route for {ip} is already recorded here; withdraw it first").into());
-            }
-            // An exclusive route announces a role's address; the replica it points at must carry
-            // that address to answer there. So the route must point at a running universe of this
-            // host, which receives the address as an alias inside its own network namespace, added
-            // before the route and verified from inside; the route follows. Both are recorded before
-            // they are made, under the route's address, and the route's own row is written first,
-            // `applying`, so that the fence has a durable target from the first moment.
-            let mut alias_universe: Option<String> = None;
-            if resource.is_some() {
-                let Some((carrier, _pid)) = universe_at(db, &via.to_string())? else {
-                    return Err(format!("an exclusive route must point at a running universe of this host, which then carries {ip}; nothing runs at {via} here").into());
-                };
-                alias_universe = Some(carrier);
-            }
-            db.execute(
-                "INSERT INTO network_routes(ip,universe_uuid,via,published_at,operation_id,exclusive_resource,alias_universe_uuid,state) VALUES(?1,?2,?3,?4,?5,?6,?7,'applying')",
-                params![ip.to_string(), uuid, via.to_string(), now, id, resource, alias_universe],
-            )?;
-            let mut plan: Vec<(&str, String, Value)> = vec![];
-            if let Some(carrier) = &alias_universe {
-                plan.push(("alias", format!("{ip}@{carrier}"), json!({"ip": ip.to_string(), "universe": carrier})));
-            }
-            plan.push(("route", dst.clone(), json!({"via": via.to_string()})));
-            let mut done: Vec<Effect> = vec![];
-            let mut failure: Option<String> = None;
-            for (kind, key, intent) in plan {
-                let e = effect_begin(db, kind, &key, &ip.to_string(), intent, id)?;
-                done.push(e.clone());
-                if let Err(err) = effect_do(db, &e) {
-                    failure = Some(err.to_string());
-                    break;
-                }
-            }
-            if failure.is_none() {
-                if let Err(err) = fault("before-route-effective") {
-                    failure = Some(err.to_string());
-                }
-            }
-            if let Some(err) = failure {
-                let report = compensate(db, &done);
-                let all_gone = report.iter().all(|r| r["gone"] == json!(true));
-                if all_gone {
-                    db.execute("DELETE FROM network_routes WHERE ip=?1", [ip.to_string()])?;
-                }
-                return Err(format!("{err}; compensation: {}{}", json!(report), if all_gone { "" } else { "; the route's record is kept for reconciliation" }).into());
-            }
-            db.execute("UPDATE network_routes SET state='effective' WHERE ip=?1", [ip.to_string()])?;
+            route_publish(db, uuid, ip, via, resource, id, now)?;
+        }
+        "network_route_resume" => {
+            let resource = lc::text(request, "exclusive_resource")?;
+            lc::token(resource)?;
+            let mut report = route_resume(db, resource, id, now)?;
+            report["effective_after"] = view(db)?;
+            return Ok(report);
         }
         "network_route_withdraw" => {
             let uuid = lc::text(request, "universe_uuid")?;
@@ -1033,6 +963,225 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
         _ => return Err("Unsupported network operation".into()),
     }
     view(db)
+}
+
+/// The publication of one /32 route, exclusive under a resource when named: every check, then the
+/// row and its effects, each recorded before it is made. What `network_route_publish` does, and what
+/// `network_route_resume` does again with a route's recorded ip, via and resource.
+fn route_publish(db: &Connection, uuid: &str, ip: Ipv4Addr, via: Ipv4Addr, exclusive: Option<&str>, id: &str, now: i64) -> Result<(), Error> {
+    let d = declared(db)?.ok_or("No network is declared on this host")?;
+    if d.state != "effective" {
+        return Err(format!("the network declaration on this host is in state {}, not effective", d.state).into());
+    }
+    if !Cidr::parse(&d.prefix, "prefix")?.contains(ip) {
+        return Err(format!("{ip} is outside the declared prefix {}", d.prefix)).map_err(|e| e.into());
+    }
+    let placed_here: i64 = db.query_row("SELECT COUNT(*) FROM network_allocations WHERE universe_uuid=?1 AND released_at IS NULL", [uuid], |r| r.get(0))?;
+    if placed_here > 0 {
+        return Err("the universe is allocated on this host; a route to elsewhere would announce it twice".into());
+    }
+    // An exclusive route -- the service address of a role only one host may hold -- is published
+    // only by the host holding that role's live activation lease under the epoch gate. The
+    // route records the resource, and the self-fence withdraws it when the lease is gone.
+    let resource = match exclusive {
+        None => None,
+        Some(r) => {
+            lc::token(r)?;
+            if crate::activation::policy(db, r)?.is_none() {
+                return Err(format!("exclusive_resource {r} is under no activation policy on this host; an exclusive route needs the lease of a declared resource").into());
+            }
+            crate::activation::refuse_if_not_activated(db, r, "network_route_publish")?;
+            Some(r.to_string())
+        }
+    };
+    let dst = format!("{ip}/32");
+    match routes_for(&dst) {
+        None => return Err("the kernel's routes could not be read; refusing on an unknown state".into()),
+        Some(r) if !r.is_empty() => return Err(format!("a route for {ip} is already effective: {}; withdraw it first", r.join("; ")).into()),
+        _ => {}
+    }
+    let existing: i64 = db.query_row("SELECT COUNT(*) FROM network_routes WHERE ip=?1", [ip.to_string()], |r| r.get(0))?;
+    if existing > 0 {
+        return Err(format!("a route for {ip} is already recorded here; withdraw it first").into());
+    }
+    // An exclusive route announces a role's address; the replica it points at must carry
+    // that address to answer there. So the route must point at a running universe of this
+    // host, which receives the address as an alias inside its own network namespace, added
+    // before the route and verified from inside; the route follows. Both are recorded before
+    // they are made, under the route's address, and the route's own row is written first,
+    // `applying`, so that the fence has a durable target from the first moment.
+    let mut alias_universe: Option<String> = None;
+    if resource.is_some() {
+        let Some((carrier, _pid)) = universe_at(db, &via.to_string())? else {
+            return Err(format!("an exclusive route must point at a running universe of this host, which then carries {ip}; nothing runs at {via} here").into());
+        };
+        alias_universe = Some(carrier);
+    }
+    db.execute(
+        "INSERT INTO network_routes(ip,universe_uuid,via,published_at,operation_id,exclusive_resource,alias_universe_uuid,state) VALUES(?1,?2,?3,?4,?5,?6,?7,'applying')",
+        params![ip.to_string(), uuid, via.to_string(), now, id, resource, alias_universe],
+    )?;
+    let mut plan: Vec<(&str, String, Value)> = vec![];
+    if let Some(carrier) = &alias_universe {
+        plan.push(("alias", format!("{ip}@{carrier}"), json!({"ip": ip.to_string(), "universe": carrier})));
+    }
+    plan.push(("route", dst.clone(), json!({"via": via.to_string()})));
+    let mut done: Vec<Effect> = vec![];
+    let mut failure: Option<String> = None;
+    for (kind, key, intent) in plan {
+        let e = effect_begin(db, kind, &key, &ip.to_string(), intent, id)?;
+        done.push(e.clone());
+        if let Err(err) = effect_do(db, &e) {
+            failure = Some(err.to_string());
+            break;
+        }
+    }
+    if failure.is_none() {
+        if let Err(err) = fault("before-route-effective") {
+            failure = Some(err.to_string());
+        }
+    }
+    if let Some(err) = failure {
+        let report = compensate(db, &done);
+        let all_gone = report.iter().all(|r| r["gone"] == json!(true));
+        if all_gone {
+            db.execute("DELETE FROM network_routes WHERE ip=?1", [ip.to_string()])?;
+        }
+        return Err(format!("{err}; compensation: {}{}", json!(report), if all_gone { "" } else { "; the route's record is kept for reconciliation" }).into());
+    }
+    db.execute("UPDATE network_routes SET state='effective' WHERE ip=?1", [ip.to_string()])?;
+    Ok(())
+}
+
+/// The recorded exclusive route of a resource, as a resume reads it: ip, universe, via, the carrier
+/// the alias was put in, and the row's state.
+#[derive(Clone, Debug, PartialEq)]
+struct RecordedRoute {
+    ip: String,
+    universe: String,
+    via: String,
+    alias: Option<String>,
+    state: String,
+}
+
+fn recorded_exclusive(db: &Connection, resource: &str) -> Result<Option<RecordedRoute>, Error> {
+    Ok(db
+        .query_row(
+            "SELECT ip,universe_uuid,via,alias_universe_uuid,COALESCE(state,'effective') FROM network_routes WHERE exclusive_resource=?1",
+            [resource],
+            |r| Ok(RecordedRoute { ip: r.get(0)?, universe: r.get(1)?, via: r.get(2)?, alias: r.get(3)?, state: r.get(4)? }),
+        )
+        .optional()?)
+}
+
+/// Whether one line of `ip route show` names `via` as its gateway: the word after `via`, compared
+/// whole, so that 10.86.1.1 is not read inside 10.86.1.10.
+fn line_via(line: &str, via: &str) -> bool {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    words.windows(2).any(|w| w[0] == "via" && w[1] == via)
+}
+
+/// The resume's first half, from this host's journal alone: the resource under a policy, its exclusive
+/// route recorded and settled, its lease live, held here and unsuperseded (the lease gate's answer, as
+/// `entitled`), and that lease acquired or renewed during this boot. A named refusal otherwise.
+fn route_resume_gate(policy: bool, recorded: Option<&RecordedRoute>, entitled: Result<(), String>, renewed_this_boot: bool) -> Result<(), (&'static str, String)> {
+    if !policy {
+        return Err(("no_policy", "the resource is under no activation policy on this host".into()));
+    }
+    let Some(r) = recorded else {
+        return Err(("no_recorded_route", "no exclusive route is recorded here for the resource; there is nothing to resume, and a first publication is network_route_publish's".into()));
+    };
+    if r.state != "effective" {
+        return Err(("route_incomplete", format!("the recorded route for {} is {}; the reconciliation undoes it, nothing resumes it", r.ip, r.state)));
+    }
+    if let Err(why) = entitled {
+        return Err(("lease_not_entitled", why));
+    }
+    // The V1 rule: a host that was down cannot know what was decided meanwhile. The ledger's /32 is
+    // withdrawn at boot and never re-applied from it; a resume therefore needs an entitlement decided
+    // again during this boot, which also keeps it from ever acting as a restore after a reboot.
+    if !renewed_this_boot {
+        return Err(("lease_not_renewed_this_boot", "the lease was neither acquired nor renewed during this boot".into()));
+    }
+    Ok(())
+}
+
+/// What a resume does, once the gate passed.
+#[derive(Debug, PartialEq)]
+enum ResumePlan {
+    /// The route via `via` is in the kernel and the recorded carrier carries the address: nothing to do.
+    AlreadyEffective,
+    /// Withdraw the dead row, then publish again with the recorded ip, via and resource, the address
+    /// carried by `carrier`, the universe running at `via` now.
+    Resume { carrier: String },
+}
+
+/// The resume's second half, from the kernel and Podman: the kernel's routes for the address, whether
+/// the recorded carrier still carries it, and the universe running at `via` now. Refused when those
+/// could not be read, when the kernel holds a route for the address through anything but `via` --
+/// somebody else's, never touched -- and when nothing runs at `via`.
+fn route_resume_plan(recorded: &RecordedRoute, kernel: Option<&[String]>, alias_effective: Option<bool>, carrier: Option<&str>) -> Result<ResumePlan, (&'static str, String)> {
+    let Some(kernel) = kernel else {
+        return Err(("kernel_unknown", "the kernel's routes could not be read; refusing on an unknown state".into()));
+    };
+    if let Some(other) = kernel.iter().find(|l| !line_via(l, &recorded.via)) {
+        return Err(("other_kernel_route", format!("the kernel holds a route for {} that is not this resume's: {other}", recorded.ip)));
+    }
+    let route_there = !kernel.is_empty();
+    if route_there && alias_effective == Some(true) && carrier.is_some_and(|c| recorded.alias.as_deref() == Some(c)) {
+        return Ok(ResumePlan::AlreadyEffective);
+    }
+    let Some(carrier) = carrier else {
+        return Err(("no_carrier_at_via", format!("nothing runs at {} on this host to carry {}", recorded.via, recorded.ip)));
+    };
+    Ok(ResumePlan::Resume { carrier: carrier.to_string() })
+}
+
+/// `network_route_resume`: the exclusive route and alias of a role this host still holds, put back
+/// after the carrier that held the address lost it -- a stop, a restart, a roll that recreated it at
+/// the same address. The alias lives in the carrier's network namespace and dies with it; the /32
+/// goes with the bridge's interface when the carrier was its only user; the ledger still says both
+/// are effective and the reconciliation only reports that drift. Withdraws the dead row with what it
+/// recorded, then publishes again with the recorded ip, via and resource, through every check a
+/// publication passes. Journaled like every network mutation: the same operation ID replays the
+/// verified answer and repeats nothing; an effective route answers `already_effective` and changes
+/// nothing. It never changes the holder, never acquires or renews, and never acts after a boot until
+/// the lease has been decided again.
+fn route_resume(db: &Connection, resource: &str, id: &str, now: i64) -> Result<Value, Error> {
+    let refused = |(code, why): (&str, String)| -> Error { format!("network_route_resume refused ({code}): {why}").into() };
+    let policy = crate::activation::policy(db, resource)?.is_some();
+    let recorded = recorded_exclusive(db, resource)?;
+    let entitled = crate::activation::refuse_if_not_activated(db, resource, "network_route_resume").map_err(|e| e.to_string());
+    let renewed = match crate::boot_restore::boot_time() {
+        Some(booted) => crate::activation::renewed_since(db, resource, booted)?,
+        None => false,
+    };
+    route_resume_gate(policy, recorded.as_ref(), entitled, renewed).map_err(refused)?;
+    let r = recorded.ok_or("no recorded route")?;
+    // Checked before anything is withdrawn: a publication would refuse on it after the withdrawal,
+    // and the record of what to resume would be gone with the dead row.
+    if !declared(db)?.is_some_and(|d| d.state == "effective") {
+        return Err(refused(("declaration_not_effective", "this host's network declaration is not effective; the route could not be published again".into())));
+    }
+    let kernel = routes_for(&format!("{}/32", r.ip));
+    let alias_effective = r.alias.as_ref().and_then(|a| running_pid(a).ok().flatten()).and_then(|pid| alias_present(pid, &r.ip));
+    let carrier = universe_at(db, &r.via)?.map(|(c, _)| c);
+    let plan = route_resume_plan(&r, kernel.as_deref(), alias_effective, carrier.as_deref()).map_err(refused)?;
+    let ResumePlan::Resume { carrier } = plan else {
+        return Ok(json!({"exclusive_resource": resource, "ip": r.ip, "via": r.via, "resumed": false, "already_effective": true, "carrier": r.alias}));
+    };
+    let ip = identifier_ip(&r.ip, "the recorded ip")?;
+    let via = identifier_ip(&r.via, "the recorded via")?;
+    let withdrawn = withdraw_route(db, &r.ip)?;
+    if withdrawn["withdrawn"] != json!(true) {
+        return Err(format!("network_route_resume: the dead row for {} could not be withdrawn: {withdrawn}", r.ip).into());
+    }
+    fault("resume-after-withdrawal")?;
+    route_publish(db, &r.universe, ip, via, Some(resource), id, now)
+        .map_err(|e| format!("network_route_resume: the dead row was withdrawn, and publishing again failed: {e}; a publication is needed (network_route_publish)"))?;
+    Ok(json!({"exclusive_resource": resource, "ip": r.ip, "via": r.via, "resumed": true, "already_effective": false,
+              "carrier_before": r.alias, "carrier_now": carrier, "withdrawn": withdrawn,
+              "note": "the recorded exclusive route and alias published again under the lease this host holds, live, unsuperseded and renewed during this boot"}))
 }
 
 /// Whether this host's declaration is effective in the kernel and Podman now: its state recorded
@@ -1258,4 +1407,148 @@ pub(crate) fn exclusive_route_held(db: &Connection, resource: &str) -> Result<bo
 pub(crate) fn incomplete_effects(db: &Connection) -> Result<usize, Error> {
     ensure_schema(db)?;
     Ok(effect_rows(db, None)?.iter().filter(|e| e.state != "effective").count())
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    const R: &str = "91eeb6bf-5489-405b-b77a-53105b0aff7a";
+    const HOST: &str = "5d1c0b8e-3f59-4d0e-9d7a-2a1e7c4b9f10";
+    const CARRIER: &str = "c7a1f732-80b5-4421-9241-e08066f04cb8";
+
+    fn recorded(alias: Option<&str>, state: &str) -> RecordedRoute {
+        RecordedRoute { ip: "10.86.0.100".into(), universe: R.into(), via: "10.86.1.10".into(), alias: alias.map(str::to_string), state: state.into() }
+    }
+
+    fn code<T: std::fmt::Debug>(r: Result<T, (&'static str, String)>) -> &'static str {
+        r.map(|_| "passes").unwrap_or_else(|(c, _)| c)
+    }
+
+    #[test]
+    fn the_gate_names_each_refusal_in_order() {
+        let route = recorded(Some(CARRIER), "effective");
+        assert_eq!(code(route_resume_gate(true, Some(&route), Ok(()), true)), "passes");
+        assert_eq!(code(route_resume_gate(false, Some(&route), Ok(()), true)), "no_policy");
+        assert_eq!(code(route_resume_gate(true, None, Ok(()), true)), "no_recorded_route");
+        for state in ["applying", "removing"] {
+            assert_eq!(code(route_resume_gate(true, Some(&recorded(Some(CARRIER), state)), Ok(()), true)), "route_incomplete");
+        }
+        for why in ["none is held", "held by another host", "expired 5 seconds ago", "superseded by epoch 158"] {
+            let r = route_resume_gate(true, Some(&route), Err(why.into()), true);
+            assert!(matches!(&r, Err(("lease_not_entitled", w)) if w == why), "{r:?}");
+        }
+        assert_eq!(code(route_resume_gate(true, Some(&route), Ok(()), false)), "lease_not_renewed_this_boot");
+        // The order: an unentitled lease is named before the boot rule, the absence of a route before both.
+        assert_eq!(code(route_resume_gate(true, None, Err("x".into()), false)), "no_recorded_route");
+        assert_eq!(code(route_resume_gate(true, Some(&route), Err("x".into()), false)), "lease_not_entitled");
+    }
+
+    #[test]
+    fn the_plan_reads_the_kernel_and_the_carrier() {
+        let route = recorded(Some(CARRIER), "effective");
+        let ours = vec!["10.86.0.100 via 10.86.1.10 dev podman1".to_string()];
+        let none: Vec<String> = vec![];
+        // The carrier stopped and started again (same universe) or recreated (another): the address
+        // and possibly the route are gone, and a universe runs at via again -- resume.
+        assert_eq!(route_resume_plan(&route, Some(&none), None, Some(CARRIER)), Ok(ResumePlan::Resume { carrier: CARRIER.into() }));
+        assert_eq!(route_resume_plan(&route, Some(&none), Some(false), Some("another")), Ok(ResumePlan::Resume { carrier: "another".into() }));
+        // The kernel kept our route (the bridge had other users) and the alias is gone: resume.
+        assert_eq!(route_resume_plan(&route, Some(&ours), Some(false), Some(CARRIER)), Ok(ResumePlan::Resume { carrier: CARRIER.into() }));
+        // Everything there: nothing to do, whatever operation ID asks.
+        assert_eq!(route_resume_plan(&route, Some(&ours), Some(true), Some(CARRIER)), Ok(ResumePlan::AlreadyEffective));
+        // The address carried by the recorded carrier, but another universe now runs at via: not
+        // effective as recorded; resumed onto the one at via.
+        assert_eq!(route_resume_plan(&route, Some(&ours), Some(true), Some("another")), Ok(ResumePlan::Resume { carrier: "another".into() }));
+        // Refusals.
+        assert_eq!(code(route_resume_plan(&route, None, None, Some(CARRIER))), "kernel_unknown");
+        assert_eq!(code(route_resume_plan(&route, Some(&none), None, None)), "no_carrier_at_via");
+        for other in ["10.86.0.100 via 192.168.10.156 dev vmbr0", "10.86.0.100 via 10.86.1.100 dev podman1", "10.86.0.100 dev podman1 scope link"] {
+            let kernel = vec![other.to_string()];
+            assert_eq!(code(route_resume_plan(&route, Some(&kernel), None, Some(CARRIER))), "other_kernel_route", "{other}");
+        }
+        let mixed = vec![ours[0].clone(), "10.86.0.100 via 192.168.10.157 dev vmbr0 metric 50".to_string()];
+        assert_eq!(code(route_resume_plan(&route, Some(&mixed), Some(true), Some(CARRIER))), "other_kernel_route");
+    }
+
+    #[test]
+    fn a_gateway_is_compared_whole() {
+        assert!(line_via("10.86.0.100 via 10.86.1.10 dev podman1", "10.86.1.10"));
+        assert!(!line_via("10.86.0.100 via 10.86.1.100 dev podman1", "10.86.1.10"));
+        assert!(!line_via("10.86.0.100 via 10.86.1.1 dev podman1", "10.86.1.10"));
+        assert!(!line_via("10.86.0.100 dev podman1", "10.86.1.10"));
+    }
+
+    /// A journal with this host's identity and no network, no allocation, no effect: the operation's
+    /// reconciliation then touches neither the kernel nor Podman, and its refusals from the journal
+    /// alone can be asked for through the operation itself.
+    fn journal() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
+        db.execute("INSERT INTO metadata VALUES('host_uuid',?1)", [HOST]).unwrap();
+        lc::ensure_schema(&db).unwrap();
+        ensure_schema(&db).unwrap();
+        crate::activation::ensure_schema(&db).unwrap();
+        crate::publisher::ensure_schema(&db).unwrap();
+        db
+    }
+
+    fn resume(db: &Connection, id: &str) -> Result<Value, String> {
+        execute(db, &json!({"operation": "network_route_resume", "operation_id": id, "authorization_ref": "t", "exclusive_resource": R})).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn the_operation_refuses_from_the_journal_and_is_reevaluated_under_the_same_id() {
+        let db = journal();
+        let err = resume(&db, "op-1").unwrap_err();
+        assert!(err.contains("network_route_resume refused (no_policy)"), "{err}");
+        db.execute("INSERT INTO activation_policy(universe_uuid,lease_seconds,takeover_margin_seconds,declared_at,operation_id,authority_id) VALUES(?1,3600,30,0,'p','lab-gate')", [R]).unwrap();
+        // A refused operation is re-evaluated under its ID, never replayed as a refusal.
+        let err = resume(&db, "op-1").unwrap_err();
+        assert!(err.contains("(no_recorded_route)"), "{err}");
+        db.execute(
+            "INSERT INTO network_routes(ip,universe_uuid,via,published_at,operation_id,exclusive_resource,alias_universe_uuid,state) VALUES('10.86.0.100',?1,'10.86.1.10',0,'pub',?1,?2,'effective')",
+            params![R, CARRIER],
+        )
+        .unwrap();
+        let err = resume(&db, "op-1").unwrap_err();
+        assert!(err.contains("(lease_not_entitled)") && err.contains("none is held"), "{err}");
+        let now = crate::now() as i64;
+        db.execute("INSERT INTO activation_leases(universe_uuid,holder_host_uuid,generation,acquired_at,expires_at,operation_id,epoch,grant_id) VALUES(?1,?2,1,1,?3,'a',157,'g')",
+                   params![R, HOST, now - 1]).unwrap();
+        let err = resume(&db, "op-1").unwrap_err();
+        assert!(err.contains("(lease_not_entitled)") && err.contains("expired"), "{err}");
+        db.execute("UPDATE activation_leases SET expires_at=?1", [now + 600]).unwrap();
+        db.execute("INSERT INTO activation_epochs VALUES(?1,'lab-gate',158,'g158','elsewhere',0,'s')", [R]).unwrap();
+        let err = resume(&db, "op-1").unwrap_err();
+        assert!(err.contains("(lease_not_entitled)") && err.contains("superseded by epoch 158"), "{err}");
+        db.execute("DELETE FROM activation_epochs", []).unwrap();
+        // Live, held here, unsuperseded -- but acquired and renewed only before this boot began.
+        db.execute("INSERT INTO activation_lease_history(universe_uuid,holder_host_uuid,generation,event,at,operation_id) VALUES(?1,?2,1,'renewed',1,'old')", params![R, HOST]).unwrap();
+        let err = resume(&db, "op-1").unwrap_err();
+        assert!(err.contains("(lease_not_renewed_this_boot)"), "{err}");
+        let status: String = db.query_row("SELECT status FROM operations WHERE id='op-1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(status, "failed");
+        // Renewed during this boot; this journal declares no network, so a publication after the
+        // withdrawal could not succeed: refused before anything is withdrawn.
+        db.execute("INSERT INTO activation_lease_history(universe_uuid,holder_host_uuid,generation,event,at,operation_id) VALUES(?1,?2,1,'renewed',?3,'now')", params![R, HOST, now]).unwrap();
+        let err = resume(&db, "op-1").unwrap_err();
+        assert!(err.contains("(declaration_not_effective)"), "{err}");
+        // Nothing was touched by any of those refusals: the recorded route is as it was.
+        assert_eq!(recorded_exclusive(&db, R).unwrap(), Some(RecordedRoute { ip: "10.86.0.100".into(), universe: R.into(), via: "10.86.1.10".into(), alias: Some(CARRIER.into()), state: "effective".into() }));
+    }
+
+    #[test]
+    fn a_verified_resume_is_replayed_under_its_id_and_repeats_nothing() {
+        let db = journal();
+        let request = json!({"operation": "network_route_resume", "operation_id": "op-done", "authorization_ref": "t", "exclusive_resource": R});
+        let result = json!({"exclusive_resource": R, "resumed": true, "carrier_now": CARRIER});
+        db.execute("INSERT INTO operations VALUES('op-done',?1,'verified',?2)", params![request.to_string(), result.to_string()]).unwrap();
+        // No policy, no route, no lease: had anything been evaluated, it would have been refused.
+        let again = execute(&db, &request).unwrap();
+        assert_eq!((again["replayed"].clone(), again["resumed"].clone(), again["carrier_now"].clone()), (json!(true), json!(true), json!(CARRIER)));
+        // Another request under the same ID is refused by the journal.
+        let other = json!({"operation": "network_route_resume", "operation_id": "op-done", "authorization_ref": "t", "exclusive_resource": "00000000-0000-4000-8000-000000000002"});
+        assert!(execute(&db, &other).unwrap_err().to_string().contains("different request"));
+    }
 }

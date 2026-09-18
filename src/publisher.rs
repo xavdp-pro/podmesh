@@ -16,8 +16,13 @@
 //!   agent's word, recorded as provenance and refused when absent), the active manager's mark is
 //!   written inside the carrier universe, and the origin answers ready at the service address with
 //!   the expected logical manager, replica and epoch. Then the connector runs as a transient unit
-//!   from a root-only runtime copy of the credential, and the unit's activity is verified.
+//!   from a root-only runtime copy of the credential, and the unit's activity is verified. The
+//!   takeover proof verified there is recorded; a later start at the same epoch may resume under it
+//!   (`resume_same_epoch`) while the lease is the same incarnation, live, held here and unsuperseded,
+//!   in the same boot -- the conditions under which a connector that never stopped continues.
 //! - `publisher_stop`: the connector stopped and the mark removed, verified.
+//! - at the daemon's start (`withdraw_at_startup`): a connector present without entitlement -- a
+//!   lease that lapsed while the daemon was down -- is withdrawn, connector and mark, journaled.
 //! - the fence (`withdraw_unentitled`): for a resource this host no longer holds, the connector
 //!   is stopped and the mark removed BEFORE the alias and the route go -- one transition, each
 //!   step recorded, each verified.
@@ -76,7 +81,20 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             state TEXT NOT NULL,
             epoch INTEGER NOT NULL,
             operation_id TEXT NOT NULL,
-            changed_at INTEGER NOT NULL);",
+            changed_at INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS publisher_takeover_verified(
+            resource TEXT NOT NULL,
+            epoch INTEGER NOT NULL,
+            generation INTEGER NOT NULL,
+            acquired_at INTEGER NOT NULL,
+            boot_id TEXT NOT NULL,
+            authority_id TEXT NOT NULL,
+            authority_key TEXT NOT NULL,
+            proof TEXT NOT NULL,
+            verified TEXT NOT NULL,
+            verified_at INTEGER NOT NULL,
+            operation_id TEXT NOT NULL,
+            PRIMARY KEY(resource, epoch));",
     )?;
     Ok(())
 }
@@ -233,6 +251,174 @@ fn verify_takeover_proof(db: &Connection, resource: &str, proof: &Value, epoch: 
               "verified_at": now, "signed": signed, "note": origin}))
 }
 
+/// A takeover proof this host verified, with the lease and the boot it was verified under: what a
+/// later start at the same epoch may resume under, and nothing else (V3-1).
+#[derive(Clone, Debug)]
+pub(crate) struct Verified {
+    epoch: i64,
+    generation: i64,
+    acquired_at: i64,
+    boot_id: String,
+    authority_id: String,
+    authority_key: String,
+    proof: Value,
+    verified: Value,
+    verified_at: i64,
+    operation_id: String,
+}
+
+/// Kept at every verification, before any effect of the start: the document, what the verification
+/// said, and the incarnation of the lease it was verified against. One row per resource and epoch; a
+/// later verification at the same epoch (after a retake, say) replaces it.
+#[allow(clippy::too_many_arguments)]
+fn record_verified(db: &Connection, resource: &str, l: &crate::activation::Lease, boot: &str, policy: &crate::activation::Policy, proof: &Value, verified: &Value, id: &str) -> Result<(), Error> {
+    db.execute(
+        "INSERT INTO publisher_takeover_verified VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+         ON CONFLICT(resource,epoch) DO UPDATE SET generation=excluded.generation, acquired_at=excluded.acquired_at, boot_id=excluded.boot_id,
+           authority_id=excluded.authority_id, authority_key=excluded.authority_key, proof=excluded.proof, verified=excluded.verified,
+           verified_at=excluded.verified_at, operation_id=excluded.operation_id",
+        params![resource, l.epoch, l.generation, l.acquired_at, boot, policy.authority_id, policy.authority_key, proof.to_string(), verified.to_string(),
+                crate::now() as i64, id],
+    )?;
+    Ok(())
+}
+
+/// The latest proof this host verified for the resource, at the highest epoch it verified one.
+fn last_verified(db: &Connection, resource: &str) -> Result<Option<Verified>, Error> {
+    Ok(db
+        .query_row(
+            "SELECT epoch,generation,acquired_at,boot_id,authority_id,authority_key,proof,verified,verified_at,operation_id
+             FROM publisher_takeover_verified WHERE resource=?1 ORDER BY epoch DESC LIMIT 1",
+            [resource],
+            |r| {
+                let json = |s: String| serde_json::from_str::<Value>(&s).unwrap_or(Value::Null);
+                Ok(Verified { epoch: r.get(0)?, generation: r.get(1)?, acquired_at: r.get(2)?, boot_id: r.get(3)?, authority_id: r.get(4)?,
+                              authority_key: r.get(5)?, proof: json(r.get(6)?), verified: json(r.get(7)?), verified_at: r.get(8)?, operation_id: r.get(9)? })
+            },
+        )
+        .optional()?)
+}
+
+/// Everything the same-epoch resume is judged on, read from this host's journal and kernel before
+/// anything is decided.
+pub(crate) struct ResumeFacts {
+    recorded: Option<Verified>,
+    lease: Option<crate::activation::Lease>,
+    this_host: String,
+    now: i64,
+    superseded_by: Option<i64>,
+    boot_id: String,
+    /// The resource's policy now: its authority and that authority's key.
+    authority: Option<(String, String)>,
+}
+
+fn resume_facts(db: &Connection, resource: &str, this_host: &str, boot: &str) -> Result<ResumeFacts, Error> {
+    let lease = crate::activation::lease(db, resource)?;
+    let superseded_by = match &lease { Some(l) => crate::activation::superseded_by(db, resource, l)?, None => None };
+    Ok(ResumeFacts {
+        recorded: last_verified(db, resource)?,
+        lease,
+        this_host: this_host.into(),
+        now: crate::now() as i64,
+        superseded_by,
+        boot_id: boot.into(),
+        authority: crate::activation::policy(db, resource)?.map(|p| (p.authority_id, p.authority_key)),
+    })
+}
+
+/// THE SAME-EPOCH RESUME (V3-1). The takeover proof attests one past fact: the transition into this
+/// epoch accounted for the previous holder. The gate stamps it with an hour's life whatever the lease,
+/// while the lease it started is renewed without any proof; a connector that died after that hour
+/// could only come back through a new rotation. A start may instead resume under the proof this host
+/// already verified and recorded, when every condition below holds -- and each is one under which a
+/// connector that never stopped is ALREADY allowed to continue (the reconciliation's entitlement, the
+/// follow tick's eligibility), so a restart under them grants nothing that continuing did not.
+/// Anything else needs a valid new proof. Returns the verification resumed from, or the named refusal.
+fn resume_refusal(f: &ResumeFacts) -> Result<&Verified, (&'static str, String)> {
+    // Live, held here, unsuperseded: the lease gate's four reasons, the very predicate under which the
+    // reconciliation leaves a running connector alone and the fence does not withdraw it.
+    let Some(l) = &f.lease else { return Err(("no_lease", "this host holds no activation lease for the resource".into())) };
+    if l.holder_host_uuid != f.this_host {
+        return Err(("lease_held_elsewhere", "the activation lease is held by another host".into()));
+    }
+    if l.expires_at <= f.now {
+        return Err(("lease_expired", format!("this host's activation lease expired {} seconds ago", f.now - l.expires_at)));
+    }
+    if let Some(seen) = f.superseded_by {
+        return Err(("lease_superseded", format!("this host's activation was superseded by epoch {seen}")));
+    }
+    let Some(r) = &f.recorded else {
+        return Err(("no_verified_proof", "this host never verified a takeover proof for this resource".into()));
+    };
+    // Same epoch: the proof accounts for the transition INTO this epoch. A newer epoch is another
+    // transition, with another previous holder to account for; a running connector under an older
+    // epoch is withdrawn by the reconciliation, which compares the transition's epoch with the lease's.
+    if r.epoch != l.epoch {
+        return Err(("epoch_changed", format!("the proof this host verified is for epoch {}, the lease is under epoch {}", r.epoch, l.epoch)));
+    }
+    // Same generation and same acquisition: the lease is the very incarnation the proof was verified
+    // against, carried forward by renewals only. A lapsed lease of this host's retaken keeps its
+    // generation and epoch but not its `acquired_at`; across the lapse a running connector is withdrawn
+    // (not live, so not entitled), so resuming after a retake would grant what continuing never did.
+    if r.generation != l.generation {
+        return Err(("generation_changed", format!("the proof was verified under lease generation {}, the lease is now generation {}", r.generation, l.generation)));
+    }
+    if r.acquired_at != l.acquired_at {
+        return Err(("lease_reacquired", format!("the lease was acquired again at {} after the proof was verified under the acquisition of {}", l.acquired_at, r.acquired_at)));
+    }
+    // Same boot: a connector never outlives its host's boot (a transient unit, a runtime credential), and
+    // after a boot the entitlement is decided again, never assumed -- the rule of boot_restore and of
+    // the permit, which is bound to the boot.
+    if r.boot_id != f.boot_id {
+        return Err(("boot_changed", "the proof was verified during another boot of this host; after a boot the entitlement is decided again".into()));
+    }
+    // Same authority and key: the proof's origin was checked under the policy as it stood; a policy
+    // naming another authority or another key would have refused that very document.
+    match &f.authority {
+        Some((id, key)) if *id == r.authority_id && *key == r.authority_key => {}
+        _ => return Err(("authority_changed", "the resource's policy no longer names the authority and key the proof was verified under".into())),
+    }
+    Ok(r)
+}
+
+/// Step 4 of a start: the takeover. A presented proof that verifies is recorded and used; otherwise
+/// (none presented, or one refused -- expired, say) the start resumes under the recorded one when the
+/// resume's conditions hold, and the resume is journaled as such with the original proof's identity.
+fn takeover(db: &Connection, resource: &str, request: &Value, epoch: i64, this_host: &str, boot: &str, id: &str) -> Result<Value, Error> {
+    let mut refused = None;
+    if let Some(proof) = request.get("takeover_proof") {
+        match verify_takeover_proof(db, resource, proof, epoch, this_host) {
+            Ok(verified) => {
+                let l = crate::activation::lease(db, resource)?.ok_or("no activation lease")?;
+                let policy = crate::activation::policy(db, resource)?.ok_or("no activation policy")?;
+                record_verified(db, resource, &l, boot, &policy, proof, &verified, id)?;
+                return Ok(verified);
+            }
+            Err(e) => refused = Some(e.to_string()),
+        }
+    }
+    let facts = resume_facts(db, resource, this_host, boot)?;
+    match resume_refusal(&facts) {
+        Ok(r) => {
+            let resumed = json!({
+                "method": "resume_same_epoch", "new_epoch": epoch, "verified_at": facts.now, "signed": r.verified["signed"],
+                "resumed_from": {"operation_id": r.operation_id, "verified_at": r.verified_at, "method": r.verified["method"],
+                                 "previous_epoch": r.verified["previous_epoch"], "previous_holder": r.verified["previous_holder"],
+                                 "issued_at": r.proof["issued_at"], "expires_at": r.proof["expires_at"], "signature": r.proof["signature"]},
+                "presented_proof_refused": refused,
+                "note": "no new proof: the lease is the same incarnation, live, held here and unsuperseded, in the same boot, under the same authority and key, as when this host verified the proof for this epoch",
+            });
+            event(db, resource, "takeover_resumed", id, Some(resumed.clone()))?;
+            Ok(resumed)
+        }
+        Err((code, why)) => Err(match refused {
+            Some(p) => format!("takeover_proof refused: {p}; and no same-epoch resume ({code}): {why}"),
+            None => format!("publisher_start requires `takeover_proof`, the authority's document for this epoch (the tool's rotate prints it; attest-fence upgrades it), unless it resumes under the proof this host already verified for this epoch; no same-epoch resume ({code}): {why}"),
+        }
+        .into()),
+    }
+}
+
 
 pub(crate) struct Publisher {
     resource: String,
@@ -286,15 +472,38 @@ pub(crate) fn unit_state(resource: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// The connector identity cloudflared logged when it registered with Cloudflare, from the
-/// unit's journal: `connection=<id>` on the registration line, the last one.
-fn connector_id(resource: &str) -> Option<String> {
-    let out = std::process::Command::new("journalctl").args(["-u", &unit_name(resource), "--no-pager", "-o", "cat", "-n", "200"]).output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
+/// The unit's current run, as systemd numbers it (`InvocationID`); None when the unit is not loaded,
+/// which for a transient unit collected after its stop means no run at all.
+fn invocation(resource: &str) -> Option<String> {
+    let out = std::process::Command::new("systemctl").args(["show", "-p", "InvocationID", "--value", &unit_name(resource)]).output().ok()?;
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit())).then_some(id)
+}
+
+/// The registration cloudflared logged, from lines of its journal: `connection=<id>` on the last
+/// registration line.
+fn registration(text: &str) -> Option<String> {
     text.lines()
         .rev()
         .filter(|l| l.contains("Registered tunnel connection"))
         .find_map(|l| l.split_whitespace().find_map(|w| w.strip_prefix("connection=").map(str::to_string)))
+}
+
+/// The connector identity cloudflared logged when it registered with Cloudflare, from the journal of
+/// the unit's CURRENT run only: the unit's name carries the lines of every earlier run too (a
+/// connector id was read on a host whose unit was inactive, 2026-09-18), and a registration read from
+/// one of those would pass a connector that never registered for a live one. The registration lines
+/// are asked for by pattern first, so that a long run does not push them out of a bounded tail; a
+/// journal without pattern support is read from its last lines instead.
+fn connector_id(resource: &str) -> Option<String> {
+    let run = invocation(resource)?;
+    let field = format!("_SYSTEMD_INVOCATION_ID={run}");
+    let journal = |extra: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("journalctl").arg(&field).args(["--no-pager", "-o", "cat"]).args(extra).output().ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).to_string())
+    };
+    registration(&journal(&["-g", "Registered tunnel connection", "-n", "50"]).unwrap_or_default())
+        .or_else(|| registration(&journal(&["-n", "2000"]).unwrap_or_default()))
 }
 
 /// The route and alias the resource holds on this host, from the network tables, verified from
@@ -378,6 +587,18 @@ pub(crate) fn mark_written(carrier: &str) -> Option<bool> {
     mark_files(carrier).map(|(current, previous)| current && !previous)
 }
 
+/// The epoch the mark inside the carrier names, read with one `podman exec` in the order the origin
+/// reads it: the current path, else the previous one. None when there is no mark or it could not be
+/// read -- which a caller comparing it with the lease's epoch must treat as a mismatch.
+pub(crate) fn mark_epoch(carrier: &str) -> Option<i64> {
+    let script = format!("cat {MARK_PATH} 2>/dev/null || cat {MARK_PATH_PREVIOUS} 2>/dev/null");
+    let out = std::process::Command::new("podman").args(["exec", &format!("podmesh-{carrier}"), "sh", "-c", &script]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice::<Value>(&out.stdout).ok()?["epoch"].as_i64()
+}
+
 pub(crate) fn mark_remove(carrier: &str) -> Result<(), Error> {
     if mark_present(carrier) == Some(true) {
         lc::podman(lc::QUICK, &["exec", &format!("podmesh-{carrier}"), "rm", "-f", MARK_PATH, MARK_PATH_PREVIOUS])?;
@@ -446,28 +667,41 @@ pub(crate) fn connector_present(resource: &str) -> Option<bool> {
 
 /// The gates of a start, evaluated without effect: what `publisher_status` reports as
 /// `publisher_eligible`, and what `publisher_start` refuses on.
-/// eligible, the refusal reasons, the service (ip, carrier) if effective, the epoch if entitled.
-type Eligibility = (bool, Vec<String>, Option<(String, String)>, Option<i64>);
+/// eligible, the refusal reasons, the service (ip, carrier) if effective, the epoch if entitled, and
+/// each gate by name -- `lease`, `policy`, `service_address`, `credential` -- true when it passes, so
+/// that a caller can tell "eligible but for the service address" from the rest without parsing text.
+type Eligibility = (bool, Vec<String>, Option<(String, String)>, Option<i64>, Value);
 
 fn eligibility(db: &Connection, p: &Publisher) -> Result<Eligibility, Error> {
     let mut reasons = vec![];
     let mut epoch = None;
-    match crate::activation::refuse_if_not_activated(db, &p.resource, "publisher_start") {
-        Ok(()) => epoch = crate::activation::lease(db, &p.resource)?.map(|l| l.epoch),
-        Err(e) => reasons.push(e.to_string()),
-    }
-    if crate::activation::policy(db, &p.resource)?.is_none() {
+    let lease_gate = match crate::activation::refuse_if_not_activated(db, &p.resource, "publisher_start") {
+        Ok(()) => {
+            epoch = crate::activation::lease(db, &p.resource)?.map(|l| l.epoch);
+            true
+        }
+        Err(e) => {
+            reasons.push(e.to_string());
+            false
+        }
+    };
+    let policy_gate = crate::activation::policy(db, &p.resource)?.is_some();
+    if !policy_gate {
         reasons.push(format!("{} is under no activation policy on this host", p.resource));
     }
     let service = service_here(db, &p.resource)?;
     if service.is_none() {
         reasons.push("no effective exclusive route and alias for the resource on this host: publish the service address first".into());
     }
-    match crate::secrets::declared(db, &p.credential) {
-        Ok(()) => {}
-        Err(e) => reasons.push(e.to_string()),
-    }
-    Ok((reasons.is_empty(), reasons, service, epoch))
+    let credential_gate = match crate::secrets::declared(db, &p.credential) {
+        Ok(()) => true,
+        Err(e) => {
+            reasons.push(e.to_string());
+            false
+        }
+    };
+    let gates = json!({"lease": lease_gate, "policy": policy_gate, "service_address": service.is_some(), "credential": credential_gate});
+    Ok((reasons.is_empty(), reasons, service, epoch, gates))
 }
 
 pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
@@ -494,7 +728,7 @@ fn view(db: &Connection, resource: &str) -> Result<Value, Error> {
     let Some(p) = declared(db, resource)? else {
         return Ok(json!({"resource": resource, "declared": false, "publisher_eligible": false, "reasons": ["no publisher declared for this resource on this host"]}));
     };
-    let (eligible, reasons, service, epoch) = eligibility(db, &p)?;
+    let (eligible, reasons, service, epoch, gates) = eligibility(db, &p)?;
     let lease = crate::activation::lease(db, resource)?;
     let readiness = service.as_ref().map(|(ip, _)| match origin_ready(ip, p.origin_port) {
         Ok((status, body)) => json!({"status": status, "body": body}),
@@ -504,25 +738,50 @@ fn view(db: &Connection, resource: &str) -> Result<Value, Error> {
         crate::manager::execute(db, &json!({"operation": "manager_status", "universe_uuid": carrier})).ok().map(|s| s["resident_status"]["replica_id"].clone())
     });
     let mark = service.as_ref().and_then(|(_, carrier)| mark_present(carrier));
+    let mark_epoch = service.as_ref().and_then(|(_, carrier)| mark_epoch(carrier));
+    // The origin as the start requires it: 200, ready, this logical manager, the lease's epoch and the
+    // carrier's own replica. What a follow tick compares on a running connector.
+    let origin_at_epoch = match (&readiness, epoch) {
+        (Some(r), Some(e)) => json!(r["status"] == json!(200) && r["body"]["ready"] == json!(true) && r["body"]["epoch"] == json!(e)
+            && r["body"]["logical_manager_id"] == json!(resource) && carrier_identity.as_ref().is_some_and(|c| !c.is_null() && r["body"]["replica_id"] == *c)),
+        _ => Value::Null,
+    };
+    let connector = connector_id(resource);
+    let this_host = crate::activation::host_uuid_public(db)?;
+    let resume = match crate::activation::boot_id() {
+        Ok(boot) => match resume_refusal(&resume_facts(db, resource, &this_host, &boot)?) {
+            Ok(r) => json!({"possible": true, "verified_epoch": r.epoch, "verified_by": r.operation_id}),
+            Err((code, why)) => json!({"possible": false, "refusal": code, "why": why}),
+        },
+        Err(e) => json!({"possible": false, "refusal": "boot_unknown", "why": e.to_string()}),
+    };
     Ok(json!({
         "resource": resource,
         "declared": {"hostname": p.hostname, "tunnel_uuid": p.tunnel_uuid, "credential": p.credential, "origin_port": p.origin_port},
-        "unit": {"name": unit_name(resource), "state": unit_state(resource)},
-        "connector_id": connector_id(resource),
-        "lease": lease.as_ref().map(|l| json!({"holder_host_uuid": l.holder_host_uuid, "expires_at": l.expires_at, "epoch": l.epoch})),
+        "unit": {"name": unit_name(resource), "state": unit_state(resource), "invocation_id": invocation(resource)},
+        "connector_id": connector,
+        // The registration of the unit's current run only; an earlier run's lines are not read.
+        "connector_registered": connector.is_some(),
+        "lease": lease.as_ref().map(|l| json!({"holder_host_uuid": l.holder_host_uuid, "expires_at": l.expires_at, "epoch": l.epoch,
+                                               "generation": l.generation, "acquired_at": l.acquired_at})),
         "epoch": epoch,
         "service": service.as_ref().map(|(ip, carrier)| json!({"ip": ip, "carrier_universe_uuid": carrier})),
         "carrier_replica_id": carrier_identity,
         "origin_readiness": readiness,
+        "origin_ready_at_lease_epoch": origin_at_epoch,
         "active_manager_mark": mark,
+        "active_manager_mark_epoch": mark_epoch,
         // Deprecated: the field's previous name, the same value, kept for one release.
         "governor_mark": mark,
         "transition": transition_of(db, resource)?.map(|(s, e)| json!({"state": s, "epoch": e})),
         "publisher_eligible": eligible,
+        "gates": gates,
         "reasons": reasons,
+        "takeover_resume": resume,
         "last": {"start": last_event(db, resource, "start")?, "stop": last_event(db, resource, "stop")?, "fence": last_event(db, resource, "fence")?,
-                 "observed": last_event(db, resource, "observed")?},
-        "scope": "this host's declaration, unit, journal and tables, and the origin asked now; the connector's identity is what cloudflared logged; Cloudflare's side is observed only through publisher_observed",
+                 "observed": last_event(db, resource, "observed")?, "takeover_resumed": last_event(db, resource, "takeover_resumed")?,
+                 "startup_withdrawal": last_event(db, resource, "startup_withdrawal")?},
+        "scope": "this host's declaration, unit, journal and tables, and the origin asked now; the connector's identity is what cloudflared logged in its current run; Cloudflare's side is observed only through publisher_observed",
     }))
 }
 
@@ -563,16 +822,16 @@ fn perform(db: &Connection, request: &Value, resource: &str) -> Result<Value, Er
                 return Err("a publisher is already recorded or active on this host; stop it first".into());
             }
             // 1. the epoch gate, 2. the service address effective here, 3. the credential
-            let (eligible, reasons, service, epoch) = eligibility(db, &p)?;
+            let (eligible, reasons, service, epoch, _) = eligibility(db, &p)?;
             if !eligible {
                 return Err(format!("publisher_start refused: {}", reasons.join("; ")).into());
             }
             let (ip, carrier) = service.ok_or("no service address")?;
             let epoch = epoch.ok_or("no epoch on the lease")?;
-            // 4. the takeover proof from the authority (the gate); the agent's `previous` is provenance only
+            // 4. the takeover proof from the authority (the gate), or the same-epoch resume under the one
+            //    this host already verified; the agent's `previous` is provenance only
             let this_host = crate::activation::host_uuid_public(db)?;
-            let proof = request.get("takeover_proof").ok_or("publisher_start requires `takeover_proof`, the authority's document for this epoch (the tool's rotate prints it; attest-fence upgrades it)")?;
-            let proof_verified = verify_takeover_proof(db, resource, proof, epoch, &this_host)?;
+            let proof_verified = takeover(db, resource, request, epoch, &this_host, &crate::activation::boot_id()?, id)?;
             let previous = request.get("previous").cloned().unwrap_or(Value::Null);
             // 5. the transition recorded before any effect; 6. the mark, then readiness at the
             //    service address; 7. the connector, then its registration; 8. effective last.
@@ -713,6 +972,84 @@ pub(crate) fn withdraw_unentitled(db: &Connection, entitled: &dyn Fn(&str) -> bo
     Ok(report)
 }
 
+/// Why this host is not entitled to publish the resource now, or None when it is: a policy, and a
+/// lease held here, live and unsuperseded -- the fence's predicate -- and, when a transition is
+/// recorded, at the transition's epoch.
+fn unentitled_why(db: &Connection, resource: &str, this_host: &str, now: i64) -> Result<Option<String>, Error> {
+    if crate::activation::policy(db, resource)?.is_none() {
+        return Ok(Some("the resource is under no activation policy here".into()));
+    }
+    let Some(l) = crate::activation::lease(db, resource)? else { return Ok(Some("no activation lease is held".into())) };
+    if l.holder_host_uuid != this_host {
+        return Ok(Some("the activation lease is held by another host".into()));
+    }
+    if l.expires_at <= now {
+        return Ok(Some(format!("the activation lease expired {} seconds ago", now - l.expires_at)));
+    }
+    if let Some(seen) = crate::activation::superseded_by(db, resource, &l)? {
+        return Ok(Some(format!("the activation was superseded by epoch {seen}")));
+    }
+    if let Some((_, epoch)) = transition_of(db, resource)?.filter(|(_, e)| *e != l.epoch) {
+        return Ok(Some(format!("the publisher was started at epoch {epoch}, the lease is under epoch {}", l.epoch)));
+    }
+    Ok(None)
+}
+
+/// The resources a startup withdrawal acts on: declared here, with something of a publisher present
+/// -- a transition, a connector's or a mark's ledger row in any state, or an active connector unit,
+/// recorded or not -- and no entitlement now. `active` says whether a resource's connector unit runs.
+fn startup_unentitled(db: &Connection, active: &dyn Fn(&str) -> bool) -> Result<Vec<Value>, Error> {
+    let this_host = crate::activation::host_uuid_public(db)?;
+    let now = crate::now() as i64;
+    let mut s = db.prepare("SELECT resource FROM publishers ORDER BY resource")?;
+    let resources: Vec<String> = s.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    let mut found = vec![];
+    for resource in resources {
+        let present = transition_of(db, &resource)?.is_some() || !publisher_effects(db, &resource)?.is_empty() || active(&resource);
+        if !present {
+            continue;
+        }
+        if let Some(why) = unentitled_why(db, &resource, &this_host, now)? {
+            found.push(json!({"resource": resource, "why": why}));
+        }
+    }
+    Ok(found)
+}
+
+/// At the daemon's start, before anything is served: every connector whose lease is no longer live,
+/// held here and unsuperseded is withdrawn -- the connector stopped, the mark removed, each verified --
+/// in one journaled operation (`publisher_startup_withdrawal`, its ID derived from this boot and the
+/// time). A lease that lapsed while the daemon was down left its connector publishing: the unit is
+/// systemd's, not the daemon's, and nothing else withdrew it (the fence timer is disarmed on the
+/// laboratory, and runs through the daemon anyway). Journaled only when something is to be withdrawn:
+/// an empty start is not evidence. The route and the alias stay: withdrawing them is the fence's.
+pub fn withdraw_at_startup(db: &Connection) -> Result<Value, Error> {
+    lc::ensure_schema(db)?;
+    crate::activation::ensure_schema(db)?;
+    crate::network::ensure_schema(db)?;
+    ensure_schema(db)?;
+    let candidates = startup_unentitled(db, &|resource: &str| connector_present(resource) == Some(true))?;
+    if candidates.is_empty() {
+        return Ok(json!({"withdrawn": [], "journaled": false, "note": "no declared publisher present without entitlement"}));
+    }
+    let boot = crate::activation::boot_id().map(|b| b.replace('-', "")).unwrap_or_else(|_| "unknown".into());
+    let id = format!("startup-withdrawal-{boot}-{}", crate::now());
+    let request = json!({"operation": "publisher_startup_withdrawal", "operation_id": id, "authorization_ref": "podmeshd-startup", "resources": candidates});
+    lc::journaled(db, &request, |db| {
+        let mut report = vec![];
+        for c in &candidates {
+            let resource = c["resource"].as_str().unwrap_or_default();
+            let mut r = withdraw(db, resource, "startup_withdrawal", &id)?;
+            r["why"] = c["why"].clone();
+            report.push(r);
+        }
+        if report.iter().any(|r| r["withdrawn"] != json!(true)) {
+            return Err(format!("the startup withdrawal did not complete: {}", json!(report)).into());
+        }
+        Ok(json!({"withdrawn": report, "journaled": true, "operation_id": id}))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,5 +1104,195 @@ mod tests {
             ("active_manager_mark", "applying"),
         ];
         assert_eq!(found, expected.map(|(k, s)| (k.to_string(), s.to_string())));
+    }
+
+    // ---------------------------------------------------------------- the same-epoch resume (V3-1)
+
+    const HOST: &str = "5d1c0b8e-3f59-4d0e-9d7a-2a1e7c4b9f10";
+    const BOOT: &str = "0b7f6f1e-6a55-4c1d-8f53-1c2d3e4f5a6b";
+    const EPOCH: i64 = 157;
+    const ACQUIRED: i64 = 1_700_000_000;
+
+    /// A journal as a laboratory host holds it for the logical manager: this host's identity, the
+    /// resource under a policy that names an authority (no key: laboratory proofs), and a live lease
+    /// held here at epoch 157, generation 3, the screen at the same epoch.
+    fn gated() -> Connection {
+        let db = journal();
+        db.execute_batch("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
+        db.execute("INSERT INTO metadata VALUES('host_uuid',?1)", [HOST]).unwrap();
+        crate::activation::ensure_schema(&db).unwrap();
+        let now = crate::now() as i64;
+        db.execute(
+            "INSERT INTO activation_policy(universe_uuid,lease_seconds,takeover_margin_seconds,declared_at,operation_id,authority_id,authority_key)
+             VALUES(?1,3600,30,0,'p','lab-gate','')",
+            [R],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO activation_leases(universe_uuid,holder_host_uuid,generation,acquired_at,expires_at,operation_id,epoch,grant_id)
+             VALUES(?1,?2,3,?3,?4,'a',?5,'g157')",
+            params![R, HOST, ACQUIRED, now + 3000, EPOCH],
+        )
+        .unwrap();
+        db.execute("INSERT INTO activation_epochs VALUES(?1,'lab-gate',?2,'g157',?3,0,'a')", params![R, EPOCH, HOST]).unwrap();
+        db
+    }
+
+    /// The gate's laboratory document for the transition into `EPOCH`, same holder, issued `age`
+    /// seconds ago with the gate's one hour of life.
+    fn proof(age: i64) -> Value {
+        let issued = crate::now() as i64 - age;
+        json!({"kind": crate::signing::UNSIGNED_PROOF_KIND, "authority_id": "lab-gate", "resource": R, "new_holder": HOST,
+               "previous_holder": HOST, "new_epoch": EPOCH, "previous_epoch": EPOCH - 1, "issued_at": issued, "expires_at": issued + 3600,
+               "method": "same_holder"})
+    }
+
+    fn start(db: &Connection, proof: Option<Value>, boot: &str, id: &str) -> Result<Value, Error> {
+        let request = match proof { Some(p) => json!({"takeover_proof": p}), None => json!({}) };
+        takeover(db, R, &request, EPOCH, HOST, boot, id)
+    }
+
+    fn refusal(db: &Connection, boot: &str) -> &'static str {
+        match resume_refusal(&resume_facts(db, R, HOST, boot).unwrap()) {
+            Ok(_) => "resumes",
+            Err((code, _)) => code,
+        }
+    }
+
+    #[test]
+    fn a_verified_proof_is_recorded_with_the_lease_incarnation_and_the_boot() {
+        let db = gated();
+        let v = start(&db, Some(proof(10)), BOOT, "op-verify").unwrap();
+        assert_eq!(v["method"], json!("same_holder"));
+        let r = last_verified(&db, R).unwrap().unwrap();
+        assert_eq!((r.epoch, r.generation, r.acquired_at, r.boot_id.as_str(), r.operation_id.as_str()), (EPOCH, 3, ACQUIRED, BOOT, "op-verify"));
+        assert_eq!((r.authority_id.as_str(), r.authority_key.as_str()), ("lab-gate", ""));
+        assert_eq!(r.proof["issued_at"], proof(10)["issued_at"]);
+    }
+
+    #[test]
+    fn with_every_condition_true_a_start_resumes_and_the_journal_says_so() {
+        let db = gated();
+        start(&db, Some(proof(10)), BOOT, "op-verify").unwrap();
+        assert_eq!(refusal(&db, BOOT), "resumes");
+        // No proof at all, then the same document an hour and more later: both resume, neither is
+        // verified again, and each resume is journaled with the original proof's identity.
+        for (presented, id) in [(None, "op-resume-1"), (Some(proof(4000)), "op-resume-2")] {
+            let refused_expected = presented.is_some();
+            let v = start(&db, presented, BOOT, id).unwrap();
+            assert_eq!(v["method"], json!("resume_same_epoch"), "{v}");
+            assert_eq!(v["new_epoch"], json!(EPOCH));
+            assert_eq!(v["resumed_from"]["operation_id"], json!("op-verify"));
+            assert_eq!(v["resumed_from"]["method"], json!("same_holder"));
+            assert_eq!(v["presented_proof_refused"].as_str().is_some_and(|e| e.contains("expired")), refused_expected, "{v}");
+            let e = last_event(&db, R, "takeover_resumed").unwrap().unwrap();
+            assert_eq!(e["operation_id"], json!(id));
+            assert_eq!(e["detail"]["resumed_from"]["operation_id"], json!("op-verify"));
+        }
+        // The resume records nothing new: the verification it rests on is still the first one.
+        assert_eq!(last_verified(&db, R).unwrap().unwrap().operation_id, "op-verify");
+    }
+
+    #[test]
+    fn each_condition_false_is_a_named_refusal() {
+        type Change = fn(&Connection);
+        let cases: [(&str, Change); 9] = [
+            ("no_lease", |db| { db.execute("DELETE FROM activation_leases", []).unwrap(); }),
+            ("lease_held_elsewhere", |db| { db.execute("UPDATE activation_leases SET holder_host_uuid='00000000-0000-4000-8000-00000000000b'", []).unwrap(); }),
+            ("lease_expired", |db| { db.execute("UPDATE activation_leases SET expires_at=?1", [crate::now() as i64 - 1]).unwrap(); }),
+            ("lease_superseded", |db| { db.execute("UPDATE activation_epochs SET epoch=158", []).unwrap(); }),
+            ("no_verified_proof", |db| { db.execute("DELETE FROM publisher_takeover_verified", []).unwrap(); }),
+            // The gate granted this host a newer epoch: live, unsuperseded, and not the transition
+            // the recorded proof accounted for.
+            ("epoch_changed", |db| {
+                db.execute("UPDATE activation_leases SET epoch=158", []).unwrap();
+                db.execute("UPDATE activation_epochs SET epoch=158", []).unwrap();
+            }),
+            ("generation_changed", |db| { db.execute("UPDATE activation_leases SET generation=4", []).unwrap(); }),
+            // A lapse of this host's own lease, retaken: the same generation and epoch, a new acquisition.
+            ("lease_reacquired", |db| { db.execute("UPDATE activation_leases SET acquired_at=acquired_at+4000", []).unwrap(); }),
+            ("authority_changed", |db| { db.execute("UPDATE activation_policy SET authority_id='another-gate'", []).unwrap(); }),
+        ];
+        for (expected, change) in cases {
+            let db = gated();
+            start(&db, Some(proof(10)), BOOT, "op-verify").unwrap();
+            change(&db);
+            assert_eq!(refusal(&db, BOOT), expected);
+            // Through the start: without a proof, refused, naming the condition, and nothing journaled
+            // as a resume.
+            let err = start(&db, None, BOOT, "op-later").unwrap_err().to_string();
+            assert!(err.contains(&format!("({expected})")) && err.contains("requires `takeover_proof`"), "{expected}: {err}");
+            assert!(last_event(&db, R, "takeover_resumed").unwrap().is_none(), "{expected}");
+        }
+        let db = gated();
+        start(&db, Some(proof(10)), BOOT, "op-verify").unwrap();
+        assert_eq!(refusal(&db, "another-boot"), "boot_changed");
+        let err = start(&db, Some(proof(4000)), "another-boot", "op-later").unwrap_err().to_string();
+        assert!(err.contains("takeover_proof refused") && err.contains("expired") && err.contains("(boot_changed)"), "{err}");
+    }
+
+    #[test]
+    fn a_different_acquisition_needs_a_new_proof_and_a_valid_one_is_recorded_for_it() {
+        let db = gated();
+        start(&db, Some(proof(10)), BOOT, "op-verify").unwrap();
+        db.execute("UPDATE activation_leases SET acquired_at=acquired_at+4000", []).unwrap();
+        let err = start(&db, None, BOOT, "op-refused").unwrap_err().to_string();
+        assert!(err.contains("(lease_reacquired)"), "{err}");
+        // The gate's new document for the same epoch is verified and replaces the record: the new
+        // incarnation may then be resumed, the old one never again.
+        start(&db, Some(proof(5)), BOOT, "op-verify-2").unwrap();
+        let r = last_verified(&db, R).unwrap().unwrap();
+        assert_eq!((r.acquired_at, r.operation_id.as_str()), (ACQUIRED + 4000, "op-verify-2"));
+        assert_eq!(start(&db, None, BOOT, "op-resume").unwrap()["resumed_from"]["operation_id"], json!("op-verify-2"));
+    }
+
+    #[test]
+    fn a_registration_is_read_from_the_lines_given_the_last_one_first() {
+        let text = "2026-09-18T06:00:00Z INF Starting tunnel\n\
+                    2026-09-18T06:00:01Z INF Registered tunnel connection connIndex=0 connection=aaaa-1 event=0 ip=198.41.200.13 location=cdg\n\
+                    2026-09-18T06:00:02Z INF Registered tunnel connection connIndex=1 connection=bbbb-2 event=0 ip=198.41.192.7 location=mrs\n\
+                    2026-09-18T06:10:00Z WRN something else connection=not-a-registration\n";
+        assert_eq!(registration(text).as_deref(), Some("bbbb-2"));
+        assert_eq!(registration("INF Starting tunnel\n"), None);
+        assert_eq!(registration(""), None);
+    }
+
+    #[test]
+    fn the_startup_withdrawal_selects_what_is_present_without_entitlement() {
+        let db = gated();
+        db.execute("INSERT INTO publishers VALUES(?1,'h.example','t','c',8080,0,'d','r')", [R]).unwrap();
+        let none: &dyn Fn(&str) -> bool = &|_| false;
+        let running: &dyn Fn(&str) -> bool = &|_| true;
+        // Nothing present: nothing selected, whatever the lease.
+        db.execute("UPDATE activation_leases SET expires_at=1", []).unwrap();
+        assert!(startup_unentitled(&db, none).unwrap().is_empty());
+        // A connector unit running with no record, its lease lapsed while the daemon was down.
+        let found = startup_unentitled(&db, running).unwrap();
+        assert!(found.len() == 1 && found[0]["why"].as_str().unwrap().contains("expired"), "{found:?}");
+        // A recorded publisher: selected while unentitled for each reason, left alone while entitled.
+        transition(&db, R, "effective", EPOCH, "s").unwrap();
+        db.execute("UPDATE activation_leases SET expires_at=?1", [crate::now() as i64 + 600]).unwrap();
+        assert!(startup_unentitled(&db, none).unwrap().is_empty());
+        type Change = fn(&Connection);
+        let cases: [(&str, Change); 4] = [
+            ("expired", |db| { db.execute("UPDATE activation_leases SET expires_at=1", []).unwrap(); }),
+            ("another host", |db| { db.execute("UPDATE activation_leases SET holder_host_uuid='00000000-0000-4000-8000-00000000000b'", []).unwrap(); }),
+            ("superseded by epoch 158", |db| { db.execute("UPDATE activation_epochs SET epoch=158", []).unwrap(); }),
+            ("started at epoch 156", |db| { db.execute("UPDATE publisher_transitions SET epoch=156", []).unwrap(); }),
+        ];
+        for (why, change) in cases {
+            let db2 = gated();
+            db2.execute("INSERT INTO publishers VALUES(?1,'h.example','t','c',8080,0,'d','r')", [R]).unwrap();
+            transition(&db2, R, "effective", EPOCH, "s").unwrap();
+            change(&db2);
+            let found = startup_unentitled(&db2, none).unwrap();
+            assert!(found.len() == 1 && found[0]["why"].as_str().unwrap().contains(why), "{why}: {found:?}");
+        }
+        // A mark's ledger row alone counts as present.
+        let db3 = gated();
+        db3.execute("INSERT INTO publishers VALUES(?1,'h.example','t','c',8080,0,'d','r')", [R]).unwrap();
+        db3.execute("UPDATE activation_leases SET expires_at=1", []).unwrap();
+        row(&db3, KIND_MARK, &format!("{R}@{CARRIER}"), R, "effective");
+        assert_eq!(startup_unentitled(&db3, none).unwrap().len(), 1);
     }
 }

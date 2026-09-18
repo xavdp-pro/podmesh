@@ -13,6 +13,7 @@ mod storage;
 mod health;
 pub use manager::control_relay;
 pub use network::reconcile as reconcile_network;
+pub use publisher::withdraw_at_startup as withdraw_unentitled_publishers_at_startup;
 mod collector;
 mod lifecycle;
 mod migration;
@@ -130,7 +131,7 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
             "manager_status" | "manager_observe" => manager::execute(db, request)?,
             "secret_declare" | "secret_remove" | "secret_status" => secrets::execute(db, request)?,
             "publisher_declare" | "publisher_start" | "publisher_stop" | "publisher_status" | "publisher_observed" => publisher::execute(db, request)?,
-            "network_declare" | "network_undeclare" | "network_route_publish" | "network_route_withdraw" | "network_reapply" | "network_status" => network::execute(db, request)?,
+            "network_declare" | "network_undeclare" | "network_route_publish" | "network_route_withdraw" | "network_route_resume" | "network_reapply" | "network_status" => network::execute(db, request)?,
             "activation_require" | "activation_acquire" | "activation_renew" | "activation_release"
             | "activation_supersede" | "activation_status" | "activation_fence" | "activation_fence_preview" => activation::execute(db, request)?,
             "recovery_point_prepare" | "recovery_point_status" | "recovery_point_restore" | "recovery_point_promote"
@@ -148,7 +149,7 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
                 "experimental_operations":["migration_preflight","migration_checkpoint","migration_status","migration_authorize_transfer",
                     "migration_complete_transfer","migration_retire_source","migration_release","migration_abandon","migration_restore_local",
                     "migration_destination_preflight","migration_restore","migration_restore_abort",
-                    "garbage_collect_plan","garbage_collect_apply","collection_retention_declare","collection_hold_declare","collection_hold_release","collection_status","network_declare","network_undeclare","network_route_publish","network_route_withdraw","network_reapply","network_status","boot_restore","boot_restore_status","manager_status","manager_observe","secret_declare","secret_remove","secret_status","publisher_declare","publisher_start","publisher_stop","publisher_status","publisher_observed"],
+                    "garbage_collect_plan","garbage_collect_apply","collection_retention_declare","collection_hold_declare","collection_hold_release","collection_status","network_declare","network_undeclare","network_route_publish","network_route_withdraw","network_route_resume","network_reapply","network_status","boot_restore","boot_restore_status","manager_status","manager_observe","secret_declare","secret_remove","secret_status","publisher_declare","publisher_start","publisher_stop","publisher_status","publisher_observed"],
                 "experimental_contracts":{
                     "migration_preflight":"read-only compatibility report bound to universe UUID, container ID, image ID, source and destination host UUIDs; no reservation, suspension or artifact",
                     "migration_checkpoint":"source: fresh checks before suspension, durable reservation, checkpoint with the packaged podmesh-vzcriu runtime in its own scope, archive/manifest/hashes under the state directory; never an authorization to restore",
@@ -169,6 +170,9 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
                     "reservation":"a reservation or an unresolved restore claim blocks create, start, delete and clone for the universe; stop remains available, and a released or collected reservation blocks nothing",
                     "boot_restore":"host-wide, journaled, called at boot by a local unit under the operator's mandate or by an operator or agent: starts, at most once per boot each, the universes whose last journaled intent is to run, through the start gates, under the caller's authorization_ref; never a managed-network universe while the declaration is not effective, an epoch-gated one, a lease-gated one whose lease was not acquired or renewed during this boot, a universe with recovery points and no policy, a quarantined copy, a holding migration reservation or unresolved restore claim, or a universe with a capture still dumping or an unfinished live promotion recorded after its last intent",
                     "network_reapply":"host-wide, journaled, called at boot before boot_restore: re-applies the effects of this host's effective declaration that the kernel or Podman no longer shows (bridge, peer routes, NAT exemption) and withdraws every recorded /32 route whose kernel route is gone, with its alias; a /32 route is never re-applied from the ledger",
+                    "network_route_resume":"host-wide, journaled (exclusive_resource): the recorded exclusive route and alias of a role this host still holds, put back after the carrier lost them (a stop, a restart, a roll at the same address): the dead row withdrawn, then published again with the recorded ip, via and resource through every check of a publication; only while the lease is live, held here, unsuperseded and was acquired or renewed during this boot, a universe runs at via, and the kernel holds no other route for the address; refused otherwise with a named reason (no_policy, no_recorded_route, route_incomplete, lease_not_entitled, lease_not_renewed_this_boot, declaration_not_effective, kernel_unknown, other_kernel_route, no_carrier_at_via); an effective route answers already_effective; never changes the holder, acquires or renews",
+                    "publisher_start":"the takeover proof is verified and recorded with the lease incarnation and boot it was verified under; without a proof, or with one refused, the start resumes under the recorded one (method resume_same_epoch, journaled with the original proof's identity) only while the lease is live, held here, unsuperseded, at the same epoch, generation and acquisition, in the same boot and under the same authority and key; refused otherwise with a named reason",
+                    "publisher_startup_withdrawal":"not a request: the daemon's own journaled operation at startup, withdrawing, connector and mark, every declared publisher present without a live, unsuperseded lease held here",
                     "boot_restore_status":"read-only: this boot's passes, what a pass would decide now for every universe intended to run, and the operations a previous run of the service left pending"
                 },
                 "scope":"local rootful Podman; network-disabled universes created or cloned by this host's PodMesh journal; one request at a time",

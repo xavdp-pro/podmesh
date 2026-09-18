@@ -68,7 +68,7 @@ fn identifier(value: &str, field: &str) -> Result<(), Error> {
 /// This boot's identity. A permit is bound to the replica's current incarnation, and a host
 /// that has rebooted must be authorised again rather than resume under a permit it held
 /// before -- whatever it was doing then, nobody has re-decided it since.
-fn boot_id() -> Result<String, Error> {
+pub(crate) fn boot_id() -> Result<String, Error> {
     Ok(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim().to_string())
 }
 
@@ -282,16 +282,39 @@ pub struct Lease {
     /// The epoch this lease was acquired under; zero for a lease under no authority.
     pub epoch: i64,
     pub grant_id: String,
+    /// When this incarnation of the lease was taken: set at every acquisition, never at a renewal.
+    /// A lapsed lease of this host's retaken keeps its generation and epoch; this is what differs.
+    pub acquired_at: i64,
 }
 
 pub fn lease(db: &Connection, uuid: &str) -> Result<Option<Lease>, Error> {
     Ok(db
         .query_row(
-            "SELECT holder_host_uuid,generation,expires_at,epoch,grant_id FROM activation_leases WHERE universe_uuid=?1",
+            "SELECT holder_host_uuid,generation,expires_at,epoch,grant_id,acquired_at FROM activation_leases WHERE universe_uuid=?1",
             [uuid],
-            |r| Ok(Lease { holder_host_uuid: r.get(0)?, generation: r.get(1)?, expires_at: r.get(2)?, epoch: r.get(3)?, grant_id: r.get(4)? }),
+            |r| Ok(Lease { holder_host_uuid: r.get(0)?, generation: r.get(1)?, expires_at: r.get(2)?, epoch: r.get(3)?, grant_id: r.get(4)?, acquired_at: r.get(5)? }),
         )
         .optional()?)
+}
+
+/// The epoch that overtook this host's lease, if its screen has seen one: what the gate's fourth
+/// refusal reads, for callers that name each refusal themselves.
+pub(crate) fn superseded_by(db: &Connection, uuid: &str, l: &Lease) -> Result<Option<i64>, Error> {
+    superseded(db, uuid, l)
+}
+
+/// Whether the lease was acquired or renewed at or after `since` (a boot's start on the wall clock):
+/// the rule `boot_restore` applies, for anything else a host would do again after its own restart.
+/// A host that was down cannot know what was decided while it was, so only an entitlement decided
+/// again since the boot counts.
+pub(crate) fn renewed_since(db: &Connection, uuid: &str, since: i64) -> Result<bool, Error> {
+    Ok(db
+        .query_row(
+            "SELECT MAX(at) FROM activation_lease_history WHERE universe_uuid=?1 AND event IN ('acquired','renewed') AND at>=?2",
+            params![uuid, since],
+            |r| r.get::<_, Option<i64>>(0),
+        )?
+        .is_some())
 }
 
 /// Whether this host's lease has been overtaken by an epoch it has seen: the node's epoch screen
