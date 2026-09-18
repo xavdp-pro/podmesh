@@ -22,7 +22,7 @@ growing by one row every tick). After `not_after` the tick grants nothing more a
 nothing: what is published runs out its lease and the tick's own stop branch withdraws it. It
 resumes nothing either, route or connector: after `not_after` the tick only reads and stops.
 """
-import hashlib, json, os, subprocess, sys, tempfile, time, uuid
+import fcntl, hashlib, json, os, subprocess, sys, tempfile, time, uuid
 
 MANDATE = os.environ.get("PODMESH_PUBLISHER_FOLLOW_MANDATE", "/etc/podmesh/publisher-follow-mandate")
 CLI = os.environ.get("PODMESH_CLI", "/usr/bin/podmesh")
@@ -150,14 +150,24 @@ class State:
         return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else unreadable
 
     def save(self):
-        """True when kept. A caller that relies on the count must fail closed when it is not."""
-        self.whole[self.resource] = self.mine
+        """True when kept. A caller that relies on the count must fail closed when it is not. Two resources'
+        ticks may save at once (third review of V3-1): the file is re-read under an exclusive lock and only
+        this resource's entry replaced, through a temporary file of this resource's own."""
         try:
             os.makedirs(os.path.dirname(STATE) or ".", mode=0o700, exist_ok=True)
-            tmp = STATE + ".partial"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.whole, f)
-            os.replace(tmp, STATE)
+            with open(STATE + ".lock", "a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                try:
+                    with open(STATE, encoding="utf-8") as f:
+                        whole = json.load(f)
+                except (OSError, ValueError):
+                    whole = {}
+                whole = whole if isinstance(whole, dict) else {}
+                whole[self.resource] = self.mine
+                tmp = f"{STATE}.{self.resource}.partial"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(whole, f)
+                os.replace(tmp, STATE)
             return True
         except OSError as e:
             print(f"podmesh-publisher-follow: the tick's state could not be kept at {STATE}: {e}", file=sys.stderr)

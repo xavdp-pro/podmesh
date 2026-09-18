@@ -247,6 +247,25 @@ with tempfile.TemporaryDirectory(prefix='podmesh-follow-state-') as kept:
 checks.append('a service address that could not be read is neither resumed nor stopped on: an unknown, stopped on the third tick in a row, '
               'and nothing started')
 
+# ---------------------------------------------------------------- the third review: two resources saving at once
+import concurrent.futures
+# A race: it is provoked, not scheduled, so each round may or may not reach it; three rounds of forty ticks
+# made the previous tick fail most runs on this workstation, and the fixed one never.
+for round_ in range(3):
+    with tempfile.TemporaryDirectory(prefix='podmesh-follow-state-') as kept:
+        path = pathlib.Path(kept) / 'tick-state.json'
+        jobs = [(UUID if n % 2 else UUID2) for n in range(40)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+            results = list(pool.map(lambda r: tick({'publisher_status': [status(unit='active', origin=None)], 'publisher_stop': [OK]},
+                                                   state_file=path, resource=r), jobs))
+        lost = [p.stderr for _, _, p in results if 'could not be kept' in p.stderr]
+        assert not lost, (round_, lost[:1])
+        kept_state = json.loads(path.read_text())
+        assert set(kept_state) == {UUID, UUID2}, kept_state
+        assert not list(pathlib.Path(kept).glob('*.partial')), list(pathlib.Path(kept).iterdir())
+checks.append("ticks of two resources saving at once keep both resources' entries: the file is merged under a lock, "
+              "each through a temporary file of its own")
+
 PAST = NOW - 60
 for label, scenario in [('only the address missing', {'publisher_status': [MISSING]}),
                         ('eligible, nothing running', {'publisher_status': [status()]}),
