@@ -228,7 +228,7 @@ What a restore attempt may consume: a restore of a damaged archive was measured 
 
 Scope and conmon lifetime: `systemd-run --scope` sets `INVOCATION_ID` for the command it runs, and Podman then leaves conmon inside that scope, which would stay active for as long as the restored universe runs. The variable is therefore removed inside the scope as well: conmon moves to its own `libpod-conmon-<id>.scope`, the transient restore scope ends with the Podman command, and stopping or deleting the universe through the API removes the conmon scope with it. `--keep` is what preserves the CRIU restore log the verification requires; the kept checkpoint files stay in the restored container's storage until the universe is removed or checkpointed again, and a later export from that container may also carry image files left by the previous restore.
 
-## Experimental: garbage collection on proof (development tree, not packaged)
+## Experimental: garbage collection on proof (packaged; carried by 0.1.0~experimental7)
 
 Age never justifies collection; proof does. The complete contract is [GARBAGE-COLLECTION.md](GARBAGE-COLLECTION.md):
 the four kinds of act a collector must never confuse, the exclusions that make an unknown fact a blocker, the
@@ -350,7 +350,7 @@ Who may apply is provenance, not proof, exactly as for a reclaim: the request re
 `authorization_ref`, the root-only socket remains the access boundary, and the collector still refuses
 anything it cannot prove. A plan authorizes nothing.
 
-## Experimental: activation leases and recovery points (development tree, not packaged)
+## Experimental: activation leases and recovery points (packaged; carried by 0.1.0~experimental7)
 
 The design is [UNIVERSE-HIGH-AVAILABILITY.md](UNIVERSE-HIGH-AVAILABILITY.md); the recovery point's format is
 [BACKUP-SERVER.md](BACKUP-SERVER.md). Every operation here carries `operation_id`, `universe_uuid` and
@@ -496,7 +496,7 @@ copy; a quarantined copy becomes the universe itself, under the lease.
 How the two files reach the inbox is the transport controller's, as for migrations: PodMesh reads
 `inbox/` and never writes it. The two-host suite's controller carries an outbox to an inbox over SSH.
 
-## Experimental: restoring after a boot (development tree, not packaged)
+## Experimental: restoring after a boot (development tree; not in 0.1.0~experimental7)
 
 A host that reboots finds its universes stopped: Podman restarts nothing, and PodMesh acts on nothing by itself.
 `boot_restore` is the operation that brings back, on this host alone and without any peer, manager or workstation,
@@ -553,7 +553,7 @@ second run in the same boot replays the first pass. Not covered: a manager unive
 profile is not recognised as one while it is stopped, and an operation written without an attempt row (a journal
 rolled back to experimental3) is not ordered.
 
-## Experimental: the universe network (development tree, not packaged)
+## Experimental: the universe network (packaged; carried by 0.1.0~experimental7, except `network_reapply`, which is in the development tree)
 
 The contract is `UNIVERSE-NETWORK-CONTRACT.md`; the operations are journaled like every other and verified from
 `podman network inspect`, `ip route` and `nft`, never from the tables alone. Every kernel or Podman mutation is
@@ -592,7 +592,7 @@ remains (`network_status`: `effects`, `incomplete_effects`).
   the declaration is not effective; a second call finds nothing to re-apply. The restore unit calls it at boot
   before `boot_restore`, under the operation ID `boot-network-<boot_id without hyphens>`.
 
-## Experimental: secrets a universe is given at creation (development tree, not packaged)
+## Experimental: secrets a universe is given at creation (packaged; carried by 0.1.0~experimental7)
 
 A secret's bytes never enter an image layer, this journal, or the API line. The operator (or the agent, over
 root SSH) places the file under `inbox/secrets/<source>` of the state directory, root-owned with no group or
@@ -611,7 +611,7 @@ or stopped. `secret_status` (read-only) lists names, digests and presence in the
 durable copy of a secret is the operator's, outside PodMesh; Podman's store at rest is root-only files on the
 host, the laboratory's accepted boundary.
 
-## Experimental: the publishing connector that follows the active manager (development tree, not packaged)
+## Experimental: the publishing connector that follows the active manager (packaged; carried by 0.1.0~experimental7)
 
 The contract is `MANAGER-PUBLISHER-CONTRACT.md`. `publisher_declare` (`resource`, `hostname`, `tunnel_uuid`,
 `credential`, optional `origin_port`) records the connector by reference; `publisher_start` (`resource`,
@@ -628,7 +628,7 @@ resource this host no longer holds (`publishers_withdrawn`); `publisher_observed
 `publisher_status` (read-only) reports the unit, the connector's identity, the lease, the origin's readiness and
 `publisher_eligible` with reasons. Every step is recorded in the network effects ledger before it is made.
 
-## Experimental: the agent's door to a manager universe (development tree, not packaged)
+## Experimental: the agent's door to a manager universe (packaged; carried by 0.1.0~experimental7)
 
 A manager universe runs the frozen manager resident behind one Unix socket at a contract path inside the
 universe (`/run/podmesh-manager/control.sock`), reachable by nothing outside it. PodMesh offers the one door:
