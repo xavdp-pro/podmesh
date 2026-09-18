@@ -44,8 +44,10 @@ rm -f /run/podmesh-manager/control.sock
 # start (observed on lab-a, 2026-09-18), and a withdrawal made while the replica was stopped found no
 # running universe to remove it from. Removed here at every start, at its path and at the previous
 # one, before the origin starts: the origin answers 503 until PodMesh writes the mark again, so this
-# replica never claims a role it may no longer hold.
+# replica never claims a role it may no longer hold. The origin reads the path PODMESH_ACTIVE_MANAGER_MARK
+# names instead of both when it is set (origin/server/index.mjs), so that path is removed too.
 rm -f /run/podmesh-manager/active-manager.json /run/podmesh-manager/governor.json
+if [ -n "${PODMESH_ACTIVE_MANAGER_MARK:-}" ]; then rm -f -- "$PODMESH_ACTIVE_MANAGER_MARK"; fi
 # A store that arrived in an image layer (a restored recovery point) is copied up by the overlay
 # filesystem on its first write, which changes its inode between the resident's read-only preflight
 # and its open; the resident refuses that as a swapped store. Rewriting the file here, before the
