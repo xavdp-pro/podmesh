@@ -858,6 +858,10 @@ fn fence(db: &Connection, id: &str, timeout: u64) -> Result<serde_json::Value, E
     // Every resource this fence found this host NOT entitled to, whether or not anything had to be
     // withdrawn for it: what a fence receipt binds a takeover proof to (Codex, P0).
     let mut unentitled = Vec::new();
+    // For each of them, what the fence found: the epoch that overtook this host's lease, if one did. A
+    // fence receipt is bound to a transition by it (third review of V3-1): the authority accepts a receipt
+    // as the previous holder's account of THIS rotation only when that host had seen the rotation's epoch.
+    let mut unentitled_detail = Vec::new();
     let listed = running_universes();
     for uuid in universes {
         let held = lease(db, &uuid)?;
@@ -867,6 +871,12 @@ fn fence(db: &Connection, id: &str, timeout: u64) -> Result<serde_json::Value, E
             .is_some_and(|l| l.holder_host_uuid == this_host && l.expires_at > now && overtaken.is_none());
         if !entitled {
             unentitled.push(uuid.clone());
+            unentitled_detail.push(serde_json::json!({
+                "resource": uuid,
+                "superseded_by_epoch": overtaken,
+                "held_by": held.as_ref().map(|l| l.holder_host_uuid.clone()),
+                "expired_seconds_ago": held.as_ref().map(|l| now - l.expires_at).filter(|&s| s >= 0),
+            }));
         }
         // One listing decides who is not running; a universe it names (or every one, when it cannot be read) is
         // confirmed by inspection before anything is stopped.
@@ -945,6 +955,7 @@ fn fence(db: &Connection, id: &str, timeout: u64) -> Result<serde_json::Value, E
         "this_host_uuid": this_host,
         "fenced": fenced,
         "unentitled": unentitled,
+        "unentitled_detail": unentitled_detail,
         "publishers_withdrawn": publishers_withdrawn,
         "routes_withdrawn": routes_withdrawn,
         "network_reconciliation": network_reconciliation,
