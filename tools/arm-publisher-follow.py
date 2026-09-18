@@ -8,7 +8,7 @@ import json, os, pathlib, subprocess, sys, tempfile, time, uuid, urllib.request,
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tests'))
-from podmesh_two_hosts import Host, request  # noqa: E402
+from podmesh_two_hosts import Host, request, control_dir  # noqa: E402
 from podmesh_manager_lab import declare_replica_config, replica_create, prove_takeover  # noqa: E402
 
 TOOL = str(ROOT / 'tools' / 'ha-standby.py')
@@ -23,7 +23,7 @@ lab_hosts = dict(kv.split('=') for kv in os.environ['PODMESH_LAB_HOSTS'].split('
 TUNNEL_ID = os.environ['PODMESH_TUNNEL_ID']
 HOSTNAME = os.environ['PODMESH_PUBLIC_HOSTNAME']
 CREDENTIALS = open(os.environ['PODMESH_TUNNEL_CREDENTIALS'], 'rb').read()
-control = tempfile.mkdtemp(prefix='podmesh-pubfollow-')
+control = control_dir('podmesh-pubfollow-')
 targets = {'lab-a': os.environ['PODMESH_SOURCE_SSH'], 'lab-b': os.environ['PODMESH_DESTINATION_SSH'], 'lab-c': os.environ['PODMESH_THIRD_SSH']}
 hosts = {alias: Host(alias, target, control, socket_path, state_dir, unit) for alias, target in targets.items()}
 sys.path.insert(0, os.environ['PODMESH_FENCING_LAB'])

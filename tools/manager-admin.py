@@ -34,7 +34,7 @@ import argparse, getpass, hashlib, json, os, secrets, sys, tempfile, time, uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'tests'))
-from podmesh_two_hosts import Host  # noqa: E402
+from podmesh_two_hosts import Host, control_dir  # noqa: E402
 
 SUBJECT_PREFIX = 'admin.user.'
 FLAG_PREFIX = 'admin.flag.'
@@ -73,7 +73,7 @@ def read_password(login):
 
 
 def host_of(args):
-    control = tempfile.mkdtemp(prefix='podmesh-manager-admin-')
+    control = control_dir('podmesh-manager-admin-')
     return Host('host', args.host, control,
                 os.environ.get('PODMESH_SOCKET', '/run/podmesh/api.sock'),
                 os.environ.get('PODMESH_STATE_DIR', '/var/lib/podmesh'),

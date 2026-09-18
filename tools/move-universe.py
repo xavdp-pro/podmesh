@@ -29,7 +29,7 @@ import argparse, json, os, sys, tempfile, time, uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'tests'))
-from podmesh_two_hosts import Host, request, transfer  # noqa: E402
+from podmesh_two_hosts import Host, request, transfer, control_dir  # noqa: E402
 
 
 def main():
@@ -40,7 +40,7 @@ def main():
     p.add_argument('--reference', default='move-universe-tool')
     p.add_argument('--keep-source', action='store_true', help='leave the stopped, checkpointed container on the source')
     args = p.parse_args()
-    control = tempfile.mkdtemp(prefix='podmesh-move-')
+    control = control_dir('podmesh-move-')
     socket_path = os.environ.get('PODMESH_SOCKET', '/run/podmesh/api.sock')
     state_dir = os.environ.get('PODMESH_STATE_DIR', '/var/lib/podmesh')
     unit = os.environ.get('PODMESH_UNIT', 'podmesh.service')

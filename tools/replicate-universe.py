@@ -67,7 +67,7 @@ import argparse, contextlib, fcntl, json, os, pathlib, subprocess, sys, tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tests'))
-from podmesh_two_hosts import Host, request, transfer  # noqa: E402
+from podmesh_two_hosts import Host, request, transfer, control_dir  # noqa: E402
 
 REF = 'replicate-universe-tool'
 MAX_RUNS_KEPT = 20
@@ -125,7 +125,7 @@ def locked(u, wait_seconds=30):
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
-_control = tempfile.mkdtemp(prefix='podmesh-replicate-')
+_control = control_dir('podmesh-replicate-')
 
 
 def host(target):

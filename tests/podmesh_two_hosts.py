@@ -611,6 +611,32 @@ def _node(argv):
 
 # ---------------------------------------------------------- controller side
 
+def control_dir(prefix):
+    """A private directory for this process's SSH connection sharing (ControlPath), removed when the process ends.
+
+    Each tool call used to leave its directory behind: the guardians tick every ten seconds, and by 2026-09-18 the
+    workstation held more than 20,000 of them in /tmp. At exit the shared connections are closed (`ssh -O exit`)
+    and the directory is removed; a crash leaves one empty directory, not a live connection."""
+    import atexit, shutil, tempfile
+    path = tempfile.mkdtemp(prefix=prefix)
+
+    def close():
+        try:
+            names = os.listdir(path)
+        except OSError:
+            return
+        for name in names:
+            try:
+                subprocess.run(['ssh', '-S', os.path.join(path, name), '-O', 'exit', 'podmesh-control'],
+                               capture_output=True, timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        shutil.rmtree(path, ignore_errors=True)
+
+    atexit.register(close)
+    return path
+
+
 class Host:
     """One lab host, reached through SSH, with its API windows and its checks."""
 

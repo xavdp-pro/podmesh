@@ -39,7 +39,7 @@ report). Skip the origin's build with PODMESH_ROLL_SKIP_ORIGIN_BUILD=1 when orig
 import hashlib, json, os, shlex, subprocess, sys, tempfile, time, uuid
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'tests'))
-from podmesh_two_hosts import Host, request  # noqa: E402
+from podmesh_two_hosts import Host, request, control_dir  # noqa: E402
 from podmesh_manager_lab import GENERIC_TAG, ENTRYPOINT, declare_replica_config, replica_create  # noqa: E402
 
 WEB = os.environ['PODMESH_WEB_TREE']
@@ -53,7 +53,7 @@ ACTIVE = os.environ.get('PODMESH_ACTIVE_MANAGER_ALIAS') or os.environ.get('PODME
 order = [a.strip() for a in os.environ.get('PODMESH_ROLL_HOSTS', ','.join(targets)).split(',') if a.strip()]
 assert order and all(a in targets for a in order) and len(set(order)) == len(order), ('PODMESH_ROLL_HOSTS', order)
 state_dir = os.environ['PODMESH_STATE_DIR']
-control = tempfile.mkdtemp(prefix='podmesh-roll-')
+control = control_dir('podmesh-roll-')
 hosts = {a: Host(a, targets[a], control, os.environ['PODMESH_SOCKET'], state_dir, os.environ['PODMESH_UNIT']) for a in order}
 ref = os.environ.get('PODMESH_ROLL_REFERENCE', 'lab-manager-image-roll')
 BUILD_DIR = '/root/manager-universe-m-u2'

@@ -63,7 +63,7 @@ import argparse, json, os, pathlib, sys, tempfile, time, uuid
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tests'))
-from podmesh_two_hosts import Host, request, transfer  # noqa: E402
+from podmesh_two_hosts import Host, request, transfer, control_dir  # noqa: E402
 
 LAB = os.environ.get('PODMESH_FENCING_LAB')
 if LAB:
@@ -187,7 +187,7 @@ def key_fields(gate):
 
 
 def hosts(args, *roles):
-    control = tempfile.mkdtemp(prefix='podmesh-ha-')
+    control = control_dir('podmesh-ha-')
     socket_path = os.environ.get('PODMESH_SOCKET', '/run/podmesh/api.sock')
     state_dir = os.environ.get('PODMESH_STATE_DIR', '/var/lib/podmesh')
     unit = os.environ.get('PODMESH_UNIT', 'podmesh.service')
