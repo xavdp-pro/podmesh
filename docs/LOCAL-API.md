@@ -594,14 +594,18 @@ remains (`network_status`: `effects`, `incomplete_effects`).
 - `network_route_resume` (host-wide; `exclusive_resource`). The alias of an exclusive route lives in its carrier's
   network namespace and dies with it, and the /32 goes with the bridge's interface when the carrier was its only
   user; the ledger still records both effective and the reconciliation only reports the drift. This puts back the
-  recorded exclusive route and alias of a role this host still holds: the dead row withdrawn with what it
-  recorded, then published again with the recorded ip, via and resource through every check of
-  `network_route_publish`, the address carried by the universe running at `via` now (the same replica restarted,
-  or one recreated at the same address). Refused, naming the reason, in this order: `no_policy`,
+  recorded exclusive route and alias of a role this host still holds, in place: the recorded row kept and marked
+  `resuming` with the carrier now at `via` (the same replica restarted, or one recreated at the same address),
+  the dead effects removed and verified gone, the kernel then holding nothing for the address, the alias and the
+  route made again, each recorded before it is made and verified, and the row `effective` again. A failure
+  compensates what the resume made and leaves the row recorded (`effective`, nothing verified under it, never
+  eligible), so that the next resume retries it; a crash leaves it `resuming`, and the reconciliation undoes its
+  effects and keeps it the same way (`routes_kept_for_resume`). Refused, naming the reason, in this order: `no_policy`,
   `no_recorded_route` (a first publication is `network_route_publish`'s), `route_incomplete` (a row left
   `applying` or `removing` is the reconciliation's), `lease_not_entitled` (the lease gate's four reasons, quoted),
   `lease_not_renewed_this_boot` (the lease neither acquired nor renewed during this boot: after a boot the
-  entitlement is decided again, and the ledger's /32 is never re-applied), `declaration_not_effective`,
+  entitlement is decided again, and the ledger's /32 is never re-applied; every lease history row written
+  since 2026-09-18 carries its boot's identity and is compared by it, older rows by the wall clock), `declaration_not_effective`,
   `kernel_unknown`, `other_kernel_route` (the kernel holds a route for the address through anything but `via`:
   somebody else's, never touched), `no_carrier_at_via`. Journaled like every network mutation: the same operation
   ID replays the verified answer and repeats nothing; a route and alias already effective answer
@@ -651,10 +655,14 @@ proof, or with one refused, resumes under that record (`takeover_proof.method` `
 the same epoch, generation and acquisition, during the same boot, under the same authority and key, and is
 refused otherwise naming the condition (`no_lease`, `lease_held_elsewhere`, `lease_expired`, `lease_superseded`,
 `no_verified_proof`, `epoch_changed`, `generation_changed`, `lease_reacquired`, `boot_changed`,
-`authority_changed`). `publisher_status` adds `gates` (each gate by name), `active_manager_mark_epoch`,
-`origin_ready_at_lease_epoch`, `unit.invocation_id`, `connector_registered` (the connector's identity and
-registration are read from the journal of the unit's current run only), the lease's `generation` and
-`acquired_at`, and `takeover_resume` (whether a start without a proof would resume now, or the refusal's name).
+`authority_changed`). `publisher_status` adds `gates` (each gate by name), `active_manager_mark_read`
+(`present` with `active_manager_mark_epoch`, `absent`, or `unknown` with `active_manager_mark_error`),
+`origin_ready_at_lease_epoch` (true, false when the origin answered otherwise, null when it could not be told),
+`unit.invocation_id`, `connector_registered` (true, false when the current run's journal holds no registration,
+null with `connector_registration_error` when it could not be read; the connector's identity and registration
+are read from the journal of the unit's current run only), the lease's `generation` and `acquired_at`, and
+`takeover_resume` (whether a start without a proof would resume now, or the refusal's name). A reading that
+could not be made is never reported as a wrong value.
 At its start the daemon withdraws, connector then mark, every declared publisher present without a live,
 unsuperseded lease held here, in one journaled operation `publisher_startup_withdrawal` (not a request).
 

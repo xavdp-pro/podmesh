@@ -51,7 +51,8 @@ written at `publisher_start` under the epoch gate, removed at `publisher_stop` a
 A connector that reaches a replica that is not the active manager gets nothing. The universe's
 `/run` is its overlay, not a tmpfs, so a mark would outlive a stop and a start of the carrier (a
 withdrawal while the carrier is stopped finds no running universe to remove it from): the
-entrypoint removes both of the mark's paths at every start, before the origin starts, and the
+entrypoint removes both of the mark's paths, and the path `PODMESH_ACTIVE_MANAGER_MARK` replaces
+them with when it is set, at every start, before the origin starts, and the
 replica claims no role until PodMesh writes the mark again at `publisher_start` (V3-1, web tree). The manager's web
 interface is not served there yet; this responder is the origin the contract requires today.
 
@@ -96,8 +97,12 @@ with it (`UNIVERSE-NETWORK-CONTRACT.md`, "Failure and cleanup states"), all with
   epoch, not its `acquired_at`); during this boot (`boot_changed`); under the same authority and key
   (`authority_changed`). Each is a condition under which a connector that never stopped is already
   allowed to continue — the reconciliation leaves it alone only under a live, unsuperseded lease held
-  here at the transition's epoch; across a lapse it is withdrawn; it does not outlive its boot — so
-  a restart under them grants nothing that continuing did not. Anything else needs a valid new proof.
+  here at the transition's epoch; it does not outlive its boot — so a restart under them grants
+  nothing that continuing did not. One of them holds only when something runs: a connector is
+  withdrawn across a lapse only if the follow tick, the fence or a reconciliation (at the daemon's
+  start, or before a network or publisher mutation) runs while the lease is lapsed; a lapse that
+  nothing observed, then a retake, leaves it running — the resume refuses that retake
+  (`lease_reacquired`) where continuing did not. Anything else needs a valid new proof.
   Then: the publisher's transition recorded `starting` before any effect; the active manager's
   mark written inside the carrier universe and verified; the origin asked at the service address
   and required to answer ready with the expected logical manager, the carrier's replica (as its
@@ -131,28 +136,39 @@ with it (`UNIVERSE-NETWORK-CONTRACT.md`, "Failure and cleanup states"), all with
   the active manager's mark (`active_manager_mark`: true while a file is at its path or at the
   previous one; `governor_mark`, deprecated, carries the same value); `publisher_eligible` with
   the refusal reasons; the last start, stop, fence and observed request. Since V3-1 also: each
-  gate by name (`gates`: `lease`, `policy`, `service_address`, `credential`); the epoch the mark
-  names (`active_manager_mark_epoch`, read in the origin's order, null when absent); whether the
-  origin answers ready at the lease's epoch with this logical manager and the carrier's replica
-  (`origin_ready_at_lease_epoch`); the unit's current run (`unit.invocation_id`) and whether the
-  connector registered in that run (`connector_registered`; `connector_id` is read from that run's
+  gate by name (`gates`: `lease`, `policy`, `service_address`, `credential`); the mark as read in
+  the origin's order (`active_manager_mark_read`: `present` with `active_manager_mark_epoch`,
+  `absent` when neither path holds a file, `unknown` with `active_manager_mark_error` when it could
+  not be read); whether the origin answers ready at the lease's epoch with this logical manager and
+  the carrier's replica (`origin_ready_at_lease_epoch`: true, false when the origin answered
+  otherwise, null when it could not be asked or the replica is not known); the unit's current run
+  (`unit.invocation_id`) and whether the connector registered in that run (`connector_registered`:
+  true, false when that run's journal was read and holds no registration, null with
+  `connector_registration_error` when it could not be read; `connector_id` is read from that run's
   journal only, never from an earlier run's lines); the lease's generation and `acquired_at`; and
   what a start without a proof would decide now (`takeover_resume`: `possible`, or the refusal's
-  name).
+  name). A reading that could not be made is never reported as a wrong value.
 
 The service address has its own resume, `network_route_resume` (`UNIVERSE-NETWORK-CONTRACT.md`
 for the route itself, `LOCAL-API.md` for the operation): the recorded exclusive route and alias of a
-role this host still holds, put back after the carrier lost them — the dead row withdrawn, then
-published again with the recorded ip, via and resource through every check of a publication — only
-while the lease is live, held here, unsuperseded and was acquired or renewed during this boot, a
-universe runs at `via`, and the kernel holds no other route for the address.
+role this host still holds, put back after the carrier lost them — in place: the recorded row kept
+and marked `resuming` with the carrier now at `via`, the dead effects removed and verified gone, the
+alias and the route made again and verified, the row `effective` again; a failure compensates and
+leaves the row recorded for the next resume, and a crash leaves it `resuming`, which the
+reconciliation undoes and keeps the same way — only while the lease is live, held here, unsuperseded
+and was acquired or renewed during this boot (by the boot's identity, recorded in every lease history
+row since 2026-09-18; by the wall clock only for older rows), a universe runs at `via`, and the
+kernel holds no other route for the address.
 
 ## Takeover, in order
 
 1. Rotate the epoch through the external gate.
 2. Deliver the supersession and fence the previous active manager (or, unreachable, wait its
    lease plus margin: the timer on it withdraws its connector, its mark, its alias and its route
-   on its own clock — `packaging/podmesh-fence`).
+   on its own clock — `packaging/podmesh-fence`). `tools/ha-standby.py rotate --previous-host`
+   delivers the supersession itself, before the new holder acquires and before any proof is made;
+   when the previous holder is not reached, the proof's barrier is no earlier than the `not_after`
+   of the follow mandate it may still renew under by itself, plus the lease and the margin (below).
 3. Observe on the previous active manager, when reachable, the connector stopped and the
    address gone.
 4. Publish the service address on the new active manager (`network_route_publish`, exclusive).
@@ -260,13 +276,49 @@ the route and alias actually re-made in a restarted carrier's namespace; `_SYSTE
 carried by `cloudflared`'s lines; the startup withdrawal of a connector whose lease lapsed while the
 daemon was down.
 
+**2026-09-18, the review's fixes, also without the laboratory:** the rotate tool's supersession and
+barrier (below; `tests/test_ha_rotate_barrier.py`); the route resumed in place, a failed or
+interrupted resume keeping its row (the review's probe, now a regression test); "could not be read"
+reported apart from a wrong value, the tick stopping on a positive mismatch at once and on unknowns
+only three ticks in a row; a failed start backed off, 20 s doubling to 300 s; an unreadable proof
+file started without, never a crash; renewals of this boot recognised by the boot's identity; every
+gateway compared as a whole word; the entrypoint clearing the mark at an overriding path too. The
+review's probes of the resume, driven through the real activation operations, are kept as
+regression tests (`src/publisher.rs`, `review_regressions`).
+
+**When the page comes back.** Only while the lease lives: the tick renews only an eligible host,
+and a host whose replica is down is not eligible, so the lease burns from its last renewal. With
+`renew_below` 900 and a lease of 3600 s, the replica must return before the lease ends: within about
+890 s to 3600 s of its stop, depending on where the lease stood at the stop. Later, the lease has
+lapsed, nothing resumes, and the gate must rotate again.
+
+**The exposure the resume added, and how it is closed (review of 2026-09-18).** Before V3-1, a
+holder whose replica was down was not eligible, its tick stopped renewing, and its lease lapsed
+before a barrier counted from a rotation elsewhere. With V3-1, if that replica returns while the
+lease still lives and nobody told the host of the rotation — `rotate` only printed the permit — the
+route resume makes it eligible again, its tick renews under its follow mandate and resumes its
+connector, its lease runs past the barrier, and the new holder starts at the barrier: two connectors
+on one tunnel. Closed in the rotate tool: to another holder, it delivers the supersession to the
+previous holder (`--previous-host`) before any proof is made, when that host is reachable, and says
+so in its report (`supersession`); a superseded host renews nothing and resumes nothing. When it
+cannot, the barrier covers what that host may still renew by itself: `tools/arm-publisher-follow.py`
+records every follow mandate it issues (host, `not_after`, no secret) in the resource's ledger before
+installing it, and `rotate` makes `eligible_after` no earlier than that `not_after` plus the lease
+plus the margin while such a mandate stands (`barrier_covers_follow_mandate`, and the proof's
+`barrier_basis`); a record it cannot read is refused (`follow_mandate_unknown`) before the gate
+moves. What the ledger cannot see — a mandate issued before the record existed, or from another
+workstation — the operator states (`--follow-mandate-not-after`). The cost: a takeover of an
+unreachable holder under a standing mandate waits for that mandate's end. The real closure, a
+renewal the old holder cannot grant itself, is a later lot.
+
 **What V3-1 does not do.** It never changes the holder, never acquires, never mints or extends a
 proof, and never renews past the mandate's `not_after`. After a reboot of the holder's host
 nothing resumes: the proof was verified during another boot (`boot_changed`) and the ledger's /32
 is withdrawn at boot and never re-applied (`network_reapply`); the entitlement has to be decided
-again, by the gate today. The takeover at the barrier stays unsound while the old holder's mandate
-renews: the barrier (`rotation + lease + margin`) ignores `not_after`, and a holder cut from the
-gate but not from its own address keeps renewing its lease in its own journal; that closes with
-renewal the old holder cannot grant itself (a later lot). The resume adds no exposure of its own:
-it brings back, on the host whose own journal still entitles it, the connector that would have been
-left running had its carrier never stopped, and that connector carries the same hazard today.
+again, by the gate today.
+
+**Known limit: a clock stepped backward.** Expiry is judged on the wall clock. A host whose clock
+steps back past a lapse sees its lease live again; nothing was retaken, so the resume's conditions
+all hold, and the tick resumes as if the lease had never lapsed. The takeover margin is the stated
+clock-skew budget; a step larger than it is not covered here (a later lot: a monotonic record of
+observed lapses, or renewal decided by the majority).

@@ -68,9 +68,9 @@ While the holder does not change, the tick and the node now bring the page back 
   continues -- and is refused naming the first condition that fails otherwise
   (`MANAGER-PUBLISHER-CONTRACT.md`).
 - **The node resumes the service address.** When the service address is the only gate missing
-  (`publisher_status`'s `gates`), the tick calls `network_route_resume` once: the dead row of the
-  resource's exclusive route withdrawn, then published again with the recorded ip, via and resource,
-  only while the lease is live, held here, unsuperseded and was acquired or renewed during this boot,
+  (`publisher_status`'s `gates`), the tick calls `network_route_resume` once: the resource's recorded
+  exclusive route and alias made again in place with the recorded ip, via and resource -- a failure
+  leaves the row recorded for the next tick's resume -- only while the lease is live, held here, unsuperseded and was acquired or renewed during this boot,
   a universe runs at `via`, and the kernel holds no other route for the address. A refusal (the
   replica not running yet, say) is reported and the tick goes on: a connector of a host that is not
   eligible is stopped as before.
@@ -78,16 +78,27 @@ While the holder does not change, the tick and the node now bring the page back 
   `publisher_status` alone, the mark's epoch with the lease's, the origin's readiness at that epoch
   (200, ready, this logical manager, the carrier's replica) and the connector's registration in its
   **current** run (the registration of an earlier run of the same unit no longer counts). On a
-  mismatch it stops the connector; the next tick starts it again under the resume rule. A node older
-  than those fields is not second-guessed.
+  positive mismatch -- no mark, a mark at another epoch, an origin that answered otherwise -- it stops
+  the connector at once; the next tick starts it again under the resume rule. A reading that could not
+  be made (a `podman exec` that failed, an origin not reached, a replica identity not known, a journal
+  not read, or a current run whose journal shows no registration) is not a mismatch: the connector is
+  stopped only when it persists three ticks in a row, counted in `/run/podmesh-publisher-follow/
+  tick-state.json` (`PODMESH_PUBLISHER_FOLLOW_STATE`), and a good reading resets the count. A node
+  older than those fields is not second-guessed.
+- **A failed start waits.** A start that cannot register holds the one-request-at-a-time daemon for
+  up to 60 seconds; after a failed start the next waits 20 s, doubling up to 300 s, in the same state
+  file; a success or a new epoch clears it. An installed proof file that cannot be read or is not a
+  document is started without, and said once per content; it never stops the tick.
 - **The replica claims nothing at its start.** The manager universe's entrypoint removes the mark,
-  at both paths, before the origin starts; the origin answers 503 until PodMesh writes the mark again
+  at both paths and at the path `PODMESH_ACTIVE_MANAGER_MARK` overrides them with, before the origin starts; the origin answers 503 until PodMesh writes the mark again
   at `publisher_start`.
 - **The daemon withdraws at its start.** A connector whose lease lapsed while the daemon was down is
   withdrawn, connector and mark, in one journaled operation before anything is served.
 
 Renewal is unchanged: only while eligible, inside `renew_below`, before `not_after`. A replica that
-stays down therefore stops the renewal, and the lease lapses on its own clock. The mandate's
+stays down therefore stops the renewal, and the lease lapses on its own clock: the page comes back by
+itself only if the replica returns before that -- with `renew_below` 900 and a 3600 s lease, within
+about 890 s to 3600 s of its stop, depending on where the lease stood. The mandate's
 `not_after` stays the human bound: after it the tick renews nothing, resumes nothing -- neither a
 route nor a connector -- and starts nothing; it still stops what is not eligible or does not match.
 
@@ -95,9 +106,20 @@ What this lot does not do: it never changes the holder, never acquires, never mi
 proof, and never renews past `not_after`. **After a reboot of the holder's host nothing resumes**:
 the tick, the mandate and the proof were under `/run`, the proof was verified during another boot,
 and the ledger's /32 is withdrawn at boot and never re-applied; the entitlement is decided again, by
-the gate today (`--refresh`). The takeover at the barrier stays unsound while the old holder's
-mandate renews (the barrier ignores `not_after`); that closes with a renewal the old holder cannot
-grant itself, a later lot. Proven without the laboratory: the unit tests of the resume rules and of
+the gate today (`--refresh`).
+
+**A rotation to another holder, and the mandate this tick renews under.** Review of 2026-09-18: with
+the resume, a holder whose replica returns while its lease lives becomes eligible again and renews;
+if a rotation elsewhere was never delivered to it, its lease runs past the barrier counted from the
+rotation, and two connectors publish one tunnel. `tools/arm-publisher-follow.py` now records every
+mandate it issues (host, `not_after`, no secret) in the resource's ledger before installing it, and
+`tools/ha-standby.py rotate` to another holder delivers the supersession to the previous holder
+(`--previous-host`) before any proof is made -- a superseded host renews nothing and resumes nothing
+-- or, when it cannot, makes the barrier no earlier than that mandate's `not_after` plus the lease
+plus the margin, and refuses (`follow_mandate_unknown`) before the gate moves when the record cannot
+be read. A mandate the ledger does not record (armed before 2026-09-18, or from another workstation)
+is stated with `--follow-mandate-not-after`. The closure that needs no workstation, a renewal the old
+holder cannot grant itself, is a later lot. Proven without the laboratory: the unit tests of the resume rules and of
 the route resume's refusals, and `tests/check-publisher-follow-script.py` against a stubbed CLI.
 Only the laboratory proves the page coming back, the route and alias re-made in a restarted
 carrier, and the registration read from a unit's current run.
