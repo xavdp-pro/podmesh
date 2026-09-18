@@ -53,7 +53,10 @@ A connector that reaches a replica that is not the active manager gets nothing. 
 withdrawal while the carrier is stopped finds no running universe to remove it from): the
 entrypoint removes both of the mark's paths, and the path `PODMESH_ACTIVE_MANAGER_MARK` replaces
 them with when it is set, at every start, before the origin starts, and the
-replica claims no role until PodMesh writes the mark again at `publisher_start` (V3-1, web tree). The manager's web
+replica claims no role until PodMesh writes the mark again at `publisher_start` (V3-1, web tree).
+With `PODMESH_ACTIVE_MANAGER_MARK` set, the origin reads that path only — neither of the two
+others — and without a file there it answers 503: it fails closed, and a node writing the usual
+path does not mark a replica configured so. The manager's web
 interface is not served there yet; this responder is the origin the contract requires today.
 
 ## Operations
@@ -168,12 +171,14 @@ kernel holds no other route for the address.
    on its own clock — `packaging/podmesh-fence`). `tools/ha-standby.py rotate --previous-host`
    delivers the supersession itself, before the new holder acquires and before any proof is made;
    when the previous holder is not reached, the proof's barrier is no earlier than the `not_after`
-   of the follow mandate it may still renew under by itself, plus the lease and the margin (below).
+   of the follow mandate it may still renew under by itself, plus the lease and the margin; and
+   every rotation carries the barrier of the epoch before it (below).
 3. Observe on the previous active manager, when reachable, the connector stopped and the
    address gone.
 4. Publish the service address on the new active manager (`network_route_publish`, exclusive).
    The barrier (the previous lease plus the margin, counted from the rotation, since the
-   previous holder may have renewed right up to it) can outlast the new holder's own lease:
+   previous holder may have renewed right up to it; see "The barrier, as it is" below) can
+   outlast the new holder's own lease:
    after it, the new holder acquires again with the rotation's permit — idempotent for the
    holder, the design's answer to a lapsed lease of one's own — before starting.
 5. `publisher_start` there: the proof's origin and binding, readiness at the new epoch, then
@@ -310,6 +315,47 @@ moves. What the ledger cannot see — a mandate issued before the record existed
 workstation — the operator states (`--follow-mandate-not-after`). The cost: a takeover of an
 unreachable holder under a standing mandate waits for that mandate's end. The real closure, a
 renewal the old holder cannot grant itself, is a later lot.
+
+**The barrier, as it is (second review of 2026-09-18).** A rotation's `eligible_after`, which the
+node enforces for every method (`first`, `same_holder`, `lease_barrier`, `fence_receipt`: a
+document is refused until it, on the node's clock, and accepted from it; an expired one stays
+refused), is the latest of:
+
+- for a rotation to another holder, now plus the lease plus the margin, where the lease is the
+  longer of this call's and the one the previous holder renews under (the ledger's policy before
+  this call) — a shorter `--lease` on the call does not shorten what the previous holder holds;
+- when that holder was not told of the rotation, its recorded follow mandate's `not_after` plus the
+  same lease and margin;
+- **the barrier carried from the gate's current epoch**, whatever the method, the same holder
+  included: the recorded proof's `eligible_after`, or, when that proof was upgraded to
+  `fence_receipt` (its previous holder fenced), only what it carried itself. A holder that was
+  never told does not become harmless because the role moved again, nor because the operator
+  rotated to the same host again (which `--refresh` does): the proof records it as
+  `carried_eligible_after`, and `attest-fence` makes a fence receipt eligible at that barrier, not
+  at once — the fence says nothing about the earlier holder.
+
+The proof expires an hour after its barrier, never before (`expires_at` = the later of now and
+`eligible_after`, plus 3600): a proof that died before it could be used would leave only a
+same-holder rotation. The rotation and a proof as long as it could need to be (as if the
+supersession will not be delivered) are recorded in the ledger as soon as the gate moves, before
+anything that can fail — a dropped SSH session to the previous holder is reported
+(`supersession.delivered` false), never raised; a failure after that leaves the rotation
+`gate_moved` with its proof, and a rerun carries it. The ledger is written under its lock
+(`ledger_locked` when another rotation, record or replication run holds it for 30 s).
+
+Refusals, all before the gate moves: `no_proof_for_current_epoch` — the ledger holds no proof for
+the gate's current epoch (a rotation made from another workstation, or one interrupted before this
+record existed), so its barrier cannot be carried; the operator recovers by stating it
+(`--barrier-not-before <unix time>`: that proof's `eligible_after`, or the latest second any earlier
+holder may still renew by itself plus its lease and margin), a universe activated by `activate`
+carrying none; `previous_host_mismatch` — the host named by `--previous-host` is not the gate's
+previous holder; `follow_mandate_unknown` — the ledger's record of a follow mandate cannot be read.
+When the supersession is delivered, the same visit stops the previous holder's connector
+(`publisher_stop`) and reports its unit as observed after (`supersession.previous_connector`).
+
+A follow mandate is recorded before it is installed, keeping the larger of the previous and the new
+`not_after` until the host's copy is read back, so that an installation that fails never leaves the
+record saying less than what the host may still hold.
 
 **What V3-1 does not do.** It never changes the holder, never acquires, never mints or extends a
 proof, and never renews past the mandate's `not_after`. After a reboot of the holder's host

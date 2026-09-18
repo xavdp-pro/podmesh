@@ -117,6 +117,24 @@ Not carried yet by the managed profile, and refused rather than assumed: `clone`
   is gone; reports drift — an effective effect the kernel no longer shows — and never touches
   it. While anything remains after reconciliation, every network mutation refuses and says
   what remains; `network_status` shows the ledger and `incomplete_effects`.
+- **A resumed exclusive route keeps its record** (`network_route_resume`, 2026-09-18). The resume
+  works in place: the row is marked `resuming` with the carrier now at `via`, its dead effects
+  are removed and verified gone, the alias and the route are made again, each recorded before it is
+  made and verified, and the row is `effective` again. A failure compensates what the resume made
+  and leaves the row recorded (`effective`, nothing verified under it, so the service address is not
+  effective), for the next resume; a crash leaves it `resuming`, and the reconciliation undoes its
+  effects and keeps it the same way, reported as `routes_kept_for_resume` — the one interrupted
+  route that is kept rather than dropped. A row still `resuming` at boot is withdrawn by
+  `network_reapply` whatever the kernel shows: a resume never survives a reboot. The resume refuses
+  `route_incomplete` for a row `applying`, `removing` or `resuming`, and `alias_unknown` when the
+  kernel holds the route and whether the carrier holds the address could not be read: a live /32
+  is never torn down on an unknown.
+- **Unknown is never absent for an alias.** A carrier that does not run carries no address (read
+  absent); one whose namespace or container could not be read is unknown (`alias_effective`
+  null in `network_status`), and whatever depends on it — the publisher's `service_address` gate,
+  the resume — says unknown and does not act as if the address were gone.
+- **A gateway is compared whole.** Every reading of a route's gateway compares the word after
+  `via` as a whole address, so a route via 10.86.1.100 is not taken for one via 10.86.1.10.
 - A managed `create` whose container could not be observed on the bridge with the allocated
   address releases the allocation and refuses; a partial container is removed.
 - Unknown is unknown: an `ip route`, `podman network inspect` or `nft` that cannot be run makes

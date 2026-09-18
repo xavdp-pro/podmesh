@@ -118,8 +118,16 @@ mandate it issues (host, `not_after`, no secret) in the resource's ledger before
 -- or, when it cannot, makes the barrier no earlier than that mandate's `not_after` plus the lease
 plus the margin, and refuses (`follow_mandate_unknown`) before the gate moves when the record cannot
 be read. A mandate the ledger does not record (armed before 2026-09-18, or from another workstation)
-is stated with `--follow-mandate-not-after`. The closure that needs no workstation, a renewal the old
-holder cannot grant itself, is a later lot. Proven without the laboratory: the unit tests of the resume rules and of
+is stated with `--follow-mandate-not-after`. Every rotation, to the same host included (`--refresh`),
+also carries the barrier of the epoch before it, and its proof lives an hour past that barrier
+(`MANAGER-PUBLISHER-CONTRACT.md`, "The barrier, as it is"). The closure that needs no workstation, a
+renewal the old holder cannot grant itself, is a later lot.
+
+A service address whose state could not be read (`gates.service_address` null) is neither resumed nor
+stopped on: it counts as an unknown reading, like the mark and the origin. When the tick's state cannot
+be written, an unknown reading stops the connector at once, since its count cannot be kept; the state
+is keyed by resource, and a value in it that is not what it should be is taken toward a stop or the
+longest wait, never a crash. Proven without the laboratory: the unit tests of the resume rules and of
 the route resume's refusals, and `tests/check-publisher-follow-script.py` against a stubbed CLI.
 Only the laboratory proves the page coming back, the route and alias re-made in a restarted
 carrier, and the registration read from a unit's current run.

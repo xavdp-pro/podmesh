@@ -602,12 +602,13 @@ remains (`network_status`: `effects`, `incomplete_effects`).
   eligible), so that the next resume retries it; a crash leaves it `resuming`, and the reconciliation undoes its
   effects and keeps it the same way (`routes_kept_for_resume`). Refused, naming the reason, in this order: `no_policy`,
   `no_recorded_route` (a first publication is `network_route_publish`'s), `route_incomplete` (a row left
-  `applying` or `removing` is the reconciliation's), `lease_not_entitled` (the lease gate's four reasons, quoted),
+  `applying`, `removing` or `resuming` is the reconciliation's), `lease_not_entitled` (the lease gate's four reasons, quoted),
   `lease_not_renewed_this_boot` (the lease neither acquired nor renewed during this boot: after a boot the
   entitlement is decided again, and the ledger's /32 is never re-applied; every lease history row written
   since 2026-09-18 carries its boot's identity and is compared by it, older rows by the wall clock), `declaration_not_effective`,
   `kernel_unknown`, `other_kernel_route` (the kernel holds a route for the address through anything but `via`:
-  somebody else's, never touched), `no_carrier_at_via`. Journaled like every network mutation: the same operation
+  somebody else's, never touched), `alias_unknown` (the kernel holds the route and whether the recorded carrier
+  holds the address could not be read: nothing is torn down on an unknown), `no_carrier_at_via`. Journaled like every network mutation: the same operation
   ID replays the verified answer and repeats nothing; a route and alias already effective answer
   `already_effective` and change nothing. It never changes the holder, never acquires and never renews. The
   follow tick calls it once per tick when the service address is the only gate of `publisher_status` missing.
@@ -655,7 +656,8 @@ proof, or with one refused, resumes under that record (`takeover_proof.method` `
 the same epoch, generation and acquisition, during the same boot, under the same authority and key, and is
 refused otherwise naming the condition (`no_lease`, `lease_held_elsewhere`, `lease_expired`, `lease_superseded`,
 `no_verified_proof`, `epoch_changed`, `generation_changed`, `lease_reacquired`, `boot_changed`,
-`authority_changed`). `publisher_status` adds `gates` (each gate by name), `active_manager_mark_read`
+`authority_changed`). `publisher_status` adds `gates` (each gate by name; `service_address` is null when the kernel's route or the
+carrier's address could not be read, and the publisher is then not eligible, never taken as having lost it), `active_manager_mark_read`
 (`present` with `active_manager_mark_epoch`, `absent`, or `unknown` with `active_manager_mark_error`),
 `origin_ready_at_lease_epoch` (true, false when the origin answered otherwise, null when it could not be told),
 `unit.invocation_id`, `connector_registered` (true, false when the current run's journal holds no registration,

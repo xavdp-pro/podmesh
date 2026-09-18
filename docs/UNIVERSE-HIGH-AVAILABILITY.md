@@ -476,7 +476,10 @@ Four subcommands. `gate` creates and drives the epoch gate — the fencing labor
 SQLite compare-and-swap file on the host the tool runs on, with the laboratory's precondition
 (one current copy, never cloned or rolled back) stated as the operator's obligation.
 `activate` declares the policy under that authority, rotates the epoch to a host and acquires;
-starting stays the operator's. `cycle` is one capture: declare the collector's retention on the active host, stop,
+starting stays the operator's. `rotate` moves an exclusive role (a logical manager) with no promotion;
+its barrier, its supersession of the previous holder and its refusals (`no_proof_for_current_epoch`,
+`previous_host_mismatch`, `follow_mandate_unknown`, `ledger_locked`) are stated in
+`MANAGER-PUBLISHER-CONTRACT.md`, "The barrier, as it is". `cycle` is one capture: declare the collector's retention on the active host, stop,
 prepare, renew, start again, carry the two files to **one or more standbys** (`--also`),
 restore into quarantine on each, prune the older quarantined copies of each through the API
 and keep a ledger per standby — with three nodes, one or two replicas per universe, as the
