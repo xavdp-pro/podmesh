@@ -62,6 +62,7 @@ impl Lab {
             full_verification_interval_ms: None,
             unchanged_snapshot_refresh_ms: None,
             catch_up_window_ms: None,
+            votes: None,
         };
         let path = directory.path().join("inspect.json");
         fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();

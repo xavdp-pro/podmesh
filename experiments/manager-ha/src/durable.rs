@@ -3998,6 +3998,20 @@ fn begin_inspection<'c>(
 
 /// The domain-separated digest of a replica's ordered facts, comparable across
 /// converged replicas of one logical manager and topology.
+/// The `logical_history_sha256` an inspection of a store under `configuration` reports for
+/// `ordered_facts`: what a reader of an exported inspection recomputes to check that the facts it
+/// holds are the ones the inspection counted, none dropped, added or altered since.
+///
+/// # Errors
+/// Returns the configuration's validation error, or a serialization failure.
+pub fn facts_history_sha256(
+    configuration: &Configuration,
+    ordered_facts: &[Fact],
+) -> DurableResult<String> {
+    let topology = configuration.topology().map_err(invalid_configuration)?;
+    logical_history_sha256(&topology, ordered_facts)
+}
+
 fn logical_history_sha256(topology: &Topology, ordered_facts: &[Fact]) -> DurableResult<String> {
     let topology_sha256 = digest(&json(topology)?);
     Ok(digest(&json(&(

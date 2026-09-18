@@ -42,6 +42,13 @@ enum AppendStartError {
 }
 
 pub mod cli;
+pub mod ledger;
+pub mod quorum;
+pub mod readmission;
+pub mod vote;
+#[cfg(test)]
+mod vote_tests;
+pub mod votes;
 
 /// Default delay after which a snapshot that a peer already acknowledged is
 /// pushed to that peer again although it has not changed. An idle replica adds
@@ -75,6 +82,10 @@ pub struct Configuration {
     /// was appended by the store itself; absent means `DEFAULT_CATCH_UP_WINDOW`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catch_up_window_ms: Option<u64>,
+    /// Signed votes (V3-4): the authority set this replica votes under. Absent means the replica
+    /// signs nothing; present, the host must provide `PODMESH_MANAGER_VOTE_DIR`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub votes: Option<votes::VoteConfiguration>,
 }
 
 impl Configuration {
@@ -129,6 +140,9 @@ impl Configuration {
                 .any(|peer| peer.endpoint.port() == 0)
         {
             return Err("static endpoints require nonzero ports".into());
+        }
+        if let Some(votes) = &self.votes {
+            votes.validate(self)?;
         }
         let parent = self.control_socket.parent().ok_or("socket has no parent")?;
         let metadata = fs::symlink_metadata(parent)?;
@@ -340,6 +354,9 @@ struct Status {
     /// while it is true, and refuses too when this status does not arrive.
     store_closed: bool,
     store_closed_reason: Option<String>,
+    /// The signing ledger's state and the tripwire's alerts, when this replica votes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    votes: Option<serde_json::Value>,
 }
 
 /// What this process has learnt about one peer while it catches up.
@@ -688,6 +705,8 @@ struct Shared {
     /// imports that inserted facts. An acknowledgement recorded at an older
     /// generation no longer describes the current snapshot.
     snapshot_generation: AtomicU64,
+    /// The signed votes' runtime, when this replica votes.
+    votes: Option<Arc<votes::VoteRuntime>>,
 }
 
 struct AppendJobGuard(Arc<Shared>);
@@ -763,6 +782,7 @@ fn status(config: &Configuration, shared: &Shared) -> Result<Status> {
         activation_authority: false,
         store_closed: store_closed.is_some(),
         store_closed_reason: store_closed.map(|failure| failure.to_string()),
+        votes: shared.votes.as_ref().map(|votes| votes.status()),
     })
 }
 
@@ -780,6 +800,20 @@ enum Control {
         scope: String,
         subject: String,
         value: String,
+    },
+    VoteLedgerInit {
+        operation_id: String,
+    },
+    VoteLedgerMarkUnadmitted {
+        operation_id: String,
+        reason: String,
+    },
+    VoteLedgerReadmit {
+        operation_id: String,
+    },
+    VoteSign {
+        operation_id: String,
+        payload: serde_json::Value,
     },
 }
 
@@ -919,6 +953,88 @@ fn start_append_observation(
     Ok((receiver, worker))
 }
 
+/// Runs one vote operation of the control socket (V3-4) in a worker, like an append, within the
+/// control deadline: authorized by the caller's UID (the operator for the ledger's operations, the
+/// observation writer for a signature), refused before any store or ledger access otherwise, and
+/// answered `vote_operation_uncertain` when the worker has not finished in time (the ledger and the
+/// store keep what it did; the status shows the ledger's state).
+#[allow(clippy::too_many_arguments)]
+fn vote_control(
+    config: &Configuration,
+    shared: &Arc<Shared>,
+    stream: &UnixStream,
+    operation_id: &str,
+    operation: votes::VoteOperation,
+    deadline: Instant,
+    workers: &mut Vec<thread::JoinHandle<()>>,
+) -> Vec<u8> {
+    let Some(runtime) = shared.votes.clone() else {
+        return b"{\"error\":\"votes_not_configured\"}".to_vec();
+    };
+    if validate_control_token(operation_id).is_err() || operation_id.starts_with("network:") {
+        return b"{\"error\":\"vote_operation_refused\"}".to_vec();
+    }
+    let Ok(peer) = rustix::net::sockopt::socket_peercred(stream) else {
+        return b"{\"error\":\"vote_operation_refused\"}".to_vec();
+    };
+    let uid = peer.uid.as_raw();
+    let allowed = if operation.operator_only() {
+        config.votes.as_ref().is_some_and(|v| v.operator_uid == uid)
+    } else {
+        uid == config.observation_writer_uid
+    };
+    if !allowed {
+        return b"{\"error\":\"vote_operation_refused\",\"code\":\"caller_uid_refused\"}".to_vec();
+    }
+    // A signature is recorded in the store before it is answered: not before this process caught up.
+    if !operation.operator_only()
+        && !shared
+            .catch_up
+            .lock()
+            .is_ok_and(|mut catch_up| catch_up.evaluate(Instant::now()))
+    {
+        return b"{\"error\":\"vote_catching_up\"}".to_vec();
+    }
+    if shared
+        .append_job_active
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return b"{\"error\":\"vote_busy\"}".to_vec();
+    }
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let job_config = config.clone();
+    let state = Arc::clone(shared);
+    let worker = thread::spawn(move || {
+        let _active = AppendJobGuard(Arc::clone(&state));
+        let replica = job_config.network.replica_id.clone();
+        let response = runtime.execute(operation, uid, || store(&job_config), &replica);
+        if response.starts_with(b"{\"vote\"") {
+            state.snapshot_generation.fetch_add(1, Ordering::SeqCst);
+        }
+        let _ = sender.send(response);
+    });
+    let wait = deadline
+        .saturating_duration_since(Instant::now())
+        .saturating_sub(CONTROL_WRITE_RESERVE);
+    match receiver.recv_timeout(wait) {
+        Ok(response) => {
+            let _ = worker.join();
+            response
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            if worker.join().is_err() {
+                shared.append_worker_failures.fetch_add(1, Ordering::SeqCst);
+            }
+            b"{\"error\":\"vote_operation_uncertain\"}".to_vec()
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            workers.push(worker);
+            b"{\"error\":\"vote_operation_uncertain\"}".to_vec()
+        }
+    }
+}
+
 /// Accounts for what this replica durably decided on an authenticated request.
 fn record_served_decision(shared: &Shared, decision: &ServedDecision) {
     match decision {
@@ -1024,6 +1140,7 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
         .open(config.network.database_path.with_extension("resident-lock"))?;
     lock.try_lock_exclusive()?;
     let _validated = config.network.open()?;
+    let vote_runtime = votes::VoteRuntime::from_environment(&config)?;
     // How this process catches up with its peers depends on the store it found:
     // the facts of this replica's own origin it held, and whether the latest of
     // them was appended by the store itself rather than imported back from a peer.
@@ -1092,6 +1209,7 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
         )),
         snapshot_generation: AtomicU64::new(0),
         store_closed_state: startup_store.closed_state(),
+        votes: vote_runtime.map(Arc::new),
     });
     let outgoing_config = config.clone();
     let outgoing_shared = Arc::clone(&shared);
@@ -1237,6 +1355,51 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
                                     b"{\"error\":\"append_observation_refused\"}".to_vec()
                                 }
                             },
+                            Ok(Control::VoteLedgerInit { operation_id }) => vote_control(
+                                &config,
+                                &shared,
+                                &stream,
+                                &operation_id,
+                                votes::VoteOperation::Init,
+                                deadline,
+                                &mut append_workers,
+                            ),
+                            Ok(Control::VoteLedgerMarkUnadmitted {
+                                operation_id,
+                                reason,
+                            }) => vote_control(
+                                &config,
+                                &shared,
+                                &stream,
+                                &operation_id,
+                                votes::VoteOperation::MarkUnadmitted { reason },
+                                deadline,
+                                &mut append_workers,
+                            ),
+                            Ok(Control::VoteLedgerReadmit { operation_id }) => vote_control(
+                                &config,
+                                &shared,
+                                &stream,
+                                &operation_id.clone(),
+                                votes::VoteOperation::Readmit { operation_id },
+                                deadline,
+                                &mut append_workers,
+                            ),
+                            Ok(Control::VoteSign {
+                                operation_id,
+                                payload,
+                            }) => vote_control(
+                                &config,
+                                &shared,
+                                &stream,
+                                &operation_id.clone(),
+                                votes::VoteOperation::Sign {
+                                    operation_id,
+                                    payload,
+                                },
+                                deadline,
+                                &mut append_workers,
+                            ),
                             Err(_) => b"{\"error\":\"invalid typed control request\"}".to_vec(),
                         },
                         _ => b"{\"error\":\"control request bound exceeded\"}".to_vec(),

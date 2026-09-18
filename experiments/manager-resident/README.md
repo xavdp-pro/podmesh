@@ -5,7 +5,9 @@ manager retains control facts in distinct replicas, without a shared live
 filesystem. This increment runs periodic authenticated snapshot exchange using
 the typed `manager-network` and durable SQLite `manager-ha` path dependencies.
 It never calls Podman, runs commands, publishes DNS/IP, grants permits, performs
-fencing or activation, or changes enrollment.
+fencing or activation, or changes enrollment. Configured to, it signs votes under a
+signing ledger ([below](#signed-votes-and-the-signing-ledger-v3-4)); a vote grants
+nothing until k of them make a certificate that a PodMesh node verifies itself.
 
 ## Resident behavior
 
@@ -333,6 +335,116 @@ absolute deadline; an interrupt never renews the deadline. No signal injection
 test is claimed for this retry branch; frame deadline and process tests cover the
 surrounding I/O paths.
 
+## Signed votes and the signing ledger (V3-4)
+
+A replica can sign a **vote**: its promise for one exclusive decision that a PodMesh node will
+verify as a quorum certificate of V3-2 (`podmesh-takeover-proof/quorum-ed25519` for an epoch
+rotation or a same-holder re-issue, `podmesh-policy-change/quorum-ed25519` for a change of the
+authority set). k votes of distinct keys on one payload assemble into exactly the certificate the
+node accepts. A vote grants nothing by itself, and `activation_authority` stays false: the node
+verifies the certificate, and proposing, deciding and delivering one are the next lot's (V3-5).
+
+**Custody.** The replica's key and its signing ledger live in a directory the host provides outside
+the universe's state, named by `PODMESH_MANAGER_VOTE_DIR` (private, of the service's user):
+`<key_id>.key` holds the 32-byte seed as 64 lowercase hex characters, and `<key_id>.ledger` is the
+ledger. No recovery point, restore, clone or migration of the replica's universe carries either.
+The host also mounts its own machine-id read-only at `PODMESH_MANAGER_HOST_ID_FILE` (default
+`/etc/machine-id`), not inside the vote directory: a universe's own `/etc/machine-id` travels with
+a clone, and a copy of the vote directory must not carry the identity it is checked against. A
+configuration with `votes` and no vote directory does not start.
+
+**The ledger** (rule R4 of the quorum model: the promise lives with the key). Per resource, one
+entry per epoch with its holder, and one entry per `from_serial` with the new policy's digest.
+Neither is keyed on the policy digest, so a change of the authority set never reopens an epoch or
+a serial. The key signs one decision per (resource, epoch) and one per (resource, from_serial): the
+same decision again, with a fresh life (`issued_at`, `expires_at`) only, is re-signed; any other
+decision for a promised number, or for a number below one promised, is refused. Every signature
+takes the next sequence number. The header binds the key (its id and public half), the host's
+machine-id and a random nonce made with the ledger; a checksum covers the file. A signature is one
+step under an exclusive `flock` on `<key_id>.ledger.lock`: check, write the new ledger to a
+temporary file, fsync it, rename it over the ledger, fsync the directory, and only then sign. A
+missing, unreadable, foreign (another key or another host) or unadmitted ledger signs nothing and
+answers a named code: `ledger_missing`, `ledger_unreadable`, `ledger_foreign_key`,
+`ledger_foreign_host`, `ledger_unadmitted`.
+
+**The vote.** `form` `podmesh-manager-vote/1`, the `voter` (key id), the `certificate_kind`, the
+`payload` (the certificate without `signatures`), `signature` (the voter's Ed25519 signature over the
+payload's canonical form: the entry the node counts), the ledger's `ledger_nonce` and
+`ledger_sequence`, and `envelope_signature`, the voter's signature over all of that. A vote counts
+only when its voter is a key of the policy (`unknown_voter` otherwise), both signatures verify
+strictly under that key (`bad_envelope_signature`, `bad_signature`), its payload names this policy
+(`policy_mismatch`), and, read from a fact, the fact's origin replica owns that key
+(`origin_mismatch`). A replica signs only a payload live on its clock, issued at most 30 seconds
+ahead, living at most `max_certificate_life_seconds`, under the policy it is configured with, and a
+policy change only away from its own serial.
+
+**The tripwire.** Before signing, the resident reads every vote its store holds (its own and its
+peers'). A vote of its own key, whose signatures verify, numbered above the ledger
+(`ledger_behind_own_votes`), or numbered since the ledger's last admission and not in it
+(`own_vote_unknown_to_ledger`), shows the ledger went back in time: a restore or a snapshot revert.
+The resident then marks the ledger unadmitted, durably, refuses, writes `resident vote alert:` and
+the code on standard error, and keeps the alert in its status. A forged vote cannot fire it.
+
+**Readmission** is the operator's, and fails closed. It reads this replica's store; for every other
+replica its store, and for every other key of the policy its ledger, and for every node of
+`votes.nodes` its screen, from evidence files the operator places in `<vote dir>/readmission/`
+(`store.<replica_id>.json`, `ledger.<key_id>.json`, `screen.<host_uuid>.json`, each
+`{"form": "podmesh-manager-readmission-evidence/1", "input", "source", "collected_at", "content"}`,
+the content being an `--inspect-store --facts-only` output, a ledger file, or
+`{"activation_status": [...]}`); and the ledgers of this host's retired keys still in the vote
+directory. It refuses, naming each input (`readmission_inputs_unreadable`), when one is missing,
+does not parse, is not what it claims (a store whose digest does not match its facts, a ledger whose
+checksum fails, a screen of another host), was collected before the ledger was marked, or holds a
+vote of a key it does not know (a retired key must be named in `votes.retired_keys`). It never
+proceeds on what it could read. It then waits until `max_certificate_life_seconds` plus 30 seconds
+have passed since the ledger was marked (`readmission_too_early`, with `retry_at`), so that a
+signature the ledger forgot and a proposer still holds has expired. It sets, per resource, the
+epoch floor at the highest epoch anything showed (a promise, a vote, a screen) and the serial floor
+at the highest `from_serial` promised or already passed, raises the sequence above the key's own
+votes, records what it read (with digests) and what it set, and admits the ledger. Where an input
+cannot be read, the alternatives are to wait, or to re-key: a new key and ledger for the replica
+(an authority-set change at serial + 1), admitted by the same operation, which reads the old key's
+votes as a retired key's, so its floors are above them too. The node screens themselves move when
+the first certificate above them is delivered (V3-5); they never move backwards.
+
+**Control operations.** Each one JSON object with an `operation_id` token:
+
+```json
+{"operation":"vote_ledger_init","operation_id":"init-1"}
+{"operation":"vote_ledger_mark_unadmitted","operation_id":"mark-1","reason":"host restored from a snapshot"}
+{"operation":"vote_ledger_readmit","operation_id":"readmit-1"}
+{"operation":"vote_sign","operation_id":"sign-1","payload":{"kind":"podmesh-takeover-proof/quorum-ed25519","...":"..."}}
+```
+
+The first three require the caller's UID to be `votes.operator_uid`; `vote_sign` requires
+`observation_writer_uid` and a caught-up process (`vote_catching_up`). Another caller gets
+`vote_operation_refused` with `caller_uid_refused`. `vote_ledger_init` creates an unadmitted ledger
+and refuses an existing one (`ledger_exists`). `vote_sign` records the vote as a fact in
+`votes/<replica_id>` (subject `epoch:<resource>:<epoch>` or `serial:<resource>:<from_serial>`)
+before it answers `{"vote", "fact"}`; a vote that could not be recorded is not answered
+(`vote_unrecorded`), and its promise stays in the ledger. The operations share the append worker:
+`vote_busy` while it is occupied, `vote_operation_uncertain` when the worker did not finish inside
+the control deadline (the ledger and the store keep what it did; `status` shows the ledger). Retry
+a signature with a fresh `operation_id`: the ledger re-signs the same decision, and the store
+refuses a changed request under an old one. Refusals are `{"error": "vote_refused", "code",
+"detail"}` and `{"error": "readmission_refused", "code", "detail", "unreadable", "retry_at",
+"alternative"}`. `status` carries `votes`: `key_id`, `ledger_state` (`admitted`, `unadmitted` or the
+refusal code), `sequence`, `unadmitted_since`, `unadmitted_reason`, `admissions` and `alerts`.
+
+The optional `votes` configuration: `key_id`, `authority_id`, `authority_quorum` (the nodes'
+`{"threshold", "keys"}`), `authority_serial`, `replica_keys` (every replica of the topology and its
+own key of the policy), `retired_keys` (`[{"key_id", "public_key"}]`, optional), `nodes` (1 to 64
+host UUIDs), `operator_uid` and `max_certificate_life_seconds` (1 to 3,600). The topology must grant
+`votes/<replica_id>` to this replica.
+
+**Not here.** Proposing, collecting votes across replicas, deciding, reading a decision through the
+node's door and delivering certificates (V3-5); lease extension by majority (V3-6); the operator's
+tool that collects readmission evidence from the hosts; re-keying without a trusted dealer. The
+tripwire sees only the votes that reached this replica's store: a restored ledger shown none of its
+later votes signs again what it forgot, which is why the restore procedure marks it unadmitted first.
+Clones of a whole host VM (key, ledger and machine-id together) are indistinguishable from the
+original: the operator's rule of no VM clone of a laboratory host on the managed network stands.
+
 ## Validation and gaps
 
 [EVIDENCE.md](EVIDENCE.md) covers three simultaneous compiled processes, UID-bound
@@ -341,7 +453,7 @@ conflicts, wrong keys, authenticated invalid batches, raw-frame/value bounds,
 read-only inspection, framing/admission limits and shutdown. The partition test
 uses six TCP proxies to cut both directions around one still-running resident.
 
-Remaining: key rotation/revocation, signed original provenance, encryption,
+Remaining: key rotation/revocation, signed original provenance of facts other than votes, encryption,
 WireGuard/real-host qualification, bounded incremental history, retention/quota,
 receipt/backup recovery, identity fencing across paths/hosts, Logger, integrated
 control-services deployment and actual exclusive-effect fencing. There is no
