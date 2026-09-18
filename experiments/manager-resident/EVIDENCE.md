@@ -135,3 +135,65 @@ real host permission proof, system service, HA/failover, activation or fencing
 claim follows from these tests. The package-facing private `0600` socket currently
 makes UID 0 or the service account the practical writer boundary; Stage P owns any
 group/ACL design.
+
+## Signed votes and the signing ledger (V3-4)
+
+Date: 2026-09-18. Scope: the library's signer, ledger, readmission and assembly, with real child
+processes for crashes and lock races, and one compiled resident process driven over its control
+socket. Temporary directories and test-only keys (a one-byte seed); no laboratory host, no real key.
+Code at `12a5adf`, the lock test's stagger at `19c287d`.
+
+What each test proves (`src/vote_tests.rs`, `src/quorum.rs`, `tests/votes.rs`):
+
+| Test | Proves |
+| --- | --- |
+| `a_vote_is_signed_once_per_resource_and_epoch_across_restarts` | one decision per (resource, epoch): the same decision re-signed, with a fresh life too; another holder, another grant or another barrier refused (`epoch_already_promised`); a lower epoch refused (`epoch_superseded`); the same after the signer is reopened from its files; another resource's epoch is its own |
+| `a_vote_is_signed_only_for_a_live_payload_under_the_replicas_policy` | no vote for an expired, too long, too early, foreign-policy, float-carrying, epoch-skipping or already-signed payload, and nothing promised for any of them |
+| `a_crash_between_the_ledger_write_and_the_signature_releases_nothing` | a child process aborted after the write before its fsync, after the rename before the directory's fsync, and after the directory's fsync before the signature, releases nothing; the ledger reads back; where the write was not durable, both disk states a power loss can leave are tried; every signature released for the epoch names one holder; after the directory's fsync the promise holds |
+| `a_ledger_restored_from_an_older_copy_trips_the_wire` | a ledger put back from an older copy signs what it forgot while it is shown none of its later votes (the hole the restore procedure's mark covers), trips `ledger_behind_own_votes` once shown one, and `own_vote_unknown_to_ledger` when it has signed past the old numbers; the mark is durable; a forged vote in its name fires nothing |
+| `a_ledger_naming_another_host_or_key_signs_nothing` | a copied vote directory on another host signs nothing (`ledger_foreign_host`), nor marks nor readmits; a ledger in another key's place (`ledger_foreign_key`), a missing, a new, and a hand-altered ledger (`ledger_missing`, `ledger_unadmitted`, `ledger_unreadable`) sign nothing; a key the policy does not name, or names with another public half, or a group-readable key file opens no signer |
+| `two_signers_on_one_ledger_are_serialized_by_its_lock` | two processes asked for epoch 9 for X and for Y, pausing 300 ms and 900 ms between reading the ledger and checking the promise: exactly one signs, three rounds |
+| `a_forged_origin_is_refused` | a vote made by replica-b's key in replica-a's name (`bad_envelope_signature`), a real vote renumbered by a relay (`bad_envelope_signature`), a replaced payload signature (`bad_signature`), a key outside the policy (`unknown_voter`), a vote in another replica's scope (`origin_mismatch`); with them, the assembly still counts one key |
+| `k_minus_one_votes_make_no_certificate` | one vote, one voter twice, and votes on two payloads are `below_threshold`; two voters on one payload make a certificate the node's rules accept |
+| `k_votes_assemble_into_the_certificate_the_node_accepts` | the assembled certificate is byte for byte the pinned vector, which the node's own verifier at `5022a7b` accepted (below); a vote is no certificate (`certificate_kind`, `mixed_forms`); a policy-change certificate assembles and verifies |
+| `a_policy_change_cannot_reopen_an_epoch` | the same key after a change to serial 1 still refuses epoch 5 to another holder; one change per (resource, from_serial) (`serial_already_promised`), none from below a promised serial (`serial_superseded`) or from a policy it does not vote under; a re-keyed replica's new ledger, readmitted with the retired key's vote in its store, has floor 5 and refuses epoch 5 under the new policy; with the retired key not configured, readmission refuses rather than skip the vote |
+| `readmission_with_an_unreadable_input_refuses` | the counter-review's D8b without an omniscient operator: a peer store missing or altered after inspection, a peer ledger altered, a screen of another host, the own store unreadable, and evidence collected before the mark each refuse by name, the ledger staying unadmitted; with every input readable it waits out the certificate life (`readmission_too_early`), then sets the floor at the highest epoch seen (the screen's 3), raises the sequence above the key's own vote, and refuses epoch 1 for another holder |
+| `the_tally_finds_no_conflict_when_promises_are_kept` | the tally makes one certificate per decision and names a conflict only when two certified decisions share an epoch, which needs signatures made outside a ledger |
+| `quorum::node_tests` (9) | the node's verifier tests ported: its pinned policy digests (2-of-3 at serials 0 and 1, the single key's 1-of-1), its Python-signed certificate, k-of-n and k-1, duplicates, foreign keys, relabelled payloads, byte flips, malformed certificates, declaration refusals |
+| `tests/votes.rs` (one process test) | through the control socket: the ledger's operations refuse another UID; a missing and a new ledger sign nothing; readmission names the three inputs it lacks, then waits, then admits above the screen; a vote is recorded in `votes/r0` before it is answered; the promise holds across a restart of the process; the ledger put back from an older copy trips the wire on the resident's own recorded vote, which the status and standard error report; the directory seen from another host signs nothing; the resident's vote and replica-b's make a certificate |
+
+**The node accepts the certificate.** The certificate replica-a's and replica-c's votes assemble for
+the fixed payload of `k_votes_assemble_into_the_certificate_the_node_accepts` was verified by the
+PodMesh node's own `signing::verify_takeover` and `Quorum::verify` at `5022a7b`, in a scratch copy of
+that tree with one added test (not part of the node): accepted, signers `replica-a` and `replica-c`,
+policy digest `965bd61a...`; refused `below_threshold` with one signature removed, and
+`bad_signature` with `new_holder` changed. The test pins the same bytes, so a drift of the
+assembly fails here.
+
+**Negative controls.** Each protection was removed in turn at `19c287d`, the test that claims it run,
+and the source restored byte for byte; all thirteen fired, and every test passed again after:
+
+| Removed | Test failed with |
+| --- | --- |
+| the refusal of a second decision for a promised epoch | another barrier signed for epoch 5 |
+| the order write, fsync, then sign (the vote sealed and released before the write) | a crash after the write released a signature |
+| the tripwire | the restored ledger signed epoch 7 for Y while shown its own later votes |
+| the machine-id comparison | the copied directory signed on the other host |
+| the `flock` | both children signed epoch 9 |
+| the envelope signature's check | the forgery in replica-a's name fell through to the payload check (`bad_signature` instead of `bad_envelope_signature`); a renumbered vote, whose payload signature is genuine, would then count |
+| both signatures' checks | the vote in replica-a's name, made by replica-b's key, counted |
+| the assembly's count (k-1 enough), the node-rule self-check kept | refused as `certificate_self_check`, not `below_threshold`: the self-check caught it |
+| the count and the self-check | a one-signature certificate was returned |
+| the sorted canonical form | the policy digest was no longer the node's |
+| promises keyed on the resource alone (the digest added) | epoch 5 for Y signed after the change to serial 1 |
+| readmission's reading of the stores' votes | the re-keyed ledger was admitted with no floor, and the retired key's vote went unread |
+| readmission's refusal of unreadable inputs | the ledger was admitted with replica-b's store missing |
+
+The recorded checks: resident library 23/23, resident process suite 42/42 plus the votes process
+test and the two inspection tests; manager-ha and manager-network suites unchanged and passing;
+strict resident Clippy and formatting; the tree's lexicon test.
+
+Not shown here: a power loss (A2 is the disk's; the laboratory disks' `cache=none` was read on
+2026-09-18), a whole-VM clone (indistinguishable, A3: the operator's rule), a peer that forges votes
+over a live authenticated link between two residents (the counting refuses them on any path, shown
+at the library), and anything of V3-5: proposing, collecting, deciding, delivering.
