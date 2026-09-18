@@ -85,11 +85,16 @@ with it (`UNIVERSE-NETWORK-CONTRACT.md`, "Failure and cleanup states"), all with
   does), the proof must be the signed kind and its signature must verify over its canonical
   form before any field is read, so an altered, unsigned or foreign-key document is refused as
   such; under a policy without a key only the unsigned laboratory kind is accepted, on its
-  binding alone, and the answer says `signed: false`. The agent's `previous` narrative is
+  binding alone, and the answer says `signed: false`. Under a policy that names a quorum of replica
+  keys (development tree, V3-2, `LOCAL-API.md`, "Quorum certificates"), the proof is a certificate
+  that at least the threshold's number of distinct keys of the quorum signed under the policy's
+  digest, bound in addition to this boot of the new holder and to the grant the lease was acquired
+  under, and the answer names the signers; a single-key policy accepts such a certificate under its
+  1-of-1 digest beside its own signed kind. The agent's `previous` narrative is
   recorded beside it and decides nothing.
   **Same-epoch resume (V3-1).** A proof that verifies is recorded with the lease incarnation it was
-  verified against (epoch, generation, `acquired_at`), this host's boot, and the policy's authority
-  and key. A later start without a proof, or with one refused (expired, say), resumes under that
+  verified against (epoch, generation, `acquired_at`), this host's boot, and the policy's authority,
+  key and quorum. A later start without a proof, or with one refused (expired, say), resumes under that
   record — method `resume_same_epoch`, journaled as the event `takeover_resumed` with the original
   proof's identity (the verifying operation, its method, issue, expiry and signature) — only while
   every one of these holds, and is refused naming the first that does not: the lease is held
@@ -97,8 +102,8 @@ with it (`UNIVERSE-NETWORK-CONTRACT.md`, "Failure and cleanup states"), all with
   (`lease_superseded`); a proof was verified for the resource (`no_verified_proof`); for this very
   epoch (`epoch_changed`); under the same generation (`generation_changed`) and the same
   acquisition (`lease_reacquired`: a lapsed lease of this host's retaken keeps its generation and
-  epoch, not its `acquired_at`); during this boot (`boot_changed`); under the same authority and key
-  (`authority_changed`). Each is a condition under which a connector that never stopped is already
+  epoch, not its `acquired_at`); during this boot (`boot_changed`); under the same authority, key
+  and quorum (`authority_changed`). Each is a condition under which a connector that never stopped is already
   allowed to continue — the reconciliation leaves it alone only under a live, unsuperseded lease held
   here at the transition's epoch; it does not outlive its boot — so a restart under them grants
   nothing that continuing did not. One of them holds only when something runs: a connector is
@@ -403,3 +408,20 @@ steps back past a lapse sees its lease live again; nothing was retaken, so the r
 all hold, and the tick resumes as if the lease had never lapsed. The takeover margin is the stated
 clock-skew budget; a step larger than it is not covered here (a later lot: a monotonic record of
 observed lapses, or renewal decided by the majority).
+
+**2026-09-18, V3-2, quorum certificates on the node — built and tested without the laboratory.** A
+policy may name its authority as a quorum of replica keys (`authority_quorum`: n public keys under
+stable key ids, a threshold k with 2k > n); the node then accepts an exclusive decision — the
+acquisition of an epoch, a same-holder re-issue, a supersession, the takeover proof at
+`publisher_start` — only as a certificate that k distinct keys of that quorum signed under the
+policy's digest, and verifies it itself, offline. The full rule, the payload and the named refusals
+are in `LOCAL-API.md`, "Quorum certificates". What stays as it was: every single-key policy, its
+permits and its signed documents (the tool's document is a verbatim test vector), so no deployed
+node or tool changes behaviour. What the unit tests prove (`src/signing.rs`, `src/activation.rs`,
+`src/publisher.rs`): k-of-n accepted at k and above and refused at k-1; a key counted once; a key
+of another policy, a certificate of another policy, resource, holder, boot or epoch refused; every
+single flipped byte of a payload or a signature refused; the screen never moving backwards, and
+moving only on a verified certificate, over a seeded sequence of 400 mixed attempts; the authority
+set changing only under a certificate of the policy in place or the operator's re-declaration naming
+its digest. What it does not do yet: produce certificates (the manager's promise rule, signed votes
+and resident operations are the next lots), extend a lease by majority, or run on a laboratory host.

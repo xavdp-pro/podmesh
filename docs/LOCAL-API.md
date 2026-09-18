@@ -371,16 +371,19 @@ lease. `stop` is never gated.
   With it, an optional `authority_key` (the gate's Ed25519 public key, 32 bytes as lowercase hex, refused unless it
   is a valid point) makes every takeover document for the resource require that key's signature (below); a key
   without an authority is refused. `activation_status` reports `authority_key` and `takeover_proof_verification`.
+  Instead of a key, `authority_quorum` names the authority as a quorum of replica keys (below, development tree);
+  a change of the authority set to or from a quorum takes `policy_change_certificate` or `replaces_policy_digest`.
 - `activation_acquire` takes the lease for this host. It is idempotent while this host's lease is live, retakes
   this host's own lapsed lease with a new generation, and takes over another host's only once that lease has
   lapsed by **at least the takeover margin** — before that it is refused and says when it may be taken. Under an
-  authority it also requires a `permit` (below) whose epoch is newer than the previous holder's.
+  authority it also requires a `permit` (below) whose epoch is newer than the previous holder's, or a
+  `certificate` when the policy names a key; under a quorum a certificate only.
 - `activation_renew` extends this host's live lease; a lapsed lease is **not** renewable and must be
   re-acquired, so an entitlement that ended is never silently extended; a superseded one is not renewable either.
-- `activation_supersede` (`permit`) delivers a newer grant, bound to whoever it was bound to, so that this host
-  learns it has been overtaken: the screen advances, and this host's lease, live or not, no longer entitles it —
-  the gate, the renewal and the fence all read that. A permit at or below the highest epoch seen is refused, so
-  the screen only ever moves forward.
+- `activation_supersede` (`permit`, or `certificate`) delivers a newer grant, bound to whoever it was bound to, so
+  that this host learns it has been overtaken: the screen advances, and this host's lease, live or not, no longer
+  entitles it — the gate, the renewal and the fence all read that. A grant at or below the highest epoch seen is
+  refused, so the screen only ever moves forward.
 - `activation_release` surrenders it. `migration_complete_transfer` releases it under its own history event,
   `released_by_handoff`.
 - `activation_status` reports the policy, the lease, its history, the replication intent, this host's
@@ -423,6 +426,70 @@ key, only `podmesh-takeover-proof/lab-unsigned` is accepted, on its binding alon
 first use (`PODMESH_HA_KEYS`, one root-only file per authority) and names its public half in every policy it
 declares. A permit is still unsigned provenance (below): what the signature closes is the origin of the
 takeover document, not of the permit.
+
+**Quorum certificates (V3-2, development tree).** A policy may name its authority as a quorum of replica keys
+instead of one key: `authority_quorum` is `{"threshold": k, "keys": [{"key_id", "public_key"}, ...]}` with an
+`authority_id`, never beside an `authority_key`. From 1 to 9 keys (the daemon reads a request of at most 4096
+bytes, and a policy change carries a new policy and a certificate together); each `key_id` is 1–32 characters of
+`[A-Za-z0-9_.:-]` starting alphanumeric, each `public_key` a valid Ed25519 point of large order (anyone can sign
+for a small-order one); no `key_id` and no public key twice (one key under two identifiers would count twice); and
+`k` a **strict majority** of the keys (`2k > n`): any two sets of `k` signers then share one, which is what lets a
+signer that promises once per resource and epoch keep two decisions apart. A 2-of-4 is refused.
+
+- **The key reference.** A `key_id` names a replica's signing key, not its store. Following the operator's
+  decision on custody, the private half is a secret the replica's host mounts outside the universe's state, so a
+  recovery point, a restore or a clone of the replica carries neither the key nor a new identity for it; the
+  policy carries only the public half. Replacing a host's key is a change of the authority set (below).
+- **The policy digest.** SHA-256, lowercase hex, of the canonical JSON (keys sorted, compact, no floating-point
+  number) of `{"form": "podmesh-authority-quorum/1", "authority_id", "single_key", "threshold", "keys"}`, the keys
+  in `key_id` order, so the order they were declared in does not matter. `activation_status` reports it as
+  `authority_policy_digest` for every keyed policy, with `authority_quorum` under a quorum. The resource is not in
+  it (one quorum may govern many resources); every certificate binds the resource separately.
+- **The certificate.** One document, `kind` `podmesh-takeover-proof/quorum-ed25519`, and `signatures`, a list of
+  `{"key_id", "signature"}` (64 bytes, 128 lowercase hex characters), each over the same bytes: the canonical form
+  of the document without `signatures`. The payload binds `authority_id`, `policy_digest`, `resource`, `new_epoch`
+  and `previous_epoch` (exactly one before), `new_holder` and `previous_holder` (null for a first epoch),
+  `holder_boot_id` (the new holder's `boot_id`: a rebooted host must be decided for again), `grant_id`, `method`
+  (`first`, `same_holder`, `fence_receipt` with its `receipt`, `lease_barrier`), `eligible_after`, `issued_at` and
+  `expires_at`; any other field it carries is covered by the signatures too. A certificate made under another
+  policy names another digest and is refused, so it cannot be replayed across policies, nor across resources.
+- **Counting.** Checked in this order, each refusal named in the error as `certificate refused (<code>)`: the kind
+  (`certificate_kind`); no single-key `signer` or `signature` beside `signatures` (`mixed_forms`); the authority
+  (`authority_mismatch`); the digest (`policy_mismatch`); every bound field present with its type, no
+  floating-point number (`payload_incomplete`); a non-empty list (`no_signatures`) of no more entries than keys
+  (`too_many_signatures`); each entry exactly `{key_id, signature}` as well-formed strings (`malformed_signature`),
+  a key not already listed (`duplicate_key`), a key of the policy (`unknown_key`), a signature that verifies
+  strictly under that key (`bad_signature`); and only then at least `k` of them (`below_threshold`). A duplicate,
+  unknown or malformed entry refuses the whole certificate rather than being skipped: what is accepted is exactly
+  a set of valid signatures from distinct keys of this policy.
+- **Where it is required.** Under a quorum, `activation_acquire` takes `certificate` and no `permit`: verified,
+  bound to this universe, this host, this boot, live on this host's clock (issued no more than 30 seconds ahead,
+  not expired), its `eligible_after` passed, its method's binding holding; the grant it carries then goes through
+  every check a permit goes through (the screen, one grant per epoch, a takeover needing a newer epoch).
+  `activation_supersede` takes a certificate naming any holder; its signatures and epoch are checked, not its
+  life, since learning one is overtaken can only stop things — and under a quorum a forged higher epoch can no
+  longer stop anything either. `publisher_start` takes the certificate as its `takeover_proof`, bound in addition
+  to this boot and to the grant the lease was acquired under; its answer names the signers (`quorum`).
+- **The single key is the 1-of-1.** A policy with `authority_key` keeps every behaviour it had: its permits, its
+  signed document verified exactly as before (a verbatim document of today's tool is a test vector), the same
+  answers. It also accepts a certificate under its own 1-of-1 digest (`single_key` true, one key with `key_id`
+  `authority_key`), which lets the gate move to certificates before the policy moves to the replicas.
+- **The epoch screen.** Under a quorum it moves forward on certificates only, never on a permit or on anything a
+  replica reports, and never backwards: a grant at or below the highest epoch seen is refused, and the table's
+  own update cannot lower it. No policy change resets it.
+- **Changing the authority set.** When the policy in place or the one declared is a quorum, a change of the
+  authority set (its digest) is accepted only with one of: `policy_change_certificate`, a certificate of kind
+  `podmesh-policy-change/quorum-ed25519` from the policy **in place** (its keys, its threshold, its digest as
+  `policy_digest`) binding `resource`, `new_policy_digest`, `issued_at` and `expires_at`, live, and never applied
+  on this host before; or `replaces_policy_digest`, the operator's explicit re-declaration, naming the digest it
+  replaces, which must still be current (a stale one is refused). Dropping the quorum is the operator's only. The
+  first authority set of a universe replaces nothing; a declaration that leaves the set as it is needs neither; a
+  change between single keys, or from none, keeps today's behaviour. Each change is recorded in
+  `activation_policy_changes` (from, to, how, the certificate's payload digest, the `authorization_ref`).
+- **What it does not prove.** That two certificates cannot exist for one epoch: that is the signers' promise (one
+  per resource and epoch, durably, even across a restored store), which the node cannot see. Renewal
+  (`activation_renew`) is unchanged: the holder still extends its own lease until majority-signed extensions
+  exist. No network door is added: certificates reach the node through the local socket like every request.
 
 **What a lease proves.** This host's own restraint: it will not start what it holds no lease for. It does
 **not** prove mutual exclusion — the lease lives in this host's journal, a host that never asks is not
