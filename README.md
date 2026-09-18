@@ -37,7 +37,7 @@ does not. The maintainers keep the laboratory status, campaign records and revie
 
 ## Debian delivery
 
-[deb.xavdp.pro](https://deb.xavdp.pro) hosts the signed experimental APT repository. The published package is `0.1.0~experimental5` for Debian 13 amd64. The repository keeps one version per suite, so an earlier package is reinstallable only from a host's own APT cache. Stable and other architectures are not validated.
+[deb.xavdp.pro](https://deb.xavdp.pro) hosts the signed experimental APT repository. The published package is `0.1.0~experimental7` for Debian 13 amd64, and the three laboratory hosts run it (read from the repository and from `apt-cache policy` on each host, 2026-09-18). What a package was qualified for is another question: the qualified status in [docs/ACCEPTANCE-TEST-PLAN.md](docs/ACCEPTANCE-TEST-PLAN.md) still describes `0.1.0~experimental5`, and experimental6 and experimental7 are published and installed without that document being rewritten for them. The repository keeps one version per suite, so an earlier package is reinstallable only from a host's own APT cache. Stable and other architectures are not validated.
 
 The delivery objective is an installable dependency chain for the complete supported system. Publish project-specific components and required patched runtime packages with explicit versions, dependencies, conflicts and rollback instructions. Use Debian's existing packages for ordinary dependencies rather than unnecessarily republishing them. The patched `podmesh-vzcriu` runtime and separate helper packages have been published and tested through experimental APT. A complete clean-host migration installation chain remains to qualify; the future backup service is not implemented.
 
