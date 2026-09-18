@@ -130,6 +130,20 @@ def current_proof():
     raise SystemExit(f'no current takeover proof at {path}; rotate first')
 
 
+def record_mandate(h, not_after):
+    """The follow mandate issued to a host, recorded in the resource's ledger (the one
+    tools/ha-standby.py keeps, no secret in it) BEFORE it is installed, so that the ledger never
+    knows less than the hosts: a rotation to another holder that cannot reach this one computes its
+    barrier from it, since this host may renew its own lease by itself until not_after."""
+    path = pathlib.Path(LEDGER) / f'{LOGICAL}.json'
+    ledger = json.loads(path.read_text()) if path.is_file() else {'universe': LOGICAL, 'cycles': [], 'rotations': []}
+    ledger.setdefault('follow_mandates', {})[h.identity] = {'host': h.role, 'not_after': not_after, 'renew': 1, 'renew_below': RENEW_BELOW,
+                                                            'issued_at': int(time.time()), 'reference': REFERENCE}
+    tmp = path.with_suffix('.json.partial')
+    tmp.write_text(json.dumps(ledger, indent=2, sort_keys=True))
+    os.replace(tmp, path)
+
+
 def install_follow(h, cli, proof):
     h.ssh(f'sudo -n install -D -m 0755 /dev/stdin {FOLLOW_REMOTE}', input_bytes=open(FOLLOW, 'rb').read())
     h.ssh('sudo -n mkdir -p -m 0700 /run/podmesh-publisher-follow')
@@ -137,8 +151,10 @@ def install_follow(h, cli, proof):
     # Bounded: the mandate dies on its own clock, and renewal happens near the lease's end, not
     # every tick. An unbounded renewal would make the holder's lease immortal, and lease expiry
     # is what withdraws an active manager nobody can reach (docs/PUBLISHER-FOLLOW-LAB.md).
+    not_after = int(time.time()) + MANDATE_SECONDS
+    record_mandate(h, not_after)
     mandate = (f'authorization_ref={REFERENCE}\nresource={LOGICAL}\nproof={PROOF_REMOTE}\nrenew=1\n'
-               f'not_after={int(time.time()) + MANDATE_SECONDS}\nrenew_below={RENEW_BELOW}\n')
+               f'not_after={not_after}\nrenew_below={RENEW_BELOW}\n')
     h.ssh(f'sudo -n install -m 0600 /dev/stdin {MANDATE_REMOTE}', input_bytes=mandate.encode())
     h.ssh(f'sudo -n systemctl stop {TIMER}.timer {TIMER}.service 2>/dev/null; sudo -n systemctl reset-failed {TIMER}.timer {TIMER}.service 2>/dev/null', check=False)
     h.ssh(
