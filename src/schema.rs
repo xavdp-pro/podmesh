@@ -115,7 +115,7 @@ pub fn all() -> Value {
         uuid("exclusive_resource", "the resource whose lease must be held here (optional)"),
     ])));
     put("network_route_withdraw", op("host", "none", "removes the route and the alias, verified", Some(vec![])));
-    put("network_route_resume", op("host", "lease", "puts back the recorded exclusive route and alias of a role this host still holds, after the carrier lost them: the dead row withdrawn, then published again with the recorded ip, via and resource; only under a lease live, held here, unsuperseded and acquired or renewed during this boot, a universe running at via and no other kernel route for the address", Some(vec![
+    put("network_route_resume", op("host", "lease", "puts back the recorded exclusive route and alias of a role this host still holds, after the carrier lost them, in place: the recorded row kept, its dead effects removed, the alias and route made again with the recorded ip, via and resource, a failure leaving the row for the next resume; only under a lease live, held here, unsuperseded and acquired or renewed during this boot, a universe running at via and no other kernel route for the address", Some(vec![
         uuid("exclusive_resource", "the resource whose recorded exclusive route is resumed"),
     ])));
     put("network_status", op("read", "none", "the declaration, the allocations, the effects ledger and what the kernel holds now", Some(vec![])));
@@ -140,7 +140,7 @@ pub fn all() -> Value {
         f("previous", "object", false, "the agent's account of the previous publisher, recorded as provenance"),
     ])));
     put("publisher_stop", op("host", "none", "stops the connector and removes the active manager's mark (active_manager_mark)", Some(vec![uuid("resource", "the resource")])));
-    put("publisher_status", op("read", "none", "the declaration, the unit and its current run, the connector's identity and registration from that run only, the lease, the origin's readiness and whether it is ready at the lease's epoch, the active manager's mark and its epoch (active_manager_mark, active_manager_mark_epoch; governor_mark, deprecated, carries the mark's presence for one release), eligibility with each gate by name, and whether a same-epoch resume would be accepted", Some(vec![uuid("resource", "the resource")])));
+    put("publisher_status", op("read", "none", "the declaration, the unit and its current run, the connector's identity and registration from that run only, the lease, the origin's readiness and whether it is ready at the lease's epoch, the active manager's mark, read as present with its epoch, absent or unknown (active_manager_mark, active_manager_mark_read, active_manager_mark_epoch; governor_mark, deprecated, carries the mark's presence for one release), eligibility with each gate by name, and whether a same-epoch resume would be accepted", Some(vec![uuid("resource", "the resource")])));
     put("publisher_observed", op("host", "none", "records what the public hostname answered, as provenance", Some(vec![
         uuid("resource", "the resource"), f("observation", "object", true, "what was observed"),
     ])));

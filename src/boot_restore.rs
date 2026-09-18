@@ -270,16 +270,8 @@ fn before_start(db: &Connection, uuid: &str, last: &LastIntent, f: &Facts) -> Re
             }
             // The entitlement must have been decided again since the boot: a host that was down cannot know
             // whether its universe was taken over elsewhere while its lease still ran.
-            let renewed = match f.booted {
-                Some(booted) => db
-                    .query_row(
-                        "SELECT MAX(at) FROM activation_lease_history WHERE universe_uuid=?1 AND event IN ('acquired','renewed') AND at>=?2",
-                        rusqlite::params![uuid, booted],
-                        |r| r.get::<_, Option<i64>>(0),
-                    )?
-                    .is_some(),
-                None => false,
-            };
+            // Compared by boot identity for the rows that carry one, by the wall clock only for older rows.
+            let renewed = crate::activation::renewed_this_boot(db, uuid, &f.boot, f.booted)?;
             if !renewed {
                 return Ok(skip("not_restored", "lease_not_renewed_since_boot", json!({
                     "booted_at": f.booted,

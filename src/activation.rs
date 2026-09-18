@@ -211,6 +211,9 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
         ("activation_policy", "authority_key TEXT NOT NULL DEFAULT ''"),
         ("activation_leases", "epoch INTEGER NOT NULL DEFAULT 0"),
         ("activation_leases", "grant_id TEXT NOT NULL DEFAULT ''"),
+        // The boot a history row was written in; NULL for the rows written before the field existed,
+        // which is the truthful reading: that boot was not recorded.
+        ("activation_lease_history", "boot_id TEXT"),
     ] {
         let name = column.split(' ').next().unwrap_or_default();
         let present: bool = db.query_row(
@@ -303,18 +306,24 @@ pub(crate) fn superseded_by(db: &Connection, uuid: &str, l: &Lease) -> Result<Op
     superseded(db, uuid, l)
 }
 
-/// Whether the lease was acquired or renewed at or after `since` (a boot's start on the wall clock):
-/// the rule `boot_restore` applies, for anything else a host would do again after its own restart.
-/// A host that was down cannot know what was decided while it was, so only an entitlement decided
-/// again since the boot counts.
-pub(crate) fn renewed_since(db: &Connection, uuid: &str, since: i64) -> Result<bool, Error> {
-    Ok(db
-        .query_row(
-            "SELECT MAX(at) FROM activation_lease_history WHERE universe_uuid=?1 AND event IN ('acquired','renewed') AND at>=?2",
-            params![uuid, since],
-            |r| r.get::<_, Option<i64>>(0),
-        )?
-        .is_some())
+/// Whether the lease was acquired or renewed during this boot: the rule `boot_restore` applies, and
+/// anything else a host does again after its own restart. A host that was down cannot know what was
+/// decided while it was, so only an entitlement decided again since the boot counts. A history row
+/// written since 2026-09-18 carries the boot's identity and is compared by it, whatever the clock
+/// says. A row written before carries none and is judged by the older rule, kept for those rows only:
+/// written at or after the boot's start on the wall clock (`booted_at`, the kernel's `btime`), which
+/// a clock stepped across the boot can mislead.
+pub(crate) fn renewed_this_boot(db: &Connection, uuid: &str, boot: &str, booted_at: Option<i64>) -> Result<bool, Error> {
+    ensure_schema(db)?;
+    let exists = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Result<bool, Error> { Ok(db.query_row(sql, p, |r| r.get::<_, i64>(0))? > 0) };
+    if exists("SELECT COUNT(*) FROM activation_lease_history WHERE universe_uuid=?1 AND event IN ('acquired','renewed') AND boot_id=?2", &[&uuid, &boot])? {
+        return Ok(true);
+    }
+    let Some(booted) = booted_at else { return Ok(false) };
+    exists(
+        "SELECT COUNT(*) FROM activation_lease_history WHERE universe_uuid=?1 AND event IN ('acquired','renewed') AND boot_id IS NULL AND at>=?2",
+        &[&uuid, &booted],
+    )
 }
 
 /// Whether this host's lease has been overtaken by an epoch it has seen: the node's epoch screen
@@ -393,9 +402,9 @@ pub fn release_by_handoff(db: &Connection, uuid: &str, id: &str) -> Result<(), E
 
 fn record(db: &Connection, uuid: &str, holder: &str, generation: i64, event: &str, id: &str) -> Result<(), Error> {
     db.execute(
-        "INSERT INTO activation_lease_history(universe_uuid,holder_host_uuid,generation,event,at,operation_id)
-         VALUES(?1,?2,?3,?4,?5,?6)",
-        params![uuid, holder, generation, event, crate::now() as i64, id],
+        "INSERT INTO activation_lease_history(universe_uuid,holder_host_uuid,generation,event,at,operation_id,boot_id)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![uuid, holder, generation, event, crate::now() as i64, id, boot_id().ok()],
     )?;
     Ok(())
 }
@@ -940,6 +949,52 @@ fn fence(db: &Connection, id: &str, timeout: u64) -> Result<serde_json::Value, E
         "left_running_or_absent": left,
         "scope": "this host only; a host that never runs this operation is not fenced by it",
     }))
+}
+
+#[cfg(test)]
+mod boot_tests {
+    use super::*;
+
+    const U: &str = "00000000-0000-4000-8000-000000000001";
+
+    fn history(db: &Connection, event: &str, at: i64, boot: Option<&str>) {
+        db.execute("INSERT INTO activation_lease_history(universe_uuid,holder_host_uuid,generation,event,at,operation_id,boot_id) VALUES(?1,'h',1,?2,?3,'o',?4)",
+                   params![U, event, at, boot]).unwrap();
+    }
+
+    /// Renewed during this boot, by the boot's identity where a row carries one (review of V3-1): a
+    /// row of another boot never counts, whatever its time says; a row of this boot counts, whatever
+    /// the clock did; a row written before the field existed is judged by the wall clock, as before.
+    #[test]
+    fn this_boot_is_recognised_by_its_identity_and_older_rows_by_the_clock() {
+        let db = Connection::open_in_memory().unwrap();
+        ensure_schema(&db).unwrap();
+        let booted = Some(1_000);
+        assert!(!renewed_this_boot(&db, U, "this-boot", booted).unwrap());
+        history(&db, "renewed", 5_000, Some("another-boot"));
+        assert!(!renewed_this_boot(&db, U, "this-boot", booted).unwrap(), "a later time under another boot counts");
+        history(&db, "policy_declared", 5_000, Some("this-boot"));
+        assert!(!renewed_this_boot(&db, U, "this-boot", booted).unwrap(), "an event that is not a renewal counts");
+        history(&db, "renewed", 10, Some("this-boot"));
+        assert!(renewed_this_boot(&db, U, "this-boot", booted).unwrap(), "a renewal of this boot stamped before btime does not count");
+        let db = Connection::open_in_memory().unwrap();
+        ensure_schema(&db).unwrap();
+        history(&db, "acquired", 999, None);
+        assert!(!renewed_this_boot(&db, U, "this-boot", booted).unwrap());
+        history(&db, "acquired", 1_000, None);
+        assert!(renewed_this_boot(&db, U, "this-boot", booted).unwrap());
+        assert!(!renewed_this_boot(&db, U, "this-boot", None).unwrap(), "an older row without a known boot start counts");
+    }
+
+    #[test]
+    fn every_history_row_written_now_carries_this_boot() {
+        let db = Connection::open_in_memory().unwrap();
+        ensure_schema(&db).unwrap();
+        record(&db, U, "h", 1, "renewed", "o").unwrap();
+        let boot: Option<String> = db.query_row("SELECT boot_id FROM activation_lease_history", [], |r| r.get(0)).unwrap();
+        assert_eq!(boot, boot_id().ok());
+        assert!(renewed_this_boot(&db, U, &boot_id().unwrap(), None).unwrap());
+    }
 }
 
 #[cfg(test)]

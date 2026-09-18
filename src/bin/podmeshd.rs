@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // network reconciliation and before anything is served.
     match podmesh::withdraw_unentitled_publishers_at_startup(&db) {
         Ok(report) => eprintln!("PodMesh publisher withdrawal at startup: {report}"),
-        Err(e) => eprintln!("PodMesh publisher withdrawal at startup FAILED: {e}; the reconciliation and the fence will retry it"),
+        Err(e) => eprintln!("PodMesh publisher withdrawal at startup FAILED: {e}; nothing retries it before the next start of this daemon but the fence, when something runs it (the reconciliation withdraws a recorded publisher, never an unrecorded connector)"),
     }
     // Whatever a crash left half-made on the network is undone before anything is served: an
     // effect that never became effective is never assumed. The report goes to the journal.

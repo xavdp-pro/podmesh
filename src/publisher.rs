@@ -472,12 +472,22 @@ pub(crate) fn unit_state(resource: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// The unit's current run, as systemd numbers it (`InvocationID`); None when the unit is not loaded,
-/// which for a transient unit collected after its stop means no run at all.
-fn invocation(resource: &str) -> Option<String> {
-    let out = std::process::Command::new("systemctl").args(["show", "-p", "InvocationID", "--value", &unit_name(resource)]).output().ok()?;
+/// The unit's current run, as systemd numbers it (`InvocationID`): None when the unit is not loaded,
+/// which for a transient unit collected after its stop means no run at all; an error when systemd
+/// could not be asked.
+fn invocation(resource: &str) -> Result<Option<String>, String> {
+    let out = std::process::Command::new("systemctl").args(["show", "-p", "InvocationID", "--value", &unit_name(resource)]).output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!("systemctl show: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
     let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (out.status.success() && !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit())).then_some(id)
+    if id.is_empty() {
+        return Ok(None);
+    }
+    if !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("systemd names the run {id:?}, not an invocation identifier"));
+    }
+    Ok(Some(id))
 }
 
 /// The registration cloudflared logged, from lines of its journal: `connection=<id>` on the last
@@ -494,16 +504,30 @@ fn registration(text: &str) -> Option<String> {
 /// connector id was read on a host whose unit was inactive, 2026-09-18), and a registration read from
 /// one of those would pass a connector that never registered for a live one. The registration lines
 /// are asked for by pattern first, so that a long run does not push them out of a bounded tail; a
-/// journal without pattern support is read from its last lines instead.
-fn connector_id(resource: &str) -> Option<String> {
-    let run = invocation(resource)?;
+/// journal without pattern support is read from its last lines instead. `Ok(None)` when the run's
+/// journal was read and holds no registration, or there is no run; an error when it could not be read
+/// -- which is not the same answer, and a caller deciding to stop a connector must tell them apart.
+fn registration_read(resource: &str) -> Result<Option<String>, String> {
+    let Some(run) = invocation(resource)? else { return Ok(None) };
     let field = format!("_SYSTEMD_INVOCATION_ID={run}");
-    let journal = |extra: &[&str]| -> Option<String> {
-        let out = std::process::Command::new("journalctl").arg(&field).args(["--no-pager", "-o", "cat"]).args(extra).output().ok()?;
-        Some(String::from_utf8_lossy(&out.stdout).to_string())
-    };
-    registration(&journal(&["-g", "Registered tunnel connection", "-n", "50"]).unwrap_or_default())
-        .or_else(|| registration(&journal(&["-n", "2000"]).unwrap_or_default()))
+    let journal = |extra: &[&str]| std::process::Command::new("journalctl").arg(&field).args(["--no-pager", "-o", "cat"]).args(extra).output().map_err(|e| e.to_string());
+    // With a pattern, no match exits 1 with nothing printed: not an error, the tail below decides.
+    if let Some(id) = registration(&String::from_utf8_lossy(&journal(&["-g", "Registered tunnel connection", "-n", "50"])?.stdout)) {
+        return Ok(Some(id));
+    }
+    let out = journal(&["-n", "2000"])?;
+    if !out.status.success() {
+        return Err(format!("journalctl: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(registration(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// The registration of the current run, for the callers that treat "could not be read" as "not
+/// registered": the start's wait and the reconciliation's integrity check, which withdraw nothing
+/// that an unread journal hides -- the start fails closed and retries, the reconciliation leaves an
+/// effective publisher alone only on a registration it read.
+fn connector_id(resource: &str) -> Option<String> {
+    registration_read(resource).ok().flatten()
 }
 
 /// The route and alias the resource holds on this host, from the network tables, verified from
@@ -587,16 +611,46 @@ pub(crate) fn mark_written(carrier: &str) -> Option<bool> {
     mark_files(carrier).map(|(current, previous)| current && !previous)
 }
 
-/// The epoch the mark inside the carrier names, read with one `podman exec` in the order the origin
-/// reads it: the current path, else the previous one. None when there is no mark or it could not be
-/// read -- which a caller comparing it with the lease's epoch must treat as a mismatch.
-pub(crate) fn mark_epoch(carrier: &str) -> Option<i64> {
-    let script = format!("cat {MARK_PATH} 2>/dev/null || cat {MARK_PATH_PREVIOUS} 2>/dev/null");
-    let out = std::process::Command::new("podman").args(["exec", &format!("podmesh-{carrier}"), "sh", "-c", &script]).output().ok()?;
+/// The mark inside the carrier as the origin reads it, with one `podman exec`: the current path, else
+/// the previous one. `Ok(Some(epoch))` for a mark and the epoch it names, `Ok(None)` when neither path
+/// holds a file -- both read, both positive answers -- and an error when it could not be read (the exec
+/// failed, the file is not a mark): unknown, which a caller must not take for a wrong mark.
+pub(crate) fn mark_read(carrier: &str) -> Result<Option<i64>, String> {
+    let script = format!(
+        "if test -f {MARK_PATH}; then cat {MARK_PATH}; elif test -f {MARK_PATH_PREVIOUS}; then cat {MARK_PATH_PREVIOUS}; else echo absent; fi"
+    );
+    let out = std::process::Command::new("podman").args(["exec", &format!("podmesh-{carrier}"), "sh", "-c", &script]).output().map_err(|e| e.to_string())?;
     if !out.status.success() {
+        return Err(format!("podman exec: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    mark_answer(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// What the carrier's answer says: `absent`, or a mark's JSON and its epoch.
+fn mark_answer(text: &str) -> Result<Option<i64>, String> {
+    if text.trim() == "absent" {
+        return Ok(None);
+    }
+    serde_json::from_str::<Value>(text.trim()).ok().and_then(|v| v["epoch"].as_i64()).map(Some).ok_or_else(|| format!("the mark could not be read as one: {:?}", text.chars().take(80).collect::<String>()))
+}
+
+/// The origin's answer against what the start requires -- 200, ready, this logical manager, the
+/// lease's epoch, the carrier's replica. `Some(true)` when all hold; `Some(false)` when the origin
+/// answered and one of them does not (a positive mismatch); `None` when it could not be told: the
+/// origin could not be asked, or it answered as required but the carrier's replica is not known.
+fn origin_verdict(readiness: &Value, epoch: i64, resource: &str, replica: Option<&Value>) -> Option<bool> {
+    if readiness.get("error").is_some() {
         return None;
     }
-    serde_json::from_slice::<Value>(&out.stdout).ok()?["epoch"].as_i64()
+    let body = &readiness["body"];
+    let answered = readiness["status"] == json!(200) && body["ready"] == json!(true) && body["epoch"] == json!(epoch) && body["logical_manager_id"] == json!(resource);
+    if !answered {
+        return Some(false);
+    }
+    match replica {
+        Some(r) if !r.is_null() => Some(body["replica_id"] == *r),
+        _ => None,
+    }
 }
 
 pub(crate) fn mark_remove(carrier: &str) -> Result<(), Error> {
@@ -738,15 +792,21 @@ fn view(db: &Connection, resource: &str) -> Result<Value, Error> {
         crate::manager::execute(db, &json!({"operation": "manager_status", "universe_uuid": carrier})).ok().map(|s| s["resident_status"]["replica_id"].clone())
     });
     let mark = service.as_ref().and_then(|(_, carrier)| mark_present(carrier));
-    let mark_epoch = service.as_ref().and_then(|(_, carrier)| mark_epoch(carrier));
-    // The origin as the start requires it: 200, ready, this logical manager, the lease's epoch and the
-    // carrier's own replica. What a follow tick compares on a running connector.
+    // What a follow tick compares on a running connector, each with "could not be told" (null, or
+    // `unknown`) kept apart from a wrong value: the tick stops a connector on a positive mismatch at
+    // once, and on unknowns only when they persist (review of V3-1).
+    let mark_now = service.as_ref().map(|(_, carrier)| mark_read(carrier));
+    let (mark_epoch, mark_state) = match &mark_now {
+        Some(Ok(Some(e))) => (json!(e), "present"),
+        Some(Ok(None)) => (Value::Null, "absent"),
+        Some(Err(_)) | None => (Value::Null, "unknown"),
+    };
     let origin_at_epoch = match (&readiness, epoch) {
-        (Some(r), Some(e)) => json!(r["status"] == json!(200) && r["body"]["ready"] == json!(true) && r["body"]["epoch"] == json!(e)
-            && r["body"]["logical_manager_id"] == json!(resource) && carrier_identity.as_ref().is_some_and(|c| !c.is_null() && r["body"]["replica_id"] == *c)),
+        (Some(r), Some(e)) => json!(origin_verdict(r, e, resource, carrier_identity.as_ref())),
         _ => Value::Null,
     };
-    let connector = connector_id(resource);
+    let registered = registration_read(resource);
+    let connector = registered.as_ref().ok().cloned().flatten();
     let this_host = crate::activation::host_uuid_public(db)?;
     let resume = match crate::activation::boot_id() {
         Ok(boot) => match resume_refusal(&resume_facts(db, resource, &this_host, &boot)?) {
@@ -758,10 +818,12 @@ fn view(db: &Connection, resource: &str) -> Result<Value, Error> {
     Ok(json!({
         "resource": resource,
         "declared": {"hostname": p.hostname, "tunnel_uuid": p.tunnel_uuid, "credential": p.credential, "origin_port": p.origin_port},
-        "unit": {"name": unit_name(resource), "state": unit_state(resource), "invocation_id": invocation(resource)},
+        "unit": {"name": unit_name(resource), "state": unit_state(resource), "invocation_id": invocation(resource).ok().flatten()},
         "connector_id": connector,
-        // The registration of the unit's current run only; an earlier run's lines are not read.
-        "connector_registered": connector.is_some(),
+        // The registration of the unit's current run only; an earlier run's lines are not read. Null
+        // when that run's journal could not be read.
+        "connector_registered": match &registered { Ok(id) => json!(id.is_some()), Err(_) => Value::Null },
+        "connector_registration_error": registered.as_ref().err(),
         "lease": lease.as_ref().map(|l| json!({"holder_host_uuid": l.holder_host_uuid, "expires_at": l.expires_at, "epoch": l.epoch,
                                                "generation": l.generation, "acquired_at": l.acquired_at})),
         "epoch": epoch,
@@ -771,6 +833,9 @@ fn view(db: &Connection, resource: &str) -> Result<Value, Error> {
         "origin_ready_at_lease_epoch": origin_at_epoch,
         "active_manager_mark": mark,
         "active_manager_mark_epoch": mark_epoch,
+        // present (with its epoch), absent (read, no file at either path) or unknown (not read).
+        "active_manager_mark_read": mark_state,
+        "active_manager_mark_error": mark_now.as_ref().and_then(|m| m.as_ref().err()),
         // Deprecated: the field's previous name, the same value, kept for one release.
         "governor_mark": mark,
         "transition": transition_of(db, resource)?.map(|(s, e)| json!({"state": s, "epoch": e})),
@@ -1257,6 +1322,34 @@ mod tests {
         assert_eq!(registration(""), None);
     }
 
+    /// A mark read is present with its epoch, absent, or unknown; the last is never a wrong epoch.
+    #[test]
+    fn a_mark_is_present_absent_or_unknown() {
+        assert_eq!(mark_answer(&json!({"resource": R, "epoch": 157, "marked_at": 1}).to_string()), Ok(Some(157)));
+        assert_eq!(mark_answer("absent\n"), Ok(None));
+        for garbage in ["", "{", "{\"resource\": \"x\"}", "not a mark"] {
+            assert!(mark_answer(garbage).is_err(), "{garbage:?}");
+        }
+    }
+
+    /// The origin's verdict: true, a positive mismatch, or unknown -- a failed request or an unknown
+    /// replica is never reported as a wrong origin.
+    #[test]
+    fn the_origin_is_ready_wrong_or_unknown() {
+        let replica = json!("replica-a");
+        let good = json!({"status": 200, "body": {"ready": true, "epoch": 157, "logical_manager_id": R, "replica_id": "replica-a"}});
+        assert_eq!(origin_verdict(&good, 157, R, Some(&replica)), Some(true));
+        assert_eq!(origin_verdict(&good, 158, R, Some(&replica)), Some(false), "another epoch");
+        assert_eq!(origin_verdict(&good, 157, R, Some(&json!("replica-b"))), Some(false), "another replica");
+        let unmarked = json!({"status": 503, "body": {"ready": false}});
+        assert_eq!(origin_verdict(&unmarked, 157, R, Some(&replica)), Some(false), "503: no mark");
+        let other = json!({"status": 200, "body": {"ready": true, "epoch": 157, "logical_manager_id": "another", "replica_id": "replica-a"}});
+        assert_eq!(origin_verdict(&other, 157, R, Some(&replica)), Some(false), "another logical manager");
+        assert_eq!(origin_verdict(&json!({"error": "connect 10.86.0.100:8080: timed out"}), 157, R, Some(&replica)), None, "not asked");
+        assert_eq!(origin_verdict(&good, 157, R, None), None, "replica unknown");
+        assert_eq!(origin_verdict(&good, 157, R, Some(&Value::Null)), None, "replica unknown");
+    }
+
     #[test]
     fn the_startup_withdrawal_selects_what_is_present_without_entitlement() {
         let db = gated();
@@ -1294,5 +1387,154 @@ mod tests {
         db3.execute("UPDATE activation_leases SET expires_at=1", []).unwrap();
         row(&db3, KIND_MARK, &format!("{R}@{CARRIER}"), R, "effective");
         assert_eq!(startup_unentitled(&db3, none).unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod review_regressions {
+    //! The adversarial probes of the V3-1 review, kept as regression tests: the same-epoch resume driven
+    //! through the real activation operations, not through direct UPDATEs of the lease table.
+    use super::*;
+    const R: &str = "91eeb6bf-5489-405b-b77a-53105b0aff7a";
+    const HOST: &str = "5d1c0b8e-3f59-4d0e-9d7a-2a1e7c4b9f10";
+    const OTHER: &str = "00000000-0000-4000-8000-00000000000b";
+
+    fn next() -> u64 { use std::sync::atomic::{AtomicU64, Ordering}; static N: AtomicU64 = AtomicU64::new(1); N.fetch_add(1, Ordering::SeqCst) }
+    fn db() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
+        db.execute("INSERT INTO metadata VALUES('host_uuid',?1)", [HOST]).unwrap();
+        lc::ensure_schema(&db).unwrap();
+        crate::network::ensure_schema(&db).unwrap();
+        crate::activation::ensure_schema(&db).unwrap();
+        ensure_schema(&db).unwrap();
+        db
+    }
+    fn act(db: &Connection, op: &str, extra: Value) -> Result<Value, String> {
+        let mut r = json!({"operation": op, "universe_uuid": R, "operation_id": format!("op-{}", next()), "authorization_ref": "probe"});
+        for (k, v) in extra.as_object().unwrap() { r[k] = v.clone(); }
+        crate::activation::execute(db, &r).map_err(|e| e.to_string())
+    }
+    fn permit(epoch: i64, host: &str) -> Value {
+        json!({"authority_id": "lab-gate", "resource": R, "epoch": epoch, "replica_id": host,
+               "instance_id": crate::activation::boot_id().unwrap(), "grant_id": format!("g{epoch}")})
+    }
+    fn proof(epoch: i64, method: &str) -> Value {
+        let now = crate::now() as i64;
+        json!({"kind": crate::signing::UNSIGNED_PROOF_KIND, "authority_id": "lab-gate", "resource": R, "new_holder": HOST,
+               "previous_holder": HOST, "new_epoch": epoch, "previous_epoch": epoch - 1, "issued_at": now, "expires_at": now + 3600, "method": method})
+    }
+    fn expired(epoch: i64) -> Value {
+        let mut p = proof(epoch, "same_holder");
+        p["issued_at"] = json!(crate::now() as i64 - 4000); p["expires_at"] = json!(crate::now() as i64 - 400); p
+    }
+    fn code(db: &Connection) -> &'static str {
+        let boot = crate::activation::boot_id().unwrap();
+        match resume_refusal(&resume_facts(db, R, HOST, &boot).unwrap()) { Ok(_) => "resumes", Err((c, _)) => c }
+    }
+    fn setup(lease: u64) -> Connection {
+        let db = db();
+        act(&db, "activation_require", json!({"lease_seconds": lease, "takeover_margin_seconds": 5, "authority_id": "lab-gate"})).unwrap();
+        act(&db, "activation_acquire", json!({"permit": permit(157, HOST)})).unwrap();
+        let boot = crate::activation::boot_id().unwrap();
+        takeover(&db, R, &json!({"takeover_proof": proof(157, "same_holder")}), 157, HOST, &boot, "op-verify").unwrap();
+        assert_eq!(code(&db), "resumes");
+        db
+    }
+    fn start(db: &Connection, p: Option<Value>, epoch: i64) -> Result<Value, String> {
+        let boot = crate::activation::boot_id().unwrap();
+        let req = match p { Some(p) => json!({"takeover_proof": p}), None => json!({}) };
+        takeover(db, R, &req, epoch, HOST, &boot, &format!("op-{}", next())).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn probe_renewal_keeps_the_resume() {
+        let db = setup(3600);
+        act(&db, "activation_renew", json!({})).unwrap();
+        assert_eq!(code(&db), "resumes");
+    }
+
+    #[test]
+    fn probe_same_holder_rotation_does_not_resume_next_epoch() {
+        let db = setup(3600);
+        act(&db, "activation_acquire", json!({"permit": permit(158, HOST)})).unwrap();
+        assert_eq!(code(&db), "epoch_changed");
+        // An expired document for 158, or 157's own, never resumes 158.
+        let e = start(&db, Some(expired(158)), 158).unwrap_err();
+        assert!(e.contains("(epoch_changed)"), "{e}");
+        let e = start(&db, Some(proof(157, "same_holder")), 158).unwrap_err();
+        assert!(e.contains("(epoch_changed)"), "{e}");
+    }
+
+    #[test]
+    fn probe_idempotent_reacquire_of_a_live_lease_kills_the_resume() {
+        let db = setup(3600);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // The same permit presented again while the lease is live (an agent's retry, a tool re-run).
+        act(&db, "activation_acquire", json!({"permit": permit(157, HOST)})).unwrap();
+        assert_eq!(code(&db), "lease_reacquired");
+    }
+
+    #[test]
+    fn probe_lapse_and_retake_with_the_same_permit() {
+        let db = setup(5);
+        std::thread::sleep(std::time::Duration::from_millis(6100));
+        assert_eq!(code(&db), "lease_expired");
+        act(&db, "activation_acquire", json!({"permit": permit(157, HOST)})).unwrap();
+        assert_eq!(code(&db), "lease_reacquired");
+        // The gate's hour-old document for 157 is still valid: it verifies again and re-records the
+        // new incarnation, which then resumes. The lapse is only as strong as the proof's expiry.
+        start(&db, Some(proof(157, "same_holder")), 157).unwrap();
+        assert_eq!(code(&db), "resumes");
+    }
+
+    #[test]
+    fn probe_supersession_and_policy_changes() {
+        let db = setup(3600);
+        act(&db, "activation_supersede", json!({"permit": permit(158, OTHER)})).unwrap();
+        assert_eq!(code(&db), "lease_superseded");
+        let db = setup(3600);
+        // Re-required with the same authority and a key: the recorded key was "".
+        let key: String = {
+            let vk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+            vk.to_bytes().iter().map(|b| format!("{b:02x}")).collect()
+        };
+        act(&db, "activation_require", json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "lab-gate", "authority_key": key})).unwrap();
+        assert_eq!(code(&db), "authority_changed");
+        // Re-required identically (what --refresh does on the other hosts): the resume survives.
+        let db = setup(3600);
+        act(&db, "activation_require", json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "lab-gate"})).unwrap();
+        assert_eq!(code(&db), "resumes");
+    }
+
+    #[test]
+    fn probe_forged_or_foreign_proof_falls_back_to_exactly_the_resume() {
+        let db = setup(3600);
+        let mut foreign = proof(157, "same_holder");
+        foreign["new_holder"] = json!(OTHER);
+        let v = start(&db, Some(foreign), 157).unwrap();
+        assert_eq!(v["method"], json!("resume_same_epoch"));
+        // And the record is untouched by a refused document.
+        assert_eq!(last_verified(&db, R).unwrap().unwrap().operation_id, "op-verify");
+        // Without a record, a forged document gives nothing.
+        let db2 = db_without_record();
+        let mut forged = proof(157, "same_holder"); forged["authority_id"] = json!("evil");
+        assert!(start(&db2, Some(forged), 157).unwrap_err().contains("no_verified_proof"));
+    }
+    fn db_without_record() -> Connection {
+        let db = db();
+        act(&db, "activation_require", json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "lab-gate"})).unwrap();
+        act(&db, "activation_acquire", json!({"permit": permit(157, HOST)})).unwrap();
+        db
+    }
+
+    #[test]
+    fn probe_a_start_that_fails_after_verification_still_leaves_the_record() {
+        // takeover() records before the start's effects; a start that then fails (readiness, say)
+        // leaves a record that later resumes without the proof ever having produced a publication.
+        let db = db_without_record();
+        start(&db, Some(proof(157, "same_holder")), 157).unwrap();
+        assert!(last_verified(&db, R).unwrap().is_some());
+        assert_eq!(code(&db), "resumes");
     }
 }

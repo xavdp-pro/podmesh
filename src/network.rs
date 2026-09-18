@@ -175,6 +175,15 @@ fn routes_for(dst: &str) -> Option<Vec<String>> {
     Some(String::from_utf8_lossy(&out.stdout).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
 }
 
+/// Whether one line of `ip route show` names `via` as its gateway: the word after `via`, compared
+/// whole, so that 10.86.1.1 is not read inside 10.86.1.10 -- nor 10.86.1.10 inside 10.86.1.100. Every
+/// reading of a route's gateway goes through it: the effective state, an effect's verification and
+/// removal, the re-application, the withdrawal and the resume.
+fn line_via(line: &str, via: &str) -> bool {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    words.windows(2).any(|w| w[0] == "via" && w[1] == via)
+}
+
 fn ip_route(args: &[&str]) -> Result<(), Error> {
     let out = std::process::Command::new("ip").args(args).output()?;
     if !out.status.success() {
@@ -282,7 +291,7 @@ fn effective(db: &Connection) -> Result<Value, Error> {
         .map(|(pool, via)| {
             let held = routes_for(pool);
             json!({"pool": pool, "via": via,
-                   "effective": held.as_ref().map(|h| h.iter().any(|l| l.contains(&format!("via {via}")))),
+                   "effective": held.as_ref().map(|h| h.iter().any(|l| line_via(l, via))),
                    "routes": held})
         })
         .collect();
@@ -297,7 +306,7 @@ fn effective(db: &Connection) -> Result<Value, Error> {
             let alias_effective = alias.as_ref().and_then(|a| running_pid(a).ok().flatten()).and_then(|pid| alias_present(pid, ip));
             json!({"ip": ip, "universe_uuid": u, "via": via, "exclusive_resource": resource, "alias_universe_uuid": alias, "alias_effective": alias_effective,
                    "state": state.clone().unwrap_or_else(|| "effective".into()),
-                   "effective": held.as_ref().map(|h| h.iter().any(|l| l.contains(&format!("via {via}")))), "routes": held})
+                   "effective": held.as_ref().map(|h| h.iter().any(|l| line_via(l, via))), "routes": held})
         })
         .collect();
     Ok(json!({
@@ -548,7 +557,7 @@ fn effect_verify(e: &Effect) -> Option<bool> {
             false => Some(false),
             true => Some(bridge_subnets(&e.key)? == vec![text_of(&e.intent, "subnet")]),
         },
-        "peer_route" | "route" => routes_for(&e.key).map(|h| h.iter().any(|l| l.contains(&format!("via {}", text_of(&e.intent, "via"))))),
+        "peer_route" | "route" => routes_for(&e.key).map(|h| h.iter().any(|l| line_via(l, &text_of(&e.intent, "via")))),
         "nat_table" => match nat_exemption_present()? {
             false => Some(false),
             // The exact rules the backend asked for -- prefix and pool as declared -- and nothing
@@ -578,7 +587,7 @@ fn effect_undo(e: &Effect) -> Result<(), Error> {
         }
         "peer_route" | "route" => {
             let via = text_of(&e.intent, "via");
-            if routes_for(&e.key).is_some_and(|h| h.iter().any(|l| l.contains(&format!("via {via}")))) {
+            if routes_for(&e.key).is_some_and(|h| h.iter().any(|l| line_via(l, &via))) {
                 ip_route(&["-4", "route", "del", &e.key, "via", &via])?;
             }
             Ok(())
@@ -686,10 +695,19 @@ pub fn reconcile(db: &Connection) -> Result<Value, Error> {
     let mut s = db.prepare("SELECT ip,state FROM network_routes WHERE state IS NOT NULL AND state!='effective'")?;
     let interrupted: Vec<(String, String)> = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
     let mut routes_dropped = vec![];
+    let mut routes_kept = vec![];
     for (ip, state) in interrupted {
         if undo_all(&ip, &format!("route {state}"))? {
-            db.execute("DELETE FROM network_routes WHERE ip=?1", [&ip])?;
-            routes_dropped.push(ip);
+            // A resume interrupted keeps its row, as a failed one does: the record of what to resume
+            // is the only thing the next resume has, and the fence still finds it. Anything else
+            // half-made is dropped whole.
+            if state == "resuming" {
+                db.execute("UPDATE network_routes SET state='effective' WHERE ip=?1", [&ip])?;
+                routes_kept.push(ip);
+            } else {
+                db.execute("DELETE FROM network_routes WHERE ip=?1", [&ip])?;
+                routes_dropped.push(ip);
+            }
         }
     }
     // A declaration whose making or unmaking was interrupted: undone whole; gone when nothing of
@@ -752,7 +770,8 @@ pub fn reconcile(db: &Connection) -> Result<Value, Error> {
     // is not verified effective is withdrawn or finished, and reported here.
     let publishers = crate::publisher::reconcile(db)?;
     let secrets = crate::secrets::reconcile(db)?;
-    Ok(json!({"undone": undone, "remaining": remaining, "drift": drift, "orphans": orphans, "routes_dropped": routes_dropped, "declarations": declarations,
+    Ok(json!({"undone": undone, "remaining": remaining, "drift": drift, "orphans": orphans, "routes_dropped": routes_dropped,
+              "routes_kept_for_resume": routes_kept, "declarations": declarations,
               "allocations_released": released, "publishers": publishers, "secrets": secrets}))
 }
 
@@ -905,10 +924,10 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
             let mut peers = db.prepare("SELECT pool,via FROM network_peer_pools")?;
             let peer_rows: Vec<(String, String)> = peers.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
             for (p, via) in &peer_rows {
-                if routes_for(p).is_some_and(|h| h.iter().any(|l| l.contains(&format!("via {via}")))) {
+                if routes_for(p).is_some_and(|h| h.iter().any(|l| line_via(l, via))) {
                     ip_route(&["-4", "route", "del", p, "via", via])?;
                 }
-                if routes_for(p).is_none_or(|h| h.iter().any(|l| l.contains(&format!("via {via}")))) {
+                if routes_for(p).is_none_or(|h| h.iter().any(|l| line_via(l, via))) {
                     return Err(format!("the route for {p} is still effective or unknown after its removal").into());
                 }
             }
@@ -941,7 +960,7 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
         "network_route_resume" => {
             let resource = lc::text(request, "exclusive_resource")?;
             lc::token(resource)?;
-            let mut report = route_resume(db, resource, id, now)?;
+            let mut report = route_resume(db, resource, id)?;
             report["effective_after"] = view(db)?;
             return Ok(report);
         }
@@ -1074,13 +1093,6 @@ fn recorded_exclusive(db: &Connection, resource: &str) -> Result<Option<Recorded
         .optional()?)
 }
 
-/// Whether one line of `ip route show` names `via` as its gateway: the word after `via`, compared
-/// whole, so that 10.86.1.1 is not read inside 10.86.1.10.
-fn line_via(line: &str, via: &str) -> bool {
-    let words: Vec<&str> = line.split_whitespace().collect();
-    words.windows(2).any(|w| w[0] == "via" && w[1] == via)
-}
-
 /// The resume's first half, from this host's journal alone: the resource under a policy, its exclusive
 /// route recorded and settled, its lease live, held here and unsuperseded (the lease gate's answer, as
 /// `entitled`), and that lease acquired or renewed during this boot. A named refusal otherwise.
@@ -1111,8 +1123,8 @@ fn route_resume_gate(policy: bool, recorded: Option<&RecordedRoute>, entitled: R
 enum ResumePlan {
     /// The route via `via` is in the kernel and the recorded carrier carries the address: nothing to do.
     AlreadyEffective,
-    /// Withdraw the dead row, then publish again with the recorded ip, via and resource, the address
-    /// carried by `carrier`, the universe running at `via` now.
+    /// Make the recorded route and alias again in place, the address carried by `carrier`, the
+    /// universe running at `via` now.
     Resume { carrier: String },
 }
 
@@ -1141,21 +1153,18 @@ fn route_resume_plan(recorded: &RecordedRoute, kernel: Option<&[String]>, alias_
 /// after the carrier that held the address lost it -- a stop, a restart, a roll that recreated it at
 /// the same address. The alias lives in the carrier's network namespace and dies with it; the /32
 /// goes with the bridge's interface when the carrier was its only user; the ledger still says both
-/// are effective and the reconciliation only reports that drift. Withdraws the dead row with what it
-/// recorded, then publishes again with the recorded ip, via and resource, through every check a
-/// publication passes. Journaled like every network mutation: the same operation ID replays the
+/// are effective and the reconciliation only reports that drift. Makes the recorded route and alias
+/// again in place, with the recorded ip, via and resource, the address carried by the universe at
+/// `via` now (`resume_in_place`). Journaled like every network mutation: the same operation ID replays the
 /// verified answer and repeats nothing; an effective route answers `already_effective` and changes
 /// nothing. It never changes the holder, never acquires or renews, and never acts after a boot until
 /// the lease has been decided again.
-fn route_resume(db: &Connection, resource: &str, id: &str, now: i64) -> Result<Value, Error> {
+fn route_resume(db: &Connection, resource: &str, id: &str) -> Result<Value, Error> {
     let refused = |(code, why): (&str, String)| -> Error { format!("network_route_resume refused ({code}): {why}").into() };
     let policy = crate::activation::policy(db, resource)?.is_some();
     let recorded = recorded_exclusive(db, resource)?;
     let entitled = crate::activation::refuse_if_not_activated(db, resource, "network_route_resume").map_err(|e| e.to_string());
-    let renewed = match crate::boot_restore::boot_time() {
-        Some(booted) => crate::activation::renewed_since(db, resource, booted)?,
-        None => false,
-    };
+    let renewed = crate::activation::renewed_this_boot(db, resource, &crate::activation::boot_id()?, crate::boot_restore::boot_time())?;
     route_resume_gate(policy, recorded.as_ref(), entitled, renewed).map_err(refused)?;
     let r = recorded.ok_or("no recorded route")?;
     // Checked before anything is withdrawn: a publication would refuse on it after the withdrawal,
@@ -1170,18 +1179,64 @@ fn route_resume(db: &Connection, resource: &str, id: &str, now: i64) -> Result<V
     let ResumePlan::Resume { carrier } = plan else {
         return Ok(json!({"exclusive_resource": resource, "ip": r.ip, "via": r.via, "resumed": false, "already_effective": true, "carrier": r.alias}));
     };
-    let ip = identifier_ip(&r.ip, "the recorded ip")?;
-    let via = identifier_ip(&r.via, "the recorded via")?;
-    let withdrawn = withdraw_route(db, &r.ip)?;
-    if withdrawn["withdrawn"] != json!(true) {
-        return Err(format!("network_route_resume: the dead row for {} could not be withdrawn: {withdrawn}", r.ip).into());
-    }
-    fault("resume-after-withdrawal")?;
-    route_publish(db, &r.universe, ip, via, Some(resource), id, now)
-        .map_err(|e| format!("network_route_resume: the dead row was withdrawn, and publishing again failed: {e}; a publication is needed (network_route_publish)"))?;
+    resume_in_place(db, &r, &carrier, id)?;
     Ok(json!({"exclusive_resource": resource, "ip": r.ip, "via": r.via, "resumed": true, "already_effective": false,
-              "carrier_before": r.alias, "carrier_now": carrier, "withdrawn": withdrawn,
-              "note": "the recorded exclusive route and alias published again under the lease this host holds, live, unsuperseded and renewed during this boot"}))
+              "carrier_before": r.alias, "carrier_now": carrier,
+              "note": "the recorded exclusive route and alias made again in place under the lease this host holds, live, unsuperseded and renewed during this boot"}))
+}
+
+/// The resume itself, on the recorded row, which is never deleted (review of V3-1: a resume that
+/// withdrew the row and then failed to publish lost the only record of what to resume, and every
+/// later resume answered no_recorded_route). The row is marked `resuming` with the carrier now at
+/// `via`; the dead effects are removed, each verified gone; the kernel must then hold nothing for the
+/// address; the alias in the carrier and the route are made, each recorded before it is made and
+/// verified; the row is `effective` again. A failure compensates what this resume made and leaves the
+/// row `effective` with nothing verified under it: still recorded, so the next resume retries it,
+/// never eligible meanwhile (the address is not effective), and withdrawn by the fence when the lease
+/// goes. A crash leaves it `resuming`, and the reconciliation undoes its effects and keeps it the same way.
+fn resume_in_place(db: &Connection, r: &RecordedRoute, carrier: &str, id: &str) -> Result<(), Error> {
+    let ip = r.ip.as_str();
+    db.execute("UPDATE network_routes SET state='resuming', alias_universe_uuid=?2 WHERE ip=?1", params![ip, carrier])?;
+    let mut failure: Option<String> = None;
+    for e in effect_rows(db, Some(ip))?.iter().rev() {
+        if let Err(err) = effect_remove(db, e) {
+            failure = Some(format!("the dead {} {} could not be removed: {err}", e.kind, e.key));
+            break;
+        }
+    }
+    if failure.is_none() {
+        if let Err(err) = fault("resume-after-withdrawal") {
+            failure = Some(err.to_string());
+        }
+    }
+    if failure.is_none() {
+        match routes_for(&format!("{ip}/32")) {
+            None => failure = Some("the kernel's routes could not be read after the dead effects were removed".into()),
+            Some(held) if !held.is_empty() => failure = Some(format!("the kernel still holds a route for {ip}: {}", held.join("; "))),
+            _ => {}
+        }
+    }
+    let mut done: Vec<Effect> = vec![];
+    if failure.is_none() {
+        for (kind, key, intent) in [
+            ("alias", format!("{ip}@{carrier}"), json!({"ip": ip, "universe": carrier})),
+            ("route", format!("{ip}/32"), json!({"via": r.via})),
+        ] {
+            let e = effect_begin(db, kind, &key, ip, intent, id)?;
+            done.push(e.clone());
+            if let Err(err) = effect_do(db, &e) {
+                failure = Some(err.to_string());
+                break;
+            }
+        }
+    }
+    if let Some(err) = failure {
+        let report = compensate(db, &done);
+        db.execute("UPDATE network_routes SET state='effective' WHERE ip=?1", [ip])?;
+        return Err(format!("network_route_resume: {err}; compensation: {}; the route stays recorded and the next resume retries it", json!(report)).into());
+    }
+    db.execute("UPDATE network_routes SET state='effective', operation_id=?2 WHERE ip=?1", params![ip, id])?;
+    Ok(())
 }
 
 /// Whether this host's declaration is effective in the kernel and Podman now: its state recorded
@@ -1247,7 +1302,7 @@ fn reapply(db: &Connection) -> Result<Value, Error> {
     let routes: Vec<(String, String)> = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
     let mut withdrawn = vec![];
     for (ip, via) in routes {
-        let gone = routes_for(&format!("{ip}/32")).is_some_and(|held| !held.iter().any(|l| l.contains(&format!("via {via}"))));
+        let gone = routes_for(&format!("{ip}/32")).is_some_and(|held| !held.iter().any(|l| line_via(l, &via)));
         if gone {
             let r = withdraw_route(db, &ip)?;
             withdrawn.push(json!({"ip": ip, "via": via, "withdrawn": r["withdrawn"], "steps": r["steps"]}));
@@ -1431,7 +1486,7 @@ mod resume_tests {
         assert_eq!(code(route_resume_gate(true, Some(&route), Ok(()), true)), "passes");
         assert_eq!(code(route_resume_gate(false, Some(&route), Ok(()), true)), "no_policy");
         assert_eq!(code(route_resume_gate(true, None, Ok(()), true)), "no_recorded_route");
-        for state in ["applying", "removing"] {
+        for state in ["applying", "removing", "resuming"] {
             assert_eq!(code(route_resume_gate(true, Some(&recorded(Some(CARRIER), state)), Ok(()), true)), "route_incomplete");
         }
         for why in ["none is held", "held by another host", "expired 5 seconds ago", "superseded by epoch 158"] {
@@ -1477,6 +1532,17 @@ mod resume_tests {
         assert!(!line_via("10.86.0.100 via 10.86.1.100 dev podman1", "10.86.1.10"));
         assert!(!line_via("10.86.0.100 via 10.86.1.1 dev podman1", "10.86.1.10"));
         assert!(!line_via("10.86.0.100 dev podman1", "10.86.1.10"));
+        assert!(line_via("10.86.2.0/24 via 192.168.10.157 dev vmbr0 proto static", "192.168.10.157"));
+    }
+
+    /// Every reading of a route's gateway in this module goes through `line_via` (review of V3-1:
+    /// the effective state, an effect's verification and removal, the re-application and the
+    /// undeclaration matched `via X` as a substring, so a route via 10.86.1.100 passed for 10.86.1.10).
+    #[test]
+    fn no_gateway_is_matched_as_a_substring() {
+        let source = include_str!("network.rs");
+        let needle = concat!("contains(&format!(\"via ", "{");
+        assert!(!source.contains(needle), "a gateway is matched as a substring somewhere in network.rs");
     }
 
     /// A journal with this host's identity and no network, no allocation, no effect: the operation's
@@ -1536,6 +1602,58 @@ mod resume_tests {
         assert!(err.contains("(declaration_not_effective)"), "{err}");
         // Nothing was touched by any of those refusals: the recorded route is as it was.
         assert_eq!(recorded_exclusive(&db, R).unwrap(), Some(RecordedRoute { ip: "10.86.0.100".into(), universe: R.into(), via: "10.86.1.10".into(), alias: Some(CARRIER.into()), state: "effective".into() }));
+    }
+
+    /// The review's probe, turned round (V3-1 review, item 2): a resume that fails after the dead
+    /// effects are removed keeps the recorded row, so the next resume is not answered
+    /// no_recorded_route and the workstation is not needed to bring the address back.
+    #[test]
+    fn a_failed_resume_keeps_the_record_the_next_resume_needs() {
+        let db = journal();
+        let now = crate::now() as i64;
+        db.execute("INSERT INTO activation_policy(universe_uuid,lease_seconds,takeover_margin_seconds,declared_at,operation_id,authority_id) VALUES(?1,3600,30,0,'p','lab-gate')", [R]).unwrap();
+        db.execute("INSERT INTO activation_leases(universe_uuid,holder_host_uuid,generation,acquired_at,expires_at,operation_id,epoch,grant_id) VALUES(?1,?2,1,1,?3,'a',157,'g')", params![R, HOST, now + 600]).unwrap();
+        db.execute("INSERT INTO activation_lease_history(universe_uuid,holder_host_uuid,generation,event,at,operation_id,boot_id) VALUES(?1,?2,1,'renewed',0,'now',?3)",
+                   params![R, HOST, crate::activation::boot_id().unwrap()]).unwrap();
+        db.execute("INSERT INTO network_routes(ip,universe_uuid,via,published_at,operation_id,exclusive_resource,alias_universe_uuid,state) VALUES('10.86.0.100',?1,'10.86.1.10',0,'pub',?1,?2,'effective')",
+                   params![R, CARRIER]).unwrap();
+        let e = effect_begin(&db, "route", "10.86.0.100/32", "10.86.0.100", json!({"via": "10.86.1.10"}), "pub").unwrap();
+        effect_state(&db, &e, "effective", None).unwrap();
+        let before = recorded_exclusive(&db, R).unwrap().unwrap();
+        // The universe named as the new carrier does not run: the alias cannot be made, after the dead
+        // route was removed -- where the previous resume had already deleted the row.
+        let gone = "00000000-0000-4000-8000-0000000000ff";
+        let err = resume_in_place(&db, &before, gone, "op-resume").unwrap_err().to_string();
+        assert!(err.contains("stays recorded"), "{err}");
+        let kept = recorded_exclusive(&db, R).unwrap().unwrap();
+        assert_eq!((kept.ip.as_str(), kept.via.as_str(), kept.state.as_str(), kept.alias.as_deref()), ("10.86.0.100", "10.86.1.10", "effective", Some(gone)));
+        // Whatever the compensation could not verify gone (here Podman could not be asked) is left for
+        // the reconciliation, never effective; the dead route is gone.
+        assert!(effect_rows(&db, Some("10.86.0.100")).unwrap().iter().all(|e| e.kind == "alias" && e.state != "effective"), "{err}");
+        // The next resume passes the journal's gate and is refused, if at all, for another reason
+        // (this journal declares no network) -- never for a record it no longer has.
+        // The leftover is the reconciliation's, which cannot ask Podman here either; cleared by hand so that
+        // the operation's own answer is what is read.
+        db.execute("DELETE FROM network_effects", []).unwrap();
+        let err = resume(&db, "op-after").unwrap_err();
+        assert!(!err.contains("(no_recorded_route)") && err.contains("(declaration_not_effective)"), "{err}");
+    }
+
+    /// A resume interrupted by a crash leaves its row `resuming`; the reconciliation undoes what it
+    /// made and keeps the row, `effective`, for the next resume, and drops a row left `applying`.
+    #[test]
+    fn the_reconciliation_keeps_an_interrupted_resume_and_drops_an_interrupted_publication() {
+        let db = journal();
+        for (ip, state) in [("10.86.0.100", "resuming"), ("10.86.0.101", "applying")] {
+            db.execute("INSERT INTO network_routes(ip,universe_uuid,via,published_at,operation_id,exclusive_resource,alias_universe_uuid,state) VALUES(?1,?2,'10.86.1.10',0,'x',?2,NULL,?3)",
+                       params![ip, R, state]).unwrap();
+            effect_begin(&db, "route", &format!("{ip}/32"), ip, json!({"via": "10.86.1.10"}), "x").unwrap();
+        }
+        let report = reconcile(&db).unwrap();
+        assert_eq!(report["routes_kept_for_resume"], json!(["10.86.0.100"]), "{report}");
+        assert_eq!(report["routes_dropped"], json!(["10.86.0.101"]), "{report}");
+        assert_eq!(recorded_exclusive(&db, R).unwrap().map(|r| r.state), Some("effective".into()));
+        assert!(effect_rows(&db, None).unwrap().is_empty());
     }
 
     #[test]
