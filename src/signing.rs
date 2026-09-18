@@ -147,11 +147,14 @@ pub const TAKEOVER_FIELDS: &[(&str, Field)] = &[
     ("expires_at", Field::Integer),
 ];
 
-/// What a policy-change certificate binds: the resource, the policy it moves to, and its own life. The
-/// policy it moves from is its `policy_digest`.
+/// What a policy-change certificate binds: the resource, the policy it moves to, both serials, and its
+/// own life. The policy it moves from is its `policy_digest`, which covers `from_serial` already; the
+/// serials are named too so that a refusal can say which step was skipped or replayed.
 pub const POLICY_CHANGE_FIELDS: &[(&str, Field)] = &[
     ("resource", Field::Text),
     ("new_policy_digest", Field::Text),
+    ("from_serial", Field::Integer),
+    ("new_serial", Field::Integer),
     ("issued_at", Field::Integer),
     ("expires_at", Field::Integer),
 ];
@@ -175,6 +178,10 @@ pub struct Quorum {
     /// The 1-of-1 of a policy that names a single `authority_key`: its signer/signature documents verify
     /// as they always did. False for a declared `authority_quorum`, even a 1-of-1 one.
     pub single_key: bool,
+    /// The authority set's serial on this host: 0 for a policy declared before the field existed, one
+    /// more at every change of the set. The digest covers it, so the same keys at another serial are
+    /// another policy, and a certificate made before a change cannot be presented after it.
+    pub serial: u64,
 }
 
 fn key_id(value: &str) -> Result<(), Error> {
@@ -240,7 +247,7 @@ impl Quorum {
             .into());
         }
         keys.sort_by(|a, b| a.key_id.cmp(&b.key_id));
-        Ok(Quorum { authority_id: authority_id.to_string(), threshold, keys, single_key: false })
+        Ok(Quorum { authority_id: authority_id.to_string(), threshold, keys, single_key: false, serial: 0 })
     }
 
     /// The 1-of-1 quorum of a policy that names a single `authority_key`: the migration's starting point.
@@ -251,7 +258,14 @@ impl Quorum {
             threshold: 1,
             keys: vec![QuorumKey { key_id: SINGLE_KEY_ID.to_string(), public_key: key_hex.to_string(), key }],
             single_key: true,
+            serial: 0,
         })
+    }
+
+    /// The same authority set at `serial`.
+    pub fn at_serial(mut self, serial: u64) -> Quorum {
+        self.serial = serial;
+        self
     }
 
     /// The quorum as a policy stores it and `activation_status` reports it.
@@ -263,7 +277,7 @@ impl Quorum {
     }
 
     /// What `policy_digest` is taken over: the form, the authority, whether it is a single key's 1-of-1,
-    /// the threshold and the keys in key_id order, canonical JSON. The resource is not in it -- one quorum
+    /// the serial, the threshold and the keys in key_id order, canonical JSON. The resource is not in it -- one quorum
     /// may govern many resources -- and is bound by every certificate separately. `single_key` is in it
     /// because the two forms differ in what they accept (a single-key policy still takes the gate's
     /// permits), so moving between them is a change of the authority set even over the same key.
@@ -272,6 +286,7 @@ impl Quorum {
         v["form"] = Value::from(QUORUM_POLICY_FORM);
         v["authority_id"] = Value::from(self.authority_id.as_str());
         v["single_key"] = Value::from(self.single_key);
+        v["serial"] = Value::from(self.serial);
         serde_json::to_vec(&v).unwrap_or_default()
     }
 
@@ -601,17 +616,24 @@ mod quorum_tests {
         }
     }
 
-    /// Proves: the canonical form and the digest are what another implementation computes. The digest of
-    /// a fixed 2-of-3 policy is pinned to the value Python's `json.dumps(sort_keys=True, separators=(',',
+    /// Proves: the canonical form and the digest are what another implementation computes, and that the
+    /// digest changes with the serial. The digest of a fixed 2-of-3 policy at serial 0 and at serial 1 is
+    /// pinned to the value Python's `json.dumps(sort_keys=True, separators=(',',
     /// ':'), ensure_ascii=False)` and `hashlib.sha256` give, and does not depend on the order the keys
     /// were declared in; a certificate signed by Python's `cryptography` over that form verifies here.
     #[test]
     fn the_policy_digest_and_a_certificate_signed_elsewhere_agree() {
         let q = quorum(2, ABC);
-        assert_eq!(q.digest(), "9ff65bd48dbffd3be07a34977033007bd0085afe399fb414e27ceeaff5c67d62");
+        assert_eq!(q.digest(), "965bd61aaad93361c01a54635b3f3ee6c40953e0680589f064cf56ca06c19d86");
         let reversed: Vec<(&str, u8)> = ABC.iter().rev().copied().collect();
         assert_eq!(quorum(2, &reversed).digest(), q.digest());
-        let python: Value = serde_json::from_str(r#"{"kind": "podmesh-takeover-proof/quorum-ed25519", "authority_id": "replicas", "policy_digest": "9ff65bd48dbffd3be07a34977033007bd0085afe399fb414e27ceeaff5c67d62", "resource": "91eeb6bf-5489-405b-b77a-53105b0aff7a", "new_epoch": 12, "previous_epoch": 11, "new_holder": "5d1c0b8e-3f59-4d0e-9d7a-2a1e7c4b9f10", "previous_holder": null, "holder_boot_id": "0b7f6f1e-6a55-4c1d-8f53-1c2d3e4f5a6b", "grant_id": "g12", "method": "lease_barrier", "eligible_after": 1700000600, "issued_at": 1700000000, "expires_at": 4102444800, "note": "decided by two replicas — naïve JSON", "signatures": [{"key_id": "replica-c", "signature": "9c722fa1724ee8b15966931dbabd728edb22712ca5393597de05bddde226ea8775e714d41ad4ab58b13597ef6d16f4c3368d0e74426c0902cbb6467f6b6d120f"}, {"key_id": "replica-a", "signature": "2035ab67576d9ca04900e013bda417c4f6630617e3f2904ce9da7367398f49a5f37ffa695b181a9945afb8a64d86ff25fd85efca896719a9a23c1e953296790d"}]}"#).unwrap();
+        // The digest covers the serial: the same keys one change later are another policy, pinned too,
+        // and a certificate of serial 0 is refused under serial 1.
+        let later = quorum(2, ABC).at_serial(1);
+        assert_eq!(later.digest(), "cd720df9baf1151f94fec5f5055460255fdc675fd3c2ef6525e563ca60e07a80");
+        assert_eq!(code(&later, &certificate(&q, &ABC[..2])), "policy_mismatch");
+        assert_ne!(Quorum::single("lab-gate", &public(42)).unwrap().at_serial(1).digest(), Quorum::single("lab-gate", &public(42)).unwrap().digest());
+        let python: Value = serde_json::from_str(r#"{"kind": "podmesh-takeover-proof/quorum-ed25519", "authority_id": "replicas", "policy_digest": "965bd61aaad93361c01a54635b3f3ee6c40953e0680589f064cf56ca06c19d86", "resource": "91eeb6bf-5489-405b-b77a-53105b0aff7a", "new_epoch": 12, "previous_epoch": 11, "new_holder": "5d1c0b8e-3f59-4d0e-9d7a-2a1e7c4b9f10", "previous_holder": null, "holder_boot_id": "0b7f6f1e-6a55-4c1d-8f53-1c2d3e4f5a6b", "grant_id": "g12", "method": "lease_barrier", "eligible_after": 1700000600, "issued_at": 1700000000, "expires_at": 4102444800, "note": "decided by two replicas — naïve JSON", "signatures": [{"key_id": "replica-c", "signature": "cbcbfdb7b05696a80eaf173c8fc9edbc38f68b1a6a4d1bda7a2b2ca937dbdc7016f0b53926a32b728a8055598e9b3618bc0c3c6e0938481394a633004d0ada06"}, {"key_id": "replica-a", "signature": "54780a60c484034192ebc49570866c8e72df15a4ceccd4289cfbb91cc476a4e4d53c5c3a5b91e405de524ccac34226ab073d1e8f9ee729ee7a661c94557ebd0c"}]}"#).unwrap();
         assert_eq!(q.verify(&python, QUORUM_PROOF_KIND, TAKEOVER_FIELDS).unwrap(), ["replica-c", "replica-a"]);
         assert_eq!(verify_takeover(&python, &q).unwrap(), ["replica-c", "replica-a"]);
     }
@@ -633,7 +655,7 @@ mod quorum_tests {
         verify(&doc, key).unwrap();
         let single = Quorum::single("lab-gate", key).unwrap();
         assert_eq!(verify_takeover(&doc, &single).unwrap(), [SINGLE_KEY_ID]);
-        assert_eq!(single.digest(), "b6f2fbdbc0317d1991baa407f8c97a0b4fbbe2d7f7737fa4040c291790436fed");
+        assert_eq!(single.digest(), "7cfa96e40596eb1f6d54ed7485e3674280925995abab60beb6503ded09b635c0");
         for field in ["resource", "new_holder", "method", "barrier_basis", "note", "signer"] {
             let mut altered = doc.clone();
             altered[field] = json!(format!("{}x", altered[field].as_str().unwrap()));

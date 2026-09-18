@@ -257,32 +257,55 @@ fn grant_of(request: &serde_json::Value, policy: &Policy, uuid: &str, holder: Op
 
 /// A change of a universe's authority set at `activation_require` (V3-2), and how it was authorised.
 ///
-/// When neither the policy in place nor the one declared is a quorum, nothing is required: that is
-/// today's behaviour for a single key or none, kept for the migration, and the change is recorded. When
-/// either is a quorum, a change of the authority set (its digest: form, authority, threshold and keys)
-/// needs one of two things, and nothing else moves it:
-/// - `policy_change_certificate`, a certificate of the policy IN PLACE (k of its keys, or the single
-///   key's 1-of-1) binding this universe and the new policy's digest, live on this clock, and never
-///   applied here before;
-/// - `replaces_policy_digest`, the operator's explicit re-declaration, naming the digest of the policy it
-///   replaces, which must still be the current one: a stale re-declaration is refused, not applied.
+/// THE SERIAL. The set carries a serial that the digest covers. It never decreases, and it rises by
+/// exactly one at every change from one authority set to another, whoever authorised it; a policy
+/// declared before the field existed is at 0. The first authority set of a host (none before) takes
+/// the serial the operator states (`authority_serial`), never below the one stored, 0 by default, so
+/// that a host joining late can be declared at the serial its peers reached and share their digest.
+/// A declaration that leaves the set as it is keeps its serial.
 ///
-/// The first authority set of a universe replaces nothing and is the operator's declaration. A
-/// declaration that leaves the authority set as it is needs neither and records nothing. The epoch
-/// screen is never touched by any of this: a new policy does not reset what this host has seen.
+/// When neither the policy in place nor the one declared is a quorum, nothing more is required: that is
+/// today's behaviour for a single key or none, kept for the migration until the gate is retired, and
+/// the change is recorded. When either is a quorum, a change of the authority set needs one of two
+/// things, and nothing else moves it:
+/// - `policy_change_certificate`, a certificate of the policy IN PLACE (k of its keys, or the single
+///   key's 1-of-1) binding this universe, `from_serial` (this host's serial now), `new_serial` (one
+///   more) and the new policy's digest at that serial, live on this clock. A certificate made before
+///   any later change names an older serial and is refused, on a host that never applied it too;
+/// - `replaces_policy_digest`, the operator's explicit re-declaration, naming the digest of the policy
+///   it replaces, which must still be the current one: a stale re-declaration is refused, not applied.
+///
+/// The epoch screen is never touched by any of this: a new policy does not reset what this host has seen.
 fn authority_change(
-    db: &Connection,
     uuid: &str,
     request: &serde_json::Value,
     current: Option<&Policy>,
-    proposed: &Policy,
+    proposed: &mut Policy,
     now: i64,
 ) -> Result<Option<(String, String, &'static str, String)>, Error> {
+    let stored = current.map_or(0, |p| p.authority_serial);
+    let stated = match request.get("authority_serial") {
+        None => None,
+        Some(v) => Some(v.as_u64().ok_or("authority_serial must be a non-negative integer")?),
+    };
     let from = match current { Some(p) => p.authority_digest()?, None => None };
-    let to = proposed.authority_digest()?;
-    if from == to {
+    proposed.authority_serial = stored;
+    if from == proposed.authority_digest()? {
+        if let Some(n) = stated.filter(|&n| n != stored) {
+            return Err(format!("authority_serial {n} is not this host's serial {stored}; the serial moves only with a change of the authority set").into());
+        }
         return Ok(None);
     }
+    proposed.authority_serial = match (&from, stated) {
+        (Some(_), None) => stored + 1,
+        (Some(_), Some(n)) if n == stored + 1 => n,
+        (Some(_), Some(n)) => {
+            return Err(format!("authority_serial {n} skips or repeats: a change moves this host's serial from {stored} to {}", stored + 1).into());
+        }
+        (None, Some(n)) if n < stored => return Err(format!("authority_serial {n} is below this host's serial {stored}; it never decreases").into()),
+        (None, n) => n.unwrap_or(stored),
+    };
+    let to = proposed.authority_digest()?;
     let (from_text, to_text) = (from.clone().unwrap_or_default(), to.clone().unwrap_or_default());
     let quorum_involved = proposed.quorum_form() || current.is_some_and(Policy::quorum_form);
     let Some(from) = from.filter(|_| quorum_involved) else {
@@ -309,6 +332,13 @@ fn authority_change(
             if to.is_none() {
                 return Err("A certificate moves an authority set to another one; dropping the key is the operator's re-declaration".into());
             }
+            let (from_serial, new_serial) = (c["from_serial"].as_i64().unwrap_or(-1), c["new_serial"].as_i64().unwrap_or(-1));
+            if from_serial != stored as i64 {
+                return Err(format!("The policy change certificate is from serial {from_serial}; this host's policy is at serial {stored}").into());
+            }
+            if new_serial != proposed.authority_serial as i64 {
+                return Err(format!("The policy change certificate moves to serial {new_serial}; a change moves serial {stored} to {}", stored + 1).into());
+            }
             if c["new_policy_digest"].as_str() != to.as_deref() {
                 return Err(format!("The policy change certificate moves to {}, not to the policy declared here ({to_text})", c["new_policy_digest"]).into());
             }
@@ -319,16 +349,9 @@ fn authority_change(
             if expires < now {
                 return Err(format!("The policy change certificate expired {} seconds ago", now - expires).into());
             }
-            let digest = crate::signing::payload_digest(c)?;
-            let used: i64 = db.query_row(
-                "SELECT COUNT(*) FROM activation_policy_changes WHERE universe_uuid=?1 AND certificate_digest=?2",
-                params![uuid, digest],
-                |r| r.get(0),
-            )?;
-            if used > 0 {
-                return Err("This policy change certificate was already applied here; a change it authorised once is not replayed".into());
-            }
-            Ok(Some((from_text, to_text, "certificate", digest)))
+            // No record of applied certificates is consulted: applying one moves the serial, so the digest in
+            // place never again matches the one it names. Its payload digest is recorded as provenance.
+            Ok(Some((from_text, to_text, "certificate", crate::signing::payload_digest(c)?)))
         }
         (None, None) => Err(format!(
             "This universe's authority set is {from}; changing it requires a certificate of that policy (policy_change_certificate) or the operator's explicit re-declaration (replaces_policy_digest: \"{from}\")"
@@ -422,6 +445,8 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
         ("activation_policy", "authority_key TEXT NOT NULL DEFAULT ''"),
         // The authority as a quorum (V3-2): the stored `{threshold, keys}`, empty for a single key or none.
         ("activation_policy", "authority_quorum TEXT NOT NULL DEFAULT ''"),
+        // The authority set's serial (V3-2): a policy declared before the field existed starts at 0.
+        ("activation_policy", "authority_serial INTEGER NOT NULL DEFAULT 0"),
         ("activation_leases", "epoch INTEGER NOT NULL DEFAULT 0"),
         ("activation_leases", "grant_id TEXT NOT NULL DEFAULT ''"),
         // The boot a history row was written in; NULL for the rows written before the field existed,
@@ -466,6 +491,9 @@ pub struct Policy {
     /// single key or none. Named, every exclusive decision is a certificate k of its n keys signed, and
     /// the epoch screen moves on certificates only: no permit is accepted.
     pub authority_quorum: String,
+    /// The authority set's serial: never lower, one more at every change from one authority set to
+    /// another, covered by the set's digest (V3-2).
+    pub authority_serial: u64,
 }
 
 impl Policy {
@@ -482,10 +510,10 @@ impl Policy {
     pub fn authority(&self) -> Result<Option<crate::signing::Quorum>, Error> {
         if self.quorum_form() {
             let v: serde_json::Value = serde_json::from_str(&self.authority_quorum)?;
-            return Ok(Some(crate::signing::Quorum::declared(&self.authority_id, &v)?));
+            return Ok(Some(crate::signing::Quorum::declared(&self.authority_id, &v)?.at_serial(self.authority_serial)));
         }
         if !self.authority_key.is_empty() {
-            return Ok(Some(crate::signing::Quorum::single(&self.authority_id, &self.authority_key)?));
+            return Ok(Some(crate::signing::Quorum::single(&self.authority_id, &self.authority_key)?.at_serial(self.authority_serial)));
         }
         Ok(None)
     }
@@ -500,7 +528,7 @@ impl Policy {
 pub fn policy(db: &Connection, uuid: &str) -> Result<Option<Policy>, Error> {
     Ok(db
         .query_row(
-            "SELECT lease_seconds,takeover_margin_seconds,desired_standbys,eligible_hosts,authorization_ref,authority_id,authority_key,authority_quorum FROM activation_policy WHERE universe_uuid=?1",
+            "SELECT lease_seconds,takeover_margin_seconds,desired_standbys,eligible_hosts,authorization_ref,authority_id,authority_key,authority_quorum,authority_serial FROM activation_policy WHERE universe_uuid=?1",
             [uuid],
             |r| {
                 let hosts: String = r.get(3)?;
@@ -513,6 +541,7 @@ pub fn policy(db: &Connection, uuid: &str) -> Result<Option<Policy>, Error> {
                     authority_id: r.get(5)?,
                     authority_key: r.get(6)?,
                     authority_quorum: r.get(7)?,
+                    authority_serial: r.get::<_, i64>(8)? as u64,
                 })
             },
         )
@@ -714,6 +743,7 @@ fn view(db: &Connection, uuid: &str) -> Result<serde_json::Value, Error> {
     // and a change replaces; and, under a quorum, the keys, the threshold and what that changes.
     if let Some(p) = policy.as_ref() {
         v["authority_policy_digest"] = serde_json::json!(p.authority_digest()?);
+        v["authority_serial"] = serde_json::json!(p.authority_serial);
     }
     if quorum {
         let p = policy.as_ref().ok_or("no policy")?;
@@ -846,7 +876,7 @@ fn perform(db: &Connection, request: &serde_json::Value) -> Result<serde_json::V
                     crate::signing::Quorum::declared(&authority, v)?.stored().to_string()
                 }
             };
-            let proposed = Policy {
+            let mut proposed = Policy {
                 lease_seconds,
                 takeover_margin_seconds: margin,
                 desired_standbys: standbys,
@@ -855,20 +885,23 @@ fn perform(db: &Connection, request: &serde_json::Value) -> Result<serde_json::V
                 authority_id: authority.clone(),
                 authority_key: authority_key.clone(),
                 authority_quorum: authority_quorum.clone(),
+                authority_serial: 0,
             };
-            let change = authority_change(db, uuid, request, policy(db, uuid)?.as_ref(), &proposed, now)?;
+            let change = authority_change(uuid, request, policy(db, uuid)?.as_ref(), &mut proposed, now)?;
             db.execute(
                 "INSERT INTO activation_policy(universe_uuid,lease_seconds,takeover_margin_seconds,declared_at,operation_id,
-                   desired_standbys,eligible_hosts,authorization_ref,authority_id,authority_key,authority_quorum)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+                   desired_standbys,eligible_hosts,authorization_ref,authority_id,authority_key,authority_quorum,authority_serial)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
                  ON CONFLICT(universe_uuid) DO UPDATE SET lease_seconds=excluded.lease_seconds,
                    takeover_margin_seconds=excluded.takeover_margin_seconds,
                    declared_at=excluded.declared_at, operation_id=excluded.operation_id,
                    desired_standbys=excluded.desired_standbys, eligible_hosts=excluded.eligible_hosts,
                    authorization_ref=excluded.authorization_ref, authority_id=excluded.authority_id,
-                   authority_key=excluded.authority_key, authority_quorum=excluded.authority_quorum",
+                   authority_key=excluded.authority_key, authority_quorum=excluded.authority_quorum,
+                   authority_serial=excluded.authority_serial",
                 params![uuid, lease_seconds as i64, margin as i64, now, id, standbys as i64,
-                        serde_json::to_string(&hosts)?, reference, authority, authority_key, authority_quorum],
+                        serde_json::to_string(&hosts)?, reference, authority, authority_key, authority_quorum,
+                        proposed.authority_serial as i64],
             )?;
             if let Some((from, to, how, certificate)) = change {
                 db.execute(
@@ -1495,6 +1528,8 @@ mod quorum_tests {
         let low = Permit { authority_id: "replicas".into(), resource: R.into(), epoch: 3, replica_id: OTHER.into(), instance_id: "b".into(), grant_id: "g3".into() };
         screen(&db, R, &low, "direct").unwrap();
         assert_eq!(screen_of(&db), Some(10));
+        let row: (String, String) = db.query_row("SELECT grant_id,replica_id FROM activation_epochs WHERE universe_uuid=?1", [R], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(row, ("g10".to_string(), HOST.to_string()), "a lower write left the grant of the epoch seen as it was");
         // And the operation says so rather than succeeding quietly: a valid certificate at or below the
         // screen is refused as a supersession and as an acquisition.
         for epoch in [9, 10] {
@@ -1591,11 +1626,18 @@ mod quorum_tests {
         let p = policy(db, R).unwrap().unwrap();
         let now = crate::now() as i64;
         sign(&json!({"kind": crate::signing::POLICY_CHANGE_KIND, "authority_id": p.authority_id, "policy_digest": p.authority_digest().unwrap().unwrap(),
-                     "resource": R, "new_policy_digest": to, "issued_at": now, "expires_at": now + 600}), signers)
+                     "resource": R, "new_policy_digest": to, "from_serial": p.authority_serial, "new_serial": p.authority_serial + 1,
+                     "issued_at": now, "expires_at": now + 600}), signers)
     }
 
-    fn digest_of(authority: &str, v: &Value) -> String {
-        crate::signing::Quorum::declared(authority, v).unwrap().digest()
+    /// The digest the quorum `v` will have on this host after the next change: at its serial plus one.
+    fn next_digest(db: &Connection, authority: &str, v: &Value) -> String {
+        let serial = policy(db, R).unwrap().map_or(0, |p| p.authority_serial);
+        crate::signing::Quorum::declared(authority, v).unwrap().at_serial(serial + 1).digest()
+    }
+
+    fn serial_of(db: &Connection) -> u64 {
+        policy(db, R).unwrap().unwrap().authority_serial
     }
 
     /// Proves the rule for changing the authority set. From the gate's single key to a 2-of-3 quorum:
@@ -1631,7 +1673,7 @@ mod quorum_tests {
         assert_eq!(changes(&db).len(), 2);
         // To another quorum (replica-c's key replaced by replica-d's), by certificate.
         let next_keys: &[(&str, u8)] = &[ABC[0], ABC[1], ("replica-d", 4)];
-        let target = digest_of("replicas", &testkit::policy(2, next_keys));
+        let target = next_digest(&db, "replicas", &testkit::policy(2, next_keys));
         let with_cert = |c: Value| { let mut r = quorum_policy(2, next_keys); r["policy_change_certificate"] = c; r };
         let e = act(&db, "activation_require", with_cert(change_certificate(&db, &target, &ABC[..1]))).unwrap_err();
         assert!(e.contains("(below_threshold)"), "{e}");
@@ -1659,12 +1701,15 @@ mod quorum_tests {
         act(&db, "activation_require", with_cert(applied.clone())).unwrap();
         assert_eq!(digest(&db), target);
         assert_eq!(changes(&db).last().unwrap(), &(first.clone(), target.clone(), "certificate".to_string()));
-        // The operator moves it back; the certificate applied once does not move it forward again.
+        // The operator moves it back; the certificate applied once does not move it forward again: the
+        // same keys are at another serial now, so the policy it names is not the one in place.
         let mut back = quorum_policy(2, ABC);
         back["replaces_policy_digest"] = json!(target);
         act(&db, "activation_require", back).unwrap();
+        assert_eq!(serial_of(&db), 3);
+        assert_ne!(digest(&db), first, "the same keys, a later serial: another digest");
         let e = act(&db, "activation_require", with_cert(applied)).unwrap_err();
-        assert!(e.contains("already applied"), "{e}");
+        assert!(e.contains("(policy_mismatch)"), "{e}");
         // Dropping the quorum: never by certificate, by the operator's re-declaration only.
         let lease_only = json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "replicas"});
         let e = act(&db, "activation_require", lease_only.clone()).unwrap_err();
@@ -1674,9 +1719,17 @@ mod quorum_tests {
         let e = act(&db, "activation_require", drop).unwrap_err();
         assert!(e.contains("dropping the key is the operator's"), "{e}");
         let mut drop = lease_only;
-        drop["replaces_policy_digest"] = json!(first);
+        drop["replaces_policy_digest"] = json!(digest(&db));
         act(&db, "activation_require", drop).unwrap();
         assert_eq!(policy(&db, R).unwrap().unwrap().authority_digest().unwrap(), None);
+        assert_eq!(serial_of(&db), 4, "dropping the set is a change too");
+        // Declared again from none: never below the serial stored, which it keeps by default.
+        let mut again = quorum_policy(2, ABC);
+        again["authority_serial"] = json!(0);
+        let e = act(&db, "activation_require", again).unwrap_err();
+        assert!(e.contains("below this host's serial 4"), "{e}");
+        act(&db, "activation_require", quorum_policy(2, ABC)).unwrap();
+        assert_eq!(serial_of(&db), 4);
         assert_eq!(screen_of(&db), Some(7), "no change of policy moved the screen");
     }
 
@@ -1694,7 +1747,8 @@ mod quorum_tests {
         let hows: Vec<String> = changes(&db).into_iter().map(|(_, _, h)| h).collect();
         assert_eq!(hows, ["declared", "redeclared_single_key", "redeclared_single_key"]);
         let mut to_replicas = json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "lab-gate", "authority_quorum": testkit::policy(2, ABC)});
-        let target = digest_of("lab-gate", &testkit::policy(2, ABC));
+        assert_eq!(serial_of(&db), 2, "each change between single keys moved the serial");
+        let target = next_digest(&db, "lab-gate", &testkit::policy(2, ABC));
         to_replicas["policy_change_certificate"] = change_certificate(&db, &target, &[(crate::signing::SINGLE_KEY_ID, GATE_SEED)]);
         act(&db, "activation_require", to_replicas).unwrap();
         assert_eq!(digest(&db), target);
@@ -1704,5 +1758,69 @@ mod quorum_tests {
         assert!(e.contains("name one"), "{e}");
         let e = act(&db, "activation_require", json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_quorum": testkit::policy(2, ABC)})).unwrap_err();
         assert!(e.contains("without authority_id"), "{e}");
+    }
+
+    /// Proves the serial (the coordinator's decision 4). A live policy-change certificate cannot be
+    /// replayed on a host that never saw it once that host has moved on: host Y, which the operator
+    /// moved to the same target and back, refuses the certificate host X applied, although Y never
+    /// applied it and its keys are the ones the certificate names. A certificate naming the right policy
+    /// but another `from_serial`, or skipping a serial, is refused; so is an operator's stated serial
+    /// that skips, and a stated serial on a declaration that changes nothing. A host joining late is
+    /// declared at the serial its peers reached and shares their digest. The status reports the serial.
+    #[test]
+    fn a_policy_change_is_bound_to_the_serial_it_moves_from() {
+        let (x, y) = (db(), db());
+        for h in [&x, &y] {
+            act(h, "activation_require", quorum_policy(2, ABC)).unwrap();
+            assert_eq!(serial_of(h), 0);
+        }
+        let next_keys: &[(&str, u8)] = &[ABC[0], ABC[1], ("replica-d", 4)];
+        let target = next_digest(&x, "replicas", &testkit::policy(2, next_keys));
+        let live = change_certificate(&x, &target, &ABC[..2]);
+        let mut apply = quorum_policy(2, next_keys);
+        apply["policy_change_certificate"] = live.clone();
+        act(&x, "activation_require", apply.clone()).unwrap();
+        assert_eq!((serial_of(&x), digest(&x)), (1, target.clone()));
+        // Y never saw it; the operator moves Y on (to the same target, then back to the first keys).
+        let mut forward = quorum_policy(2, next_keys);
+        forward["replaces_policy_digest"] = json!(digest(&y));
+        act(&y, "activation_require", forward).unwrap();
+        let mut back = quorum_policy(2, ABC);
+        back["replaces_policy_digest"] = json!(digest(&y));
+        act(&y, "activation_require", back).unwrap();
+        assert_eq!(serial_of(&y), 2);
+        let e = act(&y, "activation_require", apply).unwrap_err();
+        assert!(e.contains("(policy_mismatch)"), "the live certificate replayed on a host that moved on: {e}");
+        // The right policy in place, but another from_serial: refused by the serial itself.
+        let mut stale = change_certificate(&y, &next_digest(&y, "replicas", &testkit::policy(2, next_keys)), &[]);
+        stale["from_serial"] = json!(0);
+        let mut r = quorum_policy(2, next_keys);
+        r["policy_change_certificate"] = sign(&stale, &ABC[..2]);
+        let e = act(&y, "activation_require", r).unwrap_err();
+        assert!(e.contains("is from serial 0; this host's policy is at serial 2"), "{e}");
+        // A skipped serial: 2 -> 4.
+        let mut skip = change_certificate(&y, &crate::signing::Quorum::declared("replicas", &testkit::policy(2, next_keys)).unwrap().at_serial(4).digest(), &[]);
+        skip["new_serial"] = json!(4);
+        let mut r = quorum_policy(2, next_keys);
+        r["policy_change_certificate"] = sign(&skip, &ABC[..2]);
+        let e = act(&y, "activation_require", r).unwrap_err();
+        assert!(e.contains("moves to serial 4; a change moves serial 2 to 3"), "{e}");
+        let mut r = quorum_policy(2, next_keys);
+        r["replaces_policy_digest"] = json!(digest(&y));
+        r["authority_serial"] = json!(4);
+        let e = act(&y, "activation_require", r).unwrap_err();
+        assert!(e.contains("skips or repeats"), "{e}");
+        let mut r = quorum_policy(2, ABC);
+        r["authority_serial"] = json!(3);
+        let e = act(&y, "activation_require", r).unwrap_err();
+        assert!(e.contains("moves only with a change"), "{e}");
+        assert_eq!(serial_of(&y), 2, "no refused request moved the serial");
+        // A host joining late, declared at its peers' serial: the same digest as X.
+        let z = db();
+        let mut join = quorum_policy(2, next_keys);
+        join["authority_serial"] = json!(1);
+        let v = act(&z, "activation_require", join).unwrap();
+        assert_eq!(digest(&z), digest(&x));
+        assert_eq!(v["authority_serial"], json!(1));
     }
 }

@@ -106,6 +106,14 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
     if !present {
         db.execute_batch("ALTER TABLE publisher_takeover_verified ADD COLUMN authority_quorum TEXT NOT NULL DEFAULT '';")?;
     }
+    let present: bool = db.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('publisher_takeover_verified') WHERE name='authority_digest'",
+        [],
+        |r| Ok(r.get::<_, i64>(0)? > 0),
+    )?;
+    if !present {
+        db.execute_batch("ALTER TABLE publisher_takeover_verified ADD COLUMN authority_digest TEXT NOT NULL DEFAULT '';")?;
+    }
     Ok(())
 }
 
@@ -282,6 +290,9 @@ pub(crate) struct Verified {
     authority_key: String,
     /// The policy's quorum when the proof was verified (V3-2); empty for a single key or none.
     authority_quorum: String,
+    /// The policy's digest, serial included, when the proof was verified (V3-2); empty for a policy
+    /// without a key and for rows written before the field existed.
+    authority_digest: String,
     proof: Value,
     verified: Value,
     verified_at: i64,
@@ -295,12 +306,13 @@ pub(crate) struct Verified {
 fn record_verified(db: &Connection, resource: &str, l: &crate::activation::Lease, boot: &str, policy: &crate::activation::Policy, proof: &Value, verified: &Value, id: &str) -> Result<(), Error> {
     db.execute(
         "INSERT INTO publisher_takeover_verified(resource,epoch,generation,acquired_at,boot_id,authority_id,authority_key,proof,verified,
-           verified_at,operation_id,authority_quorum) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+           verified_at,operation_id,authority_quorum,authority_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
          ON CONFLICT(resource,epoch) DO UPDATE SET generation=excluded.generation, acquired_at=excluded.acquired_at, boot_id=excluded.boot_id,
            authority_id=excluded.authority_id, authority_key=excluded.authority_key, proof=excluded.proof, verified=excluded.verified,
-           verified_at=excluded.verified_at, operation_id=excluded.operation_id, authority_quorum=excluded.authority_quorum",
+           verified_at=excluded.verified_at, operation_id=excluded.operation_id, authority_quorum=excluded.authority_quorum,
+           authority_digest=excluded.authority_digest",
         params![resource, l.epoch, l.generation, l.acquired_at, boot, policy.authority_id, policy.authority_key, proof.to_string(), verified.to_string(),
-                crate::now() as i64, id, policy.authority_quorum],
+                crate::now() as i64, id, policy.authority_quorum, policy.authority_digest()?.unwrap_or_default()],
     )?;
     Ok(())
 }
@@ -309,14 +321,14 @@ fn record_verified(db: &Connection, resource: &str, l: &crate::activation::Lease
 fn last_verified(db: &Connection, resource: &str) -> Result<Option<Verified>, Error> {
     Ok(db
         .query_row(
-            "SELECT epoch,generation,acquired_at,boot_id,authority_id,authority_key,proof,verified,verified_at,operation_id,authority_quorum
+            "SELECT epoch,generation,acquired_at,boot_id,authority_id,authority_key,proof,verified,verified_at,operation_id,authority_quorum,authority_digest
              FROM publisher_takeover_verified WHERE resource=?1 ORDER BY epoch DESC LIMIT 1",
             [resource],
             |r| {
                 let json = |s: String| serde_json::from_str::<Value>(&s).unwrap_or(Value::Null);
                 Ok(Verified { epoch: r.get(0)?, generation: r.get(1)?, acquired_at: r.get(2)?, boot_id: r.get(3)?, authority_id: r.get(4)?,
                               authority_key: r.get(5)?, proof: json(r.get(6)?), verified: json(r.get(7)?), verified_at: r.get(8)?, operation_id: r.get(9)?,
-                              authority_quorum: r.get(10)? })
+                              authority_quorum: r.get(10)?, authority_digest: r.get(11)? })
             },
         )
         .optional()?)
@@ -333,6 +345,8 @@ pub(crate) struct ResumeFacts {
     boot_id: String,
     /// The resource's policy now: its authority, that authority's key, and its quorum.
     authority: Option<(String, String, String)>,
+    /// The policy's digest now, serial included; empty without a key.
+    authority_digest: String,
 }
 
 fn resume_facts(db: &Connection, resource: &str, this_host: &str, boot: &str) -> Result<ResumeFacts, Error> {
@@ -345,6 +359,7 @@ fn resume_facts(db: &Connection, resource: &str, this_host: &str, boot: &str) ->
         now: crate::now() as i64,
         superseded_by,
         boot_id: boot.into(),
+        authority_digest: crate::activation::policy(db, resource)?.and_then(|p| p.authority_digest().ok().flatten()).unwrap_or_default(),
         authority: crate::activation::policy(db, resource)?.map(|p| (p.authority_id, p.authority_key, p.authority_quorum)),
     })
 }
@@ -401,6 +416,12 @@ fn resume_refusal(f: &ResumeFacts) -> Result<&Verified, (&'static str, String)> 
     match &f.authority {
         Some((id, key, quorum)) if *id == r.authority_id && *key == r.authority_key && *quorum == r.authority_quorum => {}
         _ => return Err(("authority_changed", "the resource's policy no longer names the authority, key and quorum the proof was verified under".into())),
+    }
+    // A certificate names its policy's digest, serial included: after any change of the authority set,
+    // even back to the same keys, that very document would be refused. The single key's own document
+    // names no digest, and keeps the comparison above alone.
+    if r.proof["kind"].as_str() == Some(crate::signing::QUORUM_PROOF_KIND) && r.authority_digest != f.authority_digest {
+        return Err(("authority_changed", "the resource's policy has changed since the certificate was verified: its digest is no longer the one the certificate names".into()));
     }
     Ok(r)
 }
@@ -1667,7 +1688,8 @@ mod quorum_proofs {
     /// document the lease was acquired under -- and the answer names who signed; one replica's
     /// certificate, the gate's single-key document, a certificate for another grant at this epoch or
     /// for another boot are each refused; after the quorum is replaced, the resume under the recorded
-    /// certificate is refused (`authority_changed`).
+    /// certificate is refused (`authority_changed`), and still after it is moved back to the same keys,
+    /// since the serial the certificate's digest covers has moved.
     #[test]
     fn under_a_quorum_the_takeover_proof_is_a_certificate() {
         let db = db();
@@ -1699,6 +1721,15 @@ mod quorum_proofs {
         replaced["replaces_policy_digest"] = json!(digest(&db));
         act(&db, "activation_require", replaced).unwrap();
         assert!(matches!(resume_refusal(&resume_facts(&db, R, HOST, &boot).unwrap()), Err(("authority_changed", _))));
+        // Back to the very keys the certificate was verified under: the stored quorum is the same text
+        // again, but two serials later, so the certificate would be refused, and so is the resume.
+        let mut back = json!({"lease_seconds": 3600, "takeover_margin_seconds": 5, "authority_id": "replicas", "authority_quorum": testkit::policy(2, ABC)});
+        back["replaces_policy_digest"] = json!(digest(&db));
+        act(&db, "activation_require", back).unwrap();
+        match resume_refusal(&resume_facts(&db, R, HOST, &boot).unwrap()) {
+            Err(("authority_changed", why)) => assert!(why.contains("digest is no longer the one the certificate names"), "{why}"),
+            other => panic!("{:?}", other.map(|_| "resumes")),
+        }
     }
 
     /// Proves: nothing deployed changes. Under the gate's single key, the document `tools/ha-standby.py`
