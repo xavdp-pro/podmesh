@@ -2,9 +2,15 @@
 """Host-side publisher follow, under a written mandate -- and under nothing else.
 
 The daemon still does not elect an active manager or mint a takeover proof. This tick reads
-publisher_status, starts the connector only with the installed proof when this host is
-eligible at that epoch, and stops it when this host is not eligible. See
-docs/PUBLISHER-FOLLOW-LAB.md.
+publisher_status, starts the connector when this host is eligible at that epoch -- with the installed
+proof when it is for that epoch, or without one, the node then resuming under the proof it already
+verified for the epoch when the lease is the same incarnation (V3-1) -- and stops it when this host is
+not eligible. When the only gate missing is the service address, it asks the node once to resume the
+recorded exclusive route and alias (network_route_resume), which the node refuses unless the lease is
+live, held here, unsuperseded and renewed during this boot. On a running connector it checks what
+eligibility does not: the mark's epoch, the origin ready at the lease's epoch, and the connector's
+registration in its current run; on a mismatch it stops it, and the next tick starts it again under
+the resume rule. It never changes the holder. See docs/PUBLISHER-FOLLOW-LAB.md.
 
 A mandate that renews is BOUNDED, and refused otherwise. An unbounded renewal would push the
 holder's lease forward for ever, and lease expiry is the only thing that withdraws an active
@@ -13,7 +19,8 @@ takes the role at the barrier, which is the two-connector case the contract forb
 `renew=1` requires `not_after` (the wall-clock second the mandate dies) and `renew_below`
 (renew only inside that many seconds of the lease's end, which also keeps the journal from
 growing by one row every tick). After `not_after` the tick grants nothing more and renews
-nothing: what is published runs out its lease and the tick's own stop branch withdraws it.
+nothing: what is published runs out its lease and the tick's own stop branch withdraws it. It
+resumes nothing either, route or connector: after `not_after` the tick only reads and stops.
 """
 import json, os, subprocess, sys, tempfile, time, uuid
 
@@ -92,16 +99,67 @@ def maybe_renew(ref, resource):
         fail(f"activation_renew refused: {renewed.get('error') or renewed}", 1)
 
 
+def request(ref, **fields):
+    return {"operation_id": str(uuid.uuid4()), "authorization_ref": ref, **fields}
+
+
+def read_status(ref, resource):
+    status, code = cli("publisher_status", request(ref, resource=resource))
+    if code or not status.get("ok"):
+        fail(f"publisher_status refused: {status.get('error') or status}", 1)
+    return status.get("data") or {}
+
+
+def only_the_address_missing(data):
+    """Eligible but for the service address: every other gate passes, by name (publisher_status's
+    `gates`), so that a lease lost, a policy gone or a credential missing never leads to a resume."""
+    gates = data.get("gates") or {}
+    return (data.get("publisher_eligible") is not True and gates.get("service_address") is False
+            and all(gates.get(g) is True for g in ("lease", "policy", "credential")))
+
+
+def mismatch(data):
+    """What eligibility does not say about a running connector, from publisher_status alone: the mark
+    names the lease's epoch, the origin answers ready at that epoch with the carrier's replica, and the
+    connector registered in its current run. The reason, or None when all three hold. A node older
+    than these fields reports none of them; nothing is compared then, rather than a healthy connector
+    stopped at every tick until the node is rolled."""
+    if not all(k in data for k in ("active_manager_mark_epoch", "origin_ready_at_lease_epoch", "connector_registered")):
+        return None
+    epoch = data.get("epoch")
+    if data.get("active_manager_mark_epoch") != epoch:
+        return f"the active manager's mark names epoch {data.get('active_manager_mark_epoch')}, the lease is under epoch {epoch}"
+    if data.get("origin_ready_at_lease_epoch") is not True:
+        return f"the origin is not ready at epoch {epoch}: {json.dumps(data.get('origin_readiness'))[:300]}"
+    if data.get("connector_registered") is not True:
+        return "the connector has not registered with Cloudflare in its current run"
+    return None
+
+
+def stop(ref, resource, why):
+    print(f"podmesh-publisher-follow: stopping the connector: {why}", file=sys.stderr)
+    result, code = cli("publisher_stop", request(ref, resource=resource))
+    if code or not result.get("ok"):
+        fail(f"publisher_stop refused: {result.get('error') or result}", 1)
+
+
 def main():
     ref, resource, proof_path, renew, not_after, renew_below = load_mandate(MANDATE)
     now = int(time.time())
     expired = now >= not_after
-    status, code = cli("publisher_status", {"resource": resource, "operation_id": str(uuid.uuid4()), "authorization_ref": ref})
-    if code or not status.get("ok"):
-        fail(f"publisher_status refused: {status.get('error') or status}", 1)
-    data = status.get("data") or {}
+    data = read_status(ref, resource)
     if not data.get("declared"):
         sys.exit(0)
+    # The service address lost with its carrier (a replica stopped and started, a roll at the same
+    # address): the node is asked once to put the recorded route and alias back, and decides; a
+    # refusal (nothing runs at the address yet, a lease not renewed this boot) is reported and the tick
+    # goes on with what it read. Never after the mandate's end.
+    if only_the_address_missing(data) and not expired:
+        resumed, rc = cli("network_route_resume", request(ref, exclusive_resource=resource))
+        if rc or not resumed.get("ok"):
+            print(f"podmesh-publisher-follow: network_route_resume refused: {resumed.get('error') or resumed}", file=sys.stderr)
+        else:
+            data = read_status(ref, resource)
     unit_state = ((data.get("unit") or {}).get("state") or "")
     active = unit_state in ("active", "activating")
     eligible = data.get("publisher_eligible") is True
@@ -112,32 +170,32 @@ def main():
         expires_at = ((data.get("lease") or {}).get("expires_at")) or 0
         if expires_at - now <= renew_below:
             maybe_renew(ref, resource)
-    if eligible and active:
-        sys.exit(0)
     if not eligible:
         if active or data.get("transition"):
-            stop, sc = cli("publisher_stop", {"resource": resource, "operation_id": str(uuid.uuid4()), "authorization_ref": ref})
-            if sc or not stop.get("ok"):
-                fail(f"publisher_stop refused: {stop.get('error') or stop}", 1)
+            stop(ref, resource, "this host is not eligible: " + "; ".join(data.get("reasons") or []))
+        sys.exit(0)
+    if active:
+        why = mismatch(data)
+        if why:
+            stop(ref, resource, why)
         sys.exit(0)
     if expired:
         fail(f"the mandate died at {not_after}; nothing is started under it (what is published runs out its lease)", 0)
-    if not os.path.isfile(proof_path):
-        fail(f"eligible but no proof at {proof_path}; the agent must install the gate's document", 0)
-    proof = json.loads(open(proof_path, encoding="utf-8").read())
+    # The installed proof when it is for the lease's epoch; otherwise none, and the node resumes under
+    # the proof it already verified for this epoch, or refuses and says why.
     epoch = data.get("epoch")
-    if proof.get("new_epoch") != epoch:
-        fail(f"installed proof is for epoch {proof.get('new_epoch')}, lease epoch is {epoch}; waiting for a current proof", 0)
-    start, sc = cli(
-        "publisher_start",
-        {
-            "resource": resource,
-            "operation_id": str(uuid.uuid4()),
-            "authorization_ref": ref,
-            "takeover_proof": proof,
-            "previous": {"source": "publisher-follow"},
-        },
-    )
+    proof = None
+    if os.path.isfile(proof_path):
+        installed = json.loads(open(proof_path, encoding="utf-8").read())
+        if installed.get("new_epoch") == epoch:
+            proof = installed
+        else:
+            print(f"podmesh-publisher-follow: installed proof is for epoch {installed.get('new_epoch')}, lease epoch is {epoch}; "
+                  "starting without it, under the same-epoch resume", file=sys.stderr)
+    fields = {"resource": resource, "previous": {"source": "publisher-follow"}}
+    if proof is not None:
+        fields["takeover_proof"] = proof
+    start, sc = cli("publisher_start", request(ref, **fields))
     if sc or not start.get("ok"):
         err = start.get("error") or ""
         if "already recorded or active" in err:
