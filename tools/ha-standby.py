@@ -22,6 +22,11 @@ PODMESH_HA_KEYS (directory for the authority's Ed25519 signing key, one file per
 0600, generated at first use; default <ledger>/keys), PODMESH_HA_UNSIGNED=1 (laboratory
 proofs, unsigned, for a policy that names no key).
 
+Deploy note (third review of V3-1): this tool carries a rotation's barrier into same-holder and
+fence-receipt proofs, and only a PodMesh node built after 2026-09-18 holds every method until its
+`eligible_after`; an older node holds a lease barrier only. Deploy the nodes before the first use of
+this version of the tool.
+
 The takeover proof is signed: every policy this tool declares names the authority's public key,
 and every proof it prints (rotate, attest-fence) carries the signature over the proof's canonical
 form (keys sorted, compact JSON); the host verifies the signature before the binding.
@@ -44,10 +49,13 @@ Subcommands:
                                  follow mandate recorded in the ledger (or stated by --follow-mandate-not-after).
                                  Every rotation carries the current epoch's barrier forward, and is refused
                                  (no_proof_for_current_epoch) when the ledger lacks that epoch's proof, unless
-                                 --barrier-not-before states it
+                                 --barrier-not-before states it (a unix time > 0, recorded as stated). The ledger's
+                                 lock is held for the whole rotation, SSH calls included: a replication run, a
+                                 takeover, a cycle, an activation or a mandate record waits for it
   activate      --universe U --host SSH [--lease S --margin S --standbys N]
                                  declare the policy on the host under the gate's authority, rotate the
-                                 epoch to it, acquire; starting is the operator's (the API's `start`)
+                                 epoch to it, acquire; starting is the operator's (the API's `start`);
+                                 from the gate's epoch 0 only (activate_after_rotation otherwise)
   cycle         --universe U --active SSH --standby SSH [--also SSH]... [--keep N --keep-points N --minimum-age S]
                 [--capture stopped|live]
                                  one capture: declare the collector's retention on the active host,
@@ -152,8 +160,9 @@ def record_follow_mandate(universe, host_identity, role, not_after, renew_below,
     Recorded before it is installed (`confirmed` false) and again once the host's copy is read back
     (`confirmed` true). Until then the record keeps the larger of the previous and the new `not_after`: an
     installation that fails after the record must not leave the ledger saying less than what the host may
-    still hold -- a rotation that cannot reach the host computes its barrier from this."""
-    with locked(universe):
+    still hold -- a rotation that cannot reach the host computes its barrier from this. It waits up to ten
+    minutes for the lock: a rotation holds it across its SSH calls, and a few of them may hang."""
+    with locked(universe, wait_seconds=600):
         ledger = load_ledger(universe)
         mandates = ledger.setdefault('follow_mandates', {})
         before = mandates.get(host_identity)
@@ -163,6 +172,33 @@ def record_follow_mandate(universe, host_identity, role, not_after, renew_below,
                                    'installed': bool(confirmed), **({} if confirmed else {'installing_not_after': not_after})}
         save_ledger(universe, ledger)
         return mandates[host_identity]
+
+
+def record_recovery(universe, epoch, lease_seconds, margin_seconds, reference):
+    """The gate moved forward with no holder (`gate-recovery`: a host had seen a higher epoch than the gate,
+    tools/arm-publisher-follow.py), recorded as the proof of that epoch, under the ledger's lock, so that the
+    next rotation has a barrier to carry instead of refusing `no_proof_for_current_epoch` (third review of
+    V3-1). Its barrier: now plus the longest lease and margin anyone may hold -- whoever held the epochs the
+    gate skipped may renew until then -- and never earlier than what the latest recorded proof carried. It
+    is not a takeover document: no host is named, nothing is signed, and no node would accept it."""
+    with locked(universe, wait_seconds=600):
+        ledger = load_ledger(universe)
+        policy = ledger.get('policy') or {}
+        lease = max(int(lease_seconds), int(policy.get('lease_seconds') or 0))
+        margin = max(int(margin_seconds), int(policy.get('takeover_margin_seconds') or 0))
+        proofs = ledger.setdefault('proofs', {})
+        earlier = [int(k) for k in proofs if str(k).isdigit() and int(k) < epoch]
+        carried = carried_barrier(proofs[str(max(earlier))]) if earlier else 0
+        now = int(time.time())
+        eligible = max(now + lease + margin, carried)
+        proof = {'method': 'gate_recovery', 'new_epoch': epoch, 'new_holder': None, 'eligible_after': eligible,
+                 'carried_eligible_after': carried or None, 'issued_at': now, 'expires_at': eligible + 3600,
+                 'barrier_basis': 'the gate recovered past epochs no proof records: the longest lease and margin anyone may hold, from now',
+                 'note': 'the ledger\'s record of a gate recovery, not a takeover document: it names no holder and is never delivered'}
+        proofs[str(epoch)] = proof
+        ledger.setdefault('rotations', []).append({'epoch': epoch, 'to': 'gate-recovery', 'at': now, 'by': 'gate-recovery', 'reference': reference})
+        save_ledger(universe, ledger)
+        return proof
 
 
 def save_current_proof(universe, proof):
@@ -291,15 +327,27 @@ def cmd_gate(args):
 
 
 def cmd_activate(args):
+    with locked(args.universe):
+        activate(args)
+
+
+def activate(args):
+    """The first activation of a universe, from the gate's epoch 0 only (third review of V3-1): an activation
+    after a rotation made a fresh epoch with no proof and no barrier, and the next rotation, exempted as
+    following an activation, forgot the barrier a holder never told still needed. Refused before anything
+    moves (`activate_after_rotation`); moving a role that has an epoch is `rotate`'s."""
     gate = gate_or_refuse()
-    (host,) = hosts(args, ('host', args.host))
     u = args.universe
+    current = gate.inspect(u)
+    if current['epoch'] != 0:
+        raise Refusal(f'activate_after_rotation: the gate is at epoch {current["epoch"]} for {u}; activate starts from epoch 0 only, '
+                      'and moving an epoch that exists is rotate\'s, which carries its barrier')
+    (host,) = hosts(args, ('host', args.host))
     status = ok(host, request('activation_status', u, args.reference), 'status')
     if status['requires_lease'] and status.get('authority_id') not in (None, gate.authority_id):
         raise Refusal(f'the universe is under another authority on {host.role}: {status.get("authority_id")}')
     ok(host, request('activation_require', u, args.reference, lease_seconds=args.lease, takeover_margin_seconds=args.margin,
                      desired_standbys=args.standbys, authority_id=gate.authority_id, **key_fields(gate)), 'activation_require')
-    current = gate.inspect(u)
     permit = permit_for(gate, u, host, current['epoch'])
     lease = ok(host, request('activation_acquire', u, args.reference, permit=permit), 'activation_acquire')
     ledger = load_ledger(u)
@@ -307,7 +355,7 @@ def cmd_activate(args):
     # is computed from THIS lease and margin, never from a later invocation's defaults.
     ledger['policy'] = {'lease_seconds': args.lease, 'takeover_margin_seconds': args.margin, 'desired_standbys': args.standbys,
                         'authority_id': gate.authority_id, 'declared_on': host.identity, 'declared_at': int(time.time())}
-    ledger['rotations'].append({'epoch': permit['epoch'], 'to': host.identity, 'at': int(time.time()), 'by': 'activate'})
+    ledger['rotations'].append({'epoch': permit['epoch'], 'to': host.identity, 'at': int(time.time()), 'by': 'activate', 'from_epoch': current['epoch']})
     save_ledger(u, ledger)
     out({'universe': u, 'host': host.identity, 'epoch': permit['epoch'], 'lease': {k: lease[k] for k in ('generation', 'expires_at', 'live')},
          'started': False, 'note': 'starting is the operator\'s: the API\'s start goes through the gate'})
@@ -371,9 +419,13 @@ def deliver_supersession(previous, universe, permit, reference):
     try:
         stopped = previous.api(dict(visit, operation='publisher_stop'))
         seen = previous.api(dict(visit, operation='publisher_status', operation_id=str(uuid.uuid4())))
-        unit = ((seen.get('data') or {}).get('unit') or {}).get('state')
+        data = seen.get('data') or {}
+        unit = (data.get('unit') or {}).get('state')
+        # Stopped when its unit is seen neither active nor activating, or absent: no publisher declared
+        # there at all. Anything else -- the status refused, the unit not reported -- is not known stopped.
+        absent = seen.get('ok') is True and data.get('declared') is False
         result['previous_connector'] = {'stop': 'done' if stopped.get('ok') else f'refused: {stopped.get("error")}', 'unit_after': unit,
-                                        'stopped': unit not in ('active', 'activating') if unit is not None else None}
+                                        'stopped': True if absent else (unit not in ('active', 'activating') if unit is not None else None)}
     except Exception as e:  # noqa: BLE001
         result['previous_connector'] = {'stop': f'could not be asked: {e}', 'stopped': None}
     return result
@@ -422,13 +474,18 @@ def cmd_rotate(args):
         first = current['epoch'] == 0 or previous_holder is None
         handover = not first and previous_holder != host.identity
         recorded = (ledger.get('proofs') or {}).get(str(current['epoch']))
-        activated = any(r.get('epoch') == current['epoch'] and r.get('by') == 'activate' for r in ledger.get('rotations') or [])
+        # Exempt only an activation made from epoch 0 (recorded so, or, before the field existed, one that made epoch 1).
+        activated = any(r.get('epoch') == current['epoch'] and r.get('by') == 'activate'
+                        and (r.get('from_epoch') == 0 or ('from_epoch' not in r and r.get('epoch') == 1)) for r in ledger.get('rotations') or [])
         if not first and recorded is None and not activated and args.barrier_not_before is None:
             raise Refusal(f'no_proof_for_current_epoch: this ledger holds no takeover proof for the gate\'s epoch {current["epoch"]} (a rotation made '
                           'elsewhere, or one interrupted before this record existed), so the barrier it set cannot be carried forward; state it '
                           'with --barrier-not-before <unix time> -- that proof\'s eligible_after, or the latest second any earlier holder may still '
                           'renew by itself plus its lease and margin')
-        carried = max(carried_barrier(recorded), args.barrier_not_before or 0)
+        stated = args.barrier_not_before
+        if stated is not None and stated <= 0:
+            raise Refusal('barrier_not_before_invalid: --barrier-not-before must be a unix time greater than 0; 0 or a negative value states no barrier')
+        carried = carried_barrier(recorded)
         # Everything that can refuse is decided before the gate moves: the previous holder named and
         # reached is the one the gate knows, and the follow mandate that host may renew under is known.
         previous, bound = None, None
@@ -447,20 +504,31 @@ def cmd_rotate(args):
         rotation = {'epoch': permit['epoch'], 'to': host.identity, 'at': int(time.time()), 'by': 'rotate', 'state': 'gate_moved'}
         ledger['policy'] = dict(policy, authority_id=gate.authority_id, declared_on=host.identity, declared_at=int(time.time()))
         ledger['rotations'].append(rotation)
-        proof = takeover_proof(gate, u, current, host.identity, permit['epoch'], barrier, renewable_until=bound, carried=carried)
+        if stated is not None:
+            rotation['stated_barrier'] = stated
+        proof = takeover_proof(gate, u, current, host.identity, permit['epoch'], barrier, renewable_until=bound, carried=carried, stated=stated)
         ledger.setdefault('proofs', {})[str(permit['epoch'])] = proof
         save_ledger(u, ledger)
         supersession = deliver_supersession(previous, u, permit, args.reference) if handover else None
         rotation['supersession'] = supersession
         save_ledger(u, ledger)
         lease = ok(host, request('activation_acquire', u, args.reference, permit=permit), 'activation_acquire')
-        covered = bound if handover and not supersession['delivered'] else None
-        if handover and supersession['delivered']:
-            proof = takeover_proof(gate, u, current, host.identity, permit['epoch'], barrier, renewable_until=None, carried=carried)
+        # The pushed barrier is dropped only when the previous holder is told AND its connector is seen
+        # stopped (or absent): a supersession whose stop was refused or not observed leaves a connector
+        # that may still publish, and the barrier stays pushed (third review of V3-1).
+        released = bool(handover and supersession['delivered'] and (supersession.get('previous_connector') or {}).get('stopped') is True)
+        covered = bound if handover and not released else None
+        if released:
+            proof = takeover_proof(gate, u, current, host.identity, permit['epoch'], barrier, renewable_until=None, carried=carried, stated=stated)
             ledger['proofs'][str(permit['epoch'])] = proof
         rotation.update(state='complete', barrier_covers_follow_mandate=covered, carried_eligible_after=carried or None)
         save_ledger(u, ledger)
         proof_path = save_current_proof(u, proof)
+        warnings = []
+        floor = int(time.time()) + barrier['lease_seconds'] + barrier['takeover_margin_seconds']
+        if stated is not None and stated < floor:
+            warnings.append(f'the stated barrier {stated} is earlier than now plus the lease and the margin ({floor}): '
+                            'a previous holder whose lease was renewed just before this rotation may still hold it then')
     out({'resource': u, 'host': host.identity, 'epoch': permit['epoch'], 'permit': permit, 'takeover_proof': proof,
          'current_proof_path': proof_path,
          'lease': {k: lease[k] for k in ('generation', 'expires_at', 'live')},
@@ -468,12 +536,14 @@ def cmd_rotate(args):
          'supersession': supersession,
          'barrier_covers_follow_mandate': {'not_after': covered[0], 'source': covered[1]} if covered else None,
          'carried_eligible_after': carried or None,
+         'stated_barrier': stated,
+         'warnings': warnings,
          'note': 'the role moved; no universe was promoted or started, and the other hosts learn the epoch only when the permit is delivered to them '
                  '(the previous holder already has it when supersession.delivered); '
                  'the takeover proof is what an exclusive publication needs, upgraded by attest-fence once the previous holder is fenced'})
 
 
-def takeover_proof(gate, universe, before, new_holder, new_epoch, policy, renewable_until=None, carried=0):
+def takeover_proof(gate, universe, before, new_holder, new_epoch, policy, renewable_until=None, carried=0, stated=None):
     """The authority's account of the transition, bound to the resource, both epochs and both
     holders (Codex, P0). Its method says what makes the new holder eligible: `first` when no
     epoch existed, `same_holder` when this host held the previous one, else `lease_barrier` --
@@ -507,12 +577,20 @@ def takeover_proof(gate, universe, before, new_holder, new_epoch, policy, renewa
     if carried > eligible:
         eligible = carried
         basis = f'the barrier carried from epoch {previous_epoch}, which a holder barred then may still renew and resume until'
+    if stated is not None and stated > eligible:
+        eligible = stated
+        basis = f'the barrier stated by the operator (--barrier-not-before {stated}), the ledger holding no proof to carry'
     proof = {'kind': 'podmesh-takeover-proof/lab-unsigned', 'authority_id': gate.authority_id, 'resource': universe,
              'previous_epoch': previous_epoch, 'new_epoch': new_epoch, 'previous_holder': previous_holder, 'new_holder': new_holder,
              'method': method, 'eligible_after': eligible, 'issued_at': now, 'expires_at': max(now, eligible) + 3600,
              'note': 'laboratory proof, unsigned: binding checked by the host, origin not verified'}
-    if carried:
-        proof['carried_eligible_after'] = carried
+    # What a fence receipt keeps: the fence covers the previous holder only, never an earlier one nor what
+    # the operator stated for a ledger that had lost its proof.
+    carry = max(carried, stated or 0)
+    if carry:
+        proof['carried_eligible_after'] = carry
+    if stated is not None:
+        proof['stated_barrier'] = stated
     if basis:
         proof['barrier_basis'] = basis
     key = signing_key(gate.authority_id)
@@ -545,6 +623,15 @@ def attest_fence(gate, u, args):
     # resource must have taken, and one it had nothing to withdraw for still binds: the host is fenced.
     if u not in (answer.get('unentitled') or []):
         raise Refusal('the fence answer does not name this resource among those the host is not entitled to')
+    # Bound to THIS transition (third review of V3-1): the fence must have found the host overtaken by an
+    # epoch at least the current one -- in `fenced` (a universe it stopped) or `unentitled_detail` (every
+    # resource it found unentitled). A receipt of an earlier fence, or of a lease that merely lapsed, says
+    # nothing about this rotation and is refused (`stale_fence_receipt`); deliver the supersession, fence again.
+    overtaken = [e.get('superseded_by_epoch') for e in (answer.get('fenced') or []) + (answer.get('unentitled_detail') or [])
+                 if isinstance(e, dict) and (e.get('universe_uuid') == u or e.get('resource') == u)]
+    if not any(isinstance(x, int) and x >= current['epoch'] for x in overtaken):
+        raise Refusal(f'stale_fence_receipt: the fence answer does not show {host} overtaken by epoch {current["epoch"]} or later for this resource '
+                      f'(found {overtaken or "nothing"}); deliver the supersession to it and fence again')
     attempted = [r for r in (answer.get('publishers_withdrawn') or []) if r.get('resource') == u] + \
         [r for r in (answer.get('routes_withdrawn') or []) if r.get('exclusive_resource') == u]
     if any(r.get('withdrawn') is not True for r in attempted):
@@ -562,6 +649,11 @@ def attest_fence(gate, u, args):
 
 
 def cmd_cycle(args):
+    with locked(args.universe):
+        cycle(args)
+
+
+def cycle(args):
     targets = [args.standby] + list(args.also or [])
     all_hosts = hosts(args, ('active', args.active), *[(f'standby-{i+1}', s) for i, s in enumerate(targets)])
     A, standbys = all_hosts[0], all_hosts[1:]
@@ -677,6 +769,11 @@ def cycle_live(args, A, standbys, ledger):
 
 
 def cmd_takeover(args):
+    with locked(args.universe):
+        takeover(args)
+
+
+def takeover(args):
     gate = gate_or_refuse()
     (B,) = hosts(args, ('standby', args.standby))
     u = args.universe

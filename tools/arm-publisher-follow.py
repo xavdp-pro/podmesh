@@ -51,6 +51,14 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 G = 'lab-a'
 
 
+# A barrier the operator states for the rotations this tool asks for, when the ledger lost the proof it
+# would carry: `--barrier-not-before <unix time>` or PODMESH_FOLLOW_BARRIER_NOT_BEFORE, forwarded to
+# `ha-standby.py rotate --barrier-not-before`, which records it as stated.
+STATED_BARRIER = (sys.argv[sys.argv.index('--barrier-not-before') + 1] if '--barrier-not-before' in sys.argv[:-1]
+                  else os.environ.get('PODMESH_FOLLOW_BARRIER_NOT_BEFORE'))
+ROTATE_EXTRA = ['--barrier-not-before', STATED_BARRIER] if STATED_BARRIER else []
+
+
 def tool(*argv, expect=0):
     p = subprocess.run([sys.executable, '-B', TOOL, '--reference', REFERENCE, *argv], env=env, capture_output=True, text=True)
     assert p.returncode == expect, (argv, p.returncode, p.stdout[-800:], p.stderr[-800:])
@@ -91,10 +99,16 @@ def gate_ready():
     for h in hosts.values():
         s = h.api(request('activation_status', LOGICAL, REFERENCE))
         seen = max(seen, (s.get('data') or {}).get('highest_epoch_seen') or 0)
+    recovered = False
     while gate.inspect(LOGICAL)['epoch'] < seen:
         gate.transfer(LOGICAL, gate.inspect(LOGICAL)['epoch'], 'gate-recovery', 'gate-recovery')
+        recovered = True
     state = {'authority_id': gate.authority_id, 'epoch': gate.inspect(LOGICAL)['epoch']}
     gate.close()
+    # The recovered epoch has no takeover proof; the ledger records one, with its barrier, so that the
+    # rotation that follows carries it rather than refusing (no_proof_for_current_epoch).
+    if recovered:
+        state['recovery'] = ha_tool().record_recovery(LOGICAL, state['epoch'], LEASE, MARGIN, REFERENCE)
     return state
 
 
@@ -174,7 +188,7 @@ def install_follow(h, cli, proof):
 def refresh_only():
     global gate_state
     gate_state = gate_ready()
-    rot = tool('rotate', '--universe', LOGICAL, '--host', targets[G], '--lease', str(LEASE), '--margin', str(MARGIN), '--standbys', '2')
+    rot = tool('rotate', '--universe', LOGICAL, '--host', targets[G], '--lease', str(LEASE), '--margin', str(MARGIN), '--standbys', '2', *ROTATE_EXTRA)
     for other in ('lab-b', 'lab-c'):
         hosts[other].ok(request('activation_require', LOGICAL, REFERENCE, lease_seconds=LEASE, takeover_margin_seconds=MARGIN, desired_standbys=2, authority_id=rot['permit']['authority_id'], **key_fields()))
     proof, how = prove_takeover(rot, hosts, tool, request, REFERENCE, LOGICAL)
@@ -254,7 +268,7 @@ for a, h in hosts.items():
     started = h.ok(request('start', universes[a], REFERENCE, observe_seconds=3))
     assert started['application_outcome'] == 'running_when_observed', (a, started['application_outcome'])
 
-rot = tool('rotate', '--universe', LOGICAL, '--host', targets[G], '--lease', str(LEASE), '--margin', str(MARGIN))
+rot = tool('rotate', '--universe', LOGICAL, '--host', targets[G], '--lease', str(LEASE), '--margin', str(MARGIN), *ROTATE_EXTRA)
 for other in ('lab-b', 'lab-c'):
     hosts[other].ok(request('activation_require', LOGICAL, REFERENCE, lease_seconds=LEASE, takeover_margin_seconds=MARGIN, desired_standbys=2, authority_id=rot['permit']['authority_id'], **key_fields()))
 proof, how = prove_takeover(rot, hosts, tool, request, REFERENCE, LOGICAL)

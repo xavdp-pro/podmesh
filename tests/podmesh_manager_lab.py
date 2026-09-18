@@ -59,11 +59,20 @@ def prove_takeover(rot, hosts, tool, request, reference, resource):
     """The takeover proof an exclusive publication needs, from the tool's rotation: as issued when
     no holder or the same holder came before; upgraded with the previous holder's fence when that
     host is in the set (its supersession delivered, its fence run, the receipt attested); else
-    waited for, up to the authority's barrier, on this clock. Returns the proof and what was done."""
+    waited for, up to the authority's barrier, on this clock. Whatever the method, the proof is returned
+    only once its `eligible_after` is reached on this clock: a rotation carries the barrier of the epoch
+    before it into same-holder and fence-receipt documents too, and a node older than 2026-09-18 holds
+    only a lease barrier to it (third review of V3-1). Returns the proof and what was done."""
     import json, os, subprocess, tempfile, time, uuid
+
+    def at_barrier(proof, how):
+        waited = max(0, int(proof.get('eligible_after') or 0) - int(time.time()))
+        while time.time() < (proof.get('eligible_after') or 0):
+            time.sleep(1)
+        return proof, how + (f', then waited its barrier {waited} s' if waited else '')
     proof = rot['takeover_proof']
     if proof['method'] in ('first', 'same_holder'):
-        return proof, proof['method']
+        return at_barrier(proof, proof['method'])
     previous = proof.get('previous_holder')
     holder = next((h for h in hosts.values() if h.identity == previous), None)
     if holder is not None:
@@ -74,7 +83,5 @@ def prove_takeover(rot, hosts, tool, request, reference, resource):
             json.dump({'host': holder.identity, 'operation_id': opid, 'fence': fence}, f)
         attested = tool('attest-fence', '--universe', resource, '--receipt', f.name)
         os.unlink(f.name)
-        return attested['takeover_proof'], f'fenced {holder.role}'
-    while time.time() < proof['eligible_after']:
-        time.sleep(1)
-    return proof, 'waited the barrier'
+        return at_barrier(attested['takeover_proof'], f'fenced {holder.role}')
+    return at_barrier(proof, 'waited the barrier')
