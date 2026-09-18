@@ -22,11 +22,20 @@ growing by one row every tick). After `not_after` the tick grants nothing more a
 nothing: what is published runs out its lease and the tick's own stop branch withdraws it. It
 resumes nothing either, route or connector: after `not_after` the tick only reads and stops.
 """
-import json, os, subprocess, sys, tempfile, time, uuid
+import hashlib, json, os, subprocess, sys, tempfile, time, uuid
 
 MANDATE = os.environ.get("PODMESH_PUBLISHER_FOLLOW_MANDATE", "/etc/podmesh/publisher-follow-mandate")
 CLI = os.environ.get("PODMESH_CLI", "/usr/bin/podmesh")
 SOCKET = os.environ.get("PODMESH_SOCKET", "/run/podmesh/api.sock")
+# What one tick leaves the next, under /run: gone with the boot, as the mandate and the proof are.
+STATE = os.environ.get("PODMESH_PUBLISHER_FOLLOW_STATE", "/run/podmesh-publisher-follow/tick-state.json")
+# A running connector is stopped at once on a positive mismatch, and on a reading that could not be
+# made only when it could not be made this many ticks in a row: one podman exec that fails, one
+# manager_status that times out, must not take a healthy page down (review of V3-1).
+UNKNOWN_TICKS = 3
+# After a failed start, the next one waits, doubling from this up to the ceiling: a start that cannot
+# register holds the one-request-at-a-time daemon for up to 60 seconds.
+BACKOFF_FIRST, BACKOFF_CEILING = 20, 300
 
 
 def fail(msg, code=3):
@@ -118,21 +127,52 @@ def only_the_address_missing(data):
             and all(gates.get(g) is True for g in ("lease", "policy", "credential")))
 
 
-def mismatch(data):
+def load_state():
+    try:
+        with open(STATE, encoding="utf-8") as f:
+            state = json.load(f)
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    try:
+        os.makedirs(os.path.dirname(STATE), mode=0o700, exist_ok=True)
+        tmp = STATE + ".partial"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE)
+    except OSError as e:
+        print(f"podmesh-publisher-follow: the tick's state could not be kept at {STATE}: {e}", file=sys.stderr)
+
+
+def check_running(data):
     """What eligibility does not say about a running connector, from publisher_status alone: the mark
     names the lease's epoch, the origin answers ready at that epoch with the carrier's replica, and the
-    connector registered in its current run. The reason, or None when all three hold. A node older
+    connector registered in its current run. ("mismatch", why) on a positive mismatch -- a mark absent
+    or at another epoch, an origin that answered otherwise; ("unknown", why) when a reading could not be
+    made, or the current run's journal shows no registration; None when all three hold. A node older
     than these fields reports none of them; nothing is compared then, rather than a healthy connector
     stopped at every tick until the node is rolled."""
-    if not all(k in data for k in ("active_manager_mark_epoch", "origin_ready_at_lease_epoch", "connector_registered")):
+    if not all(k in data for k in ("active_manager_mark_read", "origin_ready_at_lease_epoch", "connector_registered")):
         return None
     epoch = data.get("epoch")
-    if data.get("active_manager_mark_epoch") != epoch:
-        return f"the active manager's mark names epoch {data.get('active_manager_mark_epoch')}, the lease is under epoch {epoch}"
-    if data.get("origin_ready_at_lease_epoch") is not True:
-        return f"the origin is not ready at epoch {epoch}: {json.dumps(data.get('origin_readiness'))[:300]}"
+    mark = data.get("active_manager_mark_read")
+    if mark == "absent":
+        return "mismatch", "no active manager's mark in the carrier"
+    if mark == "present" and data.get("active_manager_mark_epoch") != epoch:
+        return "mismatch", f"the active manager's mark names epoch {data.get('active_manager_mark_epoch')}, the lease is under epoch {epoch}"
+    if data.get("origin_ready_at_lease_epoch") is False:
+        return "mismatch", f"the origin is not ready at epoch {epoch}: {json.dumps(data.get('origin_readiness'))[:300]}"
+    if mark != "present":
+        return "unknown", f"the mark could not be read: {data.get('active_manager_mark_error')}"
+    if data.get("origin_ready_at_lease_epoch") is None:
+        return "unknown", f"the origin's readiness could not be told: {json.dumps(data.get('origin_readiness'))[:300]}"
+    if data.get("connector_registered") is None:
+        return "unknown", f"the current run's journal could not be read: {data.get('connector_registration_error')}"
     if data.get("connector_registered") is not True:
-        return "the connector has not registered with Cloudflare in its current run"
+        return "unknown", "the connector's current run shows no registration with Cloudflare in its journal"
     return None
 
 
@@ -141,6 +181,32 @@ def stop(ref, resource, why):
     result, code = cli("publisher_stop", request(ref, resource=resource))
     if code or not result.get("ok"):
         fail(f"publisher_stop refused: {result.get('error') or result}", 1)
+
+
+def installed_proof(proof_path, epoch, state):
+    """The installed proof when it is a document for the lease's epoch, else None: the node then
+    resumes under the proof it already verified, or refuses. A file that cannot be read or is not a
+    document (a partial copy, say) is reported once per content, never a crash."""
+    if not os.path.isfile(proof_path):
+        return None
+    raw = b""
+    try:
+        raw = open(proof_path, "rb").read()
+        proof = json.loads(raw.decode("utf-8"))
+        if not isinstance(proof, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError) as e:
+        digest = hashlib.sha256(raw).hexdigest()
+        if state.get("proof_warned") != digest:
+            print(f"podmesh-publisher-follow: the installed proof at {proof_path} cannot be used ({e}); starting without it", file=sys.stderr)
+            state["proof_warned"] = digest
+        return None
+    state.pop("proof_warned", None)
+    if proof.get("new_epoch") != epoch:
+        print(f"podmesh-publisher-follow: installed proof is for epoch {proof.get('new_epoch')}, lease epoch is {epoch}; "
+              "starting without it, under the same-epoch resume", file=sys.stderr)
+        return None
+    return proof
 
 
 def main():
@@ -163,6 +229,8 @@ def main():
     unit_state = ((data.get("unit") or {}).get("state") or "")
     active = unit_state in ("active", "activating")
     eligible = data.get("publisher_eligible") is True
+    epoch = data.get("epoch")
+    state = load_state()
     # Renew only inside the window the mandate names, and never once the mandate has died: the
     # lease must be able to lapse, both at the end of the demonstration and on a host nobody can
     # reach.
@@ -171,36 +239,59 @@ def main():
         if expires_at - now <= renew_below:
             maybe_renew(ref, resource)
     if not eligible:
+        state.pop("unknown_ticks", None)
+        save_state(state)
         if active or data.get("transition"):
             stop(ref, resource, "this host is not eligible: " + "; ".join(data.get("reasons") or []))
         sys.exit(0)
     if active:
-        why = mismatch(data)
-        if why:
-            stop(ref, resource, why)
-        sys.exit(0)
-    if expired:
-        fail(f"the mandate died at {not_after}; nothing is started under it (what is published runs out its lease)", 0)
-    # The installed proof when it is for the lease's epoch; otherwise none, and the node resumes under
-    # the proof it already verified for this epoch, or refuses and says why.
-    epoch = data.get("epoch")
-    proof = None
-    if os.path.isfile(proof_path):
-        installed = json.loads(open(proof_path, encoding="utf-8").read())
-        if installed.get("new_epoch") == epoch:
-            proof = installed
+        verdict = check_running(data)
+        if verdict is None:
+            state.pop("unknown_ticks", None)
+        elif verdict[0] == "mismatch":
+            state.pop("unknown_ticks", None)
+            save_state(state)
+            stop(ref, resource, verdict[1])
         else:
-            print(f"podmesh-publisher-follow: installed proof is for epoch {installed.get('new_epoch')}, lease epoch is {epoch}; "
-                  "starting without it, under the same-epoch resume", file=sys.stderr)
+            state["unknown_ticks"] = state.get("unknown_ticks", 0) + 1
+            if state["unknown_ticks"] >= UNKNOWN_TICKS:
+                state.pop("unknown_ticks", None)
+                save_state(state)
+                stop(ref, resource, f"{verdict[1]} ({UNKNOWN_TICKS} ticks in a row)")
+            else:
+                print(f"podmesh-publisher-follow: {verdict[1]} (tick {state['unknown_ticks']} of {UNKNOWN_TICKS} before a stop)", file=sys.stderr)
+        save_state(state)
+        sys.exit(0)
+    state.pop("unknown_ticks", None)
+    if expired:
+        save_state(state)
+        fail(f"the mandate died at {not_after}; nothing is started under it (what is published runs out its lease)", 0)
+    # A failed start holds the daemon for up to a minute: the next one waits, doubling, and a new
+    # epoch starts the count again.
+    if state.get("start_epoch") != epoch:
+        for k in ("start_failures", "next_start_at"):
+            state.pop(k, None)
+    if now < state.get("next_start_at", 0):
+        save_state(state)
+        fail(f"a start failed {state.get('start_failures')} time(s); the next is not before {state['next_start_at']}", 0)
     fields = {"resource": resource, "previous": {"source": "publisher-follow"}}
+    proof = installed_proof(proof_path, epoch, state)
     if proof is not None:
         fields["takeover_proof"] = proof
     start, sc = cli("publisher_start", request(ref, **fields))
     if sc or not start.get("ok"):
         err = start.get("error") or ""
         if "already recorded or active" in err:
+            save_state(state)
             sys.exit(0)
+        failures = state.get("start_failures", 0) + 1
+        state.update(start_failures=failures, start_epoch=epoch,
+                     next_start_at=now + min(BACKOFF_CEILING, BACKOFF_FIRST * 2 ** (failures - 1)))
+        save_state(state)
         fail(f"publisher_start refused: {err or start}", 1)
+    for k in ("start_failures", "next_start_at", "start_epoch"):
+        state.pop(k, None)
+    save_state(state)
     sys.exit(0)
 
 
