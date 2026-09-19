@@ -470,22 +470,35 @@ host UUIDs), `evidence_dir` (absolute), `operator_uid` and `max_certificate_life
 **The restore checklist.** The tripwire sees only the key's votes that reached this replica's
 store; a restored ledger shown none of its later votes signs again what it forgot (the
 `host_restore_silent` cell of the quorum model, 323 runs in 2,000). The mark is therefore the
-precondition of every restore, not a courtesy. After any revert of a host VM's snapshot, any
-restore of a host from a backup, or any restore of the vote directory:
+precondition of every restore, not a courtesy. A conservative kernel-boot guard now runs before a
+voting resident exchanges with peers and again before every ledger operation. It keeps a private,
+durable `<key_id>.boot-id` beside the ledger. If that witness is absent or differs from the current
+kernel boot ID, it durably marks an admitted ledger unadmitted **before** advancing the witness. A
+failed read or write prevents voting. This covers file-based VM backup restores that start a fresh
+kernel, even when the restored store contains no later vote to trip the ordinary check. It also
+marks on an ordinary reboot: the local files cannot prove that the reboot was not a restore, so
+operator readmission is required again. A process restart within the same boot retains admission.
 
-1. Start the resident with nothing that calls `vote_sign` running (the host's agent stopped), and
-   run `vote_ledger_mark_unadmitted` for every key of that host before the replica catches up with
-   its peers (`vote_sign` is refused until it has); only then start the agent.
+The guard cannot detect a snapshot resumed with its old kernel memory, or an in-place rollback of
+the vote directory during the same boot. Those require an external restore witness or explicit
+isolation and marking. After any revert of a host VM's snapshot, any restore of a host from a
+backup, or any restore of the vote directory:
+
+1. Keep the host's agent and vote callers stopped. On a fresh kernel boot, verify that every
+   ledger is unadmitted by the boot guard before enabling vote callers. For an in-place rollback
+   on the same boot, run `vote_ledger_mark_unadmitted` for every key before catch-up or voting;
+   only then start the agent.
 2. Collect the evidence from every other host into the evidence directory, after the mark, and
    record each file's SHA-256.
 3. Run `vote_ledger_readmit` with those digests once `retry_at` has passed. If an input cannot be
    read, wait for it.
 
-No local marker narrows the silent case soundly. Everything on the host, a marker file, the ledger's
-mtime, its nonce, the store, is reverted with the host's snapshot and stays consistent with the
-ledger it was reverted with; the boot ID changes at every legitimate reboot too. Only what lives
-off the host survives a revert: the other hosts, which the tripwire reads, and the operator, who
-marks. A hypervisor's VM generation ID would be such a witness; it is not read here.
+No local marker can distinguish a legitimate reboot from a restore. Everything on the host, a
+marker file, the ledger's mtime, its nonce, the store, is reverted with the host's snapshot; the
+boot ID changes at every legitimate reboot too. The new guard therefore chooses safety over
+automatic readmission. Only what lives off the host can distinguish a restore: the other hosts,
+which the tripwire reads, and the operator, who marks. A hypervisor's VM generation ID would be
+such a witness; it is not read here.
 
 **Not here** (see [the manager decides](#the-manager-decides-v3-5) for what V3-5 added): lease
 extension by majority (V3-6); re-keying without a trusted dealer.

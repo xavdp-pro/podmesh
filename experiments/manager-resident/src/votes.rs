@@ -333,7 +333,7 @@ impl VoteRuntime {
                 e.code, e.detail
             );
         }
-        Ok(Some(VoteRuntime {
+        let runtime = VoteRuntime {
             config: votes.clone(),
             manager: config.network.manager.clone(),
             dir,
@@ -342,7 +342,16 @@ impl VoteRuntime {
             verdicts: Mutex::new(BTreeMap::new()),
             voter: Mutex::new(VoterStatus::default()),
             timings: Mutex::new(BTreeMap::new()),
-        }))
+        };
+        // Try before peer exchange. An invalid read-only host mount already prevents signatures;
+        // signer() repeats the guard before every later operation if the mount is repaired live.
+        if let Err(e) = runtime.signer() {
+            eprintln!(
+                "resident vote alert: {}: {}; this replica signs nothing until it is fixed",
+                e.code, e.detail
+            );
+        }
+        Ok(Some(runtime))
     }
 
     /// The voter's interval, when this replica decides.
@@ -359,7 +368,7 @@ impl VoteRuntime {
             .config
             .policy()
             .map_err(|e| crate::ledger::refusal("key_not_in_policy", e.to_string()))?;
-        Signer::open(
+        let signer = Signer::open(
             &self.dir,
             &self.config.key_id,
             host,
@@ -368,7 +377,11 @@ impl VoteRuntime {
                 max_certificate_life: self.config.max_certificate_life_seconds,
                 lock_wait: LOCK_WAIT,
             },
-        )
+        )?;
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map_err(|e| crate::ledger::refusal("boot_identity_unreadable", e.to_string()))?;
+        signer.guard_boot(boot_id.trim_end_matches('\n'), now())?;
+        Ok(signer)
     }
 
     fn alert(&self, text: String) {

@@ -607,6 +607,45 @@ fn a_crash_between_the_ledger_write_and_the_signature_releases_nothing() {
 // ---------------------------------------------------------------------------------------------
 // A ledger restored from an older copy: the tripwire.
 
+/// A file-based VM restore rewinds the marker and ledger together. The next kernel boot must
+/// quarantine the ledger before the resident can exchange with peers, even if no later vote has
+/// survived elsewhere to trip the ordinary vote-history check.
+#[test]
+fn a_restored_vm_boot_is_unadmitted_before_voting() {
+    const FIRST_BOOT: &str = "11111111-2222-4333-8444-555555555555";
+    const NEXT_BOOT: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    let root = temp_root();
+    let dir = private_dir(root.path(), "a");
+    let signer = admitted_a(root.path(), &dir);
+    // Snapshot an admitted host whose marker belongs to the first boot. A same-boot process
+    // restart keeps its admission; restoring those exact bytes under a new boot quarantines it.
+    let marker = dir.join("replica-a.boot-id");
+    fs::write(&marker, FIRST_BOOT).unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+    signer.guard_boot(FIRST_BOOT, T1).unwrap();
+    assert!(signer.load().unwrap().admitted);
+    signer.guard_boot(NEXT_BOOT, T1 + 2).unwrap();
+    assert!(!signer.load().unwrap().admitted);
+    assert_eq!(signer.load().unwrap().unadmitted_since, Some(T1 + 2));
+    assert_eq!(fs::read_to_string(&marker).unwrap(), NEXT_BOOT);
+    signer.guard_boot(NEXT_BOOT, T1 + 3).unwrap();
+    assert_eq!(signer.load().unwrap().unadmitted_since, Some(T1 + 2));
+    assert_eq!(
+        code(signer.sign(&takeover(&policy(ABC, 0), R, 5, X, T1 + 3), &[], T1 + 3)),
+        "ledger_unadmitted"
+    );
+    assert_eq!(
+        code(signer.guard_boot("invalid", T1 + 3)),
+        "boot_identity_unreadable"
+    );
+
+    // An older admitted ledger without a marker (upgrade or incomplete copy) fails closed too.
+    let other = private_dir(root.path(), "b");
+    let legacy = admitted_a(root.path(), &other);
+    legacy.guard_boot(FIRST_BOOT, T1 + 4).unwrap();
+    assert!(!legacy.load().unwrap().admitted);
+}
+
 /// Proves: a ledger restored from an older copy signs again what it forgot while nobody shows it a
 /// later vote of its key (the silent revert the tripwire exists for), and trips as soon as one is
 /// shown: a vote numbered above the ledger (`ledger_behind_own_votes`), or one numbered since its

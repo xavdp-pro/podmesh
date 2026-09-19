@@ -709,6 +709,75 @@ impl Signer {
         Ok(ledger)
     }
 
+    /// Before a voting resident starts exchanging with peers, bind its ledger to this kernel boot.
+    /// A file-based VM restore boots with a new kernel boot ID while restoring the old ledger and
+    /// marker together. In that case the ledger is durably unadmitted before the marker advances.
+    /// A crash between the two writes only causes another safe mark on the next start.
+    pub fn guard_boot(&self, boot_id: &str, now: i64) -> Result<(), LedgerRefusal> {
+        if boot_id.len() != 36
+            || !boot_id.bytes().enumerate().all(|(i, b)| {
+                if [8, 13, 18, 23].contains(&i) {
+                    b == b'-'
+                } else {
+                    b.is_ascii_hexdigit() && !b.is_ascii_uppercase()
+                }
+            })
+        {
+            return Err(refusal(
+                "boot_identity_unreadable",
+                "the kernel boot ID is not a lowercase UUID",
+            ));
+        }
+        let _lock = self.lock()?;
+        let marker = self.dir.join(format!("{}.boot-id", self.key_id));
+        let previous = match fs::symlink_metadata(&marker) {
+            Ok(_) => {
+                private_file(&marker, "boot_identity_unreadable")?;
+                let bytes = read_bounded(&marker, 64)
+                    .map_err(|e| refusal("boot_identity_unreadable", e.to_string()))?;
+                Some(
+                    String::from_utf8(bytes)
+                        .map_err(|e| refusal("boot_identity_unreadable", e.to_string()))?,
+                )
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(refusal("boot_identity_unreadable", e.to_string())),
+        };
+        if previous.as_deref() == Some(boot_id) {
+            return Ok(());
+        }
+        match fs::symlink_metadata(self.ledger_path()) {
+            Ok(_) => {
+                let mut ledger = self.load()?;
+                if ledger.admitted {
+                    ledger.admitted = false;
+                    ledger.unadmitted_since = Some(now);
+                    ledger.unadmitted_reason = Some("kernel boot changed or boot witness missing: verify host restore before readmission".into());
+                    self.store(&mut ledger)?;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(refusal("storage", e.to_string())),
+        }
+        let temp = self.dir.join(format!(".{}.boot-id.tmp", self.key_id));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp)
+            .map_err(|e| refusal("storage", e.to_string()))?;
+        file.write_all(boot_id.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|e| refusal("storage", e.to_string()))?;
+        drop(file);
+        fs::rename(&temp, &marker).map_err(|e| refusal("storage", e.to_string()))?;
+        File::open(&self.dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| refusal("storage", e.to_string()))?;
+        Ok(())
+    }
+
     /// The tripwire: a vote of this key, among those shown, that the ledger cannot account for.
     fn tripwire(&self, ledger: &Ledger, seen: &[Value]) -> Option<LedgerRefusal> {
         let own: BTreeMap<String, VerifyingKey> =

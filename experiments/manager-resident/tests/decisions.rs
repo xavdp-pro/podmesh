@@ -271,6 +271,12 @@ impl Lab {
             )
             .unwrap();
             signer.init(now()).unwrap();
+            // The real pre-start guard runs before a resident opens peer exchange. Establish its
+            // witness before this fixture's operator readmission, as deployment must do.
+            let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+            signer
+                .guard_boot(boot_id.trim_end_matches('\n'), now())
+                .unwrap();
             let nodes: Vec<String> = NODES.iter().map(|n| (*n).to_string()).collect();
             let replica_id = format!("r{i}");
             let scope = Scope {
