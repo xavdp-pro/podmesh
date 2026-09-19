@@ -338,7 +338,11 @@ fired at the check that claims them:
 The recorded checks at the final heads: resident library 30/30, the process tests `decisions` 2/2,
 `votes` 1/1, `processes` 42/42 and `inspect_facts` 2/2; manager-ha and manager-network suites
 unchanged and passing; strict resident Clippy and formatting; the collector's and the vote tools' tests;
-the end-to-end test, 14 checks; the lexicon test.
+the end-to-end test, 15 checks with the timing check; the lexicon test. One full run of the resident suite at
+`f2f4c97` failed `processes::periodic_full_verification_fails_the_store_closed_after_an_old_row_is_edited`
+once: an append stayed unavailable past that test's 5-second bound. The test configures no votes, so no
+code of this lot runs in it. It then passed five times alone and in three more full runs of the process
+suite (42/42). It is recorded as intermittent, not explained.
 
 **Not shown here.** These need a laboratory host or the operator:
 
