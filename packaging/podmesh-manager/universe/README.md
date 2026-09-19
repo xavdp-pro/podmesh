@@ -135,18 +135,27 @@ and agent access to the control API.
 A replica that votes keeps its signing key and its signing ledger outside the universe's state, and
 checks the host's machine-id on a read-only mount (V3-4, the operator's custody decision and rule R4).
 The universe gets them from PodMesh's `create` with `manager_host_state: <name>` (the node's
-`LOCAL-API.md`), as exactly three bind mounts derived from the name:
+`LOCAL-API.md`), as three fixed bind mounts derived from the name. On a QEMU guest with a VM
+generation device, the node also mounts its live witness read-only:
 
 | In the universe | On the host | Mode |
 | --- | --- | --- |
 | `/run/podmesh-host/votes` | `<node state>/manager-host/<name>/votes` | read-write: `<key_id>.key`, `<key_id>.ledger` |
 | `/run/podmesh-host/evidence` | `<node state>/manager-host/<name>/evidence` | read-only: the operator's readmission evidence |
 | `/run/podmesh-host/machine-id` | `/etc/machine-id` | read-only |
+| `/run/podmesh-host/vmgenid` | QEMU `etc/vmgenid_guid/raw`, when present | read-only |
 
 The entrypoint sees `/run/podmesh-host/votes` and gives the resident `PODMESH_MANAGER_VOTE_DIR` and
-`PODMESH_MANAGER_HOST_ID_FILE`. The configuration names `votes.evidence_dir` =
+`PODMESH_MANAGER_HOST_ID_FILE`; when present, it also exports
+`PODMESH_MANAGER_GENERATION_ID_FILE`. The configuration names `votes.evidence_dir` =
 `/run/podmesh-host/evidence`. Without the mounts, a configuration that votes does not start: the
 resident refuses, and the start exits 2.
+For a VM that may be restored from a snapshot, set `votes.require_generation_id` so a missing
+external witness refuses every vote operation. The witness detects a changed generation even
+when RAM rollback preserves the old kernel boot ID. It does not prove an already in-flight
+signature safe across a RAM rollback. Until that case is separately qualified, prohibit snapshots
+that include VM RAM and their rollback while the VM can vote; use an isolated disk-only restore
+followed by ledger readmission.
 
 No recovery point, clone or migration carries the key or the ledger. PodMesh refuses mounts to live
 captures, clones and migrations, and a stopped capture exports the root filesystem only. One universe
@@ -159,18 +168,19 @@ The procedure, the seed never leaving its host:
 1. On each host, as root: `replicated/vote-key.py --vote-dir <node state>/manager-host/<name>/votes
    --key-id <key_id>`. It writes the seed (0600) and prints the public half only.
 2. Where the replica set was generated: `replicated/add-votes.py --dir <set> --key <alias>:<key_id>:<public
-   key> ... --resource <uuid>:<lease>:<margin>:<renewal not_after>`, with an optional `--baseline` for a
+   key> ... --resource <uuid>:<lease>:<margin>:<renewal not_after> --require-generation-id`, with an optional `--baseline` for a
    resource moving from the gate. It adds each replica's `votes` section and its `votes/` and
    `proposals/` scopes, and prints the policy digest. The nodes' policies must name the same
    `authority_quorum`.
 3. Declare each configuration as the replica's secret and create the universe with its
    `manager_host_state`.
-4. Create each ledger (`vote_ledger_init`, as the operator, through `podman exec` into the universe,
-   where the peer's PID is visible). Gather the evidence into the host's evidence directory with the
-   resident's `tools/collect-readmission-evidence.py`, and readmit (`vote_ledger_readmit` with the
-   printed digests) once `retry_at` has passed.
+4. Create each ledger (`manager_vote_ledger_init`, as the operator, through the node's bounded
+   manager control door; do not enter the container). Gather the evidence into the host's evidence directory with the
+   resident's `tools/collect-readmission-evidence.py`, and readmit (`manager_vote_ledger_readmit` with the
+   printed digests, also through the door) once `retry_at` has passed.
 5. On each host, enable the node's decision follow timer under its mandate (`DECISION-FOLLOW.md` of the
    node). Its `manager_universe` is the replica's universe.
 
-`replicated/test_votes_tools.py` holds the two helpers. The node's test holds the three mounts. Neither
+`replicated/test_votes_tools.py` holds the two helpers. The node's tests hold the fixed mounts and
+optional generation witness. Neither
 has run on a laboratory host.
