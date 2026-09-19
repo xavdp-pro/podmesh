@@ -1,0 +1,15 @@
+[Unit]
+Description=PodMesh decision follow, once: the replicas' certificates delivered to this node, under the operator's mandate
+Documentation=file:/usr/share/doc/podmesh/DECISION-FOLLOW.md
+After=podmesh.service
+Requisite=podmesh.service
+ConditionPathExists=/etc/podmesh/decision-follow-mandate
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/podmesh-decision-follow
+UMask=0077
+# Local Unix sockets only: the node's API and, for a resident run as a host service, its control socket.
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+NoNewPrivileges=yes
+PrivateTmp=yes

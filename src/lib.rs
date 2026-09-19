@@ -52,6 +52,7 @@ pub fn open_state(dir: &Path) -> Result<Connection, Box<dyn std::error::Error>> 
     tx.execute("INSERT OR IGNORE INTO metadata VALUES('host_uuid',?1)", [uuid.trim()])?;
     tx.commit()?;
     lifecycle::prepare_scratch(&dir.join("podman-tmp"))?;
+    manager::prepare_host_state(dir);
     migration::prepare(&dir.join("migrations"))?;
     transfer::prepare(dir)?;
     Ok(db)
@@ -128,7 +129,7 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
             // Host-wide by design: the collector is the only operation that does not name one universe.
             "garbage_collect_plan" | "garbage_collect_apply" => collector::execute(db, request)?,
             "collection_retention_declare" | "collection_hold_declare" | "collection_hold_release" | "collection_status" => retention::execute(db, request)?,
-            "manager_status" | "manager_observe" => manager::execute(db, request)?,
+            "manager_status" | "manager_decision" | "manager_observe" => manager::execute(db, request)?,
             "secret_declare" | "secret_remove" | "secret_status" => secrets::execute(db, request)?,
             "publisher_declare" | "publisher_start" | "publisher_stop" | "publisher_status" | "publisher_observed" => publisher::execute(db, request)?,
             "network_declare" | "network_undeclare" | "network_route_publish" | "network_route_withdraw" | "network_route_resume" | "network_reapply" | "network_status" => network::execute(db, request)?,
@@ -149,7 +150,7 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
                 "experimental_operations":["migration_preflight","migration_checkpoint","migration_status","migration_authorize_transfer",
                     "migration_complete_transfer","migration_retire_source","migration_release","migration_abandon","migration_restore_local",
                     "migration_destination_preflight","migration_restore","migration_restore_abort",
-                    "garbage_collect_plan","garbage_collect_apply","collection_retention_declare","collection_hold_declare","collection_hold_release","collection_status","network_declare","network_undeclare","network_route_publish","network_route_withdraw","network_route_resume","network_reapply","network_status","boot_restore","boot_restore_status","manager_status","manager_observe","secret_declare","secret_remove","secret_status","publisher_declare","publisher_start","publisher_stop","publisher_status","publisher_observed"],
+                    "garbage_collect_plan","garbage_collect_apply","collection_retention_declare","collection_hold_declare","collection_hold_release","collection_status","network_declare","network_undeclare","network_route_publish","network_route_withdraw","network_route_resume","network_reapply","network_status","boot_restore","boot_restore_status","manager_status","manager_decision","manager_observe","secret_declare","secret_remove","secret_status","publisher_declare","publisher_start","publisher_stop","publisher_status","publisher_observed"],
                 "experimental_contracts":{
                     "migration_preflight":"read-only compatibility report bound to universe UUID, container ID, image ID, source and destination host UUIDs; no reservation, suspension or artifact",
                     "migration_checkpoint":"source: fresh checks before suspension, durable reservation, checkpoint with the packaged podmesh-vzcriu runtime in its own scope, archive/manifest/hashes under the state directory; never an authorization to restore",

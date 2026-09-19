@@ -11,8 +11,11 @@ trap 'rm -rf "$work"' EXIT
 chmod 755 "$work"
 mkdir -p "$work/DEBIAN" "$work/usr/bin" "$work/usr/lib/systemd/system"
 install -m755 target/release/podmesh target/release/podmeshd "$work/usr/bin/"
-install -m644 packaging/podmesh.service packaging/podmesh-fence.service packaging/podmesh-fence.timer packaging/podmesh-restore.service "$work/usr/lib/systemd/system/"
-install -m755 packaging/podmesh-fence packaging/podmesh-restore "$work/usr/bin/"
+install -m644 packaging/podmesh.service packaging/podmesh-fence.service packaging/podmesh-fence.timer packaging/podmesh-restore.service \
+  packaging/podmesh-decision-follow.service packaging/podmesh-decision-follow.timer "$work/usr/lib/systemd/system/"
+install -m755 packaging/podmesh-fence packaging/podmesh-restore packaging/podmesh-decision-follow "$work/usr/bin/"
+install -d "$work/usr/share/doc/podmesh"
+install -m644 docs/DECISION-FOLLOW.md "$work/usr/share/doc/podmesh/"
 cat > "$work/DEBIAN/control" <<CONTROL
 Package: podmesh
 Version: $version
@@ -32,9 +35,11 @@ Description: Experimental local Podman lifecycle and manager engine
  service only; this package does not by itself install or qualify production HA.
  Migration still requires the separately packaged podmesh-vzcriu runtime.
  Volumes, join/leave occupied hosts, Backup Server and control-services
- universe are out of scope. The self-fence timer (podmesh-fence.timer) and
- the restore-after-boot unit (podmesh-restore.service) are shipped disabled
- and run nothing without the operator's mandate files.
+ universe are out of scope. The self-fence timer (podmesh-fence.timer), the
+ restore-after-boot unit (podmesh-restore.service) and the decision follow
+ timer (podmesh-decision-follow.timer, the replicas' certificates delivered to
+ this node) are shipped disabled and run nothing without the operator's
+ mandate files.
  See docs/EXPERIMENTAL-SCOPE.md for the experimental boundary.
 CONTROL
 cat > "$work/DEBIAN/postinst" <<'SCRIPT'
@@ -48,15 +53,17 @@ if [ "$1" = configure ] && [ -d /run/systemd/system ]; then
  # schedule is the operator's decision, taken by writing /etc/podmesh/fence-mandate and enabling it.
  # podmesh-restore.service neither: whether the host restores its universes at boot is the operator's
  # decision, taken by writing /etc/podmesh/restore-mandate and enabling it.
+ # podmesh-decision-follow.timer neither: whether this node takes the replicas' certificates is the
+ # operator's decision, taken by writing /etc/podmesh/decision-follow-mandate and enabling it.
 fi
 SCRIPT
 cat > "$work/DEBIAN/prerm" <<'SCRIPT'
 #!/bin/sh
 set -e
 if [ -d /run/systemd/system ]; then
- systemctl stop podmesh-fence.timer 2>/dev/null || true
+ systemctl stop podmesh-fence.timer podmesh-decision-follow.timer 2>/dev/null || true
  systemctl stop podmesh.service
- if [ "$1" = remove ]; then systemctl disable podmesh-fence.timer podmesh-restore.service 2>/dev/null || true; systemctl disable podmesh.service; fi
+ if [ "$1" = remove ]; then systemctl disable podmesh-fence.timer podmesh-restore.service podmesh-decision-follow.timer 2>/dev/null || true; systemctl disable podmesh.service; fi
 fi
 SCRIPT
 cat > "$work/DEBIAN/postrm" <<'SCRIPT'

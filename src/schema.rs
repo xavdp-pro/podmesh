@@ -55,6 +55,7 @@ pub fn all() -> Value {
         en("network_profile", true, &["isolated", "managed"], "isolated has no network; managed joins the host's declared pool"),
         f("network_address", "string", false, "an address in the host's pool, for the managed profile"),
         f("secrets", "object[]", false, "declared secrets to mount: [{name, target}]"),
+        f("manager_host_state", "string", false, "a manager replica's host state, by name: its vote directory read-write at /run/podmesh-host/votes, the operator's evidence directory and the host's machine-id read-only at /run/podmesh-host/evidence and /run/podmesh-host/machine-id, kept under this node's state directory and never removed by it"),
     ])));
     put("clone", op("universe", "lease,reservation", "a new universe from a stopped, mount-free source, through a committed snapshot image", Some(vec![
         uuid("source_uuid", "the universe to clone"),
@@ -152,6 +153,9 @@ pub fn all() -> Value {
     ])));
 
     put("manager_status", op("read", "none", "the manager resident's status through its control door, bound to the container's identity", Some(vec![])));
+    put("manager_decision", op("read", "none", "this host's manager replica's reading of the replicas' decision for one resource (decision_read), relayed through the control door: the current decision with its quorum certificate, or what is missing; the certificate is verified by the operation it is delivered to", Some(vec![
+        uuid("resource", "the resource the replicas decide"),
+    ])));
     put("manager_observe", op("universe", "none", "one observation appended in the replica's own scope through the control door", Some(vec![
         f("scope", "string", true, "the replica's granted scope"), f("subject", "string", true, "1-128 safe ASCII"), f("value", "string", true, "at most 4096 bytes"),
     ])));

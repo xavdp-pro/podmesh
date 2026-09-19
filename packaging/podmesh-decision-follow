@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Host-side decision follow (V3-5): the replicas' certificates delivered to this node, under a written
+mandate -- and under nothing else.
+
+The PodMesh manager's replicas decide an epoch rotation or a same-holder re-issue by majority: each one
+votes under its own signing ledger, and k votes of distinct keys make a quorum certificate. This tick
+reads the current decision of each resource the mandate names from THIS host's replica -- through the
+node's door (`manager_decision`, relayed into the manager universe) or through the resident's own
+control socket when the resident runs as a host service -- and hands the certificate to THIS host's
+node:
+
+- a certificate that names this host as the new holder: `activation_acquire` with it, unless this host
+  already holds the lease at that epoch; then, when the mandate says so and a publisher is declared,
+  `publisher_start` with the certificate as the takeover proof, when the node says the publisher is
+  eligible and nothing runs;
+- a certificate that names another host: `activation_supersede`, when its epoch is above this node's
+  screen. A supersession is delivered to any host: learning that one is overtaken can only stop things.
+
+It verifies no signature: the node does, with the keys of its own policy, and refuses a minority's
+certificate, a replayed one and a late one (its epoch screen moves forward on certificates only, never
+backwards). It never resynchronises the screen from anything a replica says, never renews, never
+proposes and never votes. It opens no listener: it only connects to two local Unix sockets. Every
+action is recomputed from the node's own state at every tick, so a tick repeated, interrupted or run
+twice delivers nothing twice. It fails closed: a mandate, a node answer or a decision it cannot read
+delivers nothing for that resource, and the tick exits 3; a node's refusal (a barrier not reached yet,
+say) is reported and retried at the next tick.
+
+Mandate (default /etc/podmesh/decision-follow-mandate), root-only, shell-free key=value lines:
+  authorization_ref=<the mandate's name, recorded as provenance in every request>
+  manager_universe=<UUID of this host's manager replica universe>  (read through the node's door)
+  resident_socket=<absolute path of the resident's control socket>  (a resident run as a host service)
+  resource=<UUID>          one line per resource to follow, at least one
+  publisher=0|1            start the declared publisher with the certificate (default 0)
+Exactly one of manager_universe and resident_socket.
+
+One JSON line per resource on standard output says what was done. See docs/DECISION-FOLLOW.md.
+"""
+import json, os, socket, sys, time
+
+MANDATE = os.environ.get("PODMESH_DECISION_FOLLOW_MANDATE", "/etc/podmesh/decision-follow-mandate")
+NODE_SOCKET = os.environ.get("PODMESH_SOCKET", "/run/podmesh/api.sock")
+QUORUM_PROOF_KIND = "podmesh-takeover-proof/quorum-ed25519"
+TOKEN = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:-")
+HEX_UUID = set("abcdefABCDEF0123456789-")
+# A request on the node's socket answers within these; a publisher start waits for the connector's
+# registration, up to a minute.
+NODE_TIMEOUT, PUBLISH_TIMEOUT, RESIDENT_TIMEOUT = 30, 120, 20
+
+
+class Unreadable(Exception):
+    """Something this tick could not read: nothing is delivered for the resource."""
+
+
+def fail(msg, code=3):
+    print(f"podmesh-decision-follow: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def is_uuid(value):
+    return len(value) == 36 and set(value) <= HEX_UUID and [len(p) for p in value.split("-")] == [8, 4, 4, 4, 12]
+
+
+def load_mandate(path):
+    if not os.path.isfile(path):
+        fail(f"no mandate at {path}; nothing is delivered without one")
+    vals, resources = {}, []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = (s.strip() for s in line.split("=", 1))
+            if k == "resource":
+                resources.append(v)
+            elif k in vals:
+                fail(f"the mandate names {k} twice")
+            else:
+                vals[k] = v
+    unknown = set(vals) - {"authorization_ref", "manager_universe", "resident_socket", "publisher"}
+    if unknown:
+        fail(f"the mandate carries unknown keys: {', '.join(sorted(unknown))}")
+    ref = vals.get("authorization_ref", "")
+    if not ref or not set(ref) <= TOKEN:
+        fail("the mandate names no usable authorization_ref")
+    if not resources or not all(is_uuid(r) for r in resources) or len(set(resources)) != len(resources):
+        fail("the mandate must name one or more distinct resource UUIDs")
+    universe, sock = vals.get("manager_universe"), vals.get("resident_socket")
+    if (universe is None) == (sock is None):
+        fail("the mandate names exactly one of manager_universe and resident_socket")
+    if universe is not None and not is_uuid(universe):
+        fail("the mandate's manager_universe is not a UUID")
+    if sock is not None and (not sock.startswith("/") or ".." in sock.split("/")):
+        fail("the mandate's resident_socket is not an absolute path")
+    publisher = vals.get("publisher", "0")
+    if publisher not in ("0", "1"):
+        fail("the mandate's publisher must be 0 or 1")
+    return {"ref": ref, "resources": resources, "universe": universe, "socket": sock, "publisher": publisher == "1"}
+
+
+def exchange(path, payload, terminator, timeout):
+    """One request on a local Unix socket, its answer read to the end. Connects only: nothing here
+    listens, binds or accepts."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(path)
+        s.sendall(payload + terminator)
+        if not terminator:
+            s.shutdown(socket.SHUT_WR)
+        chunks = []
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if sum(len(c) for c in chunks) > 1 << 20:
+                raise Unreadable(f"the answer on {path} exceeds 1 MiB")
+        return b"".join(chunks)
+    except OSError as e:
+        raise Unreadable(f"{path}: {e}") from e
+    finally:
+        s.close()
+
+
+def node(operation, timeout=NODE_TIMEOUT, **fields):
+    """One request to this host's node: its answer's `data`, or its refusal as (None, error)."""
+    raw = exchange(NODE_SOCKET, json.dumps({"operation": operation, **fields}).encode(), b"\n", timeout)
+    try:
+        answer = json.loads(raw)
+    except ValueError as e:
+        raise Unreadable(f"{operation}: the node's answer is not JSON") from e
+    if not isinstance(answer, dict) or not isinstance(answer.get("ok"), bool):
+        raise Unreadable(f"{operation}: the node's answer has no verdict")
+    return (answer.get("data"), None) if answer["ok"] else (None, str(answer.get("error")))
+
+
+def decision(mandate, resource):
+    """The current decision of `resource` as this host's replica reads it."""
+    if mandate["universe"]:
+        data, error = node("manager_decision", universe_uuid=mandate["universe"], resource=resource,
+                           authorization_ref=mandate["ref"])
+        if error is not None:
+            raise Unreadable(f"manager_decision refused: {error}")
+        reply = (data or {}).get("resident_reply")
+    else:
+        raw = exchange(mandate["socket"], json.dumps({"operation": "decision_read", "resource": resource}).encode(),
+                       b"", RESIDENT_TIMEOUT)
+        try:
+            reply = json.loads(raw)
+        except ValueError as e:
+            raise Unreadable("the resident's answer is not JSON") from e
+    if not isinstance(reply, dict) or "error" in reply or not isinstance(reply.get("decision"), dict):
+        raise Unreadable(f"the replica gave no decision: {json.dumps(reply)[:300]}")
+    d = reply["decision"]
+    if d.get("resource") != resource:
+        raise Unreadable("the replica answered for another resource")
+    if d.get("conflicts"):
+        raise Unreadable(f"the replica reads two certified decisions for epoch(s) {d['conflicts']}: a broken promise, which the operator settles; nothing is delivered")
+    return d
+
+
+def certificate_of(d, resource):
+    """The current certificate, checked only for the shape this tick relies on: the node verifies it."""
+    current = d.get("current")
+    if current is None:
+        return None
+    c = current.get("certificate") if isinstance(current, dict) else None
+    if not isinstance(c, dict) or c.get("kind") != QUORUM_PROOF_KIND or c.get("resource") != resource:
+        raise Unreadable("the replica's current decision carries no takeover certificate for this resource")
+    if not isinstance(c.get("new_epoch"), int) or isinstance(c.get("new_epoch"), bool) or not isinstance(c.get("new_holder"), str):
+        raise Unreadable("the certificate names no epoch or holder")
+    if not isinstance(c.get("signatures"), list):
+        raise Unreadable("the certificate carries no signatures")
+    return c
+
+
+def digest_of(c):
+    import hashlib
+    payload = {k: v for k, v in c.items() if k != "signatures"}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+
+
+def follow(mandate, resource):
+    """One resource: what the node holds, what the replica decided, and the one action that brings the
+    node to it. Returns the report line."""
+    report = {"resource": resource}
+    status, error = node("activation_status", universe_uuid=resource)
+    if error is not None or not isinstance(status, dict):
+        raise Unreadable(f"activation_status refused: {error}")
+    if not status.get("authority_quorum"):
+        raise Unreadable("this node's policy for the resource names no quorum of replica keys: a certificate is not delivered to it")
+    this_host = status.get("this_host_uuid")
+    screen = status.get("highest_epoch_seen") or 0
+    if not isinstance(this_host, str) or not isinstance(screen, int):
+        raise Unreadable("activation_status names no host or screen")
+    d = decision(mandate, resource)
+    c = certificate_of(d, resource)
+    report.update(screen=screen, decided_epoch=d.get("view", {}).get("epoch"))
+    if c is None:
+        report["action"] = "none: nothing decided yet"
+        return report
+    epoch, holder, digest = c["new_epoch"], c["new_holder"], digest_of(c)
+    report.update(epoch=epoch, holder=holder, payload_digest=digest)
+    if holder != this_host:
+        if epoch <= screen:
+            report["action"] = "none: this node has seen the epoch already"
+            return report
+        _, error = node("activation_supersede", universe_uuid=resource, certificate=c, authorization_ref=mandate["ref"],
+                        operation_id=f"decision-supersede-{epoch}-{digest[:16]}")
+        report.update(action="activation_supersede", result="refused" if error else "delivered", error=error)
+        return report
+    held = (status.get("holder_host_uuid") == this_host and status.get("epoch") == epoch
+            and status.get("live") is True and status.get("superseded") is not True)
+    if not held:
+        if epoch < screen:
+            report["action"] = "none: the certificate is below this node's screen"
+            return report
+        # The situation the request answers: a lease row that changes (a lapse, another acquisition)
+        # makes another request; the same one retried is the node's journal's to replay or re-evaluate.
+        situation = f"{status.get('generation') or 0}-{status.get('expires_at') or 0}"
+        _, error = node("activation_acquire", universe_uuid=resource, certificate=c, authorization_ref=mandate["ref"],
+                        operation_id=f"decision-acquire-{epoch}-{digest[:16]}-{situation}"[:80])
+        report.update(action="activation_acquire", result="refused" if error else "delivered", error=error)
+        if error:
+            return report
+    else:
+        report["action"] = "none: this host holds the lease at the epoch"
+    if mandate["publisher"]:
+        report["publisher"] = publish(mandate, resource, c, digest)
+    return report
+
+
+def publish(mandate, resource, c, digest):
+    """The connector started with the certificate as the takeover proof, when a publisher is declared
+    here, the node says it is eligible and nothing runs."""
+    data, error = node("publisher_status", resource=resource)
+    if error is not None or not isinstance(data, dict):
+        raise Unreadable(f"publisher_status refused: {error}")
+    if data.get("declared") is False:
+        return "none: no publisher declared here"
+    if (data.get("unit") or {}).get("state") == "active" or data.get("transition") is not None:
+        return "none: a connector runs or is recorded here"
+    if data.get("publisher_eligible") is not True:
+        return f"none: not eligible ({'; '.join(map(str, data.get('reasons') or []))})"
+    _, error = node("publisher_start", timeout=PUBLISH_TIMEOUT, resource=resource, takeover_proof=c,
+                    authorization_ref=mandate["ref"], operation_id=f"decision-publish-{digest[:16]}-{int(time.time())}")
+    return f"publisher_start refused: {error}" if error else "publisher_start delivered"
+
+
+def main():
+    mandate = load_mandate(MANDATE)
+    unreadable = 0
+    for resource in mandate["resources"]:
+        try:
+            report = follow(mandate, resource)
+        except Unreadable as e:
+            unreadable += 1
+            report = {"resource": resource, "action": "none", "unreadable": str(e)}
+            print(f"podmesh-decision-follow: {resource}: {e}; nothing delivered", file=sys.stderr)
+        print(json.dumps(report, sort_keys=True))
+    sys.exit(3 if unreadable else 0)
+
+
+if __name__ == "__main__":
+    main()

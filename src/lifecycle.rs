@@ -86,6 +86,8 @@ enum Params<'a> {
         address: Option<&'a str>,
         /// Podman `--secret` arguments and the label naming them, from `secrets::mounts`.
         secrets: (Vec<String>, Option<String>),
+        /// A manager replica's host state (V3-5): its name, for `manager::host_state_mounts`.
+        host_state: Option<&'a str>,
     },
     Clone {
         source: &'a str,
@@ -407,7 +409,16 @@ fn parse<'a>(db: &Connection, operation: &str, uuid: &str, request: &'a Value) -
             }
             // Secrets are mounted from Podman's store, never from an image: names and targets only.
             let secrets = crate::secrets::mounts(db, request)?;
-            Params::Create { image, command, profile, address, secrets }
+            // A manager replica's host state: its vote directory, the operator's evidence directory and
+            // the host's machine-id, mounted at fixed paths derived from this name alone (V3-5).
+            let host_state = request
+                .get("manager_host_state")
+                .map(|v| v.as_str().filter(|s| !s.is_empty()).ok_or("manager_host_state must be a non-empty name"))
+                .transpose()?;
+            if let Some(name) = host_state {
+                token(name)?;
+            }
+            Params::Create { image, command, profile, address, secrets, host_state }
         }
         "clone" => {
             let source = text(request, "source_uuid")?;
@@ -813,7 +824,7 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
         migration::refuse_identity_reuse(db, uuid, params.name())?;
     }
     match params {
-        Params::Create { image, command, profile, address, secrets } => create(db, id, uuid, &name, existing, image, command, profile, *address, secrets),
+        Params::Create { image, command, profile, address, secrets, host_state } => create(db, id, uuid, &name, existing, image, command, profile, *address, secrets, *host_state),
         Params::Clone { source } => clone(db, id, uuid, source, &name, existing),
         Params::Delete => delete(db, uuid, &name, existing),
         Params::Start { observe_seconds } => start(db, attempt, id, uuid, &name, existing, *observe_seconds),
@@ -852,7 +863,7 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
     }
 }
 #[allow(clippy::too_many_arguments)]
-fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Value>, image: &str, command: &[&str], profile: &str, address: Option<&str>, secrets: &(Vec<String>, Option<String>)) -> Result<Value, Error> {
+fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Value>, image: &str, command: &[&str], profile: &str, address: Option<&str>, secrets: &(Vec<String>, Option<String>), host_state: Option<&str>) -> Result<Value, Error> {
     if let Some(ref c) = existing {
         if label(c, CREATION) != Some(id) {
             return Err("Universe already exists under another creation operation".into());
@@ -886,6 +897,11 @@ fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Va
         }
         if let Some(l) = &secrets.1 {
             args.extend(["--label", l.as_str()]);
+        }
+        let host_state = host_state.map(crate::manager::host_state_mounts).transpose()?;
+        if let Some((mounts, label)) = &host_state {
+            args.extend(mounts.iter().map(String::as_str));
+            args.extend(["--label", label.as_str()]);
         }
         args.push(image);
         args.extend(command);

@@ -1,0 +1,11 @@
+[Unit]
+Description=PodMesh decision follow on a timer (disabled unless the operator enables it)
+Documentation=file:/usr/share/doc/podmesh/DECISION-FOLLOW.md
+ConditionPathExists=/etc/podmesh/decision-follow-mandate
+[Timer]
+# A decision reaches this host's replica within a few exchanges; the tick delivers it within this.
+OnBootSec=15s
+OnUnitActiveSec=10s
+AccuracySec=1s
+[Install]
+WantedBy=timers.target
