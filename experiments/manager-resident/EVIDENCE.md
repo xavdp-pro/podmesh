@@ -248,3 +248,106 @@ restored byte for byte:
 The recorded checks at `3531ca4`: resident library 28/28, resident process suite 42/42, the votes
 process test and the two inspection tests; manager-ha and manager-network suites unchanged and
 passing; strict resident Clippy and formatting; the tree's lexicon test.
+
+## The manager decides (V3-5)
+
+Date: 2026-09-19. Scope: the library's rules, compiled residents on loopback, the operator's collector,
+and one end-to-end test on a single workstation. That test runs three residents and three real PodMesh
+nodes (`podmeshd` run unprivileged on its own state directory and socket: activation needs no Podman),
+with the node tree's host agent (`claude/v3-5-host-agent`) delivering certificates. The keys are
+test-only, and the temporary directories live under the build scratch. No laboratory host, no real key.
+
+| Test | Proves |
+| --- | --- |
+| `decision_tests::the_view_is_the_highest_certificate_or_the_baseline` | the view is the highest-epoch certificate the store's verified votes assemble into, with its holder, barrier and expiry, and the certificate verifies under the node's rules; one vote moves nothing; the operator's baseline stands until a certificate passes it; two decisions certified for one epoch are a conflict, and nothing is decided on a view that holds one |
+| `decision_tests::a_proposal_is_checked_against_the_view_rule_by_rule` | each rule by its refusal: the kind, no unbound field, the policy, the resource, the life (expired, too long, issued too far ahead), the holder among the nodes, the identifiers, the barrier before the expiry, the next epoch only, the view's previous holder, `first` only before any epoch, `same_holder` only to the current holder, `fence_receipt` never, an unknown method never; the barrier each method requires, at its exact bound and one second before it: carried for the same holder; for another holder, also the current certificate's expiry, the renewal bound and the proposal's issue, each plus the lease and the margin |
+| `tests/decisions.rs` `two_replicas_of_three_decide_and_one_does_not` | three residents: `first`, a same-holder re-issue for a new boot, then a rotation, each proposed on one replica and read decided on another, with a certificate the node's rules accept; a rotation whose barrier ignores the current certificate's expiry is refused by every voter (`barrier_too_early`) and through `vote_sign`, and never decided; a signature retried on a decided payload is answered with the recorded vote (`replayed`), twice, and one vote fact is stored; a replica whose ledger is marked unadmitted does not vote and the two others decide; with one of those stopped, one vote decides nothing and the read says one is missing; every vote operation answered within the vote deadline |
+| `tests/decisions.rs` `a_peer_forging_votes_over_a_live_link_has_none_counted` | a peer holding its own key and its link's pair key pushes, as an authenticated exchange, a proposal the honest replicas refuse, its own genuine vote, a vote in replica-a's name made with its key in its own scope, and a fact it attributes to replica r0 carrying another such vote. Both honest replicas import all of it, and each counts one vote, the peer's own: nothing is decided |
+| `tools/test_collect_readmission_evidence.py` | the collector writes nothing, and exits 3, when the plan misses an input or names an extra one, or when a command fails, prints no JSON, or prints another input than it claims (a store without its digest, another key's ledger, another node's answers). It also writes nothing for a missing evidence directory, or for a replica whose ledger is not marked unadmitted. Otherwise it writes one read-only envelope per input, collected after the mark, and prints the digests of exactly those bytes |
+| `packaging/podmesh-manager/universe/replicated/test_votes_tools.py` | `vote-key.py` derives the test vectors' public halves in pure Python, writes a new seed 0600, prints only its public half, and never overwrites a key; `add-votes.py` gives a generated replica set its vote and proposal scopes and a votes section under the node's pinned policy digest `965bd61a...`, and each configuration passes the resident's own offline validation |
+| `tests/e2e/decisions-e2e.py` (14 checks, below) | the V3-5 predicate on one machine, end to end |
+
+**The end-to-end test.** Run: `PODMESH_MANAGERD=<release resident> PODMESHD=<release podmeshd>
+PODMESH_DECISION_FOLLOW=<node tree>/packaging/podmesh-decision-follow python3 -B tests/e2e/decisions-e2e.py`.
+It shows, in order:
+
+1. New ledgers sign nothing: a proposal made while every ledger is unadmitted gets no vote.
+2. The operator's readmission of two ledgers, through the collector: two stores, two ledgers and
+   three nodes' `activation_status`, their digests stated, after the 80 s wait (life 20 s plus 60 s).
+   The third ledger stays unadmitted and never votes.
+3. Epoch 1 is decided by those two replicas. The agents deliver it: the named host acquires, the two
+   others are superseded, every screen moves to 1.
+4. A same-holder re-issue (epoch 2) is decided and delivered.
+5. A rotation to another host whose barrier the view does not allow is refused by the voters, and
+   nothing is delivered. The rotation with the barrier the view requires is decided; the new holder's
+   node refuses it until its barrier ("27 seconds from now on this clock") and takes it after, the
+   previous holder is superseded, and every screen moves to 3.
+6. Epochs 1 and 2, delivered by hand as supersessions and as acquisitions, are refused by all three
+   nodes: by the screen, by their expiry, or as naming another host. No screen moves.
+7. With one replica stopped and one unadmitted, the vote left decides nothing, and the agents deliver
+   nothing. A 1-of-3 certificate hand-made from that vote is refused by the node (`below_threshold`),
+   and so is the same signature listed twice (`duplicate_key`).
+8. The stopped replica is back. The same decision, re-issued with a fresh life, is decided (its first
+   voter signs it again under one promise) and delivered: every screen moves to 4. A further run
+   delivers nothing twice, and every vote operation answered within 2 s.
+
+**Timings.** The process tests run with a debug build whose curve arithmetic is optimized
+(`Cargo.toml` profile). The longest `decision_read` measured was 342 ms and the longest voter pass
+308 ms, with three residents on one disk; typical values were 17 to 60 ms. That can exceed the 250 ms
+control deadline. Vote operations therefore answer within a vote deadline of 2 s, and the control loop
+keeps serving meanwhile (README).
+
+**Negative controls.** `podmesh-lab/claude/v3-5-manager-decides/breaks.py` removes each protection in
+turn, runs the test that claims it, and restores the source byte for byte. The heads were web
+`cd754f5` and node `3eadcfc`. The 22 breaks below all fired, and every test passed again after.
+
+| Removed | Test failed with |
+| --- | --- |
+| the same holder carries the barrier | a same-holder barrier earlier than the current one passed |
+| a rotation covers the current certificate's expiry | the library's bound passed one second early; the process test's early rotation was not refused |
+| a rotation covers the renewal bound | the required barrier fell from the renewal bound to the expiry's |
+| the next epoch only | a skipped epoch passed |
+| the previous holder compared with the view's | a wrong previous holder passed |
+| `fence_receipt` refused | a fence receipt was voted for |
+| no unbound field | a payload with an extra field passed |
+| the holder among the nodes | an unknown holder passed; the forger's proposal was not refused |
+| the view needs k votes | one vote moved the view |
+| a conflict decides nothing | a view with two certified decisions for one epoch passed a proposal |
+| the voter checks its view | the early rotation and the forger's proposal got votes |
+| `vote_sign` checks the rules | the early rotation was signed directly |
+| a retried signature answers the recorded vote | the retry was refused `epoch_not_next` |
+| an unadmitted ledger signs nothing | the unadmitted replica voted |
+| a vote's two signatures verified | the forged votes counted |
+| the agent supersedes only above the screen | a supersession sent at the screen |
+| the agent acquires only what names this host | another host's certificate acquired |
+| the agent leaves a held lease alone | the held lease acquired again |
+| the agent delivers nothing on a conflict | a conflicting decision delivered |
+| the agent starts only an idle publisher | a running publisher started again |
+| the node's door relays only `decision_read` | the agent's whole request relayed |
+| the evidence mounted read-only | the mount arguments lost `ro=true` |
+
+Two more breaks ran the whole end-to-end test, with the binary they touch rebuilt. The heads were web
+`61d9456` and node `99e2cd1`, and the baseline and the run after restoring passed, 118 s each. Both
+fired at the check that claims them:
+
+| Removed | End-to-end failed at |
+| --- | --- |
+| the voter's check of its view (every live proposal above the view voted for) | "r0 refuses the early rotation": the rotation that ignored the barrier got votes |
+| the node's count (k-1 signatures accepted, in the node's `signing.rs`) | "the node refuses a hand-made 1-of-3 certificate": it was accepted |
+
+The recorded checks at the final heads: resident library 30/30, the process tests `decisions` 2/2,
+`votes` 1/1, `processes` 42/42 and `inspect_facts` 2/2; manager-ha and manager-network suites
+unchanged and passing; strict resident Clippy and formatting; the collector's and the vote tools' tests;
+the end-to-end test, 14 checks; the lexicon test.
+
+**Not shown here.** These need a laboratory host or the operator:
+
+- the relay of `manager_decision` into a running manager universe;
+- the three host-state mounts made by a real `podman create`;
+- the units under systemd;
+- `publisher_start` with a certificate on a real connector;
+- a power loss right after a signature;
+- all of it with the workstation switched off.
+
+The majority does not extend leases (V3-6). A rotation away from a holder that may still renew by
+itself therefore waits for the renewal bound.
