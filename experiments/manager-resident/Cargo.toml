@@ -12,7 +12,7 @@ serde_json = "1"
 sha2 = "0.10"
 getrandom = "0.2"
 fs2 = "0.4"
-rustix = { version = "1", features = ["net", "process"] }
+rustix = { version = "1", features = ["fs", "net", "process"] }
 # Signed votes (V3-4): the replica signs with its own key, mounted by the host; the same crate and
 # version as the PodMesh node, which verifies the certificates the votes assemble into.
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "zeroize"] }

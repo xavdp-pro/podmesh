@@ -9,6 +9,11 @@
 //! - every other key's ledger, and any ledger of this host's retired keys still in the directory;
 //! - every node's epoch screen (its `activation_status` answers), which moves on certificates only.
 //!
+//! The evidence of other hosts is read from the operator's evidence directory, outside the vote
+//! directory and not writable by the replica, and each file only if its SHA-256 is the one the
+//! operator stated in the readmission request (`readmission_evidence_mismatch` otherwise): a replica
+//! cannot substitute what the operator collected (review of V3-4, finding 1).
+//!
 //! If any of them cannot be read, is not what it claims to be, was collected before the ledger
 //! stopped signing, or holds a vote of a key this replica does not know, it refuses and names each
 //! one (`readmission_inputs_unreadable`). The operator then waits until the input can be read:
@@ -16,8 +21,9 @@
 //! authority-set change) is the way out for a ledger that cannot itself be readmitted -- lost,
 //! unreadable, or bound to another host -- and its new ledger is admitted by this same operation,
 //! from the same inputs, reading the old key's votes as a retired key's, so it gets the same floors.
-//! Readmission also waits: until the longest life a vote may give a certificate, plus the clock
-//! skew, has passed since the ledger was marked,
+//! Readmission also waits: until the longest life a vote may give a certificate, plus the bound on
+//! the skew between any two clocks (60 s, the node's 30 s allowance on each side), has passed since
+//! the ledger was marked,
 //! so that a signature the ledger forgot and a proposer still holds has expired (review finding 1,
 //! "the wait stays, for live grants, not as a substitute for the floor").
 //!
@@ -44,8 +50,6 @@ use std::{
 
 /// The form of an evidence file.
 pub const EVIDENCE_FORM: &str = "podmesh-manager-readmission-evidence/1";
-/// The directory, inside the vote directory, the operator places the evidence in.
-pub const EVIDENCE_DIR: &str = "readmission";
 const EVIDENCE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Why readmission refused, by name, with every input it could not read.
@@ -112,6 +116,8 @@ pub struct Item {
 pub struct Evidence {
     pub items: Vec<Item>,
     pub unreadable: Vec<Unreadable>,
+    /// Evidence whose SHA-256 is not the one the operator stated, or stated and not read.
+    pub mismatched: Vec<Unreadable>,
 }
 
 /// What must be read, from the replica's configuration.
@@ -138,15 +144,20 @@ fn unreadable(input: &str, source: &str, reason: impl Into<String>) -> Unreadabl
     }
 }
 
+/// Reads a regular file without following a symlink, once: what is hashed is what is parsed.
 fn read_file(path: &Path) -> std::io::Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() {
+    use rustix::fs::{open, Mode, OFlags};
+    let fd = open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NOCTTY,
+        Mode::empty(),
+    )?;
+    let file = fs::File::from(fd);
+    if !file.metadata()?.is_file() {
         return Err(std::io::Error::other("not a regular file"));
     }
     let mut bytes = Vec::new();
-    fs::File::open(path)?
-        .take(EVIDENCE_MAX_BYTES + 1)
-        .read_to_end(&mut bytes)?;
+    file.take(EVIDENCE_MAX_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > EVIDENCE_MAX_BYTES {
         return Err(std::io::Error::other("larger than its bound"));
     }
@@ -211,15 +222,31 @@ fn screen_of(node: &str, content: &Value) -> Result<Vec<ScreenEntry>, String> {
 /// Reads one evidence file of the evidence directory.
 fn evidence_file(
     scope: &Scope<'_>,
-    dir: &Path,
+    source_of: &EvidenceSource<'_>,
     input: &'static str,
     source: &str,
-) -> Result<Item, Unreadable> {
-    let path = dir
-        .join(EVIDENCE_DIR)
-        .join(format!("{input}.{source}.json"));
-    let fail = |reason: String| unreadable(input, source, reason);
+) -> Result<Item, Failure> {
+    let name = evidence_name(input, source);
+    let path = source_of.dir.join(&name);
+    let fail = |reason: String| Failure::Unreadable(unreadable(input, source, reason));
     let bytes = read_file(&path).map_err(|e| fail(format!("{}: {e}", path.display())))?;
+    let digest = quorum::sha256_hex(&bytes);
+    match source_of.stated.get(&name) {
+        None => {
+            return Err(fail(format!(
+                "no SHA-256 was stated for {name}: readmission reads only evidence the operator vouched for"
+            )))
+        }
+        Some(stated) if *stated != digest => {
+            return Err(Failure::Mismatch(unreadable(
+                input,
+                source,
+                format!("{name} has SHA-256 {digest}, the operator stated {stated}: substituted or altered since"),
+            )))
+        }
+        Some(_) => {}
+    }
+    let fail = |reason: String| Failure::Unreadable(unreadable(input, source, reason));
     let envelope: Value =
         serde_json::from_slice(&bytes).map_err(|e| fail(format!("does not parse: {e}")))?;
     if envelope["form"].as_str() != Some(EVIDENCE_FORM)
@@ -251,31 +278,86 @@ fn evidence_file(
     Ok(Item {
         input,
         source: source.into(),
-        sha256: quorum::sha256_hex(&bytes),
+        sha256: digest,
         collected_at: Some(collected_at),
         content,
     })
 }
 
-/// Gathers every input the scope requires: the evidence files in `<vote_dir>/readmission/`
+/// The file name of one evidence input in the evidence directory.
+#[must_use]
+pub fn evidence_name(input: &str, source: &str) -> String {
+    format!("{input}.{source}.json")
+}
+
+/// Where the evidence is read from, and the SHA-256 the operator stated for each file.
+pub struct EvidenceSource<'a> {
+    /// The operator's evidence directory: outside the vote directory, and one the replica cannot
+    /// write (`check_evidence_dir`).
+    pub dir: &'a Path,
+    /// File name to SHA-256 (lowercase hex), as the operator's readmission request states them.
+    pub stated: &'a BTreeMap<String, String>,
+}
+
+enum Failure {
+    Unreadable(Unreadable),
+    Mismatch(Unreadable),
+}
+
+/// Every evidence file name readmission will read for this scope, in the order it reads them.
+#[must_use]
+pub fn evidence_names(scope: &Scope<'_>, own_key: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for replica in scope.manager.replicas.iter().map(|r| r.replica_id.as_str()) {
+        if replica != scope.replica_id {
+            names.push(evidence_name("store", replica));
+        }
+    }
+    for key in &scope.policy_keys {
+        if key != own_key {
+            names.push(evidence_name("ledger", key));
+        }
+    }
+    for node in scope.nodes {
+        names.push(evidence_name("screen", node));
+    }
+    names
+}
+
+/// Gathers every input the scope requires: the evidence files in the operator's evidence directory
 /// (`store.<replica>.json` for every other replica, `ledger.<key>.json` for every other key of the
-/// policy, `screen.<node>.json` for every node), this replica's own store as the caller read it, and
-/// any retired key's ledger in the vote directory. What cannot be read is named, never skipped.
+/// policy, `screen.<node>.json` for every node), each checked against the SHA-256 the operator
+/// stated for it; this replica's own store as the caller read it; and any retired key's ledger in
+/// the vote directory. What cannot be read is named, never skipped; a file whose digest is not the
+/// one stated is a mismatch, and so is a stated file readmission does not read. Nothing is read from
+/// the vote directory but this host's own ledgers.
 #[must_use]
 pub fn gather(
     scope: &Scope<'_>,
+    source_of: &EvidenceSource<'_>,
     vote_dir: &Path,
     own_key: &str,
     own_store: Result<Vec<Fact>, String>,
 ) -> Evidence {
     let mut evidence = Evidence::default();
-    let mut take = |result: Result<Item, Unreadable>| match result {
+    let required = evidence_names(scope, own_key);
+    for stated in source_of.stated.keys() {
+        if !required.contains(stated) {
+            evidence.mismatched.push(unreadable(
+                "stated",
+                stated,
+                "a digest was stated for a file readmission does not read",
+            ));
+        }
+    }
+    let mut take = |result: Result<Item, Failure>| match result {
         Ok(item) => evidence.items.push(item),
-        Err(u) => evidence.unreadable.push(u),
+        Err(Failure::Unreadable(u)) => evidence.unreadable.push(u),
+        Err(Failure::Mismatch(u)) => evidence.mismatched.push(u),
     };
     take(
         own_store
-            .map_err(|e| unreadable("own_store", scope.replica_id, e))
+            .map_err(|e| Failure::Unreadable(unreadable("own_store", scope.replica_id, e)))
             .map(|facts| Item {
                 input: "own_store",
                 source: scope.replica_id.into(),
@@ -286,16 +368,16 @@ pub fn gather(
     );
     for replica in scope.manager.replicas.iter().map(|r| r.replica_id.as_str()) {
         if replica != scope.replica_id {
-            take(evidence_file(scope, vote_dir, "store", replica));
+            take(evidence_file(scope, source_of, "store", replica));
         }
     }
     for key in &scope.policy_keys {
         if key != own_key {
-            take(evidence_file(scope, vote_dir, "ledger", key));
+            take(evidence_file(scope, source_of, "ledger", key));
         }
     }
     for node in scope.nodes {
-        take(evidence_file(scope, vote_dir, "screen", node));
+        take(evidence_file(scope, source_of, "screen", node));
     }
     for key in &scope.retired_keys {
         let path = vote_dir.join(format!("{key}.ledger"));
@@ -314,11 +396,91 @@ pub fn gather(
                             content: Content::Ledger(Box::new(ledger)),
                         })
                     })
-                    .map_err(|e| unreadable("retired_ledger", key, e)),
+                    .map_err(|e| Failure::Unreadable(unreadable("retired_ledger", key, e))),
             ),
         }
     }
     evidence
+}
+
+/// Whether this process could write `path`, now or after a `chmod` of its own: writable by it, or
+/// owned by it on a mount that is not read-only.
+fn replica_could_write(path: &Path) -> Result<bool, String> {
+    use rustix::fs::{accessat, statvfs, Access, AtFlags, StatVfsMountFlags, CWD};
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{} is a symlink", path.display()));
+    }
+    let read_only = statvfs(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .f_flag
+        .contains(StatVfsMountFlags::RDONLY);
+    let writable = accessat(CWD, path, Access::WRITE_OK, AtFlags::EACCESS).is_ok();
+    let owned = metadata.uid() == rustix::process::geteuid().as_raw();
+    Ok(writable || (owned && !read_only))
+}
+
+/// Checks the operator's evidence directory before readmission reads it (review of V3-4, finding 1):
+/// it is neither the vote directory nor inside it (nor holds it), and neither it nor any evidence
+/// file in it can be written by this replica, now or after a `chmod` of its own: owned by another
+/// user (the operator) and not writable, or mounted read-only into the universe. The SHA-256 the
+/// operator states for each file is the check that matters; this one keeps the replica from even
+/// staging a substitute.
+///
+/// # Errors
+/// `evidence_dir_unreadable`, `evidence_dir_inside_vote_dir`, `evidence_dir_writable`.
+pub fn check_evidence_dir(
+    evidence_dir: &Path,
+    vote_dir: &Path,
+    names: &[String],
+) -> Result<(), ReadmissionRefusal> {
+    let canonical = |p: &Path| {
+        fs::canonicalize(p).map_err(|e| {
+            refuse(
+                "evidence_dir_unreadable",
+                format!("{}: {e}", p.display()),
+                Vec::new(),
+                None,
+            )
+        })
+    };
+    let (evidence, votes) = (canonical(evidence_dir)?, canonical(vote_dir)?);
+    if evidence.starts_with(&votes) || votes.starts_with(&evidence) {
+        return Err(refuse(
+            "evidence_dir_inside_vote_dir",
+            "the evidence directory must be outside the vote directory, which the replica writes",
+            Vec::new(),
+            None,
+        ));
+    }
+    let mut writable = Vec::new();
+    let mut paths = vec![("evidence_dir".to_string(), evidence_dir.to_path_buf())];
+    paths.extend(names.iter().map(|n| (n.clone(), evidence_dir.join(n))));
+    for (what, path) in paths {
+        match replica_could_write(&path) {
+            Ok(false) => {}
+            Ok(true) => writable.push(unreadable(
+                &what,
+                &path.display().to_string(),
+                "the replica could write it",
+            )),
+            Err(e) if what != "evidence_dir" && fs::symlink_metadata(&path).is_err() => {
+                let _ = e; // A missing file is gather's to report, by name.
+            }
+            Err(e) => writable.push(unreadable(&what, &path.display().to_string(), e)),
+        }
+    }
+    if writable.is_empty() {
+        Ok(())
+    } else {
+        Err(refuse(
+            "evidence_dir_writable",
+            "readmission reads evidence only from a directory the replica cannot write: owned by the operator, or mounted read-only",
+            writable,
+            None,
+        ))
+    }
 }
 
 /// The highest numbers seen, per resource and kind, and this key's highest vote sequence.
@@ -450,6 +612,17 @@ pub fn readmit(
         ));
     }
     let since = ledger.unadmitted_since.unwrap_or(ledger.created_at);
+    if !evidence.mismatched.is_empty() {
+        return Err(refuse(
+            "readmission_evidence_mismatch",
+            format!(
+                "{} evidence file(s) are not what the operator stated; the ledger stays unadmitted",
+                evidence.mismatched.len()
+            ),
+            evidence.mismatched,
+            None,
+        ));
+    }
     let mut missing = evidence.unreadable;
     for item in &evidence.items {
         if item.collected_at.is_some_and(|at| at < since) {
@@ -492,7 +665,7 @@ pub fn readmit(
             None,
         ));
     }
-    let ready_at = since + signer.rules().max_certificate_life + ledger::CLOCK_SKEW_SECONDS;
+    let ready_at = since + signer.rules().max_certificate_life + ledger::CLOCK_SKEW_BOUND_SECONDS;
     if now < ready_at {
         return Err(refuse(
             "readmission_too_early",

@@ -93,7 +93,60 @@ struct Resident {
     vote_dir: PathBuf,
     config: Configuration,
     host_file: PathBuf,
+    /// The machine-id path the resident is given: the file itself, or its read-only mount.
+    host_id: PathBuf,
+    /// The operator's evidence directory, as the test writes it.
+    evidence: PathBuf,
+    mounts: Option<ReadOnlyMounts>,
     child: Option<Child>,
+}
+
+/// A read-only bind mount of `paths`, held by a helper process in its own user and mount namespace,
+/// reached through `/proc/<helper>/root` (the same helper as the library tests').
+struct ReadOnlyMounts {
+    helper: Child,
+}
+
+impl ReadOnlyMounts {
+    fn new(paths: &[&Path]) -> Option<Self> {
+        let mut script = String::new();
+        for p in paths {
+            let p = p.display();
+            script.push_str(&format!(
+                "mount --bind '{p}' '{p}' && mount -o remount,bind,ro '{p}' && "
+            ));
+        }
+        script.push_str("echo ready && exec sleep 600");
+        let mut helper = Command::new("unshare")
+            .args(["-rm", "sh", "-c", &script])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(helper.stdout.take()?),
+            &mut line,
+        )
+        .ok()?;
+        if line.trim() != "ready" {
+            let _ = helper.kill();
+            let _ = helper.wait();
+            return None;
+        }
+        Some(Self { helper })
+    }
+
+    fn view(&self, path: &Path) -> PathBuf {
+        PathBuf::from(format!("/proc/{}/root{}", self.helper.id(), path.display()))
+    }
+}
+
+impl Drop for ReadOnlyMounts {
+    fn drop(&mut self) {
+        let _ = self.helper.kill();
+        let _ = self.helper.wait();
+    }
 }
 
 impl Resident {
@@ -105,6 +158,8 @@ impl Resident {
         place_key(&vote_dir, "replica-a", 1);
         let host_file = dir.path().join("machine-id");
         fs::write(&host_file, format!("{HOST}\n")).unwrap();
+        let evidence = dir.path().join("evidence");
+        private(&evidence);
         let bind = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -151,6 +206,7 @@ impl Resident {
                 replica_keys: BTreeMap::from([("r0".to_string(), "replica-a".to_string())]),
                 retired_keys: vec![],
                 nodes: vec![NODE.into()],
+                evidence_dir: evidence.clone(),
                 operator_uid,
                 max_certificate_life_seconds: LIFE,
             }),
@@ -159,9 +215,43 @@ impl Resident {
             dir,
             vote_dir,
             config,
+            host_id: host_file.clone(),
             host_file,
+            evidence,
+            mounts: None,
             child: None,
         }
+    }
+
+    /// Gives the resident its machine-id and the evidence directory through read-only mounts, as
+    /// the host would; false where user namespaces are unavailable.
+    fn mount_read_only(&mut self) -> bool {
+        let Some(mounts) = ReadOnlyMounts::new(&[&self.host_file, &self.evidence]) else {
+            return false;
+        };
+        self.host_id = mounts.view(&self.host_file);
+        self.config.votes.as_mut().unwrap().evidence_dir = mounts.view(&self.evidence);
+        self.mounts = Some(mounts);
+        true
+    }
+
+    /// The SHA-256 of every evidence file as it is now: what the operator states.
+    fn digests(&self) -> Value {
+        let mut stated = serde_json::Map::new();
+        for entry in fs::read_dir(&self.evidence).unwrap() {
+            let entry = entry.unwrap();
+            let bytes = fs::read(entry.path()).unwrap();
+            let digest: String = <sha2::Sha256 as sha2::Digest>::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            stated.insert(entry.file_name().into_string().unwrap(), json!(digest));
+        }
+        Value::Object(stated)
+    }
+
+    fn readmit(&self, id: &str, stated: &Value) -> Value {
+        self.control(&json!({"operation": "vote_ledger_readmit", "operation_id": id, "evidence_sha256": stated}))
     }
 
     fn start(&mut self) {
@@ -176,7 +266,7 @@ impl Resident {
             Command::new(env!("CARGO_BIN_EXE_podmesh-manager-resident-lab"))
                 .env("PODMESH_MANAGER_NETWORK_MODE", "authenticated-static-peers")
                 .env("PODMESH_MANAGER_VOTE_DIR", &self.vote_dir)
-                .env("PODMESH_MANAGER_HOST_ID_FILE", &self.host_file)
+                .env("PODMESH_MANAGER_HOST_ID_FILE", &self.host_id)
                 .arg(path)
                 .stdout(Stdio::null())
                 .stderr(Stdio::from(log))
@@ -271,8 +361,7 @@ impl Resident {
     /// Evidence for readmission: replica-b's and replica-c's ledgers, made by their own signers, and
     /// the node's screen, collected at `at`.
     fn write_evidence(&self, at: i64) {
-        let evidence = self.vote_dir.join("readmission");
-        private(&evidence);
+        let evidence = self.evidence.clone();
         for (key, seed) in &KEYS[1..] {
             let dir = self.dir.path().join(format!("peer-{key}"));
             private(&dir);
@@ -339,7 +428,30 @@ fn the_resident_signs_votes_under_its_ledger() {
     assert_eq!(refused["code"], "caller_uid_refused", "{refused}");
     stranger.stop();
 
+    // The machine-id on a writable mount: said at the start, and nothing is signed or created.
     let mut resident = Resident::new(rustix::process::geteuid().as_raw());
+    resident.start();
+    assert_eq!(
+        resident.ledger_state()["ledger_state"],
+        "host_identity_not_read_only"
+    );
+    assert!(resident
+        .stderr()
+        .contains("resident vote alert: host_identity_not_read_only"));
+    assert_eq!(
+        resident.sign("sign-rw", &takeover(3, X, now()))["code"],
+        "host_identity_not_read_only"
+    );
+    let refused =
+        resident.control(&json!({"operation": "vote_ledger_init", "operation_id": "init-rw"}));
+    assert_eq!(refused["code"], "host_identity_not_read_only", "{refused}");
+    resident.stop();
+    if !resident.mount_read_only() {
+        eprintln!(
+            "SKIPPED the rest: read-only mounts need unprivileged user namespaces (unshare -rm)"
+        );
+        return;
+    }
     resident.start();
     assert_eq!(resident.ledger_state()["ledger_state"], "ledger_missing");
     assert_eq!(
@@ -356,8 +468,7 @@ fn the_resident_signs_votes_under_its_ledger() {
     );
 
     // Readmission: nothing to read yet, then too early, then admitted above the screen.
-    let unreadable =
-        resident.control(&json!({"operation": "vote_ledger_readmit", "operation_id": "readmit-1"}));
+    let unreadable = resident.readmit("readmit-1", &json!({}));
     assert_eq!(
         unreadable["code"], "readmission_inputs_unreadable",
         "{unreadable}"
@@ -383,15 +494,30 @@ fn the_resident_signs_votes_under_its_ledger() {
         ]
     );
     resident.write_evidence(now());
-    let early =
-        resident.control(&json!({"operation": "vote_ledger_readmit", "operation_id": "readmit-2"}));
+    let stated = resident.digests();
+    let early = resident.readmit("readmit-2", &stated);
     assert_eq!(early["code"], "readmission_too_early", "{early}");
     let ready_at = early["retry_at"].as_i64().unwrap();
     while now() < ready_at {
         thread::sleep(Duration::from_millis(200));
     }
-    let admitted =
-        resident.control(&json!({"operation": "vote_ledger_readmit", "operation_id": "readmit-3"}));
+    // The screen replaced after its digest was stated: refused, by name.
+    let screen = resident.evidence.join(format!("screen.{NODE}.json"));
+    let original = fs::read(&screen).unwrap();
+    write_one(
+        &resident.evidence,
+        "screen",
+        NODE,
+        now(),
+        json!({"activation_status": []}),
+    );
+    let substituted = resident.readmit("readmit-3a", &stated);
+    assert_eq!(
+        substituted["code"], "readmission_evidence_mismatch",
+        "{substituted}"
+    );
+    fs::write(&screen, original).unwrap();
+    let admitted = resident.readmit("readmit-3", &stated);
     assert_eq!(admitted["vote_ledger"], "admitted", "{admitted}");
     assert_eq!(admitted["admission"]["floors_set"][R]["epoch_floor"], 2);
     assert_eq!(resident.ledger_state()["ledger_state"], "admitted");
@@ -461,6 +587,7 @@ fn the_resident_signs_votes_under_its_ledger() {
     resident.stop();
 
     // The same directory seen from another host signs nothing.
+    // Written on the host's side; the resident still reads it through the read-only mount.
     fs::write(&resident.host_file, format!("{OTHER_HOST}\n")).unwrap();
     resident.start();
     assert_eq!(

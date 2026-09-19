@@ -29,7 +29,7 @@ use std::{
 const T0: i64 = 1_700_000_000;
 const LIFE: i64 = 300;
 /// Past the readmission wait of a ledger created at T0.
-const T1: i64 = T0 + LIFE + ledger::CLOCK_SKEW_SECONDS + 1;
+const T1: i64 = T0 + LIFE + 60 + 1;
 const R: &str = "91eeb6bf-5489-405b-b77a-53105b0aff7a";
 const R2: &str = "0a6a0a36-5c4b-4a3f-9f3e-7d9c1b2a3e4f";
 const X: &str = "5d1c0b8e-3f59-4d0e-9d7a-2a1e7c4b9f10";
@@ -178,7 +178,8 @@ fn write_evidence(
     ledgers: &[(&str, Value)],
     screen: &[Value],
 ) {
-    let evidence = private_dir(dir, readmission::EVIDENCE_DIR);
+    let evidence = evidence_dir_of(dir);
+    private(&evidence);
     let m = manager();
     for (replica, facts) in stores {
         let content = json!({"history_count": facts.len(), "ordered_facts": facts,
@@ -204,6 +205,60 @@ fn write_one(evidence: &Path, input: &str, source: &str, at: i64, content: Value
         serde_json::to_vec(&file).unwrap(),
     )
     .unwrap();
+}
+
+/// The operator's evidence directory for the replica whose vote directory is `vote_dir`: a sibling,
+/// outside it.
+fn evidence_dir_of(vote_dir: &Path) -> PathBuf {
+    vote_dir.with_file_name(format!(
+        "{}-evidence",
+        vote_dir.file_name().unwrap().to_str().unwrap()
+    ))
+}
+
+fn private(dir: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// What the operator states: the SHA-256 of every evidence file in `dir`, as it is now.
+fn stated_digests(dir: &Path) -> BTreeMap<String, String> {
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .map(|e| e.unwrap())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                .map(|e| {
+                    (
+                        e.file_name().into_string().unwrap(),
+                        quorum::sha256_hex(&fs::read(e.path()).unwrap()),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Gathers a readmission's evidence from the operator's evidence directory of `signer`, with the
+/// digests stated as `stated`, or as the files are now.
+fn gather_for(
+    s: &Scope<'_>,
+    signer: &Signer,
+    stated: Option<&BTreeMap<String, String>>,
+    own: Result<Vec<Fact>, String>,
+) -> readmission::Evidence {
+    let dir = evidence_dir_of(signer.dir());
+    let now_stated = stated_digests(&dir);
+    readmission::gather(
+        s,
+        &readmission::EvidenceSource {
+            dir: &dir,
+            stated: stated.unwrap_or(&now_stated),
+        },
+        signer.dir(),
+        signer.key_id(),
+        own,
+    )
 }
 
 /// A peer ledger as evidence: a real ledger file, made by that key's own signer in its own directory.
@@ -237,7 +292,7 @@ fn readmit_with(
     let keys = replica_keys();
     let nodes = vec![NODE.to_string()];
     let s = scope(&m, &keys, &nodes, signer.policy(), retired);
-    let evidence = readmission::gather(&s, signer.dir(), signer.key_id(), Ok(own_store));
+    let evidence = gather_for(&s, signer, None, Ok(own_store));
     readmission::readmit(signer, &s, evidence, "readmit-test", Some(0), now)
 }
 
@@ -1101,7 +1156,7 @@ fn a_policy_change_cannot_reopen_an_epoch() {
         &[("replica-b", b), ("replica-c", c)],
         &[],
     );
-    let later = T1 + LIFE + 31;
+    let later = T1 + LIFE + 61;
     // (d) the retired key not configured: the vote cannot be verified, and nothing is guessed.
     let refused = readmit_with_keys(&a2, own_store.clone(), &[], later).unwrap_err();
     assert_eq!(refused.code, "readmission_inputs_unreadable");
@@ -1137,7 +1192,7 @@ fn readmit_with_keys(
     keys.insert("r-a".into(), signer.key_id().into());
     let nodes = vec![NODE.to_string()];
     let s = scope(&m, &keys, &nodes, signer.policy(), retired);
-    let evidence = readmission::gather(&s, signer.dir(), signer.key_id(), Ok(own_store));
+    let evidence = gather_for(&s, signer, None, Ok(own_store));
     readmission::readmit(signer, &s, evidence, "readmit-rekey", Some(0), now)
 }
 
@@ -1194,14 +1249,15 @@ fn readmission_with_an_unreadable_input_refuses() {
             &screen,
         );
     };
-    let evidence_dir = dir.join(readmission::EVIDENCE_DIR);
-    let ready = marked + LIFE + ledger::CLOCK_SKEW_SECONDS;
+    let evidence_dir = evidence_dir_of(&dir);
+    // The longest life plus the bound on the skew between two clocks, 60 s.
+    let ready = marked + LIFE + 60;
     let refused = |expected_input: &str, expected_source: &str, own: Result<Vec<Fact>, String>| {
         let m = manager();
         let keys = replica_keys();
         let nodes = vec![NODE.to_string()];
         let s = scope(&m, &keys, &nodes, signer.policy(), &[]);
-        let evidence = readmission::gather(&s, signer.dir(), signer.key_id(), own);
+        let evidence = gather_for(&s, &signer, None, own);
         let e = readmission::readmit(&signer, &s, evidence, "readmit", Some(0), ready + 100)
             .unwrap_err();
         assert_eq!(e.code, "readmission_inputs_unreadable", "{e}");
@@ -1346,4 +1402,345 @@ fn the_tally_finds_no_conflict_when_promises_are_kept() {
         .collect();
     let (_, conflicts) = vote::tally(&q, &[votes, forged].concat());
     assert_eq!(conflicts, [(vote::PromiseKind::Epoch, R.to_string(), 5)]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The counter-review of V3-4: evidence the replica cannot substitute, a read-only host identity,
+// a lock that cannot be replaced under a live signer, and the wait's skew bound.
+
+/// A read-only bind mount of `paths`, held by a helper process in its own user and mount
+/// namespace; this process reaches it through `/proc/<helper>/root`. `None` where unprivileged user
+/// namespaces are not available, and the caller says it skipped.
+pub(crate) struct ReadOnlyMounts {
+    helper: std::process::Child,
+}
+
+impl ReadOnlyMounts {
+    pub(crate) fn new(paths: &[&Path]) -> Option<Self> {
+        let mut script = String::new();
+        for p in paths {
+            let p = p.display();
+            script.push_str(&format!(
+                "mount --bind '{p}' '{p}' && mount -o remount,bind,ro '{p}' && "
+            ));
+        }
+        script.push_str("echo ready && exec sleep 600");
+        let mut helper = Command::new("unshare")
+            .args(["-rm", "sh", "-c", &script])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(helper.stdout.take()?),
+            &mut line,
+        )
+        .ok()?;
+        if line.trim() != "ready" {
+            let _ = helper.kill();
+            let _ = helper.wait();
+            return None;
+        }
+        Some(Self { helper })
+    }
+
+    /// `path` as this process sees it on the read-only mount.
+    pub(crate) fn view(&self, path: &Path) -> PathBuf {
+        PathBuf::from(format!("/proc/{}/root{}", self.helper.id(), path.display()))
+    }
+}
+
+impl Drop for ReadOnlyMounts {
+    fn drop(&mut self) {
+        let _ = self.helper.kill();
+        let _ = self.helper.wait();
+    }
+}
+
+/// Proves (finding 1): readmission reads only evidence whose SHA-256 the operator stated. A peer's
+/// store replaced after the digests were stated by a shorter history that is consistent in itself
+/// (its own digest recomputed, the co-signed epoch dropped) is refused
+/// `readmission_evidence_mismatch`, naming it; so is a digest stated for a file readmission does not
+/// read; a required file with no digest stated is unreadable. The ledger stays unadmitted. With the
+/// digests of what is there, the same shorter history would have been admitted with a floor below
+/// the epoch it dropped: the digest is what catches it.
+#[test]
+fn evidence_substituted_after_its_digest_was_stated_is_refused() {
+    let root = temp_root();
+    let dir = private_dir(root.path(), "a");
+    place_key(&dir, "replica-a", 1);
+    let signer = signer_a(&dir);
+    signer.init(T0).unwrap();
+    let q = policy(ABC, 0);
+    let dir_b = private_dir(root.path(), "b-live");
+    place_key(&dir_b, "replica-b", 2);
+    let b = open(&dir_b, "replica-b", HOST_OTHER, policy(ABC, 0));
+    b.init(T0).unwrap();
+    admit_by_hand(&b);
+    let b4 = b.sign(&takeover(&q, R, 4, X, T0), &[], T0).unwrap();
+    let c_ledger = peer_ledger(root.path(), "replica-c", 3);
+    // The operator collected replica-b's store, which holds its vote for epoch 4, and an empty
+    // ledger of replica-b's key from elsewhere: only the store shows epoch 4.
+    write_evidence(
+        &dir,
+        T0,
+        &[("r-b", vote_facts("r-b", &[b4])), ("r-c", vec![])],
+        &[
+            ("replica-b", peer_ledger(root.path(), "replica-b", 2)),
+            ("replica-c", c_ledger),
+        ],
+        &[],
+    );
+    let evidence = evidence_dir_of(&dir);
+    let stated = stated_digests(&evidence);
+    // The substitute: replica-b's store with its vote for epoch 4 dropped, consistent in itself.
+    write_evidence_store(&evidence, "r-b", T0, &[]);
+    let m = manager();
+    let keys = replica_keys();
+    let nodes = vec![NODE.to_string()];
+    let s = scope(&m, &keys, &nodes, signer.policy(), &[]);
+    let e = readmission::readmit(
+        &signer,
+        &s,
+        gather_for(&s, &signer, Some(&stated), Ok(vec![])),
+        "r",
+        Some(0),
+        T1,
+    )
+    .unwrap_err();
+    assert_eq!(e.code, "readmission_evidence_mismatch", "{e}");
+    assert!(
+        e.unreadable
+            .iter()
+            .any(|u| u.input == "store" && u.source == "r-b"),
+        "{e}"
+    );
+    assert!(!signer.load().unwrap().admitted);
+    // A digest stated for a file readmission does not read.
+    let mut extra = stated_digests(&evidence);
+    extra.insert("store.r-z.json".into(), "00".repeat(32));
+    let e = readmission::readmit(
+        &signer,
+        &s,
+        gather_for(&s, &signer, Some(&extra), Ok(vec![])),
+        "r",
+        Some(0),
+        T1,
+    )
+    .unwrap_err();
+    assert_eq!(e.code, "readmission_evidence_mismatch", "{e}");
+    // A required file with no digest stated.
+    let mut short = stated_digests(&evidence);
+    short.remove("screen.11111111-2222-4333-8444-555555555555.json");
+    let e = readmission::readmit(
+        &signer,
+        &s,
+        gather_for(&s, &signer, Some(&short), Ok(vec![])),
+        "r",
+        Some(0),
+        T1,
+    )
+    .unwrap_err();
+    assert_eq!(e.code, "readmission_inputs_unreadable", "{e}");
+    assert!(
+        e.unreadable
+            .iter()
+            .any(|u| u.input == "screen" && u.reason.contains("no SHA-256 was stated")),
+        "{e}"
+    );
+    // What the digest caught: vouched for as it is now, the substitute admits below epoch 4.
+    let admitted = readmission::readmit(
+        &signer,
+        &s,
+        gather_for(&s, &signer, None, Ok(vec![])),
+        "r",
+        Some(0),
+        T1,
+    )
+    .unwrap();
+    assert!(
+        admitted.floors_set.get(R).is_none_or(|f| f.epoch_floor < 4),
+        "{admitted:?}"
+    );
+}
+
+fn write_evidence_store(evidence: &Path, replica: &str, at: i64, facts: &[Fact]) {
+    let m = manager();
+    let content = json!({"history_count": facts.len(), "ordered_facts": facts,
+                         "logical_history_sha256": facts_history_sha256(&m, facts).unwrap()});
+    write_one(evidence, "store", replica, at, content);
+}
+
+/// Proves (finding 1): evidence placed in the vote directory, which the replica writes, is never
+/// read. Complete, correct evidence under `<vote_dir>/readmission/`, with its digests stated, and an
+/// empty evidence directory: readmission names every input missing from the evidence directory, and
+/// reads nothing from the vote directory.
+#[test]
+fn evidence_placed_in_the_vote_directory_is_ignored() {
+    let root = temp_root();
+    let dir = private_dir(root.path(), "a");
+    place_key(&dir, "replica-a", 1);
+    let signer = signer_a(&dir);
+    signer.init(T0).unwrap();
+    empty_world(root.path(), &dir, T0);
+    let evidence = evidence_dir_of(&dir);
+    let inside = dir.join("readmission");
+    fs::rename(&evidence, &inside).unwrap();
+    private(&evidence);
+    let stated = stated_digests(&inside);
+    assert_eq!(stated.len(), 5);
+    let m = manager();
+    let keys = replica_keys();
+    let nodes = vec![NODE.to_string()];
+    let s = scope(&m, &keys, &nodes, signer.policy(), &[]);
+    let gathered = gather_for(&s, &signer, Some(&stated), Ok(vec![]));
+    assert_eq!(
+        gathered.items.iter().map(|i| i.input).collect::<Vec<_>>(),
+        ["own_store"]
+    );
+    let e = readmission::readmit(&signer, &s, gathered, "r", Some(0), T1).unwrap_err();
+    assert_eq!(e.code, "readmission_inputs_unreadable", "{e}");
+    assert_eq!(e.unreadable.len(), 5, "{e}");
+    // And the evidence directory itself may not be the vote directory or inside it.
+    let refused = readmission::check_evidence_dir(&inside, &dir, &[]).unwrap_err();
+    assert_eq!(refused.code, "evidence_dir_inside_vote_dir");
+    let refused = readmission::check_evidence_dir(&dir, &dir, &[]).unwrap_err();
+    assert_eq!(refused.code, "evidence_dir_inside_vote_dir");
+}
+
+/// Proves (finding 1): the evidence directory must be one the replica cannot write, now or after a
+/// `chmod` of its own. A directory of this user is refused even at mode 0555 with 0444 files
+/// (`evidence_dir_writable`); the same directory mounted read-only is accepted; a symlinked evidence
+/// file is refused.
+#[test]
+fn the_evidence_directory_must_be_one_the_replica_cannot_write() {
+    let root = temp_root();
+    let dir = private_dir(root.path(), "a");
+    let evidence = private_dir(root.path(), "a-evidence");
+    fs::write(evidence.join("store.r-b.json"), "{}").unwrap();
+    let names = vec!["store.r-b.json".to_string()];
+    let e = readmission::check_evidence_dir(&evidence, &dir, &names).unwrap_err();
+    assert_eq!(e.code, "evidence_dir_writable");
+    fs::set_permissions(
+        evidence.join("store.r-b.json"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    fs::set_permissions(&evidence, fs::Permissions::from_mode(0o555)).unwrap();
+    let e = readmission::check_evidence_dir(&evidence, &dir, &names).unwrap_err();
+    assert_eq!(
+        e.code, "evidence_dir_writable",
+        "not writable now, but this user's to chmod"
+    );
+    fs::set_permissions(&evidence, fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(
+        evidence.join("store.r-b.json"),
+        evidence.join("screen.n.json"),
+    )
+    .unwrap();
+    fs::set_permissions(&evidence, fs::Permissions::from_mode(0o555)).unwrap();
+    let Some(mounts) = ReadOnlyMounts::new(&[&evidence]) else {
+        eprintln!("SKIPPED: the read-only case needs unprivileged user namespaces (unshare -rm)");
+        return;
+    };
+    let seen = mounts.view(&evidence);
+    readmission::check_evidence_dir(&seen, &dir, &names).unwrap();
+    let e =
+        readmission::check_evidence_dir(&seen, &dir, &["screen.n.json".to_string()]).unwrap_err();
+    assert_eq!(e.code, "evidence_dir_writable", "a symlink is refused: {e}");
+    drop(mounts);
+    fs::set_permissions(&evidence, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Proves (finding 4): the host's machine-id is read only from a regular file on a read-only mount.
+/// The same file on a writable mount is `host_identity_not_read_only`, a symlink to it and a relative
+/// path are `host_identity_unreadable`; mounted read-only it reads. A whole-VM clone carries the
+/// same machine-id, read-only or not: this does not replace the rule of no VM clone (A3).
+#[test]
+fn the_host_identity_is_read_only_from_a_read_only_mount() {
+    let root = temp_root();
+    let file = root.path().join("machine-id");
+    fs::write(&file, format!("{HOST_A}\n")).unwrap();
+    assert_eq!(
+        HostIdentity::read(&file).unwrap_err().code,
+        "host_identity_not_read_only"
+    );
+    let link = root.path().join("machine-id-link");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    assert_eq!(
+        HostIdentity::read(&link).unwrap_err().code,
+        "host_identity_unreadable"
+    );
+    assert_eq!(
+        HostIdentity::read(Path::new("machine-id"))
+            .unwrap_err()
+            .code,
+        "host_identity_unreadable"
+    );
+    let Some(mounts) = ReadOnlyMounts::new(&[&file]) else {
+        eprintln!("SKIPPED: the read-only case needs unprivileged user namespaces (unshare -rm)");
+        return;
+    };
+    assert_eq!(
+        HostIdentity::read(&mounts.view(&file))
+            .unwrap()
+            .machine_id(),
+        HOST_A
+    );
+}
+
+/// Proves (finding 3): a lock file removed and replaced under a live signer lets no second signer
+/// in. Signer X is paused after reading the ledger, holding the lock; the lock file of the previous
+/// design (`replica-a.ledger.lock`) is removed and replaced by a new file; signer Y is started.
+/// Exactly one signs epoch 9, three rounds: the lock is on the vote directory, which the replacement
+/// does not touch.
+#[test]
+fn a_replaced_lock_file_lets_no_second_signer_in() {
+    for round in 0..3 {
+        let root = temp_root();
+        let dir = private_dir(root.path(), "a");
+        let _signer = admitted_a(root.path(), &dir);
+        let q = policy(ABC, 0);
+        let lock_file = dir.join("replica-a.ledger.lock");
+        fs::write(&lock_file, "").unwrap();
+        let mark = root.path().join("x-paused");
+        let mut x = run_child(
+            &dir,
+            "x",
+            &takeover(&q, R, 9, X, T1),
+            T1,
+            &[
+                ("PODMESH_VOTE_TEST_PAUSE", "after_check".to_string()),
+                ("PODMESH_VOTE_TEST_PAUSE_MS", "1500".to_string()),
+                ("PODMESH_VOTE_TEST_PAUSE_MARK", mark.display().to_string()),
+            ],
+        );
+        let started = std::time::Instant::now();
+        while !mark.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "round {round}: X never reached its pause"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = fs::remove_file(&lock_file);
+        fs::write(&lock_file, "replaced").unwrap();
+        let mut y = run_child(&dir, "y", &takeover(&q, R, 9, Y, T1), T1, &[]);
+        assert!(x.wait().unwrap().success() && y.wait().unwrap().success());
+        let outcomes: BTreeSet<String> = ["x", "y"]
+            .iter()
+            .map(|t| fs::read_to_string(dir.join(format!("outcome-{t}"))).unwrap())
+            .collect();
+        assert_eq!(
+            outcomes,
+            ["epoch_already_promised".to_string(), "signed".to_string()].into(),
+            "round {round}"
+        );
+        assert_eq!(
+            ["x", "y"].iter().filter_map(|t| released(&dir, t)).count(),
+            1,
+            "round {round}"
+        );
+    }
 }

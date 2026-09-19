@@ -350,8 +350,15 @@ the universe's state, named by `PODMESH_MANAGER_VOTE_DIR` (private, of the servi
 ledger. No recovery point, restore, clone or migration of the replica's universe carries either.
 The host also mounts its own machine-id read-only at `PODMESH_MANAGER_HOST_ID_FILE` (default
 `/etc/machine-id`), not inside the vote directory: a universe's own `/etc/machine-id` travels with
-a clone, and a copy of the vote directory must not carry the identity it is checked against. A
-configuration with `votes` and no vote directory does not start.
+a clone, and a copy of the vote directory must not carry the identity it is checked against. The
+resident checks it at the start and at every operation: an absolute path to a regular file, opened
+without following a symlink, on a mount that is read-only for the process (`statvfs`
+`ST_RDONLY`). Otherwise it signs nothing and answers `host_identity_not_read_only` (or
+`host_identity_unreadable`); at the start it also writes `resident vote alert:` and the code on
+standard error. This keeps a replica from rewriting the identity its ledger is bound to. It does
+not tell a whole-VM clone from its original, which carries the same machine-id, key and ledger:
+the operator's rule of no VM clone of a laboratory host on the managed network (A3) stays what
+closes that. A configuration with `votes` and no vote directory does not start.
 
 **The ledger** (rule R4 of the quorum model: the promise lives with the key). Per resource, one
 entry per epoch with its holder, and one entry per `from_serial` with the new policy's digest.
@@ -361,7 +368,9 @@ same decision again, with a fresh life (`issued_at`, `expires_at`) only, is re-s
 decision for a promised number, or for a number below one promised, is refused. Every signature
 takes the next sequence number. The header binds the key (its id and public half), the host's
 machine-id and a random nonce made with the ledger; a checksum covers the file. A signature is one
-step under an exclusive `flock` on `<key_id>.ledger.lock`: check, write the new ledger to a
+step under an exclusive `flock` on the vote directory itself, opened without following a symlink
+and checked after locking to still be the directory its path names (a lock file could be removed or
+replaced under a live signer, and the next signer would lock a new file): check, write the new ledger to a
 temporary file, fsync it, rename it over the ledger, fsync the directory, and only then sign. A
 missing, unreadable, foreign (another key or another host) or unadmitted ledger signs nothing and
 answers a named code: `ledger_missing`, `ledger_unreadable`, `ledger_foreign_key`,
@@ -387,18 +396,27 @@ the code on standard error, and keeps the alert in its status. A forged vote can
 
 **Readmission** is the operator's, and fails closed. It reads this replica's store; for every other
 replica its store, and for every other key of the policy its ledger, and for every node of
-`votes.nodes` its screen, from evidence files the operator places in `<vote dir>/readmission/`
+`votes.nodes` its screen, from evidence files the operator places in `votes.evidence_dir`
 (`store.<replica_id>.json`, `ledger.<key_id>.json`, `screen.<host_uuid>.json`, each
 `{"form": "podmesh-manager-readmission-evidence/1", "input", "source", "collected_at", "content"}`,
 the content being an `--inspect-store --facts-only` output, a ledger file, or
 `{"activation_status": [...]}`); and the ledgers of this host's retired keys still in the vote
-directory. It refuses, naming each input (`readmission_inputs_unreadable`), when one is missing,
+directory. The evidence directory is outside the vote directory (`evidence_dir_inside_vote_dir`)
+and one the replica cannot write, now or after a `chmod` of its own: owned by the operator and not
+writable by the service's user, or mounted read-only into the universe (`evidence_dir_writable`
+otherwise, naming the directory or file). Nothing is read from the vote directory but this host's
+own ledgers. The request states the SHA-256 of every evidence file (`evidence_sha256`, file name to
+digest); each file is read once, hashed, and parsed from those bytes, and a digest that is not the
+one stated, or a digest stated for a file readmission does not read, refuses by name
+(`readmission_evidence_mismatch`); a required file with no digest stated is unreadable. The
+replica can therefore not substitute what the operator collected. It refuses, naming each input (`readmission_inputs_unreadable`), when one is missing,
 does not parse, is not what it claims (a store whose digest does not match its facts, a ledger whose
 checksum fails, a screen of another host), was collected before the ledger was marked, or holds a
 vote of a key it does not know (a retired key must be named in `votes.retired_keys`). It never
-proceeds on what it could read. It then waits until `max_certificate_life_seconds` plus 30 seconds
+proceeds on what it could read. It then waits until `max_certificate_life_seconds` plus 60 seconds
 have passed since the ledger was marked (`readmission_too_early`, with `retry_at`), so that a
-signature the ledger forgot and a proposer still holds has expired. It sets, per resource, the
+signature the ledger forgot and a proposer still holds has expired on every clock: 60 seconds is the
+bound on the skew between any two clocks, the node's 30-second allowance on each side. It sets, per resource, the
 epoch floor at the highest epoch anything showed (a promise, a vote, a screen) and the serial floor
 at the highest `from_serial` promised or already passed, raises the sequence above the key's own
 votes, records what it read (with digests) and what it set, and admits the ledger. Where an input
@@ -414,7 +432,7 @@ they never move backwards.
 ```json
 {"operation":"vote_ledger_init","operation_id":"init-1"}
 {"operation":"vote_ledger_mark_unadmitted","operation_id":"mark-1","reason":"host restored from a snapshot"}
-{"operation":"vote_ledger_readmit","operation_id":"readmit-1"}
+{"operation":"vote_ledger_readmit","operation_id":"readmit-1","evidence_sha256":{"store.r1.json":"<sha256>","ledger.replica-b.json":"<sha256>","screen.<host_uuid>.json":"<sha256>"}}
 {"operation":"vote_sign","operation_id":"sign-1","payload":{"kind":"podmesh-takeover-proof/quorum-ed25519","...":"..."}}
 ```
 
@@ -436,14 +454,32 @@ refusal code), `sequence`, `unadmitted_since`, `unadmitted_reason`, `admissions`
 The optional `votes` configuration: `key_id`, `authority_id`, `authority_quorum` (the nodes'
 `{"threshold", "keys"}`), `authority_serial`, `replica_keys` (every replica of the topology and its
 own key of the policy), `retired_keys` (`[{"key_id", "public_key"}]`, optional), `nodes` (1 to 64
-host UUIDs), `operator_uid` and `max_certificate_life_seconds` (1 to 3,600). The topology must grant
+host UUIDs), `evidence_dir` (absolute), `operator_uid` and `max_certificate_life_seconds` (1 to 3,600). The topology must grant
 `votes/<replica_id>` to this replica.
+
+**The restore checklist.** The tripwire sees only the key's votes that reached this replica's
+store; a restored ledger shown none of its later votes signs again what it forgot (the
+`host_restore_silent` cell of the quorum model, 323 runs in 2,000). The mark is therefore the
+precondition of every restore, not a courtesy. After any revert of a host VM's snapshot, any
+restore of a host from a backup, or any restore of the vote directory:
+
+1. Start the resident with nothing that calls `vote_sign` running (the host's agent stopped), and
+   run `vote_ledger_mark_unadmitted` for every key of that host before the replica catches up with
+   its peers (`vote_sign` is refused until it has); only then start the agent.
+2. Collect the evidence from every other host into the evidence directory, after the mark, and
+   record each file's SHA-256.
+3. Run `vote_ledger_readmit` with those digests once `retry_at` has passed. If an input cannot be
+   read, wait for it.
+
+No local marker narrows the silent case soundly. Everything on the host, a marker file, the ledger's
+mtime, its nonce, the store, is reverted with the host's snapshot and stays consistent with the
+ledger it was reverted with; the boot ID changes at every legitimate reboot too. Only what lives
+off the host survives a revert: the other hosts, which the tripwire reads, and the operator, who
+marks. A hypervisor's VM generation ID would be such a witness; it is not read here.
 
 **Not here.** Proposing, collecting votes across replicas, deciding, reading a decision through the
 node's door and delivering certificates (V3-5); lease extension by majority (V3-6); the operator's
-tool that collects readmission evidence from the hosts; re-keying without a trusted dealer. The
-tripwire sees only the votes that reached this replica's store: a restored ledger shown none of its
-later votes signs again what it forgot, which is why the restore procedure marks it unadmitted first.
+tool that collects readmission evidence from the hosts; re-keying without a trusted dealer.
 Clones of a whole host VM (key, ledger and machine-id together) are indistinguishable from the
 original: the operator's rule of no VM clone of a laboratory host on the managed network stands.
 

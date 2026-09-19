@@ -21,10 +21,11 @@
 //! created unadmitted: only the operator's readmission (`readmission.rs`) admits one, after reading
 //! everything that could show what its key promised before.
 //!
-//! Signing is one step under an exclusive `flock` on `<key_id>.ledger.lock` (one signer per ledger,
-//! A4): read and check the ledger, check the tripwire, check the promise rule, write the new ledger to
-//! a temporary file, fsync it, rename it over the ledger, fsync the directory (A2), and only then sign
-//! and return the vote (A7). A crash anywhere before the end releases no signature.
+//! Signing is one step under an exclusive `flock` on the vote directory itself (one signer per
+//! ledger, A4; a lock file could be removed or replaced under a live signer): read and check the
+//! ledger, check the tripwire, check the promise rule, write the new ledger to a temporary file,
+//! fsync it, rename it over the ledger, fsync the directory (A2), and only then sign and return the
+//! vote (A7). A crash anywhere before the end releases no signature.
 //!
 //! The tripwire (review finding 3): before signing, the signer reads the votes it is shown (its peers'
 //! facts, and its own store's). A vote of its own key, whose signatures verify under its key, with a
@@ -51,6 +52,10 @@ use std::{
 pub const LEDGER_FORM: &str = "podmesh-manager-vote-ledger/1";
 /// How far ahead of this replica's clock a payload may be issued, as the node allows.
 pub const CLOCK_SKEW_SECONDS: i64 = 30;
+/// The bound on the skew between any two clocks that matter here, a signer's and a node's: the
+/// node's 30-second allowance on each side. Readmission waits the longest certificate life plus
+/// this bound (review of V3-4, finding 5).
+pub const CLOCK_SKEW_BOUND_SECONDS: i64 = 2 * CLOCK_SKEW_SECONDS;
 /// The largest ledger file read.
 const LEDGER_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -105,13 +110,53 @@ impl HostIdentity {
 
     /// # Errors
     /// `host_identity_unreadable`.
+    /// Reads the host's machine-id from `path`, which must be a regular file, not a symlink, on a
+    /// mount that is read-only for this process (`statvfs` `ST_RDONLY` on the opened file): the host
+    /// mounts its identity into the universe read-only, and a replica that could write the file
+    /// could make any ledger its own. This does not tell a whole-VM clone from its original, which
+    /// carries the same machine-id: the rule of no VM clone of a laboratory host on the managed
+    /// network (A3) stays the operator's.
+    ///
+    /// # Errors
+    /// `host_identity_unreadable`, `host_identity_not_read_only`.
     pub fn read(path: &Path) -> Result<HostIdentity, LedgerRefusal> {
-        let text = fs::read_to_string(path).map_err(|e| {
+        use rustix::fs::{fstatvfs, open, Mode, OFlags, StatVfsMountFlags};
+        let fail = |e: &dyn std::fmt::Display| {
             refusal(
                 "host_identity_unreadable",
                 format!("{}: {e}", path.display()),
             )
-        })?;
+        };
+        if !path.is_absolute() {
+            return Err(fail(
+                &"the host's machine-id file must be named by an absolute path",
+            ));
+        }
+        let fd = open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NOCTTY,
+            Mode::empty(),
+        )
+        .map_err(|e| fail(&e))?;
+        let mut file = File::from(fd);
+        if !file.metadata().map_err(|e| fail(&e))?.is_file() {
+            return Err(fail(&"not a regular file"));
+        }
+        let mount = fstatvfs(&file).map_err(|e| fail(&e))?;
+        if !mount.f_flag.contains(StatVfsMountFlags::RDONLY) {
+            return Err(refusal(
+                "host_identity_not_read_only",
+                format!(
+                    "{} is on a writable mount: the host's machine-id must be mounted read-only into the universe",
+                    path.display()
+                ),
+            ));
+        }
+        let mut text = String::new();
+        (&mut file)
+            .take(64)
+            .read_to_string(&mut text)
+            .map_err(|e| fail(&e))?;
         HostIdentity::from_machine_id(&text)
     }
 
@@ -485,35 +530,60 @@ impl Signer {
         self.dir.join(format!("{}.ledger", self.key_id))
     }
 
-    fn lock_path(&self) -> PathBuf {
-        self.dir.join(format!("{}.ledger.lock", self.key_id))
-    }
-
     fn temp_path(&self) -> PathBuf {
         self.dir.join(format!(".{}.ledger.tmp", self.key_id))
     }
 
-    /// Takes the ledger's exclusive lock, waiting at most the rules' lock wait.
+    /// What the lock is taken on: the vote directory itself, opened without following a symlink.
+    /// A lock file can be removed or replaced under a live signer, and the next signer then locks a
+    /// new inode (review of V3-4, finding 3); the directory holds the key and the ledger, and cannot
+    /// be removed while they are in it. Returns the open directory and the path it must still be.
+    fn lock_target(&self) -> Result<(File, PathBuf), LedgerRefusal> {
+        use rustix::fs::{open, Mode, OFlags};
+        let fd = open(
+            &self.dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| refusal("storage", format!("the vote directory, to lock: {e}")))?;
+        Ok((File::from(fd), self.dir.clone()))
+    }
+
+    /// Takes the exclusive lock of this signer's vote directory, waiting at most the rules' lock
+    /// wait. After locking, the directory's path must still name the inode locked; if it was renamed
+    /// or replaced meanwhile, the lock is dropped and taken again on what the path names now.
     pub(crate) fn lock(&self) -> Result<LedgerLock, LedgerRefusal> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .open(self.lock_path())
-            .map_err(|e| refusal("storage", format!("the ledger's lock: {e}")))?;
+        use std::os::unix::fs::MetadataExt as _;
         let deadline = Instant::now() + self.rules.lock_wait;
         loop {
-            match file.try_lock_exclusive() {
-                Ok(()) => return Ok(LedgerLock(file)),
-                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
-                Err(_) => {
-                    return Err(refusal(
-                        "ledger_busy",
-                        "another signer holds this ledger's lock",
-                    ))
+            let (file, path) = self.lock_target()?;
+            loop {
+                match file.try_lock_exclusive() {
+                    Ok(()) => break,
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => {
+                        return Err(refusal(
+                            "ledger_busy",
+                            "another signer holds this ledger's lock",
+                        ))
+                    }
                 }
+            }
+            let locked = file
+                .metadata()
+                .map_err(|e| refusal("storage", e.to_string()))?;
+            let named =
+                fs::symlink_metadata(&path).map_err(|e| refusal("storage", e.to_string()))?;
+            if (locked.dev(), locked.ino()) == (named.dev(), named.ino()) {
+                return Ok(LedgerLock(file));
+            }
+            if Instant::now() >= deadline {
+                return Err(refusal(
+                    "ledger_busy",
+                    "the locked vote directory was replaced under its path while waiting",
+                ));
             }
         }
     }
@@ -842,12 +912,17 @@ pub(crate) mod points {
     pub const CRASH: &str = "PODMESH_VOTE_TEST_CRASH";
     pub const PAUSE: &str = "PODMESH_VOTE_TEST_PAUSE";
     pub const PAUSE_MS: &str = "PODMESH_VOTE_TEST_PAUSE_MS";
+    /// A file written when the pause is reached, before sleeping.
+    pub const PAUSE_MARK: &str = "PODMESH_VOTE_TEST_PAUSE_MARK";
 
     pub fn reach(name: &str) {
         if std::env::var(CRASH).as_deref() == Ok(name) {
             std::process::abort();
         }
         if std::env::var(PAUSE).as_deref() == Ok(name) {
+            if let Ok(mark) = std::env::var(PAUSE_MARK) {
+                let _ = std::fs::write(mark, name);
+            }
             let ms = std::env::var(PAUSE_MS)
                 .ok()
                 .and_then(|v| v.parse().ok())

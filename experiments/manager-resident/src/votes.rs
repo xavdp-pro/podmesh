@@ -5,13 +5,16 @@
 //! The host provides two things outside the universe's state, through the environment:
 //! `PODMESH_MANAGER_VOTE_DIR`, the private directory holding the replica's key (`<key_id>.key`) and
 //! its signing ledger (`<key_id>.ledger`), and `PODMESH_MANAGER_HOST_ID_FILE`, the host's machine-id
-//! mounted read-only (default `/etc/machine-id`). Neither is in the store or in any recovery point.
+//! mounted read-only (default `/etc/machine-id`; checked read-only at the start and at every
+//! operation). Neither is in the store or in any recovery point. The configuration names a third,
+//! `votes.evidence_dir`: the operator's evidence for readmission, which the replica cannot write.
 //!
 //! Operations, each one JSON object on the control socket:
 //!
 //! - `vote_ledger_init` (the operator): creates the ledger of this replica's key, unadmitted;
 //! - `vote_ledger_mark_unadmitted` (the operator): the restore procedure's mark;
-//! - `vote_ledger_readmit` (the operator): readmission, which fails closed;
+//! - `vote_ledger_readmit` (the operator): readmission, which fails closed, reading only the evidence
+//!   files whose SHA-256 the request states (`evidence_sha256`, file name to digest);
 //! - `vote_sign` (the observation writer): signs a vote for a certificate payload under the ledger's
 //!   rules, reading the votes in this replica's store for the tripwire, and appends it as a fact in
 //!   this replica's vote scope `votes/<replica_id>` before it answers with it.
@@ -76,6 +79,9 @@ pub struct VoteConfiguration {
     pub retired_keys: Vec<RetiredKey>,
     /// Every PodMesh node whose epoch screen readmission reads, by host UUID.
     pub nodes: Vec<String>,
+    /// The operator's evidence directory for readmission: an absolute path outside the vote
+    /// directory that the replica cannot write (owned by the operator, or mounted read-only).
+    pub evidence_dir: PathBuf,
     /// The only UID that may create, mark and readmit the ledger.
     pub operator_uid: u32,
     /// The longest life a vote gives a certificate, in seconds; readmission waits it out.
@@ -154,6 +160,9 @@ impl VoteConfiguration {
                 return Err("a retired key is not a key of the policy".into());
             }
         }
+        if !self.evidence_dir.is_absolute() {
+            return Err("votes.evidence_dir must be an absolute path".into());
+        }
         if !(1..=3600).contains(&self.max_certificate_life_seconds) {
             return Err("votes.max_certificate_life_seconds must be 1 to 3600".into());
         }
@@ -178,6 +187,7 @@ pub(crate) enum VoteOperation {
     },
     Readmit {
         operation_id: String,
+        evidence_sha256: BTreeMap<String, String>,
     },
     Sign {
         operation_id: String,
@@ -217,6 +227,14 @@ impl VoteRuntime {
             .ok_or("votes are configured: PODMESH_MANAGER_VOTE_DIR must name the host-provided vote directory")?;
         let host_id_file = std::env::var_os(HOST_ID_FILE_ENV)
             .map_or_else(|| PathBuf::from(DEFAULT_HOST_ID_FILE), PathBuf::from);
+        // Checked at every signature too; said at once, so that a mount made writable by mistake
+        // is seen at the start rather than at the first vote.
+        if let Err(e) = HostIdentity::read(&host_id_file) {
+            eprintln!(
+                "resident vote alert: {}: {}; this replica signs nothing until it is fixed",
+                e.code, e.detail
+            );
+        }
         Ok(Some(VoteRuntime {
             config: votes.clone(),
             manager: config.network.manager.clone(),
@@ -296,7 +314,10 @@ impl VoteRuntime {
                 Ok(l) => serde_json::to_vec(&json!({"vote_ledger": "unadmitted", "unadmitted_since": l.unadmitted_since})).unwrap_or_default(),
                 Err(e) => refused(&e),
             },
-            VoteOperation::Readmit { operation_id } => self.readmit(&signer, &operation_id, uid, store, replica_id),
+            VoteOperation::Readmit {
+                operation_id,
+                evidence_sha256,
+            } => self.readmit(&signer, &operation_id, &evidence_sha256, uid, store, replica_id),
             VoteOperation::Sign { operation_id, payload } => self.sign(&signer, &operation_id, &payload, store, replica_id),
         }
     }
@@ -305,6 +326,7 @@ impl VoteRuntime {
         &self,
         signer: &Signer,
         operation_id: &str,
+        evidence_sha256: &BTreeMap<String, String>,
         uid: u32,
         store: impl Fn() -> Result<Store>,
         replica_id: &str,
@@ -335,17 +357,31 @@ impl VoteRuntime {
             retired_keys: retired,
             nodes: &config.nodes,
         };
+        let refused = |e: readmission::ReadmissionRefusal| {
+            serde_json::to_vec(&json!({"error": "readmission_refused", "code": e.code, "detail": e.detail,
+                                       "unreadable": e.unreadable, "retry_at": e.retry_at, "alternative": e.alternative}))
+            .unwrap_or_default()
+        };
+        let names = readmission::evidence_names(&scope, &config.key_id);
+        if let Err(e) = readmission::check_evidence_dir(&config.evidence_dir, &self.dir, &names) {
+            return refused(e);
+        }
         let evidence = readmission::gather(
             &scope,
+            &readmission::EvidenceSource {
+                dir: &config.evidence_dir,
+                stated: evidence_sha256,
+            },
             &self.dir,
             &config.key_id,
             own_store.map_err(|e| e.to_string()),
         );
         match readmission::readmit(signer, &scope, evidence, operation_id, Some(uid), now()) {
-            Ok(admission) => serde_json::to_vec(&json!({"vote_ledger": "admitted", "admission": admission})).unwrap_or_default(),
-            Err(e) => serde_json::to_vec(&json!({"error": "readmission_refused", "code": e.code, "detail": e.detail,
-                                                  "unreadable": e.unreadable, "retry_at": e.retry_at, "alternative": e.alternative}))
-                .unwrap_or_default(),
+            Ok(admission) => {
+                serde_json::to_vec(&json!({"vote_ledger": "admitted", "admission": admission}))
+                    .unwrap_or_default()
+            }
+            Err(e) => refused(e),
         }
     }
 

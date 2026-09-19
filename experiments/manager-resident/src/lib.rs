@@ -810,6 +810,7 @@ enum Control {
     },
     VoteLedgerReadmit {
         operation_id: String,
+        evidence_sha256: BTreeMap<String, String>,
     },
     VoteSign {
         operation_id: String,
@@ -1376,12 +1377,18 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
                                 deadline,
                                 &mut append_workers,
                             ),
-                            Ok(Control::VoteLedgerReadmit { operation_id }) => vote_control(
+                            Ok(Control::VoteLedgerReadmit {
+                                operation_id,
+                                evidence_sha256,
+                            }) => vote_control(
                                 &config,
                                 &shared,
                                 &stream,
                                 &operation_id.clone(),
-                                votes::VoteOperation::Readmit { operation_id },
+                                votes::VoteOperation::Readmit {
+                                    operation_id,
+                                    evidence_sha256,
+                                },
                                 deadline,
                                 &mut append_workers,
                             ),
