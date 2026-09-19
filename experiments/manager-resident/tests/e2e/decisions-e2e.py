@@ -25,7 +25,9 @@ What it shows, in order:
     screen moves;
  7. one replica stopped: the one vote left decides nothing, the agents deliver nothing, and a hand-made
     1-of-3 certificate from that vote is refused by the node (below_threshold), with its screen unmoved;
- 8. the agents run again with nothing new: nothing is delivered twice.
+ 8. the stopped replica back, the same decision re-issued with a fresh life is decided and delivered; the
+    agents run again with nothing new: nothing is delivered twice; every vote operation answered within
+    the vote deadline.
 
 Run (paths from the environment, nothing durable written outside TMPDIR):
   PODMESH_MANAGERD=<resident binary> PODMESHD=<podmeshd> PODMESH_DECISION_FOLLOW=<agent script> \\
@@ -436,6 +438,10 @@ def run(lab):
     check(all(r[0] == 0 and r[1]["action"].startswith("none") for r in results) and screens(lab) == [4, 4, 4],
           "the agents run again with no new decision: nothing is delivered twice")
     summary["final"] = {"screens": screens(lab), "decided": lab.read(0)["current"]["epoch"]}
+    timings = {f"r{i}": {k: lab.control(i, {"operation": "status"})["votes"][k] for k in ("operations", "voter")} for i in range(3)}
+    summary["timings"] = timings
+    check(all(t["longest_ms"] < 2000 for r in timings.values() for t in r["operations"].values()),
+          "every vote operation of every replica answered within the 2 s vote deadline (timings in the summary)", timings)
 
 
 if __name__ == "__main__":

@@ -129,3 +129,46 @@ running concurrently across three hosts converged their facts — three boot fac
 sets, authenticated imports from both peers on each replica, exchange audit rows — verified from
 outside with all three running. What it does not prove: the active manager role, takeover, partitions,
 and agent access to the control API.
+
+## The replica's host state (V3-5)
+
+A replica that votes keeps its signing key and its signing ledger outside the universe's state, and
+checks the host's machine-id on a read-only mount (V3-4, the operator's custody decision and rule R4).
+The universe gets them from PodMesh's `create` with `manager_host_state: <name>` (the node's
+`LOCAL-API.md`), as exactly three bind mounts derived from the name:
+
+| In the universe | On the host | Mode |
+| --- | --- | --- |
+| `/run/podmesh-host/votes` | `<node state>/manager-host/<name>/votes` | read-write: `<key_id>.key`, `<key_id>.ledger` |
+| `/run/podmesh-host/evidence` | `<node state>/manager-host/<name>/evidence` | read-only: the operator's readmission evidence |
+| `/run/podmesh-host/machine-id` | `/etc/machine-id` | read-only |
+
+The entrypoint sees `/run/podmesh-host/votes` and gives the resident `PODMESH_MANAGER_VOTE_DIR` and
+`PODMESH_MANAGER_HOST_ID_FILE`. The configuration names `votes.evidence_dir` =
+`/run/podmesh-host/evidence`. Without the mounts, a configuration that votes does not start: the
+resident refuses, and the start exits 2.
+
+No recovery point, clone or migration carries the key or the ledger. PodMesh refuses mounts to live
+captures, clones and migrations, and a stopped capture exports the root filesystem only. A roll that
+deletes and re-creates the replica under the same name finds them again.
+
+The procedure, the seed never leaving its host:
+
+1. On each host, as root: `replicated/vote-key.py --vote-dir <node state>/manager-host/<name>/votes
+   --key-id <key_id>`. It writes the seed (0600) and prints the public half only.
+2. Where the replica set was generated: `replicated/add-votes.py --dir <set> --key <alias>:<key_id>:<public
+   key> ... --resource <uuid>:<lease>:<margin>:<renewal not_after>`, with an optional `--baseline` for a
+   resource moving from the gate. It adds each replica's `votes` section and its `votes/` and
+   `proposals/` scopes, and prints the policy digest. The nodes' policies must name the same
+   `authority_quorum`.
+3. Declare each configuration as the replica's secret and create the universe with its
+   `manager_host_state`.
+4. Create each ledger (`vote_ledger_init`, as the operator, through `podman exec` into the universe,
+   where the peer's PID is visible). Gather the evidence into the host's evidence directory with the
+   resident's `tools/collect-readmission-evidence.py`, and readmit (`vote_ledger_readmit` with the
+   printed digests) once `retry_at` has passed.
+5. On each host, enable the node's decision follow timer under its mandate (`DECISION-FOLLOW.md` of the
+   node). Its `manager_universe` is the replica's universe.
+
+`replicated/test_votes_tools.py` holds the two helpers. The node's test holds the three mounts. Neither
+has run on a laboratory host.

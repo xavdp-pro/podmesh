@@ -7,7 +7,9 @@ the typed `manager-network` and durable SQLite `manager-ha` path dependencies.
 It never calls Podman, runs commands, publishes DNS/IP, grants permits, performs
 fencing or activation, or changes enrollment. Configured to, it signs votes under a
 signing ledger ([below](#signed-votes-and-the-signing-ledger-v3-4)); a vote grants
-nothing until k of them make a certificate that a PodMesh node verifies itself.
+nothing until k of them make a certificate that a PodMesh node verifies itself. Configured to
+decide, it reads the proposals its peers carry, checks each against its own view and votes for the
+ones that pass ([the manager decides](#the-manager-decides-v3-5)).
 
 ## Resident behavior
 
@@ -189,6 +191,7 @@ endpoints, commands or topology. Protect local config/DB; never commit secrets.
 | Control request frame | 32,768 bytes within the shared 250 ms control deadline |
 | Observation value | Nonempty UTF-8, at most 4,096 bytes |
 | Control response | 32,768 bytes within the shared 250 ms control deadline |
+| Vote operation (V3-4, V3-5) | Answered within 2,000 ms of its request; the control loop keeps serving meanwhile |
 | Socket path | Absolute, at most 100 bytes, private parent directory |
 
 SQLite uses a five-second busy timeout. These are not hard real-time guarantees.
@@ -441,12 +444,19 @@ The first three require the caller's UID to be `votes.operator_uid`; `vote_sign`
 `vote_operation_refused` with `caller_uid_refused`. `vote_ledger_init` creates an unadmitted ledger
 and refuses an existing one (`ledger_exists`). `vote_sign` records the vote as a fact in
 `votes/<replica_id>` (subject `epoch:<resource>:<epoch>` or `serial:<resource>:<from_serial>`)
-before it answers `{"vote", "fact"}`; a vote that could not be recorded is not answered
+before it answers `{"vote", "fact", "replayed"}`; a vote that could not be recorded is not answered
 (`vote_unrecorded`), and its promise stays in the ledger. The operations share the append worker:
 `vote_busy` while it is occupied, `vote_operation_uncertain` when the worker did not finish inside
-the control deadline (the ledger and the store keep what it did; `status` shows the ledger). Retry
-a signature with a fresh `operation_id`: the ledger re-signs the same decision, and the store
-refuses a changed request under an old one. Refusals are `{"error": "vote_refused", "code",
+the vote deadline (the ledger and the store keep what it did; `status` shows the ledger). **A
+signature is idempotent (V3-5):** a payload this replica already voted for, whose promise its ledger
+holds, is answered with the vote already recorded (`replayed: true`), whatever the `operation_id`,
+nothing signed or appended again, even once its certificate has formed. **The vote deadline
+(V3-5):** a vote operation reads the store, verifies every vote and writes durably, which can
+outlast the 250 ms control deadline on a busy disk (342 ms measured once, with three residents on one
+workstation disk and a debug build). The control loop no longer waits for it: it keeps serving
+status, appends and the network, and answers the vote operation when its worker finishes, within
+2,000 ms of the request, or `vote_operation_uncertain` after that. `status` reports each operation's
+last and longest duration (`votes.operations`). Refusals are `{"error": "vote_refused", "code",
 "detail"}` and `{"error": "readmission_refused", "code", "detail", "unreadable", "retry_at",
 "alternative"}`. `status` carries `votes`: `key_id`, `ledger_state` (`admitted`, `unadmitted` or the
 refusal code), `sequence`, `unadmitted_since`, `unadmitted_reason`, `admissions` and `alerts`.
@@ -477,11 +487,106 @@ ledger it was reverted with; the boot ID changes at every legitimate reboot too.
 off the host survives a revert: the other hosts, which the tripwire reads, and the operator, who
 marks. A hypervisor's VM generation ID would be such a witness; it is not read here.
 
-**Not here.** Proposing, collecting votes across replicas, deciding, reading a decision through the
-node's door and delivering certificates (V3-5); lease extension by majority (V3-6); the operator's
-tool that collects readmission evidence from the hosts; re-keying without a trusted dealer.
+**Not here** (see [the manager decides](#the-manager-decides-v3-5) for what V3-5 added): lease
+extension by majority (V3-6); re-keying without a trusted dealer.
 Clones of a whole host VM (key, ledger and machine-id together) are indistinguishable from the
 original: the operator's rule of no VM clone of a laboratory host on the managed network stands.
+
+## The manager decides (V3-5)
+
+With `votes.decisions` configured, the replicas decide an epoch rotation or a same-holder re-issue of
+the resources it names, by majority, and nothing else: declaring a host lost stays the operator's
+recorded decision, and a lease is still extended by its holder (V3-6).
+
+**A proposal** is a fact. It carries the full payload of a takeover certificate: the resource, the
+target epoch, the new holder and its `holder_boot_id`, the grant, the method, the barrier
+`eligible_after`, and the life `issued_at` and `expires_at`. It is recorded by
+`decision_propose` in the proposing replica's scope `proposals/<replica_id>` (the topology must grant
+it; `proposals_not_granted` otherwise), and replication carries it:
+
+```json
+{"operation":"decision_propose","operation_id":"propose-1","payload":{"kind":"podmesh-takeover-proof/quorum-ed25519","...":"..."}}
+```
+
+The proposing replica checks the payload's shape, policy, resource and life only
+(`proposal_refused` with a code otherwise), and answers `{"proposal", "payload_digest", "here"}`,
+`here` being its own verdict. **The proposer is not trusted.**
+
+**The voter** is a worker of the resident. Every `voter_interval_ms`, once the process has caught up
+with its peers, it reads the proposals its store holds. It checks each live one above its view
+(`decisions.rs`, `check`) and votes, under the V3-4 signing ledger, for one that passes. The vote is
+recorded in `votes/<replica_id>`. The rules, each refusal named:
+
+- a takeover certificate of this replica's policy (`decision_kind`, `policy_mismatch`), for a resource
+  it decides (`resource_not_decided_here`), carrying no field the node does not bind
+  (`payload_unknown_field`), live on this clock and living at most `max_certificate_life_seconds`
+  (`certificate_life`);
+- its holder a node of `votes.nodes` (`holder_not_a_node`), its identifiers ones the node accepts
+  (`payload_invalid`), its barrier no later than its expiry (`barrier_after_expiry`);
+- **the view**: the highest-epoch certificate the store's votes assemble into, counted only from each
+  voter's own scope and only on verified signatures, or before any, the operator's recorded
+  `baseline` for a resource moving from the gate. The proposal is the next epoch (`epoch_not_next`)
+  with the view's holder as its previous holder (`previous_holder_mismatch`). A view that holds two
+  certified decisions for one epoch decides nothing (`conflict_in_view`);
+- **the method** (`MANAGER-PUBLISHER-CONTRACT.md` of the node, "The barrier, as it is"):
+  - `first` only before any epoch (`first_after_an_epoch`);
+  - `same_holder` only to the current holder (`not_the_same_holder`), carrying its barrier;
+  - `lease_barrier` carrying the barrier and, when the holder changes, covering every way the previous
+    holder may still hold its lease without being told, each plus the lease and the margin: its
+    re-acquisition under the current certificate until that expires, a renewal by itself until
+    `renewal_not_after` (the follow mandates' `not_after`, the operator's recorded bound; 0 when none
+    renews by itself), and an acquisition at the proposal's issue (`barrier_too_early`, naming the
+    barrier required);
+  - `fence_receipt` is refused (`fence_receipt_unverifiable`): a receipt is the previous holder node's
+    unsigned answer to its own fence, which no replica can verify, and one that shortened the barrier
+    would let a single proposer start a second holder.
+
+The ledger then keeps the promise of one decision per epoch. A voter whose store lags sees a lower
+epoch and votes a round later: a late vote costs time, never safety. `vote_sign` applies the same rules to a
+takeover payload and refuses a policy change (`decision_kind`), when `votes.decisions` is configured.
+Without it, V3-4's behaviour is unchanged.
+
+**The read.** `decision_read` (the observation writer or the operator) answers:
+
+```json
+{"operation":"decision_read","resource":"<uuid>"}
+{"decision":{"resource","view":{"epoch","holder","barrier","expires_at","source"},
+             "current":{"epoch","holder","payload_digest","voters","certificate"}|null,
+             "pending":[{"payload_digest","new_epoch","new_holder","method","eligible_after","expires_at","live",
+                         "proposed_by","voters","votes","threshold","missing","here"}],
+             "conflicts":[],"threshold","keys","read_at"}}
+```
+
+`current.certificate` is what a PodMesh node verifies: k signatures of distinct keys over one payload,
+checked with the node's rules before it leaves. `pending` lists up to eight proposals above it, each
+with what is missing and this replica's own verdict (`here`: `voted`, `refused` with its code,
+`expired`, or `not_evaluated`). A host reads it through the node's door (`manager_decision`) and
+delivers the certificate with its decision follow tick (the node's `packaging/podmesh-decision-follow`).
+
+**Configuration.** `votes.decisions`:
+
+```json
+{"voter_interval_ms": 1000,
+ "resources": [{"resource": "<uuid>", "lease_seconds": 300, "takeover_margin_seconds": 30, "renewal_not_after": 0,
+                "baseline": {"epoch": 157, "holder": "<host uuid>", "eligible_after": 1789681724}}]}
+```
+
+`lease_seconds` and `takeover_margin_seconds` are the nodes' policy for the resource: the longest lease
+any holder holds. `renewal_not_after` is the latest second any holder may renew by itself. `baseline` is
+optional. The topology grants `proposals/<replica_id>` to each replica that proposes.
+`packaging/podmesh-manager/universe/replicated/add-votes.py` writes all of it for a generated replica set.
+
+**Readmission evidence** is gathered by `tools/collect-readmission-evidence.py`. From a plan naming one
+command per input, it collects:
+
+- every other replica's store (`--inspect-store --facts-only`);
+- every other key's ledger;
+- every node's screen (its `screen` subcommand, run on that node's host).
+
+It writes them read-only into the operator's evidence directory in the form readmission reads, and
+prints the `evidence_sha256` map and the request to send. It fails closed and writes nothing when an
+input is missing, extra, fails, or is not what it claims, or when the replica's ledger is not marked
+unadmitted.
 
 ## Validation and gaps
 
