@@ -197,3 +197,54 @@ Not shown here: a power loss (A2 is the disk's; the laboratory disks' `cache=non
 2026-09-18), a whole-VM clone (indistinguishable, A3: the operator's rule), a peer that forges votes
 over a live authenticated link between two residents (the counting refuses them on any path, shown
 at the library), and anything of V3-5: proposing, collecting, deciding, delivering.
+
+### After the counter-review of V3-4 (`3531ca4`)
+
+The counter-review (`podmesh-lab` `records/reviews/REVIEW-V3-4-SIGNED-VOTES-2026-09-18.md`, "holds
+with changes") found five points; the operator told us to follow its recommendations. Date:
+2026-09-19. The read-only mounts of these tests are real: a helper process holds a read-only bind
+mount in its own user and mount namespace (`unshare -rm`), and the test reaches it through
+`/proc/<helper>/root`. A test that cannot make one says `SKIPPED` on standard error; none skipped in
+the recorded runs, and the break script refuses a run that does.
+
+| Test | Proves |
+| --- | --- |
+| `evidence_substituted_after_its_digest_was_stated_is_refused` | a peer's store replaced after its digest was stated, by a shorter history consistent in itself that drops the peer's vote for epoch 4, is `readmission_evidence_mismatch`, naming it; so is a digest stated for a file readmission does not read; a required file with no digest stated is unreadable; the ledger stays unadmitted; vouched for as it is, the same substitute would have been admitted with a floor below 4 |
+| `evidence_placed_in_the_vote_directory_is_ignored` | complete, correct evidence in `<vote_dir>/readmission/` with its digests stated, and an empty evidence directory: only the own store is read and the five inputs are named unreadable; an evidence directory that is the vote directory or inside it is `evidence_dir_inside_vote_dir` |
+| `the_evidence_directory_must_be_one_the_replica_cannot_write` | a directory of the replica's own user is `evidence_dir_writable`, at mode 0755 and at 0555 with 0444 files (it could `chmod` them back); the same directory mounted read-only is accepted; a symlinked evidence file in it is refused |
+| `the_host_identity_is_read_only_from_a_read_only_mount` | the machine-id on a writable mount is `host_identity_not_read_only`; a symlink to it and a relative path are `host_identity_unreadable`; mounted read-only it reads |
+| `a_replaced_lock_file_lets_no_second_signer_in` | signer X paused after reading the ledger and holding the lock; the lock file of the previous design removed and replaced; signer Y started: exactly one signs epoch 9, three rounds |
+| `readmission_with_an_unreadable_input_refuses` (changed) | `retry_at` is pinned at the mark plus the certificate life plus 60 s |
+| `tests/votes.rs` (extended) | the resident given its machine-id on a writable mount says `host_identity_not_read_only` on standard error at the start, in its status, and to `vote_sign` and `vote_ledger_init`; given it and the evidence directory through read-only mounts, it runs the whole chain, readmission stating digests; the screen replaced after its digest was stated is `readmission_evidence_mismatch`, then the original is admitted |
+
+**Negative controls.** The thirteen earlier breaks were run again at `3531ca4` and all fired; one
+break per new protection was added, and all six fired; every test passed again after the source was
+restored byte for byte:
+
+| Removed | Test failed with |
+| --- | --- |
+| the comparison of each evidence file with its stated SHA-256 | the substituted store was admitted |
+| the separate evidence directory (read from `<vote_dir>/readmission/` again) | the five inputs were read from the vote directory |
+| the check that the replica cannot write the evidence directory | the replica's own directory was accepted |
+| the read-only check of the machine-id's mount | the machine-id was read from a writable mount |
+| the lock on the vote directory (a lock file again, with an inode check after locking) | both signers signed epoch 9: an inode check does not stop a signer that locks the replacement |
+| the 60-second bound (30 s again) | readmission admitted 30 s before `retry_at` |
+
+**What was not closed, and why.**
+
+- **Whole-VM clones.** The read-only check keeps a replica from rewriting its own identity. It does
+  not tell a whole-VM clone from its original, which carries the same machine-id, key and ledger. The
+  rule of no VM clone of a laboratory host on the managed network (A3) stays what closes that.
+- **A silently restored ledger.** No local marker narrows this case soundly. Everything kept on the
+  host (a marker file, the ledger's mtime or nonce, the store) is reverted with the host's snapshot
+  and stays consistent with the ledger it was reverted with. The boot ID changes at every legitimate
+  reboot. What survives a revert is off the host: the other hosts, which the tripwire reads, and the
+  operator, who marks the ledger. The README's restore checklist makes the mark the precondition of
+  every restore.
+- **Ownership by the operator.** The ownership of the evidence directory by the operator, rather than
+  by the service's user, is packaging (V3-5). A root resident passes the check only through a
+  read-only mount.
+
+The recorded checks at `3531ca4`: resident library 28/28, resident process suite 42/42, the votes
+process test and the two inspection tests; manager-ha and manager-network suites unchanged and
+passing; strict resident Clippy and formatting; the tree's lexicon test.
