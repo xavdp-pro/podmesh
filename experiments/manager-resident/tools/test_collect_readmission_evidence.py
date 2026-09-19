@@ -9,7 +9,7 @@ complete plan writes one read-only file per input, each an evidence envelope sta
 prints the digests of exactly those bytes and the readmission request. The same tool against real
 residents and nodes, followed by the resident's readmission, is the end-to-end test's
 (tests/e2e/decisions-e2e.py). No daemon, no host. Run: python3 -B tools/test_collect_readmission_evidence.py"""
-import hashlib, json, os, pathlib, socket, stat, subprocess, sys, tempfile, threading, time
+import hashlib, json, os, pathlib, shutil, socket, stat, subprocess, sys, tempfile, threading, time
 
 TOOL = pathlib.Path(__file__).resolve().parent / "collect-readmission-evidence.py"
 NODES = ["0a0a0a0a-0000-4000-8000-000000000000", "1b1b1b1b-1111-4111-8111-111111111111"]
@@ -128,6 +128,7 @@ def main():
     assert out["request"]["operation"] == "vote_ledger_readmit" and out["request"]["evidence_sha256"] == out["evidence_sha256"]
     checks.append("a complete plan writes one read-only envelope per input, collected after the mark, and prints the digests of exactly those bytes and the readmission request")
 
+    shutil.rmtree(td, ignore_errors=True)
     for c in checks:
         print("PASS", c)
     print(f"{len(checks)} checks passed")
