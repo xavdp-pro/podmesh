@@ -802,9 +802,16 @@ exactly three bind mounts, derived from that name and nothing the caller gives:
 - the host's `/etc/machine-id`, read-only, at `/run/podmesh-host/machine-id`: the identity the ledger is
   bound to.
 
-The two directories are made private at the first create, must be real directories, and are never
-removed by PodMesh. A roll that deletes and re-creates the replica under the same name finds its key and
-ledger again. The container is labelled `io.podmesh.manager-host-state=<name>`. A universe with mounts is
+The two directories are made private, must be real directories, and are never removed by PodMesh. **One
+universe holds a name at a time**: `create` is refused, before anything is made, with
+`manager_host_state_claimed` when another container on this node carries the name's label, and with
+`manager_host_state_held` when `<state>/manager-host/<name>` exists, which it does while a universe holds
+it. `delete` renames it to `<name>.released` once the container is gone; the next `create` of the name
+renames it back, so a roll finds its key and ledger again only after the old universe is gone. A delete
+that cannot release it fails and says so (`manager_host_state_release_blocked` when a released copy is
+already there). A directory left held by a container removed outside PodMesh is renamed by the operator,
+after checking that nothing runs with it. The container is labelled
+`io.podmesh.manager-host-state=<name>`. A universe with mounts is
 refused by clones, live captures and migrations. A stopped capture exports the root filesystem without
 them, so no recovery point carries or rewinds the key or the ledger. A promotion creates the universe
 without them, so a promoted replica that votes does not start until it is created again with its host

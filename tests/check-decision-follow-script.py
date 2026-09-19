@@ -9,7 +9,7 @@ publisher is started with the certificate as its takeover proof only when declar
 the door (manager_decision) is used when the mandate names the manager universe; and the script opens no
 listener. Purely local: no daemon, no host. The same tick against real residents and a real node is the
 web tree's end-to-end test. Run: python3 -B tests/check-decision-follow-script.py"""
-import json, os, shutil, socket, subprocess, sys, tempfile, threading
+import json, os, shutil, socket, subprocess, sys, tempfile, threading, time
 
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'packaging', 'podmesh-decision-follow')
 R = '91eeb6bf-5489-405b-b77a-53105b0aff7a'
@@ -250,7 +250,8 @@ def main():
                                ({'declared': {}, 'publisher_eligible': True, 'unit': {'state': 'active'}}, False),
                                ({'declared': {}, 'publisher_eligible': True, 'unit': {'state': 'inactive'}, 'transition': {'state': 'starting'}}, False),
                                ({'declared': {}, 'publisher_eligible': False, 'unit': {'state': 'inactive'}, 'reasons': ['no effective exclusive route']}, False),
-                               ({'declared': {}, 'publisher_eligible': True, 'unit': {'state': 'inactive'}}, True)]:
+                               ({'declared': {}, 'publisher_eligible': True, 'unit': {'state': 'inactive'},
+                                 'lease': {'generation': 1, 'acquired_at': 1789700000}}, True)]:
         w.reset()
         w.publisher = publisher
         out, _ = tick(td, pub_mandate, 0)
@@ -258,11 +259,25 @@ def main():
         assert len(starts) == int(started), (publisher, w.node.calls)
         if started:
             assert starts[0]['takeover_proof'] == w.decisions[R]['decision']['current']['certificate'] and starts[0]['resource'] == R
+    # Two ticks while the connector is not yet visible (no active unit, no transition): one operation,
+    # keyed on the certificate and the lease, never on the clock (review of V3-5, finding 5).
+    w.reset()
+    w.publisher = {'declared': {}, 'publisher_eligible': True, 'unit': {'state': 'inactive'},
+                   'lease': {'generation': 3, 'acquired_at': 1789800000}}
+    tick(td, pub_mandate, 0)
+    time.sleep(1.1)
+    tick(td, pub_mandate, 0)
+    ids = [c['operation_id'] for c in w.node.calls if c['operation'] == 'publisher_start']
+    assert len(ids) == 2 and len(set(ids)) == 1 and ids[0].endswith('-3-1789800000'), ids
+    w.reset()
+    w.publisher['lease'] = {'generation': 4, 'acquired_at': 1789800900}
+    tick(td, pub_mandate, 0)
+    assert [c['operation_id'] for c in w.node.calls if c['operation'] == 'publisher_start'] != ids[:1], w.node.calls
     w.reset()
     w.publisher = {'declared': {}, 'publisher_eligible': True, 'unit': {'state': 'inactive'}}
     tick(td, socket_mandate, 0)
     assert 'publisher_status' not in w.calls(), w.calls()
-    checks.append('publisher_start carries the certificate as its takeover proof only when the mandate says so, a publisher is declared, eligible, and nothing runs or is recorded')
+    checks.append('publisher_start carries the certificate as its takeover proof only when the mandate says so, a publisher is declared, eligible, and nothing runs or is recorded; two ticks while the connector is not yet visible send one operation ID, another acquisition of the lease another one')
 
     # Through the door: manager_decision on the node, naming the manager universe and the resource.
     w.reset()

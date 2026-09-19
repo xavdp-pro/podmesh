@@ -39,8 +39,10 @@
 //! `/run/podmesh-host/votes`, `<state>/manager-host/<name>/evidence` read-only at
 //! `/run/podmesh-host/evidence` (the operator's readmission evidence, which the replica cannot write),
 //! and the host's `/etc/machine-id` read-only at `/run/podmesh-host/machine-id`. The caller names no
-//! path. The directories are made private (0700) at the first create and never removed by PodMesh: a
-//! roll that deletes and re-creates the replica under the same name finds its key and ledger again.
+//! path. The directories are made private (0700) and never removed by PodMesh. One universe holds a
+//! name at a time: `create` refuses a name another container carries or whose directory is held, and
+//! `delete` renames the directory to `<name>.released`, which the next create of the name takes back,
+//! so a roll finds its key and ledger again only once the old universe is gone.
 //! A universe with mounts is refused by live captures and migrations, and a stopped capture exports
 //! its root filesystem only, without them.
 //!
@@ -65,34 +67,92 @@ pub fn prepare_host_state(state_dir: &std::path::Path) {
     let _ = HOST_STATE.set(state_dir.join("manager-host"));
 }
 
-/// The Podman arguments of a manager replica's host state `name`, and the label that records it: the
-/// vote directory read-write, the evidence directory and the host's machine-id read-only, each at its
-/// fixed path in the universe. The two directories are made if absent, private, and must be real
-/// directories (no symlink): what the replica is bound to is decided here. They sit in this node's
-/// state directory, which only the service's user can write.
-pub(crate) fn host_state_mounts(name: &str) -> Result<(Vec<String>, String), Error> {
+/// Claims a manager replica's host state `name` for universe `uuid` at its creation, and returns the
+/// Podman arguments of its mounts and the label that records it: the vote directory read-write, the
+/// evidence directory and the host's machine-id read-only, each at its fixed path in the universe.
+///
+/// ONE LIVE CLAIM PER NAME (review of V3-5, finding 3). The name is a path: two universes given the
+/// same name would share one vote directory, key and ledger. So a claim is refused, by name:
+/// `manager_host_state_claimed` when another container on this node carries the name's label, and
+/// `manager_host_state_held` when the directory `<name>` exists, which it does exactly while a universe
+/// holds it (or after one was removed outside PodMesh: the operator then checks and renames it to
+/// `<name>.released` by hand). A universe's `delete` renames `<name>` to `<name>.released`; the next
+/// claim of the name renames it back and finds the key and the ledger, once the old universe is gone.
+/// The directories must be real directories (no symlink) and are made private; they sit in this
+/// node's state directory, which only the service's user can write.
+pub(crate) fn claim_host_state(name: &str, uuid: &str) -> Result<(Vec<String>, String), Error> {
     lc::token(name)?;
     if name.is_empty() {
         return Err("manager_host_state must name the replica's host state".into());
     }
     let root = HOST_STATE.get().ok_or("the manager host state directory was not prepared")?;
-    host_state_mounts_in(root, name)
+    let listing: Value = serde_json::from_str(&lc::podman(30, &["ps", "--all", "--format", "json"])?)?;
+    claim_in(root, name, &holders_in(&listing, name, uuid))
 }
 
-fn host_state_mounts_in(root: &std::path::Path, name: &str) -> Result<(Vec<String>, String), Error> {
+/// The universes, other than `uuid`, whose containers on this node carry host state `name`.
+fn holders_in(listing: &Value, name: &str, uuid: &str) -> Vec<String> {
+    listing
+        .as_array()
+        .map(|containers| {
+            containers
+                .iter()
+                .filter(|c| c["Labels"][LABEL_HOST_STATE].as_str() == Some(name))
+                .map(|c| c["Labels"]["io.podmesh.universe"].as_str().or_else(|| c["Names"][0].as_str()).unwrap_or("an unnamed container").to_string())
+                .filter(|holder| holder != uuid)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn released_path(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+    root.join(format!("{name}.released"))
+}
+
+fn real_directory(p: &std::path::Path) -> Result<(), Error> {
     use std::os::unix::fs::PermissionsExt;
+    let m = std::fs::symlink_metadata(p)?;
+    if !m.is_dir() {
+        return Err(format!("{} must be a directory, not a symlink", p.display()).into());
+    }
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn claim_in(root: &std::path::Path, name: &str, holders: &[String]) -> Result<(Vec<String>, String), Error> {
+    if !holders.is_empty() {
+        return Err(format!(
+            "manager_host_state_claimed: host state {name} is carried by {} on this node; one universe holds a host state at a time",
+            holders.join(", ")
+        )
+        .into());
+    }
+    std::fs::create_dir_all(root)?;
+    real_directory(root)?;
     let base = root.join(name);
+    if std::fs::symlink_metadata(&base).is_ok() {
+        return Err(format!(
+            "manager_host_state_held: {} exists, so a universe holds host state {name}, or one was removed outside PodMesh; if none runs with it, rename it to {} once checked",
+            base.display(),
+            released_path(root, name).display()
+        )
+        .into());
+    }
+    let released = released_path(root, name);
+    if std::fs::symlink_metadata(&released).is_ok() {
+        real_directory(&released)?;
+        std::fs::rename(&released, &base)?;
+    } else {
+        std::fs::create_dir(&base)?;
+    }
+    real_directory(&base)?;
     let mut paths = Vec::new();
     for sub in ["votes", "evidence"] {
         let dir = base.join(sub);
-        std::fs::create_dir_all(&dir)?;
-        for p in [root, base.as_path(), dir.as_path()] {
-            let m = std::fs::symlink_metadata(p)?;
-            if !m.is_dir() {
-                return Err(format!("{} must be a directory, not a symlink", p.display()).into());
-            }
-            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))?;
+        if std::fs::symlink_metadata(&dir).is_err() {
+            std::fs::create_dir(&dir)?;
         }
+        real_directory(&dir)?;
         let text = dir.to_str().ok_or("the host state path is not UTF-8")?.to_string();
         if text.contains(',') {
             return Err("the host state path must not contain a comma".into());
@@ -108,6 +168,31 @@ fn host_state_mounts_in(root: &std::path::Path, name: &str) -> Result<(Vec<Strin
         "type=bind,src=/etc/machine-id,dst=/run/podmesh-host/machine-id,ro=true".to_string(),
     ];
     Ok((args, format!("{LABEL_HOST_STATE}={name}")))
+}
+
+/// Releases host state `name` once the universe that held it is gone: `<name>` renamed to
+/// `<name>.released`, never removed, so that the next claim of the name finds the key and the ledger.
+pub(crate) fn release_host_state(name: &str) -> Result<(), Error> {
+    let root = HOST_STATE.get().ok_or("the manager host state directory was not prepared")?;
+    release_in(root, name)
+}
+
+fn release_in(root: &std::path::Path, name: &str) -> Result<(), Error> {
+    let base = root.join(name);
+    if std::fs::symlink_metadata(&base).is_err() {
+        return Ok(());
+    }
+    let released = released_path(root, name);
+    if std::fs::symlink_metadata(&released).is_ok() {
+        return Err(format!(
+            "manager_host_state_release_blocked: {} already exists; {} is kept held until the operator settles which one is the replica's",
+            released.display(),
+            base.display()
+        )
+        .into());
+    }
+    std::fs::rename(&base, &released)?;
+    Ok(())
 }
 
 /// The contract path of the control socket inside a manager universe.
@@ -296,14 +381,12 @@ mod tests {
 
     /// Proves: a replica's host state is three mounts derived from its name alone -- the vote directory
     /// read-write, the evidence directory and the host's machine-id read-only, at fixed paths -- made
-    /// private at the first create and found again at the next; a name that is not a token, and a
-    /// directory replaced by a symlink, are refused.
+    /// private; a name that is not a token, and a directory replaced by a symlink, are refused.
     #[test]
     fn a_replicas_host_state_is_three_fixed_mounts() {
         let root = std::env::temp_dir().join(format!("podmesh-host-state-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let (args, label) = host_state_mounts_in(&root, "lab-a").unwrap();
+        let (args, label) = claim_in(&root, "lab-a", &[]).unwrap();
         let votes = root.join("lab-a/votes");
         assert_eq!(args, vec![
             "--mount".to_string(), format!("type=bind,src={},dst=/run/podmesh-host/votes", votes.display()),
@@ -313,13 +396,49 @@ mod tests {
         assert_eq!(label, "io.podmesh.manager-host-state=lab-a");
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&votes).unwrap().permissions().mode() & 0o777, 0o700);
-        std::fs::write(votes.join("replica-a.ledger"), "kept").unwrap();
-        assert_eq!(host_state_mounts_in(&root, "lab-a").unwrap().0, args, "the same name, the same mounts");
-        assert_eq!(std::fs::read_to_string(votes.join("replica-a.ledger")).unwrap(), "kept", "nothing is removed");
+        release_in(&root, "lab-a").unwrap();
         std::fs::create_dir_all(root.join("elsewhere")).unwrap();
-        std::fs::remove_dir_all(root.join("lab-a/evidence")).unwrap();
-        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("lab-a/evidence")).unwrap();
-        assert!(host_state_mounts_in(&root, "lab-a").is_err(), "a symlinked directory");
+        std::fs::remove_dir_all(root.join("lab-a.released/evidence")).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("lab-a.released/evidence")).unwrap();
+        assert!(claim_in(&root, "lab-a", &[]).is_err(), "a symlinked directory");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Proves (review of V3-5, finding 3): one universe holds a host state name at a time. A second
+    /// create with the same name is refused by name while the first holds it -- by the directory it holds
+    /// (`manager_host_state_held`) and by the label another container on this node carries
+    /// (`manager_host_state_claimed`, read from Podman's listing, the universe's own container excepted).
+    /// Once the first universe is deleted, its directory is released (renamed, nothing removed), and the
+    /// next create of the name takes it back and finds the key and the ledger.
+    #[test]
+    fn two_creates_with_the_same_host_state_the_second_refused() {
+        let root = std::env::temp_dir().join(format!("podmesh-host-state-twice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        claim_in(&root, "lab-a", &[]).unwrap();
+        std::fs::write(root.join("lab-a/votes/replica-a.ledger"), "kept").unwrap();
+        // The second create of the name, while the first universe holds it.
+        let e = claim_in(&root, "lab-a", &[]).unwrap_err().to_string();
+        assert!(e.starts_with("manager_host_state_held"), "{e}");
+        let first = "5d1c0b8e-3f59-4d0e-9d7a-2a1e7c4b9f10";
+        let second = "7e2d1c0b-4a3f-4e5d-8c7b-6a5f4e3d2c1b";
+        let listing = json!([
+            {"Names": ["podmesh-x"], "Labels": {"io.podmesh.universe": first, LABEL_HOST_STATE: "lab-a"}},
+            {"Names": ["podmesh-y"], "Labels": {"io.podmesh.universe": "other", LABEL_HOST_STATE: "lab-b"}},
+        ]);
+        assert_eq!(holders_in(&listing, "lab-a", second), [first]);
+        assert!(holders_in(&listing, "lab-a", first).is_empty(), "a universe's own container is not another holder");
+        let e = claim_in(&root, "lab-z", &holders_in(&listing, "lab-a", second)).unwrap_err().to_string();
+        assert!(e.starts_with("manager_host_state_claimed") && e.contains(first), "{e}");
+        assert!(!root.join("lab-z").exists(), "a refused claim makes nothing");
+        // The first universe deleted: released, then claimed again with its ledger.
+        release_in(&root, "lab-a").unwrap();
+        assert!(!root.join("lab-a").exists() && root.join("lab-a.released/votes/replica-a.ledger").exists());
+        claim_in(&root, "lab-a", &[]).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("lab-a/votes/replica-a.ledger")).unwrap(), "kept");
+        // A release that would overwrite a released directory keeps the held one.
+        std::fs::create_dir_all(root.join("lab-a.released")).unwrap();
+        let e = release_in(&root, "lab-a").unwrap_err().to_string();
+        assert!(e.starts_with("manager_host_state_release_blocked") && root.join("lab-a/votes/replica-a.ledger").exists(), "{e}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

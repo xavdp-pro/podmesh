@@ -55,7 +55,10 @@ Every action is recomputed from the node's own state at every tick:
   replays or re-evaluates it rather than repeating it. The situation is the certificate plus this host's
   lease row. A lapse of this host's own lease is a new situation: the tick re-acquires under the live
   certificate, as the node allows the holder;
-- a publisher that runs or is recorded is not started again.
+- a publisher that runs or is recorded is not started again, and a start is keyed on the certificate and
+  the lease it was acquired under (generation and `acquired_at`), never on the clock: two ticks before the
+  connector is visible send one operation, which the node's journal replays. A start that failed and a
+  later one under the same lease are the same operation too, and the node re-evaluates a failed one.
 
 The tick exits 3 and delivers nothing for a resource when it cannot read something:
 

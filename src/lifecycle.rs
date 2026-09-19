@@ -864,6 +864,7 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
 }
 #[allow(clippy::too_many_arguments)]
 fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Value>, image: &str, command: &[&str], profile: &str, address: Option<&str>, secrets: &(Vec<String>, Option<String>), host_state: Option<&str>) -> Result<Value, Error> {
+    let host_state_name = host_state;
     if let Some(ref c) = existing {
         if label(c, CREATION) != Some(id) {
             return Err("Universe already exists under another creation operation".into());
@@ -898,7 +899,8 @@ fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Va
         if let Some(l) = &secrets.1 {
             args.extend(["--label", l.as_str()]);
         }
-        let host_state = host_state.map(crate::manager::host_state_mounts).transpose()?;
+        // Claimed before anything is made: refused while another universe holds the name.
+        let host_state = host_state.map(|n| crate::manager::claim_host_state(n, uuid)).transpose()?;
         if let Some((mounts, label)) = &host_state {
             args.extend(mounts.iter().map(String::as_str));
             args.extend(["--label", label.as_str()]);
@@ -910,6 +912,9 @@ fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Va
             // that Podman does not carry.
             if managed.is_some() {
                 let _ = crate::network::release(db, uuid, id);
+            }
+            if let Some(name) = host_state_name {
+                let _ = crate::manager::release_host_state(name);
             }
             return Err(e);
         }
@@ -944,6 +949,16 @@ fn delete(db: &Connection, uuid: &str, name: &str, existing: Option<Value>) -> R
         stopped(&c).map_err(|e| format!("Refusing to delete: {e}; stop it explicitly first"))?;
         // Do not force removal and do not remove volumes.
         podman(QUICK, &["rm", name])?;
+        if inspect(name)?.is_some() {
+            return Err("Container still present after removal".into());
+        }
+        // A manager replica's host state is released once its universe is gone: renamed, never
+        // removed, for the next create of the name (V3-5).
+        if let Some(state) = c["Config"]["Labels"][crate::manager::LABEL_HOST_STATE].as_str() {
+            crate::manager::release_host_state(state).map_err(|e| {
+                format!("the universe was removed, and its host state {state} was not released ({e}); nothing will claim it until the operator renames it")
+            })?;
+        }
     }
     if inspect(name)?.is_some() {
         return Err("Container still present after removal".into());

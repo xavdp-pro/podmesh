@@ -35,7 +35,7 @@ Exactly one of manager_universe and resident_socket.
 
 One JSON line per resource on standard output says what was done. See docs/DECISION-FOLLOW.md.
 """
-import json, os, socket, sys, time
+import json, os, socket, sys
 
 MANDATE = os.environ.get("PODMESH_DECISION_FOLLOW_MANDATE", "/etc/podmesh/decision-follow-mandate")
 NODE_SOCKET = os.environ.get("PODMESH_SOCKET", "/run/podmesh/api.sock")
@@ -242,8 +242,15 @@ def publish(mandate, resource, c, digest):
         return "none: a connector runs or is recorded here"
     if data.get("publisher_eligible") is not True:
         return f"none: not eligible ({'; '.join(map(str, data.get('reasons') or []))})"
+    lease = data.get("lease") or {}
+    generation, acquired = lease.get("generation"), lease.get("acquired_at")
+    if not isinstance(generation, int) or not isinstance(acquired, int):
+        raise Unreadable("publisher_status names no lease generation and acquisition")
+    # Keyed on the certificate and the lease it was acquired under, never on the clock (review of V3-5,
+    # finding 5): two ticks before the connector is visible send one operation, which the node's journal
+    # replays; a new acquisition of the lease is a new operation.
     _, error = node("publisher_start", timeout=PUBLISH_TIMEOUT, resource=resource, takeover_proof=c,
-                    authorization_ref=mandate["ref"], operation_id=f"decision-publish-{digest[:16]}-{int(time.time())}")
+                    authorization_ref=mandate["ref"], operation_id=f"decision-publish-{digest[:16]}-{generation}-{acquired}")
     return f"publisher_start refused: {error}" if error else "publisher_start delivered"
 
 
