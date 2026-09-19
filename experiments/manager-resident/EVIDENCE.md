@@ -355,3 +355,85 @@ suite (42/42). It is recorded as intermittent, not explained.
 
 The majority does not extend leases (V3-6). A rotation away from a holder that may still renew by
 itself therefore waits for the renewal bound.
+
+### After the counter-review of V3-5 (`fded4d4`, node `2d35c25`)
+
+The counter-review (`podmesh-lab` `records/reviews/REVIEW-V3-5-MANAGER-DECIDES-2026-09-19.md`, "holds
+with changes") found five points. The coordinator asked for the most cautious option each time.
+Date: 2026-09-19.
+
+| Finding | Fix |
+| --- | --- |
+| 1. A rotation from the operator's baseline missed the gate proof's remaining life | the baseline carries the gate's last proof's `expires_at`, the view's expiry until a certificate the replicas assembled passes it; a change of holder from a baseline without it is refused (`baseline_expiry_unknown`) |
+| 2. `renewal_not_after` 0, or older than a standing follow mandate, let a majority start a second holder | until V3-6, a change of holder is refused unless `renewal_not_after` is not 0 (`renewal_unbounded`) and no earlier than the current proof's expiry and the proposal's issue (`renewal_bound_too_early`); the README and the node's contract say to freeze or remove the V3-1 mandates and record their latest `not_after` first |
+| 3. Two universes could be given one host-state name | node `create` refuses a name another container carries (`manager_host_state_claimed`) or whose directory is held (`manager_host_state_held`); `delete` renames the directory to `<name>.released`, which the next create of the name takes back |
+| 4. The collector attested shape, not freshness | `resident_socket` is required (the mark first); each input is read twice, `--settle-seconds` apart, and refused if it changed; each screen carries the node's clock (`observed_at`), refused when older than the mark; the help says the digests are not proof the cluster was live |
+| 5. `publisher_start` was keyed on the wall clock | keyed on the certificate's digest plus the lease's generation and `acquired_at` |
+
+| Test | Proves |
+| --- | --- |
+| `decision_tests::a_rotation_from_a_baseline_with_a_live_gate_proof_waits_for_it` (new) | a baseline without its proof's expiry refuses a change of holder and allows a same-holder decision; a baseline whose proof is live refuses a renewal bound below that expiry, and requires a barrier no earlier than the expiry plus the lease and the margin, which a live proposal can carry only once the proof has ended (at the bound it passes, one second less does not) |
+| `decision_tests::a_proposal_is_checked_against_the_view_rule_by_rule` (changed) | a change of holder with `renewal_not_after` 0 is refused; a bound below the current certificate's expiry is refused whatever the barrier; a bound below the proposal's issue, a follow mandate standing past what the operator recorded, is refused; at the bound the barrier rules hold as before |
+| `tests/decisions.rs` `two_replicas_of_three_decide_and_one_does_not` (changed) | with no renewal bound, every voter and `vote_sign` refuse the rotation (`renewal_unbounded`); the operator records the bound, the replicas restart with it, and the same rotation is refused by its barrier, then the rotation with the required barrier is decided |
+| `tools/test_collect_readmission_evidence.py` (4 checks, extended) | a plan without the control socket; a consistent older snapshot, every input well formed and unchanging and the screens observed an hour before the mark; a screen without its clock; a store whose history grows between the two reads: each writes nothing and exits 3 |
+| node `manager::tests::two_creates_with_the_same_host_state_the_second_refused` (new) | a second claim of a name the first universe holds is refused (`manager_host_state_held`); a name another container carries in Podman's listing is refused (`manager_host_state_claimed`), the universe's own container excepted, and makes nothing; released at delete (renamed, the ledger kept), the name is claimed again and the ledger found; a release onto an existing released copy is refused and keeps the held one |
+| node `tests/check-decision-follow-script.py` (extended) | two ticks 1.1 s apart while the connector is not visible send one `publisher_start` operation ID; another acquisition of the lease sends another |
+| `tests/e2e/decisions-e2e.py` (16 checks) | the rotation is refused by every voter while no renewal bound is recorded, nothing decided or delivered; the operator records the bound on the three replicas, which restart with it; the barrier-breaking rotation is refused; the rotation at the bound plus the wait is decided, held by the node until its barrier, then taken; the rest as before |
+
+**Negative controls.** `breaks.py` ran all 37 breaks at web `fded4d4` and node `2d35c25`: the 24
+earlier ones and 13 new ones. Results are in `breaks-result.json` and `breaks-output.txt` of
+`podmesh-lab/claude/v3-5-manager-decides/`. 36 fired. Every test passed again after the restore,
+the end-to-end test included.
+
+`rotation_ignores_expiry` was silent, as expected. It removes the current certificate's expiry from
+the barrier arithmetic. The new precondition of finding 2 makes the renewal bound at least that
+expiry, so the renewal term already covers it. The term stays as defense in depth, and the expiry is
+now held by the precondition, whose breaks fire (`renewal_below_expiry_allowed`,
+`rotation_ignores_expiry_everywhere`).
+
+The 13 new breaks:
+
+| Removed | Test failed with |
+| --- | --- |
+| the baseline's proof expiry as the view's | the view's expiry was 0, and a bound below the live proof was not refused |
+| the refusal from a baseline without its proof's expiry | the rotation got past it (refused later by its barrier) |
+| the refusal of `renewal_not_after` 0 | another code, and the process test's voters did not answer `renewal_unbounded` |
+| the renewal bound reaching the current proof's expiry | a bound one second below it was accepted |
+| the renewal bound reaching the proposal's issue | a bound below the issue was accepted |
+| the expiry in both the barrier and the precondition | a rotation before the proof's end plus the wait was accepted |
+| the collector's mark (read only when a socket is named, as before) | a plan without the socket was collected |
+| the collector's second read | a store that grew between reads was written |
+| the screens' clock against the mark | the older snapshot was written |
+| `create`'s check of the label other containers carry | the claim went through |
+| `create`'s check of the held directory | not refused by name |
+| the release at delete | the directory stayed held |
+| `publisher_start` keyed on the clock, as before | two ticks sent two operation IDs |
+
+The node's delete path (the rename after a real `podman rm`) and `create`'s reading of Podman's
+listing on a host are the laboratory's. The unit test drives the claim and the release, and the
+decision on a listing.
+
+**The recorded checks at `fded4d4`, node `2d35c25`:**
+
+- resident: library 31/31, `decisions` 2/2, `votes` 1/1, `inspect_facts` 2/2, strict Clippy and
+  formatting;
+- manager-ha and manager-network suites;
+- the collector's 4 checks, the vote tools' 3 checks, the packaging assembly test;
+- the end-to-end test, 16 checks;
+- both lexicon tests;
+- node: `cargo test --release --locked` 80/80, `test_ha_rotate_barrier.py`,
+  `check-publisher-follow-script.py`, `test_ledger_lock_inheritance.py`, the agent's 12 checks.
+
+**The process suite `processes` (42 tests) is intermittent.** None of its tests configures votes. Its
+failures were one test at a time, `periodic_full_verification_fails_the_store_closed_after_an_old_row_is_edited`
+twice and `a_replica_without_peers_is_caught_up_at_once` once, each an append not answered in time.
+Counted over the runs of this lot:
+
+- at `f2f4c97` and later: 3 failures in 13 runs of the suite;
+- in the paired comparison after the review, alternating runs of this branch and of `dd1bb98`, where
+  this lot started: this branch failed 1 of 7, `dd1bb98` 0 of 7.
+
+The only code that runs in these tests and changed in this lot is the control loop's scan of pending
+vote operations, which is empty there. The dependency profile compiles the curve and `sha2` optimized.
+Neither is shown to cause it, and a lot-caused regression is not ruled out. It stays open, for a
+counter-review or a longer paired run.
