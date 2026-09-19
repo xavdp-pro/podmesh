@@ -9,7 +9,7 @@ publisher is started with the certificate as its takeover proof only when declar
 the door (manager_decision) is used when the mandate names the manager universe; and the script opens no
 listener. Purely local: no daemon, no host. The same tick against real residents and a real node is the
 web tree's end-to-end test. Run: python3 -B tests/check-decision-follow-script.py"""
-import json, os, socket, subprocess, sys, tempfile, threading
+import json, os, shutil, socket, subprocess, sys, tempfile, threading
 
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'packaging', 'podmesh-decision-follow')
 R = '91eeb6bf-5489-405b-b77a-53105b0aff7a'
@@ -282,6 +282,7 @@ def main():
 
     w.node.close()
     w.resident.close()
+    shutil.rmtree(td, ignore_errors=True)
     for c in checks:
         print('PASS', c)
     print(f'{len(checks)} checks passed')
