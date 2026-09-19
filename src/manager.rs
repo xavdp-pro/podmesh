@@ -65,6 +65,23 @@ use std::time::Duration;
 static HOST_STATE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 /// The label that names a universe's host state.
 pub const LABEL_HOST_STATE: &str = "io.podmesh.manager-host-state";
+/// QEMU's VM generation ID lives outside the guest disk and changes on hypervisor rollback.
+const QEMU_GENERATION_ID: &str = "/sys/firmware/qemu_fw_cfg/by_name/etc/vmgenid_guid/raw";
+
+fn generation_mount(source: &std::path::Path) -> Option<[String; 2]> {
+    std::fs::symlink_metadata(source)
+        .ok()
+        .filter(|meta| meta.is_file())
+        .map(|_| {
+            [
+                "--mount".to_string(),
+                format!(
+                    "type=bind,src={},dst=/run/podmesh-host/vmgenid,ro=true",
+                    source.display()
+                ),
+            ]
+        })
+}
 
 /// Records where the manager replicas' host state lives, under this node's state directory.
 pub fn prepare_host_state(state_dir: &std::path::Path) {
@@ -163,7 +180,7 @@ fn claim_in(root: &std::path::Path, name: &str, holders: &[String]) -> Result<(V
         }
         paths.push(text);
     }
-    let args = vec![
+    let mut args = vec![
         "--mount".to_string(),
         format!("type=bind,src={},dst=/run/podmesh-host/votes", paths[0]),
         "--mount".to_string(),
@@ -171,6 +188,9 @@ fn claim_in(root: &std::path::Path, name: &str, holders: &[String]) -> Result<(V
         "--mount".to_string(),
         "type=bind,src=/etc/machine-id,dst=/run/podmesh-host/machine-id,ro=true".to_string(),
     ];
+    if let Some(mount) = generation_mount(std::path::Path::new(QEMU_GENERATION_ID)) {
+        args.extend(mount);
+    }
     Ok((args, format!("{LABEL_HOST_STATE}={name}")))
 }
 
@@ -444,20 +464,22 @@ pub(crate) const CONTROL_SOCKET_PATH: &str = CONTROL_SOCKET;
 mod tests {
     use super::*;
 
-    /// Proves: a replica's host state is three mounts derived from its name alone -- the vote directory
-    /// read-write, the evidence directory and the host's machine-id read-only, at fixed paths -- made
-    /// private; a name that is not a token, and a directory replaced by a symlink, are refused.
+    /// Proves: the three fixed host-state mounts and the optional QEMU generation witness.
     #[test]
-    fn a_replicas_host_state_is_three_fixed_mounts() {
+    fn a_replicas_host_state_has_fixed_mounts() {
         let root = std::env::temp_dir().join(format!("podmesh-host-state-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (args, label) = claim_in(&root, "lab-a", &[]).unwrap();
         let votes = root.join("lab-a/votes");
-        assert_eq!(args, vec![
+        let mut expected = vec![
             "--mount".to_string(), format!("type=bind,src={},dst=/run/podmesh-host/votes", votes.display()),
             "--mount".to_string(), format!("type=bind,src={},dst=/run/podmesh-host/evidence,ro=true", root.join("lab-a/evidence").display()),
             "--mount".to_string(), "type=bind,src=/etc/machine-id,dst=/run/podmesh-host/machine-id,ro=true".to_string(),
-        ]);
+        ];
+        if let Some(mount) = generation_mount(std::path::Path::new(QEMU_GENERATION_ID)) {
+            expected.extend(mount);
+        }
+        assert_eq!(args, expected);
         assert_eq!(label, "io.podmesh.manager-host-state=lab-a");
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&votes).unwrap().permissions().mode() & 0o777, 0o700);
@@ -466,6 +488,22 @@ mod tests {
         std::fs::remove_dir_all(root.join("lab-a.released/evidence")).unwrap();
         std::os::unix::fs::symlink(root.join("elsewhere"), root.join("lab-a.released/evidence")).unwrap();
         assert!(claim_in(&root, "lab-a", &[]).is_err(), "a symlinked directory");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hypervisor_generation_mount_is_read_only_and_rejects_a_symlink() {
+        let root = std::env::temp_dir().join(format!("podmesh-gen-mount-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("vmgenid");
+        std::fs::write(&source, [1_u8; 16]).unwrap();
+        let mount = generation_mount(&source).unwrap();
+        assert_eq!(mount[0], "--mount");
+        assert!(mount[1].ends_with("dst=/run/podmesh-host/vmgenid,ro=true"));
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        assert!(generation_mount(&alias).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
