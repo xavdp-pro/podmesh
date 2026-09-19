@@ -7,6 +7,7 @@ that `generate-replica-set.py` wrote, and the scopes a replica votes and propose
       --resource <uuid>:<lease seconds>:<takeover margin seconds>:<renewal not_after> [--resource ...] \
       [--baseline <uuid>:<epoch>:<holder host uuid>:<eligible_after>:<expires_at>] \
       [--max-certificate-life 300] [--voter-interval-ms 1000] [--operator-uid 0]
+      [--require-generation-id]
 
 Each `--key` names one replica's key by its alias: its identifier and its public half only, as
 `vote-key.py` printed it on that replica's own host (the seed never leaves the host). The policy is the
@@ -32,6 +33,7 @@ p.add_argument('--authority-id', default='replicas')
 p.add_argument('--max-certificate-life', type=int, default=300)
 p.add_argument('--voter-interval-ms', type=int, default=1000)
 p.add_argument('--operator-uid', type=int, default=0)
+p.add_argument('--require-generation-id', action='store_true', help='refuse votes without a live hypervisor generation witness')
 a = p.parse_args()
 
 with open(os.path.join(a.dir, 'replica-set.json')) as f:
@@ -79,6 +81,7 @@ for alias, r in aliases.items():
         'replica_keys': {o['replica_id']: keys[o['alias']][0] for o in manifest['replicas']},
         'nodes': nodes, 'evidence_dir': '/run/podmesh-host/evidence', 'operator_uid': a.operator_uid,
         'max_certificate_life_seconds': a.max_certificate_life,
+        'require_generation_id': a.require_generation_id,
         'decisions': {'voter_interval_ms': a.voter_interval_ms, 'resources': resources},
     }
     with open(path + '.tmp', 'w') as f:

@@ -67,6 +67,10 @@ if [ -d /run/podmesh-host/votes ]; then
   export PODMESH_MANAGER_VOTE_DIR=/run/podmesh-host/votes
   export PODMESH_MANAGER_HOST_ID_FILE=/run/podmesh-host/machine-id
   echo "manager-universe: host state mounted: votes at $PODMESH_MANAGER_VOTE_DIR, the host's machine-id at $PODMESH_MANAGER_HOST_ID_FILE"
+  if [ -r /run/podmesh-host/vmgenid ]; then
+    export PODMESH_MANAGER_GENERATION_ID_FILE=/run/podmesh-host/vmgenid
+    echo "manager-universe: read-only hypervisor generation witness mounted"
+  fi
 fi
 /usr/lib/podmesh-manager/podmesh-managerd --config /etc/podmesh-manager/config.json --state-dir /var/lib/podmesh-manager --runtime-dir /run/podmesh-manager &
 child=$!

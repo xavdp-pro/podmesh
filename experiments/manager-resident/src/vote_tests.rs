@@ -646,6 +646,53 @@ fn a_restored_vm_boot_is_unadmitted_before_voting() {
     assert!(!legacy.load().unwrap().admitted);
 }
 
+#[test]
+fn a_memory_snapshot_resume_changes_the_external_generation_witness() {
+    const OLD: &str = "11111111222243338444555555555555";
+    const NEW: &str = "aaaaaaaaaaaa4ccc8dddeeeeeeeeeeee";
+    let root = temp_root();
+    let dir = private_dir(root.path(), "a");
+    let signer = admitted_a(root.path(), &dir);
+    let marker = dir.join("replica-a.generation-id");
+    fs::write(&marker, OLD).unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+    signer.guard_generation(OLD, T1).unwrap();
+    assert!(signer.load().unwrap().admitted);
+    // The restored process and disk can keep the original boot ID. A fresh hypervisor value
+    // still quarantines before any vote operation can use this signer.
+    signer.guard_generation(NEW, T1 + 1).unwrap();
+    assert_eq!(signer.load().unwrap().unadmitted_since, Some(T1 + 1));
+    assert_eq!(
+        code(signer.sign(&takeover(&policy(ABC, 0), R, 5, X, T1 + 2), &[], T1 + 2)),
+        "ledger_unadmitted"
+    );
+    assert_eq!(fs::read_to_string(marker).unwrap(), NEW);
+}
+
+#[test]
+fn the_hypervisor_generation_reader_accepts_only_bounded_nonzero_items() {
+    let root = temp_root();
+    let path = root.path().join("generation");
+    let id: Vec<u8> = (1..=16).collect();
+    fs::write(&path, &id).unwrap();
+    let expected = quorum::hex(&id);
+    assert_eq!(crate::votes::generation_id_from(&path).unwrap(), expected);
+    let mut fw_cfg = vec![0; 4096];
+    fw_cfg[40..56].copy_from_slice(&id);
+    fs::write(&path, fw_cfg).unwrap();
+    assert_eq!(crate::votes::generation_id_from(&path).unwrap(), expected);
+    fs::write(&path, vec![0; 4096]).unwrap();
+    assert_eq!(
+        code(crate::votes::generation_id_from(&path)),
+        "generation_identity_unreadable"
+    );
+    fs::write(&path, vec![7; 4097]).unwrap();
+    assert_eq!(
+        code(crate::votes::generation_id_from(&path)),
+        "generation_identity_unreadable"
+    );
+}
+
 /// Proves: a ledger restored from an older copy signs again what it forgot while nobody shows it a
 /// later vote of its key (the silent revert the tripwire exists for), and trips as soon as one is
 /// shown: a vote numbered above the ledger (`ledger_behind_own_votes`), or one numbered since its

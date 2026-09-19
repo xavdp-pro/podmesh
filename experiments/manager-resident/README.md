@@ -479,9 +479,20 @@ kernel, even when the restored store contains no later vote to trip the ordinary
 marks on an ordinary reboot: the local files cannot prove that the reboot was not a restore, so
 operator readmission is required again. A process restart within the same boot retains admission.
 
-The guard cannot detect a snapshot resumed with its old kernel memory, or an in-place rollback of
-the vote directory during the same boot. Those require an external restore witness or explicit
-isolation and marking. After any revert of a host VM's snapshot, any restore of a host from a
+For a VM host that exposes a generation identifier outside the guest snapshot, set
+`votes.require_generation_id` and mount that live identifier read-only at the path in
+`PODMESH_MANAGER_GENERATION_ID_FILE`. The resident accepts either a 16-byte identifier or QEMU's
+4096-byte `etc/vmgenid_guid` fw_cfg item (the 16-byte value at offset 40). It keeps a separate
+private `<key_id>.generation-id` marker and checks it before every ledger operation. Missing,
+unreadable or changed evidence refuses voting; a changed value marks the ledger unadmitted before
+the marker advances. The med-pmox campaign requires this mode. The guest boot guard remains in
+place as a second signal. A memory snapshot resumed in the middle of an already running signing
+operation has not yet been adversarially qualified, so this does not alone authorize that restore
+mode for a voting VM.
+
+Without this hypervisor witness, the guard cannot detect a snapshot resumed with its old kernel
+memory, or an in-place rollback of the vote directory during the same boot. Those require an
+external restore witness or explicit isolation and marking. After any revert of a host VM's snapshot, any restore of a host from a
 backup, or any restore of the vote directory:
 
 1. Keep the host's agent and vote callers stopped. On a fresh kernel boot, verify that every
@@ -493,12 +504,11 @@ backup, or any restore of the vote directory:
 3. Run `vote_ledger_readmit` with those digests once `retry_at` has passed. If an input cannot be
    read, wait for it.
 
-No local marker can distinguish a legitimate reboot from a restore. Everything on the host, a
+No guest-local marker can distinguish a legitimate reboot from a restore. Everything on the host, a
 marker file, the ledger's mtime, its nonce, the store, is reverted with the host's snapshot; the
 boot ID changes at every legitimate reboot too. The new guard therefore chooses safety over
-automatic readmission. Only what lives off the host can distinguish a restore: the other hosts,
-which the tripwire reads, and the operator, who marks. A hypervisor's VM generation ID would be
-such a witness; it is not read here.
+automatic readmission. Only what lives off the guest can distinguish a restore: the other hosts,
+which the tripwire reads, the operator, who marks, and a hypervisor generation ID when mounted.
 
 **Not here** (see [the manager decides](#the-manager-decides-v3-5) for what V3-5 added): lease
 extension by majority (V3-6); re-keying without a trusted dealer.

@@ -332,6 +332,7 @@ impl Lab {
                     evidence_dir: mounts.view(&evidence[i]),
                     operator_uid: uid,
                     max_certificate_life_seconds: LIFE,
+                    require_generation_id: false,
                     decisions: Some(DecisionConfiguration {
                         voter_interval_ms: 200,
                         resources: vec![ResourceRules {

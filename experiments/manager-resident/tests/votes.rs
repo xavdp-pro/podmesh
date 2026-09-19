@@ -209,6 +209,7 @@ impl Resident {
                 evidence_dir: evidence.clone(),
                 operator_uid,
                 max_certificate_life_seconds: LIFE,
+                require_generation_id: false,
                 decisions: None,
             }),
         };
@@ -410,6 +411,32 @@ fn write_one(evidence: &Path, input: &str, source: &str, at: i64, content: Value
         file.to_string(),
     )
     .unwrap();
+}
+
+/// A field configuration that requires a hypervisor witness refuses even ledger initialization
+/// when the live witness mount is missing.
+#[test]
+fn a_required_hypervisor_witness_refuses_every_vote_when_missing() {
+    let mut resident = Resident::new(rustix::process::geteuid().as_raw());
+    if !resident.mount_read_only() {
+        eprintln!("SKIPPED: read-only mounts need unprivileged user namespaces");
+        return;
+    }
+    resident
+        .config
+        .votes
+        .as_mut()
+        .unwrap()
+        .require_generation_id = true;
+    resident.start();
+    assert_eq!(
+        resident.ledger_state()["ledger_state"],
+        "generation_identity_unreadable"
+    );
+    let result = resident
+        .control(&json!({"operation": "vote_ledger_init", "operation_id": "init-no-generation"}));
+    assert_eq!(result["code"], "generation_identity_unreadable", "{result}");
+    resident.stop();
 }
 
 /// Proves, through the resident's control socket: only the operator creates, marks and readmits the

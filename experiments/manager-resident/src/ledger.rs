@@ -728,22 +728,52 @@ impl Signer {
                 "the kernel boot ID is not a lowercase UUID",
             ));
         }
+        self.guard_witness(
+            "boot-id",
+            boot_id,
+            "boot_identity_unreadable",
+            "kernel boot changed or boot witness missing: verify host restore before readmission",
+            now,
+        )
+    }
+
+    /// A hypervisor generation witness is outside the guest's snapshot. It catches a rollback
+    /// that resumes kernel memory and therefore retains the old boot ID.
+    pub fn guard_generation(&self, generation_id: &str, now: i64) -> Result<(), LedgerRefusal> {
+        if generation_id.len() != 32
+            || !generation_id
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(refusal(
+                "generation_identity_unreadable",
+                "the hypervisor generation ID is not 16 bytes of lowercase hex",
+            ));
+        }
+        self.guard_witness("generation-id", generation_id, "generation_identity_unreadable", "hypervisor generation changed or generation witness missing: verify VM restore before readmission", now)
+    }
+
+    fn guard_witness(
+        &self,
+        suffix: &str,
+        observed: &str,
+        error_code: &'static str,
+        reason: &str,
+        now: i64,
+    ) -> Result<(), LedgerRefusal> {
         let _lock = self.lock()?;
-        let marker = self.dir.join(format!("{}.boot-id", self.key_id));
+        let marker = self.dir.join(format!("{}.{}", self.key_id, suffix));
         let previous = match fs::symlink_metadata(&marker) {
             Ok(_) => {
-                private_file(&marker, "boot_identity_unreadable")?;
-                let bytes = read_bounded(&marker, 64)
-                    .map_err(|e| refusal("boot_identity_unreadable", e.to_string()))?;
-                Some(
-                    String::from_utf8(bytes)
-                        .map_err(|e| refusal("boot_identity_unreadable", e.to_string()))?,
-                )
+                private_file(&marker, error_code)?;
+                let bytes =
+                    read_bounded(&marker, 64).map_err(|e| refusal(error_code, e.to_string()))?;
+                Some(String::from_utf8(bytes).map_err(|e| refusal(error_code, e.to_string()))?)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(refusal("boot_identity_unreadable", e.to_string())),
+            Err(e) => return Err(refusal(error_code, e.to_string())),
         };
-        if previous.as_deref() == Some(boot_id) {
+        if previous.as_deref() == Some(observed) {
             return Ok(());
         }
         match fs::symlink_metadata(self.ledger_path()) {
@@ -752,14 +782,14 @@ impl Signer {
                 if ledger.admitted {
                     ledger.admitted = false;
                     ledger.unadmitted_since = Some(now);
-                    ledger.unadmitted_reason = Some("kernel boot changed or boot witness missing: verify host restore before readmission".into());
+                    ledger.unadmitted_reason = Some(reason.into());
                     self.store(&mut ledger)?;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(refusal("storage", e.to_string())),
         }
-        let temp = self.dir.join(format!(".{}.boot-id.tmp", self.key_id));
+        let temp = self.dir.join(format!(".{}.{}.tmp", self.key_id, suffix));
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -767,7 +797,7 @@ impl Signer {
             .mode(0o600)
             .open(&temp)
             .map_err(|e| refusal("storage", e.to_string()))?;
-        file.write_all(boot_id.as_bytes())
+        file.write_all(observed.as_bytes())
             .and_then(|_| file.sync_all())
             .map_err(|e| refusal("storage", e.to_string()))?;
         drop(file);

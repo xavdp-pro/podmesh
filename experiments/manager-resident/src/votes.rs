@@ -47,6 +47,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::Read,
     path::PathBuf,
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -58,6 +59,8 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 pub const VOTE_DIR_ENV: &str = "PODMESH_MANAGER_VOTE_DIR";
 /// The environment variable naming the host's machine-id file, mounted read-only.
 pub const HOST_ID_FILE_ENV: &str = "PODMESH_MANAGER_HOST_ID_FILE";
+/// Optional, live hypervisor generation witness; mandatory if the vote config requires it.
+pub const GENERATION_FILE_ENV: &str = "PODMESH_MANAGER_GENERATION_ID_FILE";
 const DEFAULT_HOST_ID_FILE: &str = "/etc/machine-id";
 /// How long a vote operation waits for the ledger's lock: inside the control deadline.
 const LOCK_WAIT: Duration = Duration::from_millis(150);
@@ -98,11 +101,47 @@ pub struct VoteConfiguration {
     pub operator_uid: u32,
     /// The longest life a vote gives a certificate, in seconds; readmission waits it out.
     pub max_certificate_life_seconds: i64,
+    /// Require a live hypervisor generation witness before any vote or readmission. The med-pmox
+    /// campaign enables this because its VM snapshots may include kernel memory.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_generation_id: bool,
     /// The replicas' decisions (V3-5): which resources this replica decides and how often its voter
     /// reads the store. Absent, the replica proposes nothing, votes only through `vote_sign`, and
     /// checks no decision rule (V3-4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decisions: Option<DecisionConfiguration>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Read a bounded live hypervisor witness. QEMU's fw_cfg item is 4096 bytes with the VM
+/// generation ID at offset 40; another platform adapter may supply the bare 16 bytes.
+pub(crate) fn generation_id_from(
+    path: &std::path::Path,
+) -> std::result::Result<String, LedgerRefusal> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(4097).read_to_end(&mut bytes))
+        .map_err(|e| crate::ledger::refusal("generation_identity_unreadable", e.to_string()))?;
+    let generation = match bytes.len() {
+        16 => bytes.as_slice(),
+        4096 => &bytes[40..56],
+        _ => {
+            return Err(crate::ledger::refusal(
+                "generation_identity_unreadable",
+                "expected a 16-byte generation ID or the 4096-byte QEMU fw_cfg item",
+            ))
+        }
+    };
+    if generation.iter().all(|b| *b == 0) {
+        return Err(crate::ledger::refusal(
+            "generation_identity_unreadable",
+            "the hypervisor generation ID is zero",
+        ));
+    }
+    Ok(quorum::hex(generation))
 }
 
 impl VoteConfiguration {
@@ -381,6 +420,14 @@ impl VoteRuntime {
         let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
             .map_err(|e| crate::ledger::refusal("boot_identity_unreadable", e.to_string()))?;
         signer.guard_boot(boot_id.trim_end_matches('\n'), now())?;
+        if let Some(path) = std::env::var_os(GENERATION_FILE_ENV) {
+            signer.guard_generation(&generation_id_from(&PathBuf::from(path))?, now())?;
+        } else if self.config.require_generation_id {
+            return Err(crate::ledger::refusal(
+                "generation_identity_unreadable",
+                "this vote configuration requires a mounted hypervisor generation witness",
+            ));
+        }
         Ok(signer)
     }
 
