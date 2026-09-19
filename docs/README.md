@@ -28,6 +28,8 @@ records, reviews and decisions in a private companion repository; nothing here d
 - [MANAGER-ADMINISTRATION.md](MANAGER-ADMINISTRATION.md), [MANAGER-PUBLISHER-CONTRACT.md](MANAGER-PUBLISHER-CONTRACT.md)
   and [PUBLISHER-FOLLOW-LAB.md](PUBLISHER-FOLLOW-LAB.md) — the manager's administration surface and the public entry
   point that follows the active manager.
+- [DECISION-FOLLOW.md](DECISION-FOLLOW.md) — the host-side tick that delivers the replicas' quorum certificates
+  to this node through its local socket.
 - [GARBAGE-COLLECTION.md](GARBAGE-COLLECTION.md) — collection on proof, never on age alone.
 - [BACKUP-SERVER.md](BACKUP-SERVER.md) — the Backup Server design (recovery points, immutable chunks, off-site copy).
 - [SHAPER-SUPERVISION.md](SHAPER-SUPERVISION.md) — integration with SHAPER's supervision loop.

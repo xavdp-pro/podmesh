@@ -442,3 +442,31 @@ and resident operations are the next lots), extend a lease by majority, or run o
   late is declared at its peers' serial (`authority_serial`) so that it shares their digest.
 - **The barrier on the certificate path is kept:** a certificate's `eligible_after` holds the
   acquisition itself, whatever the method.
+
+**2026-09-19, V3-5, the manager decides: built and tested without the laboratory.** The replicas propose,
+vote and assemble certificates themselves (web tree, `experiments/manager-resident`, "The manager
+decides"). Each voter checks a proposal against its own view before it votes. The view is the current
+epoch and holder its store's votes prove, and the barrier rules above:
+
+- `same_holder` carries the barrier;
+- `lease_barrier` to another holder also covers the current certificate's expiry, the renewal bound of
+  the follow mandates, and the proposal's issue, each plus the lease and the margin;
+- `fence_receipt` is refused, because a receipt is the previous holder node's unsigned answer, which no
+  replica can verify.
+
+A host-side tick delivers the certificates through the node's local socket
+(`packaging/podmesh-decision-follow`, `DECISION-FOLLOW.md`), reading them through a new read-only door,
+`manager_decision`. The certificate names the holder's host: `activation_acquire`, then `publisher_start`
+with it as the takeover proof when a publisher is declared, eligible and idle. On every other host:
+`activation_supersede` above the screen. No listener is added anywhere.
+
+What the local end-to-end test shows, with three residents and three real nodes: an epoch and a
+same-holder re-issue decided by two replicas of three and applied by the nodes; a rotation held until its
+barrier; a minority's vote deciding nothing and its hand-made certificate refused; replayed and late
+certificates refused by the screen.
+
+What only the laboratory shows: the relay of `manager_decision` into a running manager universe,
+`publisher_start` under a certificate on a real connector, and the campaign with the workstation off. The
+majority does not extend leases yet (V3-6). Until it does, a rotation away from a holder that may still
+renew by itself waits for the follow mandates' `not_after`, and declaring a host lost stays the
+operator's.

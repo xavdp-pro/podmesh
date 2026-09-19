@@ -782,6 +782,33 @@ resident's protocol.
   the resident's own refusal (a scope it does not own, a writer it does not accept) is returned as the refusal.
   Not an exclusive effect and not gated by the activation lease: every replica appends in its own scopes and
   replication carries them.
+- `manager_decision` (`resource`, a UUID; read-only; development tree, V3-5): relays exactly one
+  `{"operation": "decision_read", "resource"}` to the resident and returns its answer as
+  `resident_reply`. The answer is the replica's current decision of the resource, with the quorum
+  certificate its votes assemble into, or each proposal above it with its voters and what is missing.
+  Nothing in it is trusted here: a certificate is verified by the operation it is delivered to
+  (`activation_acquire`, `activation_supersede`, `publisher_start`), with this host's policy's keys. The
+  host's decision follow tick reads it (`DECISION-FOLLOW.md`). No other field of the request reaches the
+  resident.
+
+**A manager replica's host state (development tree, V3-5).** `create` takes an optional
+`manager_host_state` (a name, the token of this host's replica, such as its alias). The universe then gets
+exactly three bind mounts, derived from that name and nothing the caller gives:
+
+- `<state>/manager-host/<name>/votes`, read-write, at `/run/podmesh-host/votes`: the replica's signing key
+  and its signing ledger;
+- `<state>/manager-host/<name>/evidence`, read-only, at `/run/podmesh-host/evidence`: the operator's
+  readmission evidence, which the replica cannot write;
+- the host's `/etc/machine-id`, read-only, at `/run/podmesh-host/machine-id`: the identity the ledger is
+  bound to.
+
+The two directories are made private at the first create, must be real directories, and are never
+removed by PodMesh. A roll that deletes and re-creates the replica under the same name finds its key and
+ledger again. The container is labelled `io.podmesh.manager-host-state=<name>`. A universe with mounts is
+refused by clones, live captures and migrations. A stopped capture exports the root filesystem without
+them, so no recovery point carries or rewinds the key or the ledger. A promotion creates the universe
+without them, so a promoted replica that votes does not start until it is created again with its host
+state.
 
 ## Facts for a watching agent
 
