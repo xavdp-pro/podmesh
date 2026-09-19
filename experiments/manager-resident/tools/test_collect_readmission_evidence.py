@@ -4,9 +4,12 @@
 With stubbed commands (a `python3 -c` that prints a given JSON document, or fails): a plan that misses an
 input, names one too many, or whose command fails, times out, prints no JSON or prints another input than
 it claims (a store without its digest, another key's ledger, another node's answers) writes nothing and
-exits 3; a replica whose ledger is not marked unadmitted (read on its control socket) writes nothing; a
-complete plan writes one read-only file per input, each an evidence envelope stamped after the mark, and
-prints the digests of exactly those bytes and the readmission request. The same tool against real
+exits 3; a plan without the replica's control socket, and a replica whose ledger is not marked unadmitted,
+write nothing; a plan that returns a consistent older snapshot (every input well formed, the screens
+observed before the mark) writes nothing, and neither does an input that changes between its two reads
+(review of V3-5, finding 4); a complete plan writes one read-only file per input, each an evidence
+envelope stamped after the mark, and prints the digests of exactly those bytes and the readmission
+request. The same tool against real
 residents and nodes, followed by the resident's readmission, is the end-to-end test's
 (tests/e2e/decisions-e2e.py). No daemon, no host. Run: python3 -B tools/test_collect_readmission_evidence.py"""
 import hashlib, json, os, pathlib, shutil, socket, stat, subprocess, sys, tempfile, threading, time
@@ -36,12 +39,13 @@ def ledger(key):
     return {"form": "podmesh-manager-vote-ledger/1", "key_id": key}
 
 
-def screen(node):
-    return {"activation_status": [{"this_host_uuid": node, "universe_uuid": "r", "highest_epoch_seen": None}]}
+def screen(node, observed_at=None):
+    return {"activation_status": [{"this_host_uuid": node, "universe_uuid": "r", "highest_epoch_seen": None}],
+            "observed_at": int(time.time()) + 5 if observed_at is None else observed_at}
 
 
 def plan(td, evidence, **overrides):
-    p = {"replica_config": str(config(td)), "evidence_dir": str(evidence),
+    p = {"replica_config": str(config(td)), "evidence_dir": str(evidence), "resident_socket": str(td / "marked.sock"),
          "stores": {"r1": printing(STORE), "r2": printing(STORE)},
          "ledgers": {"replica-b": printing(ledger("replica-b")), "replica-c": printing(ledger("replica-c"))},
          "screens": {n: printing(screen(n)) for n in NODES}}
@@ -56,7 +60,7 @@ def plan(td, evidence, **overrides):
 
 
 def collect(plan_path, expect):
-    p = subprocess.run(["python3", "-B", str(TOOL), "collect", "--plan", str(plan_path)], capture_output=True, text=True)
+    p = subprocess.run(["python3", "-B", str(TOOL), "collect", "--plan", str(plan_path), "--settle-seconds", "0.5"], capture_output=True, text=True)
     assert p.returncode == expect, (p.returncode, p.stdout, p.stderr)
     return p
 
@@ -88,6 +92,8 @@ def main():
     evidence = td / "evidence"
     evidence.mkdir()
     empty = lambda: not any(evidence.iterdir())
+    marked = int(time.time())
+    Resident(td / "marked.sock", "unadmitted", marked)
     base = json.loads(plan(td, evidence).read_text())
 
     for why, overrides, needle in [
@@ -105,15 +111,32 @@ def main():
         assert needle in p.stderr and "nothing was written" in p.stderr and empty(), (why, p.stderr)
     checks.append("a plan that misses an input or names one too many, a command that fails or prints no JSON, a store, a ledger or a screen that is not what it claims, or a missing evidence directory: nothing written, exit 3")
 
+    p = collect(plan(td, evidence, resident_socket=None), 3)
+    assert "names no resident_socket" in p.stderr and empty(), p.stderr
     admitted = Resident(td / "admitted.sock", "admitted", None)
     p = collect(plan(td, evidence, resident_socket=str(td / "admitted.sock")), 3)
     assert "not unadmitted" in p.stderr and empty(), p.stderr
     admitted.sock.close()
-    checks.append("a replica whose ledger is not marked unadmitted: nothing written, exit 3")
+    checks.append("a plan without the replica's control socket, and a replica whose ledger is not marked unadmitted: nothing written, exit 3")
 
-    marked = int(time.time())
-    Resident(td / "marked.sock", "unadmitted", marked)
-    p = collect(plan(td, evidence, resident_socket=str(td / "marked.sock")), 0)
+    # A consistent older snapshot: every input well formed and unchanging, the screens observed before
+    # the mark (their node clocks name an earlier time).
+    old = {n: printing(screen(n, observed_at=marked - 3600)) for n in NODES}
+    p = collect(plan(td, evidence, screens=old), 3)
+    assert "before the mark" in p.stderr and empty(), p.stderr
+    no_clock = {n: printing({"activation_status": screen(n)["activation_status"]}) for n in NODES}
+    p = collect(plan(td, evidence, screens=no_clock), 3)
+    assert "observed_at" in p.stderr and empty(), p.stderr
+    # An input that changes between its two reads: a store whose history grows.
+    counter = td / "reads"
+    counter.write_text("0")
+    growing = ["python3", "-c", f"import json,pathlib; c=pathlib.Path({str(counter)!r}); n=int(c.read_text())+1; c.write_text(str(n)); "
+               f"print(json.dumps({{'history_count': 0, 'ordered_facts': [], 'logical_history_sha256': str(n) * 64}}))"]
+    p = collect(plan(td, evidence, stores={"r1": growing, "r2": printing(STORE)}), 3)
+    assert "changed between two reads" in p.stderr and empty(), p.stderr
+    checks.append("a consistent older snapshot (screens observed before the mark), a screen without its clock, and an input that changed between its two reads: nothing written, exit 3")
+
+    p = collect(plan(td, evidence), 0)
     out = json.loads(p.stdout)
     names = sorted(os.listdir(evidence))
     assert names == sorted(["store.r1.json", "store.r2.json", "ledger.replica-b.json", "ledger.replica-c.json"] + [f"screen.{n}.json" for n in NODES]), names

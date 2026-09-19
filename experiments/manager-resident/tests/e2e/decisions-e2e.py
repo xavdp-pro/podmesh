@@ -17,8 +17,9 @@ What it shows, in order:
  3. epoch 1 (first) decided by the two admitted replicas; the agents deliver it: the named host acquires,
     the two others are superseded, and every node's screen moves to 1;
  4. a same-holder re-issue (epoch 2) decided and delivered the same way;
- 5. a rotation to another holder (epoch 3, lease_barrier) proposed with a barrier the view does not allow:
-    refused by the voters, never decided, nothing delivered; proposed with the barrier the view requires:
+ 5. a rotation to another holder (epoch 3, lease_barrier) refused while no renewal bound is recorded; the
+    bound recorded on every replica, a barrier the view does not allow refused by the voters, never
+    decided, nothing delivered; proposed with the barrier the view requires:
     decided, the new holder's node refuses it until the barrier and accepts it at the next tick after,
     the previous holder is superseded;
  6. a replayed and a late certificate (epochs 1 and 2) delivered by hand: every node refuses them, and no
@@ -319,7 +320,7 @@ def run(lab):
         }
         plan_path = lab.root / f"plan-{i}.json"
         plan_path.write_text(json.dumps(plan))
-        p = subprocess.run(["python3", "-B", str(COLLECTOR), "collect", "--plan", str(plan_path)], capture_output=True, text=True, timeout=300,
+        p = subprocess.run(["python3", "-B", str(COLLECTOR), "collect", "--plan", str(plan_path), "--settle-seconds", "1"], capture_output=True, text=True, timeout=300,
                            env={**os.environ, "PODMESH_MANAGER_NETWORK_MODE": "disabled"})
         assert p.returncode == 0, (p.stdout, p.stderr)
         collected = json.loads(p.stdout)
@@ -362,21 +363,38 @@ def run(lab):
           "a same-holder re-issue (epoch 2) is decided by two replicas of three and delivered: the holder takes the new grant, every screen moves to 2",
           {"results": results, "status": s0, "screens": screens(lab)})
 
-    # 5. A rotation to host 1: first with a barrier the view does not allow, then with the one it requires.
+    # 5. A rotation to host 1. With no renewal bound recorded, refused whatever its barrier (review of
+    #    V3-5, finding 2); then the operator records the bound (the frozen mandates' latest not_after)
+    #    on every replica, which restarts with it; a barrier the view does not allow is refused; the
+    #    barrier it requires is decided.
     rotation_early = payload(3, hosts[0], hosts[1], "lease_barrier", now() + LEASE + MARGIN)
     lab.propose(1, rotation_early, "3-early")
     for i in (0, 1):
-        until(f"r{i} refuses the early rotation", 15,
-              lambda: (lambda p: p and p["here"].get("code") == "barrier_too_early" and p["votes"] == 0)(pending(lab, i, rotation_early)))
+        until(f"r{i} refuses a rotation with no renewal bound", 15,
+              lambda: (lambda p: p and p["here"].get("code") == "renewal_unbounded" and p["votes"] == 0)(pending(lab, i, rotation_early)))
     before = screens(lab)
     results = lab.agents()
     check(lab.read(0)["current"]["epoch"] == 2 and screens(lab) == before and all(r[1]["action"].startswith("none") for r in results),
-          "a rotation whose barrier does not cover the current certificate's expiry plus the lease and the margin is refused by every voter (barrier_too_early); nothing is decided or delivered")
-    required = max(c2["eligible_after"], c2["expires_at"] + LEASE + MARGIN, now() + LEASE + MARGIN)
-    # Issued as late as the issue's own term allows (issued + lease + margin <= barrier), so that the
-    # certificate lives as long as possible past its barrier.
-    issued = required - LEASE - MARGIN
-    rotation = payload(3, hosts[0], hosts[1], "lease_barrier", required, issued=issued)
+          "a rotation to another holder while no renewal bound is recorded (a follow mandate may stand past any barrier) is refused by every voter (renewal_unbounded); nothing is decided or delivered")
+    bound = max(c2["expires_at"], now() + 15)
+    for i in range(3):
+        config = json.loads(lab.residents[i]["config"].read_text())
+        config["votes"]["decisions"]["resources"][0]["renewal_not_after"] = bound
+        lab.residents[i]["config"].write_text(json.dumps(config))
+        lab.stop_resident(i)
+        lab.start_resident(i)
+    for i in range(3):
+        until(f"r{i} caught up again", 30, lambda: lab.control(i, {"operation": "status"})["catch_up"]["caught_up"])
+    for i in (0, 1):
+        until(f"r{i} refuses the early rotation", 15,
+              lambda: (lambda p: p and p["here"].get("code") == "barrier_too_early" and p["votes"] == 0)(pending(lab, i, rotation_early)))
+    results = lab.agents()
+    check(lab.read(0)["current"]["epoch"] == 2 and screens(lab) == before and all(r[1]["action"].startswith("none") for r in results),
+          "with the bound recorded, a rotation whose barrier does not cover it plus the lease and the margin is refused by every voter (barrier_too_early); nothing is decided or delivered")
+    # The barrier the view requires: the bound (at least epoch 2's expiry) plus the lease and the
+    # margin, issued at the bound itself, as late as the bound allows.
+    required = bound + LEASE + MARGIN
+    rotation = payload(3, hosts[0], hosts[1], "lease_barrier", required, issued=bound)
     lab.propose(0, rotation, "3")
     c3 = everywhere(lab, 3)
     first_try = lab.agent(1)

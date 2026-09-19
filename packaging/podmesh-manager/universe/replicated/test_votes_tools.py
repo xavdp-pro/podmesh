@@ -49,7 +49,7 @@ def main():
         run(HERE / "generate-replica-set.py", "--out", rs, *[a for i, alias in enumerate(("lab-a", "lab-b", "lab-c")) for a in ("--replica", f"{alias}:{HOSTS[i]}:10.86.{i + 1}.10")])
         keys = [f"--key={alias}:{k}:{PUBLIC[k]}" for alias, k in (("lab-a", "replica-a"), ("lab-b", "replica-b"), ("lab-c", "replica-c"))]
         run(HERE / "add-votes.py", "--dir", rs, *keys[:2], f"--resource={R}:300:30:0", expect=1)
-        out = json.loads(run(HERE / "add-votes.py", "--dir", rs, *keys, f"--resource={R}:300:30:0", f"--baseline={R}:157:{HOSTS[0]}:1789681724").stdout)
+        out = json.loads(run(HERE / "add-votes.py", "--dir", rs, *keys, f"--resource={R}:300:30:0", f"--baseline={R}:157:{HOSTS[0]}:1789681724:1789685324").stdout)
         assert out["policy_digest"] == PINNED, out
         manifest = json.loads((rs / "replica-set.json").read_text())
         for r in manifest["replicas"]:
@@ -57,7 +57,7 @@ def main():
             scopes = {g["scope"] for g in config["network"]["manager"]["grants"]}
             assert {f"votes/{o['replica_id']}" for o in manifest["replicas"]} <= scopes and {f"proposals/{o['replica_id']}" for o in manifest["replicas"]} <= scopes
             v = config["votes"]
-            assert v["nodes"] == HOSTS and v["decisions"]["resources"][0]["baseline"]["epoch"] == 157 and v["evidence_dir"] == "/run/podmesh-host/evidence"
+            assert v["nodes"] == HOSTS and v["decisions"]["resources"][0]["baseline"] == {"epoch": 157, "holder": HOSTS[0], "eligible_after": 1789681724, "expires_at": 1789685324} and v["evidence_dir"] == "/run/podmesh-host/evidence"
         run(HERE / "add-votes.py", "--dir", rs, *keys, f"--resource={R}:300:30:0", expect=1)
         checks.append("add-votes gives every replica its vote and proposal scopes and a votes section under the node's pinned policy digest for the test keys, with the resource's rules and baseline; refuses a key missing and a set that already votes")
 

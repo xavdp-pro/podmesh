@@ -534,9 +534,12 @@ recorded in `votes/<replica_id>`. The rules, each refusal named:
   - `lease_barrier` carrying the barrier and, when the holder changes, covering every way the previous
     holder may still hold its lease without being told, each plus the lease and the margin: its
     re-acquisition under the current certificate until that expires, a renewal by itself until
-    `renewal_not_after` (the follow mandates' `not_after`, the operator's recorded bound; 0 when none
-    renews by itself), and an acquisition at the proposal's issue (`barrier_too_early`, naming the
-    barrier required);
+    `renewal_not_after` (the follow mandates' `not_after`, the operator's recorded bound), and an
+    acquisition at the proposal's issue (`barrier_too_early`, naming the barrier required). Until the
+    majority extends leases (V3-6), a change of holder is refused while `renewal_not_after` is 0
+    (`renewal_unbounded`) or earlier than the current proof's expiry or the proposal's issue
+    (`renewal_bound_too_early`), and, from a baseline, while the baseline does not name the gate's last
+    proof's `expires_at` (`baseline_expiry_unknown`);
   - `fence_receipt` is refused (`fence_receipt_unverifiable`): a receipt is the previous holder node's
     unsigned answer to its own fence, which no replica can verify, and one that shortened the barrier
     would let a single proposer start a second holder.
@@ -573,7 +576,14 @@ delivers the certificate with its decision follow tick (the node's `packaging/po
 
 `lease_seconds` and `takeover_margin_seconds` are the nodes' policy for the resource: the longest lease
 any holder holds. `renewal_not_after` is the latest second any holder may renew by itself. `baseline` is
-optional. The topology grants `proposals/<replica_id>` to each replica that proposes.
+optional; its `expires_at` is the gate's last proof's expiry, which the view uses as the current expiry
+until a certificate the replicas assembled passes the baseline.
+
+**Before any rotation to another holder (review of V3-5, findings 1 and 2).** The replicas cannot see a
+follow mandate, and the node does not re-check one. Until V3-6, the operator freezes (no new `--refresh`)
+or removes the V3-1 follow mandates on every host, then sets every replica's `renewal_not_after` to the
+latest `not_after` among them, and restarts the replicas with it. A resource leaving the gate gets the
+gate's last proof's `expires_at` in its baseline. The voters refuse a change of holder otherwise. The topology grants `proposals/<replica_id>` to each replica that proposes.
 `packaging/podmesh-manager/universe/replicated/add-votes.py` writes all of it for a generated replica set.
 
 **Readmission evidence** is gathered by `tools/collect-readmission-evidence.py`. From a plan naming one
@@ -583,10 +593,15 @@ command per input, it collects:
 - every other key's ledger;
 - every node's screen (its `screen` subcommand, run on that node's host).
 
-It writes them read-only into the operator's evidence directory in the form readmission reads, and
-prints the `evidence_sha256` map and the request to send. It fails closed and writes nothing when an
-input is missing, extra, fails, or is not what it claims, or when the replica's ledger is not marked
-unadmitted.
+The ledger is marked first: the plan names the replica's control socket, and the tool refuses a ledger
+not marked unadmitted. Each input is read twice, `--settle-seconds` apart, and refused if it changed;
+each screen carries the node's clock (`observed_at`), which must not be older than the mark. It writes
+the inputs read-only into the operator's evidence directory in the form readmission reads, and prints
+the `evidence_sha256` map and the request to send. It fails closed and writes nothing when an input is
+missing, extra, fails, is not what it claims, changed between its reads, or is a screen older than the
+mark. **The digests are not proof that the cluster was live**: they name the bytes the operator vouches
+for. A command that returns a consistent older copy of a store or a ledger passes every check but the
+screens' clock, and the operator vouches that each command reads the live input of the host it names.
 
 ## Validation and gaps
 

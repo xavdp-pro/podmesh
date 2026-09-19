@@ -113,6 +113,7 @@ fn the_view_is_the_highest_certificate_or_the_baseline() {
         epoch: 157,
         holder: N1.into(),
         eligible_after: NOW - 100,
+        expires_at: Some(NOW + 400),
     });
     let v = decisions::view(&q, &with_baseline, &decisions::verified(&q, &all));
     assert_eq!(
@@ -280,28 +281,42 @@ fn a_proposal_is_checked_against_the_view_rule_by_rule() {
     let required = RENEWAL + wait;
     assert!(required > NOW - 10 + LIFE + wait && required > NOW + wait);
     let rotation = |eligible| payload(2, Some(N0), N1, "lease_barrier", eligible, NOW);
-    let mut r = rules();
-    r.renewal_not_after = 0;
-    let check_with = |r: &ResourceRules, p: &Value| {
-        decisions::check(&q, r, &nodes(), &view, p, NOW, LIFE)
+    let check_with = |r: &ResourceRules, v: &View, p: &Value, now: i64| {
+        decisions::check(&q, r, &nodes(), v, p, now, LIFE)
             .map(|_| ())
             .map_err(|e| e.code)
     };
-    // Without a renewal bound, the current certificate's expiry is the latest term.
-    let by_expiry = NOW - 10 + LIFE + wait;
-    assert!(by_expiry > NOW + wait);
-    let mut long = rotation(by_expiry - 1);
-    long["expires_at"] = json!(by_expiry + 1);
-    long["issued_at"] = json!(by_expiry + 1 - LIFE);
+    // No renewal bound recorded: no change of holder at all until V3-6 (review of V3-5, finding 2).
+    let mut r = rules();
+    r.renewal_not_after = 0;
     assert_eq!(
-        check_with(&r, &long),
+        check_with(&r, &view, &rotation(NOW + 50), NOW),
+        Err("renewal_unbounded")
+    );
+    // A bound earlier than the current certificate's expiry: a follow mandate may stand past it, and
+    // the rotation is refused whatever barrier it carries.
+    let expiry = NOW - 10 + LIFE;
+    let by_expiry = expiry + wait;
+    let mut long = rotation(by_expiry + 5);
+    long["expires_at"] = json!(by_expiry + 10);
+    long["issued_at"] = json!(by_expiry + 10 - LIFE);
+    r.renewal_not_after = expiry - 1;
+    assert_eq!(
+        check_with(&r, &view, &long, NOW),
+        Err("renewal_bound_too_early"),
+        "a renewal bound before the current certificate's expiry"
+    );
+    // At the expiry: the barrier covers the expiry plus the wait, and one second less is refused.
+    r.renewal_not_after = expiry;
+    assert_eq!(check_with(&r, &view, &long, NOW), Ok(()));
+    long["eligible_after"] = json!(by_expiry - 1);
+    assert_eq!(
+        check_with(&r, &view, &long, NOW),
         Err("barrier_too_early"),
         "before the current certificate's expiry plus the wait"
     );
-    long["eligible_after"] = json!(by_expiry);
-    assert_eq!(check_with(&r, &long), Ok(()));
-    // With it, the renewal bound; a proposal cannot even carry a barrier that late within its life,
-    // so a rotation away from a holder that may renew by itself waits for the bound's end.
+    // With a later bound, the renewal; a proposal cannot even carry a barrier that late within its
+    // life, so a rotation away from a holder that may renew by itself waits for the bound's end.
     assert_eq!(
         decisions::required_barrier(&rules(), &view, &rotation(0)),
         Some(required)
@@ -310,64 +325,146 @@ fn a_proposal_is_checked_against_the_view_rule_by_rule() {
     let mut at_bound = rotation(required);
     at_bound["issued_at"] = json!(RENEWAL);
     at_bound["expires_at"] = json!(RENEWAL + LIFE);
-    let later =
-        decisions::check(&q, &rules(), &nodes(), &view, &at_bound, RENEWAL, LIFE).map(|_| ());
     assert_eq!(
-        later.map_err(|e| e.code),
+        check_with(&rules(), &view, &at_bound, RENEWAL),
         Ok(()),
         "at the bound, from a clock that has reached it"
     );
     at_bound["eligible_after"] = json!(required - 1);
-    let early =
-        decisions::check(&q, &rules(), &nodes(), &view, &at_bound, RENEWAL, LIFE).map(|_| ());
     assert_eq!(
-        early.map_err(|e| e.code),
+        check_with(&rules(), &view, &at_bound, RENEWAL),
         Err("barrier_too_early"),
         "one second before the bound"
     );
-    // The proposal's issue: an acquisition by the previous holder at the moment of the proposal.
+    // The proposal's issue: an acquisition by the previous holder at the moment of the proposal. From a
+    // baseline whose gate proof has expired, with a renewal bound at the issue.
     let mut no_cert = rules();
-    no_cert.renewal_not_after = 0;
+    no_cert.renewal_not_after = NOW;
     no_cert.baseline = Some(Baseline {
         epoch: 5,
         holder: N0.into(),
         eligible_after: 0,
+        expires_at: Some(NOW - 100),
     });
     let base = decisions::view(&q, &no_cert, &[]);
-    let from_base = |eligible: i64| payload(6, Some(N0), N1, "lease_barrier", eligible, NOW);
-    let base_check = |p: &Value| {
-        decisions::check(&q, &no_cert, &nodes(), &base, p, NOW, LIFE)
-            .map(|_| ())
-            .map_err(|e| e.code)
-    };
     assert_eq!(
-        base_check(&from_base(NOW + wait - 1)),
+        base.expires_at,
+        NOW - 100,
+        "the baseline's proof expiry is the view's"
+    );
+    let from_base = |eligible: i64| payload(6, Some(N0), N1, "lease_barrier", eligible, NOW);
+    assert_eq!(
+        check_with(&no_cert, &base, &from_base(NOW + wait - 1), NOW),
         Err("barrier_too_early"),
         "before the issue plus the wait"
     );
-    assert_eq!(base_check(&from_base(NOW + wait)), Ok(()));
+    assert_eq!(
+        check_with(&no_cert, &base, &from_base(NOW + wait), NOW),
+        Ok(())
+    );
+    // A bound earlier than the proposal's issue: a mandate stands past what the operator recorded.
+    no_cert.renewal_not_after = NOW - 1;
+    assert_eq!(
+        check_with(&no_cert, &base, &from_base(NOW + 50), NOW),
+        Err("renewal_bound_too_early"),
+        "a rotation while a follow mandate stands past renewal_not_after"
+    );
+    no_cert.renewal_not_after = NOW;
     // The carried barrier binds every method.
     no_cert.baseline = Some(Baseline {
         epoch: 5,
         holder: N0.into(),
         eligible_after: NOW + 50,
+        expires_at: Some(NOW - 100),
     });
     let base = decisions::view(&q, &no_cert, &[]);
-    let base_check = |p: &Value| {
-        decisions::check(&q, &no_cert, &nodes(), &base, p, NOW, LIFE)
+    assert_eq!(
+        check_with(
+            &no_cert,
+            &base,
+            &payload(6, Some(N0), N0, "same_holder", NOW + 49, NOW),
+            NOW
+        ),
+        Err("barrier_too_early")
+    );
+    assert_eq!(
+        check_with(
+            &no_cert,
+            &base,
+            &payload(6, Some(N0), N1, "lease_barrier", NOW + wait, NOW),
+            NOW
+        ),
+        Err("barrier_too_early")
+    );
+    assert_eq!(
+        check_with(
+            &no_cert,
+            &base,
+            &payload(6, Some(N0), N1, "lease_barrier", NOW + 50, NOW),
+            NOW
+        ),
+        Ok(())
+    );
+}
+
+/// Proves (review of V3-5, finding 1): a rotation away from the gate's holder covers the gate's last
+/// proof. A baseline that does not name that proof's expiry refuses any change of holder, and still
+/// allows a same-holder decision; a baseline whose proof is still live refuses a renewal bound below
+/// its expiry, and requires a barrier no earlier than that expiry plus the lease and the margin, so
+/// the rotation waits for the proof's end.
+#[test]
+fn a_rotation_from_a_baseline_with_a_live_gate_proof_waits_for_it() {
+    let q = policy();
+    let wait = LEASE + MARGIN;
+    let proof_expiry = NOW + 3_000;
+    let mut r = rules();
+    r.renewal_not_after = proof_expiry;
+    r.baseline = Some(Baseline {
+        epoch: 157,
+        holder: N0.into(),
+        eligible_after: NOW - 100,
+        expires_at: None,
+    });
+    let check_at = |r: &ResourceRules, p: &Value, now: i64| {
+        let v = decisions::view(&q, r, &[]);
+        decisions::check(&q, r, &nodes(), &v, p, now, LIFE)
             .map(|_| ())
             .map_err(|e| e.code)
     };
+    let rotation =
+        |eligible: i64, at: i64| payload(158, Some(N0), N1, "lease_barrier", eligible, at);
     assert_eq!(
-        base_check(&payload(6, Some(N0), N0, "same_holder", NOW + 49, NOW)),
-        Err("barrier_too_early")
+        check_at(&r, &rotation(NOW + 50, NOW), NOW),
+        Err("baseline_expiry_unknown")
     );
     assert_eq!(
-        base_check(&payload(6, Some(N0), N1, "lease_barrier", NOW + wait, NOW)),
+        check_at(
+            &r,
+            &payload(158, Some(N0), N0, "same_holder", NOW - 100, NOW),
+            NOW
+        ),
+        Ok(()),
+        "a same-holder decision from a baseline without its proof's expiry"
+    );
+    r.baseline.as_mut().unwrap().expires_at = Some(proof_expiry);
+    assert_eq!(decisions::view(&q, &r, &[]).expires_at, proof_expiry);
+    // A renewal bound below the live proof's expiry.
+    let mut low = r.clone();
+    low.renewal_not_after = proof_expiry - 1;
+    assert_eq!(
+        check_at(&low, &rotation(NOW + 50, NOW), NOW),
+        Err("renewal_bound_too_early")
+    );
+    // Now: no barrier a live proposal can carry reaches the proof's expiry plus the wait.
+    assert_eq!(
+        check_at(&r, &rotation(NOW + 50, NOW), NOW),
         Err("barrier_too_early")
     );
+    // At the proof's end: the barrier at its expiry plus the wait passes, one second less does not.
+    let at = proof_expiry;
+    assert_eq!(check_at(&r, &rotation(at + wait, at), at), Ok(()));
     assert_eq!(
-        base_check(&payload(6, Some(N0), N1, "lease_barrier", NOW + 50, NOW)),
-        Ok(())
+        check_at(&r, &rotation(at + wait - 1, at), at),
+        Err("barrier_too_early")
     );
 }

@@ -5,7 +5,7 @@ that `generate-replica-set.py` wrote, and the scopes a replica votes and propose
     add-votes.py --dir <replica set> \
       --key lab-a:<key_id>:<public key> --key lab-b:... --key lab-c:... \
       --resource <uuid>:<lease seconds>:<takeover margin seconds>:<renewal not_after> [--resource ...] \
-      [--baseline <uuid>:<epoch>:<holder host uuid>:<eligible_after>] \
+      [--baseline <uuid>:<epoch>:<holder host uuid>:<eligible_after>:<expires_at>] \
       [--max-certificate-life 300] [--voter-interval-ms 1000] [--operator-uid 0]
 
 Each `--key` names one replica's key by its alias: its identifier and its public half only, as
@@ -14,8 +14,11 @@ Each `--key` names one replica's key by its alias: its identifier and its public
 evidence directory is the host state's `/run/podmesh-host/evidence`, and every replica decides the
 resources named, with the barrier rules' lease, margin and renewal bound (`renewal_not_after`: the
 latest `not_after` of any follow mandate standing on the hosts, 0 when none renews by itself). A
-`--baseline` records where a resource moving from the gate starts: the gate's last epoch, its holder and
-its barrier. The nodes' policies must name the same quorum (`activation_require` with
+`--baseline` records where a resource moving from the gate starts: the gate's last epoch, its holder, its
+barrier and its proof's `expires_at` (the gate's holder may re-acquire under that proof until then; a
+change of holder waits for it). Until V3-6, a change of holder also needs `renewal_not_after` to be the
+latest `not_after` of the follow mandates, frozen or removed beforehand, and no earlier than the current
+proof's expiry; 0 refuses every change of holder. The nodes' policies must name the same quorum (`activation_require` with
 `authority_quorum`, the digest printed here). Refuses a set that already votes.
 """
 import argparse, hashlib, json, os, sys
@@ -24,7 +27,7 @@ p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDes
 p.add_argument('--dir', required=True)
 p.add_argument('--key', action='append', required=True, help='alias:key_id:public_key')
 p.add_argument('--resource', action='append', required=True, help='uuid:lease:margin:renewal_not_after')
-p.add_argument('--baseline', action='append', default=[], help='uuid:epoch:holder:eligible_after')
+p.add_argument('--baseline', action='append', default=[], help='uuid:epoch:holder:eligible_after:expires_at')
 p.add_argument('--authority-id', default='replicas')
 p.add_argument('--max-certificate-life', type=int, default=300)
 p.add_argument('--voter-interval-ms', type=int, default=1000)
@@ -50,8 +53,8 @@ digest = hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(',', ':')
 nodes = [r['host_id'] for r in manifest['replicas']]
 baselines = {}
 for spec in a.baseline:
-    uuid, epoch, holder, eligible = spec.split(':')
-    baselines[uuid] = {'epoch': int(epoch), 'holder': holder, 'eligible_after': int(eligible)}
+    uuid, epoch, holder, eligible, expires = spec.split(':')
+    baselines[uuid] = {'epoch': int(epoch), 'holder': holder, 'eligible_after': int(eligible), 'expires_at': int(expires)}
 resources = []
 for spec in a.resource:
     uuid, lease, margin, renewal = spec.split(':')

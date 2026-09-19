@@ -505,8 +505,8 @@ fn digest(payload: &Value) -> String {
 
 /// Proves, with three compiled residents: an epoch rotation and a same-holder re-issue decided by
 /// two replicas of three, each certificate read from a replica that did not propose it and accepted
-/// by the node's rules; a proposal that breaks the barrier refused by every voter, by name, never
-/// decided, and refused through `vote_sign` too; a replica whose ledger is unadmitted does not vote,
+/// by the node's rules; a rotation refused by every voter and by `vote_sign` while no renewal bound
+/// is recorded, and, once the bound is recorded, while its barrier breaks it, never decided; a replica whose ledger is unadmitted does not vote,
 /// the two others decide; with one of them stopped, one vote decides nothing and the read says one
 /// is missing; a signature retried on a decided payload is answered with the vote already recorded,
 /// appending nothing; and every vote operation answered within the vote deadline, the timings
@@ -549,8 +549,9 @@ fn two_replicas_of_three_decide_and_one_does_not() {
         (Some(REBOOT), true)
     );
 
-    // A rotation to another holder whose barrier does not cover the current certificate's expiry:
-    // every voter refuses it, and it is never decided.
+    // A rotation to another holder while no renewal bound is recorded (renewal_not_after 0: a follow
+    // mandate may stand for ever, as far as the replicas know): every voter refuses it, and so does
+    // `vote_sign` (review of V3-5, finding 2).
     let early = payload(
         3,
         Some(NODES[0]),
@@ -560,6 +561,46 @@ fn two_replicas_of_three_decide_and_one_does_not() {
         now() + LEASE + MARGIN,
     );
     lab.propose(2, "propose-3-early", &early);
+    for i in 0..3 {
+        until(
+            &format!("r{i} refuses a rotation with no renewal bound"),
+            Duration::from_secs(10),
+            || {
+                lab.pending(i, &digest(&early))
+                    .is_some_and(|p| p["here"]["code"] == "renewal_unbounded" && p["votes"] == 0)
+            },
+        );
+    }
+    let direct = lab.control(
+        0,
+        &json!({"operation": "vote_sign", "operation_id": "direct-unbounded", "payload": early}),
+    );
+    assert_eq!(direct["code"], "renewal_unbounded", "{direct}");
+    // The operator freezes the mandates and records their latest not_after, here epoch 2's expiry,
+    // on every replica, which restarts with it.
+    let bound = c2["expires_at"].as_i64().unwrap();
+    for i in 0..3 {
+        lab.configs[i]
+            .votes
+            .as_mut()
+            .unwrap()
+            .decisions
+            .as_mut()
+            .unwrap()
+            .resources[0]
+            .renewal_not_after = bound;
+        lab.stop(i);
+        lab.start(i);
+    }
+    for i in 0..3 {
+        until(
+            &format!("r{i} caught up again"),
+            Duration::from_secs(30),
+            || lab.status(i)["catch_up"]["caught_up"] == true,
+        );
+    }
+    // The same rotation, its barrier now below the bound plus the wait: every voter refuses it by its
+    // barrier, and it is never decided.
     for i in 0..3 {
         until(
             &format!("r{i} refuses the early barrier"),

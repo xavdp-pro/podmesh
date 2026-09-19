@@ -14,7 +14,7 @@ them in the form readmission reads, then prints the digests to state.
 
     {"replica_config": "/abs/config.json",       the resident configuration of the replica being readmitted
      "evidence_dir": "/abs/dir",                  the operator's evidence directory (it must exist)
-     "resident_socket": "/abs/control.sock",      optional: the replica's control socket, to check the mark
+     "resident_socket": "/abs/control.sock",      required: the replica's control socket, to read the mark
      "stores":  {"<replica_id>": [argv...]},      prints `podmesh-managerd --inspect-store --facts-only` output
      "ledgers": {"<key_id>": [argv...]},          prints that key's ledger file
      "screens": {"<node host UUID>": [argv...]}}  prints `screen` output, run on that node's host
@@ -22,14 +22,25 @@ them in the form readmission reads, then prints the digests to state.
 Each command runs here, as given (an `ssh` to a peer host, or a local command); its standard output is the
 input's content. The inputs the plan must name are computed from the replica's configuration exactly as
 readmission computes them: every other replica's store, every other key of the policy, every node of
-`votes.nodes`. It fails closed: a missing or extra input, a command that fails, times out or prints
-something that is not the input it claims to be, or a replica whose ledger is not marked unadmitted
-(when the socket is given), writes nothing and exits 3. Otherwise every file is written read-only
-(0444) through a temporary file and a rename, each stamped `collected_at` now -- after the mark, which
-readmission checks -- and the tool prints the `evidence_sha256` map and the request to send.
+`votes.nodes`. The ledger is marked first: the tool reads the mark on the replica's control socket
+(`resident_socket` is required) and refuses a ledger that is not unadmitted. Each command runs twice,
+`--settle-seconds` apart (3 by default), and an input whose content changed between the two reads is
+refused: it was not at rest. Each screen must carry the node's own clock (`observed_at`, which the
+`screen` subcommand prints) no older than the mark. It fails closed: a missing or extra input, a command
+that fails, times out or prints something that is not the input it claims to be, an input that changed
+between its reads, a screen older than the mark or without its clock, or a ledger not marked, writes
+nothing and exits 3. Otherwise every file is written read-only (0444) through a temporary file and a
+rename, each stamped `collected_at` now -- after the mark, which readmission checks -- and the tool prints
+the `evidence_sha256` map and the request to send.
+
+THE DIGESTS ARE NOT PROOF THAT THE CLUSTER WAS LIVE. They say which bytes the operator vouches for, and
+readmission refuses any other. A command that returns a consistent older copy -- a store or a ledger read
+from a backup, an `ssh` to the wrong host -- passes every check here except the screens' clock, and
+readmission would then set a floor that missed what the copy did not hold. The operator vouches that each
+command reads the live input of the host it names (review of V3-5, finding 4).
 
 `screen` runs on a node's host: it asks the node's socket `activation_status` for each resource and
-prints `{"activation_status": [...]}`, failing on any refusal.
+prints `{"activation_status": [...], "observed_at": <the node's clock>}`, failing on any refusal.
 """
 import argparse, hashlib, json, os, socket, subprocess, sys, time
 
@@ -71,7 +82,7 @@ def local_request(path, request, line):
 
 
 def screen(args):
-    answers = []
+    answers, observed = [], []
     for resource in args.resource:
         try:
             answer = local_request(args.socket, {"operation": "activation_status", "universe_uuid": resource}, True)
@@ -80,7 +91,10 @@ def screen(args):
         if not answer.get("ok"):
             fail(f"activation_status {resource} refused: {answer.get('error')}")
         answers.append(answer["data"])
-    print(json.dumps({"activation_status": answers}, sort_keys=True))
+        observed.append(answer.get("observed_at"))
+    if not all(isinstance(o, int) for o in observed):
+        fail("the node's answers carry no observed_at clock")
+    print(json.dumps({"activation_status": answers, "observed_at": min(observed)}, sort_keys=True))
 
 
 def required(config):
@@ -110,6 +124,16 @@ def run(argv):
         raise Refused(f"{' '.join(argv)[:200]} printed no JSON") from e
 
 
+def at_rest(input_, content):
+    """What must not change between two reads of a live input: a store's facts, a ledger whole, a
+    screen's epochs and serials (its answers also carry clocks and remaining times, which move)."""
+    if input_ == "store":
+        return (content.get("history_count"), content.get("logical_history_sha256"))
+    if input_ == "ledger":
+        return json.dumps(content, sort_keys=True)
+    return sorted((a.get("universe_uuid"), a.get("highest_epoch_seen"), a.get("authority_serial")) for a in content["activation_status"])
+
+
 def check(input_, source, content):
     """The input is what it claims to be, as far as can be told here; readmission checks it again
     (a store's digest against its facts, a ledger's checksum)."""
@@ -124,6 +148,8 @@ def check(input_, source, content):
         answers = content.get("activation_status") if isinstance(content, dict) else None
         if not isinstance(answers, list) or not all(isinstance(a, dict) and a.get("this_host_uuid") == source for a in answers):
             raise Refused(f"screen {source}: not the activation_status answers of node {source}")
+        if not isinstance(content.get("observed_at"), int) or isinstance(content.get("observed_at"), bool):
+            raise Refused(f"screen {source}: carries no observed_at, the node's clock")
 
 
 def collect(args):
@@ -140,22 +166,35 @@ def collect(args):
         evidence_dir = plan["evidence_dir"]
         if not os.path.isabs(evidence_dir) or not os.path.isdir(evidence_dir) or os.path.islink(evidence_dir):
             raise Refused(f"the evidence directory {evidence_dir} must be an existing absolute directory")
-        marked_at = None
-        if plan.get("resident_socket"):
-            status = local_request(plan["resident_socket"], {"operation": "status"}, False)
-            votes = status.get("votes") or {}
-            if votes.get("ledger_state") != "unadmitted":
-                raise Refused(f"the replica's ledger is {votes.get('ledger_state')!r}, not unadmitted: mark it first (vote_ledger_mark_unadmitted)")
-            marked_at = votes.get("unadmitted_since")
-        files = {}
-        for input_, table in (("store", plan["stores"]), ("ledger", plan["ledgers"]), ("screen", plan["screens"])):
-            for source, argv in sorted(table.items()):
-                content = run(argv)
-                check(input_, source, content)
-                envelope = {"form": EVIDENCE_FORM, "input": input_, "source": source, "collected_at": int(time.time()), "content": content}
-                files[f"{input_}.{source}.json"] = json.dumps(envelope, sort_keys=True).encode()
-        if marked_at is not None and int(time.time()) < marked_at:
+        if not plan.get("resident_socket"):
+            raise Refused("the plan names no resident_socket: the ledger is marked first, and the mark is read before anything is collected")
+        status = local_request(plan["resident_socket"], {"operation": "status"}, False)
+        votes = status.get("votes") or {}
+        if votes.get("ledger_state") != "unadmitted":
+            raise Refused(f"the replica's ledger is {votes.get('ledger_state')!r}, not unadmitted: mark it first (vote_ledger_mark_unadmitted)")
+        marked_at = votes.get("unadmitted_since")
+        if not isinstance(marked_at, int) or isinstance(marked_at, bool):
+            raise Refused("the replica's status names no unadmitted_since: the mark cannot be read")
+        if int(time.time()) < marked_at:
             raise Refused("this clock is before the mark: the evidence would count as collected before it")
+        table = [(i, source, argv) for i, t in (("store", plan["stores"]), ("ledger", plan["ledgers"]), ("screen", plan["screens"]))
+                 for source, argv in sorted(t.items())]
+        first = {}
+        for input_, source, argv in table:
+            content = run(argv)
+            check(input_, source, content)
+            first[(input_, source)] = content
+        time.sleep(args.settle_seconds)
+        files = {}
+        for input_, source, argv in table:
+            content = run(argv)
+            check(input_, source, content)
+            if at_rest(input_, content) != at_rest(input_, first[(input_, source)]):
+                raise Refused(f"{input_} {source} changed between two reads {args.settle_seconds} s apart: it is not at rest; collect again once it is")
+            if input_ == "screen" and content["observed_at"] < marked_at:
+                raise Refused(f"screen {source} was observed at {content['observed_at']}, before the mark at {marked_at}: not a screen of now")
+            envelope = {"form": EVIDENCE_FORM, "input": input_, "source": source, "collected_at": int(time.time()), "content": content}
+            files[f"{input_}.{source}.json"] = json.dumps(envelope, sort_keys=True).encode()
     except (Refused, KeyError, TypeError, ValueError, OSError) as e:
         fail(f"{e}; nothing was written")
     digests = {}
@@ -180,10 +219,11 @@ def collect(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     c = sub.add_parser("collect")
     c.add_argument("--plan", required=True)
+    c.add_argument("--settle-seconds", type=float, default=3.0, help="the delay between the two reads of each input")
     s = sub.add_parser("screen")
     s.add_argument("--socket", required=True)
     s.add_argument("--resource", action="append", required=True)

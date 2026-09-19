@@ -149,8 +149,10 @@ The entrypoint sees `/run/podmesh-host/votes` and gives the resident `PODMESH_MA
 resident refuses, and the start exits 2.
 
 No recovery point, clone or migration carries the key or the ledger. PodMesh refuses mounts to live
-captures, clones and migrations, and a stopped capture exports the root filesystem only. A roll that
-deletes and re-creates the replica under the same name finds them again.
+captures, clones and migrations, and a stopped capture exports the root filesystem only. One universe
+holds a name at a time: a second `create` with the same name is refused while the first holds it. A
+`delete` releases the directory (renamed, never removed), and a roll that re-creates the replica under the
+same name finds the key and the ledger once the old universe is gone.
 
 The procedure, the seed never leaving its host:
 

@@ -30,7 +30,12 @@
 //!     under the current certificate until that certificate expires, a renewal by itself until the
 //!     latest second any holder may renew by itself (`renewal_not_after`, the operator's recorded
 //!     bound: the follow mandates' `not_after`), and an acquisition at the proposal's issue; each
-//!     plus the lease and the margin;
+//!     plus the lease and the margin. Until the majority extends leases (V3-6), a change of holder
+//!     is refused unless the operator recorded an explicit renewal bound, not 0, no earlier than the
+//!     current certificate's expiry and the proposal's issue (review of V3-5, finding 2): the
+//!     replicas cannot see a follow mandate, and a bound that does not cover the present would let
+//!     the previous holder renew past the barrier. A holder change from a baseline is refused while
+//!     the baseline does not name the gate's last proof's expiry (finding 1);
 //!   - `fence_receipt`: refused. A receipt is the previous holder node's unsigned answer to its own
 //!     fence; no replica can verify it, and a receipt that shortened the barrier would let one
 //!     proposer start a second holder. It returns when a host reports its fence into its own
@@ -93,6 +98,11 @@ pub struct Baseline {
     pub epoch: i64,
     pub holder: String,
     pub eligible_after: i64,
+    /// The gate's last proof's `expires_at`: its holder may re-acquire under it until then. Until a
+    /// certificate the replicas assembled passes the baseline, it is the view's `expires_at`, and a
+    /// change of holder is refused while it is absent (review of V3-5, finding 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
 }
 
 /// The replicas' decisions: which resources this replica decides, and how often its voter reads
@@ -304,6 +314,7 @@ pub fn view(policy: &Quorum, rules: &ResourceRules, votes: &[VerifiedVote]) -> V
         out.epoch = b.epoch;
         out.holder = Some(b.holder.clone());
         out.barrier = b.eligible_after;
+        out.expires_at = b.expires_at.unwrap_or(0);
         out.source = ViewSource::Baseline;
     }
     if let Some(votes) = best {
@@ -487,6 +498,37 @@ pub fn check(
                 "method_unknown",
                 format!("method {other} is not one the node knows"),
             ))
+        }
+    }
+    let changes_holder =
+        method == "lease_barrier" && view.holder.as_deref().is_some_and(|h| h != decision.holder);
+    if changes_holder {
+        if view.source == ViewSource::Baseline
+            && rules
+                .baseline
+                .as_ref()
+                .is_some_and(|b| b.expires_at.is_none())
+        {
+            return Err(refuse(
+                "baseline_expiry_unknown",
+                "the baseline does not name the gate's last proof's expiry: its holder may re-acquire under that proof until an unknown time",
+            ));
+        }
+        if rules.renewal_not_after == 0 {
+            return Err(refuse(
+                "renewal_unbounded",
+                "no renewal bound is recorded (renewal_not_after 0): until the majority extends leases (V3-6), a change of holder needs the operator's explicit bound on self-renewal",
+            ));
+        }
+        let covered = view.expires_at.max(decision.issued_at);
+        if rules.renewal_not_after < covered {
+            return Err(refuse(
+                "renewal_bound_too_early",
+                format!(
+                    "the recorded renewal bound {} is earlier than {covered}, the later of the current proof's expiry and this proposal's issue: a follow mandate may stand past it; freeze the mandates and record their latest not_after first",
+                    rules.renewal_not_after
+                ),
+            ));
         }
     }
     let required = required_barrier(rules, view, payload).unwrap_or(i64::MAX);
