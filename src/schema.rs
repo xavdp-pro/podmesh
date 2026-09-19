@@ -159,6 +159,16 @@ pub fn all() -> Value {
     put("manager_observe", op("universe", "none", "one observation appended in the replica's own scope through the control door", Some(vec![
         f("scope", "string", true, "the replica's granted scope"), f("subject", "string", true, "1-128 safe ASCII"), f("value", "string", true, "at most 4096 bytes"),
     ])));
+    put("manager_vote_ledger_init", op("universe", "none", "operator-only initialization of this manager replica's signing ledger through its control door; the ledger starts unadmitted", Some(vec![])));
+    put("manager_vote_ledger_mark_unadmitted", op("universe", "none", "operator-only mark before a restored replica can vote; readmission evidence is still required", Some(vec![
+        f("reason", "string", true, "1-256 printable characters explaining the restore"),
+    ])));
+    put("manager_vote_ledger_readmit", op("universe", "none", "operator-only readmission of this replica's signing ledger against already collected and digest-bound evidence", Some(vec![
+        f("evidence_sha256", "object", true, "1-32 bounded evidence file names mapped to canonical SHA-256 digests, at most 3072 bytes"),
+    ])));
+    put("manager_decision_propose", op("universe", "none", "operator-only proposal to this manager replica; resident validates policy and records a proposal fact, while its peers decide by votes", Some(vec![
+        f("payload", "object", true, "the bounded takeover proposal document validated again by the resident"),
+    ])));
 
     put("recovery_point_prepare", op("universe", "reservation", "captures a universe as a recovery point, honestly unsigned: stopped (its rootfs, class quiescent) or live (a memory checkpoint resumed in place, class memory-coherent)", Some(vec![
         en("capture", false, &["stopped", "live"], "stopped (default) exports a universe already stopped; live checkpoints a running universe and resumes it in place, interrupted about half a second, gated by the activation lease as a start is"),

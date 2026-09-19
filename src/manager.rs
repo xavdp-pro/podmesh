@@ -5,7 +5,7 @@
 //! resident accepts an observation only from a peer whose UID is the configured writer. Nothing
 //! outside the universe can reach that socket -- which is the point -- and until now the only
 //! writer inside was the entrypoint recording each boot. This module is the ONE door PodMesh
-//! offers from the host: two typed operations, carried over the same root-only API as every
+//! offers from the host: named, typed operations, carried over the same root-only API as every
 //! other, each with `authorization_ref` as provenance, reaching the socket through the
 //! container's own mount namespace (`/proc/<pid>/root/...`) from inside its PID namespace: the
 //! resident checks the connecting peer's credentials, and a peer whose PID is not visible from
@@ -30,6 +30,10 @@
 //!   carrying no control socket at the contract path. The PodMesh operation ID is the resident's
 //!   operation ID, so a request the journal re-evaluates after a crash between the resident's
 //!   append and the journal's record is a replay for the resident too, and appends nothing twice.
+//! - The four V3-5 operator operations initialize, mark, and readmit this replica's signing
+//!   ledger and submit a bounded decision proposal. They are journaled, build fixed resident
+//!   requests rather than forwarding arbitrary JSON, and give no caller the ability to sign a
+//!   vote or bypass the resident's policy checks. Node activation still verifies a certificate.
 //!
 //! THE REPLICA'S HOST STATE (V3-5). A manager replica that votes keeps its signing key and its signing
 //! ledger in a directory its host provides, outside the universe's state, and reads the host's
@@ -224,6 +228,10 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
                       "scope": "this host's replica's reading of the replicas' decision, relayed as it answered; a certificate in it is verified by the operation it is delivered to, never here"}))
         }
         "manager_observe" => lc::journaled(db, request, |_| observe(request, uuid)),
+        "manager_vote_ledger_init" | "manager_vote_ledger_mark_unadmitted"
+        | "manager_vote_ledger_readmit" | "manager_decision_propose" => {
+            lc::journaled(db, request, |_| operator_control(request, uuid))
+        }
         other => Err(format!("Unknown manager operation {other}").into()),
     }
 }
@@ -283,6 +291,63 @@ fn decision_request(request: &Value) -> Result<Value, Error> {
         return Err("resource must be the UUID of a resource the replicas decide".into());
     }
     Ok(json!({"operation": "decision_read", "resource": resource}))
+}
+
+/// The operator can reach only these four resident mutations. Build a fresh request rather than
+/// forwarding the caller's JSON, so an extra field cannot become an arbitrary resident command.
+fn operator_request(request: &Value) -> Result<Value, Error> {
+    let id = lc::text(request, "operation_id")?;
+    lc::token(id)?;
+    match lc::text(request, "operation")? {
+        "manager_vote_ledger_init" => Ok(json!({"operation": "vote_ledger_init", "operation_id": id})),
+        "manager_vote_ledger_mark_unadmitted" => {
+            let reason = lc::text(request, "reason")?;
+            if reason.is_empty() || reason.len() > 256 || reason.chars().any(char::is_control) {
+                return Err("reason must be 1 to 256 printable characters".into());
+            }
+            Ok(json!({"operation": "vote_ledger_mark_unadmitted", "operation_id": id, "reason": reason}))
+        }
+        "manager_vote_ledger_readmit" => {
+            let evidence = request.get("evidence_sha256").and_then(Value::as_object)
+                .ok_or("evidence_sha256 must be an object of file names to SHA-256 digests")?;
+            if evidence.is_empty() || evidence.len() > 32 || serde_json::to_vec(evidence)?.len() > 3072 {
+                return Err("evidence_sha256 must fit 1 to 32 files and 3072 bytes".into());
+            }
+            for (name, digest) in evidence {
+                if name.is_empty() || name.len() > 128 || name == "." || name == ".."
+                    || !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+                {
+                    return Err("evidence_sha256 contains an unsafe file name".into());
+                }
+                let Some(digest) = digest.as_str() else { return Err("evidence_sha256 contains a non-string digest".into()) };
+                if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+                    return Err("evidence_sha256 contains a noncanonical digest".into());
+                }
+            }
+            Ok(json!({"operation": "vote_ledger_readmit", "operation_id": id, "evidence_sha256": evidence}))
+        }
+        "manager_decision_propose" => {
+            let payload = request.get("payload").filter(|p| p.is_object())
+                .ok_or("payload must be a decision document object")?;
+            if payload.to_string().len() > 3072 {
+                return Err("payload exceeds the 3072-byte decision ceiling".into());
+            }
+            Ok(json!({"operation": "decision_propose", "operation_id": id, "payload": payload}))
+        }
+        _ => Err("unknown manager operator operation".into()),
+    }
+}
+
+fn operator_control(request: &Value, uuid: &str) -> Result<Value, Error> {
+    let relayed = operator_request(request)?;
+    let (door, facts) = locate(uuid)?;
+    let reply = control(&door, &relayed)?;
+    if reply.get("error").is_some() {
+        return Err(format!("the resident refused {}: {}", relayed["operation"], reply).into());
+    }
+    Ok(json!({"universe_uuid": uuid, "container": facts, "resident_reply": reply,
+              "operation": request["operation"],
+              "scope": "operator request relayed to this replica only; no certificate is trusted or delivered by this relay"}))
 }
 
 fn observe(request: &Value, uuid: &str) -> Result<Value, Error> {
@@ -454,5 +519,37 @@ mod tests {
         for bad in [json!({}), json!({"resource": ""}), json!({"resource": "vote_sign"}), json!({"resource": format!("{r}x")})] {
             assert!(decision_request(&bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn operator_door_forwards_only_bounded_named_operations() {
+        let base = json!({"operation_id": "field-m5-1", "extra": {"operation": "shutdown"}});
+        for (name, translated) in [
+            ("manager_vote_ledger_init", "vote_ledger_init"),
+            ("manager_vote_ledger_mark_unadmitted", "vote_ledger_mark_unadmitted"),
+            ("manager_vote_ledger_readmit", "vote_ledger_readmit"),
+            ("manager_decision_propose", "decision_propose"),
+        ] {
+            let mut r = base.clone();
+            r["operation"] = json!(name);
+            if name == "manager_vote_ledger_mark_unadmitted" { r["reason"] = json!("snapshot restored"); }
+            if name == "manager_vote_ledger_readmit" { r["evidence_sha256"] = json!({"store.replica-a.json": "a".repeat(64)}); }
+            if name == "manager_decision_propose" { r["payload"] = json!({"kind": "test"}); }
+            let relayed = operator_request(&r).unwrap();
+            assert_eq!(relayed["operation"], translated);
+            assert_eq!(relayed["operation_id"], "field-m5-1");
+            assert!(relayed.get("extra").is_none());
+        }
+        for (op, field, bad) in [
+            ("manager_vote_ledger_mark_unadmitted", "reason", json!("\n")),
+            ("manager_vote_ledger_readmit", "evidence_sha256", json!({"../secret": "a".repeat(64)})),
+            ("manager_vote_ledger_readmit", "evidence_sha256", json!({"store.r.json": "Z".repeat(64)})),
+            ("manager_decision_propose", "payload", json!("shutdown")),
+        ] {
+            let mut r = base.clone(); r["operation"] = json!(op); r[field] = bad;
+            assert!(operator_request(&r).is_err(), "{r}");
+        }
+        let mut r = base; r["operation"] = json!("manager_shutdown");
+        assert!(operator_request(&r).is_err());
     }
 }

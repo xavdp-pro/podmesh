@@ -763,7 +763,7 @@ unsuperseded lease held here, in one journaled operation `publisher_startup_with
 
 A manager universe runs the frozen manager resident behind one Unix socket at a contract path inside the
 universe (`/run/podmesh-manager/control.sock`), reachable by nothing outside it. PodMesh offers the one door:
-two typed operations over the same root-only API, with `authorization_ref` as provenance, carried by a copy of
+named, typed operations over the same root-only API, with `authorization_ref` as provenance, carried by a copy of
 the daemon entered into the universe's PID namespace (the resident checks the peer's credentials, and a peer
 whose PID is not visible from the universe is refused whatever its UID). The PID read from Podman is bound to
 the container it was read from — the process must sit in that container's cgroup, and its start time is
@@ -790,6 +790,33 @@ resident's protocol.
   (`activation_acquire`, `activation_supersede`, `publisher_start`), with this host's policy's keys. The
   host's decision follow tick reads it (`DECISION-FOLLOW.md`). No other field of the request reaches the
   resident.
+- `manager_vote_ledger_init` (journaled, operator): relays only `vote_ledger_init` for this replica. A
+  new ledger starts unadmitted; initializing one is not permission to vote.
+- `manager_vote_ledger_mark_unadmitted` (`reason`, 1–256 printable characters; journaled, operator):
+  relays only the restore mark while the universe is running. It does **not** by itself satisfy the
+  restore requirement: after a VM or ledger restore, the mark must precede catch-up and voting,
+  before this door can be used. A separate pre-start restore guard remains necessary.
+- `manager_vote_ledger_readmit` (`evidence_sha256`, a bounded file-to-digest map; journaled,
+  operator): relays only `vote_ledger_readmit`. The operator must first collect the required evidence
+  from the other stores, ledgers and node screens into the replica's read-only evidence mount. The
+  resident checks the digest, time bound and contents; the door does not waive any requirement.
+- `manager_decision_propose` (`payload`, a decision document object of at most 3072 bytes;
+  journaled, operator): relays only `decision_propose` to this replica. The resident checks its policy,
+  resource and shape, then records a proposal fact; voters independently check it. This is neither a
+  vote nor a certificate. The node accepts an effect only after verifying a quorum certificate.
+
+The operator requests use the PodMesh operation ID as the resident's operation ID. The door strips
+extra caller fields, refuses a malformed evidence name or digest before connecting, and refuses a
+resident error instead of recording it as success. The local root-only API is the authorization
+boundary; no public or agent network listener is added. The manager's `operator_uid` and
+`observation_writer_uid` must admit the node's root-owned relay. The voting host-state and key
+handling requirements below remain mandatory.
+
+This door is a source-side prototype, not a field-ready restore procedure. Do not enable voting in
+an installed manager universe on a restorable host until a pre-start mark or an external restore
+witness prevents a restored ledger from voting before readmission. `manager_vote_ledger_readmit`
+also requires operator-collected evidence and the resident's waiting bound; the door does not
+collect it.
 
 **A manager replica's host state (development tree, V3-5).** `create` takes an optional
 `manager_host_state` (a name, the token of this host's replica, such as its alias). The universe then gets
