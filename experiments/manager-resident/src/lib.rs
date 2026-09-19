@@ -42,6 +42,9 @@ enum AppendStartError {
 }
 
 pub mod cli;
+#[cfg(test)]
+mod decision_tests;
+pub mod decisions;
 pub mod ledger;
 pub mod quorum;
 pub mod readmission;
@@ -816,6 +819,13 @@ enum Control {
         operation_id: String,
         payload: serde_json::Value,
     },
+    DecisionPropose {
+        operation_id: String,
+        payload: serde_json::Value,
+    },
+    DecisionRead {
+        resource: String,
+    },
 }
 
 fn validate_control_token(value: &str) -> Result<()> {
@@ -954,54 +964,81 @@ fn start_append_observation(
     Ok((receiver, worker))
 }
 
-/// Runs one vote operation of the control socket (V3-4) in a worker, like an append, within the
-/// control deadline: authorized by the caller's UID (the operator for the ledger's operations, the
-/// observation writer for a signature), refused before any store or ledger access otherwise, and
-/// answered `vote_operation_uncertain` when the worker has not finished in time (the ledger and the
-/// store keep what it did; the status shows the ledger's state).
-#[allow(clippy::too_many_arguments)]
+/// What the control loop does with one request: answer it now, or wait for a vote operation's
+/// worker without blocking the loop.
+enum ControlAnswer {
+    Now(Vec<u8>),
+    Later(mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>),
+}
+
+/// A vote operation whose worker the control loop is waiting for, with the caller's connection.
+struct PendingVote {
+    stream: UnixStream,
+    receiver: mpsc::Receiver<Vec<u8>>,
+    worker: thread::JoinHandle<()>,
+    deadline: Instant,
+}
+
+/// Starts one vote operation of the control socket (V3-4, V3-5) in a worker, like an append:
+/// authorized by the caller's UID (the operator for the ledger's operations, the observation writer
+/// for a signature, either for a proposal or a read), refused before any store or ledger access
+/// otherwise. The control loop does not wait for it: it keeps serving status, appends and the
+/// network, and answers the vote operation when its worker finishes, within the vote deadline
+/// (`VOTE_CONTROL_DEADLINE`), or `vote_operation_uncertain` after it (the ledger and the store keep
+/// what the worker did; the status shows the ledger's state; a signature retried is answered with
+/// the vote already recorded).
 fn vote_control(
     config: &Configuration,
     shared: &Arc<Shared>,
     stream: &UnixStream,
-    operation_id: &str,
+    operation_id: Option<&str>,
     operation: votes::VoteOperation,
-    deadline: Instant,
-    workers: &mut Vec<thread::JoinHandle<()>>,
-) -> Vec<u8> {
+) -> ControlAnswer {
+    let now = |bytes: &[u8]| ControlAnswer::Now(bytes.to_vec());
     let Some(runtime) = shared.votes.clone() else {
-        return b"{\"error\":\"votes_not_configured\"}".to_vec();
+        return now(b"{\"error\":\"votes_not_configured\"}");
     };
-    if validate_control_token(operation_id).is_err() || operation_id.starts_with("network:") {
-        return b"{\"error\":\"vote_operation_refused\"}".to_vec();
+    if operation_id
+        .is_some_and(|id| validate_control_token(id).is_err() || id.starts_with("network:"))
+    {
+        return now(b"{\"error\":\"vote_operation_refused\"}");
     }
     let Ok(peer) = rustix::net::sockopt::socket_peercred(stream) else {
-        return b"{\"error\":\"vote_operation_refused\"}".to_vec();
+        return now(b"{\"error\":\"vote_operation_refused\"}");
     };
     let uid = peer.uid.as_raw();
+    let operator = config.votes.as_ref().is_some_and(|v| v.operator_uid == uid);
+    let writer = uid == config.observation_writer_uid;
     let allowed = if operation.operator_only() {
-        config.votes.as_ref().is_some_and(|v| v.operator_uid == uid)
+        operator
+    } else if operation.operator_too() {
+        writer || operator
     } else {
-        uid == config.observation_writer_uid
+        writer
     };
     if !allowed {
-        return b"{\"error\":\"vote_operation_refused\",\"code\":\"caller_uid_refused\"}".to_vec();
+        return now(b"{\"error\":\"vote_operation_refused\",\"code\":\"caller_uid_refused\"}");
     }
-    // A signature is recorded in the store before it is answered: not before this process caught up.
-    if !operation.operator_only()
+    // A signature and a proposal are recorded in the store before they are answered: not before
+    // this process caught up.
+    if operation.writes_a_fact()
         && !shared
             .catch_up
             .lock()
             .is_ok_and(|mut catch_up| catch_up.evaluate(Instant::now()))
     {
-        return b"{\"error\":\"vote_catching_up\"}".to_vec();
+        return if matches!(operation, votes::VoteOperation::Propose { .. }) {
+            now(b"{\"error\":\"proposal_catching_up\"}")
+        } else {
+            now(b"{\"error\":\"vote_catching_up\"}")
+        };
     }
     if shared
         .append_job_active
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        return b"{\"error\":\"vote_busy\"}".to_vec();
+        return now(b"{\"error\":\"vote_busy\"}");
     }
     let (sender, receiver) = mpsc::sync_channel(1);
     let job_config = config.clone();
@@ -1010,30 +1047,12 @@ fn vote_control(
         let _active = AppendJobGuard(Arc::clone(&state));
         let replica = job_config.network.replica_id.clone();
         let response = runtime.execute(operation, uid, || store(&job_config), &replica);
-        if response.starts_with(b"{\"vote\"") {
+        if response.starts_with(b"{\"vote\"") || response.starts_with(b"{\"proposal\"") {
             state.snapshot_generation.fetch_add(1, Ordering::SeqCst);
         }
         let _ = sender.send(response);
     });
-    let wait = deadline
-        .saturating_duration_since(Instant::now())
-        .saturating_sub(CONTROL_WRITE_RESERVE);
-    match receiver.recv_timeout(wait) {
-        Ok(response) => {
-            let _ = worker.join();
-            response
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            if worker.join().is_err() {
-                shared.append_worker_failures.fetch_add(1, Ordering::SeqCst);
-            }
-            b"{\"error\":\"vote_operation_uncertain\"}".to_vec()
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            workers.push(worker);
-            b"{\"error\":\"vote_operation_uncertain\"}".to_vec()
-        }
-    }
+    ControlAnswer::Later(receiver, worker)
 }
 
 /// Accounts for what this replica durably decided on an authenticated request.
@@ -1222,12 +1241,31 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
     let integrity = thread::spawn(move || {
         verify_store_periodically(&integrity_config, &integrity_shared, startup_store);
     });
+    // The voter (V3-5): reads the proposals the store holds and votes for those that pass this
+    // replica's own checks, when this replica decides.
+    let voter = shared
+        .votes
+        .as_ref()
+        .and_then(|runtime| {
+            runtime
+                .voter_interval()
+                .map(|interval| (Arc::clone(runtime), interval))
+        })
+        .map(|(runtime, interval)| {
+            let voter_config = config.clone();
+            let voter_shared = Arc::clone(&shared);
+            thread::spawn(move || decide(&voter_config, &voter_shared, &runtime, interval))
+        });
     let mut workers = Vec::new();
     let mut append_workers = Vec::new();
+    let mut pending_votes: Vec<PendingVote> = Vec::new();
     let result = (|| -> Result<()> {
         while !shared.stopping.load(Ordering::SeqCst) {
             if outgoing.is_finished() {
                 return Err("replication worker stopped unexpectedly".into());
+            }
+            if voter.as_ref().is_some_and(thread::JoinHandle::is_finished) {
+                return Err("voter stopped unexpectedly".into());
             }
             // The periodic verification is what bounds the detection of an edited
             // old row; a resident whose verification worker stopped must not serve.
@@ -1281,11 +1319,42 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(e.into()),
             }
+            let mut vote_index = 0;
+            while vote_index < pending_votes.len() {
+                let reserve = Instant::now() + CONTROL_WRITE_RESERVE;
+                let answer = match pending_votes[vote_index].receiver.try_recv() {
+                    Ok(response) => Some((response, true)),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        Some((b"{\"error\":\"vote_operation_uncertain\"}".to_vec(), true))
+                    }
+                    Err(mpsc::TryRecvError::Empty)
+                        if reserve >= pending_votes[vote_index].deadline =>
+                    {
+                        Some((b"{\"error\":\"vote_operation_uncertain\"}".to_vec(), false))
+                    }
+                    Err(mpsc::TryRecvError::Empty) => None,
+                };
+                let Some((response, finished)) = answer else {
+                    vote_index += 1;
+                    continue;
+                };
+                let mut pending = pending_votes.swap_remove(vote_index);
+                if finished {
+                    if pending.worker.join().is_err() {
+                        shared.append_worker_failures.fetch_add(1, Ordering::SeqCst);
+                    }
+                } else {
+                    // Still running past its deadline: joined with the append workers.
+                    append_workers.push(pending.worker);
+                }
+                answer_control(&mut pending.stream, &response, reserve);
+            }
             match control.accept() {
                 Ok((mut stream, _)) => {
                     let deadline = Instant::now() + CONTROL_DEADLINE;
                     stream.set_read_timeout(Some(CONTROL_DEADLINE))?;
                     stream.set_write_timeout(Some(CONTROL_DEADLINE))?;
+                    let mut deferred = None;
                     let response = match read_control(&mut stream, deadline) {
                         Ok(bytes) => match serde_json::from_slice::<Control>(&bytes) {
                             Ok(Control::Status {}) => match status(&config, &shared) {
@@ -1356,69 +1425,100 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
                                     b"{\"error\":\"append_observation_refused\"}".to_vec()
                                 }
                             },
-                            Ok(Control::VoteLedgerInit { operation_id }) => vote_control(
-                                &config,
-                                &shared,
-                                &stream,
-                                &operation_id,
-                                votes::VoteOperation::Init,
-                                deadline,
-                                &mut append_workers,
+                            Ok(Control::VoteLedgerInit { operation_id }) => defer(
+                                &mut deferred,
+                                vote_control(
+                                    &config,
+                                    &shared,
+                                    &stream,
+                                    Some(&operation_id),
+                                    votes::VoteOperation::Init,
+                                ),
                             ),
                             Ok(Control::VoteLedgerMarkUnadmitted {
                                 operation_id,
                                 reason,
-                            }) => vote_control(
-                                &config,
-                                &shared,
-                                &stream,
-                                &operation_id,
-                                votes::VoteOperation::MarkUnadmitted { reason },
-                                deadline,
-                                &mut append_workers,
+                            }) => defer(
+                                &mut deferred,
+                                vote_control(
+                                    &config,
+                                    &shared,
+                                    &stream,
+                                    Some(&operation_id),
+                                    votes::VoteOperation::MarkUnadmitted { reason },
+                                ),
                             ),
                             Ok(Control::VoteLedgerReadmit {
                                 operation_id,
                                 evidence_sha256,
-                            }) => vote_control(
-                                &config,
-                                &shared,
-                                &stream,
-                                &operation_id.clone(),
-                                votes::VoteOperation::Readmit {
-                                    operation_id,
-                                    evidence_sha256,
-                                },
-                                deadline,
-                                &mut append_workers,
+                            }) => defer(
+                                &mut deferred,
+                                vote_control(
+                                    &config,
+                                    &shared,
+                                    &stream,
+                                    Some(&operation_id.clone()),
+                                    votes::VoteOperation::Readmit {
+                                        operation_id,
+                                        evidence_sha256,
+                                    },
+                                ),
                             ),
                             Ok(Control::VoteSign {
                                 operation_id,
                                 payload,
-                            }) => vote_control(
-                                &config,
-                                &shared,
-                                &stream,
-                                &operation_id.clone(),
-                                votes::VoteOperation::Sign {
-                                    operation_id,
-                                    payload,
-                                },
-                                deadline,
-                                &mut append_workers,
+                            }) => defer(
+                                &mut deferred,
+                                vote_control(
+                                    &config,
+                                    &shared,
+                                    &stream,
+                                    Some(&operation_id.clone()),
+                                    votes::VoteOperation::Sign {
+                                        operation_id,
+                                        payload,
+                                    },
+                                ),
+                            ),
+                            Ok(Control::DecisionPropose {
+                                operation_id,
+                                payload,
+                            }) => defer(
+                                &mut deferred,
+                                vote_control(
+                                    &config,
+                                    &shared,
+                                    &stream,
+                                    Some(&operation_id.clone()),
+                                    votes::VoteOperation::Propose {
+                                        operation_id,
+                                        payload,
+                                    },
+                                ),
+                            ),
+                            Ok(Control::DecisionRead { resource }) => defer(
+                                &mut deferred,
+                                vote_control(
+                                    &config,
+                                    &shared,
+                                    &stream,
+                                    None,
+                                    votes::VoteOperation::Read { resource },
+                                ),
                             ),
                             Err(_) => b"{\"error\":\"invalid typed control request\"}".to_vec(),
                         },
                         _ => b"{\"error\":\"control request bound exceeded\"}".to_vec(),
                     };
-                    if response.len() <= CONTROL_RESPONSE_MAX {
-                        let _ = write_control(&mut stream, &response, deadline);
+                    if let Some((receiver, worker)) = deferred {
+                        pending_votes.push(PendingVote {
+                            stream,
+                            receiver,
+                            worker,
+                            deadline: deadline - CONTROL_DEADLINE + VOTE_CONTROL_DEADLINE,
+                        });
                     } else {
-                        let _ = write_control(
-                            &mut stream,
-                            b"{\"error\":\"control response exceeds bound\"}",
-                            deadline,
-                        );
+                        answer_control(&mut stream, &response, deadline);
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -1438,6 +1538,12 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
     for worker in workers {
         join_failed |= worker.join().is_err();
     }
+    for pending in pending_votes {
+        drop(pending.stream);
+        if pending.worker.join().is_err() {
+            shared.append_worker_failures.fetch_add(1, Ordering::SeqCst);
+        }
+    }
     for worker in append_workers {
         if worker.join().is_err() {
             shared.append_worker_failures.fetch_add(1, Ordering::SeqCst);
@@ -1445,16 +1551,81 @@ pub(crate) fn run(config: Configuration) -> Result<()> {
     }
     let outgoing_result = outgoing.join();
     let integrity_result = integrity.join();
+    let voter_result = voter.map(thread::JoinHandle::join);
     cleanup?;
     if join_failed {
         return Err("incoming worker panicked".into());
     }
     integrity_result.map_err(|_| "store verification worker panicked")?;
+    if let Some(voter_result) = voter_result {
+        voter_result.map_err(|_| "voter panicked")?;
+    }
     outgoing_result.map_err(|_| "outgoing worker panicked")??;
     result
 }
 
+/// The voter's loop: one pass per interval, only once this process has caught up with its peers
+/// (a vote is a fact of this replica's own origin), until the resident stops.
+fn decide(
+    config: &Configuration,
+    shared: &Shared,
+    runtime: &votes::VoteRuntime,
+    interval: Duration,
+) {
+    let mut next = Instant::now() + interval;
+    while !shared.stopping.load(Ordering::SeqCst) {
+        if Instant::now() >= next {
+            next = Instant::now() + interval;
+            let caught_up = shared
+                .catch_up
+                .lock()
+                .is_ok_and(|mut catch_up| catch_up.evaluate(Instant::now()));
+            if caught_up {
+                if let Ok(cast) = runtime.decide_once(|| store(config), &config.network.replica_id)
+                {
+                    if cast > 0 {
+                        shared.snapshot_generation.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Writes one control answer within `deadline`, or the bound's refusal when it exceeds it.
+fn answer_control(stream: &mut UnixStream, response: &[u8], deadline: Instant) {
+    if response.len() <= CONTROL_RESPONSE_MAX {
+        let _ = write_control(stream, response, deadline);
+    } else {
+        let _ = write_control(
+            stream,
+            b"{\"error\":\"control response exceeds bound\"}",
+            deadline,
+        );
+    }
+}
+
+/// Keeps a vote operation's worker for the loop to answer later, and answers nothing now.
+fn defer(
+    deferred: &mut Option<(mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>)>,
+    answer: ControlAnswer,
+) -> Vec<u8> {
+    match answer {
+        ControlAnswer::Now(response) => response,
+        ControlAnswer::Later(receiver, worker) => {
+            *deferred = Some((receiver, worker));
+            Vec::new()
+        }
+    }
+}
+
 const CONTROL_DEADLINE: Duration = Duration::from_millis(250);
+/// The deadline of a vote operation (V3-5): a signature, a proposal, a read or a readmission reads
+/// the store, verifies every vote and writes durably, which can outlast the control deadline on a
+/// busy disk (up to 342 ms measured with three residents on one workstation disk). The control loop
+/// does not wait for it: status, appends and the network are served meanwhile.
+const VOTE_CONTROL_DEADLINE: Duration = Duration::from_millis(2_000);
 const CONTROL_WRITE_RESERVE: Duration = Duration::from_millis(25);
 const CONTROL_RESPONSE_MAX: usize = 32_768;
 

@@ -12,6 +12,15 @@ Environment=PODMESH_MANAGER_CONFIG=/etc/podmesh-manager/config.json
 Environment=PODMESH_MANAGER_STATE_DIR=/var/lib/podmesh-manager
 Environment=PODMESH_MANAGER_RUNTIME_DIR=/run/podmesh-manager
 Environment=PODMESH_MANAGER_NETWORK_MODE=disabled
+# Signed votes (V3-4, V3-5), read only when the configuration votes: the replica's key and its signing
+# ledger in a vote directory outside the state directory (no copy of the state carries or rewinds
+# them), the host's machine-id read-only at a path of its own, and the operator's readmission evidence
+# in /var/lib/podmesh-manager-evidence (root's, which this user cannot write; named by the
+# configuration's votes.evidence_dir).
+Environment=PODMESH_MANAGER_VOTE_DIR=/var/lib/podmesh-manager-votes
+Environment=PODMESH_MANAGER_HOST_ID_FILE=/run/podmesh-manager-host/machine-id
+BindReadOnlyPaths=/etc/machine-id:/run/podmesh-manager-host/machine-id
+ReadWritePaths=-/var/lib/podmesh-manager-votes
 ExecStart=/usr/lib/podmesh-manager/podmesh-managerd --config ${PODMESH_MANAGER_CONFIG} --state-dir ${PODMESH_MANAGER_STATE_DIR} --runtime-dir ${PODMESH_MANAGER_RUNTIME_DIR}
 RuntimeDirectory=podmesh-manager
 RuntimeDirectoryMode=0700

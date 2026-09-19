@@ -27,6 +27,9 @@ grep -q '^RuntimeDirectoryMode=0700$' "$work/extracted/usr/lib/systemd/system/po
 grep -q '^Restart=no$' "$work/extracted/usr/lib/systemd/system/podmesh-manager.service"
 grep -q '^IPAddressDeny=any$' "$work/extracted/usr/lib/systemd/system/podmesh-manager.service"
 grep -q '^RestrictAddressFamilies=AF_UNIX$' "$work/extracted/usr/lib/systemd/system/podmesh-manager.service"
+grep -q '^Environment=PODMESH_MANAGER_VOTE_DIR=/var/lib/podmesh-manager-votes$' "$work/extracted/usr/lib/systemd/system/podmesh-manager.service"
+grep -q '^BindReadOnlyPaths=/etc/machine-id:/run/podmesh-manager-host/machine-id$' "$work/extracted/usr/lib/systemd/system/podmesh-manager.service"
+grep -q '^Environment=PODMESH_MANAGER_HOST_ID_FILE=/run/podmesh-manager-host/machine-id$' "$work/extracted/usr/lib/systemd/system/podmesh-manager.service"
 grep -q '^Package: podmesh-manager$' "$work/control/control"
 python3 - "$work/extracted/usr/share/podmesh-manager/config.example.json" <<'PY'
 import json, sys
@@ -48,6 +51,9 @@ if [ "$1" = configure ]; then
   fi
   install -d -m 0750 -o root -g podmesh-manager /etc/podmesh-manager
   install -d -m 0750 -o podmesh-manager -g podmesh-manager /var/lib/podmesh-manager
+  # Signed votes: the vote directory is the service's own and private; the evidence directory is root's.
+  install -d -m 0700 -o podmesh-manager -g podmesh-manager /var/lib/podmesh-manager-votes
+  install -d -m 0755 -o root -g root /var/lib/podmesh-manager-evidence
   if [ -d /run/systemd/system ]; then systemctl daemon-reload; fi
 fi
 SCRIPT

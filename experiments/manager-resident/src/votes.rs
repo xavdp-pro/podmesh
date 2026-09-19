@@ -19,8 +19,20 @@
 //!   rules, reading the votes in this replica's store for the tripwire, and appends it as a fact in
 //!   this replica's vote scope `votes/<replica_id>` before it answers with it.
 //!
-//! Proposing, deciding and delivering certificates are V3-5's.
+//! The manager decides (V3-5, `decisions.rs`): with `votes.decisions` configured,
+//!
+//! - `decision_propose` (the observation writer or the operator): records a proposal, the full payload
+//!   of a takeover certificate, as a fact in this replica's scope `proposals/<replica_id>`;
+//! - `decision_read` (the same callers): the current decision of a resource with its assembled
+//!   certificate, or each live proposal above it with its voters, what is missing and this replica's
+//!   own verdict;
+//! - the voter, a worker of the resident, reads the proposals its store holds at every
+//!   `voter_interval_ms`, checks each against its own view and votes for one that passes;
+//! - `vote_sign` checks the same rules before it signs a takeover payload, and refuses a policy change
+//!   (which the replicas do not decide here); it is idempotent: a payload this replica already voted
+//!   for, with the promise in its ledger, answers the recorded vote again.
 use crate::{
+    decisions::{self, DecisionConfiguration, Proposal},
     ledger::{HostIdentity, LedgerRefusal, Signer, SigningRules, TRIPWIRE_CODES},
     quorum::{self, Quorum},
     readmission::{self, Scope},
@@ -86,6 +98,11 @@ pub struct VoteConfiguration {
     pub operator_uid: u32,
     /// The longest life a vote gives a certificate, in seconds; readmission waits it out.
     pub max_certificate_life_seconds: i64,
+    /// The replicas' decisions (V3-5): which resources this replica decides and how often its voter
+    /// reads the store. Absent, the replica proposes nothing, votes only through `vote_sign`, and
+    /// checks no decision rule (V3-4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decisions: Option<DecisionConfiguration>,
 }
 
 impl VoteConfiguration {
@@ -166,6 +183,9 @@ impl VoteConfiguration {
         if !(1..=3600).contains(&self.max_certificate_life_seconds) {
             return Err("votes.max_certificate_life_seconds must be 1 to 3600".into());
         }
+        if let Some(d) = &self.decisions {
+            d.validate(&self.nodes)?;
+        }
         Ok(())
     }
 }
@@ -177,6 +197,22 @@ pub(crate) struct VoteRuntime {
     dir: PathBuf,
     host_id_file: PathBuf,
     alerts: Mutex<Vec<String>>,
+    /// This replica's last verdict on each proposal its voter read, by payload digest.
+    verdicts: Mutex<BTreeMap<String, Value>>,
+    /// The voter's own account: passes, votes cast, the last pass's duration and error.
+    voter: Mutex<VoterStatus>,
+    /// The duration of the vote operations served on the control socket: the last and the longest.
+    timings: Mutex<BTreeMap<&'static str, (u64, u64)>>,
+}
+
+/// The voter's account, in the status.
+#[derive(Default, Clone, Serialize)]
+struct VoterStatus {
+    passes: u64,
+    votes_cast: u64,
+    last_pass_ms: Option<u64>,
+    longest_pass_ms: u64,
+    last_error: Option<String>,
 }
 
 /// The vote operations the control socket takes.
@@ -193,12 +229,51 @@ pub(crate) enum VoteOperation {
         operation_id: String,
         payload: Value,
     },
+    Propose {
+        operation_id: String,
+        payload: Value,
+    },
+    Read {
+        resource: String,
+    },
 }
 
 impl VoteOperation {
     /// Whether only the operator may ask it.
     pub(crate) fn operator_only(&self) -> bool {
-        !matches!(self, VoteOperation::Sign { .. })
+        matches!(
+            self,
+            VoteOperation::Init
+                | VoteOperation::MarkUnadmitted { .. }
+                | VoteOperation::Readmit { .. }
+        )
+    }
+
+    /// Whether the operator may ask it too, beside the observation writer.
+    pub(crate) fn operator_too(&self) -> bool {
+        matches!(
+            self,
+            VoteOperation::Propose { .. } | VoteOperation::Read { .. }
+        )
+    }
+
+    /// Whether it writes a fact, and so waits for this process to have caught up with its peers.
+    pub(crate) fn writes_a_fact(&self) -> bool {
+        matches!(
+            self,
+            VoteOperation::Sign { .. } | VoteOperation::Propose { .. }
+        )
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            VoteOperation::Init => "vote_ledger_init",
+            VoteOperation::MarkUnadmitted { .. } => "vote_ledger_mark_unadmitted",
+            VoteOperation::Readmit { .. } => "vote_ledger_readmit",
+            VoteOperation::Sign { .. } => "vote_sign",
+            VoteOperation::Propose { .. } => "decision_propose",
+            VoteOperation::Read { .. } => "decision_read",
+        }
     }
 }
 
@@ -211,6 +286,29 @@ fn now() -> i64 {
 fn refused(e: &LedgerRefusal) -> Vec<u8> {
     serde_json::to_vec(&json!({"error": "vote_refused", "code": e.code, "detail": e.detail}))
         .unwrap_or_else(|_| b"{\"error\":\"vote_refused\"}".to_vec())
+}
+
+fn answer(value: &Value) -> Vec<u8> {
+    serde_json::to_vec(value).unwrap_or_else(|_| b"{\"error\":\"vote_refused\"}".to_vec())
+}
+
+fn decision_refused(error: &'static str, code: &str, detail: &str) -> Vec<u8> {
+    answer(&json!({"error": error, "code": code, "detail": detail}))
+}
+
+/// Every fact of this replica's store.
+fn export(store: &impl Fn() -> Result<Store>) -> Result<Vec<Fact>> {
+    match store()?.execute(&Request::Export {})? {
+        Response::Snapshot { snapshot } => Ok(snapshot.facts),
+        _ => Err("unexpected export response".into()),
+    }
+}
+
+/// A vote signed and recorded, or found already recorded.
+struct Recorded {
+    vote: Value,
+    fact: String,
+    replayed: bool,
 }
 
 impl VoteRuntime {
@@ -241,7 +339,18 @@ impl VoteRuntime {
             dir,
             host_id_file,
             alerts: Mutex::new(Vec::new()),
+            verdicts: Mutex::new(BTreeMap::new()),
+            voter: Mutex::new(VoterStatus::default()),
+            timings: Mutex::new(BTreeMap::new()),
         }))
+    }
+
+    /// The voter's interval, when this replica decides.
+    pub(crate) fn voter_interval(&self) -> Option<Duration> {
+        self.config
+            .decisions
+            .as_ref()
+            .map(|d| Duration::from_millis(d.voter_interval_ms))
     }
 
     fn signer(&self) -> std::result::Result<Signer, LedgerRefusal> {
@@ -281,6 +390,17 @@ impl VoteRuntime {
             Err(e) => (e.code, Some(e.detail.clone())),
         };
         let ledger = ledger.ok();
+        let timings: BTreeMap<&str, Value> = self
+            .timings
+            .lock()
+            .map(|t| {
+                t.iter()
+                    .map(|(k, (last, longest))| {
+                        (*k, json!({"last_ms": last, "longest_ms": longest}))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         json!({
             "key_id": self.config.key_id,
             "ledger_state": state,
@@ -290,6 +410,9 @@ impl VoteRuntime {
             "unadmitted_reason": ledger.as_ref().and_then(|l| l.unadmitted_reason.clone()),
             "admissions": ledger.as_ref().map(|l| l.admissions.len()),
             "alerts": alerts,
+            "decides": self.config.decisions.as_ref().map(|d| d.resources.iter().map(|r| r.resource.clone()).collect::<Vec<_>>()),
+            "voter": self.config.decisions.as_ref().map(|_| self.voter.lock().map(|v| json!(v.clone())).unwrap_or(Value::Null)),
+            "operations": timings,
         })
     }
 
@@ -301,6 +424,34 @@ impl VoteRuntime {
         store: impl Fn() -> Result<Store>,
         replica_id: &str,
     ) -> Vec<u8> {
+        let started = std::time::Instant::now();
+        let name = operation.name();
+        let response = self.perform(operation, uid, store, replica_id);
+        let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Ok(mut t) = self.timings.lock() {
+            let entry = t.entry(name).or_insert((0, 0));
+            *entry = (ms, entry.1.max(ms));
+        }
+        response
+    }
+
+    fn perform(
+        &self,
+        operation: VoteOperation,
+        uid: u32,
+        store: impl Fn() -> Result<Store>,
+        replica_id: &str,
+    ) -> Vec<u8> {
+        // Reading and proposing need no signer: a replica whose ledger cannot sign still tells what
+        // its store holds, and still carries a proposal to its peers.
+        match operation {
+            VoteOperation::Read { resource } => return self.read(&resource, &store),
+            VoteOperation::Propose {
+                operation_id,
+                payload,
+            } => return self.propose(&operation_id, &payload, &store, replica_id),
+            _ => {}
+        }
         let signer = match self.signer() {
             Ok(s) => s,
             Err(e) => return refused(&e),
@@ -318,7 +469,8 @@ impl VoteRuntime {
                 operation_id,
                 evidence_sha256,
             } => self.readmit(&signer, &operation_id, &evidence_sha256, uid, store, replica_id),
-            VoteOperation::Sign { operation_id, payload } => self.sign(&signer, &operation_id, &payload, store, replica_id),
+            VoteOperation::Sign { operation_id, payload } => self.sign(&signer, &operation_id, &payload, &store, replica_id),
+            VoteOperation::Read { .. } | VoteOperation::Propose { .. } => b"{\"error\":\"vote_refused\"}".to_vec(),
         }
     }
 
@@ -343,10 +495,7 @@ impl VoteRuntime {
                 retired.insert(key.key_id.clone());
             }
         }
-        let own_store = store().and_then(|mut s| match s.execute(&Request::Export {})? {
-            Response::Snapshot { snapshot } => Ok(snapshot.facts),
-            _ => Err("unexpected export response".into()),
-        });
+        let own_store = export(&store);
         let manager = &self.manager;
         let scope = Scope {
             manager,
@@ -385,62 +534,421 @@ impl VoteRuntime {
         }
     }
 
+    /// The decision rules for `payload`, when this replica decides (V3-5): a takeover certificate of
+    /// a resource it decides, checked against its own view of `facts`. Without `votes.decisions`,
+    /// nothing is checked here (V3-4).
+    fn check_rules(
+        &self,
+        payload: &Value,
+        facts: &[Fact],
+    ) -> std::result::Result<(), decisions::DecisionRefusal> {
+        let Some(d) = &self.config.decisions else {
+            return Ok(());
+        };
+        let policy = self
+            .config
+            .policy()
+            .map_err(|e| decisions::DecisionRefusal {
+                code: "vote_configuration_invalid",
+                detail: e.to_string(),
+            })?;
+        if payload["kind"].as_str() != Some(quorum::QUORUM_PROOF_KIND) {
+            return Err(decisions::DecisionRefusal {
+                code: "decision_kind",
+                detail: "a replica that decides signs takeover certificates only; a change of the authority set is the operator's".into(),
+            });
+        }
+        let resource = payload["resource"].as_str().unwrap_or_default();
+        let Some(rules) = d.rules(resource) else {
+            return Err(decisions::DecisionRefusal {
+                code: "resource_not_decided_here",
+                detail: format!("{resource} is not among the resources this replica decides"),
+            });
+        };
+        let counted =
+            decisions::verified(&policy, &counted_votes(facts, &self.config.replica_keys));
+        let view = decisions::view(&policy, rules, &counted);
+        decisions::check(
+            &policy,
+            rules,
+            &self.config.nodes,
+            &view,
+            payload,
+            now(),
+            self.config.max_certificate_life_seconds,
+        )
+        .map(|_| ())
+    }
+
+    /// This replica's own recorded vote for exactly `payload`, if its ledger still holds the promise
+    /// it was made under: what a retry answers again, with nothing signed or appended twice.
+    fn recorded_vote(
+        &self,
+        signer: &Signer,
+        payload: &Value,
+        facts: &[Fact],
+        replica_id: &str,
+    ) -> Option<Recorded> {
+        let target = vote::Decision::of_payload(payload).ok()?;
+        let ledger = signer.load().ok().filter(|l| l.admitted)?;
+        let promise = ledger.promise(target.kind, &target.resource, target.number)?;
+        if promise.decision_digest != target.decision_digest {
+            return None;
+        }
+        let own: BTreeMap<String, ed25519_dalek::VerifyingKey> =
+            [(self.config.key_id.clone(), signer.verifying_key())].into();
+        let scope = vote::vote_scope(replica_id);
+        facts.iter().rev().find_map(|fact| {
+            if fact.scope != scope || fact.origin_replica_id != replica_id {
+                return None;
+            }
+            let value: Value = serde_json::from_str(&fact.value).ok()?;
+            let verified = vote::verify_origin(&value, &own).ok()?;
+            (verified.voter == self.config.key_id
+                && verified.decision.payload_digest == target.payload_digest)
+                .then(|| Recorded {
+                    vote: value,
+                    fact: fact.event_id.clone(),
+                    replayed: true,
+                })
+        })
+    }
+
+    /// Signs a vote for `payload` under the ledger and records it in this replica's vote scope
+    /// before it is released, or answers the vote already recorded for it.
+    fn sign_and_record(
+        &self,
+        signer: &Signer,
+        operation_id: &str,
+        payload: &Value,
+        facts: &[Fact],
+        store: &impl Fn() -> Result<Store>,
+        replica_id: &str,
+    ) -> std::result::Result<Recorded, LedgerRefusal> {
+        if let Some(recorded) = self.recorded_vote(signer, payload, facts, replica_id) {
+            return Ok(recorded);
+        }
+        // The votes this replica can see, its own and its peers', for the tripwire.
+        let seen = votes_in(facts);
+        let vote = signer.sign(payload, &seen, now()).inspect_err(|e| {
+            if TRIPWIRE_CODES.contains(&e.code) {
+                self.alert(format!("{}: {}", e.code, e.detail));
+            }
+        })?;
+        // The vote is recorded in this replica's own vote scope before it is released: the promise
+        // is already durable in the ledger, and a vote that is not recorded is not answered.
+        let unrecorded = |detail: String| crate::ledger::refusal("vote_unrecorded", detail);
+        let decision = vote::Decision::of_payload(payload).map_err(|e| unrecorded(e.detail))?;
+        let kind = match decision.kind {
+            PromiseKind::Epoch => "epoch",
+            PromiseKind::Serial => "serial",
+        };
+        let executed = store()
+            .and_then(|mut s| {
+                Ok(s.execute_with_receipt(&Request::Observe {
+                    operation_id: operation_id.to_string(),
+                    scope: vote::vote_scope(replica_id),
+                    subject: format!("{kind}:{}:{}", decision.resource, decision.number),
+                    exclusive_resource: None,
+                    active_claim: false,
+                    value: vote.to_string(),
+                })?)
+            })
+            .map_err(|e| unrecorded(e.to_string()))?;
+        match executed.response {
+            Response::Observed { fact } => Ok(Recorded {
+                vote,
+                fact: fact.event_id,
+                replayed: false,
+            }),
+            _ => Err(unrecorded(
+                "the store did not answer with the recorded fact".into(),
+            )),
+        }
+    }
+
     fn sign(
         &self,
         signer: &Signer,
         operation_id: &str,
         payload: &Value,
-        store: impl Fn() -> Result<Store>,
+        store: &impl Fn() -> Result<Store>,
         replica_id: &str,
     ) -> Vec<u8> {
-        // The votes this replica can see, its own and its peers', for the tripwire.
-        let facts: Vec<Fact> =
-            match store().and_then(|mut s| match s.execute(&Request::Export {})? {
-                Response::Snapshot { snapshot } => Ok(snapshot.facts),
-                _ => Err("unexpected export response".into()),
-            }) {
-                Ok(facts) => facts,
-                Err(_) => return b"{\"error\":\"vote_store_unreadable\"}".to_vec(),
-            };
-        let seen = votes_in(&facts);
-        let vote = match signer.sign(payload, &seen, now()) {
-            Ok(vote) => vote,
-            Err(e) => {
-                if TRIPWIRE_CODES.contains(&e.code) {
-                    self.alert(format!("{}: {}", e.code, e.detail));
-                }
-                return refused(&e);
+        let Ok(facts) = export(store) else {
+            return b"{\"error\":\"vote_store_unreadable\"}".to_vec();
+        };
+        // A retry first: the vote already recorded for this very payload is answered again, even
+        // once the view has moved past it (its certificate formed meanwhile, say).
+        if let Some(r) = self.recorded_vote(signer, payload, &facts, replica_id) {
+            return answer(&json!({"vote": r.vote, "fact": r.fact, "replayed": r.replayed}));
+        }
+        if let Err(e) = self.check_rules(payload, &facts) {
+            return decision_refused("vote_refused", e.code, &e.detail);
+        }
+        match self.sign_and_record(signer, operation_id, payload, &facts, store, replica_id) {
+            Ok(r) => answer(&json!({"vote": r.vote, "fact": r.fact, "replayed": r.replayed})),
+            Err(e) if e.code == "vote_unrecorded" => b"{\"error\":\"vote_unrecorded\"}".to_vec(),
+            Err(e) => refused(&e),
+        }
+    }
+
+    /// Records a proposal: the full payload of a takeover certificate, in this replica's scope
+    /// `proposals/<replica_id>`. The proposal is checked for its shape, its policy, its resource and
+    /// its life only; whether anyone votes for it is each voter's own check, and the answer carries
+    /// this replica's (`here`).
+    fn propose(
+        &self,
+        operation_id: &str,
+        payload: &Value,
+        store: &impl Fn() -> Result<Store>,
+        replica_id: &str,
+    ) -> Vec<u8> {
+        let refused = |code: &str, detail: &str| decision_refused("proposal_refused", code, detail);
+        let Some(d) = &self.config.decisions else {
+            return refused(
+                "decisions_not_configured",
+                "this replica decides nothing: votes.decisions is absent",
+            );
+        };
+        let scope = decisions::proposal_scope(replica_id);
+        if !self
+            .manager
+            .grants
+            .iter()
+            .any(|g| g.scope == scope && g.owner_replica_id == replica_id)
+        {
+            return refused(
+                "proposals_not_granted",
+                &format!("the topology does not grant {scope} to this replica"),
+            );
+        }
+        let Ok(policy) = self.config.policy() else {
+            return refused(
+                "vote_configuration_invalid",
+                "the vote configuration's policy",
+            );
+        };
+        let decision = match vote::Decision::of_payload(payload) {
+            Ok(decision) if decision.kind == PromiseKind::Epoch => decision,
+            Ok(_) => {
+                return refused(
+                    "decision_kind",
+                    "a proposal is a takeover certificate's payload",
+                )
             }
+            Err(e) => return refused("payload_invalid", &e.detail),
         };
-        // The vote is recorded in this replica's own vote scope before it is released: the promise
-        // is already durable in the ledger, and a vote that is not recorded is not answered.
-        let Ok(decision) = vote::Decision::of_payload(payload) else {
-            return b"{\"error\":\"vote_unrecorded\"}".to_vec();
-        };
-        let kind = match decision.kind {
-            PromiseKind::Epoch => "epoch",
-            PromiseKind::Serial => "serial",
-        };
+        if d.rules(&decision.resource).is_none() {
+            return refused(
+                "resource_not_decided_here",
+                &format!(
+                    "{} is not among the resources this replica decides",
+                    decision.resource
+                ),
+            );
+        }
+        if payload["authority_id"].as_str() != Some(policy.authority_id.as_str())
+            || payload["policy_digest"].as_str() != Some(policy.digest().as_str())
+        {
+            return refused(
+                "policy_mismatch",
+                "the payload names another authority set than the one the replicas vote under",
+            );
+        }
+        let now = now();
+        if decision.expires_at <= now
+            || decision.expires_at - decision.issued_at > self.config.max_certificate_life_seconds
+        {
+            return refused("certificate_life", "a proposal is recorded only while live, living at most the longest certificate life");
+        }
+        let value = decisions::proposal_value(payload).to_string();
+        if value.len() > 4096 {
+            return refused("payload_invalid", "a proposal is at most 4096 bytes");
+        }
         let recorded = store().and_then(|mut s| {
             Ok(s.execute_with_receipt(&Request::Observe {
                 operation_id: operation_id.to_string(),
-                scope: vote::vote_scope(replica_id),
-                subject: format!("{kind}:{}:{}", decision.resource, decision.number),
+                scope: scope.clone(),
+                subject: decisions::proposal_subject(&decision.resource, decision.number),
                 exclusive_resource: None,
                 active_claim: false,
-                value: vote.to_string(),
+                value,
             })?)
         });
-        match recorded {
+        let fact = match recorded {
             Ok(executed) => match executed.response {
-                Response::Observed { fact } => {
-                    serde_json::to_vec(&json!({"vote": vote, "fact": fact.event_id}))
-                        .unwrap_or_default()
-                }
-                _ => b"{\"error\":\"vote_unrecorded\"}".to_vec(),
+                Response::Observed { fact } => fact.event_id,
+                _ => return b"{\"error\":\"proposal_unrecorded\"}".to_vec(),
             },
-            Err(_) => b"{\"error\":\"vote_unrecorded\"}".to_vec(),
+            Err(e) => return refused("proposal_unrecorded", &e.to_string()),
+        };
+        let here = export(store)
+            .map_err(|e| decisions::DecisionRefusal {
+                code: "vote_store_unreadable",
+                detail: e.to_string(),
+            })
+            .and_then(|facts| self.check_rules(payload, &facts));
+        answer(&json!({
+            "proposal": fact,
+            "payload_digest": decision.payload_digest,
+            "here": match here { Ok(()) => json!({"verdict": "passes"}), Err(e) => json!({"verdict": "refused", "code": e.code, "detail": e.detail}) },
+        }))
+    }
+
+    /// What this replica's store says about one resource's decision.
+    fn read(&self, resource: &str, store: &impl Fn() -> Result<Store>) -> Vec<u8> {
+        let Some(rules) = self
+            .config
+            .decisions
+            .as_ref()
+            .and_then(|d| d.rules(resource))
+        else {
+            return decision_refused(
+                "decision_refused",
+                "resource_not_decided_here",
+                "this replica decides no such resource",
+            );
+        };
+        let Ok(policy) = self.config.policy() else {
+            return decision_refused(
+                "decision_refused",
+                "vote_configuration_invalid",
+                "the vote configuration's policy",
+            );
+        };
+        let facts = match export(store) {
+            Ok(facts) => facts,
+            Err(e) => {
+                return decision_refused(
+                    "decision_refused",
+                    "vote_store_unreadable",
+                    &e.to_string(),
+                )
+            }
+        };
+        let counted =
+            decisions::verified(&policy, &counted_votes(&facts, &self.config.replica_keys));
+        let proposals = decisions::proposals_in(&facts);
+        let here = self.verdicts.lock().map(|v| v.clone()).unwrap_or_default();
+        answer(
+            &json!({"decision": decisions::read(&policy, rules, &counted, &proposals, &here, now())}),
+        )
+    }
+
+    /// One pass of the voter: reads the proposals the store holds, checks each live one above the
+    /// view against this replica's view, and votes for one that passes, under the ledger. Records a
+    /// verdict for each. Returns how many votes it recorded.
+    ///
+    /// # Errors
+    /// The store could not be read; nothing was voted.
+    pub(crate) fn decide_once(
+        &self,
+        store: impl Fn() -> Result<Store>,
+        replica_id: &str,
+    ) -> Result<usize> {
+        let started = std::time::Instant::now();
+        let outcome = self.decide_pass(&store, replica_id);
+        let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Ok(mut v) = self.voter.lock() {
+            v.passes += 1;
+            v.last_pass_ms = Some(ms);
+            v.longest_pass_ms = v.longest_pass_ms.max(ms);
+            match &outcome {
+                Ok(cast) => {
+                    v.votes_cast += *cast as u64;
+                    v.last_error = None;
+                }
+                Err(e) => v.last_error = Some(e.to_string()),
+            }
         }
+        outcome
+    }
+
+    fn decide_pass(&self, store: &impl Fn() -> Result<Store>, replica_id: &str) -> Result<usize> {
+        let Some(d) = &self.config.decisions else {
+            return Ok(0);
+        };
+        let policy = self.config.policy()?;
+        let facts = export(store)?;
+        let counted =
+            decisions::verified(&policy, &counted_votes(&facts, &self.config.replica_keys));
+        let proposals = decisions::proposals_in(&facts);
+        let voted = decisions::voters_by_payload(&counted);
+        let now = now();
+        let mut verdicts = BTreeMap::new();
+        let mut cast = 0;
+        let signer = self.signer();
+        for rules in &d.resources {
+            let view = decisions::view(&policy, rules, &counted);
+            let mut candidates: Vec<&Proposal> = proposals
+                .iter()
+                .filter(|p| p.decision.resource == rules.resource && p.decision.number > view.epoch)
+                .collect();
+            candidates.sort_by(|a, b| {
+                (
+                    a.decision.number,
+                    a.decision.issued_at,
+                    &a.decision.payload_digest,
+                )
+                    .cmp(&(
+                        b.decision.number,
+                        b.decision.issued_at,
+                        &b.decision.payload_digest,
+                    ))
+            });
+            for p in candidates {
+                let digest = p.decision.payload_digest.clone();
+                let verdict = if voted
+                    .get(&digest)
+                    .is_some_and(|v| v.contains(&self.config.key_id))
+                {
+                    json!({"verdict": "voted"})
+                } else if p.decision.expires_at <= now {
+                    json!({"verdict": "expired"})
+                } else {
+                    match decisions::check(
+                        &policy,
+                        rules,
+                        &self.config.nodes,
+                        &view,
+                        &p.payload,
+                        now,
+                        self.config.max_certificate_life_seconds,
+                    ) {
+                        Err(e) => json!({"verdict": "refused", "code": e.code, "detail": e.detail}),
+                        Ok(_) => match &signer {
+                            Err(e) => {
+                                json!({"verdict": "refused", "code": e.code, "detail": e.detail})
+                            }
+                            Ok(signer) => match self.sign_and_record(
+                                signer,
+                                &format!("decide-{digest}"),
+                                &p.payload,
+                                &facts,
+                                store,
+                                replica_id,
+                            ) {
+                                Ok(r) => {
+                                    if !r.replayed {
+                                        cast += 1;
+                                    }
+                                    json!({"verdict": "voted", "fact": r.fact})
+                                }
+                                Err(e) => {
+                                    json!({"verdict": "refused", "code": e.code, "detail": e.detail})
+                                }
+                            },
+                        },
+                    }
+                };
+                verdicts.insert(digest, verdict);
+            }
+        }
+        if let Ok(mut v) = self.verdicts.lock() {
+            *v = verdicts;
+        }
+        Ok(cast)
     }
 }
 
@@ -455,5 +963,17 @@ pub fn votes_in(facts: &[Fact]) -> Vec<Value> {
                 .starts_with(&format!("{}/", vote::VOTE_SCOPE_PREFIX))
         })
         .filter_map(|f| serde_json::from_str(&f.value).ok())
+        .collect()
+}
+
+/// The votes a set of facts carries that a decision counts: each read from its fact with
+/// `vote_of_fact`, so that it comes from the scope of the replica that owns its voter's key. Their
+/// signatures are verified again wherever they are counted.
+#[must_use]
+pub fn counted_votes(facts: &[Fact], replica_keys: &BTreeMap<String, String>) -> Vec<Value> {
+    facts
+        .iter()
+        .filter_map(|f| vote::vote_of_fact(f, replica_keys))
+        .filter_map(std::result::Result::ok)
         .collect()
 }

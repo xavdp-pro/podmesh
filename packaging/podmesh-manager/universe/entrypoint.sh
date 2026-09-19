@@ -56,6 +56,18 @@ for f in /var/lib/podmesh-manager/manager.sqlite /var/lib/podmesh-manager/manage
   if [ -f "$f" ]; then cp -p -- "$f" "$f.copyup" && mv -f -- "$f.copyup" "$f"; fi
 done
 export PODMESH_MANAGER_NETWORK_MODE=authenticated-static-peers
+# The replica's host state (V3-5): a replica that votes keeps its key and its signing ledger in a
+# directory its host provides, outside this universe's state, and reads the host's machine-id from a
+# read-only mount. PodMesh's `create` with `manager_host_state` gives this universe exactly three mounts
+# at fixed paths; the resident is told where two of them are, and the configuration names the third
+# (`votes.evidence_dir` = /run/podmesh-host/evidence). Without them a configuration that votes does not
+# start: the resident refuses, and this start exits 2 like any other refusal to run. Nothing here is
+# written: the resident checks the vote directory and the machine-id's read-only mount itself.
+if [ -d /run/podmesh-host/votes ]; then
+  export PODMESH_MANAGER_VOTE_DIR=/run/podmesh-host/votes
+  export PODMESH_MANAGER_HOST_ID_FILE=/run/podmesh-host/machine-id
+  echo "manager-universe: host state mounted: votes at $PODMESH_MANAGER_VOTE_DIR, the host's machine-id at $PODMESH_MANAGER_HOST_ID_FILE"
+fi
 /usr/lib/podmesh-manager/podmesh-managerd --config /etc/podmesh-manager/config.json --state-dir /var/lib/podmesh-manager --runtime-dir /run/podmesh-manager &
 child=$!
 echo "manager-universe: resident started pid=$child"

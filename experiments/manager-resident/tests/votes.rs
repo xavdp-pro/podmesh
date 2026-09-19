@@ -209,6 +209,7 @@ impl Resident {
                 evidence_dir: evidence.clone(),
                 operator_uid,
                 max_certificate_life_seconds: LIFE,
+                decisions: None,
             }),
         };
         Self {

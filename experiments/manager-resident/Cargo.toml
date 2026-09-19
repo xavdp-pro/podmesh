@@ -26,3 +26,15 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 all = "deny"
+
+# Every decision read and every voter pass verifies each vote's two signatures. The curve arithmetic is
+# optimized in the development profile too, so that the timings the process tests measure against the
+# control deadline are of the order of a release build's, not a hundred times them.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
