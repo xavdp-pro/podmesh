@@ -5,6 +5,20 @@ is the default**, per the image policy of 2026-09-14, with a musl build of the r
 (`MUSL-BUILD.md`); `Containerfile` (Debian 13) is the documented compatibility branch that carries
 the frozen glibc candidate as it is (`DEBIAN-EXCEPTION.md`, `ALPINE-PROOF.md`).
 
+For a musl build from a Debian build container, install `musl-tools` and the Rust
+`x86_64-unknown-linux-musl` target, then build the resident with an explicit static link:
+
+```sh
+RUSTFLAGS='-C relocation-model=static -C link-arg=-static' \
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+  cargo build --release --locked --target x86_64-unknown-linux-musl
+```
+
+Check that `file` reports a statically linked executable, that `--version` exits successfully,
+and that the resident passes its decision tests before putting it in an image. A build that
+returns exit code zero but crashes on invocation is not an image candidate. Record the exact
+source, toolchain, SHA-256 and image digest with the qualification evidence.
+
 Codex's decision of 2026-09-14: the manager is one logical universe; PodMesh's activation,
 recovery points and epoch screen are its only exclusive-role enforcement. This directory is
 the smallest universe definition of the packaged resident, and what it taught.
