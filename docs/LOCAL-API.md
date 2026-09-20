@@ -820,7 +820,7 @@ collect it.
 
 **A manager replica's host state (development tree, V3-5).** `create` takes an optional
 `manager_host_state` (a name, the token of this host's replica, such as its alias). The universe then gets
-exactly three bind mounts, derived from that name and nothing the caller gives:
+three required bind mounts, derived from that name and nothing the caller gives:
 
 - `<state>/manager-host/<name>/votes`, read-write, at `/run/podmesh-host/votes`: the replica's signing key
   and its signing ledger;
@@ -828,6 +828,11 @@ exactly three bind mounts, derived from that name and nothing the caller gives:
   readmission evidence, which the replica cannot write;
 - the host's `/etc/machine-id`, read-only, at `/run/podmesh-host/machine-id`: the identity the ledger is
   bound to.
+
+On a QEMU guest exposing `/sys/firmware/qemu_fw_cfg/by_name/etc/vmgenid_guid/raw`, the node also
+mounts that live VM generation witness read-only at `/run/podmesh-host/vmgenid`. Voting configurations
+that require this witness refuse a missing or changed value; it does not make a RAM-inclusive VM
+rollback safe against an already in-flight signature.
 
 The two directories are made private, must be real directories, and are never removed by PodMesh. **One
 universe holds a name at a time**: `create` is refused, before anything is made, with

@@ -38,11 +38,12 @@
 //! THE REPLICA'S HOST STATE (V3-5). A manager replica that votes keeps its signing key and its signing
 //! ledger in a directory its host provides, outside the universe's state, and reads the host's
 //! machine-id from a read-only mount: no recovery point, restore, clone or migration of the universe
-//! carries or rewinds them. `create` with `manager_host_state: <name>` gives the universe exactly three
+//! carries or rewinds them. `create` with `manager_host_state: <name>` gives the universe three required
 //! bind mounts, derived here and nowhere else: `<state>/manager-host/<name>/votes` read-write at
 //! `/run/podmesh-host/votes`, `<state>/manager-host/<name>/evidence` read-only at
 //! `/run/podmesh-host/evidence` (the operator's readmission evidence, which the replica cannot write),
-//! and the host's `/etc/machine-id` read-only at `/run/podmesh-host/machine-id`. The caller names no
+//! and the host's `/etc/machine-id` read-only at `/run/podmesh-host/machine-id`. A QEMU guest also gets
+//! its live generation witness read-only at `/run/podmesh-host/vmgenid` when the device exists. The caller names no
 //! path. The directories are made private (0700) and never removed by PodMesh. One universe holds a
 //! name at a time: `create` refuses a name another container carries or whose directory is held, and
 //! `delete` renames the directory to `<name>.released`, which the next create of the name takes back,
