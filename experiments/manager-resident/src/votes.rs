@@ -938,7 +938,6 @@ impl VoteRuntime {
         let now = now();
         let mut verdicts = BTreeMap::new();
         let mut cast = 0;
-        let signer = self.signer();
         for rules in &d.resources {
             let view = decisions::view(&policy, rules, &counted);
             let mut candidates: Vec<&Proposal> = proposals
@@ -977,12 +976,14 @@ impl VoteRuntime {
                         self.config.max_certificate_life_seconds,
                     ) {
                         Err(e) => json!({"verdict": "refused", "code": e.code, "detail": e.detail}),
-                        Ok(_) => match &signer {
+                        // A pass can vote for more than one proposal. Re-read the host and VM
+                        // witnesses before each signature, not just once at the start of the pass.
+                        Ok(_) => match self.signer() {
                             Err(e) => {
                                 json!({"verdict": "refused", "code": e.code, "detail": e.detail})
                             }
                             Ok(signer) => match self.sign_and_record(
-                                signer,
+                                &signer,
                                 &format!("decide-{digest}"),
                                 &p.payload,
                                 &facts,

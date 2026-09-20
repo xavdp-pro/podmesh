@@ -151,7 +151,9 @@ The entrypoint sees `/run/podmesh-host/votes` and gives the resident `PODMESH_MA
 `/run/podmesh-host/evidence`. Without the mounts, a configuration that votes does not start: the
 resident refuses, and the start exits 2.
 For a VM that may be restored from a snapshot, set `votes.require_generation_id` so a missing
-external witness refuses every vote operation. The witness detects a changed generation even
+external witness refuses every vote operation. The resident may still start to serve read-only
+status and exchange facts, but it cannot sign until the witness is available and the ledger is
+admitted. The witness detects a changed generation even
 when RAM rollback preserves the old kernel boot ID. It does not prove an already in-flight
 signature safe across a RAM rollback. Until that case is separately qualified, prohibit snapshots
 that include VM RAM and their rollback while the VM can vote; use an isolated disk-only restore
