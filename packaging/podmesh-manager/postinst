@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = configure ]; then
+  if ! getent passwd podmesh-manager >/dev/null; then
+    adduser --system --group --home /nonexistent --no-create-home \
+      --shell /usr/sbin/nologin podmesh-manager
+  fi
+  install -d -m 0750 -o root -g podmesh-manager /etc/podmesh-manager
+  install -d -m 0750 -o podmesh-manager -g podmesh-manager /var/lib/podmesh-manager
+  # Signed votes: the vote directory is the service's own and private; the evidence directory is root's.
+  install -d -m 0700 -o podmesh-manager -g podmesh-manager /var/lib/podmesh-manager-votes
+  install -d -m 0755 -o root -g root /var/lib/podmesh-manager-evidence
+  if [ -d /run/systemd/system ]; then systemctl daemon-reload; fi
+fi
