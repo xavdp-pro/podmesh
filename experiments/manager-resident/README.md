@@ -510,6 +510,14 @@ value marks the ledger unadmitted before the marker advances, including when it 
 first guard but before signature release; a promise already made stays, which is the direction a
 crash in the same place already leaves and the one that never forgets a vote that did go out.
 
+The packaged `podmesh-manager.service` mounts the item read-only at
+`/run/podmesh-manager-host/vmgenid` and names it in `PODMESH_MANAGER_GENERATION_ID_FILE`. The mount
+is optional in the unit, because a bare-metal host has no such item: the unit still starts, and a
+vote configuration that then finds no witness refuses to sign unless the operator recorded a
+`generation_witness_waiver` saying why this host cannot be snapshotted. The refusal belongs to the
+resident, which can name it, not to systemd. The containerized universe reaches the same place
+through its entrypoint and `/run/podmesh-host/vmgenid`.
+
 The guest boot guard remains in place as a second signal. There is still a gap between the last
 witness read and the signature reaching a caller: a signature already released and then rolled back
 out of the ledger's knowledge cannot be recalled by any check inside the guest. A memory snapshot

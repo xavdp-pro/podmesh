@@ -164,10 +164,13 @@ The entrypoint sees `/run/podmesh-host/votes` and gives the resident `PODMESH_MA
 `PODMESH_MANAGER_GENERATION_ID_FILE`. The configuration names `votes.evidence_dir` =
 `/run/podmesh-host/evidence`. Without the mounts, a configuration that votes does not start: the
 resident refuses, and the start exits 2.
-For a VM that may be restored from a snapshot, set `votes.require_generation_id` so a missing
-external witness refuses every vote operation. The resident may still start to serve read-only
-status and exchange facts, but it cannot sign until the witness is available and the ledger is
-admitted. The witness detects a changed generation even
+`votes.require_generation_id` is true unless the configuration says otherwise, so a missing external
+witness refuses every vote operation by default; `add-votes.py` writes it that way and only
+`--waive-generation-witness "<the operator's own reason>"` turns it off, carrying that reason into
+every replica as `generation_witness_waiver`. The resident refuses a witness that is not on the
+filesystem the hypervisor answers for, which a bind mount of the `fw_cfg` item satisfies and a copy
+of it does not. The resident may still start to serve read-only status and exchange facts, but it
+cannot sign until the witness is available and the ledger is admitted. The witness detects a changed generation even
 when RAM rollback preserves the old kernel boot ID. It does not prove an already in-flight
 signature safe across a RAM rollback. Until that case is separately qualified, prohibit snapshots
 that include VM RAM and their rollback while the VM can vote; use an isolated disk-only restore

@@ -339,6 +339,7 @@ impl Lab {
                     operator_uid: uid,
                     max_certificate_life_seconds: LIFE,
                     require_generation_id: false,
+                    generation_witness_waiver: Some("test fixture on a workstation, not in a guest: no hypervisor can snapshot it".into()),
                     decisions: Some(DecisionConfiguration {
                         voter_interval_ms: 200,
                         resources: vec![ResourceRules {

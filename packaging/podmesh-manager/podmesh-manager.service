@@ -20,6 +20,14 @@ Environment=PODMESH_MANAGER_NETWORK_MODE=disabled
 Environment=PODMESH_MANAGER_VOTE_DIR=/var/lib/podmesh-manager-votes
 Environment=PODMESH_MANAGER_HOST_ID_FILE=/run/podmesh-manager-host/machine-id
 BindReadOnlyPaths=/etc/machine-id:/run/podmesh-manager-host/machine-id
+# The hypervisor's generation witness, when this host is a guest that exposes one. It is the only
+# thing that survives a snapshot resume of this host to say the guest went back, so a voting replica
+# reads it again before it seals a signature. The mount is optional (-) because a bare-metal host has
+# no such item; the unit still starts, and a vote configuration that then finds no witness refuses to
+# sign unless the operator recorded a generation_witness_waiver saying why this host cannot be
+# snapshotted. That refusal belongs to the resident, which can name it, not to systemd.
+Environment=PODMESH_MANAGER_GENERATION_ID_FILE=/run/podmesh-manager-host/vmgenid
+BindReadOnlyPaths=-/sys/firmware/qemu_fw_cfg/by_name/etc/vmgenid_guid/raw:/run/podmesh-manager-host/vmgenid
 ReadWritePaths=-/var/lib/podmesh-manager-votes
 ExecStart=/usr/lib/podmesh-manager/podmesh-managerd --config ${PODMESH_MANAGER_CONFIG} --state-dir ${PODMESH_MANAGER_STATE_DIR} --runtime-dir ${PODMESH_MANAGER_RUNTIME_DIR}
 RuntimeDirectory=podmesh-manager

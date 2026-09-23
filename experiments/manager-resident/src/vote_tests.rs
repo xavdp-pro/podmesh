@@ -2113,3 +2113,97 @@ fn a_witness_that_already_moved_leaves_no_promise_behind() {
         "and promised nothing: epoch 6 is still free for whoever the operator readmits this replica to serve"
     );
 }
+
+/// Proves (the witness's own forms and their refusals): what a witness may be, and what it may not.
+/// QEMU's `fw_cfg` item is 4096 bytes with the generation at offset 40; a platform adapter may
+/// supply the bare 16. Everything else refuses rather than being interpreted: a length that is
+/// neither, an all-zero item that means the hypervisor gave nothing, and a file that is not there.
+/// A sysfs path is a filesystem the hypervisor answers for, which does not make every sysfs file a
+/// generation item: `/sys/devices/system/cpu/online` passes the filesystem test and is still
+/// unreadable as a witness. Nothing here writes a marker or touches a ledger.
+#[test]
+fn a_witness_is_one_of_two_forms_and_nothing_else() {
+    let root = temp_root();
+
+    let bare = root.path().join("bare");
+    let expected = write_generation(&bare, 7);
+    assert_eq!(crate::votes::generation_id_from(&bare).unwrap(), expected);
+
+    // The fw_cfg item: 4096 bytes, the generation at offset 40, the rest none of our business.
+    let fw_cfg = root.path().join("fw-cfg");
+    let mut item = vec![0xAA_u8; 4096];
+    item[40..56].copy_from_slice(&[9_u8; 16]);
+    fs::write(&fw_cfg, &item).unwrap();
+    assert_eq!(
+        crate::votes::generation_id_from(&fw_cfg).unwrap(),
+        quorum::hex(&[9_u8; 16]),
+        "the 16 bytes at offset 40, not the bytes around them"
+    );
+
+    let wrong_length = root.path().join("wrong-length");
+    fs::write(&wrong_length, [1_u8; 15]).unwrap();
+    assert_eq!(
+        code(crate::votes::generation_id_from(&wrong_length)),
+        "generation_identity_unreadable",
+        "a length that is neither form is refused, not padded or truncated into one"
+    );
+
+    let zero = root.path().join("zero");
+    fs::write(&zero, [0_u8; 16]).unwrap();
+    assert_eq!(
+        code(crate::votes::generation_id_from(&zero)),
+        "generation_identity_unreadable",
+        "an all-zero item is the hypervisor saying nothing"
+    );
+
+    assert_eq!(
+        code(crate::votes::generation_id_from(&root.path().join("absent"))),
+        "generation_identity_unreadable"
+    );
+
+    // Sysfs is the filesystem, not the item. A sysfs file that is not a generation item passes the
+    // filesystem test and is refused when it is read, which is where the two checks divide.
+    let sysfs = std::path::Path::new("/sys/devices/system/cpu/online");
+    if sysfs.exists() {
+        ledger::trust_generation_witness(sysfs).expect("sysfs is a filesystem worth reading again");
+        assert_eq!(
+            code(crate::votes::generation_id_from(sysfs)),
+            "generation_identity_unreadable",
+            "and it is still not a generation item"
+        );
+    }
+}
+
+/// Proves (a path that could never be a witness marks nothing): whether a path can be a witness at
+/// all is settled before `guard_generation`, which persists a marker and can mark the ledger
+/// unadmitted. Before this, naming an unusable path still wrote the marker and could quarantine the
+/// ledger durably; a typo in one environment variable was enough to stop a replica voting until an
+/// operator readmitted it.
+#[test]
+fn a_path_that_could_never_be_a_witness_marks_nothing() {
+    let root = temp_root();
+    let dir = private_dir(root.path(), "a");
+    let signer = admitted_a(root.path(), &dir);
+    let marker = dir.join("replica-a.generation-id");
+
+    let ordinary = root.path().join("generation");
+    write_generation(&ordinary, 1);
+    let refused = ledger::trust_generation_witness(&ordinary).unwrap_err();
+    assert_eq!(refused.code, ledger::GENERATION_WITNESS_UNTRUSTED);
+
+    let absent = ledger::trust_generation_witness(&root.path().join("typo")).unwrap_err();
+    assert_eq!(
+        absent.code,
+        ledger::GENERATION_WITNESS_UNTRUSTED,
+        "a path that is not there cannot be read again either"
+    );
+
+    assert!(
+        !marker.exists(),
+        "no marker was written for a path that was refused before it was read"
+    );
+    assert!(
+        signer.load().unwrap().admitted,
+        "and the ledger was not quarantined by the attempt"
+    );
+}

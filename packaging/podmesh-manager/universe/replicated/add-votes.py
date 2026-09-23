@@ -7,7 +7,7 @@ that `generate-replica-set.py` wrote, and the scopes a replica votes and propose
       --resource <uuid>:<lease seconds>:<takeover margin seconds>:<renewal not_after> [--resource ...] \
       [--baseline <uuid>:<epoch>:<holder host uuid>:<eligible_after>:<expires_at>] \
       [--max-certificate-life 300] [--voter-interval-ms 1000] [--operator-uid 0]
-      [--require-generation-id]
+      [--waive-generation-witness "<the operator's own reason>"]
 
 Each `--key` names one replica's key by its alias: its identifier and its public half only, as
 `vote-key.py` printed it on that replica's own host (the seed never leaves the host). The policy is the
@@ -15,7 +15,13 @@ Each `--key` names one replica's key by its alias: its identifier and its public
 evidence directory is the host state's `/run/podmesh-host/evidence`, and every replica decides the
 resources named, with the barrier rules' lease, margin and renewal bound (`renewal_not_after`: the
 latest `not_after` of any follow mandate standing on the hosts, 0 when none renews by itself). A
-`--baseline` records where a resource moving from the gate starts: the gate's last epoch, its holder, its
+A live hypervisor generation witness is **required** unless the operator waives it. Written this way,
+`require_generation_id` is true and a replica that starts without its mount refuses to vote rather than
+voting with no defence against a snapshot rollback. `--waive-generation-witness` takes the operator's own
+reason, in their words, writes `require_generation_id` false and carries that reason into every
+configuration as `generation_witness_waiver`; the replica reports it for as long as it holds. There is no
+way to write false without a reason, because a tool cannot decide for the operator that a guest is beyond
+the reach of snapshots. A `--baseline` records where a resource moving from the gate starts: the gate's last epoch, its holder, its
 barrier and its proof's `expires_at` (the gate's holder may re-acquire under that proof until then; a
 change of holder waits for it). Until V3-6, a change of holder also needs `renewal_not_after` to be the
 latest `not_after` of the follow mandates, frozen or removed beforehand, and no earlier than the current
@@ -33,8 +39,11 @@ p.add_argument('--authority-id', default='replicas')
 p.add_argument('--max-certificate-life', type=int, default=300)
 p.add_argument('--voter-interval-ms', type=int, default=1000)
 p.add_argument('--operator-uid', type=int, default=0)
-p.add_argument('--require-generation-id', action='store_true', help='refuse votes without a live hypervisor generation witness')
+p.add_argument('--waive-generation-witness', metavar='REASON', help="the operator's own reason for voting with no live hypervisor generation witness; without it a witness is required")
 a = p.parse_args()
+waiver = (a.waive_generation_witness or '').strip()
+if a.waive_generation_witness is not None and not waiver:
+    sys.exit('add-votes: --waive-generation-witness needs the operator\'s reason, not an empty string')
 
 with open(os.path.join(a.dir, 'replica-set.json')) as f:
     manifest = json.load(f)
@@ -81,17 +90,24 @@ for alias, r in aliases.items():
         'replica_keys': {o['replica_id']: keys[o['alias']][0] for o in manifest['replicas']},
         'nodes': nodes, 'evidence_dir': '/run/podmesh-host/evidence', 'operator_uid': a.operator_uid,
         'max_certificate_life_seconds': a.max_certificate_life,
-        'require_generation_id': a.require_generation_id,
+        'require_generation_id': not waiver,
         'decisions': {'voter_interval_ms': a.voter_interval_ms, 'resources': resources},
     }
+    if waiver:
+        config['votes']['generation_witness_waiver'] = waiver
     with open(path + '.tmp', 'w') as f:
         json.dump(config, f, indent=2)
         f.write('\n')
     os.chmod(path + '.tmp', 0o600)
     os.replace(path + '.tmp', path)
 manifest['votes'] = {'authority_id': a.authority_id, 'authority_quorum': quorum, 'policy_digest': digest, 'nodes': nodes,
-                     'keys': {alias: k for alias, (k, _) in keys.items()}}
+                     'keys': {alias: k for alias, (k, _) in keys.items()},
+                     'require_generation_id': not waiver}
+if waiver:
+    manifest['votes']['generation_witness_waiver'] = waiver
 with open(os.path.join(a.dir, 'replica-set.json'), 'w') as f:
     json.dump(manifest, f, indent=2)
     f.write('\n')
-print(json.dumps({'policy_digest': digest, 'authority_quorum': quorum, 'nodes': nodes}))
+print(json.dumps({'policy_digest': digest, 'authority_quorum': quorum, 'nodes': nodes,
+                  'require_generation_id': not waiver,
+                  **({'generation_witness_waiver': waiver} if waiver else {})}))

@@ -117,6 +117,30 @@ pub const TRIPWIRE_CODES: &[&str] = &[
     GENERATION_CHANGED,
 ];
 
+/// Says whether a path can be a generation witness at all, without reading it and without touching
+/// the ledger. Call it **before** `guard_generation`, which persists a marker and can mark the
+/// ledger unadmitted: a path that could never be a witness must not be able to quarantine anything.
+///
+/// # Errors
+/// `generation_witness_untrusted`: the path cannot be read as a file, or is not on a filesystem the
+/// hypervisor answers for. Only sysfs qualifies, where the platform exposes `fw_cfg` items; a bind
+/// mount of such a file into a universe keeps that filesystem and still qualifies.
+pub fn trust_generation_witness(path: &std::path::Path) -> Result<(), LedgerRefusal> {
+    let filesystem = rustix::fs::statfs(path)
+        .map_err(|e| refusal(GENERATION_WITNESS_UNTRUSTED, e.to_string()))?;
+    if filesystem.f_type != SYSFS_MAGIC {
+        return Err(refusal(
+            GENERATION_WITNESS_UNTRUSTED,
+            format!(
+                "the witness at {} is on filesystem type {:#x}, not the sysfs the hypervisor answers for ({SYSFS_MAGIC:#x}): a rollback would restore this file and the page cache that last read it, so reading it again would show the generation the guest went back to",
+                path.display(),
+                filesystem.f_type
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The host this replica runs on, as the host itself names it: its machine-id, 32 lowercase hex
 /// characters, read from a file the host mounts read-only into the universe (by default
 /// `/etc/machine-id`). A universe's own `/etc/machine-id` is not the host's and travels with a clone.
@@ -881,18 +905,7 @@ impl Signer {
     /// `generation_witness_untrusted`: the witness is not on a filesystem the hypervisor answers
     /// for. Use `waive_generation` instead if the operator decides to sign without the defence.
     pub fn watch_generation(&mut self, path: PathBuf, observed: &str) -> Result<(), LedgerRefusal> {
-        let filesystem = rustix::fs::statfs(&path)
-            .map_err(|e| refusal(GENERATION_WITNESS_UNTRUSTED, e.to_string()))?;
-        if filesystem.f_type != SYSFS_MAGIC {
-            return Err(refusal(
-                GENERATION_WITNESS_UNTRUSTED,
-                format!(
-                    "the witness at {} is on filesystem type {:#x}, not the sysfs the hypervisor answers for ({SYSFS_MAGIC:#x}): a rollback would restore this file and the page cache that last read it, so reading it again would show the generation the guest went back to",
-                    path.display(),
-                    filesystem.f_type
-                ),
-            ));
-        }
+        trust_generation_witness(&path)?;
         self.watch_generation_unchecked(path, observed);
         Ok(())
     }

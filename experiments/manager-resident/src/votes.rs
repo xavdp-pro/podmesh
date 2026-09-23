@@ -107,6 +107,11 @@ pub struct VoteConfiguration {
     /// decision to sign without that defence; the signer then carries the waiver and shows it.
     #[serde(default = "require_generation_id_default")]
     pub require_generation_id: bool,
+    /// The operator's own reason for voting with no generation witness, required whenever
+    /// `require_generation_id` is false. The signer carries it as its waiver and `status` reports
+    /// it, so that doing without the defence is a named act and not a sentence a tool produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_witness_waiver: Option<String>,
     /// The replicas' decisions (V3-5): which resources this replica decides and how often its voter
     /// reads the store. Absent, the replica proposes nothing, votes only through `vote_sign`, and
     /// checks no decision rule (V3-4).
@@ -429,35 +434,67 @@ impl VoteRuntime {
         signer.guard_boot(boot_id.trim_end_matches('\n'), now())?;
         if let Some(path) = std::env::var_os(GENERATION_FILE_ENV) {
             let path = PathBuf::from(path);
-            let generation = generation_id_from(&path)?;
-            signer.guard_generation(&generation, now())?;
-            // The guard released the ledger's lock: the signer keeps the witness, and reads it
-            // again under the lock before it releases a signature or admits the ledger.
-            match signer.watch_generation(path, &generation) {
-                Ok(()) => {}
-                Err(untrusted) if !self.config.require_generation_id => {
-                    // The operator chose to sign without the defence; a witness that proves nothing
-                    // is that same choice, so it is recorded as the waiver it is rather than
-                    // watched as a protection it cannot give.
-                    signer.waive_generation(format!(
-                        "require_generation_id is false and the witness offered is not one the hypervisor answers for ({}): {}",
-                        untrusted.code, untrusted.detail
-                    ));
+            // Whether the path could be a witness at all is settled before `guard_generation`,
+            // which persists a marker and can mark the ledger unadmitted. A path that could never
+            // be a witness must not be able to quarantine a ledger by being named.
+            match crate::ledger::trust_generation_witness(&path) {
+                Ok(()) => {
+                    let generation = generation_id_from(&path)?;
+                    signer.guard_generation(&generation, now())?;
+                    // The guard released the ledger's lock: the signer keeps the witness, and reads
+                    // it again under the lock before it releases a signature or admits the ledger.
+                    signer.watch_generation_unchecked(path, &generation);
                 }
-                Err(untrusted) => return Err(untrusted),
+                Err(untrusted) => {
+                    // A witness that proves nothing is the same position as no witness: it needs
+                    // the operator's recorded decision, and it marks nothing on the way there.
+                    let waiver = self.waiver(Some(&untrusted))?;
+                    signer.waive_generation(waiver);
+                }
             }
-        } else if self.config.require_generation_id {
-            return Err(crate::ledger::refusal(
-                "generation_identity_unreadable",
-                "this vote configuration requires a mounted hypervisor generation witness",
-            ));
         } else {
-            signer.waive_generation(format!(
-                "no hypervisor generation witness is mounted and require_generation_id is false: this replica cannot tell that its guest went back to an earlier generation, and a snapshot rollback of it would go unseen. Mount a witness and set the flag, or keep {} out of reach of snapshots",
-                self.config.key_id
-            ));
+            let waiver = self.waiver(None)?;
+            signer.waive_generation(waiver);
         }
         Ok(signer)
+    }
+
+    /// The operator's recorded decision to vote without the generation witness, refused unless the
+    /// configuration carries it in the operator's own words. `untrusted`, when present, is why the
+    /// witness that was offered cannot serve; the waiver must still be the operator's.
+    fn waiver(
+        &self,
+        untrusted: Option<&LedgerRefusal>,
+    ) -> std::result::Result<String, LedgerRefusal> {
+        let reason = self
+            .config
+            .generation_witness_waiver
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty());
+        let Some(reason) = reason else {
+            let missing = match untrusted {
+                Some(u) => format!(
+                    "the generation witness mounted cannot serve ({}: {})",
+                    u.code, u.detail
+                ),
+                None => "no generation witness is mounted".to_string(),
+            };
+            return Err(crate::ledger::refusal(
+                "generation_identity_unreadable",
+                format!("{missing}, and this configuration records no generation_witness_waiver. Mount a witness the hypervisor answers for, or write the operator's own reason for voting without one; a tool cannot decide that for them"),
+            ));
+        };
+        if self.config.require_generation_id {
+            return Err(crate::ledger::refusal(
+                "generation_identity_unreadable",
+                "this vote configuration requires a mounted hypervisor generation witness; a waiver does not override require_generation_id, which the operator sets to false in the same act",
+            ));
+        }
+        Ok(match untrusted {
+            Some(u) => format!("operator waiver: {reason} (the witness offered cannot serve: {}: {})", u.code, u.detail),
+            None => format!("operator waiver: {reason}"),
+        })
     }
 
     fn alert(&self, text: String) {

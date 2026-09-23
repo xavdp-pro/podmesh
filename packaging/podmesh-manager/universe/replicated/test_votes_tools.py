@@ -61,6 +61,34 @@ def main():
         run(HERE / "add-votes.py", "--dir", rs, *keys, f"--resource={R}:300:30:0", expect=1)
         checks.append("add-votes gives every replica its vote and proposal scopes and a votes section under the node's pinned policy digest for the test keys, with the resource's rules and baseline; refuses a key missing and a set that already votes")
 
+        # The generated JSON must require the witness by itself. Written any other way, the tool
+        # would hand back the default the resident refuses to take, and a replica would vote with
+        # no defence against a snapshot rollback because nobody typed a flag.
+        for r in manifest["replicas"]:
+            v = json.loads((rs / r["alias"] / "config.json").read_text())["votes"]
+            assert v["require_generation_id"] is True, v
+            assert "generation_witness_waiver" not in v, v
+        assert manifest["votes"]["require_generation_id"] is True and out["require_generation_id"] is True, (manifest["votes"], out)
+        checks.append("a generated vote configuration requires the hypervisor generation witness, in every replica, in the manifest and in what the tool prints")
+
+        # Waiving it is the operator's act, in the operator's words, carried into every replica.
+        waived = td / "rs-waived"
+        run(HERE / "generate-replica-set.py", "--out", waived, *[a for i, alias in enumerate(("lab-a", "lab-b", "lab-c")) for a in ("--replica", f"{alias}:{HOSTS[i]}:10.86.{i + 1}.10")])
+        reason = "bare-metal hosts, no hypervisor can snapshot them: recorded by Xavier on 2026-09-23"
+        printed = json.loads(run(HERE / "add-votes.py", "--dir", waived, *keys, f"--resource={R}:300:30:0", f"--waive-generation-witness={reason}").stdout)
+        for r in manifest["replicas"]:
+            v = json.loads((waived / r["alias"] / "config.json").read_text())["votes"]
+            assert v["require_generation_id"] is False and v["generation_witness_waiver"] == reason, v
+        assert printed["generation_witness_waiver"] == reason and printed["require_generation_id"] is False, printed
+        assert json.loads((waived / "replica-set.json").read_text())["votes"]["generation_witness_waiver"] == reason
+
+        # And there is no way to reach false without a reason: an empty one is refused outright.
+        empty = td / "rs-empty"
+        run(HERE / "generate-replica-set.py", "--out", empty, *[a for i, alias in enumerate(("lab-a", "lab-b", "lab-c")) for a in ("--replica", f"{alias}:{HOSTS[i]}:10.86.{i + 1}.10")])
+        run(HERE / "add-votes.py", "--dir", empty, *keys, f"--resource={R}:300:30:0", "--waive-generation-witness=   ", expect=1)
+        assert "votes" not in json.loads((empty / "lab-a" / "config.json").read_text()), "a refused waiver wrote nothing"
+        checks.append("waiving the witness needs the operator's own reason, which every replica, the manifest and the printed result then carry; an empty reason is refused and writes nothing")
+
         managerd = os.environ.get("PODMESH_MANAGERD")
         if managerd:
             for r in manifest["replicas"]:
