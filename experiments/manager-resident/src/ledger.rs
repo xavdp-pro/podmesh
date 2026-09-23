@@ -125,7 +125,7 @@ pub const TRIPWIRE_CODES: &[&str] = &[
 /// `generation_witness_untrusted`: the path cannot be read as a file, or is not on a filesystem the
 /// hypervisor answers for. Only sysfs qualifies, where the platform exposes `fw_cfg` items; a bind
 /// mount of such a file into a universe keeps that filesystem and still qualifies.
-pub fn trust_generation_witness(path: &std::path::Path) -> Result<(), LedgerRefusal> {
+pub fn trust_generation_witness(path: &std::path::Path) -> Result<WitnessIdentity, LedgerRefusal> {
     let filesystem = rustix::fs::statfs(path)
         .map_err(|e| refusal(GENERATION_WITNESS_UNTRUSTED, e.to_string()))?;
     if filesystem.f_type != SYSFS_MAGIC {
@@ -138,7 +138,21 @@ pub fn trust_generation_witness(path: &std::path::Path) -> Result<(), LedgerRefu
             ),
         ));
     }
-    Ok(())
+    current_witness_identity(path)
+}
+
+/// What a witness is right now: its filesystem, device and inode. This judges nothing — it only
+/// says what is there, so that a later read can tell the file changed underneath it.
+fn current_witness_identity(path: &std::path::Path) -> Result<WitnessIdentity, LedgerRefusal> {
+    let filesystem = rustix::fs::statfs(path)
+        .map_err(|e| refusal(GENERATION_WITNESS_UNTRUSTED, e.to_string()))?;
+    let file = rustix::fs::stat(path)
+        .map_err(|e| refusal(GENERATION_WITNESS_UNTRUSTED, e.to_string()))?;
+    Ok(WitnessIdentity {
+        filesystem: filesystem.f_type,
+        device: file.st_dev,
+        inode: file.st_ino,
+    })
 }
 
 /// The host this replica runs on, as the host itself names it: its machine-id, 32 lowercase hex
@@ -425,6 +439,17 @@ fn release(_vote: &Value) {}
 struct WatchedGeneration {
     path: PathBuf,
     observed: String,
+    identity: WitnessIdentity,
+}
+
+/// What a witness was, when it was accepted: the filesystem it is on and the file it is. Checked
+/// again before every read, because a path is not a file: a symlink flipped, a mount laid over it or
+/// a file replaced since would otherwise be read on the strength of a check made once at startup.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct WitnessIdentity {
+    filesystem: rustix::fs::FsWord,
+    device: u64,
+    inode: u64,
 }
 
 /// What a signer knows about its hypervisor generation witness.
@@ -905,25 +930,66 @@ impl Signer {
     /// `generation_witness_untrusted`: the witness is not on a filesystem the hypervisor answers
     /// for. Use `waive_generation` instead if the operator decides to sign without the defence.
     pub fn watch_generation(&mut self, path: PathBuf, observed: &str) -> Result<(), LedgerRefusal> {
-        trust_generation_witness(&path)?;
-        self.watch_generation_unchecked(path, observed);
+        let identity = trust_generation_witness(&path)?;
+        self.generation = GenerationWatch::Watched(WatchedGeneration {
+            path,
+            observed: observed.to_string(),
+            identity,
+        });
         Ok(())
+    }
+
+    /// Adopts the witness at `path` in one ordered act: judge the path, read it, guard the ledger
+    /// against the marker, and watch it. Nothing durable is marked before the path is judged, and
+    /// there is one order rather than one per caller.
+    ///
+    /// # Errors
+    /// `generation_witness_untrusted`, `generation_identity_unreadable`, and the guard's.
+    pub fn adopt_generation_witness(
+        &mut self,
+        path: PathBuf,
+        now: i64,
+    ) -> Result<String, LedgerRefusal> {
+        let identity = trust_generation_witness(&path)?;
+        let observed = crate::votes::generation_id_from(&path)?;
+        self.guard_generation(&observed, now)?;
+        self.generation = GenerationWatch::Watched(WatchedGeneration {
+            path,
+            observed: observed.clone(),
+            identity,
+        });
+        Ok(observed)
     }
 
     /// Watches a witness without checking the filesystem it is on. The laboratory's suites use it
     /// against ordinary files; a replica that may sign uses `watch_generation`, which refuses one.
+    #[cfg(test)]
     pub(crate) fn watch_generation_unchecked(&mut self, path: PathBuf, observed: &str) {
+        let identity = current_witness_identity(&path).unwrap_or(WitnessIdentity {
+            filesystem: 0,
+            device: 0,
+            inode: 0,
+        });
         self.generation = GenerationWatch::Watched(WatchedGeneration {
             path,
             observed: observed.to_string(),
+            identity,
         });
     }
 
     /// Records the operator's decision to sign with no generation witness, and why. The signer then
     /// signs, and every rollback this check would have caught passes unseen: the decision is the
     /// operator's, it is named, and `status` shows it for as long as it holds.
-    pub fn waive_generation(&mut self, reason: impl Into<String>) {
-        self.generation = GenerationWatch::Waived(reason.into());
+    pub fn waive_generation(&mut self, reason: impl Into<String>) -> Result<(), LedgerRefusal> {
+        let reason = reason.into();
+        if reason.trim().is_empty() {
+            return Err(refusal(
+                GENERATION_WITNESS_ABSENT,
+                "a waiver with no reason is not a waiver: name why this guest is beyond the reach of snapshots",
+            ));
+        }
+        self.generation = GenerationWatch::Waived(reason);
+        Ok(())
     }
 
     /// The reason a witness was waived, if one was.
@@ -954,6 +1020,22 @@ impl Signer {
                 ))
             }
         };
+        // The path is judged again, not only when it was adopted: a symlink flipped, a mount laid
+        // over it or a file replaced since would otherwise be read on a check made once at startup.
+        // A witness that cannot be stat'd at all is the unreadable case, not the untrusted one:
+        // nothing shows the generation did not change, and the caller fails closed either way, but
+        // the two say different things to whoever reads the refusal.
+        let now_identity = current_witness_identity(&watched.path)
+            .map_err(|e| refusal("generation_identity_unreadable", e.detail))?;
+        if now_identity != watched.identity {
+            return Err(refusal(
+                GENERATION_WITNESS_UNTRUSTED,
+                format!(
+                    "the witness at {} is no longer the file that was accepted: it was replaced, remounted or redirected since, and what it says now stands for nothing",
+                    watched.path.display()
+                ),
+            ));
+        }
         let observed = crate::votes::generation_id_from(&watched.path)?;
         if observed == watched.observed {
             return Ok(());

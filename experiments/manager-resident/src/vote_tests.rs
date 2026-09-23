@@ -88,7 +88,9 @@ fn open(dir: &Path, key_id: &str, host: &str, policy: Quorum) -> Signer {
     // These suites test what the ledger and the policy decide, not the hypervisor witness. A signer
     // that says nothing about the witness now refuses to sign, so each one says here, once, that it
     // is deliberately doing without. The suites that do test the witness watch one instead.
-    signer.waive_generation("test signer: these suites do not exercise the generation witness");
+    signer
+        .waive_generation("test signer: these suites do not exercise the generation witness")
+        .unwrap();
     signer
 }
 
@@ -2030,7 +2032,9 @@ fn a_signer_that_says_nothing_about_a_witness_signs_nothing() {
     );
 
     // The operator's recorded decision to do without, and the signature it then allows.
-    silent.waive_generation("no hypervisor snapshots on this host: recorded by the operator");
+    silent
+        .waive_generation("no hypervisor snapshots on this host: recorded by the operator")
+        .unwrap();
     assert_eq!(
         silent.generation_waiver(),
         Some("no hypervisor snapshots on this host: recorded by the operator")
@@ -2299,7 +2303,9 @@ fn a_witness_that_moves_between_candidate_signatures_costs_the_quorum_that_voter
         rules(),
     )
     .unwrap();
-    restarted.waive_generation("restart of the quarantined replica, for this check only");
+    restarted
+        .waive_generation("restart of the quarantined replica, for this check only")
+        .unwrap();
     assert_eq!(
         code(restarted.sign(&takeover(&q, R, 14, X, T1 + 1), &[], T1 + 1)),
         "ledger_unadmitted"
@@ -2342,4 +2348,151 @@ fn a_signature_costs_far_less_than_the_vote_deadline() {
         "the slowest of twenty signatures was {worst:?}, which is not comfortably inside the {deadline:?} vote control deadline"
     );
     println!("gate 2: slowest of twenty signatures {worst:?}, vote control deadline {deadline:?}");
+}
+
+/// Proves (the unanswered question reaches readmission too): a signer that has said nothing about a
+/// witness readmits nothing, not only signs nothing. The earlier suite proved the signing half and
+/// the docstring claimed both; a counter-review noticed that the readmission half was never
+/// exercised. It is the half that matters after a restore, when readmission is the only way back.
+#[test]
+fn a_signer_that_says_nothing_about_a_witness_readmits_nothing() {
+    let root = temp_root();
+    let dir = private_dir(root.path(), "a");
+    place_key(&dir, "replica-a", 1);
+    let silent = Signer::open(
+        &dir,
+        "replica-a",
+        HostIdentity::from_machine_id(HOST_A).unwrap(),
+        policy(ABC, 0),
+        rules(),
+    )
+    .unwrap();
+    silent.init(T0).unwrap();
+    empty_world(root.path(), &dir, T0);
+
+    let refused = readmit_with(&silent, vec![], &[], T1).unwrap_err();
+    assert_eq!(refused.code, ledger::GENERATION_WITNESS_ABSENT);
+    assert!(
+        !silent.load().unwrap().admitted,
+        "and the ledger stays unadmitted, which is the safe direction"
+    );
+
+    // The same signer, once the operator has recorded why it does without, readmits.
+    let mut spoken = Signer::open(
+        &dir,
+        "replica-a",
+        HostIdentity::from_machine_id(HOST_A).unwrap(),
+        policy(ABC, 0),
+        rules(),
+    )
+    .unwrap();
+    spoken
+        .waive_generation("bare-metal host, no hypervisor can snapshot it: recorded by the operator")
+        .unwrap();
+    readmit_with(&spoken, vec![], &[], T1).unwrap();
+    assert!(spoken.load().unwrap().admitted);
+}
+
+/// Proves (a waiver with no reason is not a waiver): the empty string is refused at the signer, not
+/// only at the tool that writes configurations. A counter-review pointed out that the tool's check
+/// was the only one, so a crate caller could waive with nothing at all.
+#[test]
+fn a_waiver_with_no_reason_is_refused() {
+    let root = temp_root();
+    let dir = private_dir(root.path(), "a");
+    place_key(&dir, "replica-a", 1);
+    let mut signer = Signer::open(
+        &dir,
+        "replica-a",
+        HostIdentity::from_machine_id(HOST_A).unwrap(),
+        policy(ABC, 0),
+        rules(),
+    )
+    .unwrap();
+    for empty in ["", "   ", "\n\t "] {
+        assert_eq!(
+            signer.waive_generation(empty).unwrap_err().code,
+            ledger::GENERATION_WITNESS_ABSENT
+        );
+    }
+    assert!(
+        signer.generation_waiver().is_none(),
+        "a refused waiver leaves the signer as it was: still saying nothing"
+    );
+    signer.waive_generation("a reason").unwrap();
+    assert_eq!(signer.generation_waiver(), Some("a reason"));
+}
+
+/// Proves (the witness is judged again, not once): a path is not a file. A witness swapped since it
+/// was accepted — a file replaced, a symlink flipped, a mount laid over it — is refused, because the
+/// check that accepted it was made once at startup and the guest has had the time since. Before
+/// this, the value of whatever now sat at that path was compared as though it were the witness.
+#[test]
+fn a_witness_swapped_since_it_was_accepted_is_refused() {
+    let root = temp_root();
+    let dir = private_dir(root.path(), "a");
+    let mut signer = admitted_a(root.path(), &dir);
+    let q = policy(ABC, 0);
+    let witness = root.path().join("generation");
+    let guarded = write_generation(&witness, 1);
+    place_generation_marker(&dir, "replica-a", &guarded);
+    signer.guard_generation(&guarded, T1).unwrap();
+    signer.watch_generation_unchecked(witness.clone(), &guarded);
+    signer.sign(&takeover(&q, R, 5, X, T1), &[], T1).unwrap();
+
+    // Another file, holding the very value that was guarded, put in its place.
+    let impostor = root.path().join("impostor");
+    fs::write(&impostor, fs::read(&witness).unwrap()).unwrap();
+    fs::rename(&impostor, &witness).unwrap();
+
+    assert_eq!(
+        code(signer.sign(&takeover(&q, R, 6, X, T1), &[], T1)),
+        ledger::GENERATION_WITNESS_UNTRUSTED,
+        "the same value from another file is not the witness that was accepted"
+    );
+    assert!(
+        signer.load().unwrap().admitted,
+        "a witness that was swapped says nothing about the generation, so it quarantines nothing"
+    );
+}
+
+/// Proves (the ordered adoption marks nothing on a path it refuses): the whole act — judge the path,
+/// read it, guard the ledger, watch it — refuses at the first step for a path that could never be a
+/// witness, and leaves no marker behind. The earlier suite called only the judging function and so
+/// proved the error code rather than the order; a counter-review said so.
+#[test]
+fn adopting_a_path_that_could_never_be_a_witness_marks_nothing() {
+    let root = temp_root();
+    let dir = private_dir(root.path(), "a");
+    // Deliberately not `admitted_a`, whose signer already waives: this suite is about a signer that
+    // has said nothing, so it opens its own after the ledger exists.
+    drop(admitted_a(root.path(), &dir));
+    let mut signer = Signer::open(
+        &dir,
+        "replica-a",
+        HostIdentity::from_machine_id(HOST_A).unwrap(),
+        policy(ABC, 0),
+        rules(),
+    )
+    .unwrap();
+    let marker = dir.join("replica-a.generation-id");
+
+    let ordinary = root.path().join("generation");
+    write_generation(&ordinary, 1);
+    assert_eq!(
+        code(signer.adopt_generation_witness(ordinary, T1)),
+        ledger::GENERATION_WITNESS_UNTRUSTED
+    );
+    assert_eq!(
+        code(signer.adopt_generation_witness(root.path().join("typo"), T1)),
+        ledger::GENERATION_WITNESS_UNTRUSTED
+    );
+    assert!(!marker.exists(), "no marker was written for either path");
+    assert!(signer.load().unwrap().admitted, "and nothing was quarantined");
+
+    // And the signer is still saying nothing: a refused adoption is not a waiver.
+    assert_eq!(
+        code(signer.sign(&takeover(&policy(ABC, 0), R, 5, X, T1), &[], T1)),
+        ledger::GENERATION_WITNESS_ABSENT
+    );
 }

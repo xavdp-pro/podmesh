@@ -273,9 +273,11 @@ impl Lab {
             // This fixture runs on the workstation, not in a guest, and its configuration below
             // sets `require_generation_id: false`. The signer says so, as the runtime would: a
             // signer that has said nothing about the witness signs nothing.
-            signer.waive_generation(
-                "end-to-end fixture on the workstation: no hypervisor generation witness, matching require_generation_id: false",
-            );
+            signer
+                .waive_generation(
+                    "end-to-end fixture on the workstation: no hypervisor generation witness, matching require_generation_id: false",
+                )
+                .unwrap();
             signer.init(now()).unwrap();
             // The real pre-start guard runs before a resident opens peer exchange. Establish its
             // witness before this fixture's operator readmission, as deployment must do.

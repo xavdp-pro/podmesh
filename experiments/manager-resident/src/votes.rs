@@ -437,24 +437,22 @@ impl VoteRuntime {
             // Whether the path could be a witness at all is settled before `guard_generation`,
             // which persists a marker and can mark the ledger unadmitted. A path that could never
             // be a witness must not be able to quarantine a ledger by being named.
-            match crate::ledger::trust_generation_witness(&path) {
-                Ok(()) => {
-                    let generation = generation_id_from(&path)?;
-                    signer.guard_generation(&generation, now())?;
-                    // The guard released the ledger's lock: the signer keeps the witness, and reads
-                    // it again under the lock before it releases a signature or admits the ledger.
-                    signer.watch_generation_unchecked(path, &generation);
-                }
-                Err(untrusted) => {
+            // One ordered act: the path is judged, read, guarded and watched, so that nothing
+            // durable is marked on the strength of a path that could never be a witness, and so
+            // that there is one order rather than one per caller.
+            match signer.adopt_generation_witness(path, now()) {
+                Ok(_) => {}
+                Err(refused) if refused.code == crate::ledger::GENERATION_WITNESS_UNTRUSTED => {
                     // A witness that proves nothing is the same position as no witness: it needs
-                    // the operator's recorded decision, and it marks nothing on the way there.
-                    let waiver = self.waiver(Some(&untrusted))?;
-                    signer.waive_generation(waiver);
+                    // the operator's recorded decision, and it marked nothing on the way there.
+                    let waiver = self.waiver(Some(&refused))?;
+                    signer.waive_generation(waiver)?;
                 }
+                Err(other) => return Err(other),
             }
         } else {
             let waiver = self.waiver(None)?;
-            signer.waive_generation(waiver);
+            signer.waive_generation(waiver)?;
         }
         Ok(signer)
     }
@@ -506,10 +504,18 @@ impl VoteRuntime {
         }
     }
 
-    /// The status's `votes` section: the ledger's state as a signer would find it, and the alerts.
+    /// The status's `votes` section: the ledger's state as a signer would find it, the alerts, and
+    /// whether this replica votes without a generation witness, on whose recorded reason.
     pub(crate) fn status(&self) -> Value {
         let alerts = self.alerts.lock().map(|a| a.clone()).unwrap_or_default();
-        let ledger = self.signer().and_then(|s| s.load());
+        let signer = self.signer();
+        // Whether this replica is defended against a snapshot rollback, and on whose recorded word
+        // if it is not. A waiver that no one can read is a waiver no one can withdraw.
+        let waiver = signer
+            .as_ref()
+            .ok()
+            .and_then(|s| s.generation_waiver().map(str::to_string));
+        let ledger = signer.and_then(|s| s.load());
         let (state, detail) = match &ledger {
             Ok(l) if l.admitted => ("admitted", None),
             Ok(_) => ("unadmitted", None),
@@ -536,6 +542,8 @@ impl VoteRuntime {
             "unadmitted_reason": ledger.as_ref().and_then(|l| l.unadmitted_reason.clone()),
             "admissions": ledger.as_ref().map(|l| l.admissions.len()),
             "alerts": alerts,
+            "generation_witness": if waiver.is_some() { "waived" } else { "watched" },
+            "generation_witness_waiver": waiver,
             "decides": self.config.decisions.as_ref().map(|d| d.resources.iter().map(|r| r.resource.clone()).collect::<Vec<_>>()),
             "voter": self.config.decisions.as_ref().map(|_| self.voter.lock().map(|v| json!(v.clone())).unwrap_or(Value::Null)),
             "operations": timings,
