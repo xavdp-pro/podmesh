@@ -2207,3 +2207,139 @@ fn a_path_that_could_never_be_a_witness_marks_nothing() {
         "and the ledger was not quarantined by the attempt"
     );
 }
+
+/// A replica of the quorum with its own directory, key, admitted ledger and its own live generation
+/// witness, as three guests of one hypervisor would each have. Returns the signer and its witness.
+fn watching_replica(root: &Path, key_id: &str, seed: u8) -> (Signer, std::path::PathBuf) {
+    let dir = private_dir(root, key_id);
+    place_key(&dir, key_id, seed);
+    let mut signer = Signer::open(
+        &dir,
+        key_id,
+        HostIdentity::from_machine_id(HOST_A).unwrap(),
+        policy(ABC, 0),
+        rules(),
+    )
+    .unwrap();
+    signer.init(T0).unwrap();
+    admit_by_hand(&signer);
+    let witness = root.join(format!("{key_id}.generation"));
+    let guarded = write_generation(&witness, seed);
+    place_generation_marker(&dir, key_id, &guarded);
+    signer.guard_generation(&guarded, T1).unwrap();
+    signer.watch_generation_unchecked(witness.clone(), &guarded);
+    (signer, witness)
+}
+
+/// Proves (MED-M5 gate 2, at the quorum): a witness that moves between candidate signatures costs
+/// the quorum exactly that voter, and nothing else. The two whose guests did not move still decide,
+/// because 2 of 3 is the threshold and the third is not needed; the one that moved releases nothing
+/// for the new epoch, is durably unadmitted and stays so across a restart; and its earlier vote, for
+/// the earlier epoch, cannot be made to stand for the new one. A quorum that loses a second voter
+/// this way decides nothing, which is the direction a rollback must push a cluster.
+///
+/// This is three signers on one workstation, not three guests: it proves the rule, not the field.
+#[test]
+fn a_witness_that_moves_between_candidate_signatures_costs_the_quorum_that_voter() {
+    let root = temp_root();
+    let q = policy(ABC, 0);
+    let (a, witness_a) = watching_replica(root.path(), "replica-a", 1);
+    let (b, _witness_b) = watching_replica(root.path(), "replica-b", 2);
+    let (c, witness_c) = watching_replica(root.path(), "replica-c", 3);
+
+    // Epoch 12: every guest is on the generation it was guarded on, and any two of the three decide.
+    let first = takeover(&q, R, 12, X, T1);
+    let (va, vb) = (
+        a.sign(&first, &[], T1).unwrap(),
+        b.sign(&first, &[], T1).unwrap(),
+    );
+    let certificate = vote::assemble(&q, &first, &[va.clone(), vb.clone()]).unwrap();
+    assert_eq!(
+        q.verify(&certificate, QUORUM_PROOF_KIND, TAKEOVER_FIELDS)
+            .unwrap(),
+        ["replica-a", "replica-b"]
+    );
+
+    // Between the candidate signatures, a's guest is resumed from a snapshot.
+    write_generation(&witness_a, 9);
+
+    let second = takeover(&q, R, 13, X, T1);
+    assert_eq!(
+        code(a.sign(&second, &[], T1)),
+        ledger::GENERATION_CHANGED,
+        "the voter whose guest moved releases nothing"
+    );
+    assert!(!a.load().unwrap().admitted, "and is quarantined, durably");
+
+    // The other two decide the new epoch without it: the quorum is two, not three.
+    let (vb2, vc2) = (
+        b.sign(&second, &[], T1).unwrap(),
+        c.sign(&second, &[], T1).unwrap(),
+    );
+    let second_certificate = vote::assemble(&q, &second, &[vb2, vc2]).unwrap();
+    assert_eq!(
+        q.verify(&second_certificate, QUORUM_PROOF_KIND, TAKEOVER_FIELDS)
+            .unwrap(),
+        ["replica-b", "replica-c"]
+    );
+
+    // a's earlier vote belongs to epoch 12 and cannot be counted for 13: assembly reads the payload
+    // each signature was made over, not the number of signatures collected.
+    assert!(
+        vote::assemble(&q, &second, &[va, vb]).is_err(),
+        "a vote for another payload is not a vote for this one"
+    );
+
+    // Nor does a come back by restarting: another signer on those files signs nothing either.
+    let mut restarted = Signer::open(
+        &private_dir(root.path(), "replica-a"),
+        "replica-a",
+        HostIdentity::from_machine_id(HOST_A).unwrap(),
+        policy(ABC, 0),
+        rules(),
+    )
+    .unwrap();
+    restarted.waive_generation("restart of the quarantined replica, for this check only");
+    assert_eq!(
+        code(restarted.sign(&takeover(&q, R, 14, X, T1 + 1), &[], T1 + 1)),
+        "ledger_unadmitted"
+    );
+
+    // A second guest resumed leaves one voter: below the threshold, nothing is decided.
+    write_generation(&witness_c, 9);
+    let third = takeover(&q, R, 15, X, T1);
+    assert_eq!(code(c.sign(&third, &[], T1)), ledger::GENERATION_CHANGED);
+    let vb3 = b.sign(&third, &[], T1).unwrap();
+    assert!(
+        vote::assemble(&q, &third, &[vb3]).is_err(),
+        "one voter of three decides nothing"
+    );
+}
+
+/// Proves (MED-M5 gate 2, the deadline): what the witness costs a signature is far below the vote
+/// control deadline the resident answers within. The two reads the signing path now makes are two
+/// opens of a small file under a lock already held; the measurement here is the whole `sign`, key
+/// and all. It is a floor, not a promise: a laboratory guest reading a `fw_cfg` item through a bind
+/// mount is slower than a workstation reading a local file, and the field measurement belongs to
+/// the campaign record, not to this suite.
+#[test]
+fn a_signature_costs_far_less_than_the_vote_deadline() {
+    let root = temp_root();
+    let q = policy(ABC, 0);
+    let (signer, _witness) = watching_replica(root.path(), "replica-a", 1);
+
+    let mut worst = std::time::Duration::ZERO;
+    for epoch in 12..32 {
+        let payload = takeover(&q, R, epoch, X, T1);
+        let started = std::time::Instant::now();
+        signer.sign(&payload, &[], T1).unwrap();
+        worst = worst.max(started.elapsed());
+    }
+
+    let deadline = crate::VOTE_CONTROL_DEADLINE;
+    assert!(
+        worst * 20 < deadline,
+        "the slowest of twenty signatures was {worst:?}, which is not comfortably inside the {deadline:?} vote control deadline"
+    );
+    println!("gate 2: slowest of twenty signatures {worst:?}, vote control deadline {deadline:?}");
+}
