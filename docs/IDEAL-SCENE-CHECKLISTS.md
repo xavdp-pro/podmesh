@@ -5,6 +5,9 @@ Status: checklists, 2026-09-17. Derive from [IDEAL-SCENE.md](IDEAL-SCENE.md) and
 second person can repeat), and an item that stops being true is no longer met. The maintainers keep the current status of
 each item with the laboratory's evidence.
 
+An item marked `[–]` has been **withdrawn by a recorded operator decision**, with its date and reason. It is neither met
+nor owed. It is struck through rather than deleted, so that what left the scope, and when, stays readable.
+
 ## A. The core invariants (checked in every campaign)
 
 - [ ] A1 A single-writer universe never ran in two places with two histories.
@@ -68,7 +71,9 @@ each item with the laboratory's evidence.
 - [ ] F5 Volumes and databases captured application-consistently.
 - [ ] F6 Backup Server outside the cluster: versioned, immutable, restore tested.
 - [ ] F7 Off-site copy (Rule 16 level 5) with deletion lock.
-- [ ] F8 Shared replicated storage (CephFS test bed): data not copied, storage-level fence verified.
+- [–] F8 ~~Shared replicated storage (CephFS test bed): data not copied, storage-level fence verified.~~
+  **Withdrawn 23 September 2026 by operator decision (no CephFS).** Not met, not pending: out of scope. `[–]` marks
+  an item withdrawn with provenance, which is not the same as one still owed.
 
 ## G. Topology certification (one campaign each, A1 to A6 included)
 
@@ -81,7 +86,9 @@ each item with the laboratory's evidence.
 - [ ] G4 **Three hosts**: D1 to D9 and E1 to E7.
 - [ ] G5 **Ten hosts enrolled at once**: enrollment, odd voter set across failure domains, rebalancing, one host lost,
   two hosts lost in different failure domains.
-- [ ] G6 **Shared storage**: failover without data copy; storage-level fence; storage outage behaviour stated.
+- [–] G6 ~~**Shared storage**: failover without data copy; storage-level fence; storage outage behaviour stated.~~
+  **Withdrawn 23 September 2026 by operator decision (no CephFS).** No topology campaign certifies shared
+  replicated storage; the guarantee statement says so rather than staying silent.
 
 ## H. Adding and removing hosts (the tandem's experience)
 
