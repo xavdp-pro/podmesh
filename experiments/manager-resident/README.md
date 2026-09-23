@@ -479,19 +479,42 @@ kernel, even when the restored store contains no later vote to trip the ordinary
 marks on an ordinary reboot: the local files cannot prove that the reboot was not a restore, so
 operator readmission is required again. A process restart within the same boot retains admission.
 
-For a VM host that exposes a generation identifier outside the guest snapshot, set
-`votes.require_generation_id` and mount that live identifier read-only at the path in
-`PODMESH_MANAGER_GENERATION_ID_FILE`. The resident accepts either a 16-byte identifier or QEMU's
-4096-byte `etc/vmgenid_guid` fw_cfg item (the 16-byte value at offset 40). It keeps a separate
-private `<key_id>.generation-id` marker and checks it before every ledger operation. The signer
-also re-reads the live witness under the ledger lock immediately before sealing a signature; the
-readmission path re-reads it before admitting the ledger. Missing or unreadable evidence refuses
-voting. A changed value marks the ledger unadmitted before the marker advances, including when it
-changes after the first guard but before signature release. The med-pmox campaign requires this
-mode. The guest boot guard remains in place as a second signal. There is still a gap between the
-last witness read and the signature reaching a caller. A memory snapshot resumed during an
-already running signing operation has not been adversarially qualified, so this does not alone
-authorize that restore mode for a voting VM.
+For a VM host that exposes a generation identifier outside the guest snapshot, mount that live
+identifier read-only at the path in `PODMESH_MANAGER_GENERATION_ID_FILE`. The resident accepts
+either a 16-byte identifier or QEMU's 4096-byte `etc/vmgenid_guid` fw_cfg item (the 16-byte value at
+offset 40). It keeps a separate private `<key_id>.generation-id` marker and checks it before every
+ledger operation.
+
+`votes.require_generation_id` is **true unless the configuration says otherwise**. A configuration
+that never mentions the witness therefore requires one, and a replica started without its mount
+refuses to vote instead of voting undefended. Setting it false is the operator's recorded decision
+to sign without the defence: the signer then carries a named waiver, which `status` reports for as
+long as it holds. A signer that has been told neither — no witness watched, no waiver recorded —
+refuses to sign and refuses to readmit, naming `generation_witness_absent`. Silence is not a waiver.
+
+The witness is only worth re-reading if it lives outside the guest's snapshot, so the resident
+checks the filesystem it is on and accepts only sysfs, where the platform exposes `fw_cfg` items; a
+bind mount of such a file into a universe keeps that filesystem and still qualifies. A witness on an
+ordinary filesystem is refused with `generation_witness_untrusted`: a rollback that restores the
+guest's memory restores its page cache with it, so that file would answer with the value it held
+before the rollback and reading it again would prove nothing. Where `require_generation_id` is
+false, such a witness is recorded as the waiver it is rather than watched as a protection it cannot
+give. Each read also asks the kernel to drop what it caches for the file first.
+
+The signer reads the witness **twice** under the ledger lock. The first read is the last moment at
+which the ledger is still exactly what was loaded, so a witness that had already moved refuses
+before anything durable changes and leaves no promise pinning that resource's number. The second is
+the last act before the seal, because the ledger was written between the two. The readmission path
+re-reads it before admitting the ledger. Missing or unreadable evidence refuses voting. A changed
+value marks the ledger unadmitted before the marker advances, including when it changes after the
+first guard but before signature release; a promise already made stays, which is the direction a
+crash in the same place already leaves and the one that never forgets a vote that did go out.
+
+The guest boot guard remains in place as a second signal. There is still a gap between the last
+witness read and the signature reaching a caller: a signature already released and then rolled back
+out of the ledger's knowledge cannot be recalled by any check inside the guest. A memory snapshot
+resumed during an already running signing operation has not been adversarially qualified, so none
+of this alone authorizes that restore mode for a voting VM.
 
 Without this hypervisor witness, the guard cannot detect a snapshot resumed with its old kernel
 memory, or an in-place rollback of the vote directory during the same boot. Those require an

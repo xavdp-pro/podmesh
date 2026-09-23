@@ -101,9 +101,11 @@ pub struct VoteConfiguration {
     pub operator_uid: u32,
     /// The longest life a vote gives a certificate, in seconds; readmission waits it out.
     pub max_certificate_life_seconds: i64,
-    /// Require a live hypervisor generation witness before any vote or readmission. The med-pmox
-    /// campaign enables this because its VM snapshots may include kernel memory.
-    #[serde(default, skip_serializing_if = "is_false")]
+    /// Require a live hypervisor generation witness before any vote or readmission. True unless
+    /// the configuration says otherwise, because a guest whose hypervisor can snapshot it cannot
+    /// otherwise tell that it went back in time. Setting it false is the operator's recorded
+    /// decision to sign without that defence; the signer then carries the waiver and shows it.
+    #[serde(default = "require_generation_id_default")]
     pub require_generation_id: bool,
     /// The replicas' decisions (V3-5): which resources this replica decides and how often its voter
     /// reads the store. Absent, the replica proposes nothing, votes only through `vote_sign`, and
@@ -112,8 +114,8 @@ pub struct VoteConfiguration {
     pub decisions: Option<DecisionConfiguration>,
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
+fn require_generation_id_default() -> bool {
+    true
 }
 
 /// Read a bounded live hypervisor witness. QEMU's fw_cfg item is 4096 bytes with the VM
@@ -123,7 +125,12 @@ pub(crate) fn generation_id_from(
 ) -> std::result::Result<String, LedgerRefusal> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)
-        .and_then(|file| file.take(4097).read_to_end(&mut bytes))
+        .and_then(|mut file| {
+            // Best effort: the witness may be on a filesystem that caches nothing, and the call
+            // may be refused. Neither is a reason to fail, but a cache that can be dropped is.
+            let _ = rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed);
+            file.by_ref().take(4097).read_to_end(&mut bytes)
+        })
         .map_err(|e| crate::ledger::refusal("generation_identity_unreadable", e.to_string()))?;
     let generation = match bytes.len() {
         16 => bytes.as_slice(),
@@ -426,11 +433,28 @@ impl VoteRuntime {
             signer.guard_generation(&generation, now())?;
             // The guard released the ledger's lock: the signer keeps the witness, and reads it
             // again under the lock before it releases a signature or admits the ledger.
-            signer.watch_generation(path, &generation);
+            match signer.watch_generation(path, &generation) {
+                Ok(()) => {}
+                Err(untrusted) if !self.config.require_generation_id => {
+                    // The operator chose to sign without the defence; a witness that proves nothing
+                    // is that same choice, so it is recorded as the waiver it is rather than
+                    // watched as a protection it cannot give.
+                    signer.waive_generation(format!(
+                        "require_generation_id is false and the witness offered is not one the hypervisor answers for ({}): {}",
+                        untrusted.code, untrusted.detail
+                    ));
+                }
+                Err(untrusted) => return Err(untrusted),
+            }
         } else if self.config.require_generation_id {
             return Err(crate::ledger::refusal(
                 "generation_identity_unreadable",
                 "this vote configuration requires a mounted hypervisor generation witness",
+            ));
+        } else {
+            signer.waive_generation(format!(
+                "no hypervisor generation witness is mounted and require_generation_id is false: this replica cannot tell that its guest went back to an earlier generation, and a snapshot rollback of it would go unseen. Mount a witness and set the flag, or keep {} out of reach of snapshots",
+                self.config.key_id
             ));
         }
         Ok(signer)

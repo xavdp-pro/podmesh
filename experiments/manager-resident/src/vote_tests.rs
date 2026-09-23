@@ -77,14 +77,19 @@ fn temp_root() -> tempfile::TempDir {
 }
 
 fn open(dir: &Path, key_id: &str, host: &str, policy: Quorum) -> Signer {
-    Signer::open(
+    let mut signer = Signer::open(
         dir,
         key_id,
         HostIdentity::from_machine_id(host).unwrap(),
         policy,
         rules(),
     )
-    .unwrap()
+    .unwrap();
+    // These suites test what the ledger and the policy decide, not the hypervisor witness. A signer
+    // that says nothing about the witness now refuses to sign, so each one says here, once, that it
+    // is deliberately doing without. The suites that do test the witness watch one instead.
+    signer.waive_generation("test signer: these suites do not exercise the generation witness");
+    signer
 }
 
 fn signer_a(dir: &Path) -> Signer {
@@ -484,7 +489,7 @@ fn child_signs_one_vote() {
         let path = PathBuf::from(path);
         let generation = crate::votes::generation_id_from(&path).unwrap();
         signer.guard_generation(&generation, now).unwrap();
-        signer.watch_generation(path, &generation);
+        signer.watch_generation_unchecked(path, &generation);
     }
     let result = signer.sign(&spec["payload"], &[], now);
     fs::write(
@@ -711,7 +716,7 @@ fn a_generation_that_moves_after_the_guard_releases_no_signature() {
     let guarded = write_generation(&witness, 1);
     place_generation_marker(&dir, "replica-a", &guarded);
     signer.guard_generation(&guarded, T1).unwrap();
-    signer.watch_generation(witness.clone(), &guarded);
+    signer.watch_generation_unchecked(witness.clone(), &guarded);
     // On the generation guarded, the vote is signed as before.
     signer.sign(&takeover(&q, R, 5, X, T1), &[], T1).unwrap();
 
@@ -741,7 +746,7 @@ fn a_generation_that_moves_after_the_guard_releases_no_signature() {
     let guarded = write_generation(&witness, 3);
     place_generation_marker(&second, "replica-a", &guarded);
     other.guard_generation(&guarded, T1).unwrap();
-    other.watch_generation(witness.clone(), &guarded);
+    other.watch_generation_unchecked(witness.clone(), &guarded);
     fs::remove_file(&witness).unwrap();
     assert_eq!(
         code(other.sign(&takeover(&q, R, 5, X, T1), &[], T1)),
@@ -814,7 +819,7 @@ fn a_generation_that_moves_before_an_admission_admits_nothing() {
     let guarded = write_generation(&witness, 1);
     place_generation_marker(&dir, "replica-a", &guarded);
     signer.guard_generation(&guarded, T1).unwrap();
-    signer.watch_generation(witness.clone(), &guarded);
+    signer.watch_generation_unchecked(witness.clone(), &guarded);
 
     write_generation(&witness, 2);
     assert_eq!(
@@ -1987,4 +1992,124 @@ fn a_replaced_lock_file_lets_no_second_signer_in() {
             "round {round}"
         );
     }
+}
+
+/// Proves (the unanswered question): a signer that has said nothing about a hypervisor generation
+/// witness signs nothing and readmits nothing. Before this, the absence of a witness was silently
+/// the same as a witness that agreed, so one replica started without its mount voted with no
+/// defence against a snapshot rollback and nothing anywhere said so. Silence is not a waiver; the
+/// operator's decision to do without is recorded on the signer and can then be read back.
+#[test]
+fn a_signer_that_says_nothing_about_a_witness_signs_nothing() {
+    let root = temp_root();
+    let dir = private_dir(root.path(), "a");
+    // `admitted_a` leaves an admitted ledger on these files, and waives on its own signer.
+    let _prepared = admitted_a(root.path(), &dir);
+    let q = policy(ABC, 0);
+
+    // A second signer on the same files that was never told anything about a witness.
+    let mut silent = Signer::open(
+        &dir,
+        "replica-a",
+        HostIdentity::from_machine_id(HOST_A).unwrap(),
+        policy(ABC, 0),
+        rules(),
+    )
+    .unwrap();
+    assert_eq!(
+        code(silent.sign(&takeover(&q, R, 5, X, T1), &[], T1)),
+        ledger::GENERATION_WITNESS_ABSENT
+    );
+    assert!(
+        silent.load().unwrap().admitted,
+        "an unanswered question quarantines nothing: it is a configuration fault, not evidence that the guest went back"
+    );
+    assert!(
+        silent.generation_waiver().is_none(),
+        "nothing was waived, so nothing is reported as waived"
+    );
+
+    // The operator's recorded decision to do without, and the signature it then allows.
+    silent.waive_generation("no hypervisor snapshots on this host: recorded by the operator");
+    assert_eq!(
+        silent.generation_waiver(),
+        Some("no hypervisor snapshots on this host: recorded by the operator")
+    );
+    silent.sign(&takeover(&q, R, 5, X, T1), &[], T1).unwrap();
+}
+
+/// Proves (the witness must be one the hypervisor answers for): a witness on an ordinary filesystem
+/// is refused. A rollback that restores the guest's memory restores its page cache with it, so such
+/// a file answers with the value it held before the rollback and reading it again proves nothing.
+/// Only a filesystem the hypervisor itself answers for -- sysfs, where the platform exposes QEMU's
+/// `fw_cfg` items, including through a bind mount of one into a universe -- is accepted.
+#[test]
+fn a_witness_the_hypervisor_does_not_answer_for_is_refused() {
+    let root = temp_root();
+    let dir = private_dir(root.path(), "a");
+    let mut signer = admitted_a(root.path(), &dir);
+    let witness = root.path().join("generation");
+    let guarded = write_generation(&witness, 1);
+
+    let refused = signer
+        .watch_generation(witness.clone(), &guarded)
+        .unwrap_err();
+    assert_eq!(refused.code, ledger::GENERATION_WITNESS_UNTRUSTED);
+    assert!(
+        refused.detail.contains("page cache"),
+        "the refusal says why an ordinary file cannot be the witness: {}",
+        refused.detail
+    );
+
+    let absent = signer
+        .watch_generation(root.path().join("no-such-witness"), &guarded)
+        .unwrap_err();
+    assert_eq!(absent.code, ledger::GENERATION_WITNESS_UNTRUSTED);
+
+    // A file the kernel answers for is accepted. Any sysfs path proves the filesystem test; the
+    // deployed witness is QEMU's `fw_cfg` item, which lives on the same filesystem.
+    let sysfs = std::path::Path::new("/sys/devices/system/cpu/online");
+    if sysfs.exists() {
+        signer
+            .watch_generation(sysfs.to_path_buf(), &guarded)
+            .expect("sysfs is a filesystem the hypervisor answers for");
+    }
+}
+
+/// Proves (nothing promised for a vote that was refused outright): when the witness has already
+/// moved by the time a signature is asked for, the refusal comes before the ledger is written, so
+/// no promise is left pinning that resource's number. Before this, the witness was read only after
+/// the promise had been stored, and a refusal left the ledger holding a number against every other
+/// holder while no vote had been released for it.
+#[test]
+fn a_witness_that_already_moved_leaves_no_promise_behind() {
+    let root = temp_root();
+    let dir = private_dir(root.path(), "a");
+    let mut signer = admitted_a(root.path(), &dir);
+    let q = policy(ABC, 0);
+    let witness = root.path().join("generation");
+    let guarded = write_generation(&witness, 1);
+    place_generation_marker(&dir, "replica-a", &guarded);
+    signer.guard_generation(&guarded, T1).unwrap();
+    signer.watch_generation_unchecked(witness.clone(), &guarded);
+    signer.sign(&takeover(&q, R, 5, X, T1), &[], T1).unwrap();
+    let settled = signer.load().unwrap();
+
+    // The guest went back before the next signature was even asked for.
+    write_generation(&witness, 2);
+    assert_eq!(
+        code(signer.sign(&takeover(&q, R, 6, X, T1), &[], T1)),
+        ledger::GENERATION_CHANGED
+    );
+
+    let after = signer.load().unwrap();
+    assert!(!after.admitted, "the ledger is quarantined, durably");
+    assert_eq!(
+        after.sequence, settled.sequence,
+        "the refused signature issued no sequence number"
+    );
+    assert_eq!(
+        after.resources, settled.resources,
+        "and promised nothing: epoch 6 is still free for whoever the operator readmits this replica to serve"
+    );
 }

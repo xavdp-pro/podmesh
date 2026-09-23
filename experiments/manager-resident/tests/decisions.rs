@@ -259,7 +259,7 @@ impl Lab {
             fs::write(&key, format!("{}\n", quorum::hex(&[KEYS[i].1; 32]))).unwrap();
             fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
             // The ledger, created and admitted by the library's readmission with a clock past its wait.
-            let signer = Signer::open(
+            let mut signer = Signer::open(
                 &vote_dir,
                 KEYS[i].0,
                 HostIdentity::from_machine_id(HOSTS[i]).unwrap(),
@@ -270,6 +270,12 @@ impl Lab {
                 },
             )
             .unwrap();
+            // This fixture runs on the workstation, not in a guest, and its configuration below
+            // sets `require_generation_id: false`. The signer says so, as the runtime would: a
+            // signer that has said nothing about the witness signs nothing.
+            signer.waive_generation(
+                "end-to-end fixture on the workstation: no hypervisor generation witness, matching require_generation_id: false",
+            );
             signer.init(now()).unwrap();
             // The real pre-start guard runs before a resident opens peer exchange. Establish its
             // witness before this fixture's operator readmission, as deployment must do.

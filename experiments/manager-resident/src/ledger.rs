@@ -95,6 +95,20 @@ pub(crate) fn refusal(code: &'static str, detail: impl Into<String>) -> LedgerRe
 /// guest moved to another generation under a signature or an admission.
 pub const GENERATION_CHANGED: &str = "generation_changed";
 
+/// The code a signer raises when nothing has said whether it has a generation witness. Silence is
+/// not a waiver: a replica that may sign either watches a witness, or carries the operator's
+/// recorded decision to do without one. It never signs because no one mentioned the subject.
+pub const GENERATION_WITNESS_ABSENT: &str = "generation_witness_absent";
+
+/// The code a signer raises when the witness it was offered does not live outside the guest's
+/// snapshot. A file on an ordinary filesystem goes back with the guest, and so does the page cache
+/// that served its last read, so reading it again proves nothing about the generation.
+pub const GENERATION_WITNESS_UNTRUSTED: &str = "generation_witness_untrusted";
+
+/// `sysfs`, where the platform exposes QEMU's `fw_cfg` items. The hypervisor answers each read, and
+/// a bind mount of such a file keeps its filesystem, so a mount into a universe still qualifies.
+const SYSFS_MAGIC: rustix::fs::FsWord = 0x6265_6572;
+
 /// The codes that mark the ledger unadmitted while it is signing: the tripwire's, and the watched
 /// generation witness's. Each one is also an alert, named on standard error by the resident.
 pub const TRIPWIRE_CODES: &[&str] = &[
@@ -389,6 +403,18 @@ struct WatchedGeneration {
     observed: String,
 }
 
+/// What a signer knows about its hypervisor generation witness.
+enum GenerationWatch {
+    /// Nothing has been said yet. A signer left in this state refuses to sign and refuses to
+    /// readmit: an unanswered question is not an answer.
+    Unset,
+    /// The witness the host provides, and the value `guard_generation` accepted from it.
+    Watched(WatchedGeneration),
+    /// The operator's recorded decision to sign without a witness, and the reason given. The
+    /// replica then has no defence against a snapshot rollback, and says so in its status.
+    Waived(String),
+}
+
 /// The replica's signer: its key, its ledger, its host, the policy it votes under, and the live
 /// generation witness it watches, if its host provides one.
 pub struct Signer {
@@ -399,7 +425,7 @@ pub struct Signer {
     host: HostIdentity,
     policy: Quorum,
     rules: SigningRules,
-    generation: Option<WatchedGeneration>,
+    generation: GenerationWatch,
 }
 
 /// The lock on a ledger, released when dropped.
@@ -525,7 +551,7 @@ impl Signer {
             host,
             policy,
             rules,
-            generation: None,
+            generation: GenerationWatch::Unset,
         })
     }
 
@@ -843,25 +869,77 @@ impl Signer {
 
     /// Watches the live generation witness at `path`, whose value `guard_generation` has just
     /// accepted, for the rest of this signer's life: `sign` reads the file again under the signing
-    /// lock, immediately before a vote is sealed, and readmission before it admits.
-    pub fn watch_generation(&mut self, path: PathBuf, observed: &str) {
-        self.generation = Some(WatchedGeneration {
+    /// lock, before it mutates the ledger and again immediately before a vote is sealed, and
+    /// readmission before it admits.
+    ///
+    /// The witness is only worth reading again if it lives outside the guest's snapshot, so this
+    /// checks the filesystem it is on before accepting it. A rollback that restores the guest's
+    /// memory restores its page cache too; a witness on an ordinary filesystem would then answer
+    /// with the value it held before the rollback, and the second read would prove nothing.
+    ///
+    /// # Errors
+    /// `generation_witness_untrusted`: the witness is not on a filesystem the hypervisor answers
+    /// for. Use `waive_generation` instead if the operator decides to sign without the defence.
+    pub fn watch_generation(&mut self, path: PathBuf, observed: &str) -> Result<(), LedgerRefusal> {
+        let filesystem = rustix::fs::statfs(&path)
+            .map_err(|e| refusal(GENERATION_WITNESS_UNTRUSTED, e.to_string()))?;
+        if filesystem.f_type != SYSFS_MAGIC {
+            return Err(refusal(
+                GENERATION_WITNESS_UNTRUSTED,
+                format!(
+                    "the witness at {} is on filesystem type {:#x}, not the sysfs the hypervisor answers for ({SYSFS_MAGIC:#x}): a rollback would restore this file and the page cache that last read it, so reading it again would show the generation the guest went back to",
+                    path.display(),
+                    filesystem.f_type
+                ),
+            ));
+        }
+        self.watch_generation_unchecked(path, observed);
+        Ok(())
+    }
+
+    /// Watches a witness without checking the filesystem it is on. The laboratory's suites use it
+    /// against ordinary files; a replica that may sign uses `watch_generation`, which refuses one.
+    pub(crate) fn watch_generation_unchecked(&mut self, path: PathBuf, observed: &str) {
+        self.generation = GenerationWatch::Watched(WatchedGeneration {
             path,
             observed: observed.to_string(),
         });
     }
 
-    /// Reads the watched generation witness again, if this signer watches one. The hypervisor holds
-    /// it outside the guest's snapshot: a guest that went back to another generation since the
-    /// guard, taking this process's memory and its files with it, reads another value here.
+    /// Records the operator's decision to sign with no generation witness, and why. The signer then
+    /// signs, and every rollback this check would have caught passes unseen: the decision is the
+    /// operator's, it is named, and `status` shows it for as long as it holds.
+    pub fn waive_generation(&mut self, reason: impl Into<String>) {
+        self.generation = GenerationWatch::Waived(reason.into());
+    }
+
+    /// The reason a witness was waived, if one was.
+    pub fn generation_waiver(&self) -> Option<&str> {
+        match &self.generation {
+            GenerationWatch::Waived(reason) => Some(reason.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Reads the watched generation witness again. The hypervisor holds it outside the guest's
+    /// snapshot: a guest that went back to another generation since the guard, taking this
+    /// process's memory and its files with it, reads another value here.
     ///
     /// # Errors
     /// `generation_changed`: the witness no longer holds the value guarded; the caller releases
     /// nothing and the ledger is quarantined. `generation_identity_unreadable`: the witness cannot
     /// be read now, so nothing shows the generation did not change, and the caller fails closed.
+    /// `generation_witness_absent`: nothing has said whether this signer has a witness at all.
     pub(crate) fn check_generation(&self) -> Result<(), LedgerRefusal> {
-        let Some(watched) = &self.generation else {
-            return Ok(());
+        let watched = match &self.generation {
+            GenerationWatch::Watched(watched) => watched,
+            GenerationWatch::Waived(_) => return Ok(()),
+            GenerationWatch::Unset => {
+                return Err(refusal(
+                    GENERATION_WITNESS_ABSENT,
+                    "no hypervisor generation witness was watched and none was waived: this signer cannot tell whether its guest went back to an earlier generation, and it signs nothing until one or the other is recorded",
+                ))
+            }
         };
         let observed = crate::votes::generation_id_from(&watched.path)?;
         if observed == watched.observed {
@@ -874,6 +952,29 @@ impl Signer {
                 watched.observed
             ),
         ))
+    }
+
+    /// Reads the watched witness and, when it says the guest moved, marks the ledger unadmitted
+    /// durably before refusing. A witness that is absent, untrusted or unreadable refuses without
+    /// quarantining: those say the check could not be made, not that a rollback happened.
+    fn guard_generation_or_quarantine(
+        &self,
+        ledger: &mut Ledger,
+        now: i64,
+    ) -> Result<(), LedgerRefusal> {
+        let Err(alarm) = self.check_generation() else {
+            return Ok(());
+        };
+        if alarm.code == GENERATION_CHANGED {
+            ledger.admitted = false;
+            ledger.unadmitted_since = Some(now);
+            ledger.unadmitted_reason = Some(format!(
+                "generation witness ({}): {}; it signs nothing until the operator readmits it",
+                alarm.code, alarm.detail
+            ));
+            self.store(ledger)?;
+        }
+        Err(alarm)
     }
 
     /// The tripwire: a vote of this key, among those shown, that the ledger cannot account for.
@@ -981,6 +1082,13 @@ impl Signer {
                 format!("a replica votes only for a change away from its own authority set, at serial {}", self.policy.serial),
             ));
         }
+        // The witness is read twice. This first read is the last moment at which the ledger is
+        // still exactly what was loaded: `guard_generation` ran before this lock was taken, and a
+        // snapshot resume since would have taken this process, the ledger and the marker back with
+        // it, so only the hypervisor's own witness still says so. Refusing here leaves no promise
+        // behind for a vote that was never released -- a promise the ledger would otherwise hold
+        // against a different holder at the same number, for nothing.
+        self.guard_generation_or_quarantine(&mut ledger, now)?;
         point("after_check");
         let resource = ledger
             .resources
@@ -1058,23 +1166,13 @@ impl Signer {
         }
         ledger.sequence = sequence;
         self.store(&mut ledger)?;
-        // The last check before a signature of this key exists. `guard_generation` ran before this
-        // lock was taken; a snapshot resume since would have taken this process, the ledger and the
-        // marker back with it, and only the hypervisor's own witness still says so. A changed
-        // witness marks the ledger unadmitted, durably, and nothing is released; a witness that
-        // cannot be read proves nothing either, so nothing is released then either.
-        if let Err(alarm) = self.check_generation() {
-            if alarm.code == GENERATION_CHANGED {
-                ledger.admitted = false;
-                ledger.unadmitted_since = Some(now);
-                ledger.unadmitted_reason = Some(format!(
-                    "generation witness ({}): {}; it signs nothing until the operator readmits it",
-                    alarm.code, alarm.detail
-                ));
-                self.store(&mut ledger)?;
-            }
-            return Err(alarm);
-        }
+        // And again, as the last act before a signature of this key exists, because the ledger was
+        // written since the first read and a resume between the two would have taken that write
+        // back with it. A changed witness marks the ledger unadmitted, durably, and nothing is
+        // released; a witness that cannot be read proves nothing either, so nothing is released
+        // then either. The promise stays: an over-promise is the direction a crash here already
+        // leaves, and it is the one that never forgets a vote that did go out.
+        self.guard_generation_or_quarantine(&mut ledger, now)?;
         let vote = vote::seal(
             &self.key,
             &self.key_id,
