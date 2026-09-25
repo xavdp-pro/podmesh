@@ -115,3 +115,16 @@ outside that the cgroups disappeared and the container is absent, a declared dis
 tolerance, and an incomplete-reclaim outcome for any residual process. Who may request
 such an action remains an open product policy; a local root socket is not a delegated
 authority model.
+
+## Storage engine direction (2026-09-25)
+
+Node local state (`state.sqlite`) and manager replica history (`manager.sqlite`) are
+scheduled to move to **isolated MariaDB instances per functional role**, with SQLite
+remaining a dev/lab fallback until deprecation. This is a durability and backup
+harmonization track, not field qualification.
+
+- Plan: [STORAGE-MARIADB-MIGRATION-PLAN.md](STORAGE-MARIADB-MIGRATION-PLAN.md)
+- Phase 0 decisions: private lab record
+  `podmesh-lab/records/storage-mariadb-2026-09-25/README.md`
+- Implementation branch: `codex/v3-5-med-integrated` (or successor). No MED-M5 or gate
+  closure until Phase 6 prerequisites in the plan.
