@@ -164,6 +164,12 @@ class Lab:
                           "replica_keys": {f"r{j}": KEYS[j][0] for j in range(3)}, "nodes": [n["host"] for n in self.nodes],
                           "evidence_dir": str(view(str(self.root / f"evidence-{i}"))), "operator_uid": uid,
                           "max_certificate_life_seconds": LIFE,
+                          # Workstation e2e has no hypervisor fw_cfg; match unit tests (require false + named waiver).
+                          "require_generation_id": False,
+                          "generation_witness_waiver": (
+                              "end-to-end fixture on the workstation: no hypervisor generation witness, "
+                              "matching require_generation_id: false"
+                          ),
                           "decisions": {"voter_interval_ms": 300, "resources": [
                               {"resource": R, "lease_seconds": LEASE, "takeover_margin_seconds": MARGIN, "renewal_not_after": 0}]}},
             }
