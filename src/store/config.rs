@@ -351,3 +351,98 @@ fn integer(value: &Json, key: &str) -> Result<Option<i64>> {
         Some(_) => Err(Fault::Type.error(format!("{key} is a whole number"))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("podmesh-store-config-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_node_with_no_store_in_its_configuration_keeps_the_journal_it_has() {
+        let dir = Path::new("/var/lib/podmesh");
+        for document in [json!({}), json!({"store": null}), json!({"state_dir": "elsewhere"})] {
+            let config = StoreConfig::from_json(&document, Some(dir)).unwrap();
+            assert_eq!(config.engine, Engine::Sqlite);
+            assert_eq!(config.sqlite.path, dir.join("state.sqlite"));
+            assert!(config.sqlite.journal_wal);
+            assert_eq!(config.described(), "sqlite:/var/lib/podmesh/state.sqlite");
+        }
+    }
+
+    #[test]
+    fn a_store_profile_is_read_whole_and_an_unknown_engine_refused() {
+        let document = json!({"store": {
+            "engine": "mariadb",
+            "sqlite": {"path": "/var/lib/podmesh/state.sqlite", "busy_timeout_ms": 250, "journal_mode": "default"},
+            "mariadb": {"host": "192.0.2.10", "port": 3307, "user": "podmesh-node", "database": "podmesh-node",
+                        "password_file": "/apps/podmesh-node/etc/mysql/localhost/passwd",
+                        "connect_timeout_ms": 1500, "lock_wait_timeout_seconds": 3}
+        }});
+        let config = StoreConfig::from_json(&document, None).unwrap();
+        assert_eq!(config.engine, Engine::Mariadb);
+        assert_eq!(config.sqlite.busy_timeout, Duration::from_millis(250));
+        assert!(!config.sqlite.journal_wal);
+        assert_eq!(config.mariadb.port, 3307);
+        assert_eq!(config.mariadb.lock_wait_timeout, Duration::from_secs(3));
+        assert_eq!(config.described(), "mysql://podmesh-node@192.0.2.10:3307/podmesh-node");
+
+        let refused = StoreConfig::from_json(&json!({"store": {"engine": "postgres"}}), None).unwrap_err();
+        assert_eq!(refused.fault, Fault::Unsupported);
+        assert_eq!(StoreConfig::from_json(&json!({"store": {"engine": 1}}), None).unwrap_err().fault, Fault::Type);
+        assert_eq!(StoreConfig::from_json(&json!({"store": []}), None).unwrap_err().fault, Fault::Type);
+    }
+
+    #[test]
+    fn a_password_in_the_configuration_is_refused_outright() {
+        let document = json!({"store": {"engine": "mariadb", "mariadb": {"password": "written down"}}});
+        let refused = StoreConfig::from_json(&document, None).unwrap_err();
+        assert_eq!(refused.fault, Fault::Denied);
+        assert!(refused.message.contains("password_file"));
+    }
+
+    #[test]
+    fn a_password_file_is_read_only_when_its_owner_alone_can_read_it() {
+        let dir = scratch("password");
+        let path = dir.join("passwd");
+        fs::write(&path, "kept in the file\n").unwrap();
+        let config = MariadbConfig { password_file: Some(path.clone()), ..MariadbConfig::default() };
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            let refused = config.password().unwrap_err();
+            assert_eq!(refused.fault, Fault::Denied);
+            assert!(refused.message.contains("0600"));
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(config.password().unwrap().as_deref(), Some("kept in the file"));
+
+        // And what it builds carries the password, while what it says about itself does not.
+        let url = config.url().unwrap();
+        assert!(url.contains("kept%20in%20the%20file"));
+        assert_eq!(redact(&url), "mysql://podmesh-node:***@127.0.0.1:3306/podmesh-node");
+        assert!(!config.described().contains("kept"));
+        assert!(!format!("{config:?}").contains("kept"));
+
+        let absent = MariadbConfig::default();
+        assert_eq!(absent.password().unwrap(), None);
+        assert_eq!(absent.url().unwrap(), "mysql://podmesh-node@127.0.0.1:3306/podmesh-node");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_dsn_replaces_the_fields_and_is_never_printed_whole() {
+        let config = MariadbConfig::from_dsn("mysql://podmesh-node:held@127.0.0.1:33061/podmesh-node");
+        assert_eq!(config.url().unwrap(), "mysql://podmesh-node:held@127.0.0.1:33061/podmesh-node");
+        assert_eq!(config.described(), "mysql://podmesh-node:***@127.0.0.1:33061/podmesh-node");
+        assert_eq!(redact("not a url"), "not a url");
+    }
+}

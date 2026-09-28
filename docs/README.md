@@ -36,5 +36,8 @@ records, reviews and decisions in a private companion repository; nothing here d
 
 ## Engineering
 - [RUST-IMPLEMENTATION-PLAN.md](RUST-IMPLEMENTATION-PLAN.md) — the implementation plan.
+- [STORE-CONFIGURATION.md](STORE-CONFIGURATION.md) and
+  [STORAGE-MARIADB-MIGRATION-PLAN.md](STORAGE-MARIADB-MIGRATION-PLAN.md) — which engine carries a
+  node's journal, and the migration from the SQLite file to a MariaDB instance per functional role.
 - [ACCEPTANCE-TEST-PLAN.md](ACCEPTANCE-TEST-PLAN.md) — the acceptance gates and their required evidence.
 - [../AGENTS.md](../AGENTS.md) — what belongs in this repository, in the private companion, and in neither.

@@ -124,6 +124,15 @@ Update `docs/EXPERIMENTAL-SCOPE.md` with a short pointer to this plan.
 Exit: all existing unit/integration tests green on SQLite; MariaDB backend compiles
 and passes a **minimal** schema bootstrap test.
 
+**In the tree** (2026-09-28): `src/store/` carries the contract (`DurableStore`), the
+SQLite backend wrapping the existing `rusqlite` paths, and the MariaDB backend behind the
+Cargo feature `mariadb`, off by default. The configuration surface (`store.engine`), how to
+build with the feature and how to run the bootstrap test are in
+[STORE-CONFIGURATION.md](STORE-CONFIGURATION.md). No caller is moved: `open_state` still
+opens `state.sqlite` through `rusqlite`, and nothing reads `store.engine` yet. Point 5's CI
+matrix is not set up; the two suites are run by hand, the MariaDB one against a server named
+by `PODMESH_MARIADB_DSN`.
+
 ### Phase 2 — Node (`state.sqlite`) migration
 
 1. Move DDL from scattered `CREATE TABLE` in `src/*.rs` to **versioned migrations**
