@@ -154,6 +154,18 @@ by `PODMESH_MARIADB_DSN`.
 Exit: lab record with dump size, restore time, and full `tests/` delta green on
 MariaDB node store.
 
+**In the tree** (2026-09-28), points 1 to 3: the node's schema is one ordered set of migrations in
+`src/store/migrations/node/`, a file per engine, carrying all 38 production tables; `open_state`
+reads the store profile (`store.json` under the state directory, or `PODMESH_STORE_PROFILE`) and
+applies the set to whichever engine it names, recording the version in `store_schema`. An incomplete
+MariaDB profile is refused before anything opens, and a MariaDB profile never falls back to a file.
+`src/store/catalog.rs` answers what a store carries on both engines, so no caller reads
+`sqlite_master` on the migrated path; the two SQLite-only escapes that remain are named in
+[STORE-CONFIGURATION.md](STORE-CONFIGURATION.md). What is **not** done: the node's operations still
+take a `rusqlite::Connection`, so a node configured for MariaDB opens, migrates and then refuses to
+serve, by name. Point 4 (`podmesh-storage-migrate`) and point 5 (the backup script) are separate
+work; point 6 re-runs on MariaDB once the call sites are ported.
+
 ### Phase 3 — Manager (`manager.sqlite` / `manager-ha`) migration
 
 1. Port `experiments/manager-ha` durable layer to `podmesh-storage` (largest risk:

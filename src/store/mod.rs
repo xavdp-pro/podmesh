@@ -14,11 +14,14 @@
 //! [`mariadb::MariadbStore`] is the engine the plan moves to, built only when this crate is
 //! built with the `mariadb` feature.
 //!
-//! What this module does **not** do, on purpose: it changes no caller. `open_state` in
-//! `lib.rs` still opens `state.sqlite` through `rusqlite` exactly as before, every module still
-//! receives a `Connection`, and nothing in the node reads `store.engine` yet. Phase 2 of the
-//! plan moves the node's own schema and call sites here, one at a time, behind the versioned
-//! migrations it describes; this phase only proves that both engines answer the same contract.
+//! Phase 2 brought the node's **schema** here and left its **call sites** where they were.
+//! [`migrations`] carries every production table of the node journal as ordered SQL, one file per
+//! engine, and `open_state` applies them to whichever store the profile names: the journal exists
+//! in the same shape on both engines, at a version the store records. What still speaks SQLite is
+//! everything above the journal -- `handle` and the modules under it take a `rusqlite::Connection`
+//! -- so a node whose profile says `mariadb` opens, migrates, and is then refused by name rather
+//! than served from a file. [`catalog`] is where the last of the dialect went: a caller asks what
+//! the store carries instead of reading `sqlite_master`.
 //!
 //! Two conventions hold across engines, because the two dialects do not agree:
 //!
@@ -27,9 +30,9 @@
 //!   into the same five, so a caller written against one engine reads the same shapes on the
 //!   other. What a column may hold is the schema's business, not this layer's.
 //!
-//! DDL is not portable and this module does not pretend it is: the only schema it carries is
-//! its own bootstrap table, written once per engine in [`bootstrap`]. Phase 2 brings the node's
-//! tables as versioned migrations with the engine-specific sections the plan calls for.
+//! DDL is not portable and this module does not pretend it is: [`bootstrap`] writes its own
+//! schema table in each engine's dialect, and [`migrations`] carries the node's tables as one
+//! ordered set with a file per engine.
 pub mod catalog;
 pub mod config;
 #[cfg(feature = "mariadb")]

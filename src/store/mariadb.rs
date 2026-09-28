@@ -11,10 +11,11 @@
 //! is mapped to the same named faults SQLite's codes map to, so a caller written for one engine
 //! decides the same way on the other.
 //!
-//! This phase installs no node schema here. What it proves is the bootstrap of the plan: a store
-//! this backend opens can carry a table, write a row inside a transaction, read it back, list
-//! what it carries and check itself. Phase 2 brings the node's own tables as versioned
-//! migrations, and only then does a node write anything real to MariaDB.
+//! The node's own schema installs through this backend as of Phase 2: [`super::migrations`] has
+//! a MariaDB file for every migration, and `open_state` applies them when the profile names this
+//! engine. What a node does **not** yet do is read and write its journal here -- its operations
+//! still take a `rusqlite::Connection`, so a node configured for MariaDB migrates and is then
+//! refused by name.
 use super::config::{redact, Engine, MariadbConfig};
 use super::{DurableStore, Fault, Integrity, Result, Row, Transaction, Value};
 use mysql::prelude::Queryable;

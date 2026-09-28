@@ -3,11 +3,19 @@
 Status: Phase 2 preparation at `1bc73fc`. This inventories production
 `state.sqlite` DDL under `src/`; it is not a MariaDB qualification record.
 
+**All 38 tables below are now carried by the versioned migration set** in
+`src/store/migrations/node/`, in SQLite and MariaDB dialects, applied by
+`open_state` and recorded in `store_schema`. The table below still says which
+module owns each one and what made it a risk; the risks marked as
+introspection or dialect are answered in
+[STORE-CONFIGURATION.md](STORE-CONFIGURATION.md).
+
 ## Open path
 
 `src/lib.rs::open_state` is the only runtime open that owns and writes
-`state.sqlite`. It creates the state directory, opens
-`<state-dir>/state.sqlite`, enables WAL, and creates the base tables.
+`state.sqlite`. It reads the store profile, opens the store the profile names
+(`<state-dir>/state.sqlite` by default, with WAL), applies the node's
+migrations, and binds the journal to this machine.
 `src/bin/podmeshd.rs` calls it at daemon startup; `src/publisher.rs` also calls
 it for connector startup. The default state directory remains
 `/var/lib/podmesh`.
@@ -42,11 +50,21 @@ There are **38 unique production tables**.
 
 ## Cross-cutting risks
 
-- DDL is created lazily by module `ensure_schema` functions, without a schema
-  version table or one ordered migration set.
-- SQLite `INTEGER PRIMARY KEY`, partial indexes, `INSERT OR IGNORE` /
-  `INSERT OR REPLACE`, PRAGMA introspection, and `sqlite_master` queries require
-  explicit MariaDB equivalents.
+- ~~DDL is created lazily by module `ensure_schema` functions, without a schema
+  version table or one ordered migration set.~~ The set exists and records its
+  version; the modules keep their `ensure_schema` for journals written by older
+  packages, and two tests hold the two shapes in step.
+- ~~SQLite `INTEGER PRIMARY KEY`, partial indexes, PRAGMA introspection, and
+  `sqlite_master` queries require explicit MariaDB equivalents.~~ Each has one,
+  tabulated in [STORE-CONFIGURATION.md](STORE-CONFIGURATION.md); the partial
+  unique indexes on `network_allocations` become a virtual column under a plain
+  unique key, and introspection goes through `src/store/catalog.rs`.
+- **Still open**: `INSERT OR IGNORE` and `INSERT OR REPLACE` are in the module
+  statements, not in the DDL, so they are ported with their call sites. The
+  identity binding in `open_state` is the one that has been: it reads and then
+  writes inside a transaction, which is the same fact on both engines.
 - Timestamps and booleans are currently integer values; structured documents
-  and digests are mostly `TEXT`. Type changes must preserve existing comparison
-  and canonicalization behavior.
+  and digests are mostly `TEXT`. The migration set maps them to `BIGINT` and
+  `LONGTEXT`/`VARCHAR(n)` so that a caller reads back the same five storage
+  classes, but comparison and canonicalization are only proven per call site as
+  each one is ported.

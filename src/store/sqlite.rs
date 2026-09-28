@@ -5,9 +5,9 @@
 //! things the contract asks for and the bare connection does not give: faults named rather than
 //! error codes, and a wait before a busy store is reported busy.
 //!
-//! Nothing in the node opens its journal through this type yet. It exists so that the MariaDB
-//! backend has something to be compared against, statement for statement, before Phase 2 moves
-//! the node's own schema and call sites onto the contract.
+//! `open_state` opens the node's journal through this type and hands the connection back with
+//! [`SqliteStore::into_connection`]: the schema arrives as migrations through the contract, and
+//! the modules keep the `rusqlite::Connection` they have always been given, on the same file.
 use super::config::{Engine, SqliteConfig};
 use super::{DurableStore, Fault, Integrity, Result, Row, Transaction, Value};
 use rusqlite::{
