@@ -411,6 +411,13 @@ mod tests {
     use super::super::{bootstrap, schema_version, BOOTSTRAP_VERSION};
     use super::*;
 
+    /// One MariaDB test at a time: they all write into the one database the DSN names, and each
+    /// drops the tables it made. A poisoned lock is taken anyway -- the test that panicked has
+    /// already reported, and holding the rest back would report it again as a failure of theirs.
+    fn serialized() -> std::sync::MutexGuard<'static, ()> {
+        super::super::MARIADB_TEST_SERVER.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// The store the environment names, or none. A DSN that is set and does not open is a
     /// failure, not a skip: an operator who names a server is asking for it to be used.
     fn server() -> Option<MariadbStore> {
@@ -424,15 +431,19 @@ mod tests {
         }
     }
 
+    /// Take the server, then open it: `store_or_skip!(store)` declares the guard and the store,
+    /// and returns from the test when no server is named.
     macro_rules! store_or_skip {
-        () => {
-            match server() {
+        ($store:ident) => {
+            let _serialized = serialized();
+            #[allow(unused_mut)]
+            let mut $store = match server() {
                 Some(store) => store,
                 None => {
                     eprintln!("skipped: {DSN_ENVIRONMENT} names no MariaDB server");
                     return;
                 }
-            }
+            };
         };
     }
 
@@ -441,7 +452,7 @@ mod tests {
     /// and checks out. Nothing of the node's own schema is installed; that is Phase 2.
     #[test]
     fn a_mariadb_instance_carries_the_bootstrap_schema() {
-        let mut store = store_or_skip!();
+        store_or_skip!(store);
         assert_eq!(store.engine(), Engine::Mariadb);
         assert!(
             store.database().unwrap().is_some(),
@@ -486,7 +497,7 @@ mod tests {
 
     #[test]
     fn the_five_value_kinds_come_back_as_they_were_written() {
-        let mut store = store_or_skip!();
+        store_or_skip!(store);
         store
             .execute_batch(
                 "DROP TABLE IF EXISTS store_kinds; \
@@ -528,7 +539,7 @@ mod tests {
 
     #[test]
     fn a_transaction_that_is_dropped_leaves_nothing_behind() {
-        let mut store = store_or_skip!();
+        store_or_skip!(store);
         store
             .execute_batch(
                 "DROP TABLE IF EXISTS store_observations; \
@@ -579,6 +590,7 @@ mod tests {
     /// is the same retryable fault SQLite gives for a file another writer holds.
     #[test]
     fn a_row_another_transaction_holds_is_busy_not_failed() {
+        let _serialized = serialized();
         let Some(config) = MariadbConfig::from_environment() else {
             eprintln!("skipped: {DSN_ENVIRONMENT} names no MariaDB server");
             return;

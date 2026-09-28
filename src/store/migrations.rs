@@ -447,6 +447,98 @@ mod tests {
         assert_eq!(store.query("SELECT ip FROM network_allocations", &[]).unwrap().len(), 3);
     }
 
+    /// Phase 2's exit criterion for the other engine: the node's whole schema installs on a real
+    /// MariaDB instance, records its version, is not re-applied on the next open, and enforces the
+    /// live-allocation rule the SQLite partial indexes state -- through a virtual column here,
+    /// which is the one construct of the set the two dialects cannot share.
+    ///
+    /// It also asserts what Phase 1 put on the open path and Phase 2 must not have moved off it:
+    /// the store refused to open unless the server flushes its redo log on every commit.
+    ///
+    /// The instance is named by `PODMESH_MARIADB_DSN` and is written into: the test drops the
+    /// node's tables before and after. Point it at a store of its own, never at one a node uses.
+    #[cfg(feature = "mariadb")]
+    #[test]
+    fn a_mariadb_instance_carries_the_whole_node_schema() {
+        use super::super::{config::DSN_ENVIRONMENT, mariadb::MariadbStore, MariadbConfig};
+
+        let _serialized = super::super::MARIADB_TEST_SERVER.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(config) = MariadbConfig::from_environment() else {
+            eprintln!("skipped: {DSN_ENVIRONMENT} names no MariaDB server");
+            return;
+        };
+        config.validate().expect("the DSN names a database to migrate in");
+        let mut store = match MariadbStore::open(&config) {
+            Ok(store) => store,
+            Err(error) => panic!("{DSN_ENVIRONMENT} names {}, which did not open: {error}", config.described()),
+        };
+
+        // Phase 1's durability gate is still what let this open succeed.
+        let flush = store.query("SELECT @@GLOBAL.innodb_flush_log_at_trx_commit", &[]).unwrap();
+        assert_eq!(flush[0].value(0).unwrap().clone(), Value::Integer(1), "the open gate let a non-flushing server through");
+
+        let drop_everything = |store: &mut MariadbStore| {
+            for table in INVENTORY.iter().chain([super::super::SCHEMA_TABLE].iter()) {
+                store.execute_batch(&format!("DROP TABLE IF EXISTS `{table}`;")).unwrap();
+            }
+        };
+        drop_everything(&mut store);
+
+        let applied = apply(&mut store).unwrap();
+        assert_eq!((applied.from, applied.to), (0, node_version()));
+        assert_eq!(applied.ran.len(), NODE_MIGRATIONS.len());
+        let mut carried = store.tables().unwrap();
+        carried.retain(|table| table != super::super::SCHEMA_TABLE);
+        // Sorted here rather than taken as the store returned it: `ORDER BY` follows the server's
+        // collation, and where an underscore falls against a letter is not the same on the two
+        // engines. What the migration set promises is the same tables, not the same order.
+        carried.sort();
+        assert_eq!(carried, INVENTORY, "the instance carries the node's tables and nothing else");
+        assert_eq!(schema_version(&mut store, NODE).unwrap(), Some(node_version()));
+
+        // A node's own statements read the same on this engine: the reserved names are quoted the
+        // one way both engines accept, and a row written in a transaction is read back after it.
+        let mut tx = store.transaction().unwrap();
+        tx.execute("INSERT INTO metadata(`key`, value) VALUES(?, ?)", &[Value::from("host_uuid"), Value::from("9c1b")]).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(store.query("SELECT value FROM metadata", &[]).unwrap()[0].text(0).unwrap(), "9c1b");
+
+        let again = apply(&mut store).unwrap();
+        assert!(again.ran.is_empty(), "a second open applies nothing");
+        assert_eq!(store.query("SELECT value FROM metadata", &[]).unwrap().len(), 1);
+
+        // The rule the partial indexes carry on SQLite, checked on the engine that has none.
+        let allocate = "INSERT INTO network_allocations(universe_uuid, network_uuid, ip, allocated_at, operation_id, released_at, released_by) \
+                        VALUES(?, ?, ?, 1, 'op', ?, ?)";
+        let row = |universe: &str, ip: &str, released: Option<i64>| {
+            vec![
+                Value::from(universe),
+                Value::from("net"),
+                Value::from(ip),
+                Value::from(released),
+                Value::from(released.map(|_| "op")),
+            ]
+        };
+        store.execute(allocate, &row("u1", "10.0.0.1", None)).unwrap();
+        assert_eq!(store.execute(allocate, &row("u2", "10.0.0.1", None)).unwrap_err().fault, Fault::Integrity);
+        assert_eq!(store.execute(allocate, &row("u1", "10.0.0.2", None)).unwrap_err().fault, Fault::Integrity);
+        store.execute("UPDATE network_allocations SET released_at = 2, released_by = 'op' WHERE ip = ?", &[Value::from("10.0.0.1")]).unwrap();
+        store.execute(allocate, &row("u2", "10.0.0.1", None)).unwrap();
+        assert_eq!(store.query("SELECT ip FROM network_allocations", &[]).unwrap().len(), 2);
+
+        // And what the caller asks the catalog is answered without a dialect on this engine too.
+        assert!(super::super::catalog::has_column(&mut store, "secrets", "state").unwrap());
+        assert!(!super::super::catalog::has_column(&mut store, "secrets", "content").unwrap());
+        assert_eq!(
+            super::super::catalog::columns(&mut store, "recovery_point_staged").unwrap().last().map(String::as_str),
+            Some("uncompressed_bytes")
+        );
+
+        let integrity = store.integrity_check().unwrap();
+        assert!(integrity.ok, "{:?}", integrity.findings);
+        drop_everything(&mut store);
+    }
+
     #[test]
     fn a_store_from_a_later_build_is_refused_rather_than_downgraded() {
         let mut store = memory();

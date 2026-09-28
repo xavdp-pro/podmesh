@@ -498,6 +498,73 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A profile that names MariaDB and not enough to reach it is refused before anything opens.
+    /// Fail closed is the whole point: the alternative is a node that starts on a file while its
+    /// operator believes it writes to a server.
+    #[test]
+    fn an_incomplete_mariadb_profile_is_refused_before_anything_is_opened() {
+        let complete = |password_file: PathBuf| StoreConfig {
+            engine: Engine::Mariadb,
+            mariadb: MariadbConfig { password_file: Some(password_file), ..MariadbConfig::default() },
+            ..StoreConfig::default()
+        };
+        let dir = scratch("validate");
+        let path = dir.join("passwd");
+        fs::write(&path, "kept in the file\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        complete(path.clone()).validate().unwrap();
+
+        // No password file at all, and a password file nobody put a password in.
+        let refused = StoreConfig { engine: Engine::Mariadb, ..StoreConfig::default() }.validate().unwrap_err();
+        assert_eq!(refused.fault, Fault::Denied);
+        assert!(refused.message.contains("password_file"));
+        let empty = dir.join("empty");
+        fs::write(&empty, "\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&empty, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(complete(empty).validate().unwrap_err().fault, Fault::Denied);
+
+        // The slug on either side, and somewhere to reach.
+        for blank in ["user", "database", "host"] {
+            let mut config = complete(path.clone());
+            match blank {
+                "user" => config.mariadb.user.clear(),
+                "database" => config.mariadb.database.clear(),
+                _ => config.mariadb.host.clear(),
+            }
+            assert_eq!(config.validate().unwrap_err().fault, Fault::Unavailable, "{blank}");
+        }
+        // A socket is somewhere to reach, so an empty host beside one is not a refusal.
+        let mut by_socket = complete(path);
+        by_socket.mariadb.host.clear();
+        by_socket.mariadb.socket = Some(PathBuf::from("/run/mysqld/mysqld.sock"));
+        by_socket.validate().unwrap();
+
+        // A DSN says it all, as long as it names a database to resolve table names in.
+        let dsn = |url: &str| StoreConfig {
+            engine: Engine::Mariadb,
+            mariadb: MariadbConfig::from_dsn(url),
+            ..StoreConfig::default()
+        };
+        dsn("mysql://podmesh-node:held@127.0.0.1:33061/podmesh-node").validate().unwrap();
+        assert_eq!(dsn("mysql://podmesh-node:held@127.0.0.1:33061/").validate().unwrap_err().fault, Fault::Unavailable);
+        assert_eq!(dsn("mysql://podmesh-node:held@127.0.0.1:33061").validate().unwrap_err().fault, Fault::Unavailable);
+        let wrong_scheme = dsn("postgres://podmesh-node:held@127.0.0.1/podmesh-node").validate().unwrap_err();
+        assert_eq!(wrong_scheme.fault, Fault::Unsupported);
+        assert!(!wrong_scheme.message.contains("held"), "a refusal never prints a password");
+
+        // And the profile a node has today is complete as it stands.
+        StoreConfig::for_state_dir(Path::new("/var/lib/podmesh")).validate().unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_dsn_replaces_the_fields_and_is_never_printed_whole() {
         let config = MariadbConfig::from_dsn("mysql://podmesh-node:held@127.0.0.1:33061/podmesh-node");
