@@ -1,10 +1,13 @@
 //! Local managed-container operations. No implicit image pulls or network access.
 use crate::migration::{self, Binding};
+use crate::store::{DurableStore, Row as StoreRow, Value as Stored};
 use crate::{recovery, restore, transfer};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeSet,
     fmt, fs,
+    net::Ipv4Addr,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -178,7 +181,11 @@ pub(crate) fn text<'a>(r: &'a Value, key: &str) -> Result<&'a str, Error> {
         .ok_or_else(|| format!("Missing {key}").into())
 }
 pub(crate) fn token(value: &str) -> Result<(), Error> {
-    if value.len() > 80 || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+    if value.len() > 80
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
         return Err("Identifier must contain 1-80 ASCII letters, digits or hyphens".into());
     }
     Ok(())
@@ -202,7 +209,9 @@ pub fn prepare_scratch(dir: &Path) -> Result<(), Error> {
     empty_scratch()
 }
 fn empty_scratch() -> Result<(), Error> {
-    let dir = SCRATCH.get().ok_or("Podman scratch directory not prepared")?;
+    let dir = SCRATCH
+        .get()
+        .ok_or("Podman scratch directory not prepared")?;
     if dir.exists() {
         fs::remove_dir_all(dir)?;
     }
@@ -213,7 +222,9 @@ fn empty_scratch() -> Result<(), Error> {
 pub(crate) fn run_podman(timeout: u64, args: &[&str]) -> Result<Output, Error> {
     // GNU timeout bounds this process group; no shell evaluates caller input.
     let limit = timeout.to_string();
-    let scratch = SCRATCH.get().ok_or("Podman scratch directory not prepared")?;
+    let scratch = SCRATCH
+        .get()
+        .ok_or("Podman scratch directory not prepared")?;
     Ok(Command::new("/usr/bin/timeout")
         .env("TMPDIR", scratch)
         // systemd sets INVOCATION_ID for this service. Podman then leaves conmon in the
@@ -259,7 +270,8 @@ pub(crate) fn inspect(name: &str) -> Result<Option<Value>, Error> {
     Ok(Some(data[0].clone()))
 }
 pub(crate) fn images() -> Result<Vec<Value>, Error> {
-    let all: Value = serde_json::from_str(&podman(QUICK, &["images", "--all", "--format", "json"])?)?;
+    let all: Value =
+        serde_json::from_str(&podman(QUICK, &["images", "--all", "--format", "json"])?)?;
     Ok(all.as_array().ok_or("Invalid image inventory")?.clone())
 }
 pub(crate) fn image_id(i: &Value) -> &str {
@@ -284,7 +296,14 @@ fn stopped(c: &Value) -> Result<(), Error> {
 /// Seconds since the Unix epoch for Podman's UTC timestamps (`YYYY-MM-DDTHH:MM:SS[.frac]Z`).
 pub(crate) fn epoch(ts: &str) -> Option<i64> {
     let b = ts.as_bytes();
-    if b.len() < 20 || !ts.ends_with('Z') || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+    if b.len() < 20
+        || !ts.ends_with('Z')
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
         return None;
     }
     let num = |from: usize, to: usize| ts.get(from..to)?.parse::<i64>().ok();
@@ -345,11 +364,15 @@ pub(crate) fn owned(db: &Connection, c: &Value, uuid: &str, role: &str) -> Resul
     // ownership is the verified migration_restore that binds this universe to this container ID. A local
     // restore from a preserved archive produces a new container ID the same way.
     if let Some(id) = c["Id"].as_str() {
-        if restore::restored_here(db, uuid, id)? || recovery::restored_locally(db, uuid, id)? || crate::recovery_point::promoted_live_here(db, uuid, id)? {
+        if restore::restored_here(db, uuid, id)?
+            || recovery::restored_locally(db, uuid, id)?
+            || crate::recovery_point::promoted_live_here(db, uuid, id)?
+        {
             return Ok(());
         }
     }
-    let operation = label(c, CREATION).ok_or_else(|| format!("{role} has no creation operation"))?;
+    let operation =
+        label(c, CREATION).ok_or_else(|| format!("{role} has no creation operation"))?;
     let row: Option<(String, Option<String>)> = db
         .query_row(
             "SELECT request,result FROM operations WHERE id=?1 AND status='verified'",
@@ -357,11 +380,16 @@ pub(crate) fn owned(db: &Connection, c: &Value, uuid: &str, role: &str) -> Resul
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let (request, result) = row.ok_or_else(|| format!("{role} is not recorded as a verified PodMesh universe on this host"))?;
+    let (request, result) = row.ok_or_else(|| {
+        format!("{role} is not recorded as a verified PodMesh universe on this host")
+    })?;
     let request: Value = serde_json::from_str(&request)?;
     let result: Value = serde_json::from_str(&result.ok_or("Missing persisted result")?)?;
     let kind = request["operation"].as_str().unwrap_or("");
-    if !["create", "clone"].contains(&kind) || request["universe_uuid"].as_str() != Some(uuid) || result["container_id"] != c["Id"] {
+    if !["create", "clone"].contains(&kind)
+        || request["universe_uuid"].as_str() != Some(uuid)
+        || result["container_id"] != c["Id"]
+    {
         return Err(format!("{role} container does not match its recorded creation").into());
     }
     // A container this host transferred away never regains ownership through its original creation.
@@ -381,15 +409,25 @@ pub(crate) fn owned(db: &Connection, c: &Value, uuid: &str, role: &str) -> Resul
     }
     Ok(())
 }
-fn parse<'a>(db: &Connection, operation: &str, uuid: &str, request: &'a Value) -> Result<Params<'a>, Error> {
+fn parse<'a>(
+    db: &Connection,
+    operation: &str,
+    uuid: &str,
+    request: &'a Value,
+) -> Result<Params<'a>, Error> {
     Ok(match operation {
         "create" => {
             let image = text(request, "image")?;
             // An immutable local image ID is mandatory for this first version.
-            if image.len() != 71 || !image.starts_with("sha256:") || !image[7..].bytes().all(|c| c.is_ascii_hexdigit()) {
+            if image.len() != 71
+                || !image.starts_with("sha256:")
+                || !image[7..].bytes().all(|c| c.is_ascii_hexdigit())
+            {
                 return Err("Use a full local sha256 image ID".into());
             }
-            let command = request["command"].as_array().ok_or("command must be an array")?;
+            let command = request["command"]
+                .as_array()
+                .ok_or("command must be an array")?;
             let command: Vec<&str> = command
                 .iter()
                 .map(|v| v.as_str().ok_or("command items must be strings"))
@@ -400,10 +438,15 @@ fn parse<'a>(db: &Connection, operation: &str, uuid: &str, request: &'a Value) -
             // A universe's network is a decision, not a default that depends on host state.
             let profile = text(request, "network_profile")
                 .map_err(|_| "network_profile is required: isolated or managed (docs/UNIVERSE-NETWORK-CONTRACT.md)")?;
-            if profile != crate::network::PROFILE_ISOLATED && profile != crate::network::PROFILE_MANAGED {
+            if profile != crate::network::PROFILE_ISOLATED
+                && profile != crate::network::PROFILE_MANAGED
+            {
                 return Err("network_profile must be isolated or managed".into());
             }
-            let address = request.get("network_address").map(|v| v.as_str().ok_or("network_address must be a string")).transpose()?;
+            let address = request
+                .get("network_address")
+                .map(|v| v.as_str().ok_or("network_address must be a string"))
+                .transpose()?;
             if address.is_some() && profile != crate::network::PROFILE_MANAGED {
                 return Err("network_address is only meaningful with the managed profile".into());
             }
@@ -413,12 +456,23 @@ fn parse<'a>(db: &Connection, operation: &str, uuid: &str, request: &'a Value) -
             // the host's machine-id, mounted at fixed paths derived from this name alone (V3-5).
             let host_state = request
                 .get("manager_host_state")
-                .map(|v| v.as_str().filter(|s| !s.is_empty()).ok_or("manager_host_state must be a non-empty name"))
+                .map(|v| {
+                    v.as_str()
+                        .filter(|s| !s.is_empty())
+                        .ok_or("manager_host_state must be a non-empty name")
+                })
                 .transpose()?;
             if let Some(name) = host_state {
                 token(name)?;
             }
-            Params::Create { image, command, profile, address, secrets, host_state }
+            Params::Create {
+                image,
+                command,
+                profile,
+                address,
+                secrets,
+                host_state,
+            }
         }
         "clone" => {
             let source = text(request, "source_uuid")?;
@@ -452,7 +506,10 @@ fn parse<'a>(db: &Connection, operation: &str, uuid: &str, request: &'a Value) -
                 .and_then(Value::as_str)
                 .filter(|v| ["kill", "leave_running"].contains(v))
                 .ok_or("on_timeout must be \"kill\" or \"leave_running\"")?;
-            Params::Stop { timeout, on_timeout }
+            Params::Stop {
+                timeout,
+                on_timeout,
+            }
         }
         "pause" => Params::Pause,
         "resume" => Params::Resume,
@@ -460,7 +517,9 @@ fn parse<'a>(db: &Connection, operation: &str, uuid: &str, request: &'a Value) -
             let memory_bytes = match request.get("memory_bytes") {
                 None | Some(Value::Null) => None,
                 Some(v) => {
-                    let m = v.as_u64().ok_or("memory_bytes must be a positive integer of bytes")?;
+                    let m = v
+                        .as_u64()
+                        .ok_or("memory_bytes must be a positive integer of bytes")?;
                     let total = host_memory_bytes()?;
                     if m < MIN_MEMORY_BYTES || m > total {
                         return Err(format!("memory_bytes must be from {MIN_MEMORY_BYTES} to this host's {total} bytes").into());
@@ -471,10 +530,15 @@ fn parse<'a>(db: &Connection, operation: &str, uuid: &str, request: &'a Value) -
             let cpus = match request.get("cpus") {
                 None | Some(Value::Null) => None,
                 Some(v) => {
-                    let c = v.as_f64().ok_or("cpus must be a number of cores, fractions allowed")?;
+                    let c = v
+                        .as_f64()
+                        .ok_or("cpus must be a number of cores, fractions allowed")?;
                     let cores = host_cpus() as f64;
                     if !(MIN_CPUS..=cores).contains(&c) {
-                        return Err(format!("cpus must be from {MIN_CPUS} to this host's {cores} cores").into());
+                        return Err(format!(
+                            "cpus must be from {MIN_CPUS} to this host's {cores} cores"
+                        )
+                        .into());
                     }
                     Some((c * 100.0).round() / 100.0)
                 }
@@ -487,11 +551,21 @@ fn parse<'a>(db: &Connection, operation: &str, uuid: &str, request: &'a Value) -
         "migration_preflight" | "migration_checkpoint" => {
             // Every identity the checkpoint is bound to is explicit and immutable.
             let container_id = text(request, "container_id")?;
-            if container_id.len() != 64 || !container_id.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
-                return Err("container_id must be a full 64-character lowercase hexadecimal container ID".into());
+            if container_id.len() != 64
+                || !container_id
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            {
+                return Err(
+                    "container_id must be a full 64-character lowercase hexadecimal container ID"
+                        .into(),
+                );
             }
             let image = text(request, "image")?;
-            if image.len() != 71 || !image.starts_with("sha256:") || !image[7..].bytes().all(|c| c.is_ascii_hexdigit()) {
+            if image.len() != 71
+                || !image.starts_with("sha256:")
+                || !image[7..].bytes().all(|c| c.is_ascii_hexdigit())
+            {
                 return Err("Use a full local sha256 image ID".into());
             }
             let source_host = text(request, "source_host_uuid")?;
@@ -516,7 +590,9 @@ fn parse<'a>(db: &Connection, operation: &str, uuid: &str, request: &'a Value) -
         }
         "migration_authorize_transfer" => {
             let checkpoint = text(request, "checkpoint_operation_id")?;
-            token(checkpoint).map_err(|_| "checkpoint_operation_id must contain 1-80 ASCII letters, digits or hyphens")?;
+            token(checkpoint).map_err(|_| {
+                "checkpoint_operation_id must contain 1-80 ASCII letters, digits or hyphens"
+            })?;
             let destination = text(request, "destination_host_uuid")?;
             if !is_uuid(destination) {
                 return Err("destination_host_uuid must be a UUID".into());
@@ -531,7 +607,9 @@ fn parse<'a>(db: &Connection, operation: &str, uuid: &str, request: &'a Value) -
         // can never resolve to a reservation the caller did not mean.
         "migration_release" | "migration_abandon" | "migration_restore_local" => {
             let checkpoint = text(request, "checkpoint_operation_id")?;
-            token(checkpoint).map_err(|_| "checkpoint_operation_id must contain 1-80 ASCII letters, digits or hyphens")?;
+            token(checkpoint).map_err(|_| {
+                "checkpoint_operation_id must contain 1-80 ASCII letters, digits or hyphens"
+            })?;
             match operation {
                 "migration_release" => Params::MigrationRelease { checkpoint },
                 "migration_abandon" => Params::MigrationAbandon { checkpoint },
@@ -557,7 +635,9 @@ fn parse<'a>(db: &Connection, operation: &str, uuid: &str, request: &'a Value) -
                     // Explicit, typed and default false: ending processes is never implied by an abort.
                     let reclaim_processes = match request.get("reclaim_processes") {
                         None | Some(Value::Null) => false,
-                        Some(v) => v.as_bool().ok_or("reclaim_processes must be true or false")?,
+                        Some(v) => v
+                            .as_bool()
+                            .ok_or("reclaim_processes must be true or false")?,
                     };
                     Params::MigrationRestoreAbort {
                         authorization,
@@ -580,6 +660,649 @@ pub(crate) fn ensure_schema(db: &Connection) -> Result<(), Error> {
     migration::ensure_schema(db)?;
     Ok(())
 }
+
+trait LifecycleDb {
+    fn secret_mounts(&mut self, request: &Value) -> Result<(Vec<String>, Option<String>), Error>;
+    fn owned(&mut self, c: &Value, uuid: &str, role: &str) -> Result<(), Error>;
+    fn refuse_reserved(&mut self, uuid: &str, operation: &str) -> Result<(), Error>;
+    fn refuse_activation(&mut self, uuid: &str, operation: &str) -> Result<(), Error>;
+    fn refuse_identity_reuse(&mut self, uuid: &str, operation: &str) -> Result<(), Error>;
+    fn allocate_network(
+        &mut self,
+        uuid: &str,
+        id: &str,
+        requested: Option<&str>,
+    ) -> Result<(String, String, String), Error>;
+    fn release_network(&mut self, uuid: &str, id: &str) -> Result<Option<String>, Error>;
+    fn earlier_attempt(&mut self, id: &str, attempt: i64) -> Result<Option<i64>, Error>;
+    fn reservation_state(&mut self, uuid: &str) -> Result<Option<String>, Error>;
+    fn remove_snapshots(&mut self, uuid: &str) -> Result<(Vec<String>, Vec<Value>), Error>;
+    fn remove_restore_images(&mut self, uuid: &str) -> Result<(Vec<String>, Vec<Value>), Error>;
+}
+
+struct SqliteLifecycleDb<'a> {
+    db: &'a Connection,
+}
+
+impl LifecycleDb for SqliteLifecycleDb<'_> {
+    fn secret_mounts(&mut self, request: &Value) -> Result<(Vec<String>, Option<String>), Error> {
+        crate::secrets::mounts(self.db, request)
+    }
+
+    fn owned(&mut self, c: &Value, uuid: &str, role: &str) -> Result<(), Error> {
+        owned(self.db, c, uuid, role)
+    }
+
+    fn refuse_reserved(&mut self, uuid: &str, operation: &str) -> Result<(), Error> {
+        migration::refuse_if_reserved(self.db, uuid, operation)
+    }
+
+    fn refuse_activation(&mut self, uuid: &str, operation: &str) -> Result<(), Error> {
+        crate::activation::refuse_if_not_activated(self.db, uuid, operation)
+    }
+
+    fn refuse_identity_reuse(&mut self, uuid: &str, operation: &str) -> Result<(), Error> {
+        migration::refuse_identity_reuse(self.db, uuid, operation)
+    }
+
+    fn allocate_network(
+        &mut self,
+        uuid: &str,
+        id: &str,
+        requested: Option<&str>,
+    ) -> Result<(String, String, String), Error> {
+        crate::network::allocate(self.db, uuid, id, requested)
+    }
+
+    fn release_network(&mut self, uuid: &str, id: &str) -> Result<Option<String>, Error> {
+        crate::network::release(self.db, uuid, id)
+    }
+
+    fn earlier_attempt(&mut self, id: &str, attempt: i64) -> Result<Option<i64>, Error> {
+        earlier_attempt(self.db, id, attempt)
+    }
+
+    fn reservation_state(&mut self, uuid: &str) -> Result<Option<String>, Error> {
+        Ok(migration::reservation(self.db, uuid)?.map(|reservation| reservation.state))
+    }
+
+    fn remove_snapshots(&mut self, uuid: &str) -> Result<(Vec<String>, Vec<Value>), Error> {
+        remove_snapshots(self.db, uuid)
+    }
+
+    fn remove_restore_images(&mut self, uuid: &str) -> Result<(Vec<String>, Vec<Value>), Error> {
+        crate::recovery_point::remove_restore_images(self.db, uuid)
+    }
+}
+
+struct DurableLifecycleDb<'a> {
+    store: &'a mut dyn DurableStore,
+}
+
+impl DurableLifecycleDb<'_> {
+    fn query_one(&mut self, sql: &str, values: &[Stored]) -> Result<Option<StoreRow>, Error> {
+        Ok(self.store.query_one(sql, values)?)
+    }
+
+    fn query(&mut self, sql: &str, values: &[Stored]) -> Result<Vec<StoreRow>, Error> {
+        Ok(self.store.query(sql, values)?)
+    }
+
+    fn execute(&mut self, sql: &str, values: &[Stored]) -> Result<u64, Error> {
+        Ok(self.store.execute(sql, values)?)
+    }
+
+    fn restored_here(&mut self, uuid: &str, container_id: &str) -> Result<bool, Error> {
+        let row = self.query_one(
+            "SELECT o.request, o.result FROM migration_restore_claims k JOIN operations o ON o.id = k.operation_id \
+             WHERE k.universe_uuid = ? AND k.container_id = ? AND k.state = 'restored' AND o.status = 'verified'",
+            &[Stored::from(uuid), Stored::from(container_id)],
+        )?;
+        let Some(row) = row else { return Ok(false) };
+        let request: Value = serde_json::from_str(row.text(0)?)?;
+        let result: Value = serde_json::from_str(row.value(1)?.text().unwrap_or("null"))?;
+        Ok(request["operation"] == "migration_restore"
+            && request["universe_uuid"].as_str() == Some(uuid)
+            && result["container_id"].as_str() == Some(container_id))
+    }
+
+    fn restored_locally(&mut self, uuid: &str, container_id: &str) -> Result<bool, Error> {
+        let rows = self.query(
+            "SELECT request, result FROM operations WHERE status = 'verified' AND result LIKE ?",
+            &[Stored::from(format!("%{container_id}%"))],
+        )?;
+        for row in rows {
+            let request: Value = serde_json::from_str(row.text(0)?)?;
+            let result: Value = serde_json::from_str(row.value(1)?.text().unwrap_or("null"))?;
+            if request["operation"] == "migration_restore_local"
+                && request["universe_uuid"].as_str() == Some(uuid)
+                && result["container_id"].as_str() == Some(container_id)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn promoted_live_here(&mut self, uuid: &str, container_id: &str) -> Result<bool, Error> {
+        Ok(self
+            .query_one(
+                "SELECT 1 FROM recovery_point_live_promotions WHERE universe_uuid = ? AND container_id = ?",
+                &[Stored::from(uuid), Stored::from(container_id)],
+            )?
+            .is_some())
+    }
+
+    fn transferred_away(&mut self, uuid: &str, container_id: &str) -> Result<bool, Error> {
+        Ok(self
+            .query_one(
+                "SELECT universe_uuid FROM migration_reservations WHERE universe_uuid = ? AND container_id = ? AND state = 'transferred' \
+                 UNION ALL SELECT universe_uuid FROM migration_reservation_history \
+                 WHERE universe_uuid = ? AND container_id = ? AND state = 'transferred' LIMIT 1",
+                &[
+                    Stored::from(uuid),
+                    Stored::from(container_id),
+                    Stored::from(uuid),
+                    Stored::from(container_id),
+                ],
+            )?
+            .is_some())
+    }
+
+    fn collected_absent(&mut self, uuid: &str, container_id: &str) -> Result<bool, Error> {
+        Ok(self
+            .query_one(
+                "SELECT universe_uuid FROM migration_universe_tombstones \
+                 WHERE universe_uuid = ? AND container_id = ? AND container_absent_at_collection = 1 \
+                 UNION ALL SELECT universe_uuid FROM migration_collection_history \
+                 WHERE universe_uuid = ? AND container_id = ? AND container_absent_at_collection = 1 LIMIT 1",
+                &[
+                    Stored::from(uuid),
+                    Stored::from(container_id),
+                    Stored::from(uuid),
+                    Stored::from(container_id),
+                ],
+            )?
+            .is_some())
+    }
+
+    fn snapshot_recorded(&mut self, uuid: &str, image: &Value) -> Result<bool, Error> {
+        let labels = &image["Labels"];
+        let Some(operation) = labels[SNAPSHOT_OPERATION].as_str() else {
+            return Ok(false);
+        };
+        let row = self.query_one(
+            "SELECT request, status, result FROM operations WHERE id = ?",
+            &[Stored::from(operation)],
+        )?;
+        let Some(row) = row else { return Ok(false) };
+        let request: Value = serde_json::from_str(row.text(0)?)?;
+        if request["operation"] != "clone"
+            || request["universe_uuid"].as_str() != Some(uuid)
+            || request["source_uuid"].as_str() != labels[UNIVERSE].as_str()
+        {
+            return Ok(false);
+        }
+        if row.text(1)? != "verified" {
+            return Ok(true);
+        }
+        let result: Value = serde_json::from_str(row.value(2)?.text().unwrap_or("null"))?;
+        Ok(result["snapshot_image"].as_str() == Some(image_id(image))
+            && result["source_container_id"] == labels[SNAPSHOT_SOURCE])
+    }
+}
+
+impl LifecycleDb for DurableLifecycleDb<'_> {
+    fn secret_mounts(&mut self, request: &Value) -> Result<(Vec<String>, Option<String>), Error> {
+        let Some(list) = request.get("secrets") else {
+            return Ok((vec![], None));
+        };
+        let list = list
+            .as_array()
+            .ok_or("secrets must be a list of {name, target}")?;
+        let mut args = vec![];
+        let mut labels = vec![];
+        for entry in list {
+            let name = text(entry, "name")?;
+            token(name)?;
+            let target = text(entry, "target")?;
+            if !target.starts_with('/')
+                || target.contains("..")
+                || target.contains(',')
+                || target.ends_with('/')
+            {
+                return Err(format!(
+                    "secret target {target} must be an absolute file path without '..' or ','"
+                )
+                .into());
+            }
+            if self
+                .query_one(
+                    "SELECT sha256 FROM secrets WHERE name = ? AND removed_at IS NULL AND state = 'effective'",
+                    &[Stored::from(name)],
+                )?
+                .is_none()
+            {
+                return Err(format!("secret {name} is not declared on this host (secret_declare)").into());
+            }
+            let present = Command::new("podman")
+                .args(["secret", "exists", name])
+                .output();
+            match present {
+                Ok(output) if output.status.success() => {}
+                Ok(_) => {
+                    return Err(format!("secret {name} is declared here but absent from Podman's store; declare it again").into())
+                }
+                Err(_) => {
+                    return Err(format!("Podman's secret store could not be asked about {name}; refusing on an unknown state").into())
+                }
+            }
+            args.push("--secret".to_string());
+            args.push(format!(
+                "source={name},type=mount,target={target},mode=0600,uid=0,gid=0"
+            ));
+            labels.push(format!("{name}:{target}"));
+        }
+        Ok(if labels.is_empty() {
+            (args, None)
+        } else {
+            (
+                args,
+                Some(format!("io.podmesh.secrets={}", labels.join(";"))),
+            )
+        })
+    }
+
+    fn owned(&mut self, c: &Value, uuid: &str, role: &str) -> Result<(), Error> {
+        if let Some(container_id) = c["Id"].as_str() {
+            if self.restored_here(uuid, container_id)?
+                || self.restored_locally(uuid, container_id)?
+                || self.promoted_live_here(uuid, container_id)?
+            {
+                return Ok(());
+            }
+        }
+        let operation =
+            label(c, CREATION).ok_or_else(|| format!("{role} has no creation operation"))?;
+        let row = self.query_one(
+            "SELECT request, result FROM operations WHERE id = ? AND status = 'verified'",
+            &[Stored::from(operation)],
+        )?;
+        let Some(row) = row else {
+            return Err(format!(
+                "{role} is not recorded as a verified PodMesh universe on this host"
+            )
+            .into());
+        };
+        let request: Value = serde_json::from_str(row.text(0)?)?;
+        let result: Value = serde_json::from_str(row.value(1)?.text().unwrap_or("null"))?;
+        if !["create", "clone"].contains(&request["operation"].as_str().unwrap_or(""))
+            || request["universe_uuid"].as_str() != Some(uuid)
+            || result["container_id"] != c["Id"]
+        {
+            return Err(format!("{role} container does not match its recorded creation").into());
+        }
+        let container_id = c["Id"].as_str().unwrap_or("");
+        if self.transferred_away(uuid, container_id)? {
+            return Err(format!(
+                "{role} container was transferred to another host by a completed migration; its original creation no longer grants ownership"
+            )
+            .into());
+        }
+        if self.collected_absent(uuid, container_id)? {
+            return Err(format!(
+                "{role} container was proven absent when this universe was collected; its original creation no longer grants ownership"
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn refuse_reserved(&mut self, uuid: &str, operation: &str) -> Result<(), Error> {
+        if let Some(row) = self.query_one(
+            "SELECT operation_id, state, container_id, image_id, source_host_uuid, destination_host_uuid, \
+             container_started_at, created_at, updated_at, detail FROM migration_reservations WHERE universe_uuid = ?",
+            &[Stored::from(uuid)],
+        )? {
+            let state = row.text(1)?;
+            if state != "released" && state != "collected" {
+                return Err(failure(
+                    format!(
+                        "Universe {uuid} is reserved by migration operation {} (state {state}); {operation} is refused while the reservation exists",
+                        row.text(0)?
+                    ),
+                    json!({"reservation": {
+                        "operation_id": row.text(0)?, "state": state, "container_id": row.text(2)?,
+                        "image_id": row.text(3)?, "source_host_uuid": row.text(4)?,
+                        "destination_host_uuid": row.text(5)?, "container_started_at": row.text(6)?,
+                        "created_at": row.integer(7)?, "updated_at": row.integer(8)?,
+                        "detail": row.value(9)?.text().and_then(|detail| serde_json::from_str::<Value>(detail).ok())
+                    }}),
+                ));
+            }
+        }
+        if let Some(row) = self.query_one(
+            "SELECT authorization_id, state FROM migration_restore_claims \
+             WHERE universe_uuid = ? AND state IN ('restoring', 'restore_failed') ORDER BY created_at LIMIT 1",
+            &[Stored::from(uuid)],
+        )? {
+            return Err(failure(
+                format!(
+                    "Universe {uuid} has an unresolved restore claim for authorization {} (state {}); {operation} is refused until migration_restore verifies it or migration_restore_abort closes it",
+                    row.text(0)?,
+                    row.text(1)?
+                ),
+                json!({"restore_claim": {"authorization_id": row.text(0)?, "state": row.text(1)?}}),
+            ));
+        }
+        Ok(())
+    }
+
+    fn refuse_activation(&mut self, uuid: &str, operation: &str) -> Result<(), Error> {
+        if self
+            .query_one(
+                "SELECT universe_uuid FROM activation_policy WHERE universe_uuid = ?",
+                &[Stored::from(uuid)],
+            )?
+            .is_none()
+        {
+            return Ok(());
+        }
+        let held = self.query_one(
+            "SELECT holder_host_uuid, expires_at, epoch FROM activation_leases WHERE universe_uuid = ?",
+            &[Stored::from(uuid)],
+        )?;
+        let this_host = self
+            .query_one(
+                "SELECT value FROM metadata WHERE `key` = ?",
+                &[Stored::from("host_uuid")],
+            )?
+            .ok_or("The journal carries no host_uuid")?;
+        let this_host = this_host.text(0)?;
+        let Some(lease) = held else {
+            return Err(format!(
+                "{operation} refused: this universe requires an activation lease and none is held"
+            )
+            .into());
+        };
+        if lease.text(0)? != this_host {
+            return Err(format!(
+                "{operation} refused: the activation lease is held by another host"
+            )
+            .into());
+        }
+        let now = crate::now() as i64;
+        if lease.integer(1)? <= now {
+            return Err(format!(
+                "{operation} refused: this host's activation lease expired {} seconds ago",
+                now - lease.integer(1)?
+            )
+            .into());
+        }
+        if let Some(epoch) = self.query_one(
+            "SELECT epoch FROM activation_epochs WHERE universe_uuid = ? AND epoch > ? ORDER BY epoch DESC LIMIT 1",
+            &[Stored::from(uuid), Stored::from(lease.integer(2)?)],
+        )? {
+            return Err(format!(
+                "{operation} refused: this host's activation was superseded by epoch {}",
+                epoch.integer(0)?
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn refuse_identity_reuse(&mut self, uuid: &str, operation: &str) -> Result<(), Error> {
+        if let Some(row) = self.query_one(
+            "SELECT class, class_number, collected_by_operation, collected_at \
+             FROM migration_universe_tombstones WHERE universe_uuid = ?",
+            &[Stored::from(uuid)],
+        )? {
+            return Err(failure(
+                format!(
+                    "Universe {uuid} was collected on this host by garbage collection operation {} (class {}); {operation} with this universe UUID is refused, because reusing a collected identity requires a verified handoff restore or an explicit replacement procedure",
+                    row.text(2)?,
+                    row.text(0)?
+                ),
+                json!({"tombstone": {
+                    "universe_uuid": uuid, "class": row.text(0)?, "class_number": row.integer(1)?,
+                    "collected_by_operation": row.text(2)?, "collected_at": row.integer(3)?
+                }}),
+            ));
+        }
+        Ok(())
+    }
+
+    fn allocate_network(
+        &mut self,
+        uuid: &str,
+        id: &str,
+        requested: Option<&str>,
+    ) -> Result<(String, String, String), Error> {
+        let declaration = self
+            .query_one(
+                "SELECT network_uuid, pool, gateway, bridge, state FROM network_declaration LIMIT 1",
+                &[],
+            )?
+            .ok_or("The managed profile needs a network declared on this host (network_declare); none is")?;
+        if declaration.text(4)? != "effective" {
+            return Err(format!(
+                "The network declaration on this host is in state {}, not effective",
+                declaration.text(4)?
+            )
+            .into());
+        }
+        let network_uuid = declaration.text(0)?.to_string();
+        let pool_text = declaration.text(1)?;
+        let gateway: Ipv4Addr = declaration.text(2)?.parse()?;
+        let bridge = declaration.text(3)?.to_string();
+        if let Some(row) = self.query_one(
+            "SELECT ip FROM network_allocations WHERE universe_uuid = ? AND released_at IS NULL",
+            &[Stored::from(uuid)],
+        )? {
+            return Ok((bridge, row.text(0)?.to_string(), network_uuid));
+        }
+        let (network, bits) = pool_text.split_once('/').ok_or("pool must be a.b.c.d/n")?;
+        let network: Ipv4Addr = network.parse().map_err(|_| "pool has an invalid address")?;
+        let bits: u8 = bits
+            .parse()
+            .map_err(|_| "pool has an invalid prefix length")?;
+        if !(8..=30).contains(&bits) {
+            return Err("pool prefix length must be from 8 to 30".into());
+        }
+        let mask = u32::MAX << (32 - bits);
+        let first = u32::from(network) & mask;
+        if first != u32::from(network) {
+            return Err("pool must name the network address, not a host in it".into());
+        }
+        let last = first | !mask;
+        let used: BTreeSet<u32> = self
+            .query(
+                "SELECT ip FROM network_allocations WHERE released_at IS NULL",
+                &[],
+            )?
+            .into_iter()
+            .filter_map(|row| {
+                row.text(0)
+                    .ok()
+                    .and_then(|ip| ip.parse::<Ipv4Addr>().ok())
+                    .map(u32::from)
+            })
+            .collect();
+        let selected = match requested {
+            Some(text) => {
+                let address: Ipv4Addr = text
+                    .parse()
+                    .map_err(|_| "network_address must be an IPv4 address")?;
+                let raw = u32::from(address);
+                if raw & mask != first || raw == first || raw == last {
+                    return Err(format!(
+                        "network_address {address} is outside the local pool {pool_text}"
+                    )
+                    .into());
+                }
+                if address == gateway {
+                    return Err(format!("network_address {address} is the pool's gateway").into());
+                }
+                if used.contains(&raw) {
+                    return Err(format!(
+                        "network_address {address} is allocated to another universe"
+                    )
+                    .into());
+                }
+                address
+            }
+            None => {
+                let mut candidate = first + 1;
+                loop {
+                    if candidate >= last {
+                        return Err("The local pool has no free address left".into());
+                    }
+                    let address = Ipv4Addr::from(candidate);
+                    if address != gateway && !used.contains(&candidate) {
+                        break address;
+                    }
+                    candidate += 1;
+                }
+            }
+        };
+        self.execute(
+            "INSERT INTO network_allocations(universe_uuid, network_uuid, ip, allocated_at, operation_id) \
+             VALUES(?, ?, ?, ?, ?)",
+            &[
+                Stored::from(uuid),
+                Stored::from(&network_uuid),
+                Stored::from(selected.to_string()),
+                Stored::from(crate::now() as i64),
+                Stored::from(id),
+            ],
+        )?;
+        Ok((bridge, selected.to_string(), network_uuid))
+    }
+
+    fn release_network(&mut self, uuid: &str, id: &str) -> Result<Option<String>, Error> {
+        let held = self.query_one(
+            "SELECT ip FROM network_allocations WHERE universe_uuid = ? AND released_at IS NULL",
+            &[Stored::from(uuid)],
+        )?;
+        let Some(row) = held else { return Ok(None) };
+        let ip = row.text(0)?.to_string();
+        self.execute(
+            "UPDATE network_allocations SET released_at = ?, released_by = ? \
+             WHERE universe_uuid = ? AND released_at IS NULL",
+            &[
+                Stored::from(crate::now() as i64),
+                Stored::from(id),
+                Stored::from(uuid),
+            ],
+        )?;
+        Ok(Some(ip))
+    }
+
+    fn earlier_attempt(&mut self, id: &str, attempt: i64) -> Result<Option<i64>, Error> {
+        let row = self.query_one(
+            "SELECT MIN(started_at) FROM operation_attempts WHERE operation_id = ? AND id < ?",
+            &[Stored::from(id), Stored::from(attempt)],
+        )?;
+        Ok(row.and_then(|row| row.value(0).ok().and_then(Stored::integer)))
+    }
+
+    fn reservation_state(&mut self, uuid: &str) -> Result<Option<String>, Error> {
+        Ok(self
+            .query_one(
+                "SELECT state FROM migration_reservations WHERE universe_uuid = ?",
+                &[Stored::from(uuid)],
+            )?
+            .map(|row| row.text(0).map(str::to_string))
+            .transpose()?)
+    }
+
+    fn remove_snapshots(&mut self, uuid: &str) -> Result<(Vec<String>, Vec<Value>), Error> {
+        let (mut removed, mut retained) = (vec![], vec![]);
+        for image in images()?
+            .iter()
+            .filter(|image| image["Labels"][SNAPSHOT_FOR].as_str() == Some(uuid))
+        {
+            let id = image_id(image).to_string();
+            let tags = names(image);
+            if tags
+                .iter()
+                .any(|name| !name.starts_with(SNAPSHOT_REPOSITORY))
+            {
+                retained.push(json!({"image": id, "reason": "image has names outside the PodMesh snapshot repository"}));
+                continue;
+            }
+            if !self.snapshot_recorded(uuid, image)? {
+                retained.push(json!({"image": id, "reason": "snapshot provenance does not match this host's journal"}));
+                continue;
+            }
+            let targets = if tags.is_empty() {
+                vec![id.as_str()]
+            } else {
+                tags
+            };
+            let mut args = vec!["image", "rm"];
+            args.extend(targets);
+            match podman(QUICK, &args) {
+                Ok(_) => removed.push(id),
+                Err(error) => retained.push(json!({"image": id, "reason": error.to_string()})),
+            }
+        }
+        let remaining = images()?;
+        removed.retain(|id| {
+            let present = remaining.iter().any(|image| image_id(image) == id.as_str());
+            if present {
+                retained.push(json!({"image": id, "reason": "untagged but still present; a dependent image or container uses it"}));
+            }
+            !present
+        });
+        Ok((removed, retained))
+    }
+
+    fn remove_restore_images(&mut self, uuid: &str) -> Result<(Vec<String>, Vec<Value>), Error> {
+        let mut ids: Vec<String> = self
+            .query(
+                "SELECT imported_image_id FROM recovery_point_restores WHERE restored_universe_uuid = ? \
+                 UNION SELECT r.imported_image_id FROM recovery_point_promotions p \
+                 JOIN recovery_point_restores r ON r.restored_universe_uuid = p.restored_universe_uuid \
+                 WHERE p.universe_uuid = ?",
+                &[Stored::from(uuid), Stored::from(uuid)],
+            )?
+            .iter()
+            .map(|row| row.text(0).map(str::to_string))
+            .collect::<crate::store::Result<Vec<_>>>()?;
+        ids.sort();
+        ids.dedup();
+        let (mut removed, mut retained) = (vec![], vec![]);
+        if ids.is_empty() {
+            return Ok((removed, retained));
+        }
+        let present = images()?;
+        for id in ids {
+            let bare = id.trim_start_matches("sha256:").to_string();
+            let Some(image) = present.iter().find(|image| image_id(image) == bare) else {
+                continue;
+            };
+            let names: Vec<&str> = image["Names"]
+                .as_array()
+                .map(|held| held.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if names
+                .iter()
+                .any(|name| !name.starts_with("localhost/podmesh-recovery:"))
+            {
+                retained.push(json!({"image": bare, "reason": "image has names outside the PodMesh restore repository"}));
+                continue;
+            }
+            match run_podman(QUICK, &["image", "rm", &bare]) {
+                Ok(output) if output.status.success() => removed.push(bare),
+                Ok(output) => retained.push(json!({"image": bare, "reason": String::from_utf8_lossy(&output.stderr).trim()})),
+                Err(error) => retained.push(json!({"image": bare, "reason": error.to_string()})),
+            }
+        }
+        Ok((removed, retained))
+    }
+}
 pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
     let operation = text(request, "operation")?;
     let id = text(request, "operation_id")?;
@@ -596,9 +1319,11 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
     ensure_schema(db)?;
     let canonical = request.to_string();
     let previous: Option<(String, String, Option<String>)> = db
-        .query_row("SELECT request,status,result FROM operations WHERE id=?1", [id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
+        .query_row(
+            "SELECT request,status,result FROM operations WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
         .optional()?;
     if let Some((saved, status, result)) = previous {
         if saved != canonical {
@@ -609,7 +1334,10 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
         }
         // pending (interrupted) or failed: re-evaluate from the observed state below.
     } else {
-        db.execute("INSERT INTO operations VALUES(?1,?2,'pending',NULL)", params![id, canonical])?;
+        db.execute(
+            "INSERT INTO operations VALUES(?1,?2,'pending',NULL)",
+            params![id, canonical],
+        )?;
     }
     db.execute(
         "INSERT INTO operation_attempts(operation_id,started_at) VALUES(?1,?2)",
@@ -630,9 +1358,15 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
             )?;
         }
         Err(e) => {
-            let details = e.downcast_ref::<Failure>().map(|f| f.details.clone()).unwrap_or(Value::Null);
+            let details = e
+                .downcast_ref::<Failure>()
+                .map(|f| f.details.clone())
+                .unwrap_or(Value::Null);
             let record = json!({"error": e.to_string(), "details": details}).to_string();
-            db.execute("UPDATE operations SET status='failed', result=?2 WHERE id=?1", params![id, record])?;
+            db.execute(
+                "UPDATE operations SET status='failed', result=?2 WHERE id=?1",
+                params![id, record],
+            )?;
             db.execute(
                 "UPDATE operation_attempts SET finished_at=?2, outcome='failed', detail=?3 WHERE id=?1",
                 params![attempt, finished, record],
@@ -640,6 +1374,291 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
         }
     }
     outcome
+}
+
+/// The lifecycle operations whose journal has been ported to the engine-neutral store contract.
+///
+/// The schema is installed when the node store opens. This path therefore performs no DDL and
+/// uses only positional `?` placeholders. A pending operation and its attempt are committed
+/// before Podman is touched; the terminal journal update is committed as one transaction.
+pub fn execute_store(store: &mut dyn DurableStore, request: &Value) -> Result<Value, Error> {
+    let operation = text(request, "operation")?;
+    if ![
+        "create",
+        "delete",
+        "clone",
+        "start",
+        "stop",
+        "pause",
+        "resume",
+        "resources",
+    ]
+    .contains(&operation)
+    {
+        return Err("Unsupported durable lifecycle operation".into());
+    }
+    let id = text(request, "operation_id")?;
+    token(id)?;
+    let uuid = text(request, "universe_uuid")?;
+    if !is_uuid(uuid) {
+        return Err("Invalid universe UUID".into());
+    }
+    text(request, "authorization_ref")?;
+    let params = {
+        let mut db = DurableLifecycleDb { store };
+        parse_store(&mut db, operation, uuid, request)?
+    };
+    let canonical = request.to_string();
+    let previous = store.query_one(
+        "SELECT request, status, result FROM operations WHERE id = ?",
+        &[Stored::from(id)],
+    )?;
+    if let Some(row) = previous {
+        if row.text(0)? != canonical {
+            return Err("Operation ID already belongs to a different request".into());
+        }
+        if row.text(1)? == "verified" {
+            return replay_store(store, id, uuid, row.value(2)?.text().map(str::to_string));
+        }
+    }
+
+    let started = crate::now() as i64;
+    let attempt = {
+        let mut tx = store.transaction()?;
+        if previous.is_none() {
+            tx.execute(
+                "INSERT INTO operations(id, request, status, result) VALUES(?, ?, 'pending', NULL)",
+                &[Stored::from(id), Stored::from(&canonical)],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO operation_attempts(operation_id, started_at) VALUES(?, ?)",
+            &[Stored::from(id), Stored::from(started)],
+        )?;
+        let attempt = tx
+            .query_one(
+                "SELECT id FROM operation_attempts WHERE operation_id = ? ORDER BY id DESC LIMIT 1",
+                &[Stored::from(id)],
+            )?
+            .ok_or("The lifecycle attempt was inserted but could not be read back")?
+            .integer(0)?;
+        tx.commit()?;
+        attempt
+    };
+
+    let outcome = {
+        let mut db = DurableLifecycleDb { store };
+        perform_managed(&mut db, attempt, id, uuid, &params)
+    };
+    let finished = crate::now() as i64;
+    let mut tx = store.transaction()?;
+    match &outcome {
+        Ok(result) => {
+            tx.execute(
+                "UPDATE operations SET status = 'verified', result = ? WHERE id = ?",
+                &[Stored::from(result.to_string()), Stored::from(id)],
+            )?;
+            tx.execute(
+                "UPDATE operation_attempts SET finished_at = ?, outcome = 'verified' WHERE id = ?",
+                &[Stored::from(finished), Stored::from(attempt)],
+            )?;
+        }
+        Err(error) => {
+            let details = error
+                .downcast_ref::<Failure>()
+                .map(|failure| failure.details.clone())
+                .unwrap_or(Value::Null);
+            let record = json!({"error": error.to_string(), "details": details}).to_string();
+            tx.execute(
+                "UPDATE operations SET status = 'failed', result = ? WHERE id = ?",
+                &[Stored::from(&record), Stored::from(id)],
+            )?;
+            tx.execute(
+                "UPDATE operation_attempts SET finished_at = ?, outcome = 'failed', detail = ? WHERE id = ?",
+                &[
+                    Stored::from(finished),
+                    Stored::from(record),
+                    Stored::from(attempt),
+                ],
+            )?;
+        }
+    }
+    tx.commit()?;
+    outcome
+}
+
+fn parse_store<'a>(
+    db: &mut dyn LifecycleDb,
+    operation: &str,
+    uuid: &str,
+    request: &'a Value,
+) -> Result<Params<'a>, Error> {
+    Ok(match operation {
+        "create" => {
+            let image = text(request, "image")?;
+            if image.len() != 71
+                || !image.starts_with("sha256:")
+                || !image[7..]
+                    .bytes()
+                    .all(|character| character.is_ascii_hexdigit())
+            {
+                return Err("Use a full local sha256 image ID".into());
+            }
+            let command = request["command"]
+                .as_array()
+                .ok_or("command must be an array")?;
+            let command: Vec<&str> = command
+                .iter()
+                .map(|value| value.as_str().ok_or("command items must be strings"))
+                .collect::<Result<_, _>>()?;
+            if command.is_empty() {
+                return Err("Explicit command required".into());
+            }
+            let profile = text(request, "network_profile")
+                .map_err(|_| "network_profile is required: isolated or managed (docs/UNIVERSE-NETWORK-CONTRACT.md)")?;
+            if profile != crate::network::PROFILE_ISOLATED
+                && profile != crate::network::PROFILE_MANAGED
+            {
+                return Err("network_profile must be isolated or managed".into());
+            }
+            let address = request
+                .get("network_address")
+                .map(|value| value.as_str().ok_or("network_address must be a string"))
+                .transpose()?;
+            if address.is_some() && profile != crate::network::PROFILE_MANAGED {
+                return Err("network_address is only meaningful with the managed profile".into());
+            }
+            let secrets = db.secret_mounts(request)?;
+            let host_state = request
+                .get("manager_host_state")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|name| !name.is_empty())
+                        .ok_or("manager_host_state must be a non-empty name")
+                })
+                .transpose()?;
+            if let Some(name) = host_state {
+                token(name)?;
+            }
+            Params::Create {
+                image,
+                command,
+                profile,
+                address,
+                secrets,
+                host_state,
+            }
+        }
+        "clone" => {
+            let source = text(request, "source_uuid")?;
+            if !is_uuid(source) {
+                return Err("Invalid source UUID".into());
+            }
+            if source == uuid {
+                return Err("A clone requires a new universe UUID".into());
+            }
+            Params::Clone { source }
+        }
+        "delete" => Params::Delete,
+        "start" => {
+            let observe_seconds = match request.get("observe_seconds") {
+                None => DEFAULT_OBSERVE_SECONDS,
+                Some(value) => value
+                    .as_u64()
+                    .filter(|seconds| *seconds <= MAX_OBSERVE_SECONDS)
+                    .ok_or("observe_seconds must be an integer from 0 to 30")?,
+            };
+            Params::Start { observe_seconds }
+        }
+        "stop" => {
+            let timeout = request
+                .get("timeout_seconds")
+                .and_then(Value::as_u64)
+                .filter(|seconds| *seconds <= MAX_STOP_TIMEOUT_SECONDS)
+                .ok_or("timeout_seconds must be an integer from 0 to 300")?;
+            let on_timeout = request
+                .get("on_timeout")
+                .and_then(Value::as_str)
+                .filter(|value| ["kill", "leave_running"].contains(value))
+                .ok_or("on_timeout must be \"kill\" or \"leave_running\"")?;
+            Params::Stop {
+                timeout,
+                on_timeout,
+            }
+        }
+        "pause" => Params::Pause,
+        "resume" => Params::Resume,
+        "resources" => {
+            let memory_bytes = match request.get("memory_bytes") {
+                None | Some(Value::Null) => None,
+                Some(value) => {
+                    let memory = value
+                        .as_u64()
+                        .ok_or("memory_bytes must be a positive integer of bytes")?;
+                    let total = host_memory_bytes()?;
+                    if memory < MIN_MEMORY_BYTES || memory > total {
+                        return Err(format!("memory_bytes must be from {MIN_MEMORY_BYTES} to this host's {total} bytes").into());
+                    }
+                    Some(memory)
+                }
+            };
+            let cpus = match request.get("cpus") {
+                None | Some(Value::Null) => None,
+                Some(value) => {
+                    let cpus = value
+                        .as_f64()
+                        .ok_or("cpus must be a number of cores, fractions allowed")?;
+                    let cores = host_cpus() as f64;
+                    if !(MIN_CPUS..=cores).contains(&cpus) {
+                        return Err(format!(
+                            "cpus must be from {MIN_CPUS} to this host's {cores} cores"
+                        )
+                        .into());
+                    }
+                    Some((cpus * 100.0).round() / 100.0)
+                }
+            };
+            if memory_bytes.is_none() && cpus.is_none() {
+                return Err("resources requires memory_bytes, cpus or both".into());
+            }
+            Params::Resources { memory_bytes, cpus }
+        }
+        _ => return Err("Unsupported durable lifecycle operation".into()),
+    })
+}
+
+fn replay_store(
+    store: &mut dyn DurableStore,
+    id: &str,
+    uuid: &str,
+    result: Option<String>,
+) -> Result<Value, Error> {
+    let original: Value = serde_json::from_str(&result.ok_or("Missing persisted result")?)?;
+    let verified_at = store
+        .query_one(
+            "SELECT MAX(finished_at) FROM operation_attempts WHERE operation_id = ? AND outcome = 'verified'",
+            &[Stored::from(id)],
+        )?
+        .and_then(|row| row.value(0).ok().and_then(Stored::integer));
+    let current = observe(uuid)?;
+    let same_container = match (
+        original["container_id"].as_str(),
+        current["container_id"].as_str(),
+    ) {
+        (Some(recorded), Some(observed)) => json!(recorded == observed),
+        (Some(_), None) => json!(false),
+        _ => Value::Null,
+    };
+    Ok(json!({
+        "replayed": true,
+        "historical": true,
+        "notice": "original_result is the persisted result from when this operation was verified, not current state; current is a fresh Podman observation",
+        "verified_at": verified_at,
+        "original_result": original,
+        "current": current,
+        "current_matches_recorded_container": same_container,
+    }))
 }
 /// The journal contract, for modules whose operations are not lifecycle operations: a stable
 /// operation ID, one request per ID, a verified operation replayed as its persisted result
@@ -654,7 +1673,9 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
 pub(crate) fn fault(point: &str) -> Result<(), Error> {
     // One or several points, comma-separated: `PODMESH_FAULT=publisher-after-connector,publisher-during-compensation:crash`
     // fails the first and crashes in the compensation the failure starts.
-    let Ok(spec) = std::env::var("PODMESH_FAULT") else { return Ok(()) };
+    let Ok(spec) = std::env::var("PODMESH_FAULT") else {
+        return Ok(());
+    };
     for one in spec.split(',').map(str::trim) {
         if one == format!("{point}:crash") {
             eprintln!("PodMesh fault injection: crashing at {point}");
@@ -666,7 +1687,10 @@ pub(crate) fn fault(point: &str) -> Result<(), Error> {
             return Ok(());
         }
         if one == point {
-            return Err(format!("simulated storage failure at {point}; nothing is recorded as effective").into());
+            return Err(format!(
+                "simulated storage failure at {point}; nothing is recorded as effective"
+            )
+            .into());
         }
     }
     Ok(())
@@ -682,23 +1706,29 @@ pub(crate) fn journaled(
     ensure_schema(db)?;
     let canonical = request.to_string();
     let previous: Option<(String, String, Option<String>)> = db
-        .query_row("SELECT request,status,result FROM operations WHERE id=?1", [id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
+        .query_row(
+            "SELECT request,status,result FROM operations WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
         .optional()?;
     if let Some((saved, status, result)) = previous {
         if saved != canonical {
             return Err("Operation ID already belongs to a different request".into());
         }
         if status == "verified" {
-            let mut original: Value = serde_json::from_str(&result.ok_or("Missing persisted result")?)?;
+            let mut original: Value =
+                serde_json::from_str(&result.ok_or("Missing persisted result")?)?;
             original["replayed"] = json!(true);
             original["historical"] = json!(true);
             original["notice"] = json!("this is the result persisted when the operation was verified, not current state; a replay repeats no effect");
             return Ok(original);
         }
     } else {
-        db.execute("INSERT INTO operations VALUES(?1,?2,'pending',NULL)", params![id, canonical])?;
+        db.execute(
+            "INSERT INTO operations VALUES(?1,?2,'pending',NULL)",
+            params![id, canonical],
+        )?;
     }
     db.execute(
         "INSERT INTO operation_attempts(operation_id,started_at) VALUES(?1,?2)",
@@ -709,7 +1739,10 @@ pub(crate) fn journaled(
     let finished = crate::now() as i64;
     match &outcome {
         Ok(result) => {
-            db.execute("UPDATE operations SET status='verified', result=?2 WHERE id=?1", params![id, result.to_string()])?;
+            db.execute(
+                "UPDATE operations SET status='verified', result=?2 WHERE id=?1",
+                params![id, result.to_string()],
+            )?;
             db.execute(
                 "UPDATE operation_attempts SET finished_at=?2, outcome='verified' WHERE id=?1",
                 params![attempt, finished],
@@ -717,7 +1750,10 @@ pub(crate) fn journaled(
         }
         Err(e) => {
             let record = json!({"error": e.to_string()}).to_string();
-            db.execute("UPDATE operations SET status='failed', result=?2 WHERE id=?1", params![id, record])?;
+            db.execute(
+                "UPDATE operations SET status='failed', result=?2 WHERE id=?1",
+                params![id, record],
+            )?;
             db.execute(
                 "UPDATE operation_attempts SET finished_at=?2, outcome='failed', detail=?3 WHERE id=?1",
                 params![attempt, finished, record],
@@ -729,19 +1765,34 @@ pub(crate) fn journaled(
 
 /// A verified operation is never executed again. Its persisted result is returned as
 /// history, next to a fresh observation that may contradict it.
-fn replay(db: &Connection, id: &str, uuid: &str, operation: &str, result: Option<String>) -> Result<Value, Error> {
+fn replay(
+    db: &Connection,
+    id: &str,
+    uuid: &str,
+    operation: &str,
+    result: Option<String>,
+) -> Result<Value, Error> {
     let original: Value = serde_json::from_str(&result.ok_or("Missing persisted result")?)?;
     // A replay never repeats an effect. Migration replays add a fresh re-hash or state of what the operation produced.
     let extra = match operation {
         "migration_checkpoint" => Some((
             "current_artifacts",
-            migration::verify_artifacts(id, original["archive"]["sha256"].as_str(), original["manifest"]["sha256"].as_str())?,
+            migration::verify_artifacts(
+                id,
+                original["archive"]["sha256"].as_str(),
+                original["manifest"]["sha256"].as_str(),
+            )?,
         )),
-        "migration_authorize_transfer" => Some(("current_artifacts", transfer::verify_outbox(&original)?)),
-        "migration_restore" | "migration_restore_abort" => Some(("current_outcome", restore::verify_outcome(&original)?)),
-        "migration_complete_transfer" | "migration_retire_source" => {
-            Some(("current_reservation", json!(migration::reservation(db, uuid)?.map(|r| r.view()))))
+        "migration_authorize_transfer" => {
+            Some(("current_artifacts", transfer::verify_outbox(&original)?))
         }
+        "migration_restore" | "migration_restore_abort" => {
+            Some(("current_outcome", restore::verify_outcome(&original)?))
+        }
+        "migration_complete_transfer" | "migration_retire_source" => Some((
+            "current_reservation",
+            json!(migration::reservation(db, uuid)?.map(|r| r.view())),
+        )),
         _ => None,
     };
     let verified_at: Option<i64> = db.query_row(
@@ -750,7 +1801,10 @@ fn replay(db: &Connection, id: &str, uuid: &str, operation: &str, result: Option
         |r| r.get(0),
     )?;
     let current = observe(uuid)?;
-    let same_container = match (original["container_id"].as_str(), current["container_id"].as_str()) {
+    let same_container = match (
+        original["container_id"].as_str(),
+        current["container_id"].as_str(),
+    ) {
         (Some(recorded), Some(observed)) => json!(recorded == observed),
         (Some(_), None) => json!(false),
         _ => Value::Null,
@@ -769,13 +1823,35 @@ fn replay(db: &Connection, id: &str, uuid: &str, operation: &str, result: Option
     }
     Ok(response)
 }
-fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params) -> Result<Value, Error> {
+fn perform(
+    db: &Connection,
+    attempt: i64,
+    id: &str,
+    uuid: &str,
+    params: &Params,
+) -> Result<Value, Error> {
+    if matches!(
+        params,
+        Params::Create { .. }
+            | Params::Clone { .. }
+            | Params::Delete
+            | Params::Start { .. }
+            | Params::Stop { .. }
+            | Params::Pause
+            | Params::Resume
+            | Params::Resources { .. }
+    ) {
+        let mut managed = SqliteLifecycleDb { db };
+        return perform_managed(&mut managed, attempt, id, uuid, params);
+    }
     let name = format!("podmesh-{uuid}");
     let existing = inspect(&name)?;
     // On a migration destination an occupied name is a reported blocker, not an early refusal.
     let on_destination = matches!(
         params,
-        Params::DestinationPreflight { .. } | Params::MigrationRestore { .. } | Params::MigrationRestoreAbort { .. }
+        Params::DestinationPreflight { .. }
+            | Params::MigrationRestore { .. }
+            | Params::MigrationRestoreAbort { .. }
     );
     if let Some(ref c) = existing {
         if !on_destination && label(c, UNIVERSE) != Some(uuid) {
@@ -789,7 +1865,13 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
     // flight is about, so they wait for the reservation like the rest.
     if matches!(
         params,
-        Params::Create { .. } | Params::Clone { .. } | Params::Delete | Params::Start { .. } | Params::Pause | Params::Resume | Params::Resources { .. }
+        Params::Create { .. }
+            | Params::Clone { .. }
+            | Params::Delete
+            | Params::Start { .. }
+            | Params::Pause
+            | Params::Resume
+            | Params::Resources { .. }
     ) {
         migration::refuse_if_reserved(db, uuid, params.name())?;
     }
@@ -824,21 +1906,31 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
         migration::refuse_identity_reuse(db, uuid, params.name())?;
     }
     match params {
-        Params::Create { image, command, profile, address, secrets, host_state } => create(db, id, uuid, &name, existing, image, command, profile, *address, secrets, *host_state),
-        Params::Clone { source } => clone(db, id, uuid, source, &name, existing),
-        Params::Delete => delete(db, uuid, &name, existing),
-        Params::Start { observe_seconds } => start(db, attempt, id, uuid, &name, existing, *observe_seconds),
-        Params::Stop { timeout, on_timeout } => stop(db, attempt, id, uuid, &name, existing, *timeout, on_timeout),
-        Params::Pause => pause(db, uuid, &name, existing),
-        Params::Resume => resume(db, uuid, &name, existing),
-        Params::Resources { memory_bytes, cpus } => resources(db, uuid, &name, existing, *memory_bytes, *cpus),
+        Params::Create { .. }
+        | Params::Clone { .. }
+        | Params::Delete
+        | Params::Start { .. }
+        | Params::Stop { .. }
+        | Params::Pause
+        | Params::Resume
+        | Params::Resources { .. } => unreachable!("managed lifecycle operations returned above"),
         Params::MigrationPreflight(binding) => migration::preflight(db, uuid, binding, existing),
-        Params::MigrationCheckpoint(binding) => migration::checkpoint(db, attempt, id, uuid, &name, binding, existing),
+        Params::MigrationCheckpoint(binding) => {
+            migration::checkpoint(db, attempt, id, uuid, &name, binding, existing)
+        }
         Params::MigrationAuthorize {
             checkpoint,
             destination,
             authorization_ref,
-        } => transfer::authorize(db, id, uuid, checkpoint, destination, authorization_ref, existing),
+        } => transfer::authorize(
+            db,
+            id,
+            uuid,
+            checkpoint,
+            destination,
+            authorization_ref,
+            existing,
+        ),
         Params::MigrationComplete { authorization } => {
             let result = transfer::complete(db, id, uuid, authorization, existing)?;
             // The universe now runs elsewhere, so this host's entitlement is surrendered. This is
@@ -849,21 +1941,128 @@ fn perform(db: &Connection, attempt: i64, id: &str, uuid: &str, params: &Params)
             crate::activation::release_by_handoff(db, uuid, id)?;
             Ok(result)
         }
-        Params::MigrationRetire { authorization } => transfer::retire(db, id, uuid, &name, authorization, existing),
-        Params::MigrationRelease { checkpoint } => recovery::release(db, id, uuid, checkpoint, existing),
-        Params::MigrationAbandon { checkpoint } => recovery::abandon(db, id, uuid, checkpoint, existing),
-        Params::MigrationRestoreLocal { checkpoint } => recovery::restore_local(db, attempt, id, uuid, &name, checkpoint, existing),
-        Params::DestinationPreflight { authorization } => restore::preflight(db, uuid, authorization, existing),
-        Params::MigrationRestore { authorization } => restore::restore(db, attempt, id, uuid, &name, authorization, existing),
+        Params::MigrationRetire { authorization } => {
+            transfer::retire(db, id, uuid, &name, authorization, existing)
+        }
+        Params::MigrationRelease { checkpoint } => {
+            recovery::release(db, id, uuid, checkpoint, existing)
+        }
+        Params::MigrationAbandon { checkpoint } => {
+            recovery::abandon(db, id, uuid, checkpoint, existing)
+        }
+        Params::MigrationRestoreLocal { checkpoint } => {
+            recovery::restore_local(db, attempt, id, uuid, &name, checkpoint, existing)
+        }
+        Params::DestinationPreflight { authorization } => {
+            restore::preflight(db, uuid, authorization, existing)
+        }
+        Params::MigrationRestore { authorization } => {
+            restore::restore(db, attempt, id, uuid, &name, authorization, existing)
+        }
         Params::MigrationRestoreAbort {
             authorization,
             reference,
             reclaim_processes,
-        } => restore::abort(db, id, uuid, &name, authorization, reference, *reclaim_processes, existing),
+        } => restore::abort(
+            db,
+            id,
+            uuid,
+            &name,
+            authorization,
+            reference,
+            *reclaim_processes,
+            existing,
+        ),
+    }
+}
+
+fn perform_managed(
+    db: &mut dyn LifecycleDb,
+    attempt: i64,
+    id: &str,
+    uuid: &str,
+    params: &Params,
+) -> Result<Value, Error> {
+    let name = format!("podmesh-{uuid}");
+    let existing = inspect(&name)?;
+    if let Some(ref container) = existing {
+        if label(container, UNIVERSE) != Some(uuid) {
+            return Err("Target is not managed by PodMesh".into());
+        }
+    }
+    if matches!(
+        params,
+        Params::Create { .. }
+            | Params::Clone { .. }
+            | Params::Delete
+            | Params::Start { .. }
+            | Params::Pause
+            | Params::Resume
+            | Params::Resources { .. }
+    ) {
+        db.refuse_reserved(uuid, params.name())?;
+    }
+    if matches!(
+        params,
+        Params::Start { .. } | Params::Resume | Params::Clone { .. }
+    ) {
+        db.refuse_activation(uuid, params.name())?;
+    }
+    if matches!(params, Params::Create { .. } | Params::Clone { .. }) {
+        db.refuse_identity_reuse(uuid, params.name())?;
+    }
+    match params {
+        Params::Create {
+            image,
+            command,
+            profile,
+            address,
+            secrets,
+            host_state,
+        } => create(
+            db,
+            id,
+            uuid,
+            &name,
+            existing,
+            image,
+            command,
+            profile,
+            *address,
+            secrets,
+            *host_state,
+        ),
+        Params::Clone { source } => clone(db, id, uuid, source, &name, existing),
+        Params::Delete => delete(db, uuid, &name, existing),
+        Params::Start { observe_seconds } => {
+            start(db, attempt, id, uuid, &name, existing, *observe_seconds)
+        }
+        Params::Stop {
+            timeout,
+            on_timeout,
+        } => stop(db, attempt, id, uuid, &name, existing, *timeout, on_timeout),
+        Params::Pause => pause(db, uuid, &name, existing),
+        Params::Resume => resume(db, uuid, &name, existing),
+        Params::Resources { memory_bytes, cpus } => {
+            resources(db, uuid, &name, existing, *memory_bytes, *cpus)
+        }
+        _ => Err("Unsupported durable lifecycle operation".into()),
     }
 }
 #[allow(clippy::too_many_arguments)]
-fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Value>, image: &str, command: &[&str], profile: &str, address: Option<&str>, secrets: &(Vec<String>, Option<String>), host_state: Option<&str>) -> Result<Value, Error> {
+fn create(
+    db: &mut dyn LifecycleDb,
+    id: &str,
+    uuid: &str,
+    name: &str,
+    existing: Option<Value>,
+    image: &str,
+    command: &[&str],
+    profile: &str,
+    address: Option<&str>,
+    secrets: &(Vec<String>, Option<String>),
+    host_state: Option<&str>,
+) -> Result<Value, Error> {
     let host_state_name = host_state;
     if let Some(ref c) = existing {
         if label(c, CREATION) != Some(id) {
@@ -877,7 +2076,7 @@ fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Va
         // The managed profile: one stable address allocated to the universe UUID from this host's
         // pool, on the host's bridge. The isolated profile: no network, as every lot before had it.
         let managed = if profile == crate::network::PROFILE_MANAGED {
-            Some(crate::network::allocate(db, uuid, id, address)?)
+            Some(db.allocate_network(uuid, id, address)?)
         } else {
             None
         };
@@ -887,12 +2086,30 @@ fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Va
                 network_arg = format!("--network={bridge}");
                 ip_label = format!("{}={ip}", crate::network::LABEL_IP);
                 network_label = format!("{}={network_uuid}", crate::network::LABEL_NETWORK);
-                args.extend(["--network", bridge, "--ip", ip, "--label", &ip_label, "--label", &network_label]);
+                args.extend([
+                    "--network",
+                    bridge,
+                    "--ip",
+                    ip,
+                    "--label",
+                    &ip_label,
+                    "--label",
+                    &network_label,
+                ]);
                 let _ = &network_arg;
             }
             None => args.push("--network=none"),
         }
-        args.extend(["--name", name, "--label", &label, "--label", &provenance, "--label", &profile_label]);
+        args.extend([
+            "--name",
+            name,
+            "--label",
+            &label,
+            "--label",
+            &provenance,
+            "--label",
+            &profile_label,
+        ]);
         for a in &secrets.0 {
             args.push(a.as_str());
         }
@@ -900,7 +2117,9 @@ fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Va
             args.extend(["--label", l.as_str()]);
         }
         // Claimed before anything is made: refused while another universe holds the name.
-        let host_state = host_state.map(|n| crate::manager::claim_host_state(n, uuid)).transpose()?;
+        let host_state = host_state
+            .map(|n| crate::manager::claim_host_state(n, uuid))
+            .transpose()?;
         if let Some((mounts, label)) = &host_state {
             args.extend(mounts.iter().map(String::as_str));
             args.extend(["--label", label.as_str()]);
@@ -911,7 +2130,7 @@ fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Va
             // A managed create that did not produce a container releases its address; nothing is kept
             // that Podman does not carry.
             if managed.is_some() {
-                let _ = crate::network::release(db, uuid, id);
+                let _ = db.release_network(uuid, id);
             }
             if let Some(name) = host_state_name {
                 let _ = crate::manager::release_host_state(name);
@@ -922,20 +2141,36 @@ fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Va
     let c = inspect(name)?.ok_or("Created container not observable")?;
     let network = crate::network::of_container(&c);
     if profile == crate::network::PROFILE_MANAGED {
-        let requested = network["requested"]["ip"].as_str().unwrap_or("").to_string();
-        let bridge = c["Config"]["Labels"][crate::network::LABEL_PROFILE].as_str().map(|_| crate::network::BRIDGE).unwrap_or("");
+        let requested = network["requested"]["ip"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let bridge = c["Config"]["Labels"][crate::network::LABEL_PROFILE]
+            .as_str()
+            .map(|_| crate::network::BRIDGE)
+            .unwrap_or("");
         // Before a start the address is not up, and Podman records a created container's static
         // address only in the command it will run; after a start it is in the network settings.
         // Both are read back from Podman, never from this service's own allocation table, and a
         // container that carries neither is removed and its address released: nothing is kept that
         // Podman does not carry.
-        let effective = network["effective"].as_array().is_some_and(|v| v.iter().any(|n| n["ip"].as_str() == Some(requested.as_str())));
-        let create_command: Vec<&str> = c["Config"]["CreateCommand"].as_array().map(|v| v.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
-        let carried = create_command.windows(2).any(|w| w[0] == "--ip" && w[1] == requested)
-            && c["NetworkSettings"]["Networks"].as_object().is_some_and(|m| m.contains_key(bridge));
+        let effective = network["effective"].as_array().is_some_and(|v| {
+            v.iter()
+                .any(|n| n["ip"].as_str() == Some(requested.as_str()))
+        });
+        let create_command: Vec<&str> = c["Config"]["CreateCommand"]
+            .as_array()
+            .map(|v| v.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let carried = create_command
+            .windows(2)
+            .any(|w| w[0] == "--ip" && w[1] == requested)
+            && c["NetworkSettings"]["Networks"]
+                .as_object()
+                .is_some_and(|m| m.contains_key(bridge));
         if !effective && !carried {
             let _ = podman(QUICK, &["rm", name]);
-            let _ = crate::network::release(db, uuid, id);
+            let _ = db.release_network(uuid, id);
             return Err(format!("the container does not carry the allocated address {requested}; it was removed and the address released").into());
         }
     }
@@ -943,9 +2178,14 @@ fn create(db: &Connection, id: &str, uuid: &str, name: &str, existing: Option<Va
         json!({"status":"verified","state":c["State"]["Status"],"universe_uuid":uuid,"container_id":c["Id"],"network":network,"started":false}),
     )
 }
-fn delete(db: &Connection, uuid: &str, name: &str, existing: Option<Value>) -> Result<Value, Error> {
+fn delete(
+    db: &mut dyn LifecycleDb,
+    uuid: &str,
+    name: &str,
+    existing: Option<Value>,
+) -> Result<Value, Error> {
     if let Some(c) = existing {
-        owned(db, &c, uuid, "Target")?;
+        db.owned(&c, uuid, "Target")?;
         stopped(&c).map_err(|e| format!("Refusing to delete: {e}; stop it explicitly first"))?;
         // Do not force removal and do not remove volumes.
         podman(QUICK, &["rm", name])?;
@@ -963,12 +2203,12 @@ fn delete(db: &Connection, uuid: &str, name: &str, existing: Option<Value>) -> R
     if inspect(name)?.is_some() {
         return Err("Container still present after removal".into());
     }
-    let (removed, retained) = remove_snapshots(db, uuid)?;
+    let (removed, retained) = db.remove_snapshots(uuid)?;
     // A restored or promoted universe's imported image goes the same way, once nothing uses it.
-    let (restore_removed, restore_retained) = crate::recovery_point::remove_restore_images(db, uuid)?;
+    let (restore_removed, restore_retained) = db.remove_restore_images(uuid)?;
     // A managed universe's address is released once its container is gone: bound to the UUID
     // while the universe exists here, free afterwards, recorded either way.
-    let released_ip = crate::network::release(db, uuid, "delete")?;
+    let released_ip = db.release_network(uuid, "delete")?;
     Ok(
         json!({"status":"verified","universe_uuid":uuid,"absent":true,"volumes":"retained","snapshot_images_removed":removed,"snapshot_images_retained":retained,
                "restore_images_removed":restore_removed,"restore_images_retained":restore_retained,"network_address_released":released_ip}),
@@ -1001,7 +2241,7 @@ fn start_result(c: &Value, uuid: &str, action: &str, observe_seconds: u64, note:
     result
 }
 fn start(
-    db: &Connection,
+    db: &mut dyn LifecycleDb,
     attempt: i64,
     id: &str,
     uuid: &str,
@@ -1010,9 +2250,9 @@ fn start(
     observe_seconds: u64,
 ) -> Result<Value, Error> {
     let c = existing.ok_or("Universe container not found")?;
-    owned(db, &c, uuid, "Target")?;
+    db.owned(&c, uuid, "Target")?;
     let started_at = c["State"]["StartedAt"].as_str().unwrap_or("").to_string();
-    if let Some(first) = earlier_attempt(db, id, attempt)? {
+    if let Some(first) = db.earlier_attempt(id, attempt)? {
         match epoch(&started_at) {
             Some(t) if t >= first => {
                 return Ok(start_result(&c, uuid, "none_start_observed_since_first_attempt", 0,
@@ -1049,7 +2289,10 @@ fn start(
             view["runtime_error"] = c["State"]["Error"].clone();
             view
         });
-        return Err(failure(format!("Start failed: {e}"), json!({"observed": observed})));
+        return Err(failure(
+            format!("Start failed: {e}"),
+            json!({"observed": observed}),
+        ));
     }
     // The application may exit at once. Report only what is observed within the window.
     let deadline = Instant::now() + Duration::from_secs(observe_seconds);
@@ -1074,11 +2317,11 @@ fn start(
     let mut result = start_result(&c, uuid, "started", observe_seconds, note);
     // Starting a released universe begins its application afresh. Say so: the caller chose this over
     // migration_restore_local, which is the operation that resumes the checkpointed memory.
-    if let Some(r) = migration::reservation(db, uuid)? {
+    if let Some(state) = db.reservation_state(uuid)? {
         result["memory_restored"] = json!(false);
         result["memory_note"] = json!(format!(
             "this is an ordinary start of a universe whose reservation is {}: the checkpointed memory was not restored and the application began afresh; migration_restore_local resumes it instead",
-            r.state
+            state
         ));
     }
     Ok(result)
@@ -1095,7 +2338,9 @@ fn host_memory_bytes() -> Result<u64, Error> {
 }
 
 fn host_cpus() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 fn state_result(c: &Value, uuid: &str, operation: &str, action: &str, note: &str) -> Value {
@@ -1112,56 +2357,108 @@ fn state_result(c: &Value, uuid: &str, operation: &str, action: &str, note: &str
 /// Freeze a running universe. Its processes stop being scheduled, its memory and its network
 /// address stay; Podman reports `paused`. A paused universe is already stopped for every purpose
 /// of a second writer, so this is never gated by the lease, and it is idempotent by state.
-fn pause(db: &Connection, uuid: &str, name: &str, existing: Option<Value>) -> Result<Value, Error> {
+fn pause(
+    db: &mut dyn LifecycleDb,
+    uuid: &str,
+    name: &str,
+    existing: Option<Value>,
+) -> Result<Value, Error> {
     let c = existing.ok_or("Universe container not found")?;
-    owned(db, &c, uuid, "Target")?;
+    db.owned(&c, uuid, "Target")?;
     let state = status(&c);
     if state == "paused" {
-        return Ok(state_result(&c, uuid, "pause", "none_already_paused", "the universe was already paused; nothing was sent"));
+        return Ok(state_result(
+            &c,
+            uuid,
+            "pause",
+            "none_already_paused",
+            "the universe was already paused; nothing was sent",
+        ));
     }
     if state != "running" {
         return Err(failure(format!("Container state {state} is outside the pause contract: only a running universe is paused"), json!({"observed": state_view(&c)})));
     }
     if let Err(e) = podman(QUICK, &["pause", name]) {
         let observed = inspect(name)?.map(|c| state_view(&c));
-        return Err(failure(format!("Pause failed: {e}"), json!({"observed": observed})));
+        return Err(failure(
+            format!("Pause failed: {e}"),
+            json!({"observed": observed}),
+        ));
     }
     let c = inspect(name)?.ok_or("Container disappeared after pause")?;
     if status(&c) != "paused" {
-        return Err(failure("Podman reported success but the universe is not paused", json!({"observed": state_view(&c)})));
+        return Err(failure(
+            "Podman reported success but the universe is not paused",
+            json!({"observed": state_view(&c)}),
+        ));
     }
-    Ok(state_result(&c, uuid, "pause", "paused", "every process of the universe is frozen; its memory and its address stay; resume thaws it"))
+    Ok(state_result(
+        &c,
+        uuid,
+        "pause",
+        "paused",
+        "every process of the universe is frozen; its memory and its address stay; resume thaws it",
+    ))
 }
 
 /// Thaw a paused universe. It leaves a running writer behind, so the caller passed the same gate
 /// as `start`; a universe that is running already is left alone.
-fn resume(db: &Connection, uuid: &str, name: &str, existing: Option<Value>) -> Result<Value, Error> {
+fn resume(
+    db: &mut dyn LifecycleDb,
+    uuid: &str,
+    name: &str,
+    existing: Option<Value>,
+) -> Result<Value, Error> {
     let c = existing.ok_or("Universe container not found")?;
-    owned(db, &c, uuid, "Target")?;
+    db.owned(&c, uuid, "Target")?;
     let state = status(&c);
     if state == "running" {
-        return Ok(state_result(&c, uuid, "resume", "none_already_running", "the universe was running; nothing was sent"));
+        return Ok(state_result(
+            &c,
+            uuid,
+            "resume",
+            "none_already_running",
+            "the universe was running; nothing was sent",
+        ));
     }
     if state != "paused" {
         return Err(failure(format!("Container state {state} is outside the resume contract: only a paused universe is resumed (a stopped one is started)"), json!({"observed": state_view(&c)})));
     }
     if let Err(e) = podman(QUICK, &["unpause", name]) {
         let observed = inspect(name)?.map(|c| state_view(&c));
-        return Err(failure(format!("Resume failed: {e}"), json!({"observed": observed})));
+        return Err(failure(
+            format!("Resume failed: {e}"),
+            json!({"observed": observed}),
+        ));
     }
     let c = inspect(name)?.ok_or("Container disappeared after resume")?;
     if status(&c) != "running" {
-        return Err(failure("Podman reported success but the universe is not running", json!({"observed": state_view(&c)})));
+        return Err(failure(
+            "Podman reported success but the universe is not running",
+            json!({"observed": state_view(&c)}),
+        ));
     }
-    Ok(state_result(&c, uuid, "resume", "resumed", "the universe's processes run again from where they were frozen"))
+    Ok(state_result(
+        &c,
+        uuid,
+        "resume",
+        "resumed",
+        "the universe's processes run again from where they were frozen",
+    ))
 }
 
 /// What the kernel enforces for this container right now: its cgroup's memory.max and cpu.max,
 /// read from the unified hierarchy. `None` when the container has no cgroup (not running).
 fn cgroup_limits(c: &Value) -> Option<Value> {
-    let path = c["State"]["CgroupPath"].as_str().filter(|p| !p.is_empty())?;
+    let path = c["State"]["CgroupPath"]
+        .as_str()
+        .filter(|p| !p.is_empty())?;
     let dir = std::path::Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
-    let read = |f: &str| std::fs::read_to_string(dir.join(f)).ok().map(|s| s.trim().to_string());
+    let read = |f: &str| {
+        std::fs::read_to_string(dir.join(f))
+            .ok()
+            .map(|s| s.trim().to_string())
+    };
     let memory_max = read("memory.max")?;
     let cpu_max = read("cpu.max")?;
     // cpu.max is "<quota> <period>" in microseconds, or "max <period>".
@@ -1169,7 +2466,10 @@ fn cgroup_limits(c: &Value) -> Option<Value> {
         let mut it = cpu_max.split_whitespace();
         match (it.next(), it.next().and_then(|p| p.parse::<f64>().ok())) {
             (Some("max"), _) => None,
-            (Some(q), Some(period)) => q.parse::<f64>().ok().map(|q| (q / period * 100.0).round() / 100.0),
+            (Some(q), Some(period)) => q
+                .parse::<f64>()
+                .ok()
+                .map(|q| (q / period * 100.0).round() / 100.0),
             _ => None,
         }
     };
@@ -1185,28 +2485,44 @@ fn cgroup_limits(c: &Value) -> Option<Value> {
 /// Set the memory limit and the CPU allowance of a universe (`podman update`). On a running
 /// universe the kernel applies them to its cgroup at once, and the result reads them back from
 /// there; on a stopped one they are kept for its next start and read back from Podman's record.
-fn resources(db: &Connection, uuid: &str, name: &str, existing: Option<Value>, memory_bytes: Option<u64>, cpus: Option<f64>) -> Result<Value, Error> {
+fn resources(
+    db: &mut dyn LifecycleDb,
+    uuid: &str,
+    name: &str,
+    existing: Option<Value>,
+    memory_bytes: Option<u64>,
+    cpus: Option<f64>,
+) -> Result<Value, Error> {
     let c = existing.ok_or("Universe container not found")?;
-    owned(db, &c, uuid, "Target")?;
+    db.owned(&c, uuid, "Target")?;
     let state = status(&c);
     if !(state == "running" || state == "paused" || STOPPED.contains(&state)) {
-        return Err(failure(format!("Container state {state} is outside the resources contract"), json!({"observed": state_view(&c)})));
+        return Err(failure(
+            format!("Container state {state} is outside the resources contract"),
+            json!({"observed": state_view(&c)}),
+        ));
     }
     let mut args: Vec<String> = vec!["update".into()];
     if let Some(m) = memory_bytes {
         // The same value for swap: a limit on memory alone lets the universe spill into swap
         // instead of being limited.
-        args.push("--memory".into()); args.push(m.to_string());
-        args.push("--memory-swap".into()); args.push(m.to_string());
+        args.push("--memory".into());
+        args.push(m.to_string());
+        args.push("--memory-swap".into());
+        args.push(m.to_string());
     }
     if let Some(cp) = cpus {
-        args.push("--cpus".into()); args.push(format!("{cp}"));
+        args.push("--cpus".into());
+        args.push(format!("{cp}"));
     }
     args.push(name.into());
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     if let Err(e) = podman(QUICK, &argv) {
         let observed = inspect(name)?.map(|c| state_view(&c));
-        return Err(failure(format!("Resources update failed: {e}"), json!({"observed": observed})));
+        return Err(failure(
+            format!("Resources update failed: {e}"),
+            json!({"observed": observed}),
+        ));
     }
     let c = inspect(name)?.ok_or("Container disappeared after the update")?;
     let recorded_memory = c["HostConfig"]["Memory"].as_u64().unwrap_or(0);
@@ -1221,22 +2537,34 @@ fn resources(db: &Connection, uuid: &str, name: &str, existing: Option<Value>, m
     let exited = !(state == "running" || state == "paused" || state == "created");
     if !exited {
         if !memory_agrees {
-            return Err(failure("Podman reported success but records another memory limit", json!({"requested": memory_bytes, "recorded": recorded_memory})));
+            return Err(failure(
+                "Podman reported success but records another memory limit",
+                json!({"requested": memory_bytes, "recorded": recorded_memory}),
+            ));
         }
         if !cpus_agree {
-            return Err(failure("Podman reported success but records another CPU allowance", json!({"requested": cpus, "recorded": recorded_cpus})));
+            return Err(failure(
+                "Podman reported success but records another CPU allowance",
+                json!({"requested": cpus, "recorded": recorded_cpus}),
+            ));
         }
     }
     let kernel = cgroup_limits(&c);
     if let Some(k) = kernel.as_ref() {
         if let Some(m) = memory_bytes {
             if k["memory_max_bytes"].as_u64() != Some(m) {
-                return Err(failure("The kernel does not enforce the requested memory limit", json!({"requested": m, "kernel": k})));
+                return Err(failure(
+                    "The kernel does not enforce the requested memory limit",
+                    json!({"requested": m, "kernel": k}),
+                ));
             }
         }
         if let Some(cp) = cpus {
             if k["cpus"].as_f64().is_none_or(|v| (v - cp).abs() > 0.011) {
-                return Err(failure("The kernel does not enforce the requested CPU allowance", json!({"requested": cp, "kernel": k})));
+                return Err(failure(
+                    "The kernel does not enforce the requested CPU allowance",
+                    json!({"requested": cp, "kernel": k}),
+                ));
             }
         }
     }
@@ -1281,7 +2609,8 @@ fn stop_result(
     result["on_timeout"] = json!(on_timeout);
     result["forced"] = json!(forced);
     result["forced_evidence"] = json!(match (action, on_timeout, forced) {
-        ("stopped", "kill", true) => "podman reported escalation to SIGKILL after the graceful timeout",
+        ("stopped", "kill", true) =>
+            "podman reported escalation to SIGKILL after the graceful timeout",
         ("stopped", "kill", false) => "no escalation reported by podman",
         ("stopped", _, _) => "only the stop signal was sent",
         _ => "no signal was sent",
@@ -1292,7 +2621,7 @@ fn stop_result(
 }
 #[allow(clippy::too_many_arguments)]
 fn stop(
-    db: &Connection,
+    db: &mut dyn LifecycleDb,
     attempt: i64,
     id: &str,
     uuid: &str,
@@ -1302,7 +2631,7 @@ fn stop(
     on_timeout: &str,
 ) -> Result<Value, Error> {
     let c = existing.ok_or("Universe container not found")?;
-    owned(db, &c, uuid, "Target")?;
+    db.owned(&c, uuid, "Target")?;
     let state = status(&c);
     if STOPPED.contains(&state) {
         return Ok(stop_result(
@@ -1324,7 +2653,7 @@ fn stop(
         ));
     }
     let started_at = c["State"]["StartedAt"].as_str().unwrap_or("").to_string();
-    if let Some(first) = earlier_attempt(db, id, attempt)? {
+    if let Some(first) = db.earlier_attempt(id, attempt)? {
         match epoch(&started_at) {
             Some(t) if t < first => {}
             _ => {
@@ -1335,7 +2664,10 @@ fn stop(
             }
         }
     }
-    let signal = c["Config"]["StopSignal"].as_str().unwrap_or("SIGTERM").to_string();
+    let signal = c["Config"]["StopSignal"]
+        .as_str()
+        .unwrap_or("SIGTERM")
+        .to_string();
     let begin = Instant::now();
     let mut forced = false;
     if on_timeout == "kill" {
@@ -1396,7 +2728,14 @@ fn stop(
 /// Clone a stopped, mount-free universe: commit its root filesystem into a snapshot image
 /// tagged by operation ID, then create a new network-disabled container from that image.
 /// A retry reuses a snapshot committed by an interrupted attempt of the same operation.
-fn clone(db: &Connection, id: &str, uuid: &str, source: &str, name: &str, existing: Option<Value>) -> Result<Value, Error> {
+fn clone(
+    db: &mut dyn LifecycleDb,
+    id: &str,
+    uuid: &str,
+    source: &str,
+    name: &str,
+    existing: Option<Value>,
+) -> Result<Value, Error> {
     let reference = format!("{SNAPSHOT_REPOSITORY}{id}");
     let mut reused = false;
     if let Some(ref c) = existing {
@@ -1404,12 +2743,19 @@ fn clone(db: &Connection, id: &str, uuid: &str, source: &str, name: &str, existi
             return Err("Clone target already belongs to another operation".into());
         }
     } else {
-        let prior = images()?.into_iter().find(|i| names(i).contains(&reference.as_str()));
+        let prior = images()?
+            .into_iter()
+            .find(|i| names(i).contains(&reference.as_str()));
         let image = if let Some(snapshot) = prior {
             let l = &snapshot["Labels"];
-            if l[SNAPSHOT_FOR].as_str() != Some(uuid) || l[SNAPSHOT_OPERATION].as_str() != Some(id) || l[UNIVERSE].as_str() != Some(source)
+            if l[SNAPSHOT_FOR].as_str() != Some(uuid)
+                || l[SNAPSHOT_OPERATION].as_str() != Some(id)
+                || l[UNIVERSE].as_str() != Some(source)
             {
-                return Err("Snapshot reference exists with different provenance; refusing to reuse it".into());
+                return Err(
+                    "Snapshot reference exists with different provenance; refusing to reuse it"
+                        .into(),
+                );
             }
             reused = true;
             image_id(&snapshot).to_string()
@@ -1419,13 +2765,21 @@ fn clone(db: &Connection, id: &str, uuid: &str, source: &str, name: &str, existi
             if label(&before, UNIVERSE) != Some(source) {
                 return Err("Clone source is not managed by PodMesh".into());
             }
-            owned(db, &before, source, "Clone source")?;
-            migration::refuse_if_reserved(db, source, "clone from this source")?;
-            stopped(&before).map_err(|e| format!("Clone source must be stopped for a coherent filesystem snapshot: {e}"))?;
-            if before["Mounts"].as_array().map(|m| !m.is_empty()).unwrap_or(true) {
+            db.owned(&before, source, "Clone source")?;
+            db.refuse_reserved(source, "clone from this source")?;
+            stopped(&before).map_err(|e| {
+                format!("Clone source must be stopped for a coherent filesystem snapshot: {e}")
+            })?;
+            if before["Mounts"]
+                .as_array()
+                .map(|m| !m.is_empty())
+                .unwrap_or(true)
+            {
                 return Err("Volume and bind mount cloning is not supported yet".into());
             }
-            let source_id = before["Id"].as_str().ok_or("Missing source container identity")?;
+            let source_id = before["Id"]
+                .as_str()
+                .ok_or("Missing source container identity")?;
             let changes = [
                 format!("LABEL {SNAPSHOT_FOR}={uuid}"),
                 format!("LABEL {SNAPSHOT_OPERATION}={id}"),
@@ -1449,12 +2803,17 @@ fn clone(db: &Connection, id: &str, uuid: &str, source: &str, name: &str, existi
                 ],
             )?;
             let after = inspect(&source_name)?;
-            let unchanged = after
-                .as_ref()
-                .is_some_and(|a| a["Id"] == before["Id"] && a["State"]["StartedAt"] == before["State"]["StartedAt"] && stopped(a).is_ok());
+            let unchanged = after.as_ref().is_some_and(|a| {
+                a["Id"] == before["Id"]
+                    && a["State"]["StartedAt"] == before["State"]["StartedAt"]
+                    && stopped(a).is_ok()
+            });
             if !unchanged {
                 let _ = podman(QUICK, &["image", "rm", &reference]);
-                return Err("Clone source was started or replaced during the snapshot; snapshot discarded".into());
+                return Err(
+                    "Clone source was started or replaced during the snapshot; snapshot discarded"
+                        .into(),
+                );
             }
             let snapshot = images()?
                 .into_iter()
@@ -1466,7 +2825,11 @@ fn clone(db: &Connection, id: &str, uuid: &str, source: &str, name: &str, existi
         let provenance = format!("{CREATION}={id}");
         // A clone does not carry the managed profile yet: it is created isolated, labelled so, and its
         // answer says so (docs/UNIVERSE-NETWORK-CONTRACT.md).
-        let profile_label = format!("{}={}", crate::network::LABEL_PROFILE, crate::network::PROFILE_ISOLATED);
+        let profile_label = format!(
+            "{}={}",
+            crate::network::LABEL_PROFILE,
+            crate::network::PROFILE_ISOLATED
+        );
         podman(
             QUICK,
             &[
@@ -1487,7 +2850,11 @@ fn clone(db: &Connection, id: &str, uuid: &str, source: &str, name: &str, existi
     }
     // Verify the observed clone, whether created now or by an interrupted attempt.
     let c = inspect(name)?.ok_or("Clone not observable")?;
-    let image = c["Image"].as_str().unwrap_or("").trim_start_matches("sha256:").to_string();
+    let image = c["Image"]
+        .as_str()
+        .unwrap_or("")
+        .trim_start_matches("sha256:")
+        .to_string();
     let snapshot = images()?
         .into_iter()
         .find(|i| image_id(i) == image)
@@ -1500,7 +2867,12 @@ fn clone(db: &Connection, id: &str, uuid: &str, source: &str, name: &str, existi
     {
         return Err("Clone provenance does not match the operation".into());
     }
-    if c["HostConfig"]["NetworkMode"].as_str() != Some("none") || c["Mounts"].as_array().map(|m| !m.is_empty()).unwrap_or(true) {
+    if c["HostConfig"]["NetworkMode"].as_str() != Some("none")
+        || c["Mounts"]
+            .as_array()
+            .map(|m| !m.is_empty())
+            .unwrap_or(true)
+    {
         return Err("Clone configuration does not match the supported scope".into());
     }
     Ok(
@@ -1518,11 +2890,15 @@ fn snapshot_recorded(db: &Connection, uuid: &str, i: &Value) -> Result<bool, Err
         return Ok(false);
     };
     let row: Option<(String, String, Option<String>)> = db
-        .query_row("SELECT request,status,result FROM operations WHERE id=?1", [operation], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
+        .query_row(
+            "SELECT request,status,result FROM operations WHERE id=?1",
+            [operation],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
         .optional()?;
-    let Some((request, status, result)) = row else { return Ok(false) };
+    let Some((request, status, result)) = row else {
+        return Ok(false);
+    };
     let request: Value = serde_json::from_str(&request)?;
     if request["operation"] != "clone"
         || request["universe_uuid"].as_str() != Some(uuid)
@@ -1535,13 +2911,17 @@ fn snapshot_recorded(db: &Connection, uuid: &str, i: &Value) -> Result<bool, Err
         return Ok(true);
     }
     let result: Value = serde_json::from_str(result.as_deref().unwrap_or("null"))?;
-    Ok(result["snapshot_image"].as_str() == Some(image_id(i)) && result["source_container_id"] == l[SNAPSHOT_SOURCE])
+    Ok(result["snapshot_image"].as_str() == Some(image_id(i))
+        && result["source_container_id"] == l[SNAPSHOT_SOURCE])
 }
 /// Remove snapshot images committed for this universe. Never forced: an image still used
 /// by a container or by a dependent image, or without journal provenance, is retained and reported.
 fn remove_snapshots(db: &Connection, uuid: &str) -> Result<(Vec<String>, Vec<Value>), Error> {
     let (mut removed, mut retained) = (vec![], vec![]);
-    for i in images()?.iter().filter(|i| i["Labels"][SNAPSHOT_FOR].as_str() == Some(uuid)) {
+    for i in images()?
+        .iter()
+        .filter(|i| i["Labels"][SNAPSHOT_FOR].as_str() == Some(uuid))
+    {
         let id = image_id(i).to_string();
         let tags = names(i);
         if tags.iter().any(|n| !n.starts_with(SNAPSHOT_REPOSITORY)) {
@@ -1552,7 +2932,11 @@ fn remove_snapshots(db: &Connection, uuid: &str) -> Result<(Vec<String>, Vec<Val
             retained.push(json!({"image":id,"reason":"snapshot provenance does not match this host's journal"}));
             continue;
         }
-        let targets = if tags.is_empty() { vec![id.as_str()] } else { tags };
+        let targets = if tags.is_empty() {
+            vec![id.as_str()]
+        } else {
+            tags
+        };
         let mut args = vec!["image", "rm"];
         args.extend(targets);
         match podman(QUICK, &args) {

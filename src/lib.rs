@@ -1,19 +1,19 @@
-mod cleanup;
 mod activation;
 mod boot_restore;
+mod cleanup;
+mod manager;
+mod network;
+mod publisher;
 mod recovery_point;
 mod retention;
-mod network;
-mod manager;
-mod secrets;
-mod publisher;
-mod signing;
 mod schema;
+mod secrets;
+mod signing;
 // The journal's engine, named once (docs/STORE-CONFIGURATION.md). Public so that the tools and
 // the manager tree may open a store; `storage` below is Podman's graph, not this.
-pub mod store;
-mod storage;
 mod health;
+mod storage;
+pub mod store;
 pub use manager::control_relay;
 pub use network::reconcile as reconcile_network;
 pub use publisher::withdraw_at_startup as withdraw_unentitled_publishers_at_startup;
@@ -35,7 +35,10 @@ use std::{
 use store::{migrations, DurableStore, Engine, SqliteStore, StoreConfig, Value as Stored};
 
 pub fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 /// The file a node's store profile is read from, under its state directory, when it is there.
@@ -60,9 +63,14 @@ pub fn store_profile(dir: &Path) -> Result<StoreConfig, Box<dyn std::error::Erro
             beside
         }
     };
-    let text = fs::read_to_string(&path).map_err(|e| format!("The store profile {} could not be read: {e}", path.display()))?;
-    let document: Value =
-        serde_json::from_str(&text).map_err(|e| format!("The store profile {} is not JSON: {e}", path.display()))?;
+    let text = fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "The store profile {} could not be read: {e}",
+            path.display()
+        )
+    })?;
+    let document: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("The store profile {} is not JSON: {e}", path.display()))?;
     Ok(StoreConfig::from_json(&document, Some(dir))?)
 }
 
@@ -129,7 +137,10 @@ impl NodeStore {
 /// Whichever engine carries it, the journal is the same set of tables at the same version: the
 /// migrations in `src/store/migrations/node/` are applied in order, and the store records which
 /// of them it has. An incomplete MariaDB profile is refused before anything is opened.
-pub fn open_node_store(dir: &Path, config: &StoreConfig) -> Result<NodeStore, Box<dyn std::error::Error>> {
+pub fn open_node_store(
+    dir: &Path,
+    config: &StoreConfig,
+) -> Result<NodeStore, Box<dyn std::error::Error>> {
     fs::create_dir_all(dir)?;
     config.validate()?;
     let opened = match config.engine {
@@ -160,19 +171,38 @@ pub fn open_node_store(dir: &Path, config: &StoreConfig) -> Result<NodeStore, Bo
 /// both. One process opens a node's journal, so there is no second writer to race here.
 fn bind_to_this_host(store: &mut dyn DurableStore) -> Result<(), Box<dyn std::error::Error>> {
     let machine = fs::read_to_string("/etc/machine-id")?.trim().to_string();
-    let uuid = fs::read_to_string("/proc/sys/kernel/random/uuid")?.trim().to_string();
-    let held = store.query_one("SELECT value FROM metadata WHERE `key` = ?", &[Stored::from("machine_id")])?;
+    let uuid = fs::read_to_string("/proc/sys/kernel/random/uuid")?
+        .trim()
+        .to_string();
+    let held = store.query_one(
+        "SELECT value FROM metadata WHERE `key` = ?",
+        &[Stored::from("machine_id")],
+    )?;
     if let Some(previous) = &held {
         if previous.text(0)? != machine {
-            return Err("State belongs to a different host; explicit identity adoption required".into());
+            return Err(
+                "State belongs to a different host; explicit identity adoption required".into(),
+            );
         }
     }
     let mut tx = store.transaction()?;
     if held.is_none() {
-        tx.execute("INSERT INTO metadata(`key`, value) VALUES(?, ?)", &[Stored::from("machine_id"), Stored::from(machine)])?;
+        tx.execute(
+            "INSERT INTO metadata(`key`, value) VALUES(?, ?)",
+            &[Stored::from("machine_id"), Stored::from(machine)],
+        )?;
     }
-    if tx.query_one("SELECT value FROM metadata WHERE `key` = ?", &[Stored::from("host_uuid")])?.is_none() {
-        tx.execute("INSERT INTO metadata(`key`, value) VALUES(?, ?)", &[Stored::from("host_uuid"), Stored::from(uuid)])?;
+    if tx
+        .query_one(
+            "SELECT value FROM metadata WHERE `key` = ?",
+            &[Stored::from("host_uuid")],
+        )?
+        .is_none()
+    {
+        tx.execute(
+            "INSERT INTO metadata(`key`, value) VALUES(?, ?)",
+            &[Stored::from("host_uuid"), Stored::from(uuid)],
+        )?;
     }
     tx.commit()?;
     Ok(())
@@ -232,15 +262,7 @@ fn inventory() -> Result<Value, Box<dyn std::error::Error>> {
 fn sqlite_only_operation(operation: &str) -> bool {
     matches!(
         operation,
-        "create"
-            | "delete"
-            | "clone"
-            | "start"
-            | "stop"
-            | "pause"
-            | "resume"
-            | "resources"
-            | "migration_preflight"
+        "migration_preflight"
             | "migration_checkpoint"
             | "migration_authorize_transfer"
             | "migration_complete_transfer"
@@ -300,6 +322,13 @@ fn sqlite_only_operation(operation: &str) -> bool {
     )
 }
 
+fn durable_lifecycle_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "create" | "delete" | "clone" | "start" | "stop" | "pause" | "resume" | "resources"
+    )
+}
+
 fn durable_capabilities(engine: Engine) -> Value {
     json!({
         "schemas": schema::all(),
@@ -313,10 +342,18 @@ fn durable_capabilities(engine: Engine) -> Value {
             "storage_status",
             "host_status",
             "universe_stats",
+            "create",
+            "delete",
+            "clone",
+            "start",
+            "stop",
+            "pause",
+            "resume",
+            "resources",
         ],
         "store_engine": engine.as_str(),
         "unsupported_error_code": "store_engine_unsupported",
-        "scope": "read-only local API; module-owned operations remain SQLite-only",
+        "scope": "read-only local API plus lifecycle create/delete/clone/start/stop/pause/resume/resources; other module-owned mutations remain SQLite-only",
     })
 }
 
@@ -326,7 +363,34 @@ fn durable_capabilities(engine: Engine) -> Value {
 /// contract reads. Module-owned status operations remain on the named refusal path with their
 /// module until that module is ported as a whole.
 fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
-    let operation = request.get("operation").and_then(Value::as_str).unwrap_or("");
+    let operation = request
+        .get("operation")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if durable_lifecycle_operation(operation) {
+        let result = lifecycle::execute_store(store, request);
+        let response = match result {
+            Ok(data) => json!({"ok":true,"observed_at":now(),"data":data}),
+            Err(error) => {
+                let mut failure = json!({"ok":false,"observed_at":now(),"error":error.to_string()});
+                if let Some(details) = error.downcast_ref::<lifecycle::Failure>() {
+                    failure["details"] = details.details.clone();
+                }
+                failure
+            }
+        };
+        if let Err(error) = store.execute(
+            "INSERT INTO observations(observed_at, operation, result) VALUES(?, ?, ?)",
+            &[
+                Stored::from(now() as i64),
+                Stored::from(operation),
+                Stored::from(response.to_string()),
+            ],
+        ) {
+            return json!({"ok":false,"error":format!("Observation persistence failed: {error}")});
+        }
+        return response;
+    }
     if sqlite_only_operation(operation) {
         return json!({
             "ok": false,
@@ -345,7 +409,10 @@ fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
             "capabilities" => durable_capabilities(store.engine()),
             "identity" => {
                 let row = store
-                    .query_one("SELECT value FROM metadata WHERE `key` = ?", &[Stored::from("host_uuid")])?
+                    .query_one(
+                        "SELECT value FROM metadata WHERE `key` = ?",
+                        &[Stored::from("host_uuid")],
+                    )?
                     .ok_or("The journal carries no host_uuid")?;
                 json!({"host_uuid": row.text(0)?})
             }
@@ -380,7 +447,10 @@ fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
 }
 
 pub fn handle(db: &Connection, request: &Value) -> Value {
-    let op = request.get("operation").and_then(Value::as_str).unwrap_or("");
+    let op = request
+        .get("operation")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let result: Result<Value, Box<dyn std::error::Error>> = (|| {
         Ok(match op {
             "create"
@@ -404,17 +474,42 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
             | "migration_restore_abort" => lifecycle::execute(db, request)?,
             // Host-wide by design: the collector is the only operation that does not name one universe.
             "garbage_collect_plan" | "garbage_collect_apply" => collector::execute(db, request)?,
-            "collection_retention_declare" | "collection_hold_declare" | "collection_hold_release" | "collection_status" => retention::execute(db, request)?,
-            "manager_status" | "manager_decision" | "manager_observe"
-            | "manager_vote_ledger_init" | "manager_vote_ledger_mark_unadmitted"
-            | "manager_vote_ledger_readmit" | "manager_decision_propose" => manager::execute(db, request)?,
+            "collection_retention_declare"
+            | "collection_hold_declare"
+            | "collection_hold_release"
+            | "collection_status" => retention::execute(db, request)?,
+            "manager_status"
+            | "manager_decision"
+            | "manager_observe"
+            | "manager_vote_ledger_init"
+            | "manager_vote_ledger_mark_unadmitted"
+            | "manager_vote_ledger_readmit"
+            | "manager_decision_propose" => manager::execute(db, request)?,
             "secret_declare" | "secret_remove" | "secret_status" => secrets::execute(db, request)?,
-            "publisher_declare" | "publisher_start" | "publisher_stop" | "publisher_status" | "publisher_observed" => publisher::execute(db, request)?,
-            "network_declare" | "network_undeclare" | "network_route_publish" | "network_route_withdraw" | "network_route_resume" | "network_reapply" | "network_status" => network::execute(db, request)?,
-            "activation_require" | "activation_acquire" | "activation_renew" | "activation_release"
-            | "activation_supersede" | "activation_status" | "activation_fence" | "activation_fence_preview" => activation::execute(db, request)?,
-            "recovery_point_prepare" | "recovery_point_status" | "recovery_point_restore" | "recovery_point_promote"
-            | "recovery_point_stage" | "recovery_point_discard" | "recovery_point_resume" => recovery_point::execute(db, request)?,
+            "publisher_declare" | "publisher_start" | "publisher_stop" | "publisher_status"
+            | "publisher_observed" => publisher::execute(db, request)?,
+            "network_declare"
+            | "network_undeclare"
+            | "network_route_publish"
+            | "network_route_withdraw"
+            | "network_route_resume"
+            | "network_reapply"
+            | "network_status" => network::execute(db, request)?,
+            "activation_require"
+            | "activation_acquire"
+            | "activation_renew"
+            | "activation_release"
+            | "activation_supersede"
+            | "activation_status"
+            | "activation_fence"
+            | "activation_fence_preview" => activation::execute(db, request)?,
+            "recovery_point_prepare"
+            | "recovery_point_status"
+            | "recovery_point_restore"
+            | "recovery_point_promote"
+            | "recovery_point_stage"
+            | "recovery_point_discard"
+            | "recovery_point_resume" => recovery_point::execute(db, request)?,
             "boot_restore" | "boot_restore_status" => boot_restore::execute(db, request)?,
             "migration_status" => migration::status(db, request)?,
             "storage_status" => storage::status()?,
@@ -471,10 +566,14 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
                     "clone":"stopped, mount-free source through a committed snapshot image"
                 }
             }),
-            "identity" => json!({"host_uuid":db.query_row("SELECT value FROM metadata WHERE key='host_uuid'",[],|r|r.get::<_,String>(0))?}),
+            "identity" => {
+                json!({"host_uuid":db.query_row("SELECT value FROM metadata WHERE key='host_uuid'",[],|r|r.get::<_,String>(0))?})
+            }
             "inventory" => json!({"containers":inventory()?,"store":"default rootful Podman"}),
             "observations" => {
-                let mut stmt = db.prepare("SELECT id,observed_at,operation FROM observations ORDER BY id DESC LIMIT 20")?;
+                let mut stmt = db.prepare(
+                    "SELECT id,observed_at,operation FROM observations ORDER BY id DESC LIMIT 20",
+                )?;
                 let rows = stmt.query_map([], |r| {
                     Ok(json!({"id":r.get::<_,i64>(0)?,"observed_at":r.get::<_,i64>(1)?,"operation":r.get::<_,String>(2)?}))
                 })?;
@@ -543,12 +642,16 @@ mod api_store_tests {
     }
 
     #[test]
-    fn a_durable_node_serves_reads_and_names_the_sqlite_only_refusal() {
+    fn a_durable_node_serves_reads_and_round_trips_a_lifecycle_write() {
         let mut sqlite = SqliteStore::open_in_memory().unwrap();
+        migrations::apply(&mut sqlite).unwrap();
         sqlite
-            .execute_batch(
-                "CREATE TABLE metadata(`key` TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 INSERT INTO metadata(`key`, value) VALUES('host_uuid', 'host-from-durable-store');",
+            .execute(
+                "INSERT INTO metadata(`key`, value) VALUES(?, ?)",
+                &[
+                    Stored::from("host_uuid"),
+                    Stored::from("host-from-durable-store"),
+                ],
             )
             .unwrap();
         let mut node = NodeStore::Durable(Box::new(MariaDbAdapter(sqlite)));
@@ -566,11 +669,24 @@ mod api_store_tests {
         assert_eq!(identity["ok"], true);
         assert_eq!(identity["data"]["host_uuid"], "host-from-durable-store");
 
-        let refused = node.handle(&json!({"operation": "create"}));
+        let deletion = json!({
+            "operation": "delete",
+            "operation_id": "durable-delete",
+            "universe_uuid": "16926159-bf59-4537-8f6e-5cfea52540ea",
+            "authorization_ref": "test"
+        });
+        let written = node.handle(&deletion);
+        assert_eq!(written["ok"], true, "{written}");
+        assert_eq!(written["data"]["absent"], true);
+
+        let replayed = node.handle(&deletion);
+        assert_eq!(replayed["ok"], true, "{replayed}");
+        assert_eq!(replayed["data"]["replayed"], true);
+        assert_eq!(replayed["data"]["original_result"]["absent"], true);
+
+        let refused = node.handle(&json!({"operation": "migration_checkpoint"}));
         assert_eq!(refused["ok"], false);
         assert_eq!(refused["error_code"], "store_engine_unsupported");
-        assert_eq!(refused["operation"], "create");
-        assert_eq!(refused["store_engine"], "mariadb");
-        assert!(refused["error"].as_str().unwrap().contains("still SQLite-only"));
+        assert_eq!(refused["operation"], "migration_checkpoint");
     }
 }
