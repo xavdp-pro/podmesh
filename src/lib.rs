@@ -99,9 +99,9 @@ impl NodeStore {
 
     /// Serve one local API request without changing the SQLite operation path.
     ///
-    /// SQLite keeps the existing [`handle`] byte for byte. A durable engine serves only the
-    /// small read-only surface ported below; every other known operation is refused by name until
-    /// the module that owns it speaks [`DurableStore`].
+    /// SQLite keeps the existing [`handle`] byte for byte. A durable engine serves the reads,
+    /// lifecycle, and secret operations ported below; every other known operation is refused by
+    /// name until the module that owns it speaks [`DurableStore`].
     pub fn handle(&mut self, request: &Value) -> Value {
         match self {
             NodeStore::Sqlite(db) => handle(db, request),
@@ -286,9 +286,6 @@ fn sqlite_only_operation(operation: &str) -> bool {
             | "manager_vote_ledger_mark_unadmitted"
             | "manager_vote_ledger_readmit"
             | "manager_decision_propose"
-            | "secret_declare"
-            | "secret_remove"
-            | "secret_status"
             | "publisher_declare"
             | "publisher_start"
             | "publisher_stop"
@@ -350,18 +347,20 @@ fn durable_capabilities(engine: Engine) -> Value {
             "pause",
             "resume",
             "resources",
+            "secret_declare",
+            "secret_remove",
+            "secret_status",
         ],
         "store_engine": engine.as_str(),
         "unsupported_error_code": "store_engine_unsupported",
-        "scope": "read-only local API plus lifecycle create/delete/clone/start/stop/pause/resume/resources; other module-owned mutations remain SQLite-only",
+        "scope": "read-only local API, lifecycle create/delete/clone/start/stop/pause/resume/resources, and secret_declare/secret_remove/secret_status; other module-owned mutations remain SQLite-only",
     })
 }
 
-/// The read-only local API carried by a non-SQLite journal.
+/// Local API carried by a non-SQLite journal.
 ///
-/// These are exactly the direct read branches in [`handle`]: two journal reads and five host or
-/// contract reads. Module-owned status operations remain on the named refusal path with their
-/// module until that module is ported as a whole.
+/// Reads, lifecycle, and secret declare/remove/status go through [`DurableStore`]. Every other
+/// module-owned operation stays on the named refusal until that module is ported.
 fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
     let operation = request
         .get("operation")
@@ -378,6 +377,24 @@ fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
                 }
                 failure
             }
+        };
+        if let Err(error) = store.execute(
+            "INSERT INTO observations(observed_at, operation, result) VALUES(?, ?, ?)",
+            &[
+                Stored::from(now() as i64),
+                Stored::from(operation),
+                Stored::from(response.to_string()),
+            ],
+        ) {
+            return json!({"ok":false,"error":format!("Observation persistence failed: {error}")});
+        }
+        return response;
+    }
+    if matches!(operation, "secret_declare" | "secret_remove" | "secret_status") {
+        let result = secrets::execute_store(store, request);
+        let response = match result {
+            Ok(data) => json!({"ok":true,"observed_at":now(),"data":data}),
+            Err(error) => json!({"ok":false,"observed_at":now(),"error":error.to_string()}),
         };
         if let Err(error) = store.execute(
             "INSERT INTO observations(observed_at, operation, result) VALUES(?, ?, ?)",
