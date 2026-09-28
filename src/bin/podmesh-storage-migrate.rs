@@ -1,8 +1,7 @@
 use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 
-const USAGE: &str =
-    "Usage: podmesh-storage-migrate --from-sqlite PATH --to-dsn URL [--dry-run]";
+const USAGE: &str = "Usage: podmesh-storage-migrate --from-sqlite PATH --to-dsn URL [--dry-run]";
 
 #[derive(Debug, PartialEq)]
 struct Args {
@@ -112,7 +111,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() {
     let values = std::env::args().skip(1).collect::<Vec<_>>();
-    if values.iter().any(|value| value == "--help" || value == "-h") {
+    if values
+        .iter()
+        .any(|value| value == "--help" || value == "-h")
+    {
         println!("{USAGE}");
         return;
     }
@@ -129,6 +131,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parses_required_arguments_and_dry_run() {
@@ -160,5 +163,31 @@ mod tests {
     #[test]
     fn quotes_sqlite_identifiers() {
         assert_eq!(quoted_identifier("odd\"table"), "\"odd\"\"table\"");
+    }
+
+    #[test]
+    fn inspects_table_names_and_row_counts_read_only() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "podmesh-storage-migrate-{}-{nonce}.sqlite",
+            std::process::id()
+        ));
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE alpha(id INTEGER PRIMARY KEY);
+             CREATE TABLE beta(value TEXT NOT NULL);
+             INSERT INTO alpha VALUES(1);
+             INSERT INTO beta VALUES('one'),('two');",
+        )
+        .unwrap();
+        drop(db);
+
+        let result = inspect_sqlite(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(result, vec![("alpha".into(), 1), ("beta".into(), 2)]);
     }
 }
