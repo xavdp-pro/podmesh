@@ -1413,7 +1413,7 @@ pub fn execute_store(store: &mut dyn DurableStore, request: &Value) -> Result<Va
         "SELECT request, status, result FROM operations WHERE id = ?",
         &[Stored::from(id)],
     )?;
-    if let Some(row) = previous {
+    if let Some(ref row) = previous {
         if row.text(0)? != canonical {
             return Err("Operation ID already belongs to a different request".into());
         }
