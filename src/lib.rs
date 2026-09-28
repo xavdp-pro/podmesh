@@ -643,6 +643,10 @@ mod api_store_tests {
 
     #[test]
     fn a_durable_node_serves_reads_and_round_trips_a_lifecycle_write() {
+        lifecycle::prepare_scratch(
+            &std::env::temp_dir().join(format!("podmesh-lifecycle-store-test-{}", std::process::id())),
+        )
+        .unwrap();
         let mut sqlite = SqliteStore::open_in_memory().unwrap();
         migrations::apply(&mut sqlite).unwrap();
         sqlite
