@@ -21,19 +21,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // to start rather than fall back to a file it was not configured to write.
     let profile = podmesh::store_profile(&dir)?;
     eprintln!("PodMesh store: {}", profile.described());
-    let db = podmesh::open_node_store(&dir, &profile)?.into_connection()?;
+    let mut store = podmesh::open_node_store(&dir, &profile)?;
     // A connector whose lease lapsed while this daemon was down is still publishing: its unit is
     // systemd's. It is withdrawn first, connector and mark, in one journaled operation, before the
     // network reconciliation and before anything is served.
-    match podmesh::withdraw_unentitled_publishers_at_startup(&db) {
-        Ok(report) => eprintln!("PodMesh publisher withdrawal at startup: {report}"),
-        Err(e) => eprintln!("PodMesh publisher withdrawal at startup FAILED: {e}; nothing retries it before the next start of this daemon but the fence, when something runs it (the reconciliation withdraws a recorded publisher, never an unrecorded connector)"),
-    }
-    // Whatever a crash left half-made on the network is undone before anything is served: an
-    // effect that never became effective is never assumed. The report goes to the journal.
-    match podmesh::reconcile_network(&db) {
-        Ok(report) => eprintln!("PodMesh network reconciliation at startup: {report}"),
-        Err(e) => eprintln!("PodMesh network reconciliation at startup FAILED: {e}; network mutations will refuse until it succeeds"),
+    if let Some(db) = store.connection() {
+        match podmesh::withdraw_unentitled_publishers_at_startup(db) {
+            Ok(report) => eprintln!("PodMesh publisher withdrawal at startup: {report}"),
+            Err(e) => eprintln!("PodMesh publisher withdrawal at startup FAILED: {e}; nothing retries it before the next start of this daemon but the fence, when something runs it (the reconciliation withdraws a recorded publisher, never an unrecorded connector)"),
+        }
+        // Whatever a crash left half-made on the network is undone before anything is served: an
+        // effect that never became effective is never assumed. The report goes to the journal.
+        match podmesh::reconcile_network(db) {
+            Ok(report) => eprintln!("PodMesh network reconciliation at startup: {report}"),
+            Err(e) => eprintln!("PodMesh network reconciliation at startup FAILED: {e}; network mutations will refuse until it succeeds"),
+        }
+    } else {
+        eprintln!(
+            "PodMesh startup mutation refusal: store_engine_unsupported; \
+             publisher withdrawal and network reconciliation are still SQLite-only"
+        );
     }
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     std::fs::create_dir_all(socket.parent().ok_or("Invalid socket path")?)?;
@@ -53,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(_) => {
                     if byte[0] == b'\n' {
                         break match serde_json::from_slice(&bytes) {
-                            Ok(v) => podmesh::handle(&db, &v),
+                            Ok(v) => store.handle(&v),
                             Err(_) => serde_json::json!({"ok":false,"error":"Invalid JSON"}),
                         };
                     }

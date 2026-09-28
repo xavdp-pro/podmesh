@@ -89,6 +89,18 @@ impl NodeStore {
         }
     }
 
+    /// Serve one local API request without changing the SQLite operation path.
+    ///
+    /// SQLite keeps the existing [`handle`] byte for byte. A durable engine serves only the
+    /// small read-only surface ported below; every other known operation is refused by name until
+    /// the module that owns it speaks [`DurableStore`].
+    pub fn handle(&mut self, request: &Value) -> Value {
+        match self {
+            NodeStore::Sqlite(db) => handle(db, request),
+            NodeStore::Durable(store) => handle_durable(store.as_mut(), request),
+        }
+    }
+
     /// The connection the node's operations take, or a refusal naming why there is none.
     ///
     /// This is where Phase 2 stops. The node's schema is versioned and installs on both engines,
@@ -216,6 +228,157 @@ fn inventory() -> Result<Value, Box<dyn std::error::Error>> {
     }
     Ok(serde_json::from_slice(&output)?)
 }
+
+fn sqlite_only_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "create"
+            | "delete"
+            | "clone"
+            | "start"
+            | "stop"
+            | "pause"
+            | "resume"
+            | "resources"
+            | "migration_preflight"
+            | "migration_checkpoint"
+            | "migration_authorize_transfer"
+            | "migration_complete_transfer"
+            | "migration_retire_source"
+            | "migration_release"
+            | "migration_abandon"
+            | "migration_restore_local"
+            | "migration_destination_preflight"
+            | "migration_restore"
+            | "migration_restore_abort"
+            | "garbage_collect_plan"
+            | "garbage_collect_apply"
+            | "collection_retention_declare"
+            | "collection_hold_declare"
+            | "collection_hold_release"
+            | "collection_status"
+            | "manager_status"
+            | "manager_decision"
+            | "manager_observe"
+            | "manager_vote_ledger_init"
+            | "manager_vote_ledger_mark_unadmitted"
+            | "manager_vote_ledger_readmit"
+            | "manager_decision_propose"
+            | "secret_declare"
+            | "secret_remove"
+            | "secret_status"
+            | "publisher_declare"
+            | "publisher_start"
+            | "publisher_stop"
+            | "publisher_status"
+            | "publisher_observed"
+            | "network_declare"
+            | "network_undeclare"
+            | "network_route_publish"
+            | "network_route_withdraw"
+            | "network_route_resume"
+            | "network_reapply"
+            | "network_status"
+            | "activation_require"
+            | "activation_acquire"
+            | "activation_renew"
+            | "activation_release"
+            | "activation_supersede"
+            | "activation_status"
+            | "activation_fence"
+            | "activation_fence_preview"
+            | "recovery_point_prepare"
+            | "recovery_point_status"
+            | "recovery_point_restore"
+            | "recovery_point_promote"
+            | "recovery_point_stage"
+            | "recovery_point_discard"
+            | "recovery_point_resume"
+            | "boot_restore"
+            | "boot_restore_status"
+            | "migration_status"
+    )
+}
+
+fn durable_capabilities(engine: Engine) -> Value {
+    json!({
+        "schemas": schema::all(),
+        "schema_version": "podmesh-operation-schema/1",
+        "version": option_env!("PODMESH_PACKAGE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
+        "operations": [
+            "capabilities",
+            "identity",
+            "inventory",
+            "observations",
+            "storage_status",
+            "host_status",
+            "universe_stats",
+        ],
+        "store_engine": engine.as_str(),
+        "unsupported_error_code": "store_engine_unsupported",
+        "scope": "read-only local API; module-owned operations remain SQLite-only",
+    })
+}
+
+/// The read-only local API carried by a non-SQLite journal.
+///
+/// These are exactly the direct read branches in [`handle`]: two journal reads and five host or
+/// contract reads. Module-owned status operations remain on the named refusal path with their
+/// module until that module is ported as a whole.
+fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
+    let operation = request.get("operation").and_then(Value::as_str).unwrap_or("");
+    if sqlite_only_operation(operation) {
+        return json!({
+            "ok": false,
+            "observed_at": now(),
+            "error_code": "store_engine_unsupported",
+            "error": format!(
+                "Operation {operation} is unavailable with store.engine={}: its module is still SQLite-only",
+                store.engine()
+            ),
+            "operation": operation,
+            "store_engine": store.engine().as_str(),
+        });
+    }
+    let result: Result<Value, Box<dyn std::error::Error>> = (|| {
+        Ok(match operation {
+            "capabilities" => durable_capabilities(store.engine()),
+            "identity" => {
+                let row = store
+                    .query_one("SELECT value FROM metadata WHERE `key` = ?", &[Stored::from("host_uuid")])?
+                    .ok_or("The journal carries no host_uuid")?;
+                json!({"host_uuid": row.text(0)?})
+            }
+            "inventory" => json!({"containers":inventory()?,"store":"default rootful Podman"}),
+            "observations" => {
+                let rows = store.query(
+                    "SELECT id, observed_at, operation FROM observations ORDER BY id DESC LIMIT 20",
+                    &[],
+                )?;
+                let observations = rows
+                    .iter()
+                    .map(|row| {
+                        Ok(json!({
+                            "id": row.integer(0)?,
+                            "observed_at": row.integer(1)?,
+                            "operation": row.text(2)?,
+                        }))
+                    })
+                    .collect::<store::Result<Vec<_>>>()?;
+                json!({"observations": observations})
+            }
+            "storage_status" => storage::status()?,
+            "host_status" => health::host_status()?,
+            "universe_stats" => health::universe_stats()?,
+            _ => return Err("Unsupported operation".into()),
+        })
+    })();
+    match result {
+        Ok(data) => json!({"ok":true,"observed_at":now(),"data":data}),
+        Err(error) => json!({"ok":false,"observed_at":now(),"error":error.to_string()}),
+    }
+}
+
 pub fn handle(db: &Connection, request: &Value) -> Value {
     let op = request.get("operation").and_then(Value::as_str).unwrap_or("");
     let result: Result<Value, Box<dyn std::error::Error>> = (|| {
@@ -338,4 +501,76 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
         return json!({"ok":false,"error":format!("Observation persistence failed: {e}")});
     }
     response
+}
+
+#[cfg(test)]
+mod api_store_tests {
+    use super::*;
+    use store::{Integrity, Result as StoreResult, Row, Transaction};
+
+    /// The local API test does not need a server: this adapter exercises the non-SQLite
+    /// `NodeStore` branch while SQLite supplies the contract implementation underneath.
+    struct MariaDbAdapter(SqliteStore);
+
+    impl DurableStore for MariaDbAdapter {
+        fn engine(&self) -> Engine {
+            Engine::Mariadb
+        }
+
+        fn execute(&mut self, sql: &str, params: &[Stored]) -> StoreResult<u64> {
+            self.0.execute(sql, params)
+        }
+
+        fn execute_batch(&mut self, sql: &str) -> StoreResult<()> {
+            self.0.execute_batch(sql)
+        }
+
+        fn query(&mut self, sql: &str, params: &[Stored]) -> StoreResult<Vec<Row>> {
+            self.0.query(sql, params)
+        }
+
+        fn transaction(&mut self) -> StoreResult<Box<dyn Transaction + '_>> {
+            self.0.transaction()
+        }
+
+        fn integrity_check(&mut self) -> StoreResult<Integrity> {
+            self.0.integrity_check()
+        }
+
+        fn tables(&mut self) -> StoreResult<Vec<String>> {
+            self.0.tables()
+        }
+    }
+
+    #[test]
+    fn a_durable_node_serves_reads_and_names_the_sqlite_only_refusal() {
+        let mut sqlite = SqliteStore::open_in_memory().unwrap();
+        sqlite
+            .execute_batch(
+                "CREATE TABLE metadata(`key` TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO metadata(`key`, value) VALUES('host_uuid', 'host-from-durable-store');",
+            )
+            .unwrap();
+        let mut node = NodeStore::Durable(Box::new(MariaDbAdapter(sqlite)));
+
+        let capabilities = node.handle(&json!({"operation": "capabilities"}));
+        assert_eq!(capabilities["ok"], true);
+        assert_eq!(capabilities["data"]["store_engine"], "mariadb");
+        assert!(capabilities["data"]["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|operation| operation == "capabilities"));
+
+        let identity = node.handle(&json!({"operation": "identity"}));
+        assert_eq!(identity["ok"], true);
+        assert_eq!(identity["data"]["host_uuid"], "host-from-durable-store");
+
+        let refused = node.handle(&json!({"operation": "create"}));
+        assert_eq!(refused["ok"], false);
+        assert_eq!(refused["error_code"], "store_engine_unsupported");
+        assert_eq!(refused["operation"], "create");
+        assert_eq!(refused["store_engine"], "mariadb");
+        assert!(refused["error"].as_str().unwrap().contains("still SQLite-only"));
+    }
 }
