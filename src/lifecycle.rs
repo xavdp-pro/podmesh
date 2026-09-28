@@ -2975,4 +2975,85 @@ mod tests {
         assert!(!is_uuid("16926159-bf59-4537-8f6e-5cfea52540e"));
         assert!(!is_uuid("16926159xbf59-4537-8f6e-5cfea52540ea"));
     }
+
+    #[cfg(feature = "mariadb")]
+    #[test]
+    fn mariadb_lifecycle_write_round_trips_when_a_server_is_named() {
+        use crate::store::config::DSN_ENVIRONMENT;
+        use crate::store::{
+            migrations, DurableStore, MariadbConfig, MariadbStore, Value as Stored,
+        };
+        use serde_json::json;
+
+        let _serialized = crate::store::MARIADB_TEST_SERVER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(config) = MariadbConfig::from_environment() else {
+            eprintln!("skipped: {DSN_ENVIRONMENT} names no MariaDB server");
+            return;
+        };
+        let mut store = MariadbStore::open(&config).unwrap_or_else(|error| {
+            panic!(
+                "{DSN_ENVIRONMENT} names {}, which did not open: {error}",
+                config.described()
+            )
+        });
+        migrations::apply(&mut store).unwrap();
+        super::prepare_scratch(
+            &std::env::temp_dir().join(format!(
+                "podmesh-mariadb-lifecycle-test-{}",
+                std::process::id()
+            )),
+        )
+        .unwrap();
+
+        let operation_id = "mariadb-lifecycle-delete";
+        store
+            .execute(
+                "DELETE FROM operation_attempts WHERE operation_id = ?",
+                &[Stored::from(operation_id)],
+            )
+            .unwrap();
+        store
+            .execute(
+                "DELETE FROM operations WHERE id = ?",
+                &[Stored::from(operation_id)],
+            )
+            .unwrap();
+        let request = json!({
+            "operation": "delete",
+            "operation_id": operation_id,
+            "universe_uuid": "731b538e-8f8a-4f8d-a234-29df4d993c15",
+            "authorization_ref": "mariadb lifecycle test"
+        });
+        let written = super::execute_store(&mut store, &request).unwrap();
+        assert_eq!(written["absent"], true);
+        let row = store
+            .query_one(
+                "SELECT status, result FROM operations WHERE id = ?",
+                &[Stored::from(operation_id)],
+            )
+            .unwrap()
+            .expect("the operation is durable");
+        assert_eq!(row.text(0).unwrap(), "verified");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(row.text(1).unwrap()).unwrap()["absent"],
+            true
+        );
+        let replayed = super::execute_store(&mut store, &request).unwrap();
+        assert_eq!(replayed["replayed"], true);
+
+        store
+            .execute(
+                "DELETE FROM operation_attempts WHERE operation_id = ?",
+                &[Stored::from(operation_id)],
+            )
+            .unwrap();
+        store
+            .execute(
+                "DELETE FROM operations WHERE id = ?",
+                &[Stored::from(operation_id)],
+            )
+            .unwrap();
+    }
 }
