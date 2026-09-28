@@ -104,10 +104,19 @@ impl Fault {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct StoreError {
     pub fault: Fault,
     pub message: String,
+}
+
+/// The same sentence as [`fmt::Display`]. A refusal reaches an operator through whichever of the
+/// two the caller happened to use -- `main` returning `Box<dyn Error>` prints the debug form --
+/// and a node that refuses to start says why in words either way.
+impl fmt::Debug for StoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
 }
 
 impl StoreError {
