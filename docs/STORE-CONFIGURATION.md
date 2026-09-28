@@ -98,8 +98,9 @@ conventions hold across both engines, because the dialects do not agree:
   read back into the same five, so a caller written against one engine reads the same shapes on the other.
 
 On every MariaDB open the backend sets session isolation to `REPEATABLE READ` and **refuses** to
-open unless both `@@SESSION.innodb_flush_log_at_trx_commit` and `@@GLOBAL.innodb_flush_log_at_trx_commit`
-are `1` (Muse counter-view, 2026-09-28). Durability is not a soft preference.
+open unless `@@GLOBAL.innodb_flush_log_at_trx_commit` is `1` (Muse counter-view, 2026-09-28).
+MariaDB 10.11 exposes this variable as GLOBAL-only, and that value is effective for every session.
+Durability is not a soft preference.
 
 Faults are named rather than left as engine codes: `busy`, `locked`, `unavailable`, `denied`, `schema`,
 `integrity`, `type`, `unsupported`, `other`. The pair that matters is `busy` and `locked` — the store
@@ -110,3 +111,32 @@ DDL is not portable and the layer does not pretend it is. The only schema it ins
 `store_schema` table, written once per engine, which records which schema a store carries and at which
 version. Phase 2 brings the node's tables as versioned migrations with the engine-specific sections
 the plan calls for.
+
+## Offline SQLite copy
+
+Build the migration tool with the MariaDB backend:
+
+```bash
+cargo build --release --bin podmesh-storage-migrate --features mariadb
+```
+
+The source journal must be offline. A dry run opens it read-only, lists its
+tables and row counts, and does not contact MariaDB:
+
+```bash
+podmesh-storage-migrate \
+  --from-sqlite /var/lib/podmesh/state.sqlite \
+  --to-dsn "$PODMESH_MARIADB_DSN" \
+  --dry-run
+```
+
+Without `--dry-run`, the tool requires a target with no user tables, translates
+the supported SQLite schema inventory to InnoDB, copies each table in a
+transaction, then verifies every row count and a logical SHA-256 over every
+row. Schema constructs without a safe generic translation are refused rather
+than weakened.
+
+`--force` is destructive: it drops **every table in the selected target
+database** before copying. Take and verify a scoped MariaDB backup first, and
+confirm that the DSN names the node role's isolated database. The tool never
+prints the unredacted DSN.
