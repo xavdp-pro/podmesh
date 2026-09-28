@@ -16,7 +16,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let dir = PathBuf::from(std::env::var("PODMESH_STATE_DIR").unwrap_or("/var/lib/podmesh".into()));
     let socket = PathBuf::from(std::env::var("PODMESH_SOCKET").unwrap_or("/run/podmesh/api.sock".into()));
-    let db = podmesh::open_state(&dir)?;
+    // Which store carries this node's journal is a configuration, not a path (docs/STORE-CONFIGURATION.md).
+    // A node with no profile keeps the journal it has, and one whose profile is incomplete refuses
+    // to start rather than fall back to a file it was not configured to write.
+    let profile = podmesh::store_profile(&dir)?;
+    eprintln!("PodMesh store: {}", profile.described());
+    let db = podmesh::open_node_store(&dir, &profile)?.into_connection()?;
     // A connector whose lease lapsed while this daemon was down is still publishing: its unit is
     // systemd's. It is withdrawn first, connector and mark, in one journaled operation, before the
     // network reconciliation and before anything is served.

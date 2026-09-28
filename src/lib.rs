@@ -23,42 +23,152 @@ mod migration;
 mod recovery;
 mod restore;
 mod transfer;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use store::{migrations, DurableStore, Engine, SqliteStore, StoreConfig, Value as Stored};
 
 pub fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
-pub fn open_state(dir: &Path) -> Result<Connection, Box<dyn std::error::Error>> {
-    fs::create_dir_all(dir)?;
-    let db = Connection::open(dir.join("state.sqlite"))?;
-    db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS observations(id INTEGER PRIMARY KEY,observed_at INTEGER NOT NULL,operation TEXT NOT NULL,result TEXT NOT NULL);")?;
-    let machine = fs::read_to_string("/etc/machine-id")?.trim().to_string();
-    let stored: Option<String> = db
-        .query_row("SELECT value FROM metadata WHERE key='machine_id'", [], |r| r.get(0))
-        .optional()?;
-    if let Some(previous) = stored {
-        if previous != machine {
-            return Err("State belongs to a different host; explicit identity adoption required".into());
+
+/// The file a node's store profile is read from, under its state directory, when it is there.
+/// A node with no such file keeps the journal it has: SQLite, in `state.sqlite` beside it.
+pub const STORE_PROFILE_FILE: &str = "store.json";
+/// Another profile file, named by the operator. Named and unreadable is a refusal, not a default.
+pub const STORE_PROFILE_ENVIRONMENT: &str = "PODMESH_STORE_PROFILE";
+
+/// The store profile this state directory runs under (`docs/STORE-CONFIGURATION.md`).
+///
+/// The default is what every node has today, and a node that names no profile is a node whose
+/// behaviour is unchanged. A profile that cannot be read is never replaced by the default: an
+/// operator who wrote one is asking for it.
+pub fn store_profile(dir: &Path) -> Result<StoreConfig, Box<dyn std::error::Error>> {
+    let path = match std::env::var_os(STORE_PROFILE_ENVIRONMENT) {
+        Some(named) => PathBuf::from(named),
+        None => {
+            let beside = dir.join(STORE_PROFILE_FILE);
+            if !beside.exists() {
+                return Ok(StoreConfig::for_state_dir(dir));
+            }
+            beside
+        }
+    };
+    let text = fs::read_to_string(&path).map_err(|e| format!("The store profile {} could not be read: {e}", path.display()))?;
+    let document: Value =
+        serde_json::from_str(&text).map_err(|e| format!("The store profile {} is not JSON: {e}", path.display()))?;
+    Ok(StoreConfig::from_json(&document, Some(dir))?)
+}
+
+/// A node's journal, open, as whichever engine its profile named.
+pub enum NodeStore {
+    /// The engine every node runs today: the `rusqlite` connection every module still takes.
+    Sqlite(Connection),
+    /// A journal reached through the store contract, which is MariaDB today.
+    Durable(Box<dyn DurableStore>),
+}
+
+impl NodeStore {
+    pub fn engine(&self) -> Engine {
+        match self {
+            NodeStore::Sqlite(_) => Engine::Sqlite,
+            NodeStore::Durable(store) => store.engine(),
         }
     }
-    let tx = db.unchecked_transaction()?;
-    tx.execute("INSERT OR IGNORE INTO metadata VALUES('machine_id',?1)", [&machine])?;
-    let uuid = fs::read_to_string("/proc/sys/kernel/random/uuid")?;
-    tx.execute("INSERT OR IGNORE INTO metadata VALUES('host_uuid',?1)", [uuid.trim()])?;
-    tx.commit()?;
+
+    pub fn connection(&self) -> Option<&Connection> {
+        match self {
+            NodeStore::Sqlite(db) => Some(db),
+            NodeStore::Durable(_) => None,
+        }
+    }
+
+    /// The connection the node's operations take, or a refusal naming why there is none.
+    ///
+    /// This is where Phase 2 stops. The node's schema is versioned and installs on both engines,
+    /// and the profile decides which one is opened -- but `handle` and every module below it
+    /// still speak `rusqlite`, so a journal that is not a file has nothing to hand them. A node
+    /// configured for MariaDB is refused here, by name, rather than served from a file it was not
+    /// configured to use.
+    pub fn into_connection(self) -> Result<Connection, Box<dyn std::error::Error>> {
+        match self {
+            NodeStore::Sqlite(db) => Ok(db),
+            NodeStore::Durable(store) => Err(format!(
+                "store.engine is {engine}: the journal opened and its schema is at version {version}, \
+                 but this build's operations still read and write the node's journal as SQLite \
+                 (Phase 2 of docs/STORAGE-MARIADB-MIGRATION-PLAN.md ports them). \
+                 Set store.engine to sqlite to run this node.",
+                engine = store.engine(),
+                version = migrations::node_version(),
+            )
+            .into()),
+        }
+    }
+}
+
+/// Open the node's journal under the profile it is configured with, and bring its schema up.
+///
+/// Whichever engine carries it, the journal is the same set of tables at the same version: the
+/// migrations in `src/store/migrations/node/` are applied in order, and the store records which
+/// of them it has. An incomplete MariaDB profile is refused before anything is opened.
+pub fn open_node_store(dir: &Path, config: &StoreConfig) -> Result<NodeStore, Box<dyn std::error::Error>> {
+    fs::create_dir_all(dir)?;
+    config.validate()?;
+    let opened = match config.engine {
+        Engine::Sqlite => {
+            let mut store = SqliteStore::open(&config.sqlite)?;
+            migrations::apply(&mut store)?;
+            bind_to_this_host(&mut store)?;
+            NodeStore::Sqlite(store.into_connection())
+        }
+        Engine::Mariadb => {
+            let mut store = store::open(config)?;
+            migrations::apply(store.as_mut())?;
+            bind_to_this_host(store.as_mut())?;
+            NodeStore::Durable(store)
+        }
+    };
     lifecycle::prepare_scratch(&dir.join("podman-tmp"))?;
     manager::prepare_host_state(dir);
     migration::prepare(&dir.join("migrations"))?;
     transfer::prepare(dir)?;
-    Ok(db)
+    Ok(opened)
+}
+
+/// Bind the journal to the machine it belongs to, and give the host its UUID if it has none.
+///
+/// Written through the store contract rather than in SQLite's dialect: `INSERT OR IGNORE` is one
+/// engine's, so the row is read and then written inside a transaction, which is the same fact on
+/// both. One process opens a node's journal, so there is no second writer to race here.
+fn bind_to_this_host(store: &mut dyn DurableStore) -> Result<(), Box<dyn std::error::Error>> {
+    let machine = fs::read_to_string("/etc/machine-id")?.trim().to_string();
+    let uuid = fs::read_to_string("/proc/sys/kernel/random/uuid")?.trim().to_string();
+    let held = store.query_one("SELECT value FROM metadata WHERE `key` = ?", &[Stored::from("machine_id")])?;
+    if let Some(previous) = &held {
+        if previous.text(0)? != machine {
+            return Err("State belongs to a different host; explicit identity adoption required".into());
+        }
+    }
+    let mut tx = store.transaction()?;
+    if held.is_none() {
+        tx.execute("INSERT INTO metadata(`key`, value) VALUES(?, ?)", &[Stored::from("machine_id"), Stored::from(machine)])?;
+    }
+    if tx.query_one("SELECT value FROM metadata WHERE `key` = ?", &[Stored::from("host_uuid")])?.is_none() {
+        tx.execute("INSERT INTO metadata(`key`, value) VALUES(?, ?)", &[Stored::from("host_uuid"), Stored::from(uuid)])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// The node's journal as every module still takes it, under the profile the state directory names.
+pub fn open_state(dir: &Path) -> Result<Connection, Box<dyn std::error::Error>> {
+    open_node_store(dir, &store_profile(dir)?)?.into_connection()
 }
 fn inventory() -> Result<Value, Box<dyn std::error::Error>> {
     // Fixed command; no caller-controlled shell or command arguments.

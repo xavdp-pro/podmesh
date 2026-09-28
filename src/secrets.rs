@@ -35,8 +35,7 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             authorization_ref TEXT NOT NULL,
             removed_at INTEGER);",
     )?;
-    let present: bool = db.query_row("SELECT COUNT(*) FROM pragma_table_info('secrets') WHERE name='state'", [], |r| Ok(r.get::<_, i64>(0)? > 0))?;
-    if !present {
+    if !crate::store::catalog::connection::has_column(db, "secrets", "state")? {
         db.execute_batch("ALTER TABLE secrets ADD COLUMN state TEXT NOT NULL DEFAULT 'effective';")?;
     }
     Ok(())

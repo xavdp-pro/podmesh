@@ -105,10 +105,7 @@ pub(crate) struct LastIntent {
 }
 
 fn table_exists(db: &Connection, name: &str) -> Result<bool, Error> {
-    Ok(db
-        .query_row("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1", [name], |_| Ok(()))
-        .optional()?
-        .is_some())
+    Ok(crate::store::catalog::connection::has_table(db, name)?)
 }
 
 /// The attempt that last expressed each operation. A replayed operation writes no attempt, so this
