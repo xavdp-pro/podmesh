@@ -97,6 +97,10 @@ conventions hold across both engines, because the dialects do not agree:
 - **Values are SQLite's five storage classes** — null, integer, real, text, bytes. A MariaDB column is
   read back into the same five, so a caller written against one engine reads the same shapes on the other.
 
+On every MariaDB open the backend sets session isolation to `REPEATABLE READ` and **refuses** to
+open unless both `@@SESSION.innodb_flush_log_at_trx_commit` and `@@GLOBAL.innodb_flush_log_at_trx_commit`
+are `1` (Muse counter-view, 2026-09-28). Durability is not a soft preference.
+
 Faults are named rather than left as engine codes: `busy`, `locked`, `unavailable`, `denied`, `schema`,
 `integrity`, `type`, `unsupported`, `other`. The pair that matters is `busy` and `locked` — the store
 refused this attempt and the same attempt may succeed later. `SQLITE_BUSY`, `SQLITE_LOCKED`, MariaDB's

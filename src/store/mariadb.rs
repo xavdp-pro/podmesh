@@ -25,6 +25,37 @@ use std::sync::Arc;
 /// back as [`Value::Blob`] rather than decoded.
 const BINARY_COLLATION: u16 = 63;
 
+fn flush_log_is_one(value: &Value) -> bool {
+    match value {
+        Value::Integer(1) => true,
+        Value::Text(text) => text == "1",
+        Value::Real(f) => *f == 1.0,
+        _ => false,
+    }
+}
+
+fn require_flush_log_at_commit(conn: &mut Conn, target: &str) -> Result<()> {
+    let rows = query_on(
+        conn,
+        "SELECT @@SESSION.innodb_flush_log_at_trx_commit, @@GLOBAL.innodb_flush_log_at_trx_commit",
+        &[],
+    )?;
+    let Some(row) = rows.into_iter().next() else {
+        return Err(Fault::Other.error(format!(
+            "{target} refuses to open: innodb_flush_log_at_trx_commit was unreadable"
+        )));
+    };
+    let session = row.value(0)?;
+    let global = row.value(1)?;
+    if flush_log_is_one(session) && flush_log_is_one(global) {
+        return Ok(());
+    }
+    Err(Fault::Other.error(format!(
+        "{target} refuses to open: innodb_flush_log_at_trx_commit must be 1 \
+         (session={session:?}, global={global:?}); durability is not optional"
+    )))
+}
+
 pub struct MariadbStore {
     conn: Conn,
     /// What this store is, without its password, for a message or a refusal.
@@ -44,6 +75,12 @@ impl MariadbStore {
         let seconds = config.lock_wait_timeout.as_secs().max(1);
         conn.query_drop(format!("SET SESSION innodb_lock_wait_timeout = {seconds}"))
             .map_err(|e| fault_of(&e).error(format!("{target} refused the lock wait timeout: {e}")))?;
+        // Muse must-fix: name the isolation the plan relies on, do not inherit a silent change.
+        conn.query_drop("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .map_err(|e| fault_of(&e).error(format!("{target} refused REPEATABLE READ: {e}")))?;
+        // Muse must-fix: refuse a server that does not flush the redo log on every commit.
+        // Session and global are both checked so a SESSION override cannot hide a GLOBAL=0/2.
+        require_flush_log_at_commit(&mut conn, &target)?;
         Ok(Self { conn, target })
     }
 
