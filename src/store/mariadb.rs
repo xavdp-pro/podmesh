@@ -298,11 +298,9 @@ fn fault_of(error: &mysql::Error) -> Fault {
     match error {
         mysql::Error::MySqlError(said) => from_code(said.code),
         mysql::Error::IoError(_) | mysql::Error::CodecError(_) => Fault::Unavailable,
-        mysql::Error::DriverError(driver) => match driver {
-            DriverError::ConnectTimeout | DriverError::CouldNotConnect(_) | DriverError::Timeout => Fault::Unavailable,
-            _ => Fault::Other,
-        },
-        mysql::Error::UrlError(_) => Fault::Other,
+        mysql::Error::DriverError(
+            DriverError::ConnectTimeout | DriverError::CouldNotConnect(_) | DriverError::Timeout,
+        ) => Fault::Unavailable,
         _ => Fault::Other,
     }
 }
