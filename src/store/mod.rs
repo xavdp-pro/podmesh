@@ -455,3 +455,33 @@ pub fn schema_version(store: &mut dyn DurableStore, name: &str) -> Result<Option
         None => Ok(None),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_profile_decides_which_engine_opens() {
+        let dir = std::env::temp_dir().join(format!("podmesh-store-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = StoreConfig::for_state_dir(&dir);
+        let mut store = open(&config).unwrap();
+        assert_eq!(store.engine(), Engine::Sqlite);
+        bootstrap(store.as_mut(), "node", BOOTSTRAP_VERSION).unwrap();
+        drop(store);
+        assert!(dir.join("state.sqlite").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A build with no MariaDB backend refuses a MariaDB profile by name. It must never fall
+    /// back to a file: a node that believes it writes to a server and writes to a file instead
+    /// would be right about everything it reads back, and wrong about where its journal is.
+    #[cfg(not(feature = "mariadb"))]
+    #[test]
+    fn a_mariadb_profile_is_refused_by_a_build_that_carries_no_mariadb() {
+        let config = StoreConfig { engine: Engine::Mariadb, ..StoreConfig::default() };
+        let refused = open(&config).err().expect("a build without the feature opens no MariaDB store");
+        assert_eq!(refused.fault, Fault::Unsupported);
+        assert!(refused.message.contains("mariadb feature"));
+    }
+}
