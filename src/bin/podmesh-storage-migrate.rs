@@ -681,7 +681,7 @@ fn copy_to_mariadb(args: &Args, counts: &[TableCount]) -> Result<(), Box<dyn std
         return Err("the target DSN selects no MariaDB database".into());
     }
     println!("MariaDB target: {}", target.target());
-    println!("Durability gate: innodb_flush_log_at_trx_commit = 1 (session and global)");
+    println!("Durability gate: global innodb_flush_log_at_trx_commit = 1");
 
     let existing = target.tables()?;
     if !existing.is_empty() && !args.force {
