@@ -182,6 +182,49 @@ impl MariadbConfig {
         Ok(url)
     }
 
+    /// Whether this profile says enough to reach an instance, checked before one is opened.
+    ///
+    /// The rule is that nothing is guessed. A DSN must name a database, because a connection with
+    /// no database resolves every unqualified table name nowhere. A profile without a DSN must
+    /// name the user, the database and a password file, and that file must already be readable by
+    /// its owner alone: a node whose store credentials are world-readable is refused here rather
+    /// than after it has written its first row.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(dsn) = &self.dsn {
+            let rest = dsn
+                .strip_prefix("mysql://")
+                .ok_or_else(|| Fault::Unsupported.error(format!("store.mariadb.dsn is a mysql:// URL, not {}", redact(dsn))))?;
+            let after_host = rest.split_once('/').map(|(_, after)| after).unwrap_or_default();
+            let database = after_host.split(['?', '#']).next().unwrap_or_default();
+            if database.is_empty() {
+                return Err(Fault::Unavailable
+                    .error(format!("store.mariadb.dsn names no database: {}", redact(dsn))));
+            }
+            return Ok(());
+        }
+        if self.user.trim().is_empty() {
+            return Err(Fault::Unavailable.error("store.mariadb.user is the node role's functional slug, and it is empty"));
+        }
+        if self.database.trim().is_empty() {
+            return Err(Fault::Unavailable.error("store.mariadb.database names the node's own database, and it is empty"));
+        }
+        if self.socket.is_none() && self.host.trim().is_empty() {
+            return Err(Fault::Unavailable.error("store.mariadb names neither a host nor a socket"));
+        }
+        match &self.password_file {
+            None => Err(Fault::Denied.error(
+                "store.mariadb.password_file is not named: a node's store credentials are read from a file, mode 0600, never from the configuration",
+            )),
+            Some(_) => match self.password()? {
+                Some(password) if !password.is_empty() => Ok(()),
+                _ => Err(Fault::Denied.error(format!(
+                    "the password file {} is empty",
+                    self.password_file.as_ref().map(|path| path.display().to_string()).unwrap_or_default()
+                ))),
+            },
+        }
+    }
+
     /// What this profile may be written down as: everything but the password.
     pub fn described(&self) -> String {
         match &self.dsn {
@@ -324,6 +367,23 @@ impl StoreConfig {
         match self.engine {
             Engine::Sqlite => format!("sqlite:{}", self.sqlite.path.display()),
             Engine::Mariadb => self.mariadb.described(),
+        }
+    }
+
+    /// Whether this profile says enough to open the store it names, checked **before** anything
+    /// is opened so that an incomplete profile is a refusal at startup rather than a node that
+    /// half-runs. A profile that names an engine and not how to reach it is not a default to fall
+    /// back from: it is a mistake, and the node is the wrong place to guess at it.
+    pub fn validate(&self) -> Result<()> {
+        match self.engine {
+            Engine::Sqlite => {
+                if self.sqlite.path.file_name().is_none() {
+                    return Err(Fault::Unavailable
+                        .error(format!("store.sqlite.path is the journal file, not a directory: {}", self.sqlite.path.display())));
+                }
+                Ok(())
+            }
+            Engine::Mariadb => self.mariadb.validate(),
         }
     }
 }

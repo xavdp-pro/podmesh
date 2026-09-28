@@ -30,9 +30,11 @@
 //! DDL is not portable and this module does not pretend it is: the only schema it carries is
 //! its own bootstrap table, written once per engine in [`bootstrap`]. Phase 2 brings the node's
 //! tables as versioned migrations with the engine-specific sections the plan calls for.
+pub mod catalog;
 pub mod config;
 #[cfg(feature = "mariadb")]
 pub mod mariadb;
+pub mod migrations;
 pub mod sqlite;
 
 pub use config::{Engine, MariadbConfig, SqliteConfig, StoreConfig};
@@ -404,8 +406,8 @@ pub fn open(config: &StoreConfig) -> Result<Box<dyn DurableStore>> {
 /// The table where the store records which schema it carries, and at which version.
 pub const SCHEMA_TABLE: &str = "store_schema";
 
-/// The version this phase writes. Phase 2 of the plan replaces this single row with the
-/// versioned migrations it describes; the table itself is meant to survive that.
+/// The version a store carries after the bootstrap alone, before any node migration is applied.
+/// [`migrations::apply`] moves the recorded version on from here, one migration at a time.
 pub const BOOTSTRAP_VERSION: i64 = 1;
 
 fn schema_ddl(engine: Engine) -> &'static str {
@@ -429,13 +431,17 @@ fn schema_ddl(engine: Engine) -> &'static str {
     }
 }
 
-/// Make the store carry [`SCHEMA_TABLE`], and record that `name` is at `version`.
+/// Make the store carry [`SCHEMA_TABLE`], which is where every schema records its version.
 ///
-/// This is the whole schema this phase installs, and the minimal thing a MariaDB instance must
-/// answer for the node to consider it usable: create a table, write a row in a transaction,
-/// read it back. It is written to be run again on a store that already has it.
+/// It is the minimal thing an instance must answer for the node to consider it usable, and it is
+/// written to be run again on a store that already has it.
+pub fn ensure_schema_table(store: &mut dyn DurableStore) -> Result<()> {
+    store.execute_batch(schema_ddl(store.engine()))
+}
+
+/// Make the store carry [`SCHEMA_TABLE`], and record that `name` is at `version`.
 pub fn bootstrap(store: &mut dyn DurableStore, name: &str, version: i64) -> Result<()> {
-    store.execute_batch(schema_ddl(store.engine()))?;
+    ensure_schema_table(store)?;
     let applied_at = crate::now() as i64;
     // Delete then insert rather than an upsert: `ON CONFLICT` and `ON DUPLICATE KEY` are each
     // one engine's dialect, and the transaction makes the pair atomic on both.
