@@ -35,9 +35,8 @@ fn flush_log_is_one(value: &Value) -> bool {
 }
 
 fn require_flush_log_at_commit(conn: &mut Conn, target: &str) -> Result<()> {
-    // MariaDB 10.11 exposes this as GLOBAL-only (unlike variables that may be
-    // overridden per session), so asking for @@SESSION fails with error 1238.
-    // The global value is the effective value for every transaction here.
+    // MariaDB 10.11 exposes this as GLOBAL-only, so asking for @@SESSION fails
+    // with error 1238. The global value is effective for every transaction here.
     let rows = query_on(conn, "SELECT @@GLOBAL.innodb_flush_log_at_trx_commit", &[])?;
     let Some(row) = rows.into_iter().next() else {
         return Err(Fault::Other.error(format!(
@@ -64,21 +63,15 @@ impl MariadbStore {
     pub fn open(config: &MariadbConfig) -> Result<Self> {
         let target = config.described();
         let url = config.url()?;
-        let opts = Opts::from_url(&url).map_err(|e| {
-            Fault::Other.error(format!("{} is not a usable DSN: {e}", redact(&url)))
-        })?;
+        let opts = Opts::from_url(&url)
+            .map_err(|e| Fault::Other.error(format!("{} is not a usable DSN: {e}", redact(&url))))?;
         // Only the connect timeout is set here. A read timeout would end a long statement the
         // node meant to run, which is a different decision and not this layer's to take.
-        let opts = Opts::from(
-            OptsBuilder::from_opts(opts).tcp_connect_timeout(Some(config.connect_timeout)),
-        );
-        let mut conn = Conn::new(opts)
-            .map_err(|e| fault_of(&e).error(format!("{target} could not be opened: {e}")))?;
+        let opts = Opts::from(OptsBuilder::from_opts(opts).tcp_connect_timeout(Some(config.connect_timeout)));
+        let mut conn = Conn::new(opts).map_err(|e| fault_of(&e).error(format!("{target} could not be opened: {e}")))?;
         let seconds = config.lock_wait_timeout.as_secs().max(1);
         conn.query_drop(format!("SET SESSION innodb_lock_wait_timeout = {seconds}"))
-            .map_err(|e| {
-                fault_of(&e).error(format!("{target} refused the lock wait timeout: {e}"))
-            })?;
+            .map_err(|e| fault_of(&e).error(format!("{target} refused the lock wait timeout: {e}")))?;
         // Muse must-fix: name the isolation the plan relies on, do not inherit a silent change.
         conn.query_drop("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             .map_err(|e| fault_of(&e).error(format!("{target} refused REPEATABLE READ: {e}")))?;
@@ -95,9 +88,7 @@ impl MariadbStore {
 
     /// The database this connection is in, which is where every unqualified name resolves.
     pub fn database(&mut self) -> Result<Option<String>> {
-        let row = query_on(&mut self.conn, "SELECT DATABASE()", &[])?
-            .into_iter()
-            .next();
+        let row = query_on(&mut self.conn, "SELECT DATABASE()", &[])?.into_iter().next();
         Ok(row.and_then(|row| row.value(0).ok().and_then(Value::text).map(str::to_string)))
     }
 }
@@ -115,9 +106,7 @@ impl DurableStore for MariadbStore {
         // The server takes one statement per call unless multi-statement is on, and it is not:
         // a batch that arrives as one string is a batch the server would parse as one statement.
         for statement in statements(sql) {
-            self.conn
-                .query_drop(&statement)
-                .map_err(|e| fault_of(&e).error(format!("{statement}: {e}")))?;
+            self.conn.query_drop(&statement).map_err(|e| fault_of(&e).error(format!("{statement}: {e}")))?;
         }
         Ok(())
     }
@@ -139,35 +128,16 @@ impl DurableStore for MariadbStore {
         let checked = self.tables()?;
         let mut findings = Vec::new();
         for table in &checked {
-            let rows = query_on(
-                &mut self.conn,
-                &format!("CHECK TABLE {}", quoted(table)?),
-                &[],
-            )?;
+            let rows = query_on(&mut self.conn, &format!("CHECK TABLE {}", quoted(table)?), &[])?;
             for row in rows {
-                let kind = row
-                    .named("Msg_type")
-                    .or_else(|_| row.value(2))?
-                    .text()
-                    .unwrap_or_default()
-                    .to_string();
-                let said = row
-                    .named("Msg_text")
-                    .or_else(|_| row.value(3))?
-                    .text()
-                    .unwrap_or_default()
-                    .to_string();
+                let kind = row.named("Msg_type").or_else(|_| row.value(2))?.text().unwrap_or_default().to_string();
+                let said = row.named("Msg_text").or_else(|_| row.value(3))?.text().unwrap_or_default().to_string();
                 if !(kind == "status" && said == "OK") {
                     findings.push(format!("{table}: {kind}: {said}"));
                 }
             }
         }
-        Ok(Integrity {
-            engine: Engine::Mariadb,
-            ok: findings.is_empty(),
-            checked,
-            findings,
-        })
+        Ok(Integrity { engine: Engine::Mariadb, ok: findings.is_empty(), checked, findings })
     }
 
     fn tables(&mut self) -> Result<Vec<String>> {
@@ -177,9 +147,7 @@ impl DurableStore for MariadbStore {
              WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' ORDER BY table_name",
             &[],
         )?;
-        rows.iter()
-            .map(|row| row.text(0).map(str::to_string))
-            .collect()
+        rows.iter().map(|row| row.text(0).map(str::to_string)).collect()
     }
 }
 
@@ -197,15 +165,11 @@ impl Transaction for MariadbTransaction<'_> {
     }
 
     fn commit(self: Box<Self>) -> Result<()> {
-        self.tx
-            .commit()
-            .map_err(|e| fault_of(&e).error(format!("the transaction could not be committed: {e}")))
+        self.tx.commit().map_err(|e| fault_of(&e).error(format!("the transaction could not be committed: {e}")))
     }
 
     fn rollback(self: Box<Self>) -> Result<()> {
-        self.tx.rollback().map_err(|e| {
-            fault_of(&e).error(format!("the transaction could not be rolled back: {e}"))
-        })
+        self.tx.rollback().map_err(|e| fault_of(&e).error(format!("the transaction could not be rolled back: {e}")))
     }
 }
 
@@ -227,32 +191,19 @@ impl Executor for mysql::Transaction<'_> {
 }
 
 fn execute_on<E: Executor>(executor: &mut E, sql: &str, params: &[Value]) -> Result<u64> {
-    executor
-        .exec_drop(sql, params_of(params))
-        .map_err(|e| fault_of(&e).error(format!("{sql}: {e}")))?;
+    executor.exec_drop(sql, params_of(params)).map_err(|e| fault_of(&e).error(format!("{sql}: {e}")))?;
     Ok(executor.rows_affected())
 }
 
 fn query_on<Q: Queryable>(queryable: &mut Q, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
-    let rows: Vec<mysql::Row> = queryable
-        .exec(sql, params_of(params))
-        .map_err(|e| fault_of(&e).error(format!("{sql}: {e}")))?;
+    let rows: Vec<mysql::Row> = queryable.exec(sql, params_of(params)).map_err(|e| fault_of(&e).error(format!("{sql}: {e}")))?;
     let mut columns: Option<Arc<Vec<String>>> = None;
     let mut binary: Vec<bool> = Vec::new();
     let mut collected = Vec::with_capacity(rows.len());
     for row in rows {
         if columns.is_none() {
-            columns = Some(Arc::new(
-                row.columns_ref()
-                    .iter()
-                    .map(|column| column.name_str().to_string())
-                    .collect(),
-            ));
-            binary = row
-                .columns_ref()
-                .iter()
-                .map(|column| column.character_set() == BINARY_COLLATION)
-                .collect();
+            columns = Some(Arc::new(row.columns_ref().iter().map(|column| column.name_str().to_string()).collect()));
+            binary = row.columns_ref().iter().map(|column| column.character_set() == BINARY_COLLATION).collect();
         }
         let values = row
             .unwrap_raw()
@@ -291,9 +242,7 @@ fn from_mysql(value: MyValue, binary: bool) -> Value {
     match value {
         MyValue::NULL => Value::Null,
         MyValue::Int(i) => Value::Integer(i),
-        MyValue::UInt(u) => {
-            i64::try_from(u).map_or_else(|_| Value::Text(u.to_string()), Value::Integer)
-        }
+        MyValue::UInt(u) => i64::try_from(u).map_or_else(|_| Value::Text(u.to_string()), Value::Integer),
         MyValue::Float(f) => Value::Real(f64::from(f)),
         MyValue::Double(f) => Value::Real(f),
         MyValue::Bytes(bytes) if binary => Value::Blob(bytes),
@@ -301,9 +250,9 @@ fn from_mysql(value: MyValue, binary: bool) -> Value {
             Ok(text) => Value::Text(text),
             Err(not_text) => Value::Blob(not_text.into_bytes()),
         },
-        MyValue::Date(year, month, day, hour, minute, second, micros) => Value::Text(format!(
-            "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{micros:06}"
-        )),
+        MyValue::Date(year, month, day, hour, minute, second, micros) => {
+            Value::Text(format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{micros:06}"))
+        }
         MyValue::Time(negative, days, hours, minutes, seconds, micros) => Value::Text(format!(
             "{}{:02}:{minutes:02}:{seconds:02}.{micros:06}",
             if negative { "-" } else { "" },
@@ -316,9 +265,7 @@ fn from_mysql(value: MyValue, binary: bool) -> Value {
 /// a table name is read from `information_schema`, never from a caller's string.
 fn quoted(identifier: &str) -> Result<String> {
     let plain = !identifier.is_empty()
-        && identifier
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '$'));
+        && identifier.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '$'));
     if !plain {
         return Err(Fault::Schema.error(format!("{identifier} is not a name this store quotes")));
     }
@@ -394,13 +341,13 @@ fn fault_of(error: &mysql::Error) -> Fault {
 
 fn from_code(code: u16) -> Fault {
     match code {
-        1205 => Fault::Busy,                               // lock wait timeout exceeded
-        1040 | 1203 => Fault::Busy, // too many connections, for this user or at all
-        1213 => Fault::Locked,      // deadlock, broken by the server
-        1044 | 1045 | 1142 | 1143 | 1227 => Fault::Denied, // access, privilege, super
-        1046 | 1049 | 1051 | 1054 | 1109 | 1146 => Fault::Schema, // no database, table, column selected or found
+        1205 => Fault::Busy,                                        // lock wait timeout exceeded
+        1040 | 1203 => Fault::Busy,                                 // too many connections, for this user or at all
+        1213 => Fault::Locked,                                      // deadlock, broken by the server
+        1044 | 1045 | 1142 | 1143 | 1227 => Fault::Denied,          // access, privilege, super
+        1046 | 1049 | 1051 | 1054 | 1109 | 1146 => Fault::Schema,   // no database, table, column selected or found
         1022 | 1048 | 1062 | 1451 | 1452 | 1557 => Fault::Integrity, // key, null, duplicate, foreign key
-        1264 | 1366 | 1406 => Fault::Type, // out of range, wrong value, too long
+        1264 | 1366 | 1406 => Fault::Type,                          // out of range, wrong value, too long
         _ => Fault::Other,
     }
 }
@@ -417,10 +364,7 @@ mod tests {
         let config = MariadbConfig::from_environment()?;
         match MariadbStore::open(&config) {
             Ok(store) => Some(store),
-            Err(error) => panic!(
-                "{DSN_ENVIRONMENT} names {}, which did not open: {error}",
-                config.described()
-            ),
+            Err(error) => panic!("{DSN_ENVIRONMENT} names {}, which did not open: {error}", config.described()),
         }
     }
 
@@ -443,45 +387,24 @@ mod tests {
     fn a_mariadb_instance_carries_the_bootstrap_schema() {
         let mut store = store_or_skip!();
         assert_eq!(store.engine(), Engine::Mariadb);
-        assert!(
-            store.database().unwrap().is_some(),
-            "the DSN names no database to write in"
-        );
+        assert!(store.database().unwrap().is_some(), "the DSN names no database to write in");
 
-        store
-            .execute_batch("DROP TABLE IF EXISTS store_schema;")
-            .unwrap();
+        store.execute_batch("DROP TABLE IF EXISTS store_schema;").unwrap();
         bootstrap(&mut store, "node", BOOTSTRAP_VERSION).unwrap();
         // Run again: a bootstrap is what a node does at every start, not once ever.
         bootstrap(&mut store, "node", BOOTSTRAP_VERSION).unwrap();
 
-        assert_eq!(
-            schema_version(&mut store, "node").unwrap(),
-            Some(BOOTSTRAP_VERSION)
-        );
+        assert_eq!(schema_version(&mut store, "node").unwrap(), Some(BOOTSTRAP_VERSION));
         assert_eq!(schema_version(&mut store, "manager").unwrap(), None);
-        assert_eq!(
-            store
-                .query("SELECT COUNT(*) FROM store_schema", &[])
-                .unwrap()[0]
-                .integer(0)
-                .unwrap(),
-            1
-        );
-        assert!(store
-            .tables()
-            .unwrap()
-            .iter()
-            .any(|table| table == "store_schema"));
+        assert_eq!(store.query("SELECT COUNT(*) FROM store_schema", &[]).unwrap()[0].integer(0).unwrap(), 1);
+        assert!(store.tables().unwrap().iter().any(|table| table == "store_schema"));
 
         let integrity = store.integrity_check().unwrap();
         assert!(integrity.ok, "{:?}", integrity.findings);
         assert_eq!(integrity.to_json()["store_integrity_result"], "ok");
         assert_eq!(integrity.to_json()["engine"], "mariadb");
 
-        store
-            .execute_batch("DROP TABLE IF EXISTS store_schema;")
-            .unwrap();
+        store.execute_batch("DROP TABLE IF EXISTS store_schema;").unwrap();
     }
 
     #[test]
@@ -521,9 +444,7 @@ mod tests {
         let read: Vec<Value> = rows[0].values().to_vec();
         assert_eq!(read, written.to_vec());
         assert_eq!(rows[0].named("as_text").unwrap().text(), Some("a universe"));
-        store
-            .execute_batch("DROP TABLE IF EXISTS store_kinds;")
-            .unwrap();
+        store.execute_batch("DROP TABLE IF EXISTS store_kinds;").unwrap();
     }
 
     #[test]
@@ -537,41 +458,18 @@ mod tests {
             .unwrap();
         {
             let mut tx = store.transaction().unwrap();
-            tx.execute(
-                "INSERT INTO store_observations(id) VALUES(?)",
-                &[Value::from(1_i64)],
-            )
-            .unwrap();
+            tx.execute("INSERT INTO store_observations(id) VALUES(?)", &[Value::from(1_i64)]).unwrap();
         }
-        assert!(store
-            .query("SELECT id FROM store_observations", &[])
-            .unwrap()
-            .is_empty());
+        assert!(store.query("SELECT id FROM store_observations", &[]).unwrap().is_empty());
 
         let mut tx = store.transaction().unwrap();
-        tx.execute(
-            "INSERT INTO store_observations(id) VALUES(?)",
-            &[Value::from(2_i64)],
-        )
-        .unwrap();
+        tx.execute("INSERT INTO store_observations(id) VALUES(?)", &[Value::from(2_i64)]).unwrap();
         tx.commit().unwrap();
-        assert_eq!(
-            store
-                .query("SELECT id FROM store_observations", &[])
-                .unwrap()[0]
-                .integer(0)
-                .unwrap(),
-            2
-        );
+        assert_eq!(store.query("SELECT id FROM store_observations", &[]).unwrap()[0].integer(0).unwrap(), 2);
 
-        let duplicated = store.execute(
-            "INSERT INTO store_observations(id) VALUES(?)",
-            &[Value::from(2_i64)],
-        );
+        let duplicated = store.execute("INSERT INTO store_observations(id) VALUES(?)", &[Value::from(2_i64)]);
         assert_eq!(duplicated.unwrap_err().fault, Fault::Integrity);
-        store
-            .execute_batch("DROP TABLE IF EXISTS store_observations;")
-            .unwrap();
+        store.execute_batch("DROP TABLE IF EXISTS store_observations;").unwrap();
     }
 
     /// The other half of the busy mapping, against the server rather than the code table: a row
@@ -583,50 +481,26 @@ mod tests {
             eprintln!("skipped: {DSN_ENVIRONMENT} names no MariaDB server");
             return;
         };
-        let impatient = MariadbConfig {
-            lock_wait_timeout: std::time::Duration::from_secs(1),
-            ..config.clone()
-        };
+        let impatient = MariadbConfig { lock_wait_timeout: std::time::Duration::from_secs(1), ..config.clone() };
         let mut held = MariadbStore::open(&config).unwrap();
         held.execute_batch(
             "DROP TABLE IF EXISTS store_leases; \
              CREATE TABLE store_leases(id BIGINT NOT NULL PRIMARY KEY, holder VARCHAR(32) NOT NULL) ENGINE=InnoDB;",
         )
         .unwrap();
-        held.execute(
-            "INSERT INTO store_leases(id, holder) VALUES(?, ?)",
-            &[Value::from(1_i64), Value::from("none")],
-        )
-        .unwrap();
+        held.execute("INSERT INTO store_leases(id, holder) VALUES(?, ?)", &[Value::from(1_i64), Value::from("none")]).unwrap();
         let mut waiting = MariadbStore::open(&impatient).unwrap();
 
         let mut writing = held.transaction().unwrap();
-        writing
-            .execute(
-                "UPDATE store_leases SET holder = ? WHERE id = ?",
-                &[Value::from("held"), Value::from(1_i64)],
-            )
-            .unwrap();
+        writing.execute("UPDATE store_leases SET holder = ? WHERE id = ?", &[Value::from("held"), Value::from(1_i64)]).unwrap();
         let refused = waiting
-            .execute(
-                "UPDATE store_leases SET holder = ? WHERE id = ?",
-                &[Value::from("waiting"), Value::from(1_i64)],
-            )
+            .execute("UPDATE store_leases SET holder = ? WHERE id = ?", &[Value::from("waiting"), Value::from(1_i64)])
             .unwrap_err();
-        assert!(
-            refused.retryable(),
-            "a held row answers busy or locked, said {refused}"
-        );
+        assert!(refused.retryable(), "a held row answers busy or locked, said {refused}");
         writing.commit().unwrap();
 
-        waiting
-            .execute(
-                "UPDATE store_leases SET holder = ? WHERE id = ?",
-                &[Value::from("waiting"), Value::from(1_i64)],
-            )
-            .unwrap();
-        held.execute_batch("DROP TABLE IF EXISTS store_leases;")
-            .unwrap();
+        waiting.execute("UPDATE store_leases SET holder = ? WHERE id = ?", &[Value::from("waiting"), Value::from(1_i64)]).unwrap();
+        held.execute_batch("DROP TABLE IF EXISTS store_leases;").unwrap();
     }
 
     #[test]
@@ -662,11 +536,7 @@ mod tests {
         assert_eq!(quoted("store_schema").unwrap(), "`store_schema`");
         assert_eq!(quoted("podmesh-node").unwrap(), "`podmesh-node`");
         for refused in ["", "a`b", "a b", "a;b", "a\"b"] {
-            assert_eq!(
-                quoted(refused).unwrap_err().fault,
-                Fault::Schema,
-                "{refused}"
-            );
+            assert_eq!(quoted(refused).unwrap_err().fault, Fault::Schema, "{refused}");
         }
     }
 }
