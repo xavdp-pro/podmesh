@@ -9,6 +9,9 @@ mod secrets;
 mod publisher;
 mod signing;
 mod schema;
+// The journal's engine, named once (docs/STORE-CONFIGURATION.md). Public so that the tools and
+// the manager tree may open a store; `storage` below is Podman's graph, not this.
+pub mod store;
 mod storage;
 mod health;
 pub use manager::control_relay;
