@@ -456,7 +456,7 @@ pub fn bootstrap(store: &mut dyn DurableStore, name: &str, version: i64) -> Resu
 
 /// The MariaDB tests share one server, named by one DSN, and each of them creates and drops
 /// tables in it. They take this first so that what one drops is never what another is reading.
-#[cfg(test)]
+#[cfg(all(test, feature = "mariadb"))]
 pub(crate) static MARIADB_TEST_SERVER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The version a named schema is recorded at, or none when the store never carried it.
