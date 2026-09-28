@@ -5,17 +5,23 @@ Status: Phase 2 preparation at `1bc73fc`. This inventories production
 
 ## Open path
 
-`src/lib.rs::open_state` is the only production file-backed `rusqlite` open. It
-creates the state directory, opens `<state-dir>/state.sqlite`, enables WAL, and
-creates the base tables. `src/bin/podmeshd.rs` calls it at daemon startup;
-`src/publisher.rs` also calls it for connector startup. The default state
-directory remains `/var/lib/podmesh`.
+`src/lib.rs::open_state` is the only runtime open that owns and writes
+`state.sqlite`. It creates the state directory, opens
+`<state-dir>/state.sqlite`, enables WAL, and creates the base tables.
+`src/bin/podmeshd.rs` calls it at daemon startup; `src/publisher.rs` also calls
+it for connector startup. The default state directory remains
+`/var/lib/podmesh`.
 
-The other `Connection::open_*` calls under `src/` are nine test-only in-memory
-opens: four in `activation.rs`, one in `boot_restore.rs`, one in `network.rs`,
-and three in `publisher.rs`. Their inline `CREATE TABLE` statements reproduce
-subsets of the production tables for fixtures; they do not add production
-tables.
+`src/bin/podmesh-storage-migrate.rs` opens the operator-supplied SQLite source
+with `SQLITE_OPEN_READ_ONLY`; it neither creates schema nor opens the configured
+runtime path implicitly.
+
+The existing modules contain nine test-only in-memory opens: four in
+`activation.rs`, one in `boot_restore.rs`, one in `network.rs`, and three in
+`publisher.rs`. Their inline `CREATE TABLE` statements reproduce subsets of the
+production tables for fixtures. The migration binary test has one temporary
+file-backed open and creates `alpha` and `beta` fixtures. None adds a production
+table.
 
 ## Production tables
 
