@@ -275,10 +275,6 @@ fn sqlite_only_operation(operation: &str) -> bool {
             | "migration_restore_abort"
             | "garbage_collect_plan"
             | "garbage_collect_apply"
-            | "collection_retention_declare"
-            | "collection_hold_declare"
-            | "collection_hold_release"
-            | "collection_status"
             | "manager_status"
             | "manager_decision"
             | "manager_observe"
@@ -350,10 +346,14 @@ fn durable_capabilities(engine: Engine) -> Value {
             "secret_declare",
             "secret_remove",
             "secret_status",
+            "collection_retention_declare",
+            "collection_hold_declare",
+            "collection_hold_release",
+            "collection_status",
         ],
         "store_engine": engine.as_str(),
         "unsupported_error_code": "store_engine_unsupported",
-        "scope": "read-only local API, lifecycle create/delete/clone/start/stop/pause/resume/resources, and secret_declare/secret_remove/secret_status; other module-owned mutations remain SQLite-only",
+        "scope": "read-only local API, lifecycle create/delete/clone/start/stop/pause/resume/resources, secret_declare/secret_remove/secret_status, and collection_retention_declare/collection_hold_declare/collection_hold_release/collection_status; other module-owned mutations remain SQLite-only",
     })
 }
 
@@ -392,6 +392,30 @@ fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
     }
     if matches!(operation, "secret_declare" | "secret_remove" | "secret_status") {
         let result = secrets::execute_store(store, request);
+        let response = match result {
+            Ok(data) => json!({"ok":true,"observed_at":now(),"data":data}),
+            Err(error) => json!({"ok":false,"observed_at":now(),"error":error.to_string()}),
+        };
+        if let Err(error) = store.execute(
+            "INSERT INTO observations(observed_at, operation, result) VALUES(?, ?, ?)",
+            &[
+                Stored::from(now() as i64),
+                Stored::from(operation),
+                Stored::from(response.to_string()),
+            ],
+        ) {
+            return json!({"ok":false,"error":format!("Observation persistence failed: {error}")});
+        }
+        return response;
+    }
+    if matches!(
+        operation,
+        "collection_retention_declare"
+            | "collection_hold_declare"
+            | "collection_hold_release"
+            | "collection_status"
+    ) {
+        let result = retention::execute_store(store, request);
         let response = match result {
             Ok(data) => json!({"ok":true,"observed_at":now(),"data":data}),
             Err(error) => json!({"ok":false,"observed_at":now(),"error":error.to_string()}),
@@ -685,10 +709,22 @@ mod api_store_tests {
             .unwrap()
             .iter()
             .any(|operation| operation == "capabilities"));
+        assert!(capabilities["data"]["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|operation| operation == "collection_status"));
 
         let identity = node.handle(&json!({"operation": "identity"}));
         assert_eq!(identity["ok"], true);
         assert_eq!(identity["data"]["host_uuid"], "host-from-durable-store");
+
+        let retention = node.handle(&json!({
+            "operation": "collection_status",
+            "universe_uuid": "16926159-bf59-4537-8f6e-5cfea52540ea"
+        }));
+        assert_eq!(retention["ok"], true, "{retention}");
+        assert_eq!(retention["data"]["retention_declared"], false);
 
         let deletion = json!({
             "operation": "delete",
