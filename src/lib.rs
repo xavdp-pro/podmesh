@@ -100,8 +100,9 @@ impl NodeStore {
     /// Serve one local API request without changing the SQLite operation path.
     ///
     /// SQLite keeps the existing [`handle`] byte for byte. A durable engine serves the reads,
-    /// lifecycle, and secret operations ported below; every other known operation is refused by
-    /// name until the module that owns it speaks [`DurableStore`].
+    /// lifecycle, secret, collection retention, network, and publisher operations ported below;
+    /// every other known operation is refused by name until the module that owns it speaks
+    /// [`DurableStore`].
     pub fn handle(&mut self, request: &Value) -> Value {
         match self {
             NodeStore::Sqlite(db) => handle(db, request),
@@ -282,11 +283,6 @@ fn sqlite_only_operation(operation: &str) -> bool {
             | "manager_vote_ledger_mark_unadmitted"
             | "manager_vote_ledger_readmit"
             | "manager_decision_propose"
-            | "publisher_declare"
-            | "publisher_start"
-            | "publisher_stop"
-            | "publisher_status"
-            | "publisher_observed"
             | "activation_require"
             | "activation_acquire"
             | "activation_renew"
@@ -350,18 +346,23 @@ fn durable_capabilities(engine: Engine) -> Value {
             "network_route_resume",
             "network_reapply",
             "network_status",
+            "publisher_declare",
+            "publisher_start",
+            "publisher_stop",
+            "publisher_status",
+            "publisher_observed",
         ],
         "store_engine": engine.as_str(),
         "unsupported_error_code": "store_engine_unsupported",
-        "scope": "read-only local API, lifecycle create/delete/clone/start/stop/pause/resume/resources, secrets, collection retention, and network declare/routes/status; other module-owned mutations remain SQLite-only",
+        "scope": "read-only local API, lifecycle create/delete/clone/start/stop/pause/resume/resources, secrets, collection retention, network declare/routes/status, and publisher declare/start/stop/status/observed; other module-owned mutations remain SQLite-only",
     })
 }
 
 /// Local API carried by a non-SQLite journal.
 ///
-/// Reads, lifecycle, secrets, collection retention, and network operations go through
-/// [`DurableStore`]. Every other module-owned operation stays on the named refusal until that
-/// module is ported.
+/// Reads, lifecycle, secrets, collection retention, network, and publisher operations go
+/// through [`DurableStore`]. Every other module-owned operation stays on the named refusal
+/// until that module is ported.
 fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
     let operation = request
         .get("operation")
@@ -435,6 +436,24 @@ fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
     }
     if matches!(operation, "network_declare" | "network_undeclare" | "network_route_publish" | "network_route_withdraw" | "network_route_resume" | "network_reapply" | "network_status") {
         let result = network::execute_store(store, request);
+        let response = match result {
+            Ok(data) => json!({"ok":true,"observed_at":now(),"data":data}),
+            Err(error) => json!({"ok":false,"observed_at":now(),"error":error.to_string()}),
+        };
+        if let Err(error) = store.execute(
+            "INSERT INTO observations(observed_at, operation, result) VALUES(?, ?, ?)",
+            &[
+                Stored::from(now() as i64),
+                Stored::from(operation),
+                Stored::from(response.to_string()),
+            ],
+        ) {
+            return json!({"ok":false,"error":format!("Observation persistence failed: {error}")});
+        }
+        return response;
+    }
+    if matches!(operation, "publisher_declare" | "publisher_start" | "publisher_stop" | "publisher_status" | "publisher_observed") {
+        let result = publisher::execute_store(store, request);
         let response = match result {
             Ok(data) => json!({"ok":true,"observed_at":now(),"data":data}),
             Err(error) => json!({"ok":false,"observed_at":now(),"error":error.to_string()}),

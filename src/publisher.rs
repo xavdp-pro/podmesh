@@ -35,6 +35,7 @@
 //! hostname resolves (Cloudflare's), and the manager's web interface (the origin here is the
 //! universe's epoch-qualified readiness responder).
 use crate::lifecycle as lc;
+use crate::store::{DurableStore, Value as Stored};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -1167,6 +1168,974 @@ pub fn withdraw_at_startup(db: &Connection) -> Result<Value, Error> {
     })
 }
 
+/// The same five operations through the store contract, for a journal that is not a file.
+///
+/// `publisher_status` reads without journaling, exactly as [`execute`] does, with one
+/// structural gap: the carrier's resident replica is read through the manager module, which
+/// still takes a `Connection`, so the store path reports it unknown (and the origin's
+/// verdict with it) rather than inventing it. `publisher_declare`, `publisher_start`,
+/// `publisher_stop` and `publisher_observed` are journaled by operation ID with the same
+/// replay rule as the connection path and as [`secrets::execute_store`]: a verified ID
+/// returns its persisted result marked replayed and never runs again, any other ID runs and
+/// is recorded verified or failed with an attempt row either way.
+///
+/// Every statement uses `?` placeholders bound by position, so the same text runs on both
+/// engines; `` `key` `` and `` `at` `` are quoted because MariaDB reserves them. The schema
+/// is installed when the store opens, so this path performs no DDL. The pre-mutation
+/// network reconciliation of the connection path has no store entry point -- its module is
+/// untouched here -- so a mutation refuses while any network effect row is not effective,
+/// read-only, instead of reconciling first.
+///
+/// The ledger's `intent` column holds 64 characters on MariaDB, which a mark's or a
+/// connector's full JSON intent does not fit: the store path records the carrier alone for
+/// a mark and a compact `{"ip","port"}` for a connector, and reads back both these and the
+/// connection path's full objects. Podman, systemd, journalctl and TCP side effects run as
+/// they do on the connection path.
+pub fn execute_store(store: &mut dyn DurableStore, request: &Value) -> Result<Value, Error> {
+    let operation = lc::text(request, "operation")?;
+    let resource = lc::text(request, "resource")?;
+    lc::token(resource)?;
+    if !["publisher_status", "publisher_declare", "publisher_start", "publisher_stop", "publisher_observed"].contains(&operation) {
+        return Err("Unsupported publisher operation".into());
+    }
+    if operation == "publisher_status" {
+        return view_store(store, resource);
+    }
+    journaled_store(store, request, |store| {
+        refuse_unreconciled_store(store)?;
+        perform_store(store, request, resource)
+    })
+}
+
+fn stored_optional_text(value: &Stored) -> Result<Option<String>, Error> {
+    match value {
+        Stored::Null => Ok(None),
+        Stored::Text(text) => Ok(Some(text.clone())),
+        Stored::Blob(bytes) => Ok(Some(String::from_utf8_lossy(bytes).into_owned())),
+        other => Err(format!("column is {}, not text", other.kind()).into()),
+    }
+}
+
+fn journaled_store(
+    store: &mut dyn DurableStore,
+    request: &Value,
+    run: impl FnOnce(&mut dyn DurableStore) -> Result<Value, Error>,
+) -> Result<Value, Error> {
+    let id = lc::text(request, "operation_id")?;
+    lc::token(id)?;
+    let canonical = request.to_string();
+    if let Some(row) = store.query_one("SELECT request, status, result FROM operations WHERE id = ?", &[Stored::from(id)])? {
+        let saved = row.text(0)?.to_string();
+        let status = row.text(1)?.to_string();
+        let result = stored_optional_text(row.value(2)?)?;
+        if saved != canonical {
+            return Err("Operation ID already belongs to a different request".into());
+        }
+        if status == "verified" {
+            let stored = result.ok_or("Missing persisted result")?;
+            let mut original: Value = serde_json::from_str(&stored)?;
+            original["replayed"] = json!(true);
+            original["historical"] = json!(true);
+            original["notice"] = json!("this is the result persisted when the operation was verified, not current state; a replay repeats no effect");
+            return Ok(original);
+        }
+    } else {
+        store.execute(
+            "INSERT INTO operations(id, request, status) VALUES(?, ?, ?)",
+            &[Stored::from(id), Stored::from(canonical.clone()), Stored::from("pending")],
+        )?;
+    }
+    store.execute(
+        "INSERT INTO operation_attempts(operation_id, started_at) VALUES(?, ?)",
+        &[Stored::from(id), Stored::from(crate::now() as i64)],
+    )?;
+    let attempt = store
+        .query_one("SELECT id FROM operation_attempts WHERE operation_id = ? ORDER BY id DESC LIMIT 1", &[Stored::from(id)])?
+        .ok_or("Missing operation attempt")?
+        .integer(0)?;
+    let outcome = run(store);
+    let finished = crate::now() as i64;
+    match &outcome {
+        Ok(result) => {
+            store.execute(
+                "UPDATE operations SET status = ?, result = ? WHERE id = ?",
+                &[Stored::from("verified"), Stored::from(result.to_string()), Stored::from(id)],
+            )?;
+            store.execute(
+                "UPDATE operation_attempts SET finished_at = ?, outcome = ? WHERE id = ?",
+                &[Stored::from(finished), Stored::from("verified"), Stored::from(attempt)],
+            )?;
+        }
+        Err(error) => {
+            let record = json!({"error": error.to_string()}).to_string();
+            store.execute(
+                "UPDATE operations SET status = ?, result = ? WHERE id = ?",
+                &[Stored::from("failed"), Stored::from(record.clone()), Stored::from(id)],
+            )?;
+            store.execute(
+                "UPDATE operation_attempts SET finished_at = ?, outcome = ?, detail = ? WHERE id = ?",
+                &[Stored::from(finished), Stored::from("failed"), Stored::from(record), Stored::from(attempt)],
+            )?;
+        }
+    }
+    outcome
+}
+
+/// The connection path reconciles the network ledger before every mutation; the store entry
+/// point of that reconciliation lives in a module this port does not touch, so a mutation
+/// refuses while any network effect row is not effective instead of reconciling first.
+fn refuse_unreconciled_store(store: &mut dyn DurableStore) -> Result<(), Error> {
+    let rows = store.query("SELECT kind, `key`, owner, state FROM network_effects WHERE state <> ? ORDER BY id", &[Stored::from("effective")])?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let remaining = rows
+        .iter()
+        .map(|row| -> Result<Value, Error> {
+            Ok(json!({"kind": row.text(0)?, "key": row.text(1)?, "owner": row.text(2)?, "was": row.text(3)?}))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Err(format!("incomplete network effects remain; refusing: {}", json!(remaining)).into())
+}
+
+fn declared_store(store: &mut dyn DurableStore, resource: &str) -> Result<Option<Publisher>, Error> {
+    let Some(row) = store.query_one(
+        "SELECT resource, hostname, tunnel_uuid, credential, origin_port FROM publishers WHERE resource = ?",
+        &[Stored::from(resource)],
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Publisher {
+        resource: row.text(0)?.to_string(),
+        hostname: row.text(1)?.to_string(),
+        tunnel_uuid: row.text(2)?.to_string(),
+        credential: row.text(3)?.to_string(),
+        origin_port: row.integer(4)? as u16,
+    }))
+}
+
+fn event_store(store: &mut dyn DurableStore, resource: &str, what: &str, id: &str, detail: Option<Value>) -> Result<(), Error> {
+    store.execute(
+        "INSERT INTO publisher_events(resource, event, `at`, operation_id, detail) VALUES(?, ?, ?, ?, ?)",
+        &[
+            Stored::from(resource),
+            Stored::from(what),
+            Stored::from(crate::now() as i64),
+            Stored::from(id),
+            detail.map(|d| Stored::from(d.to_string())).unwrap_or(Stored::Null),
+        ],
+    )?;
+    Ok(())
+}
+
+fn last_event_store(store: &mut dyn DurableStore, resource: &str, what: &str) -> Result<Option<Value>, Error> {
+    let Some(row) = store.query_one(
+        "SELECT `at`, operation_id, detail FROM publisher_events WHERE resource = ? AND event = ? ORDER BY id DESC LIMIT 1",
+        &[Stored::from(resource), Stored::from(what)],
+    )?
+    else {
+        return Ok(None);
+    };
+    let detail = stored_optional_text(row.value(2)?)?.and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    Ok(Some(json!({"at": row.integer(0)?, "operation_id": row.text(1)?, "detail": detail})))
+}
+
+fn transition_store(store: &mut dyn DurableStore, resource: &str, state: &str, epoch: i64, id: &str) -> Result<(), Error> {
+    let now = crate::now() as i64;
+    if store.query_one("SELECT state FROM publisher_transitions WHERE resource = ?", &[Stored::from(resource)])?.is_some() {
+        store.execute(
+            "UPDATE publisher_transitions SET state = ?, epoch = ?, operation_id = ?, changed_at = ? WHERE resource = ?",
+            &[Stored::from(state), Stored::from(epoch), Stored::from(id), Stored::from(now), Stored::from(resource)],
+        )?;
+    } else {
+        store.execute(
+            "INSERT INTO publisher_transitions(resource, state, epoch, operation_id, changed_at) VALUES(?, ?, ?, ?, ?)",
+            &[Stored::from(resource), Stored::from(state), Stored::from(epoch), Stored::from(id), Stored::from(now)],
+        )?;
+    }
+    Ok(())
+}
+
+fn transition_of_store(store: &mut dyn DurableStore, resource: &str) -> Result<Option<(String, i64)>, Error> {
+    let Some(row) = store
+        .query_one("SELECT state, epoch FROM publisher_transitions WHERE resource = ?", &[Stored::from(resource)])?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((row.text(0)?.to_string(), row.integer(1)?)))
+}
+
+/// The activation lease gate of [`crate::activation::refuse_if_not_activated`], read through
+/// the store contract: the helper only takes a `Connection`, so the same four refusals are
+/// decided here from the same tables, with the same words. No SQLite file is opened.
+fn refuse_activated_store(store: &mut dyn DurableStore, uuid: &str, operation: &str) -> Result<(), Error> {
+    if policy_store(store, uuid)?.is_none() {
+        return Ok(());
+    }
+    let now = crate::now() as i64;
+    let Some(l) = lease_store(store, uuid)? else {
+        return Err(format!("{operation} refused: this universe requires an activation lease and none is held").into());
+    };
+    let this_host = host_store(store)?;
+    if l.holder_host_uuid != this_host {
+        return Err(format!("{operation} refused: the activation lease is held by another host").into());
+    }
+    if l.expires_at <= now {
+        return Err(format!("{operation} refused: this host's activation lease expired {} seconds ago", now - l.expires_at).into());
+    }
+    if let Some(seen) = superseded_store(store, uuid, &l)? {
+        return Err(format!("{operation} refused: this host's activation was superseded by epoch {seen}").into());
+    }
+    Ok(())
+}
+
+fn host_store(store: &mut dyn DurableStore) -> Result<String, Error> {
+    Ok(store
+        .query_one("SELECT value FROM metadata WHERE `key` = ?", &[Stored::from("host_uuid")])?
+        .ok_or("The journal carries no host_uuid")?
+        .text(0)?
+        .to_string())
+}
+
+fn policy_store(store: &mut dyn DurableStore, uuid: &str) -> Result<Option<crate::activation::Policy>, Error> {
+    let Some(row) = store.query_one(
+        "SELECT lease_seconds, takeover_margin_seconds, desired_standbys, eligible_hosts, authorization_ref, authority_id, authority_key, authority_quorum, authority_serial FROM activation_policy WHERE universe_uuid = ?",
+        &[Stored::from(uuid)],
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(crate::activation::Policy {
+        lease_seconds: row.integer(0)? as u64,
+        takeover_margin_seconds: row.integer(1)? as u64,
+        desired_standbys: row.integer(2)? as u64,
+        eligible_hosts: serde_json::from_str(row.text(3)?).unwrap_or_default(),
+        authorization_ref: row.text(4)?.to_string(),
+        authority_id: row.text(5)?.to_string(),
+        authority_key: row.text(6)?.to_string(),
+        authority_quorum: row.text(7)?.to_string(),
+        authority_serial: row.integer(8)? as u64,
+    }))
+}
+
+fn lease_store(store: &mut dyn DurableStore, uuid: &str) -> Result<Option<crate::activation::Lease>, Error> {
+    let Some(row) = store.query_one(
+        "SELECT holder_host_uuid, generation, expires_at, epoch, grant_id, acquired_at FROM activation_leases WHERE universe_uuid = ?",
+        &[Stored::from(uuid)],
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(crate::activation::Lease {
+        holder_host_uuid: row.text(0)?.to_string(),
+        generation: row.integer(1)?,
+        expires_at: row.integer(2)?,
+        epoch: row.integer(3)?,
+        grant_id: row.text(4)?.to_string(),
+        acquired_at: row.integer(5)?,
+    }))
+}
+
+fn superseded_store(store: &mut dyn DurableStore, uuid: &str, l: &crate::activation::Lease) -> Result<Option<i64>, Error> {
+    let Some(row) =
+        store.query_one("SELECT epoch FROM activation_epochs WHERE universe_uuid = ?", &[Stored::from(uuid)])?
+    else {
+        return Ok(None);
+    };
+    let seen = row.integer(0)?;
+    Ok(if seen > l.epoch { Some(seen) } else { None })
+}
+
+/// Podman's secret store, asked directly: whether it holds a name. The same probe as the
+/// secrets module's, repeated here because that module is not edited by this port.
+fn credential_in_store(name: &str) -> Option<bool> {
+    let out = std::process::Command::new("podman").args(["secret", "exists", name]).output().ok()?;
+    Some(out.status.success())
+}
+
+/// What [`crate::secrets::declared`] answers, read through the store contract with the same
+/// words: the credential's row must be effective, and Podman's store is still asked directly.
+fn secret_declared_store(store: &mut dyn DurableStore, name: &str) -> Result<(), Error> {
+    let held = store.query_one(
+        "SELECT sha256 FROM secrets WHERE name = ? AND removed_at IS NULL AND state = ?",
+        &[Stored::from(name), Stored::from("effective")],
+    )?;
+    if held.is_none() {
+        return Err(format!("secret {name} is not declared on this host (secret_declare)").into());
+    }
+    match credential_in_store(name) {
+        Some(true) => Ok(()),
+        Some(false) => Err(format!("secret {name} is declared here but absent from Podman's store; declare it again").into()),
+        None => Err(format!("Podman's secret store could not be asked about {name}; refusing on an unknown state").into()),
+    }
+}
+
+/// The route and alias the resource holds on this host, read through the store contract: the
+/// recorded row from the journal, its effectiveness from the read-only network status (the
+/// kernel and the carrier's addresses, asked now), combined by the same gate.
+fn service_here_store(store: &mut dyn DurableStore, resource: &str) -> Result<(Option<(String, String)>, Option<bool>), Error> {
+    let Some(row) = store.query_one(
+        "SELECT ip, alias_universe_uuid, state FROM network_routes WHERE exclusive_resource = ?",
+        &[Stored::from(resource)],
+    )?
+    else {
+        return Ok((None, Some(false)));
+    };
+    let ip = row.text(0)?.to_string();
+    let carrier = stored_optional_text(row.value(1)?)?;
+    let state = stored_optional_text(row.value(2)?)?;
+    if state.as_deref().unwrap_or("effective") != "effective" {
+        return Ok((None, Some(false)));
+    }
+    let Some(carrier) = carrier else { return Ok((None, Some(false))) };
+    let status = crate::network::execute_store(store, &json!({"operation": "network_status"}))?;
+    let entry = status["effective"]["published_routes"]
+        .as_array()
+        .and_then(|rs| rs.iter().find(|r| r["ip"] == json!(ip)).cloned());
+    let (route, address) = match &entry {
+        Some(r) => (r["effective"].as_bool(), r["alias_effective"].as_bool()),
+        None => (None, None),
+    };
+    let gate = service_gate(route, address);
+    Ok((if gate == Some(true) { Some((ip, carrier)) } else { None }, gate))
+}
+
+fn eligibility_store(store: &mut dyn DurableStore, p: &Publisher) -> Result<Eligibility, Error> {
+    let mut reasons = vec![];
+    let mut epoch = None;
+    let lease_gate = match refuse_activated_store(store, &p.resource, "publisher_start") {
+        Ok(()) => {
+            epoch = lease_store(store, &p.resource)?.map(|l| l.epoch);
+            true
+        }
+        Err(e) => {
+            reasons.push(e.to_string());
+            false
+        }
+    };
+    let policy_gate = policy_store(store, &p.resource)?.is_some();
+    if !policy_gate {
+        reasons.push(format!("{} is under no activation policy on this host", p.resource));
+    }
+    let (service, gate) = service_here_store(store, &p.resource)?;
+    match gate {
+        Some(true) => {}
+        Some(false) => reasons.push("no effective exclusive route and alias for the resource on this host: publish the service address first".into()),
+        None => reasons.push("whether the exclusive route and alias are effective could not be read (the kernel's routes or the carrier's addresses): not eligible until it can be".into()),
+    }
+    let credential_gate = match secret_declared_store(store, &p.credential) {
+        Ok(()) => true,
+        Err(e) => {
+            reasons.push(e.to_string());
+            false
+        }
+    };
+    let gates = json!({"lease": lease_gate, "policy": policy_gate, "service_address": gate, "credential": credential_gate});
+    Ok((reasons.is_empty(), reasons, service, epoch, gates))
+}
+
+fn last_verified_store(store: &mut dyn DurableStore, resource: &str) -> Result<Option<Verified>, Error> {
+    let Some(row) = store.query_one(
+        "SELECT epoch, generation, acquired_at, boot_id, authority_id, authority_key, proof, verified, verified_at, operation_id, authority_quorum, authority_digest
+         FROM publisher_takeover_verified WHERE resource = ? ORDER BY epoch DESC LIMIT 1",
+        &[Stored::from(resource)],
+    )?
+    else {
+        return Ok(None);
+    };
+    let json = |s: &str| serde_json::from_str::<Value>(s).unwrap_or(Value::Null);
+    let proof = row.text(6)?.to_string();
+    let verified = row.text(7)?.to_string();
+    Ok(Some(Verified {
+        epoch: row.integer(0)?,
+        generation: row.integer(1)?,
+        acquired_at: row.integer(2)?,
+        boot_id: row.text(3)?.to_string(),
+        authority_id: row.text(4)?.to_string(),
+        authority_key: row.text(5)?.to_string(),
+        proof: json(&proof),
+        verified: json(&verified),
+        verified_at: row.integer(8)?,
+        operation_id: row.text(9)?.to_string(),
+        authority_quorum: row.text(10)?.to_string(),
+        authority_digest: row.text(11)?.to_string(),
+    }))
+}
+
+fn resume_facts_store(store: &mut dyn DurableStore, resource: &str, this_host: &str, boot: &str) -> Result<ResumeFacts, Error> {
+    let lease = lease_store(store, resource)?;
+    let superseded_by = match &lease { Some(l) => superseded_store(store, resource, l)?, None => None };
+    let policy = policy_store(store, resource)?;
+    Ok(ResumeFacts {
+        recorded: last_verified_store(store, resource)?,
+        lease,
+        this_host: this_host.into(),
+        now: crate::now() as i64,
+        superseded_by,
+        boot_id: boot.into(),
+        authority_digest: policy.as_ref().and_then(|p| p.authority_digest().ok().flatten()).unwrap_or_default(),
+        authority: policy.map(|p| (p.authority_id, p.authority_key, p.authority_quorum)),
+    })
+}
+
+/// Step 4 of a start, through the store contract: the same verification as
+/// [`verify_takeover_proof`], read from the journal instead of a `Connection`.
+fn verify_takeover_proof_store(store: &mut dyn DurableStore, resource: &str, proof: &Value, epoch: i64, this_host: &str) -> Result<Value, Error> {
+    let now = crate::now() as i64;
+    let policy = policy_store(store, resource)?.ok_or("no activation policy")?;
+    let text = |k: &str| proof[k].as_str().map(str::to_string).ok_or_else(|| format!("takeover_proof lacks {k}"));
+    let authority = policy.authority()?;
+    let signed = authority.is_some();
+    let kind = text("kind")?;
+    let mut signers = None;
+    let origin = if let Some(quorum) = authority.as_ref() {
+        let certificate = kind == crate::signing::QUORUM_PROOF_KIND;
+        if quorum.single_key && kind != crate::signing::SIGNED_PROOF_KIND && !certificate {
+            return Err(format!("takeover_proof is {kind}; this resource's policy names the authority's key and requires {} (or a certificate, {}, under its 1-of-1 digest)",
+                               crate::signing::SIGNED_PROOF_KIND, crate::signing::QUORUM_PROOF_KIND).into());
+        }
+        if !quorum.single_key && !certificate {
+            return Err(format!("takeover_proof is {kind}; this resource's policy names a quorum of {} keys and requires {}", quorum.keys.len(), crate::signing::QUORUM_PROOF_KIND).into());
+        }
+        let who = crate::signing::verify_takeover(proof, quorum).map_err(|e| format!("takeover_proof: {e}"))?;
+        if certificate {
+            if text("holder_boot_id")? != crate::activation::boot_id()? {
+                return Err("takeover_proof is bound to another boot of this host; a rebooted host must be decided for again".into());
+            }
+            let grant = lease_store(store, resource)?.map(|l| l.grant_id).unwrap_or_default();
+            if text("grant_id")? != grant {
+                return Err(format!("takeover_proof is for grant {}, this host's lease was acquired under grant {grant}", text("grant_id")?).into());
+            }
+            signers = Some(json!({"signers": who, "threshold": quorum.threshold, "keys": quorum.keys.len(), "policy_digest": quorum.digest()}));
+            "a certificate: the threshold's number of distinct keys of the policy's quorum signed its canonical form under the policy's digest"
+        } else {
+            "signed by the authority's key named in the policy; the signature verified over the document's canonical form"
+        }
+    } else {
+        if kind != crate::signing::UNSIGNED_PROOF_KIND {
+            return Err(format!("takeover_proof is {kind}; this resource's policy names no authority key, and only a laboratory proof is accepted without one").into());
+        }
+        "laboratory proof, unsigned: its binding is checked, its origin is not"
+    };
+    if text("authority_id")? != policy.authority_id {
+        return Err("takeover_proof names another authority than this resource's policy".into());
+    }
+    if text("resource")? != resource {
+        return Err("takeover_proof is bound to another resource".into());
+    }
+    if text("new_holder")? != this_host {
+        return Err("takeover_proof names another host as the new holder".into());
+    }
+    let new_epoch = proof["new_epoch"].as_i64().ok_or("takeover_proof lacks new_epoch")?;
+    let previous_epoch = proof["previous_epoch"].as_i64().ok_or("takeover_proof lacks previous_epoch")?;
+    if new_epoch != epoch {
+        return Err(format!("takeover_proof is for epoch {new_epoch}, this host's lease is under epoch {epoch}").into());
+    }
+    if previous_epoch != epoch - 1 {
+        return Err(format!("takeover_proof names previous epoch {previous_epoch}, not the one before {epoch}").into());
+    }
+    let issued = proof["issued_at"].as_i64().ok_or("takeover_proof lacks issued_at")?;
+    let expires = proof["expires_at"].as_i64().ok_or("takeover_proof lacks expires_at")?;
+    if issued > now + 30 {
+        return Err("takeover_proof is issued in the future beyond the clock allowance".into());
+    }
+    if expires < now {
+        return Err(format!("takeover_proof expired {} seconds ago", now - expires).into());
+    }
+    if let Some(eligible) = proof.get("eligible_after").and_then(Value::as_i64) {
+        if now < eligible {
+            return Err(format!("takeover_proof: the authority's barrier is at {eligible}, {} seconds from now on this clock; refusing before it", eligible - now).into());
+        }
+    }
+    let previous_holder = proof["previous_holder"].as_str();
+    crate::activation::takeover_method(proof, resource, this_host, previous_epoch, "takeover_proof")?;
+    let mut verified = json!({"method": proof["method"], "previous_epoch": previous_epoch, "new_epoch": new_epoch, "previous_holder": previous_holder,
+              "verified_at": now, "signed": signed, "note": origin});
+    if let Some(q) = signers {
+        verified["quorum"] = q;
+    }
+    Ok(verified)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_verified_store(
+    store: &mut dyn DurableStore,
+    resource: &str,
+    l: &crate::activation::Lease,
+    boot: &str,
+    policy: &crate::activation::Policy,
+    proof: &Value,
+    verified: &Value,
+    id: &str,
+) -> Result<(), Error> {
+    let quorum = policy.authority_quorum.clone();
+    let digest = policy.authority_digest()?.unwrap_or_default();
+    let now = crate::now() as i64;
+    if store
+        .query_one(
+            "SELECT epoch FROM publisher_takeover_verified WHERE resource = ? AND epoch = ?",
+            &[Stored::from(resource), Stored::from(l.epoch)],
+        )?
+        .is_some()
+    {
+        store.execute(
+            "UPDATE publisher_takeover_verified SET generation = ?, acquired_at = ?, boot_id = ?, authority_id = ?, authority_key = ?,
+             proof = ?, verified = ?, verified_at = ?, operation_id = ?, authority_quorum = ?, authority_digest = ? WHERE resource = ? AND epoch = ?",
+            &[
+                Stored::from(l.generation), Stored::from(l.acquired_at), Stored::from(boot),
+                Stored::from(policy.authority_id.clone()), Stored::from(policy.authority_key.clone()),
+                Stored::from(proof.to_string()), Stored::from(verified.to_string()), Stored::from(now),
+                Stored::from(id), Stored::from(quorum), Stored::from(digest),
+                Stored::from(resource), Stored::from(l.epoch),
+            ],
+        )?;
+    } else {
+        store.execute(
+            "INSERT INTO publisher_takeover_verified(resource, epoch, generation, acquired_at, boot_id, authority_id, authority_key, proof, verified,
+               verified_at, operation_id, authority_quorum, authority_digest) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Stored::from(resource), Stored::from(l.epoch), Stored::from(l.generation), Stored::from(l.acquired_at),
+                Stored::from(boot), Stored::from(policy.authority_id.clone()), Stored::from(policy.authority_key.clone()),
+                Stored::from(proof.to_string()), Stored::from(verified.to_string()), Stored::from(now),
+                Stored::from(id), Stored::from(quorum), Stored::from(digest),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn takeover_store(
+    store: &mut dyn DurableStore,
+    resource: &str,
+    request: &Value,
+    epoch: i64,
+    this_host: &str,
+    boot: &str,
+    id: &str,
+) -> Result<Value, Error> {
+    let mut refused = None;
+    if let Some(proof) = request.get("takeover_proof") {
+        match verify_takeover_proof_store(store, resource, proof, epoch, this_host) {
+            Ok(verified) => {
+                let l = lease_store(store, resource)?.ok_or("no activation lease")?;
+                let policy = policy_store(store, resource)?.ok_or("no activation policy")?;
+                record_verified_store(store, resource, &l, boot, &policy, proof, &verified, id)?;
+                return Ok(verified);
+            }
+            Err(e) => refused = Some(e.to_string()),
+        }
+    }
+    let facts = resume_facts_store(store, resource, this_host, boot)?;
+    match resume_refusal(&facts) {
+        Ok(r) => {
+            let resumed = json!({
+                "method": "resume_same_epoch", "new_epoch": epoch, "verified_at": facts.now, "signed": r.verified["signed"],
+                "resumed_from": {"operation_id": r.operation_id, "verified_at": r.verified_at, "method": r.verified["method"],
+                                 "previous_epoch": r.verified["previous_epoch"], "previous_holder": r.verified["previous_holder"],
+                                 "issued_at": r.proof["issued_at"], "expires_at": r.proof["expires_at"], "signature": r.proof["signature"]},
+                "presented_proof_refused": refused,
+                "note": "no new proof: the lease is the same incarnation, live, held here and unsuperseded, in the same boot, under the same authority and key, as when this host verified the proof for this epoch",
+            });
+            event_store(store, resource, "takeover_resumed", id, Some(resumed.clone()))?;
+            Ok(resumed)
+        }
+        Err((code, why)) => Err(match refused {
+            Some(p) => format!("takeover_proof refused: {p}; and no same-epoch resume ({code}): {why}"),
+            None => format!("publisher_start requires `takeover_proof`, the authority's document for this epoch (the tool's rotate prints it; attest-fence upgrades it), unless it resumes under the proof this host already verified for this epoch; no same-epoch resume ({code}): {why}"),
+        }
+        .into()),
+    }
+}
+
+fn view_store(store: &mut dyn DurableStore, resource: &str) -> Result<Value, Error> {
+    let Some(p) = declared_store(store, resource)? else {
+        return Ok(json!({"resource": resource, "declared": false, "publisher_eligible": false, "reasons": ["no publisher declared for this resource on this host"]}));
+    };
+    let (eligible, reasons, service, epoch, gates) = eligibility_store(store, &p)?;
+    let lease = lease_store(store, resource)?;
+    let readiness = service.as_ref().map(|(ip, _)| match origin_ready(ip, p.origin_port) {
+        Ok((status, body)) => json!({"status": status, "body": body}),
+        Err(e) => json!({"error": e}),
+    });
+    // The carrier's resident replica is read through the manager module, which still takes a
+    // `Connection`: the store path reports it unknown, and the origin's verdict with it, rather
+    // than asking through a SQLite file it was not configured to use.
+    let carrier_identity: Option<Value> = None;
+    let mark = service.as_ref().and_then(|(_, carrier)| mark_present(carrier));
+    let mark_now = service.as_ref().map(|(_, carrier)| mark_read(carrier));
+    let (mark_epoch, mark_state) = match &mark_now {
+        Some(Ok(Some(e))) => (json!(e), "present"),
+        Some(Ok(None)) => (Value::Null, "absent"),
+        Some(Err(_)) | None => (Value::Null, "unknown"),
+    };
+    let origin_at_epoch = match (&readiness, epoch) {
+        (Some(r), Some(e)) => json!(origin_verdict(r, e, resource, carrier_identity.as_ref())),
+        _ => Value::Null,
+    };
+    let registered = registration_read(resource);
+    let connector = registered.as_ref().ok().cloned().flatten();
+    let this_host = host_store(store)?;
+    let resume = match crate::activation::boot_id() {
+        Ok(boot) => match resume_refusal(&resume_facts_store(store, resource, &this_host, &boot)?) {
+            Ok(r) => json!({"possible": true, "verified_epoch": r.epoch, "verified_by": r.operation_id}),
+            Err((code, why)) => json!({"possible": false, "refusal": code, "why": why}),
+        },
+        Err(e) => json!({"possible": false, "refusal": "boot_unknown", "why": e.to_string()}),
+    };
+    Ok(json!({
+        "resource": resource,
+        "declared": {"hostname": p.hostname, "tunnel_uuid": p.tunnel_uuid, "credential": p.credential, "origin_port": p.origin_port},
+        "unit": {"name": unit_name(resource), "state": unit_state(resource), "invocation_id": invocation(resource).ok().flatten()},
+        "connector_id": connector,
+        "connector_registered": match &registered { Ok(id) => json!(id.is_some()), Err(_) => Value::Null },
+        "connector_registration_error": registered.as_ref().err(),
+        "lease": lease.as_ref().map(|l| json!({"holder_host_uuid": l.holder_host_uuid, "expires_at": l.expires_at, "epoch": l.epoch,
+                                               "generation": l.generation, "acquired_at": l.acquired_at})),
+        "epoch": epoch,
+        "service": service.as_ref().map(|(ip, carrier)| json!({"ip": ip, "carrier_universe_uuid": carrier})),
+        "carrier_replica_id": carrier_identity,
+        "origin_readiness": readiness,
+        "origin_ready_at_lease_epoch": origin_at_epoch,
+        "active_manager_mark": mark,
+        "active_manager_mark_epoch": mark_epoch,
+        "active_manager_mark_read": mark_state,
+        "active_manager_mark_error": mark_now.as_ref().and_then(|m| m.as_ref().err()),
+        // Deprecated: the field's previous name, the same value, kept for one release.
+        "governor_mark": mark,
+        "transition": transition_of_store(store, resource)?.map(|(s, e)| json!({"state": s, "epoch": e})),
+        "publisher_eligible": eligible,
+        "gates": gates,
+        "reasons": reasons,
+        "takeover_resume": resume,
+        "last": {"start": last_event_store(store, resource, "start")?, "stop": last_event_store(store, resource, "stop")?, "fence": last_event_store(store, resource, "fence")?,
+                 "observed": last_event_store(store, resource, "observed")?, "takeover_resumed": last_event_store(store, resource, "takeover_resumed")?,
+                 "startup_withdrawal": last_event_store(store, resource, "startup_withdrawal")?},
+        "scope": "this host's declaration, unit, journal and tables, and the origin asked now; the connector's identity is what cloudflared logged in its current run; Cloudflare's side is observed only through publisher_observed",
+    }))
+}
+
+/// One ledger row of the publisher's, through the store contract: the intent is kept as the
+/// recorded text, whatever form (the connection path's object or this path's compact one) it
+/// was written in.
+#[derive(Clone)]
+struct StoreEffect {
+    id: i64,
+    kind: String,
+    key: String,
+    owner: String,
+    intent: String,
+}
+
+fn effect_begin_store(
+    store: &mut dyn DurableStore,
+    kind: &str,
+    key: &str,
+    owner: &str,
+    intent: Stored,
+    operation_id: &str,
+) -> Result<StoreEffect, Error> {
+    let intent_text = match &intent {
+        Stored::Text(text) => text.clone(),
+        _ => String::new(),
+    };
+    store.execute(
+        "INSERT INTO network_effects(kind, `key`, owner, intent, state, operation_id, changed_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
+        &[
+            Stored::from(kind), Stored::from(key), Stored::from(owner), intent,
+            Stored::from("applying"), Stored::from(operation_id), Stored::from(crate::now() as i64),
+        ],
+    )?;
+    let id = store
+        .query_one(
+            "SELECT id FROM network_effects WHERE operation_id = ? AND kind = ? AND `key` = ? ORDER BY id DESC LIMIT 1",
+            &[Stored::from(operation_id), Stored::from(kind), Stored::from(key)],
+        )?
+        .ok_or("The network effect was inserted but could not be read back")?
+        .integer(0)?;
+    Ok(StoreEffect { id, kind: kind.into(), key: key.into(), owner: owner.into(), intent: intent_text })
+}
+
+fn effect_state_store(store: &mut dyn DurableStore, effect: &StoreEffect, state: &str, observed: Option<&Value>) -> Result<(), Error> {
+    store.execute(
+        "UPDATE network_effects SET state = ?, changed_at = ?, observed = ? WHERE id = ?",
+        &[
+            Stored::from(state),
+            Stored::from(crate::now() as i64),
+            observed.map(|value| Stored::from(value.to_string())).unwrap_or(Stored::Null),
+            Stored::from(effect.id),
+        ],
+    )?;
+    Ok(())
+}
+
+/// The carrier a mark's ledger row is about: the connection path's object names it, this
+/// path's compact intent is it, and the row's key ends in it either way.
+fn mark_carrier(effect: &StoreEffect) -> String {
+    if let Ok(parsed) = serde_json::from_str::<Value>(&effect.intent) {
+        if let Some(carrier) = parsed.as_str().or_else(|| parsed["carrier"].as_str()) {
+            return carrier.to_string();
+        }
+    }
+    if !effect.intent.is_empty() && !effect.intent.trim_start().starts_with(['{', '"']) {
+        return effect.intent.clone();
+    }
+    effect.key.rsplit('@').next().unwrap_or("").to_string()
+}
+
+fn effect_undo_store(effect: &StoreEffect) -> Result<(), Error> {
+    if is_mark(&effect.kind) {
+        mark_remove(&mark_carrier(effect))
+    } else if effect.kind == KIND_PUBLISHER {
+        connector_stop(&effect.owner)
+    } else {
+        Err(format!("unknown effect kind {}", effect.kind).into())
+    }
+}
+
+fn effect_verify_store(effect: &StoreEffect) -> Option<bool> {
+    if is_mark(&effect.kind) {
+        mark_present(&mark_carrier(effect))
+    } else if effect.kind == KIND_PUBLISHER {
+        connector_present(&effect.owner)
+    } else {
+        None
+    }
+}
+
+fn effect_remove_store(store: &mut dyn DurableStore, effect: &StoreEffect) -> Result<(), Error> {
+    effect_state_store(store, effect, "removing", None)?;
+    if let Err(err) = effect_undo_store(effect) {
+        effect_state_store(store, effect, "removing", Some(&json!({"error": err.to_string()})))?;
+        return Err(err);
+    }
+    match effect_verify_store(effect) {
+        Some(false) => {
+            store.execute("DELETE FROM network_effects WHERE id = ?", &[Stored::from(effect.id)])?;
+            Ok(())
+        }
+        Some(true) => {
+            effect_state_store(store, effect, "removing", Some(&json!({"still_present": true})))?;
+            Err(format!("{} {} is still present after its removal", effect.kind, effect.key).into())
+        }
+        None => {
+            effect_state_store(store, effect, "removing", Some(&json!({"unknown": true})))?;
+            Err(format!("{} {} could not be verified after its removal; its state is unknown", effect.kind, effect.key).into())
+        }
+    }
+}
+
+fn compensate_store(store: &mut dyn DurableStore, effects: &[StoreEffect]) -> Vec<Value> {
+    let mut report = vec![];
+    for effect in effects.iter().rev() {
+        match effect_remove_store(store, effect) {
+            Ok(()) => report.push(json!({"kind": effect.kind, "key": effect.key, "gone": true})),
+            Err(error) => report.push(json!({"kind": effect.kind, "key": effect.key, "gone": false, "error": error.to_string()})),
+        }
+    }
+    report
+}
+
+fn publisher_effects_store(store: &mut dyn DurableStore, resource: &str) -> Result<Vec<StoreEffect>, Error> {
+    Ok(store
+        .query("SELECT id, kind, `key`, owner, intent FROM network_effects WHERE owner = ? ORDER BY id", &[Stored::from(resource)])?
+        .iter()
+        .map(|row| -> Result<StoreEffect, Error> {
+            Ok(StoreEffect {
+                id: row.integer(0)?,
+                kind: row.text(1)?.to_string(),
+                key: row.text(2)?.to_string(),
+                owner: row.text(3)?.to_string(),
+                intent: stored_optional_text(row.value(4)?)?.unwrap_or_default(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|e| e.kind == KIND_PUBLISHER || is_mark(&e.kind))
+        .collect())
+}
+
+fn withdraw_store(store: &mut dyn DurableStore, resource: &str, why: &str, id: &str) -> Result<Value, Error> {
+    if let Some((_, epoch)) = transition_of_store(store, resource)? {
+        transition_store(store, resource, "stopping", epoch, id)?;
+    }
+    let effects = publisher_effects_store(store, resource)?;
+    let mut steps = vec![];
+    let mut failed = false;
+    for e in effects.iter().rev() {
+        match effect_remove_store(store, e) {
+            Ok(()) => steps.push(json!({"kind": e.kind, "key": e.key, "gone": true})),
+            Err(err) => { failed = true; steps.push(json!({"kind": e.kind, "key": e.key, "gone": false, "error": err.to_string()})) }
+        }
+    }
+    if connector_present(resource) == Some(true) {
+        match connector_stop(resource) {
+            Ok(()) => steps.push(json!({"kind": KIND_PUBLISHER, "unrecorded": true, "gone": connector_present(resource) == Some(false)})),
+            Err(err) => { failed = true; steps.push(json!({"kind": KIND_PUBLISHER, "unrecorded": true, "gone": false, "error": err.to_string()})) }
+        }
+    }
+    if !failed {
+        store.execute("DELETE FROM publisher_transitions WHERE resource = ?", &[Stored::from(resource)])?;
+    }
+    event_store(store, resource, why, id, Some(json!({"steps": steps})))?;
+    Ok(json!({"resource": resource, "withdrawn": !failed, "steps": steps, "unit": unit_state(resource)}))
+}
+
+fn perform_store(store: &mut dyn DurableStore, request: &Value, resource: &str) -> Result<Value, Error> {
+    let operation = lc::text(request, "operation")?;
+    let id = lc::text(request, "operation_id")?;
+    let reference = lc::text(request, "authorization_ref")?;
+    match operation {
+        "publisher_declare" => {
+            let hostname = lc::text(request, "hostname")?;
+            if hostname.is_empty() || hostname.len() > 253 || !hostname.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.')) {
+                return Err("hostname must be a DNS name".into());
+            }
+            let tunnel = lc::text(request, "tunnel_uuid")?;
+            lc::token(tunnel)?;
+            let credential = lc::text(request, "credential")?;
+            lc::token(credential)?;
+            let port = request.get("origin_port").and_then(Value::as_u64).unwrap_or(8080);
+            if !(1..=65535).contains(&port) {
+                return Err("origin_port must be 1 to 65535".into());
+            }
+            if policy_store(store, resource)?.is_none() {
+                return Err(format!("{resource} is under no activation policy on this host; a publisher follows a governed resource").into());
+            }
+            secret_declared_store(store, credential)?;
+            let now = crate::now() as i64;
+            if store.query_one("SELECT resource FROM publishers WHERE resource = ?", &[Stored::from(resource)])?.is_some() {
+                store.execute(
+                    "UPDATE publishers SET hostname = ?, tunnel_uuid = ?, credential = ?, origin_port = ?, declared_at = ?, operation_id = ?, authorization_ref = ? WHERE resource = ?",
+                    &[
+                        Stored::from(hostname), Stored::from(tunnel), Stored::from(credential), Stored::from(port as i64),
+                        Stored::from(now), Stored::from(id), Stored::from(reference), Stored::from(resource),
+                    ],
+                )?;
+            } else {
+                store.execute(
+                    "INSERT INTO publishers(resource, hostname, tunnel_uuid, credential, origin_port, declared_at, operation_id, authorization_ref) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                    &[
+                        Stored::from(resource), Stored::from(hostname), Stored::from(tunnel), Stored::from(credential),
+                        Stored::from(port as i64), Stored::from(now), Stored::from(id), Stored::from(reference),
+                    ],
+                )?;
+            }
+            event_store(store, resource, "declare", id, None)?;
+            view_store(store, resource)
+        }
+        "publisher_start" => {
+            let Some(p) = declared_store(store, resource)? else { return Err("no publisher declared for this resource on this host".into()) };
+            if transition_of_store(store, resource)?.is_some() || connector_present(resource) == Some(true) {
+                return Err("a publisher is already recorded or active on this host; stop it first".into());
+            }
+            // 1. the epoch gate, 2. the service address effective here, 3. the credential
+            let (eligible, reasons, service, epoch, _) = eligibility_store(store, &p)?;
+            if !eligible {
+                return Err(format!("publisher_start refused: {}", reasons.join("; ")).into());
+            }
+            let (ip, carrier) = service.ok_or("no service address")?;
+            let epoch = epoch.ok_or("no epoch on the lease")?;
+            // 4. the takeover proof from the authority (the gate), or the same-epoch resume under the one
+            //    this host already verified; the agent's `previous` is provenance only
+            let this_host = host_store(store)?;
+            let proof_verified = takeover_store(store, resource, request, epoch, &this_host, &crate::activation::boot_id()?, id)?;
+            let previous = request.get("previous").cloned().unwrap_or(Value::Null);
+            // 5. the transition recorded before any effect; 6. the mark, then readiness at the
+            //    service address; 7. the connector, then its registration; 8. effective last.
+            //    Any failure undoes what was made, last first, and leaves no transition.
+            transition_store(store, resource, "starting", epoch, id)?;
+            let mut done = vec![];
+            let mut failure: Option<String> = None;
+            let mut connector: Option<String> = None;
+            for (kind, key) in [(KIND_MARK, format!("{resource}@{carrier}")), (KIND_PUBLISHER, unit_name(resource))] {
+                // The ledger's intent column holds 64 characters on MariaDB, which the full JSON
+                // intent does not fit: the carrier alone for a mark, a compact `{"ip","port"}`
+                // for a connector. Crash recovery reads the carrier and the resource back from the
+                // row's intent and key.
+                let intent = if kind == KIND_MARK {
+                    Stored::from(carrier.clone())
+                } else {
+                    Stored::from(json!({"ip": ip, "port": p.origin_port}).to_string())
+                };
+                let e = effect_begin_store(store, kind, &key, resource, intent, id)?;
+                done.push(e.clone());
+                let step: Result<Option<String>, Error> = (|| {
+                    if kind == KIND_MARK {
+                        mark_write(&carrier, resource, epoch)?;
+                        lc::fault("publisher-after-mark")?;
+                        match mark_written(&carrier) {
+                            Some(true) => effect_state_store(store, &e, "effective", None)?,
+                            Some(false) => return Err(format!("{} {} is not effective after being applied", kind, key).into()),
+                            None => return Err(format!("{} {} could not be verified after being applied; its state is unknown", kind, key).into()),
+                        }
+                        match origin_ready(&ip, p.origin_port) {
+                            Ok((200, body)) if body["logical_manager_id"] == json!(resource) && body["epoch"] == json!(epoch) && body["ready"] == json!(true) => {
+                                // The origin's answer is bound to the carrier's resident replica, read
+                                // through the manager module: still SQLite-only, so on this journal the
+                                // binding cannot be checked and the start stops here, compensated below.
+                                // A body that names the wrong replica is refused the same way.
+                                Err("publisher_start refused: the carrier's resident replica could not be read through this journal (the manager module is still SQLite-only); the origin's answer cannot be bound to the carrier".into())
+                            }
+                            Ok((status, body)) => {
+                                Err(format!("the origin at {ip}:{} is not ready for this active manager at epoch {epoch}: HTTP {status} {body}", p.origin_port).into())
+                            }
+                            Err(e) => {
+                                Err(format!("the origin at {ip}:{} could not be asked: {e}", p.origin_port).into())
+                            }
+                        }
+                    } else {
+                        connector_start(&p, &ip)?;
+                        lc::fault("publisher-after-connector")?;
+                        Ok(Some(wait_registered(resource, 60).map_err(|err| format!("{err}"))?))
+                    }
+                })();
+                match step {
+                    Ok(idc) => connector = idc,
+                    Err(err) => {
+                        failure = Some(err.to_string());
+                        break;
+                    }
+                }
+            }
+            if failure.is_none() {
+                if let Err(err) = lc::fault("publisher-before-effective") {
+                    failure = Some(err.to_string());
+                }
+            }
+            if let Some(err) = failure {
+                let _ = lc::fault("publisher-during-compensation");
+                let report = compensate_store(store, &done);
+                let all_gone = report.iter().all(|r| r["gone"] == json!(true));
+                if all_gone {
+                    store.execute("DELETE FROM publisher_transitions WHERE resource = ?", &[Stored::from(resource)])?;
+                }
+                event_store(store, resource, "start_failed", id, Some(json!({"error": err, "compensation": report})))?;
+                return Err(format!("{err}; compensation: {}{}", json!(report), if all_gone { "" } else { "; the transition is kept for reconciliation" }).into());
+            }
+            transition_store(store, resource, "effective", epoch, id)?;
+            event_store(store, resource, "start", id, Some(json!({"epoch": epoch, "ip": ip, "carrier": carrier, "connector_id": connector, "takeover_proof": proof_verified, "previous": previous})))?;
+            let mut v = view_store(store, resource)?;
+            v["published"] = json!(true);
+            v["takeover_proof"] = proof_verified;
+            Ok(v)
+        }
+        "publisher_stop" => {
+            let report = withdraw_store(store, resource, "stop", id)?;
+            if report["withdrawn"] != json!(true) {
+                return Err(format!("the publisher's withdrawal did not complete: {report}").into());
+            }
+            view_store(store, resource)
+        }
+        "publisher_observed" => {
+            let observation = request.get("observation").cloned().ok_or("publisher_observed requires `observation`")?;
+            event_store(store, resource, "observed", id, Some(observation))?;
+            view_store(store, resource)
+        }
+        _ => Err("Unsupported publisher operation".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1746,5 +2715,118 @@ mod quorum_proofs {
         cert["grant_id"] = json!("g158");
         let v = start(&db, &sign(&cert, &[(crate::signing::SINGLE_KEY_ID, 42)]), 158).unwrap();
         assert_eq!(v["quorum"]["signers"], json!([crate::signing::SINGLE_KEY_ID]));
+    }
+}
+
+#[cfg(test)]
+mod publisher_store_tests {
+    //! The store contract for the five publisher operations, against the in-memory
+    //! [`DurableStore`] the secrets tests use: no Podman, no systemd, no MariaDB server.
+    use super::*;
+    use crate::store::{migrations, sqlite::SqliteStore};
+
+    const R: &str = "91eeb6bf-5489-405b-b77a-53105b0aff7a";
+
+    fn memory_store() -> SqliteStore {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        migrations::apply(&mut store).unwrap();
+        store
+    }
+
+    /// A connection journal as a node holds it: bound to a host, schemas installed. The
+    /// connection path reconciles the network ledger before every mutation, so the comparison
+    /// needs the same tables, not a bare database.
+    fn connection_journal() -> rusqlite::Connection {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
+        db.execute("INSERT INTO metadata VALUES('host_uuid','test-host')", []).unwrap();
+        lc::ensure_schema(&db).unwrap();
+        crate::activation::ensure_schema(&db).unwrap();
+        crate::network::ensure_schema(&db).unwrap();
+        ensure_schema(&db).unwrap();
+        db
+    }
+
+    #[test]
+    fn store_status_reports_an_undeclared_resource_and_does_not_journal() {
+        let mut store = memory_store();
+        let request = json!({"operation": "publisher_status", "resource": R});
+        let via_store = execute_store(&mut store, &request).unwrap();
+        assert_eq!(via_store["resource"], json!(R));
+        assert_eq!(via_store["declared"], json!(false));
+        assert_eq!(via_store["publisher_eligible"], json!(false));
+        assert!(via_store["reasons"].as_array().is_some_and(|r| r.iter().any(|reason| reason.as_str().is_some_and(|s| s.contains("no publisher declared")))));
+        assert!(store.query("SELECT id FROM operations", &[]).unwrap().is_empty(), "a status writes no journal row");
+        let db = store.into_connection();
+        assert_eq!(execute(&db, &request).unwrap(), via_store);
+    }
+
+    #[test]
+    fn store_refused_declare_is_retried_and_a_clashing_id_is_refused() {
+        let mut store = memory_store();
+        let request = json!({"operation": "publisher_declare", "operation_id": "publisher-refused-1",
+            "authorization_ref": "test", "resource": R, "hostname": "manager.example",
+            "tunnel_uuid": "tunnel-1", "credential": "cred-1", "origin_port": 8080});
+        let first = execute_store(&mut store, &request).unwrap_err().to_string();
+        assert!(first.contains("under no activation policy"), "{first}");
+        // The same refusal from the connection path, word for word.
+        let db = connection_journal();
+        assert_eq!(execute(&db, &request).unwrap_err().to_string(), first);
+        // A failed attempt re-runs and records a new attempt row.
+        let second = execute_store(&mut store, &request).unwrap_err().to_string();
+        assert_eq!(second, first);
+        let attempts = store
+            .query("SELECT id FROM operation_attempts WHERE operation_id = ?", &[Stored::from("publisher-refused-1")])
+            .unwrap();
+        assert_eq!(attempts.len(), 2);
+        let status = store
+            .query_one("SELECT status FROM operations WHERE id = ?", &[Stored::from("publisher-refused-1")])
+            .unwrap()
+            .expect("the refused declare is journaled");
+        assert_eq!(status.text(0).unwrap(), "failed");
+        // An operation id that belongs to a different request is refused.
+        let clash = json!({"operation": "publisher_declare", "operation_id": "publisher-refused-1",
+            "authorization_ref": "test", "resource": R, "hostname": "manager.example",
+            "tunnel_uuid": "tunnel-2", "credential": "cred-1", "origin_port": 8080});
+        assert!(execute_store(&mut store, &clash).unwrap_err().to_string().contains("different request"));
+    }
+
+    #[test]
+    fn store_verified_operation_replays_without_an_attempt() {
+        let mut store = memory_store();
+        let request = json!({"operation": "publisher_observed", "operation_id": "publisher-replay-1",
+            "authorization_ref": "test", "resource": R, "observation": {"seen": true}});
+        let result = json!({"resource": R, "declared": false});
+        store
+            .execute(
+                "INSERT INTO operations(id, request, status, result) VALUES(?, ?, ?, ?)",
+                &[
+                    Stored::from("publisher-replay-1"),
+                    Stored::from(request.to_string()),
+                    Stored::from("verified"),
+                    Stored::from(result.to_string()),
+                ],
+            )
+            .unwrap();
+        let replayed = execute_store(&mut store, &request).unwrap();
+        assert_eq!(replayed["replayed"], json!(true));
+        assert_eq!(replayed["historical"], json!(true));
+        assert_eq!(replayed["resource"], json!(R));
+        assert!(replayed["notice"].as_str().unwrap().contains("not current state"));
+        assert!(store
+            .query("SELECT id FROM operation_attempts WHERE operation_id = ?", &[Stored::from("publisher-replay-1")])
+            .unwrap()
+            .is_empty(), "a verified replay records no attempt");
+    }
+
+    #[test]
+    fn an_unsupported_publisher_operation_is_refused_on_both_paths() {
+        let mut store = memory_store();
+        let request = json!({"operation": "publisher_rotate", "operation_id": "publisher-bad-1",
+            "authorization_ref": "test", "resource": R});
+        let store_err = execute_store(&mut store, &request).unwrap_err().to_string();
+        let db = connection_journal();
+        assert_eq!(execute(&db, &request).unwrap_err().to_string(), store_err);
+        assert_eq!(store_err, "Unsupported publisher operation");
     }
 }
