@@ -291,13 +291,6 @@ fn sqlite_only_operation(operation: &str) -> bool {
             | "publisher_stop"
             | "publisher_status"
             | "publisher_observed"
-            | "network_declare"
-            | "network_undeclare"
-            | "network_route_publish"
-            | "network_route_withdraw"
-            | "network_route_resume"
-            | "network_reapply"
-            | "network_status"
             | "activation_require"
             | "activation_acquire"
             | "activation_renew"
@@ -350,10 +343,17 @@ fn durable_capabilities(engine: Engine) -> Value {
             "secret_declare",
             "secret_remove",
             "secret_status",
+            "network_declare",
+            "network_undeclare",
+            "network_route_publish",
+            "network_route_withdraw",
+            "network_route_resume",
+            "network_reapply",
+            "network_status",
         ],
         "store_engine": engine.as_str(),
         "unsupported_error_code": "store_engine_unsupported",
-        "scope": "read-only local API, lifecycle create/delete/clone/start/stop/pause/resume/resources, and secret_declare/secret_remove/secret_status; other module-owned mutations remain SQLite-only",
+        "scope": "read-only local API, lifecycle create/delete/clone/start/stop/pause/resume/resources, secret_declare/secret_remove/secret_status, and network_declare/network_undeclare/network_route_publish/network_route_withdraw/network_route_resume/network_reapply/network_status; other module-owned mutations remain SQLite-only",
     })
 }
 
@@ -392,6 +392,24 @@ fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
     }
     if matches!(operation, "secret_declare" | "secret_remove" | "secret_status") {
         let result = secrets::execute_store(store, request);
+        let response = match result {
+            Ok(data) => json!({"ok":true,"observed_at":now(),"data":data}),
+            Err(error) => json!({"ok":false,"observed_at":now(),"error":error.to_string()}),
+        };
+        if let Err(error) = store.execute(
+            "INSERT INTO observations(observed_at, operation, result) VALUES(?, ?, ?)",
+            &[
+                Stored::from(now() as i64),
+                Stored::from(operation),
+                Stored::from(response.to_string()),
+            ],
+        ) {
+            return json!({"ok":false,"error":format!("Observation persistence failed: {error}")});
+        }
+        return response;
+    }
+    if matches!(operation, "network_declare" | "network_undeclare" | "network_route_publish" | "network_route_withdraw" | "network_route_resume" | "network_reapply" | "network_status") {
+        let result = network::execute_store(store, request);
         let response = match result {
             Ok(data) => json!({"ok":true,"observed_at":now(),"data":data}),
             Err(error) => json!({"ok":false,"observed_at":now(),"error":error.to_string()}),

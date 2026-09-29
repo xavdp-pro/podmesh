@@ -11,6 +11,7 @@
 //! What it refuses: two declarations on one host, an allocation outside the local pool, a second
 //! active route for one address, and any cleanup that cannot prove what remains.
 use crate::lifecycle as lc;
+use crate::store::{DurableStore, Value as Stored};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::net::Ipv4Addr;
@@ -1478,9 +1479,957 @@ pub(crate) fn incomplete_effects(db: &Connection) -> Result<usize, Error> {
     Ok(effect_rows(db, None)?.iter().filter(|e| e.state != "effective").count())
 }
 
+/// The network operations through an engine-neutral journal. The schema is installed when the
+/// store opens, so this path performs no DDL and every statement uses positional placeholders.
+pub fn execute_store(store: &mut dyn DurableStore, request: &Value) -> Result<Value, Error> {
+    let operation = lc::text(request, "operation")?;
+    if ![
+        "network_status",
+        "network_declare",
+        "network_undeclare",
+        "network_route_publish",
+        "network_route_withdraw",
+        "network_route_resume",
+        "network_reapply",
+    ]
+    .contains(&operation)
+    {
+        return Err("Unsupported network operation".into());
+    }
+    if operation == "network_status" {
+        return view_store(store);
+    }
+    if request.get("universe_uuid").is_some() && !operation.starts_with("network_route_") {
+        return Err(format!("{operation} is host-wide and takes no universe_uuid").into());
+    }
+    journaled_store(store, request, |store| {
+        let reconciliation = reconcile_store(store)?;
+        if reconciliation["remaining"].as_array().is_some_and(|rows| !rows.is_empty()) {
+            return Err(format!(
+                "incomplete network effects remain after reconciliation; refusing every network mutation until they are gone: {}",
+                reconciliation["remaining"]
+            )
+            .into());
+        }
+        let mut answer = perform_store(store, request)?;
+        answer["reconciliation_before"] = reconciliation;
+        Ok(answer)
+    })
+}
+
+fn stored_optional_text(value: &Stored) -> Result<Option<String>, Error> {
+    match value {
+        Stored::Null => Ok(None),
+        Stored::Text(text) => Ok(Some(text.clone())),
+        Stored::Blob(bytes) => Ok(Some(String::from_utf8_lossy(bytes).into_owned())),
+        other => Err(format!("column is {}, not text", other.kind()).into()),
+    }
+}
+
+fn journaled_store(
+    store: &mut dyn DurableStore,
+    request: &Value,
+    run: impl FnOnce(&mut dyn DurableStore) -> Result<Value, Error>,
+) -> Result<Value, Error> {
+    let id = lc::text(request, "operation_id")?;
+    lc::token(id)?;
+    let canonical = request.to_string();
+    if let Some(row) = store.query_one(
+        "SELECT request, status, result FROM operations WHERE id = ?",
+        &[Stored::from(id)],
+    )? {
+        if row.text(0)? != canonical {
+            return Err("Operation ID already belongs to a different request".into());
+        }
+        if row.text(1)? == "verified" {
+            let persisted = stored_optional_text(row.value(2)?)?.ok_or("Missing persisted result")?;
+            let mut result: Value = serde_json::from_str(&persisted)?;
+            result["replayed"] = json!(true);
+            result["historical"] = json!(true);
+            result["notice"] = json!("this is the result persisted when the operation was verified, not current state; a replay repeats no effect");
+            return Ok(result);
+        }
+    } else {
+        store.execute(
+            "INSERT INTO operations(id, request, status) VALUES(?, ?, ?)",
+            &[Stored::from(id), Stored::from(canonical), Stored::from("pending")],
+        )?;
+    }
+    store.execute(
+        "INSERT INTO operation_attempts(operation_id, started_at) VALUES(?, ?)",
+        &[Stored::from(id), Stored::from(crate::now() as i64)],
+    )?;
+    let attempt = store
+        .query_one(
+            "SELECT id FROM operation_attempts WHERE operation_id = ? ORDER BY id DESC LIMIT 1",
+            &[Stored::from(id)],
+        )?
+        .ok_or("Missing operation attempt")?
+        .integer(0)?;
+    let outcome = run(store);
+    let finished = crate::now() as i64;
+    match &outcome {
+        Ok(result) => {
+            store.execute(
+                "UPDATE operations SET status = ?, result = ? WHERE id = ?",
+                &[Stored::from("verified"), Stored::from(result.to_string()), Stored::from(id)],
+            )?;
+            store.execute(
+                "UPDATE operation_attempts SET finished_at = ?, outcome = ? WHERE id = ?",
+                &[Stored::from(finished), Stored::from("verified"), Stored::from(attempt)],
+            )?;
+        }
+        Err(error) => {
+            let record = json!({"error": error.to_string()}).to_string();
+            store.execute(
+                "UPDATE operations SET status = ?, result = ? WHERE id = ?",
+                &[Stored::from("failed"), Stored::from(record.clone()), Stored::from(id)],
+            )?;
+            store.execute(
+                "UPDATE operation_attempts SET finished_at = ?, outcome = ?, detail = ? WHERE id = ?",
+                &[Stored::from(finished), Stored::from("failed"), Stored::from(record), Stored::from(attempt)],
+            )?;
+        }
+    }
+    outcome
+}
+
+fn declared_store(store: &mut dyn DurableStore) -> Result<Option<Declaration>, Error> {
+    let Some(row) = store.query_one(
+        "SELECT network_uuid, prefix, pool, gateway, bridge, state, nat_backend FROM network_declaration LIMIT 1",
+        &[],
+    )? else {
+        return Ok(None);
+    };
+    Ok(Some(Declaration {
+        network_uuid: row.text(0)?.to_string(),
+        prefix: row.text(1)?.to_string(),
+        pool: row.text(2)?.to_string(),
+        gateway: row.text(3)?.to_string(),
+        bridge: row.text(4)?.to_string(),
+        state: row.text(5)?.to_string(),
+        nat_backend: stored_optional_text(row.value(6)?)?.unwrap_or_else(|| NAT_NOTRACK.into()),
+    }))
+}
+
+fn effect_rows_store(store: &mut dyn DurableStore, owner: Option<&str>) -> Result<Vec<Effect>, Error> {
+    let rows = match owner {
+        Some(owner) => store.query(
+            "SELECT id, kind, `key`, owner, intent, state FROM network_effects WHERE owner = ? ORDER BY id",
+            &[Stored::from(owner)],
+        )?,
+        None => store.query("SELECT id, kind, `key`, owner, intent, state FROM network_effects ORDER BY id", &[])?,
+    };
+    rows.iter()
+        .map(|row| {
+            let kind = row.text(1)?.to_string();
+            let mut intent: Value = serde_json::from_str(row.text(4)?).unwrap_or(Value::Null);
+            if let Some(parts) = intent.as_array() {
+                intent = match (kind.as_str(), parts.as_slice()) {
+                    ("nat_table", [backend, prefix, pool]) => json!({"backend": backend, "prefix": prefix, "pool": pool}),
+                    ("alias", [ip, universe]) => json!({"ip": ip, "universe": universe}),
+                    _ => intent,
+                };
+            }
+            Ok(Effect {
+                id: row.integer(0)?,
+                kind,
+                key: row.text(2)?.to_string(),
+                owner: row.text(3)?.to_string(),
+                intent,
+                state: row.text(5)?.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn effect_begin_store(
+    store: &mut dyn DurableStore,
+    kind: &str,
+    key: &str,
+    owner: &str,
+    intent: Value,
+    operation_id: &str,
+) -> Result<Effect, Error> {
+    // The MariaDB migration deliberately bounds this field to 64 characters. The two intents
+    // that can exceed it use an ordered representation on the store path and are expanded again
+    // by `effect_rows_store`; the effect presented to the host helpers remains unchanged.
+    let persisted_intent = match kind {
+        "nat_table" => json!([intent["backend"], intent["prefix"], intent["pool"]]),
+        "alias" => json!([intent["ip"], intent["universe"]]),
+        _ => intent.clone(),
+    }
+    .to_string();
+    store.execute(
+        "INSERT INTO network_effects(kind, `key`, owner, intent, state, operation_id, changed_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
+        &[
+            Stored::from(kind), Stored::from(key), Stored::from(owner), Stored::from(persisted_intent),
+            Stored::from("applying"), Stored::from(operation_id), Stored::from(crate::now() as i64),
+        ],
+    )?;
+    let id = store
+        .query_one(
+            "SELECT id FROM network_effects WHERE operation_id = ? AND kind = ? AND `key` = ? ORDER BY id DESC LIMIT 1",
+            &[Stored::from(operation_id), Stored::from(kind), Stored::from(key)],
+        )?
+        .ok_or("The network effect was inserted but could not be read back")?
+        .integer(0)?;
+    Ok(Effect { id, kind: kind.into(), key: key.into(), owner: owner.into(), intent, state: "applying".into() })
+}
+
+fn effect_state_store(store: &mut dyn DurableStore, effect: &Effect, state: &str, observed: Option<&Value>) -> Result<(), Error> {
+    store.execute(
+        "UPDATE network_effects SET state = ?, changed_at = ?, observed = ? WHERE id = ?",
+        &[
+            Stored::from(state), Stored::from(crate::now() as i64),
+            observed.map(|value| Stored::from(value.to_string())).unwrap_or(Stored::Null), Stored::from(effect.id),
+        ],
+    )?;
+    Ok(())
+}
+
+fn effect_do_store(store: &mut dyn DurableStore, effect: &Effect) -> Result<(), Error> {
+    effect_apply(effect)?;
+    fault(&format!("after-{}", effect.kind))?;
+    match effect_verify_applied(effect) {
+        Some(true) => effect_state_store(store, effect, "effective", None),
+        Some(false) => Err(format!("{} {} is not effective after being applied", effect.kind, effect.key).into()),
+        None => Err(format!("{} {} could not be verified after being applied; its state is unknown", effect.kind, effect.key).into()),
+    }
+}
+
+fn effect_remove_store(store: &mut dyn DurableStore, effect: &Effect) -> Result<(), Error> {
+    effect_state_store(store, effect, "removing", None)?;
+    if let Err(error) = effect_undo(effect) {
+        effect_state_store(store, effect, "removing", Some(&json!({"error": error.to_string()})))?;
+        return Err(error);
+    }
+    match effect_verify(effect) {
+        Some(false) => {
+            store.execute("DELETE FROM network_effects WHERE id = ?", &[Stored::from(effect.id)])?;
+            Ok(())
+        }
+        Some(true) => {
+            effect_state_store(store, effect, "removing", Some(&json!({"still_present": true})))?;
+            Err(format!("{} {} is still present after its removal", effect.kind, effect.key).into())
+        }
+        None => {
+            effect_state_store(store, effect, "removing", Some(&json!({"unknown": true})))?;
+            Err(format!("{} {} could not be verified after its removal; its state is unknown", effect.kind, effect.key).into())
+        }
+    }
+}
+
+fn compensate_store(store: &mut dyn DurableStore, effects: &[Effect]) -> Vec<Value> {
+    let mut report = vec![];
+    for effect in effects.iter().rev() {
+        match effect_remove_store(store, effect) {
+            Ok(()) => report.push(json!({"kind": effect.kind, "key": effect.key, "gone": true})),
+            Err(error) => report.push(json!({"kind": effect.kind, "key": effect.key, "gone": false, "error": error.to_string()})),
+        }
+    }
+    report
+}
+
+fn effective_store(store: &mut dyn DurableStore) -> Result<Value, Error> {
+    let declaration = declared_store(store)?;
+    let peers = store.query("SELECT pool, via FROM network_peer_pools ORDER BY pool", &[])?;
+    let peer_routes = peers.iter().map(|row| -> Result<Value, Error> {
+        let pool = row.text(0)?;
+        let via = row.text(1)?;
+        let held = routes_for(pool);
+        Ok(json!({"pool": pool, "via": via, "effective": held.as_ref().map(|routes| routes.iter().any(|line| line_via(line, via))), "routes": held}))
+    }).collect::<Result<Vec<_>, _>>()?;
+    let rows = store.query(
+        "SELECT ip, universe_uuid, via, exclusive_resource, alias_universe_uuid, state FROM network_routes ORDER BY ip",
+        &[],
+    )?;
+    let published = rows.iter().map(|row| -> Result<Value, Error> {
+        let ip = row.text(0)?;
+        let universe = row.text(1)?;
+        let via = row.text(2)?;
+        let resource = stored_optional_text(row.value(3)?)?;
+        let alias = stored_optional_text(row.value(4)?)?;
+        let state = stored_optional_text(row.value(5)?)?.unwrap_or_else(|| "effective".into());
+        let held = routes_for(&format!("{ip}/32"));
+        let alias_effective = alias.as_ref().and_then(|carrier| alias_reading(carrier, ip));
+        Ok(json!({"ip": ip, "universe_uuid": universe, "via": via, "exclusive_resource": resource,
+                  "alias_universe_uuid": alias, "alias_effective": alias_effective, "state": state,
+                  "effective": held.as_ref().map(|routes| routes.iter().any(|line| line_via(line, via))), "routes": held}))
+    }).collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({
+        "bridge": declaration.as_ref().map(|d| json!({"name": d.bridge, "exists": bridge_exists(&d.bridge), "subnets": bridge_subnets(&d.bridge)})),
+        "peer_pool_routes": peer_routes,
+        "published_routes": published,
+        "ip_forward": std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward").ok().map(|text| text.trim() == "1"),
+    }))
+}
+
+fn view_store(store: &mut dyn DurableStore) -> Result<Value, Error> {
+    let declaration = declared_store(store)?;
+    let rows = store.query("SELECT universe_uuid, ip, released_at FROM network_allocations ORDER BY ip", &[])?;
+    let allocations = rows.iter().map(|row| -> Result<Value, Error> {
+        Ok(json!({"universe_uuid": row.text(0)?, "ip": row.text(1)?, "released_at": row.value(2)?.integer()}))
+    }).collect::<Result<Vec<_>, _>>()?;
+    let observed = match declaration.as_ref() {
+        Some(d) => store.query_one("SELECT observed FROM network_declaration WHERE network_uuid = ?", &[Stored::from(&d.network_uuid)])?
+            .and_then(|row| stored_optional_text(row.value(0).ok()?).ok().flatten())
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok()),
+        None => None,
+    };
+    let effects = effect_rows_store(store, None)?;
+    Ok(json!({
+        "declaration": declaration.as_ref().map(|d| json!({"network_uuid": d.network_uuid, "prefix": d.prefix, "pool": d.pool,
+            "gateway": d.gateway, "bridge": d.bridge, "state": d.state, "observed": observed})),
+        "allocations": allocations,
+        "effective": effective_store(store)?,
+        "nat_exemption": {"table": NFT_TABLE, "backend": declaration.as_ref().map(|d| d.nat_backend.clone()), "present": nat_exemption_present(), "rules": nft_rules()},
+        "effects": effects.iter().map(|effect| json!({"kind": effect.kind, "key": effect.key, "owner": effect.owner, "state": effect.state, "present": effect_verify(effect)})).collect::<Vec<_>>(),
+        "incomplete_effects": effects.iter().filter(|effect| effect.state != "effective").count(),
+        "scope": "this host's declaration, allocations and routes; the effective state is read from Podman and the kernel now, and an observation that could not be made is null (unknown), never zero",
+    }))
+}
+
+fn release_store(store: &mut dyn DurableStore, uuid: &str, operation_id: &str) -> Result<Option<String>, Error> {
+    let row = store.query_one(
+        "SELECT ip FROM network_allocations WHERE universe_uuid = ? AND released_at IS NULL",
+        &[Stored::from(uuid)],
+    )?;
+    let Some(row) = row else { return Ok(None) };
+    let ip = row.text(0)?.to_string();
+    store.execute(
+        "UPDATE network_allocations SET released_at = ?, released_by = ? WHERE universe_uuid = ? AND released_at IS NULL",
+        &[Stored::from(crate::now() as i64), Stored::from(operation_id), Stored::from(uuid)],
+    )?;
+    Ok(Some(ip))
+}
+
+fn reconcile_store(store: &mut dyn DurableStore) -> Result<Value, Error> {
+    let mut undone = vec![];
+    let mut remaining = vec![];
+    let mut drift = vec![];
+    let mut routes_dropped = vec![];
+    let mut routes_kept = vec![];
+
+    let interrupted = store.query(
+        "SELECT ip, state FROM network_routes WHERE state IS NOT NULL AND state <> ?",
+        &[Stored::from("effective")],
+    )?;
+    for row in interrupted {
+        let ip = row.text(0)?.to_string();
+        let state = row.text(1)?.to_string();
+        let mut all_gone = true;
+        for effect in effect_rows_store(store, Some(&ip))?.iter().rev() {
+            match effect_remove_store(store, effect) {
+                Ok(()) => undone.push(json!({"kind": effect.kind, "key": effect.key, "owner": ip, "was": effect.state, "why": format!("route {state}")})),
+                Err(error) => {
+                    all_gone = false;
+                    remaining.push(json!({"kind": effect.kind, "key": effect.key, "owner": ip, "was": effect.state, "why": format!("route {state}"), "error": error.to_string()}));
+                }
+            }
+        }
+        if all_gone {
+            if state == "resuming" {
+                store.execute("UPDATE network_routes SET state = ? WHERE ip = ?", &[Stored::from("effective"), Stored::from(&ip)])?;
+                routes_kept.push(ip);
+            } else {
+                store.execute("DELETE FROM network_routes WHERE ip = ?", &[Stored::from(&ip)])?;
+                routes_dropped.push(ip);
+            }
+        }
+    }
+
+    let mut declarations = vec![];
+    if let Some(declaration) = declared_store(store)? {
+        if matches!(declaration.state.as_str(), "declaring" | "undeclaring" | "failed") {
+            let mut all_gone = true;
+            for effect in effect_rows_store(store, Some(&declaration.network_uuid))?.iter().rev() {
+                match effect_remove_store(store, effect) {
+                    Ok(()) => undone.push(json!({"kind": effect.kind, "key": effect.key, "owner": declaration.network_uuid,
+                                                 "was": effect.state, "why": format!("declaration {}", declaration.state)})),
+                    Err(error) => {
+                        all_gone = false;
+                        remaining.push(json!({"kind": effect.kind, "key": effect.key, "owner": declaration.network_uuid,
+                                              "was": effect.state, "why": format!("declaration {}", declaration.state), "error": error.to_string()}));
+                    }
+                }
+            }
+            if all_gone {
+                store.execute("DELETE FROM network_peer_pools WHERE network_uuid = ?", &[Stored::from(&declaration.network_uuid)])?;
+                store.execute("DELETE FROM network_declaration WHERE network_uuid = ?", &[Stored::from(&declaration.network_uuid)])?;
+                declarations.push(json!({"network_uuid": declaration.network_uuid, "was": declaration.state, "now": "gone"}));
+            } else {
+                let observed = json!({"reconciled": true, "remaining": remaining.clone()});
+                store.execute(
+                    "UPDATE network_declaration SET state = ?, observed = ? WHERE network_uuid = ?",
+                    &[Stored::from("failed"), Stored::from(observed.to_string()), Stored::from(&declaration.network_uuid)],
+                )?;
+                declarations.push(json!({"network_uuid": declaration.network_uuid, "was": declaration.state, "now": "failed"}));
+            }
+        }
+    }
+
+    let mut orphans = vec![];
+    for effect in effect_rows_store(store, None)? {
+        if effect.state == "effective" {
+            let routes = store.query_one("SELECT COUNT(*) FROM network_routes WHERE ip = ?", &[Stored::from(&effect.owner)])?
+                .ok_or("Missing network route count")?.integer(0)?;
+            let declarations_count = store.query_one("SELECT COUNT(*) FROM network_declaration WHERE network_uuid = ?", &[Stored::from(&effect.owner)])?
+                .ok_or("Missing network declaration count")?.integer(0)?;
+            let publishers = store.query_one("SELECT COUNT(*) FROM publishers WHERE resource = ?", &[Stored::from(&effect.owner)])?
+                .ok_or("Missing publisher count")?.integer(0)?;
+            if routes + declarations_count + publishers == 0 {
+                match effect_remove_store(store, &effect) {
+                    Ok(()) => orphans.push(json!({"kind": effect.kind, "key": effect.key, "owner": effect.owner, "gone": true})),
+                    Err(error) => remaining.push(json!({"kind": effect.kind, "key": effect.key, "owner": effect.owner,
+                                                        "was": "effective orphan", "error": error.to_string()})),
+                }
+                continue;
+            }
+            if effect_verify(&effect) != Some(true) {
+                drift.push(json!({"kind": effect.kind, "key": effect.key, "owner": effect.owner, "observed": effect_verify(&effect)}));
+            }
+            continue;
+        }
+        match effect_remove_store(store, &effect) {
+            Ok(()) => undone.push(json!({"kind": effect.kind, "key": effect.key, "owner": effect.owner, "was": effect.state, "why": "effect alone"})),
+            Err(error) => remaining.push(json!({"kind": effect.kind, "key": effect.key, "owner": effect.owner,
+                                                "was": effect.state, "why": "effect alone", "error": error.to_string()})),
+        }
+    }
+
+    let live = store.query("SELECT universe_uuid, ip FROM network_allocations WHERE released_at IS NULL", &[])?;
+    let mut released = vec![];
+    for row in live {
+        let universe = row.text(0)?.to_string();
+        let ip = row.text(1)?.to_string();
+        if lc::inspect(&format!("podmesh-{universe}"))?.is_none() {
+            release_store(store, &universe, "reconciliation")?;
+            released.push(json!({"universe_uuid": universe, "ip": ip}));
+        }
+    }
+    Ok(json!({"undone": undone, "remaining": remaining, "drift": drift, "orphans": orphans,
+              "routes_dropped": routes_dropped, "routes_kept_for_resume": routes_kept,
+              "declarations": declarations, "allocations_released": released}))
+}
+
+fn perform_store(store: &mut dyn DurableStore, request: &Value) -> Result<Value, Error> {
+    let operation = lc::text(request, "operation")?;
+    let id = lc::text(request, "operation_id")?;
+    let reference = lc::text(request, "authorization_ref")?;
+    let now = crate::now() as i64;
+    match operation {
+        "network_declare" => {
+            let network_uuid = lc::text(request, "network_uuid")?;
+            lc::token(network_uuid)?;
+            let prefix = Cidr::parse(lc::text(request, "prefix")?, "prefix")?;
+            let pool = Cidr::parse(lc::text(request, "pool")?, "pool")?;
+            if !prefix.contains_cidr(&pool) {
+                return Err("pool must lie inside prefix".into());
+            }
+            if let Some(declaration) = declared_store(store)? {
+                return Err(format!("This host already carries the declaration of network {} (state {}); undeclare it first", declaration.network_uuid, declaration.state).into());
+            }
+            let peer_pools: Vec<(String, String)> = match request.get("peer_pools") {
+                None => vec![],
+                Some(value) => value.as_array().ok_or("peer_pools must be a list of {pool, via}")?.iter().map(|entry| -> Result<_, Error> {
+                    let peer = Cidr::parse(lc::text(entry, "pool")?, "peer_pools[].pool")?;
+                    if !prefix.contains_cidr(&peer) || peer.first() == pool.first() {
+                        return Err("a peer pool must lie inside prefix and differ from the local pool".into());
+                    }
+                    let via = identifier_ip(lc::text(entry, "via")?, "peer_pools[].via")?;
+                    Ok((peer.text(), via.to_string()))
+                }).collect::<Result<_, _>>()?,
+            };
+            for candidate in std::iter::once(pool.text()).chain(peer_pools.iter().map(|(peer, _)| peer.clone())) {
+                match routes_for(&candidate) {
+                    None => return Err("the kernel's routes could not be read; refusing to declare on an unknown state".into()),
+                    Some(routes) if !routes.is_empty() => return Err(format!("a route for {candidate} already exists: {}", routes.join("; ")).into()),
+                    _ => {}
+                }
+            }
+            if bridge_exists(BRIDGE) != Some(false) {
+                return Err(format!("the Podman network {BRIDGE} already exists or could not be checked; refusing to declare over it").into());
+            }
+            if nat_exemption_present() != Some(false) {
+                return Err(format!("the nftables table {NFT_TABLE} already exists or could not be checked; refusing to declare over it").into());
+            }
+            let backend = match request.get("nat_exemption") {
+                None => NAT_NULL_SNAT,
+                Some(value) => match value.as_str() {
+                    Some(NAT_NULL_SNAT) => NAT_NULL_SNAT,
+                    Some(NAT_NOTRACK) => NAT_NOTRACK,
+                    Some(NAT_NONE) => NAT_NONE,
+                    _ => return Err(format!("nat_exemption must be {NAT_NULL_SNAT} (default), {NAT_NOTRACK} or {NAT_NONE}").into()),
+                },
+            };
+            let gateway = Ipv4Addr::from(pool.first() + 1).to_string();
+            store.execute(
+                "INSERT INTO network_declaration(network_uuid, prefix, pool, gateway, bridge, state, declared_at, operation_id, authorization_ref, nat_backend) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                &[Stored::from(network_uuid), Stored::from(prefix.text()), Stored::from(pool.text()), Stored::from(&gateway),
+                  Stored::from(BRIDGE), Stored::from("declaring"), Stored::from(now), Stored::from(id), Stored::from(reference), Stored::from(backend)],
+            )?;
+            let mut plan = vec![("bridge", BRIDGE.to_string(), json!({"subnet": pool.text(), "gateway": gateway}))];
+            for (peer, via) in &peer_pools {
+                plan.push(("peer_route", peer.clone(), json!({"via": via})));
+            }
+            if backend != NAT_NONE {
+                plan.push(("nat_table", NFT_TABLE.to_string(), json!({"backend": backend, "prefix": prefix.text(), "pool": pool.text()})));
+            }
+            let mut done = vec![];
+            let mut failure = None;
+            for (kind, key, intent) in plan {
+                let effect = effect_begin_store(store, kind, &key, network_uuid, intent, id)?;
+                done.push(effect.clone());
+                if let Err(error) = effect_do_store(store, &effect) {
+                    failure = Some(error.to_string());
+                    break;
+                }
+            }
+            if failure.is_none() {
+                if let Err(error) = fault("before-declaration-effective") {
+                    failure = Some(error.to_string());
+                }
+            }
+            if let Some(error) = failure {
+                let report = compensate_store(store, &done);
+                let observed = json!({"error": error, "compensation": report});
+                store.execute(
+                    "UPDATE network_declaration SET state = ?, observed = ? WHERE network_uuid = ?",
+                    &[Stored::from("failed"), Stored::from(observed.to_string()), Stored::from(network_uuid)],
+                )?;
+                return Err(format!("{error}; compensation: {}", json!(report)).into());
+            }
+            for (peer, via) in &peer_pools {
+                store.execute(
+                    "INSERT INTO network_peer_pools(pool, via, network_uuid) VALUES(?, ?, ?)",
+                    &[Stored::from(peer), Stored::from(via), Stored::from(network_uuid)],
+                )?;
+            }
+            store.execute("UPDATE network_declaration SET state = ? WHERE network_uuid = ?", &[Stored::from("effective"), Stored::from(network_uuid)])?;
+        }
+        "network_undeclare" => undeclare_store(store, request)?,
+        "network_route_publish" => {
+            let uuid = lc::text(request, "universe_uuid")?;
+            lc::token(uuid)?;
+            let ip = identifier_ip(lc::text(request, "ip")?, "ip")?;
+            let via = identifier_ip(lc::text(request, "via")?, "via")?;
+            let resource = request.get("exclusive_resource").map(|value| value.as_str().ok_or("exclusive_resource must be a string")).transpose()?;
+            route_publish_store(store, uuid, ip, via, resource, id, now)?;
+        }
+        "network_route_withdraw" => {
+            let uuid = lc::text(request, "universe_uuid")?;
+            lc::token(uuid)?;
+            let row = store.query_one("SELECT ip FROM network_routes WHERE universe_uuid = ?", &[Stored::from(uuid)])?;
+            let Some(row) = row else { return Err("No route is published here for this universe".into()) };
+            let ip = row.text(0)?.to_string();
+            let report = withdraw_route_store(store, &ip)?;
+            if report["withdrawn"] != json!(true) {
+                return Err(format!("the withdrawal of the route for {ip} did not complete: {report}").into());
+            }
+        }
+        "network_route_resume" => {
+            let resource = lc::text(request, "exclusive_resource")?;
+            lc::token(resource)?;
+            let mut report = route_resume_store(store, resource, id)?;
+            report["effective_after"] = view_store(store)?;
+            return Ok(report);
+        }
+        "network_reapply" => {
+            let mut report = reapply_store(store)?;
+            report["effective_after"] = view_store(store)?;
+            return Ok(report);
+        }
+        _ => return Err("Unsupported network operation".into()),
+    }
+    view_store(store)
+}
+
+fn undeclare_store(store: &mut dyn DurableStore, request: &Value) -> Result<(), Error> {
+    let network_uuid = lc::text(request, "network_uuid")?;
+    let Some(declaration) = declared_store(store)? else { return Err("No network is declared on this host".into()) };
+    if declaration.network_uuid != network_uuid {
+        return Err(format!("This host carries network {}, not {network_uuid}", declaration.network_uuid).into());
+    }
+    let live = store.query_one("SELECT COUNT(*) FROM network_allocations WHERE released_at IS NULL", &[])?.ok_or("Missing allocation count")?.integer(0)?;
+    let routes = store.query_one("SELECT COUNT(*) FROM network_routes", &[])?.ok_or("Missing route count")?.integer(0)?;
+    if live > 0 || routes > 0 {
+        return Err(format!("{live} live allocation(s) and {routes} published route(s) remain; nothing is undeclared").into());
+    }
+    store.execute("UPDATE network_declaration SET state = ? WHERE network_uuid = ?", &[Stored::from("undeclaring"), Stored::from(network_uuid)])?;
+    for effect in effect_rows_store(store, Some(network_uuid))?.iter().rev() {
+        effect_remove_store(store, effect)?;
+        fault(&format!("undeclare-after-{}", effect.kind))?;
+    }
+    let peers = store.query("SELECT pool, via FROM network_peer_pools", &[])?;
+    for row in peers {
+        let pool = row.text(0)?;
+        let via = row.text(1)?;
+        if routes_for(pool).is_some_and(|held| held.iter().any(|line| line_via(line, via))) {
+            ip_route(&["-4", "route", "del", pool, "via", via])?;
+        }
+        if routes_for(pool).is_none_or(|held| held.iter().any(|line| line_via(line, via))) {
+            return Err(format!("the route for {pool} is still effective or unknown after its removal").into());
+        }
+    }
+    if bridge_exists(&declaration.bridge) == Some(true) {
+        lc::podman(lc::QUICK, &["network", "rm", &declaration.bridge])?;
+    }
+    if bridge_exists(&declaration.bridge) != Some(false) {
+        return Err("the bridge still exists or could not be checked after its removal".into());
+    }
+    if nat_exemption_present() == Some(true) {
+        nft(&["delete", "table", "inet", NFT_TABLE])?;
+    }
+    if nat_exemption_present() != Some(false) {
+        return Err(format!("the nftables table {NFT_TABLE} still exists or could not be checked after its removal").into());
+    }
+    store.execute("DELETE FROM network_peer_pools WHERE network_uuid = ?", &[Stored::from(network_uuid)])?;
+    store.execute("DELETE FROM network_declaration WHERE network_uuid = ?", &[Stored::from(network_uuid)])?;
+    Ok(())
+}
+
+fn activation_policy_store(store: &mut dyn DurableStore, resource: &str) -> Result<bool, Error> {
+    Ok(store.query_one("SELECT COUNT(*) FROM activation_policy WHERE universe_uuid = ?", &[Stored::from(resource)])?
+        .ok_or("Missing activation policy count")?.integer(0)? > 0)
+}
+
+fn activation_entitled_store(store: &mut dyn DurableStore, resource: &str, operation: &str) -> Result<(), Error> {
+    if !activation_policy_store(store, resource)? {
+        return Ok(());
+    }
+    let Some(lease) = store.query_one(
+        "SELECT holder_host_uuid, expires_at, epoch FROM activation_leases WHERE universe_uuid = ?",
+        &[Stored::from(resource)],
+    )? else {
+        return Err(format!("{operation} refused: this universe requires an activation lease and none is held").into());
+    };
+    let host = store.query_one("SELECT value FROM metadata WHERE `key` = ?", &[Stored::from("host_uuid")])?
+        .ok_or("The journal carries no host_uuid")?.text(0)?.to_string();
+    if lease.text(0)? != host {
+        return Err(format!("{operation} refused: the activation lease is held by another host").into());
+    }
+    let now = crate::now() as i64;
+    if lease.integer(1)? <= now {
+        return Err(format!("{operation} refused: this host's activation lease expired {} seconds ago", now - lease.integer(1)?).into());
+    }
+    let epoch = lease.integer(2)?;
+    if let Some(seen) = store.query_one("SELECT epoch FROM activation_epochs WHERE universe_uuid = ?", &[Stored::from(resource)])? {
+        let seen = seen.integer(0)?;
+        if seen > epoch {
+            return Err(format!("{operation} refused: this host's activation was superseded by epoch {seen}").into());
+        }
+    }
+    Ok(())
+}
+
+fn renewed_this_boot_store(store: &mut dyn DurableStore, resource: &str) -> Result<bool, Error> {
+    let boot = crate::activation::boot_id()?;
+    let current = store.query_one(
+        "SELECT COUNT(*) FROM activation_lease_history WHERE universe_uuid = ? AND event IN ('acquired','renewed') AND boot_id = ?",
+        &[Stored::from(resource), Stored::from(boot)],
+    )?.ok_or("Missing activation history count")?.integer(0)?;
+    if current > 0 {
+        return Ok(true);
+    }
+    let Some(booted_at) = crate::boot_restore::boot_time() else { return Ok(false) };
+    Ok(store.query_one(
+        "SELECT COUNT(*) FROM activation_lease_history WHERE universe_uuid = ? AND event IN ('acquired','renewed') AND boot_id IS NULL AND `at` >= ?",
+        &[Stored::from(resource), Stored::from(booted_at)],
+    )?.ok_or("Missing legacy activation history count")?.integer(0)? > 0)
+}
+
+fn universe_at_store(store: &mut dyn DurableStore, ip: &str) -> Result<Option<(String, i64)>, Error> {
+    let Some(row) = store.query_one(
+        "SELECT universe_uuid FROM network_allocations WHERE ip = ? AND released_at IS NULL",
+        &[Stored::from(ip)],
+    )? else { return Ok(None) };
+    let universe = row.text(0)?.to_string();
+    Ok(running_pid(&universe)?.map(|pid| (universe, pid)))
+}
+
+fn route_publish_store(
+    store: &mut dyn DurableStore,
+    uuid: &str,
+    ip: Ipv4Addr,
+    via: Ipv4Addr,
+    exclusive: Option<&str>,
+    operation_id: &str,
+    now: i64,
+) -> Result<(), Error> {
+    let declaration = declared_store(store)?.ok_or("No network is declared on this host")?;
+    if declaration.state != "effective" {
+        return Err(format!("the network declaration on this host is in state {}, not effective", declaration.state).into());
+    }
+    if !Cidr::parse(&declaration.prefix, "prefix")?.contains(ip) {
+        return Err(format!("{ip} is outside the declared prefix {}", declaration.prefix).into());
+    }
+    let placed_here = store.query_one(
+        "SELECT COUNT(*) FROM network_allocations WHERE universe_uuid = ? AND released_at IS NULL",
+        &[Stored::from(uuid)],
+    )?.ok_or("Missing allocation count")?.integer(0)?;
+    if placed_here > 0 {
+        return Err("the universe is allocated on this host; a route to elsewhere would announce it twice".into());
+    }
+    let resource = match exclusive {
+        None => None,
+        Some(resource) => {
+            lc::token(resource)?;
+            if !activation_policy_store(store, resource)? {
+                return Err(format!("exclusive_resource {resource} is under no activation policy on this host; an exclusive route needs the lease of a declared resource").into());
+            }
+            activation_entitled_store(store, resource, "network_route_publish")?;
+            Some(resource.to_string())
+        }
+    };
+    let destination = format!("{ip}/32");
+    match routes_for(&destination) {
+        None => return Err("the kernel's routes could not be read; refusing on an unknown state".into()),
+        Some(routes) if !routes.is_empty() => return Err(format!("a route for {ip} is already effective: {}; withdraw it first", routes.join("; ")).into()),
+        _ => {}
+    }
+    let existing = store.query_one("SELECT COUNT(*) FROM network_routes WHERE ip = ?", &[Stored::from(ip.to_string())])?
+        .ok_or("Missing network route count")?.integer(0)?;
+    if existing > 0 {
+        return Err(format!("a route for {ip} is already recorded here; withdraw it first").into());
+    }
+    let alias = if resource.is_some() {
+        let Some((carrier, _)) = universe_at_store(store, &via.to_string())? else {
+            return Err(format!("an exclusive route must point at a running universe of this host, which then carries {ip}; nothing runs at {via} here").into());
+        };
+        Some(carrier)
+    } else {
+        None
+    };
+    store.execute(
+        "INSERT INTO network_routes(ip, universe_uuid, via, published_at, operation_id, exclusive_resource, alias_universe_uuid, state) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+        &[Stored::from(ip.to_string()), Stored::from(uuid), Stored::from(via.to_string()), Stored::from(now), Stored::from(operation_id),
+          resource.as_ref().map(Stored::from).unwrap_or(Stored::Null), alias.as_ref().map(Stored::from).unwrap_or(Stored::Null), Stored::from("applying")],
+    )?;
+    let mut plan = vec![];
+    if let Some(carrier) = &alias {
+        plan.push(("alias", format!("{ip}@{carrier}"), json!({"ip": ip.to_string(), "universe": carrier})));
+    }
+    plan.push(("route", destination, json!({"via": via.to_string()})));
+    let mut done = vec![];
+    let mut failure = None;
+    for (kind, key, intent) in plan {
+        let effect = effect_begin_store(store, kind, &key, &ip.to_string(), intent, operation_id)?;
+        done.push(effect.clone());
+        if let Err(error) = effect_do_store(store, &effect) {
+            failure = Some(error.to_string());
+            break;
+        }
+    }
+    if failure.is_none() {
+        if let Err(error) = fault("before-route-effective") {
+            failure = Some(error.to_string());
+        }
+    }
+    if let Some(error) = failure {
+        let report = compensate_store(store, &done);
+        let all_gone = report.iter().all(|row| row["gone"] == json!(true));
+        if all_gone {
+            store.execute("DELETE FROM network_routes WHERE ip = ?", &[Stored::from(ip.to_string())])?;
+        }
+        return Err(format!("{error}; compensation: {}{}", json!(report), if all_gone { "" } else { "; the route's record is kept for reconciliation" }).into());
+    }
+    store.execute("UPDATE network_routes SET state = ? WHERE ip = ?", &[Stored::from("effective"), Stored::from(ip.to_string())])?;
+    Ok(())
+}
+
+fn withdraw_route_store(store: &mut dyn DurableStore, ip: &str) -> Result<Value, Error> {
+    let Some(row) = store.query_one(
+        "SELECT universe_uuid, via, exclusive_resource, alias_universe_uuid FROM network_routes WHERE ip = ?",
+        &[Stored::from(ip)],
+    )? else {
+        return Ok(json!({"ip": ip, "withdrawn": false, "error": "no such route recorded"}));
+    };
+    let universe = row.text(0)?.to_string();
+    let via = row.text(1)?.to_string();
+    let resource = stored_optional_text(row.value(2)?)?;
+    let alias = stored_optional_text(row.value(3)?)?;
+    store.execute("UPDATE network_routes SET state = ? WHERE ip = ?", &[Stored::from("removing"), Stored::from(ip)])?;
+    let effects = effect_rows_store(store, Some(ip))?;
+    let mut steps = vec![];
+    let mut failed = false;
+    if effects.is_empty() {
+        let route = Effect { id: 0, kind: "route".into(), key: format!("{ip}/32"), owner: ip.into(), intent: json!({"via": via}), state: "effective".into() };
+        match effect_undo(&route).and_then(|_| match effect_verify(&route) { Some(false) => Ok(()), _ => Err("still present or unknown".into()) }) {
+            Ok(()) => steps.push(json!({"kind": "route", "gone": true})),
+            Err(error) => { failed = true; steps.push(json!({"kind": "route", "gone": false, "error": error.to_string()})); }
+        }
+        if let Some(carrier) = &alias {
+            match alias_remove(carrier, ip) {
+                Ok(()) => steps.push(json!({"kind": "alias", "gone": true})),
+                Err(error) => { failed = true; steps.push(json!({"kind": "alias", "gone": false, "error": error.to_string()})); }
+            }
+        }
+    } else {
+        for effect in effects.iter().rev() {
+            match effect_remove_store(store, effect) {
+                Ok(()) => steps.push(json!({"kind": effect.kind, "key": effect.key, "gone": true})),
+                Err(error) => { failed = true; steps.push(json!({"kind": effect.kind, "key": effect.key, "gone": false, "error": error.to_string()})); }
+            }
+            if !failed {
+                fault(&format!("withdraw-after-{}", effect.kind))?;
+            }
+        }
+    }
+    if !failed {
+        store.execute("DELETE FROM network_routes WHERE ip = ?", &[Stored::from(ip)])?;
+    }
+    Ok(json!({"ip": ip, "universe_uuid": universe, "exclusive_resource": resource, "alias_universe_uuid": alias,
+              "withdrawn": !failed, "alias_withdrawn": steps.iter().filter(|step| step["kind"] == "alias").all(|step| step["gone"] == json!(true)),
+              "steps": steps, "routes_now": routes_for(&format!("{ip}/32"))}))
+}
+
+fn reapply_store(store: &mut dyn DurableStore) -> Result<Value, Error> {
+    let Some(declaration) = declared_store(store)? else {
+        return Ok(json!({"declaration": null, "reapplied": [], "already_present": [], "routes_withdrawn": [], "note": "no network is declared on this host"}));
+    };
+    if declaration.state != "effective" {
+        return Err(format!("the declaration of network {} is {}, not effective; nothing is re-applied", declaration.network_uuid, declaration.state).into());
+    }
+    let (mut reapplied, mut present, mut failed) = (vec![], vec![], vec![]);
+    for effect in effect_rows_store(store, Some(&declaration.network_uuid))? {
+        if effect.state != "effective" || !matches!(effect.kind.as_str(), "bridge" | "peer_route" | "nat_table") {
+            continue;
+        }
+        match effect_verify(&effect) {
+            Some(true) => present.push(json!({"kind": effect.kind, "key": effect.key})),
+            Some(false) => {
+                let applied = effect_apply(&effect).and_then(|_| match effect_verify(&effect) {
+                    Some(true) => Ok(()),
+                    Some(false) => Err("not effective after being re-applied".into()),
+                    None => Err("could not be verified after being re-applied".into()),
+                });
+                match applied {
+                    Ok(()) => reapplied.push(json!({"kind": effect.kind, "key": effect.key})),
+                    Err(error) => failed.push(json!({"kind": effect.kind, "key": effect.key, "error": error.to_string()})),
+                }
+            }
+            None => failed.push(json!({"kind": effect.kind, "key": effect.key, "error": "its presence could not be read"})),
+        }
+    }
+    let rows = store.query(
+        "SELECT ip, via, state FROM network_routes WHERE state IS NULL OR state IN ('effective','resuming') ORDER BY ip",
+        &[],
+    )?;
+    let mut withdrawn = vec![];
+    for row in rows {
+        let ip = row.text(0)?.to_string();
+        let via = row.text(1)?.to_string();
+        let state = stored_optional_text(row.value(2)?)?.unwrap_or_else(|| "effective".into());
+        let gone = state == "resuming" || routes_for(&format!("{ip}/32")).is_some_and(|held| !held.iter().any(|line| line_via(line, &via)));
+        if gone {
+            let report = withdraw_route_store(store, &ip)?;
+            withdrawn.push(json!({"ip": ip, "via": via, "withdrawn": report["withdrawn"], "steps": report["steps"]}));
+        }
+    }
+    if !failed.is_empty() {
+        return Err(format!("some effects of the declaration could not be re-applied: {}", json!(failed)).into());
+    }
+    Ok(json!({"declaration": declaration.network_uuid, "reapplied": reapplied, "already_present": present, "routes_withdrawn": withdrawn}))
+}
+
+fn recorded_exclusive_store(store: &mut dyn DurableStore, resource: &str) -> Result<Option<RecordedRoute>, Error> {
+    let Some(row) = store.query_one(
+        "SELECT ip, universe_uuid, via, alias_universe_uuid, state FROM network_routes WHERE exclusive_resource = ?",
+        &[Stored::from(resource)],
+    )? else { return Ok(None) };
+    Ok(Some(RecordedRoute {
+        ip: row.text(0)?.to_string(),
+        universe: row.text(1)?.to_string(),
+        via: row.text(2)?.to_string(),
+        alias: stored_optional_text(row.value(3)?)?,
+        state: stored_optional_text(row.value(4)?)?.unwrap_or_else(|| "effective".into()),
+    }))
+}
+
+fn route_resume_store(store: &mut dyn DurableStore, resource: &str, operation_id: &str) -> Result<Value, Error> {
+    let refused = |(code, why): (&str, String)| -> Error { format!("network_route_resume refused ({code}): {why}").into() };
+    let policy = activation_policy_store(store, resource)?;
+    let recorded = recorded_exclusive_store(store, resource)?;
+    let entitled = activation_entitled_store(store, resource, "network_route_resume").map_err(|error| error.to_string());
+    let renewed = renewed_this_boot_store(store, resource)?;
+    route_resume_gate(policy, recorded.as_ref(), entitled, renewed).map_err(refused)?;
+    let route = recorded.ok_or("no recorded route")?;
+    if !declared_store(store)?.is_some_and(|declaration| declaration.state == "effective") {
+        return Err(refused(("declaration_not_effective", "this host's network declaration is not effective; the route could not be published again".into())));
+    }
+    let kernel = routes_for(&format!("{}/32", route.ip));
+    let alias_effective = match route.alias.as_ref() {
+        Some(alias) => alias_reading(alias, &route.ip),
+        None => Some(false),
+    };
+    let carrier = universe_at_store(store, &route.via)?.map(|(universe, _)| universe);
+    let plan = route_resume_plan(&route, kernel.as_deref(), alias_effective, carrier.as_deref()).map_err(refused)?;
+    let ResumePlan::Resume { carrier } = plan else {
+        return Ok(json!({"exclusive_resource": resource, "ip": route.ip, "via": route.via, "resumed": false,
+                         "already_effective": true, "carrier": route.alias}));
+    };
+    resume_in_place_store(store, &route, &carrier, operation_id)?;
+    Ok(json!({"exclusive_resource": resource, "ip": route.ip, "via": route.via, "resumed": true, "already_effective": false,
+              "carrier_before": route.alias, "carrier_now": carrier,
+              "note": "the recorded exclusive route and alias made again in place under the lease this host holds, live, unsuperseded and renewed during this boot"}))
+}
+
+fn resume_in_place_store(store: &mut dyn DurableStore, route: &RecordedRoute, carrier: &str, operation_id: &str) -> Result<(), Error> {
+    let ip = route.ip.as_str();
+    store.execute(
+        "UPDATE network_routes SET state = ?, alias_universe_uuid = ? WHERE ip = ?",
+        &[Stored::from("resuming"), Stored::from(carrier), Stored::from(ip)],
+    )?;
+    let mut failure = None;
+    for effect in effect_rows_store(store, Some(ip))?.iter().rev() {
+        if let Err(error) = effect_remove_store(store, effect) {
+            failure = Some(format!("the dead {} {} could not be removed: {error}", effect.kind, effect.key));
+            break;
+        }
+    }
+    if failure.is_none() {
+        if let Err(error) = fault("resume-after-withdrawal") {
+            failure = Some(error.to_string());
+        }
+    }
+    if failure.is_none() {
+        match routes_for(&format!("{ip}/32")) {
+            None => failure = Some("the kernel's routes could not be read after the dead effects were removed".into()),
+            Some(held) if !held.is_empty() => failure = Some(format!("the kernel still holds a route for {ip}: {}", held.join("; "))),
+            _ => {}
+        }
+    }
+    let mut done = vec![];
+    if failure.is_none() {
+        for (kind, key, intent) in [
+            ("alias", format!("{ip}@{carrier}"), json!({"ip": ip, "universe": carrier})),
+            ("route", format!("{ip}/32"), json!({"via": route.via})),
+        ] {
+            let effect = effect_begin_store(store, kind, &key, ip, intent, operation_id)?;
+            done.push(effect.clone());
+            if let Err(error) = effect_do_store(store, &effect) {
+                failure = Some(error.to_string());
+                break;
+            }
+        }
+    }
+    if let Some(error) = failure {
+        let report = compensate_store(store, &done);
+        store.execute("UPDATE network_routes SET state = ? WHERE ip = ?", &[Stored::from("effective"), Stored::from(ip)])?;
+        return Err(format!("network_route_resume: {error}; compensation: {}; the route stays recorded and the next resume retries it", json!(report)).into());
+    }
+    store.execute(
+        "UPDATE network_routes SET state = ?, operation_id = ? WHERE ip = ?",
+        &[Stored::from("effective"), Stored::from(operation_id), Stored::from(ip)],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod resume_tests {
     use super::*;
+    use crate::store::{migrations, SqliteStore};
 
     const R: &str = "91eeb6bf-5489-405b-b77a-53105b0aff7a";
     const HOST: &str = "5d1c0b8e-3f59-4d0e-9d7a-2a1e7c4b9f10";
@@ -1573,6 +2522,63 @@ mod resume_tests {
         crate::activation::ensure_schema(&db).unwrap();
         crate::publisher::ensure_schema(&db).unwrap();
         db
+    }
+
+    fn memory_store() -> SqliteStore {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        migrations::apply(&mut store).unwrap();
+        store
+    }
+
+    #[test]
+    fn store_status_matches_connection_and_does_not_journal() {
+        let mut store = memory_store();
+        let request = json!({"operation": "network_status"});
+        let via_store = execute_store(&mut store, &request).unwrap();
+        let operations = store.query("SELECT id FROM operations", &[]).unwrap();
+        assert!(operations.is_empty());
+        let db = store.into_connection();
+        let via_connection = execute(&db, &request).unwrap();
+        assert_eq!(via_store, via_connection);
+    }
+
+    #[test]
+    fn store_refused_mutation_is_retried_and_a_clashing_id_is_refused() {
+        let mut store = memory_store();
+        let request = json!({"operation": "network_undeclare", "operation_id": "network-refused-1",
+            "authorization_ref": "test", "network_uuid": "network-a"});
+        let first = execute_store(&mut store, &request).unwrap_err().to_string();
+        assert_eq!(first, "No network is declared on this host");
+        let second = execute_store(&mut store, &request).unwrap_err().to_string();
+        assert_eq!(second, first);
+        let attempts = store.query(
+            "SELECT id FROM operation_attempts WHERE operation_id = ?",
+            &[Stored::from("network-refused-1")],
+        ).unwrap();
+        assert_eq!(attempts.len(), 2);
+        let clash = json!({"operation": "network_undeclare", "operation_id": "network-refused-1",
+            "authorization_ref": "test", "network_uuid": "network-b"});
+        assert!(execute_store(&mut store, &clash).unwrap_err().to_string().contains("different request"));
+    }
+
+    #[test]
+    fn store_verified_operation_replays_without_an_attempt() {
+        let mut store = memory_store();
+        let request = json!({"operation": "network_reapply", "operation_id": "network-replay-1", "authorization_ref": "test"});
+        let result = json!({"declaration": null, "reapplied": [], "already_present": [], "routes_withdrawn": []});
+        store.execute(
+            "INSERT INTO operations(id, request, status, result) VALUES(?, ?, ?, ?)",
+            &[Stored::from("network-replay-1"), Stored::from(request.to_string()), Stored::from("verified"), Stored::from(result.to_string())],
+        ).unwrap();
+        let replayed = execute_store(&mut store, &request).unwrap();
+        assert_eq!(replayed["replayed"], true);
+        assert_eq!(replayed["historical"], true);
+        assert_eq!(replayed["declaration"], Value::Null);
+        assert!(replayed["notice"].as_str().unwrap().contains("not current state"));
+        assert!(store.query(
+            "SELECT id FROM operation_attempts WHERE operation_id = ?",
+            &[Stored::from("network-replay-1")],
+        ).unwrap().is_empty());
     }
 
     fn resume(db: &Connection, id: &str) -> Result<Value, String> {
