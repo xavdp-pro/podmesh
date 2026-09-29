@@ -465,6 +465,8 @@ fn a_vote_is_signed_only_for_a_live_payload_under_the_replicas_policy() {
 // The child process: signs one vote, possibly crashing or pausing inside the ledger's write.
 
 const CHILD: &str = "PODMESH_VOTE_TEST_CHILD";
+/// The live generation witness a child guards and watches, when its test gives it one.
+const CHILD_GENERATION: &str = "PODMESH_VOTE_TEST_CHILD_GENERATION";
 
 /// Not a test by itself: returns at once unless a parent test runs it as a child process.
 #[test]
@@ -474,8 +476,16 @@ fn child_signs_one_vote() {
     };
     let spec: Value = serde_json::from_str(&spec).unwrap();
     let dir = PathBuf::from(spec["dir"].as_str().unwrap());
-    let signer = signer_a(&dir);
+    let mut signer = signer_a(&dir);
     let now = spec["now"].as_i64().unwrap();
+    // The witness, guarded before the signing lock and watched through it, as the resident's own
+    // signer holds it: the parent moves it while this child is inside the lock.
+    if let Ok(path) = std::env::var(CHILD_GENERATION) {
+        let path = PathBuf::from(path);
+        let generation = crate::votes::generation_id_from(&path).unwrap();
+        signer.guard_generation(&generation, now).unwrap();
+        signer.watch_generation(path, &generation);
+    }
     let result = signer.sign(&spec["payload"], &[], now);
     fs::write(
         dir.join(format!("outcome-{}", spec["tag"].as_str().unwrap())),
@@ -667,6 +677,154 @@ fn a_memory_snapshot_resume_changes_the_external_generation_witness() {
         "ledger_unadmitted"
     );
     assert_eq!(fs::read_to_string(marker).unwrap(), NEW);
+}
+
+/// A live hypervisor generation witness: the 16 bytes `byte`, as a platform adapter supplies the
+/// bare item. Returns the identifier a signer reads from it.
+fn write_generation(path: &Path, byte: u8) -> String {
+    fs::write(path, [byte; 16]).unwrap();
+    quorum::hex(&[byte; 16])
+}
+
+/// The marker `guard_generation` compares the witness to, as a host that never moved generation
+/// would have left it: so the guard passes and quarantines nothing.
+fn place_generation_marker(dir: &Path, key_id: &str, generation: &str) {
+    let marker = dir.join(format!("{key_id}.generation-id"));
+    fs::write(&marker, generation).unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// Proves (the guard's time-of-check gap): the generation is guarded before the signing lock is
+/// taken and the lock released again, so a signer that watches the witness reads it once more under
+/// that lock, in the last moment before its vote is sealed. A witness that moved between the guard
+/// and the signature releases nothing, names `generation_changed` and marks the ledger unadmitted,
+/// durably; before this, a signature was released on the strength of a check the snapshot resume had
+/// undone. A witness that cannot be read shows nothing about the generation either: it releases
+/// nothing, and quarantines nothing by itself.
+#[test]
+fn a_generation_that_moves_after_the_guard_releases_no_signature() {
+    let root = temp_root();
+    let dir = private_dir(root.path(), "a");
+    let mut signer = admitted_a(root.path(), &dir);
+    let q = policy(ABC, 0);
+    let witness = root.path().join("generation");
+    let guarded = write_generation(&witness, 1);
+    place_generation_marker(&dir, "replica-a", &guarded);
+    signer.guard_generation(&guarded, T1).unwrap();
+    signer.watch_generation(witness.clone(), &guarded);
+    // On the generation guarded, the vote is signed as before.
+    signer.sign(&takeover(&q, R, 5, X, T1), &[], T1).unwrap();
+
+    // The hypervisor resumes the guest from a snapshot: this process's memory, the ledger and the
+    // marker go back together, and only the witness it holds outside the snapshot says so.
+    write_generation(&witness, 2);
+    assert_eq!(
+        code(signer.sign(&takeover(&q, R, 6, X, T1), &[], T1)),
+        ledger::GENERATION_CHANGED
+    );
+    let quarantined = signer.load().unwrap();
+    assert!(!quarantined.admitted);
+    assert_eq!(quarantined.unadmitted_since, Some(T1));
+    assert!(quarantined
+        .unadmitted_reason
+        .as_deref()
+        .unwrap()
+        .starts_with("generation witness (generation_changed)"));
+    assert_eq!(
+        code(signer_a(&dir).sign(&takeover(&q, R, 6, X, T1 + 1), &[], T1 + 1)),
+        "ledger_unadmitted",
+        "durably: another signer on these files signs nothing either"
+    );
+
+    let second = private_dir(root.path(), "b");
+    let mut other = admitted_a(root.path(), &second);
+    let guarded = write_generation(&witness, 3);
+    place_generation_marker(&second, "replica-a", &guarded);
+    other.guard_generation(&guarded, T1).unwrap();
+    other.watch_generation(witness.clone(), &guarded);
+    fs::remove_file(&witness).unwrap();
+    assert_eq!(
+        code(other.sign(&takeover(&q, R, 5, X, T1), &[], T1)),
+        "generation_identity_unreadable"
+    );
+    assert!(
+        other.load().unwrap().admitted,
+        "an unreadable witness quarantines nothing by itself"
+    );
+}
+
+/// Proves: the witness is read inside the signing lock, not before it. A child signer is paused
+/// after its checks, holding the lock, while the generation moves under it; it releases no
+/// signature, answers `generation_changed`, and leaves the ledger unadmitted on disk.
+#[test]
+fn a_generation_that_moves_inside_the_signing_lock_releases_no_signature() {
+    let root = temp_root();
+    let dir = private_dir(root.path(), "a");
+    let signer = admitted_a(root.path(), &dir);
+    let q = policy(ABC, 0);
+    let witness = root.path().join("generation");
+    let guarded = write_generation(&witness, 1);
+    place_generation_marker(&dir, "replica-a", &guarded);
+    let mark = root.path().join("child-paused");
+    let mut child = run_child(
+        &dir,
+        "generation",
+        &takeover(&q, R, 9, X, T1),
+        T1,
+        &[
+            ("PODMESH_VOTE_TEST_PAUSE", "after_check".to_string()),
+            ("PODMESH_VOTE_TEST_PAUSE_MS", "1500".to_string()),
+            ("PODMESH_VOTE_TEST_PAUSE_MARK", mark.display().to_string()),
+            (CHILD_GENERATION, witness.display().to_string()),
+        ],
+    );
+    let started = std::time::Instant::now();
+    while !mark.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the child never reached its pause"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    write_generation(&witness, 2);
+    assert!(child.wait().unwrap().success());
+    assert_eq!(
+        fs::read_to_string(dir.join("outcome-generation")).unwrap(),
+        ledger::GENERATION_CHANGED
+    );
+    assert!(
+        released(&dir, "generation").is_none(),
+        "a signature was released after the generation moved under the lock"
+    );
+    assert!(!signer.load().unwrap().admitted);
+}
+
+/// Proves (the same gap on the readmission path): the witness is read once more before the ledger
+/// becomes admitted, so a generation that moved while the operator's evidence was being read admits
+/// nothing. Back on the generation guarded, the same readmission admits.
+#[test]
+fn a_generation_that_moves_before_an_admission_admits_nothing() {
+    let root = temp_root();
+    let dir = private_dir(root.path(), "a");
+    place_key(&dir, "replica-a", 1);
+    let mut signer = signer_a(&dir);
+    signer.init(T0).unwrap();
+    empty_world(root.path(), &dir, T0);
+    let witness = root.path().join("generation");
+    let guarded = write_generation(&witness, 1);
+    place_generation_marker(&dir, "replica-a", &guarded);
+    signer.guard_generation(&guarded, T1).unwrap();
+    signer.watch_generation(witness.clone(), &guarded);
+
+    write_generation(&witness, 2);
+    assert_eq!(
+        readmit_with(&signer, vec![], &[], T1).unwrap_err().code,
+        ledger::GENERATION_CHANGED
+    );
+    assert!(!signer.load().unwrap().admitted);
+    write_generation(&witness, 1);
+    readmit_with(&signer, vec![], &[], T1).unwrap();
+    assert!(signer.load().unwrap().admitted);
 }
 
 #[test]

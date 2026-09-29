@@ -33,6 +33,16 @@
 //! does not hold, proves the ledger went back in time. The signer then marks the ledger unadmitted,
 //! durably, refuses, and names the alert. It closes the easiest hole, a silent revert of a host's VM
 //! snapshot, whenever one of the key's later votes survives anywhere the signer is shown.
+//!
+//! The watched generation witness (V3-5 review): `guard_generation` reads the hypervisor's value
+//! before the resident exchanges anything, and releases the ledger's lock again. A snapshot resume
+//! between that check and a signature takes everything inside the guest back with it -- this
+//! process's memory, the ledger, the `<key_id>.generation-id` marker -- so a signature released
+//! after it would leave a ledger that does not know it was made. Only the witness itself, which the
+//! hypervisor holds outside the snapshot, still says which generation this is. A signer given that
+//! file (`watch_generation`) therefore reads it again under the signing lock, in the last moment
+//! before a vote is sealed, and readmission reads it again before it admits a ledger: a value other
+//! than the one guarded marks the ledger unadmitted, durably, and releases nothing.
 use crate::quorum::{self, Quorum};
 use crate::vote::{self, Decision, LedgerStamp, PromiseKind};
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -81,8 +91,17 @@ pub(crate) fn refusal(code: &'static str, detail: impl Into<String>) -> LedgerRe
     }
 }
 
-/// The codes the tripwire raises: each one is also an alert, named on standard error by the resident.
-pub const TRIPWIRE_CODES: &[&str] = &["ledger_behind_own_votes", "own_vote_unknown_to_ledger"];
+/// The code a watched generation witness raises when it no longer holds the value guarded: the
+/// guest moved to another generation under a signature or an admission.
+pub const GENERATION_CHANGED: &str = "generation_changed";
+
+/// The codes that mark the ledger unadmitted while it is signing: the tripwire's, and the watched
+/// generation witness's. Each one is also an alert, named on standard error by the resident.
+pub const TRIPWIRE_CODES: &[&str] = &[
+    "ledger_behind_own_votes",
+    "own_vote_unknown_to_ledger",
+    GENERATION_CHANGED,
+];
 
 /// The host this replica runs on, as the host itself names it: its machine-id, 32 lowercase hex
 /// characters, read from a file the host mounts read-only into the universe (by default
@@ -363,7 +382,15 @@ fn release(vote: &Value) {
 #[cfg(not(test))]
 fn release(_vote: &Value) {}
 
-/// The replica's signer: its key, its ledger, its host and the policy it votes under.
+/// The live hypervisor generation witness a signer watches: the file the hypervisor holds outside
+/// the guest's snapshot, and the value `guard_generation` accepted from it.
+struct WatchedGeneration {
+    path: PathBuf,
+    observed: String,
+}
+
+/// The replica's signer: its key, its ledger, its host, the policy it votes under, and the live
+/// generation witness it watches, if its host provides one.
 pub struct Signer {
     dir: PathBuf,
     key_id: String,
@@ -372,6 +399,7 @@ pub struct Signer {
     host: HostIdentity,
     policy: Quorum,
     rules: SigningRules,
+    generation: Option<WatchedGeneration>,
 }
 
 /// The lock on a ledger, released when dropped.
@@ -497,6 +525,7 @@ impl Signer {
             host,
             policy,
             rules,
+            generation: None,
         })
     }
 
@@ -739,6 +768,10 @@ impl Signer {
 
     /// A hypervisor generation witness is outside the guest's snapshot. It catches a rollback
     /// that resumes kernel memory and therefore retains the old boot ID.
+    ///
+    /// This guard releases the ledger's lock again: a signer that will go on to sign or readmit
+    /// must also be given the file the value was read from (`watch_generation`), so that the same
+    /// witness is read once more, under the lock, before anything is released or admitted.
     pub fn guard_generation(&self, generation_id: &str, now: i64) -> Result<(), LedgerRefusal> {
         if generation_id.len() != 32
             || !generation_id
@@ -808,6 +841,41 @@ impl Signer {
         Ok(())
     }
 
+    /// Watches the live generation witness at `path`, whose value `guard_generation` has just
+    /// accepted, for the rest of this signer's life: `sign` reads the file again under the signing
+    /// lock, immediately before a vote is sealed, and readmission before it admits.
+    pub fn watch_generation(&mut self, path: PathBuf, observed: &str) {
+        self.generation = Some(WatchedGeneration {
+            path,
+            observed: observed.to_string(),
+        });
+    }
+
+    /// Reads the watched generation witness again, if this signer watches one. The hypervisor holds
+    /// it outside the guest's snapshot: a guest that went back to another generation since the
+    /// guard, taking this process's memory and its files with it, reads another value here.
+    ///
+    /// # Errors
+    /// `generation_changed`: the witness no longer holds the value guarded; the caller releases
+    /// nothing and the ledger is quarantined. `generation_identity_unreadable`: the witness cannot
+    /// be read now, so nothing shows the generation did not change, and the caller fails closed.
+    pub(crate) fn check_generation(&self) -> Result<(), LedgerRefusal> {
+        let Some(watched) = &self.generation else {
+            return Ok(());
+        };
+        let observed = crate::votes::generation_id_from(&watched.path)?;
+        if observed == watched.observed {
+            return Ok(());
+        }
+        Err(refusal(
+            GENERATION_CHANGED,
+            format!(
+                "the hypervisor's generation is {observed}, this signer was guarded on {}: the guest moved to another generation (a snapshot resume or a restore) since, and everything inside it may have gone back with it",
+                watched.observed
+            ),
+        ))
+    }
+
     /// The tripwire: a vote of this key, among those shown, that the ledger cannot account for.
     fn tripwire(&self, ledger: &Ledger, seen: &[Value]) -> Option<LedgerRefusal> {
         let own: BTreeMap<String, VerifyingKey> =
@@ -854,7 +922,8 @@ impl Signer {
     /// them. `now` is this replica's clock, in seconds.
     ///
     /// # Errors
-    /// The ledger's refusals; the tripwire's (the ledger is then marked unadmitted); `payload_invalid`,
+    /// The ledger's refusals; the tripwire's and `generation_changed` (the ledger is then marked
+    /// unadmitted); `generation_identity_unreadable`; `payload_invalid`,
     /// `policy_mismatch`, `certificate_life`, `serial_not_current`; and the promise rule's:
     /// `epoch_at_or_below_floor`, `epoch_superseded`, `epoch_already_promised`,
     /// `serial_at_or_below_floor`, `serial_superseded`, `serial_already_promised`.
@@ -989,6 +1058,23 @@ impl Signer {
         }
         ledger.sequence = sequence;
         self.store(&mut ledger)?;
+        // The last check before a signature of this key exists. `guard_generation` ran before this
+        // lock was taken; a snapshot resume since would have taken this process, the ledger and the
+        // marker back with it, and only the hypervisor's own witness still says so. A changed
+        // witness marks the ledger unadmitted, durably, and nothing is released; a witness that
+        // cannot be read proves nothing either, so nothing is released then either.
+        if let Err(alarm) = self.check_generation() {
+            if alarm.code == GENERATION_CHANGED {
+                ledger.admitted = false;
+                ledger.unadmitted_since = Some(now);
+                ledger.unadmitted_reason = Some(format!(
+                    "generation witness ({}): {}; it signs nothing until the operator readmits it",
+                    alarm.code, alarm.detail
+                ));
+                self.store(&mut ledger)?;
+            }
+            return Err(alarm);
+        }
         let vote = vote::seal(
             &self.key,
             &self.key_id,

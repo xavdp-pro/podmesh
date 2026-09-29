@@ -407,7 +407,7 @@ impl VoteRuntime {
             .config
             .policy()
             .map_err(|e| crate::ledger::refusal("key_not_in_policy", e.to_string()))?;
-        let signer = Signer::open(
+        let mut signer = Signer::open(
             &self.dir,
             &self.config.key_id,
             host,
@@ -421,7 +421,12 @@ impl VoteRuntime {
             .map_err(|e| crate::ledger::refusal("boot_identity_unreadable", e.to_string()))?;
         signer.guard_boot(boot_id.trim_end_matches('\n'), now())?;
         if let Some(path) = std::env::var_os(GENERATION_FILE_ENV) {
-            signer.guard_generation(&generation_id_from(&PathBuf::from(path))?, now())?;
+            let path = PathBuf::from(path);
+            let generation = generation_id_from(&path)?;
+            signer.guard_generation(&generation, now())?;
+            // The guard released the ledger's lock: the signer keeps the witness, and reads it
+            // again under the lock before it releases a signature or admits the ledger.
+            signer.watch_generation(path, &generation);
         } else if self.config.require_generation_id {
             return Err(crate::ledger::refusal(
                 "generation_identity_unreadable",

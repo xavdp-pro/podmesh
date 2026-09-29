@@ -592,7 +592,8 @@ fn from_ledger(e: LedgerRefusal) -> ReadmissionRefusal {
 /// # Errors
 /// The ledger's own refusals (`ledger_missing`, `ledger_unreadable`, `ledger_foreign_key`,
 /// `ledger_foreign_host`), `ledger_admitted`, `readmission_inputs_unreadable`,
-/// `readmission_too_early`, and the storage refusal.
+/// `readmission_too_early`, the watched generation witness's (`generation_changed`,
+/// `generation_identity_unreadable`), and the storage refusal.
 pub fn readmit(
     signer: &Signer,
     scope: &Scope<'_>,
@@ -713,6 +714,13 @@ pub fn readmit(
         sequence_before,
         sequence_set: ledger.sequence,
     };
+    // The same gap the signature has: the generation was guarded before this lock was taken, and a
+    // snapshot resume since would have taken the ledger, the marker and everything this readmission
+    // read back with it, so that an admission written now would admit the ledger of the generation
+    // that went back. The witness the hypervisor holds outside the snapshot is read once more, in
+    // the last moment before the ledger becomes admitted; a changed one admits nothing, and the
+    // ledger stays unadmitted as it already is, for the operator to look at.
+    signer.check_generation().map_err(from_ledger)?;
     ledger.admitted = true;
     ledger.admitted_at_sequence = ledger.sequence;
     ledger.unadmitted_since = None;
