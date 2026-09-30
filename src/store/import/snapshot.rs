@@ -25,7 +25,7 @@ pub fn sync_directory(path: &Path) -> Result<()> { File::open(path).map_err(io_e
 
 fn read_regular(path: &Path) -> Result<File> {
     // Linux O_NOFOLLOW. PodMesh's supported host/snapshot path is Linux.
-    let file = OpenOptions::new().read(true).custom_flags(0o400000).open(path).map_err(io_error)?;
+    let file = OpenOptions::new().read(true).custom_flags(0o400000 | 0o4000).open(path).map_err(io_error)?;
     let fd = file.metadata().map_err(io_error)?;
     let named = fs::symlink_metadata(path).map_err(io_error)?;
     if !fd.is_file() || !named.is_file() || fd.dev() != named.dev() || fd.ino() != named.ino() {
@@ -85,6 +85,22 @@ pub fn bundle_manifest(path: &Path, caps: &Caps) -> Result<Json> {
     Ok(Json::Object(result))
 }
 
+fn copy_bounded(input:&mut File,output:&mut File,expected:u64,boundary:&mut dyn FnMut()->Result<()>)->Result<()> {
+    let mut copied=0u64;let mut buffer=[0u8;65536];
+    loop {
+        boundary()?;
+        let remaining=expected.checked_sub(copied).ok_or_else(||refusal("source_file_drift"))?;
+        let count=std::cmp::min(buffer.len() as u64,remaining+1) as usize;
+        let n=input.read(&mut buffer[..count]).map_err(io_error)?;
+        boundary()?;
+        if n==0 {if copied!=expected{return Err(refusal("source_file_drift"));}break;}
+        copied=copied.checked_add(n as u64).ok_or_else(||refusal("resource_counter_overflow"))?;
+        if copied>expected{return Err(refusal("source_file_drift"));}
+        output.write_all(&buffer[..n]).map_err(io_error)?;boundary()?;
+    }
+    Ok(())
+}
+
 pub struct Snapshot {
     pub path: PathBuf,
     pub seal: Json,
@@ -97,6 +113,13 @@ pub fn capture(source: &Path, manifest: &Json, destination: &Path, caps: &Caps) 
 /// Campaign fault observer operates only on private clone/seal boundaries. The original
 /// remains descriptor-only; errors and external SIGKILL never trigger original cleanup.
 pub fn capture_observed(source:&Path,manifest:&Json,destination:&Path,caps:&Caps,event:&mut dyn FnMut(&str)->Result<()>)->Result<Snapshot> {
+    capture_controlled(source,manifest,destination,caps,event,&mut ||Ok(()))
+}
+
+/// D4 supplies its monotonic budget callback; byte/page ceilings also apply to offline calls.
+/// Checks surround each chunk/backup step, not an OS guarantee to cancel a hung syscall.
+pub fn capture_controlled(source:&Path,manifest:&Json,destination:&Path,caps:&Caps,event:&mut dyn FnMut(&str)->Result<()>,boundary:&mut dyn FnMut()->Result<()>)->Result<Snapshot> {
+    boundary()?;
     if manifest["synthetic_only"] != true || manifest["customer_data"] != false || manifest["real_keys_or_credentials"] != false
         || manifest["all_owners_and_maintenance_quiesced"] != true || manifest["generator"] != "podmesh-c02-synthetic/1"
         || manifest["source_path"].as_str() != source.to_str() {
@@ -104,7 +127,7 @@ pub fn capture_observed(source:&Path,manifest:&Json,destination:&Path,caps:&Caps
     }
     let lock_path=manifest["source_lock"].as_str().ok_or_else(|| refusal("source_lease_missing"))?;
     let lease=read_regular(Path::new(lock_path))?;
-    lease.lock_shared().map_err(io_error)?;
+    lease.try_lock_shared().map_err(|_|refusal("source_lease_contended_or_failed"))?;
     let mut files=bundle_files(source,caps)?;
     let mut before=serde_json::Map::new();
     for (role,file) in &mut files { before.insert(role.clone(),match file {Some(file)=>fingerprint(file)?,None=>Json::Null}); }
@@ -118,34 +141,47 @@ pub fn capture_observed(source:&Path,manifest:&Json,destination:&Path,caps:&Caps
             let mut out=create_file(&target)?;
             file.seek(SeekFrom::Start(0)).map_err(io_error)?;
             let expected=before[role.as_str()]["bytes"].as_u64().ok_or_else(|| refusal("source_bundle_manifest_mismatch"))?;
-            let copied=std::io::copy(&mut file.take(expected+1),&mut out).map_err(io_error)?;
-            if copied!=expected { return Err(refusal("source_file_drift")); }
-            out.sync_all().map_err(io_error)?;
+            copy_bounded(file,&mut out,expected,boundary)?;
+            boundary()?;out.sync_all().map_err(io_error)?;boundary()?;
         }
     }
     sync_directory(destination)?;
     if bundle_manifest(source,caps)? != Json::Object(before.clone()) { return Err(refusal("source_file_drift")); }
     event("after_source_bundle_clone")?;
     // First SQLite open: never the original path or its original companion files.
+    boundary()?;
     let clone=Connection::open_with_flags(&clone_path,OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(sqlite_error)?;
+    boundary()?;
     clone.execute_batch("BEGIN;").map_err(sqlite_error)?;
+    boundary()?;
     let integrity:String=clone.query_row("PRAGMA integrity_check",[],|r|r.get(0)).map_err(sqlite_error)?;
+    boundary()?;
     if integrity!="ok" { return Err(refusal("private_clone_integrity_failed")); }
     let snapshot_path=destination.join("snapshot.sqlite");
     create_file(&snapshot_path)?.sync_all().map_err(io_error)?;
     let mut snapshot=Connection::open_with_flags(&snapshot_path,OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(sqlite_error)?;
     {
+        boundary()?;
+        let pages:i64=clone.query_row("PRAGMA page_count",[],|r|r.get(0)).map_err(sqlite_error)?;
+        let page_size:i64=clone.query_row("PRAGMA page_size",[],|r|r.get(0)).map_err(sqlite_error)?;
+        if pages<0 || page_size<=0 || (pages as u64).checked_mul(page_size as u64).filter(|n|*n<=caps.snapshot).is_none(){return Err(refusal("source_limit_exceeded"));}
         let backup=Backup::new(&clone,&mut snapshot).map_err(sqlite_error)?;
-        loop {
-            match backup.step(128).map_err(sqlite_error)? {
-                StepResult::Done=>break,
-                StepResult::More=>{},
-                _=>return Err(refusal("private_backup_not_completed")),
-            }
-            if fs::metadata(&snapshot_path).map_err(io_error)?.len()>caps.snapshot { return Err(refusal("source_limit_exceeded")); }
+        let mut previous=pages+1;
+        for _ in 0..=(pages as u64/128+1) {
+            boundary()?;
+            let result=backup.step(128).map_err(sqlite_error)?;
+            boundary()?;
+            let progress=backup.progress();
+            if progress.pagecount as i64!=pages || progress.remaining<0 || progress.remaining as i64>=previous {return Err(refusal("private_backup_progress_not_bounded"));}
+            previous=progress.remaining as i64;
+            if fs::metadata(&snapshot_path).map_err(io_error)?.len()>caps.snapshot {return Err(refusal("source_limit_exceeded"));}
+            match result {StepResult::Done if progress.remaining==0=>break,StepResult::More if progress.remaining>0=>{},_=>return Err(refusal("private_backup_not_completed"))}
         }
+        if previous!=0{return Err(refusal("private_backup_step_bound_exceeded"));}
     }
+    boundary()?;
     let integrity:String=snapshot.query_row("PRAGMA integrity_check",[],|r|r.get(0)).map_err(sqlite_error)?;
+    boundary()?;
     if integrity!="ok" { return Err(refusal("private_snapshot_integrity_failed")); }
     drop(snapshot);drop(clone);
     let mut file=read_regular(&snapshot_path)?;
@@ -186,10 +222,20 @@ fn reject_sidecars(path: &Path) -> Result<()> {
 }
 
 pub fn open_sealed(path: &Path, seal: &Json) -> Result<SealedReader> {
-    open_sealed_checked(path,seal,||{})
+    open_sealed_controlled(path,seal,&mut ||Ok(()))
 }
 
-fn open_sealed_checked(path: &Path, seal: &Json, after_verify: impl FnOnce()) -> Result<SealedReader> {
+pub fn open_sealed_controlled(path:&Path,seal:&Json,boundary:&mut dyn FnMut()->Result<()>)->Result<SealedReader> {
+    open_sealed_checked_controlled(path,seal,||{},boundary)
+}
+
+#[cfg(test)]
+fn open_sealed_checked(path:&Path,seal:&Json,after_verify:impl FnOnce())->Result<SealedReader> {
+    open_sealed_checked_controlled(path,seal,after_verify,&mut ||Ok(()))
+}
+
+fn open_sealed_checked_controlled(path:&Path,seal:&Json,after_verify:impl FnOnce(),boundary:&mut dyn FnMut()->Result<()>)->Result<SealedReader> {
+    boundary()?;
     use std::sync::atomic::{AtomicU64,Ordering};
     static NEXT:AtomicU64=AtomicU64::new(0);
     if seal["format"] != "podmesh-c02-private-snapshot/1" || seal["snapshot_bytes"].as_u64().filter(|n| *n <= 33_554_432).is_none() { return Err(refusal("sealed_snapshot_mismatch")); }
@@ -208,7 +254,7 @@ fn open_sealed_checked(path: &Path, seal: &Json, after_verify: impl FnOnce()) ->
     let read_path=directory.join("read.sqlite");
     let mut out=create_file(&read_path)?;
     file.seek(SeekFrom::Start(0)).map_err(io_error)?;
-    if std::io::copy(&mut (&mut file).take(size+1),&mut out).map_err(io_error)?!=size {return Err(refusal("sealed_snapshot_mismatch"));}
+    copy_bounded(&mut file,&mut out,size,boundary)?;
     out.sync_all().map_err(io_error)?;
     fs::set_permissions(&read_path,fs::Permissions::from_mode(0o400)).map_err(io_error)?;
     let identity=fingerprint(&mut read_regular(&read_path)?)?;
@@ -223,10 +269,12 @@ fn open_sealed_checked(path: &Path, seal: &Json, after_verify: impl FnOnce()) ->
         if byte.is_ascii_alphanumeric() || matches!(byte,b'/'|b'_'|b'-'|b'.') {uri.push(*byte as char);} else {uri.push_str(&format!("%{byte:02X}"));}
     }
     uri.push_str("?mode=ro&immutable=1");
+    boundary()?;
     let db=Connection::open_with_flags(uri,OpenFlags::SQLITE_OPEN_READ_ONLY|OpenFlags::SQLITE_OPEN_URI|OpenFlags::SQLITE_OPEN_NOFOLLOW).map_err(sqlite_error)?;
     db.execute_batch("BEGIN;").map_err(sqlite_error)?;
     let current=fingerprint(&mut read_regular(&read_path)?)?;
     if current!=identity {return Err(refusal("private_reader_identity_changed"));}
+    boundary()?;
     Ok(SealedReader{db,identity,read_path})
 }
 
@@ -234,6 +282,52 @@ fn open_sealed_checked(path: &Path, seal: &Json, after_verify: impl FnOnce()) ->
 mod reader_tests {
     use super::*;
     use crate::store::import::fixture;
+
+    #[test]
+    fn bounded_chunk_copy_observes_budget_and_preserves_input() {
+        let root=std::env::temp_dir().join(format!("podmesh-chunk-budget-{}-{}",std::process::id(),crate::now()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let input=root.join("input");let output=root.join("partial");
+        create_file(&input).unwrap().write_all(&vec![42;131072]).unwrap();
+        let before=fingerprint(&mut read_regular(&input).unwrap()).unwrap();
+        let mut calls=0;let error=copy_bounded(&mut read_regular(&input).unwrap(),&mut create_file(&output).unwrap(),131072,&mut ||{calls+=1;if calls==4{Err(refusal("injected_campaign_budget"))}else{Ok(())}}).unwrap_err();
+        assert_eq!(error.message,"injected_campaign_budget");
+        assert_eq!(fs::metadata(&output).unwrap().len(),65536);
+        assert_eq!(fingerprint(&mut read_regular(&input).unwrap()).unwrap(),before);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn snapshot_budget_refuses_after_clone_before_sqlite_and_keeps_partial() {
+        let root=std::env::temp_dir().join(format!("podmesh-backup-budget-{}-{}",std::process::id(),crate::now()));
+        let manifest=fixture::create(&root).unwrap();let caps=fixture::development_caps().unwrap();
+        let cloned=std::cell::Cell::new(false);
+        let error=capture_controlled(&root.join("source.sqlite"),&manifest,&root.join("partial"),&caps,&mut |point|{if point=="after_source_bundle_clone"{cloned.set(true);}Ok(())},&mut ||{if cloned.get(){Err(refusal("injected_campaign_budget"))}else{Ok(())}}).err().unwrap();
+        assert_eq!(error.message,"injected_campaign_budget");
+        assert!(root.join("partial/clone.sqlite").exists());assert!(!root.join("partial/seal.json").exists());
+        assert_eq!(bundle_manifest(&root.join("source.sqlite"),&caps).unwrap(),manifest["bundle"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_budget_observes_backup_step_before_seal() {
+        let root=std::env::temp_dir().join(format!("podmesh-step-budget-{}-{}",std::process::id(),crate::now()));
+        let manifest=fixture::create(&root).unwrap();let caps=fixture::development_caps().unwrap();
+        let cloned=std::cell::Cell::new(false);let calls=std::cell::Cell::new(0);
+        let error=capture_controlled(&root.join("source.sqlite"),&manifest,&root.join("partial"),&caps,&mut |point|{if point=="after_source_bundle_clone"{cloned.set(true);}Ok(())},&mut ||{if cloned.get(){calls.set(calls.get()+1);if calls.get()==7{return Err(refusal("injected_backup_step_budget"));}}Ok(())}).err().unwrap();
+        assert_eq!(error.message,"injected_backup_step_budget");assert!(root.join("partial/snapshot.sqlite").exists());assert!(!root.join("partial/seal.json").exists());
+        assert_eq!(bundle_manifest(&root.join("source.sqlite"),&caps).unwrap(),manifest["bundle"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn descriptor_only_source_refuses_fifo_before_read_or_sqlite_open() {
+        let path=std::env::temp_dir().join(format!("podmesh-snapshot-fifo-{}-{}",std::process::id(),crate::now()));
+        assert!(std::process::Command::new("mkfifo").args(["-m","600"]).arg(&path).status().unwrap().success());
+        let named=path.clone();let (send,recv)=std::sync::mpsc::channel();
+        let worker=std::thread::spawn(move||{send.send(read_regular(&named).err().unwrap().message).unwrap();});
+        let result=recv.recv_timeout(std::time::Duration::from_secs(3));
+        if result.is_err(){let _rescue=OpenOptions::new().write(true).custom_flags(0o4000).open(&path);panic!("source FIFO blocked before descriptor regularity check");}
+        assert_eq!(result.unwrap(),"source_file_identity_mismatch");worker.join().unwrap();fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn sealed_sidecars_and_post_verify_replacement_refuse() {

@@ -145,6 +145,17 @@ mod tests {
     }
 
     #[test]
+    fn contended_source_lease_refuses_before_clone_and_preserves_source() {
+        let root=std::env::temp_dir().join(format!("podmesh-c02-source-lock-{}-{}",std::process::id(),crate::now()));
+        let manifest=create(&root).unwrap();let source_path=root.join("source.sqlite");let caps=development_caps().unwrap();
+        let owner=std::fs::File::open(root.join("source.lock")).unwrap();owner.try_lock().unwrap();
+        let destination=root.join("never-created");
+        assert_eq!(snapshot::capture(&source_path,&manifest,&destination,&caps).err().unwrap().message,"source_lease_contended_or_failed");
+        assert!(!destination.exists());assert_eq!(snapshot::bundle_manifest(&source_path,&caps).unwrap(),manifest["bundle"]);
+        drop(owner);fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn unsupported_key_width_exhaustion_and_secret_material_refuse_before_copy() {
         let root=std::env::temp_dir().join(format!("podmesh-c02-domain-{}-{}",std::process::id(),crate::now()));
         create(&root).unwrap();let path=root.join("source.sqlite");let caps=development_caps().unwrap();

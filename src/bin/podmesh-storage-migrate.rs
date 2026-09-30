@@ -148,12 +148,13 @@ fn run() -> Result<Json> {
                 &["copy", "copy_resume", "capability"],
             )?;
             podmesh::store::import::contract::check_binary_pin(&contract.json)?;
-            let captured = snapshot::capture_observed(
+            let captured = snapshot::capture_controlled(
                 &contract.source_path,
                 &contract.source,
                 required(&paths, "--output")?,
                 &contract.caps,
                 &mut |point| contract.event(point),
+                &mut || contract.clock_boundary(),
             )?;
             contract.boundary()?;
             Ok(

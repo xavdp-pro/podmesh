@@ -47,7 +47,7 @@ mod tests {
             db.execute_batch(create).unwrap();
             let before = db.tables().unwrap();
             assert!(migrations::apply(&mut db).unwrap_err().message.contains("import_non_serving"));
-            assert!(migrations::apply_set(&mut db, migrations::NODE, &migrations::NODE_MIGRATIONS).is_err());
+            assert!(migrations::apply_set(&mut db, migrations::NODE, migrations::NODE_MIGRATIONS).is_err());
             assert!(ensure_schema_table(&mut db).is_err());
             assert!(bootstrap(&mut db, "node", 11).is_err());
             assert_eq!(db.tables().unwrap(), before);

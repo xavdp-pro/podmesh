@@ -66,12 +66,16 @@ fn digest(value: &Json) -> Result<String> {
         &serde_json::to_vec(value).map_err(|_| refusal("canonical_contract_json_failed"))?,
     ))
 }
-fn prerequisite_provenance(receipt: &Json, contract: &Json) -> Result<()> {
+fn prerequisite_provenance(receipt: &Json, contract: &Json, plan_sha: &str) -> Result<()> {
     for key in [
         "source_commit",
         "binary_sha256",
         "source_manifest_sha256",
         "SQL_hashes",
+        "migration_id",
+        "resource_caps",
+        "canonical_contract_sha256",
+        "resource_caps_contract_sha256",
     ] {
         if receipt[key] != contract[key] || receipt[key].is_null() {
             return Err(refusal(
@@ -79,7 +83,55 @@ fn prerequisite_provenance(receipt: &Json, contract: &Json) -> Result<()> {
             ));
         }
     }
+    if receipt["plan_sha256"] != plan_sha {
+        return Err(refusal("prerequisite_exact_plan_mismatch"));
+    }
     Ok(())
+}
+
+fn plan_binding(contract: &Contract, plan: &Plan, seal: &Json) -> Result<(String,String,String)> {
+    let source_schema_hex = canonical::row(&plan.source_schema)?
+        .iter().map(|b|format!("{b:02x}")).collect::<String>();
+    let snapshot_sha = contract::text(seal,"snapshot_sha256")?.to_owned();
+    let plan_sha=digest(&json!({"tables":plan.tables.iter().map(Table::manifest).collect::<Vec<_>>(),"shape":plan.shape_hash,"snapshot":snapshot_sha,"source_schema_hex":source_schema_hex,"source_manifest":contract.source_sha256,"caps":contract.json["resource_caps"],"canonical":contract::CANONICAL_SHA,"SQL":sql_hashes()}))?;
+    Ok((source_schema_hex,snapshot_sha,plan_sha))
+}
+
+fn validate_dump_restore_link(receipt:&Json,contract:&Json,origin:&Json,source:&Json,target:&Json)->Result<()> {
+    if receipt["format"]!="podmesh-A-synthetic-dump-restore/1" || receipt["status"]!="DUMP_RESTORED_TYPED_VERIFICATION_PENDING"
+        || receipt["serving"]!=false || receipt["identity_rebound"]!=false || receipt["typed_verification_proven"]!=false {
+        return Err(refusal("admin_dump_receipt_status_or_flags_refused"));
+    }
+    if receipt["origin_receipt"]!=contract["restore_origin_receipt"] || receipt["origin_receipt"].is_null()
+        || receipt["helper_sha256"]!=contract["dump_restore_helper_sha256"] || receipt["helper_sha256"].is_null()
+        || receipt["restored_database"]!=contract["database"] || source["database"]!=origin["database"] {
+        return Err(refusal("admin_dump_origin_helper_or_database_mismatch"));
+    }
+    for key in ["container_id","volume_name","image_id"] {
+        if source[key].is_null() || target[key].is_null() || source[key]!=origin["target_resource_identity"][key] || target[key]!=contract["target_resource_identity"][key] {
+            return Err(refusal("admin_dump_resource_identity_mismatch"));
+        }
+    }
+    if source["container_id"]==target["container_id"] || source["volume_name"]==target["volume_name"] || origin["database"]==contract["database"] {
+        return Err(refusal("admin_dump_distinct_resource_required"));
+    }
+    Ok(())
+}
+fn validate_dump_hash(receipt:&Json,actual:&str)->Result<()> {
+    if actual!=contract::text(receipt,"dump_sha256")?{return Err(refusal("admin_dump_actual_bytes_checksum_mismatch"));}
+    Ok(())
+}
+fn checked_dump_restore(contract:&Contract,origin:&Json)->Result<Json> {
+    let spec=&contract.json["dump_restore_receipt"];
+    let receipt=contract::pinned_json(spec)?;
+    let source=contract::pinned_json(&receipt["source_resource"])?;
+    let target=contract::pinned_json(&receipt["target_resource"])?;
+    validate_dump_restore_link(&receipt,&contract.json,origin,&source,&target)?;
+    let bytes=contract::number(&receipt,"dump_bytes")?;
+    let path=Path::new(contract::text(spec,"path")?).parent().ok_or_else(||refusal("admin_dump_parent_missing"))?.join("database.sql");
+    let sha=contract::hash_private_stream(&path,bytes,67_108_864,&mut ||contract.clock_boundary())?;
+    validate_dump_hash(&receipt,&sha)?;
+    Ok(receipt)
 }
 
 fn warnings(db: &mut dyn DurableStore) -> Result<()> {
@@ -194,7 +246,7 @@ fn checked_settings(rows: Vec<Row>, config: &Contract) -> Result<Json> {
         || row.integer(9)? != 1
         || row.text(10)? != contract::text(&config.json, "database_charset")?
         || row.text(11)? != contract::text(&config.json, "database_collation")?
-        || row.text(14)?.to_ascii_lowercase() != "dynamic"
+        || !row.text(14)?.eq_ignore_ascii_case("dynamic")
         || row.integer(15)? != 1
         || row.integer(16)? != 1
     {
@@ -451,14 +503,7 @@ impl<'a> ImportContext<'a> {
         if contract.json["SQL_hashes"] != sql_hashes() {
             return Err(refusal("fixture_sql_source_pins_mismatch"));
         }
-        let source_schema_hex = canonical::row(&plan.source_schema)?
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
-        let snapshot_sha = contract::text(seal, "snapshot_sha256")?.to_owned();
-        let plan_sha = digest(
-            &json!({"tables":plan.tables.iter().map(Table::manifest).collect::<Vec<_>>(),"shape":plan.shape_hash,"snapshot":snapshot_sha,"source_schema_hex":source_schema_hex,"source_manifest":contract.source_sha256,"caps":contract.json["resource_caps"],"canonical":contract::CANONICAL_SHA,"SQL":sql_hashes()}),
-        )?;
+        let (source_schema_hex,snapshot_sha,plan_sha)=plan_binding(contract,plan,seal)?;
         let identity_sha = contract.target_identity()?;
         contract.boundary()?;
         let db = configure(contract)?;
@@ -539,7 +584,7 @@ impl<'a> ImportContext<'a> {
         }
         self.contract
             .event(&format!("after_each_node_DDL:{}", index + 1))?;
-        if sql.starts_with("ALTER TABLE") {
+        if crate::store::sql::without_leading_comments(sql).starts_with("ALTER TABLE") {
             self.contract
                 .event(&format!("after_each_successor_ALTER:{}", index + 1))?;
         }
@@ -868,7 +913,7 @@ pub fn protocol() -> Result<Json> {
     ];
     for (index, sql) in statements.iter().enumerate() {
         killpoints.push(format!("after_each_node_DDL:{}", index + 1));
-        if sql.starts_with("ALTER TABLE") {
+        if crate::store::sql::without_leading_comments(sql).starts_with("ALTER TABLE") {
             killpoints.push(format!("after_each_successor_ALTER:{}", index + 1));
         }
         if sql.starts_with("INSERT INTO store_schema") {
@@ -890,7 +935,7 @@ pub fn protocol() -> Result<Json> {
         }
     }
     Ok(
-        json!({"format":"podmesh-c02-protocol/1","status":"SOURCE_PROTOCOL_ONLY_NO_SERVER_PROOF","source_version":10,"target_version":11,"node_tables":migrations::node_tables()?,"SQL_hashes":sql_hashes(),"DDL_steps":statements.len(),"schema_stage_count":statements.len()+1,"killpoints":killpoints,"canonical_contract_sha256":contract::CANONICAL_SHA,"resource_caps_contract_sha256":contract::CAPS_SHA,"required_contract_fields":["schema","status","server_execution_authorized","role","dsn","database","server_version","current_user","migration_id","writer_lock","source_manifest_path","source_manifest_sha256","resource_caps","resource_caps_contract_sha256","canonical_contract_sha256","SQL_hashes","source_commit","binary_sha256","target_resource_identity","connect_timeout_ms","lock_wait_timeout_seconds","statement_timeout_ms","maximum_campaign_seconds","session_sql_mode","database_charset","database_collation","admission_probe_directory_for_capability"],"roles":{"capability":"fresh empty target; marker-first candidate schema capacity, all38typed roundtrip and fullindex probes","seeded_restore":"read-only owning-store synthetic restoration before copy; capability receipt and restore_origin_receipt required","copy":"fresh empty DB; capability+seeded_restore receipts required before DDL","copy_resume":"known partial/full schema bound to same plan/source/resource; COMPLETE stays non-serving","restored_copy":"read-only postcopy restore; new A resource identity; capability+copy origin receipt; no identity rebind","negative_gate":"A isolated durability-negative fixture only; C never changes GLOBAL"},"limits":"Synthetic bounded domains only. Negative IDs copied but auto-ID continuation, unknown/deleted highwater and exhaustion remain C03 limitations; real keys/authority remain outside portable store.","serving":false}),
+        json!({"format":"podmesh-c02-protocol/1","status":"SOURCE_PROTOCOL_ONLY_NO_SERVER_PROOF","source_version":10,"target_version":11,"node_tables":migrations::node_tables()?,"SQL_hashes":sql_hashes(),"DDL_steps":statements.len(),"schema_stage_count":statements.len()+1,"killpoints":killpoints,"canonical_contract_sha256":contract::CANONICAL_SHA,"resource_caps_contract_sha256":contract::CAPS_SHA,"required_contract_fields":["schema","status","server_execution_authorized","role","dsn","database","server_version","current_user","migration_id","writer_lock","source_manifest_path","source_manifest_sha256","resource_caps","resource_caps_contract_sha256","canonical_contract_sha256","SQL_hashes","source_commit","binary_sha256","target_resource_identity","connect_timeout_ms","lock_wait_timeout_seconds","statement_timeout_ms","maximum_campaign_seconds","session_sql_mode","database_charset","database_collation"],"target_resource_identity_required_fields":["container_id","volume_name","image_id"],"migration_id_scope":"campaign-global capability/copy/seeded-restore/postcopy-restore; distinct resource identity per target; never identity rebind/adoption","control_file_modes":["0600","0400"],"conditional_contract_fields":{"capability":["admission_probe_directory"],"copy":["capability_receipt","seeded_restore_receipt"],"copy_resume":["capability_receipt","seeded_restore_receipt"],"seeded_restore":["capability_receipt","restore_origin_receipt","dump_restore_receipt","dump_restore_helper_sha256"],"restored_copy":["capability_receipt","restore_origin_receipt","dump_restore_receipt","dump_restore_helper_sha256"],"killpoint":["killpoint","kill_event_path"]},"roles":{"capability":"fresh empty target; marker-first candidate schema capacity, all38typed roundtrip and fullindex probes","seeded_restore":"read-only owning-store synthetic restoration before copy; capability receipt and restore_origin_receipt required","copy":"fresh empty DB; capability+seeded_restore receipts required before DDL","copy_resume":"known partial/full schema bound to same plan/source/resource; COMPLETE stays non-serving","restored_copy":"read-only postcopy restore; new A resource identity; capability+copy origin receipt; no identity rebind","negative_gate":"A isolated durability-negative fixture only; C never changes GLOBAL"},"limits":"Synthetic bounded domains only. Negative IDs copied but auto-ID continuation, unknown/deleted highwater and exhaustion remain C03 limitations; real keys/authority remain outside portable store.","serving":false}),
     )
 }
 
@@ -920,7 +965,7 @@ pub fn run(mode: &str, request: &Request<'_>) -> Result<Json> {
         .as_u64()
         .ok_or_else(|| refusal("snapshot_size_missing"))?;
     contract.caps.check(size, 0, 0, 0)?;
-    let reader = snapshot::open_sealed(request.snapshot_path, &seal)?;
+    let reader = snapshot::open_sealed_controlled(request.snapshot_path, &seal, &mut ||contract.clock_boundary())?;
     let plan = source::inspect(&reader, &contract.caps, size)?;
     if json!(plan.tables.iter().map(Table::manifest).collect::<Vec<_>>())
         != contract.source["tables"]
@@ -928,6 +973,8 @@ pub fn run(mode: &str, request: &Request<'_>) -> Result<Json> {
     {
         return Err(refusal("synthetic_source_manifest_mismatch"));
     }
+    let (_,_,expected_plan_sha)=plan_binding(&contract,&plan,&seal)?;
+    // A campaign-global migration ID binds capability/copy/restore; resource IDs differ.
     // Validate prerequisite receipts BEFORE opening the target or any target DDL.
     let capability = if mode == "capability" {
         None
@@ -940,7 +987,7 @@ pub fn run(mode: &str, request: &Request<'_>) -> Result<Json> {
         None
     };
     if let Some(cap) = &capability {
-        prerequisite_provenance(cap, &contract.json)?;
+        prerequisite_provenance(cap, &contract.json, &expected_plan_sha)?;
         if cap["SQL_hashes"] != sql_hashes()
             || cap["source_manifest_sha256"] != contract.source_sha256
             || cap["tables"] != contract.source["tables"]
@@ -949,7 +996,7 @@ pub fn run(mode: &str, request: &Request<'_>) -> Result<Json> {
         }
     }
     if let Some(restore) = &seeded {
-        prerequisite_provenance(restore, &contract.json)?;
+        prerequisite_provenance(restore, &contract.json, &expected_plan_sha)?;
         if restore["tables"] != contract.source["tables"]
             || restore["SQL_hashes"] != sql_hashes()
             || restore["restoration_kind"] != "seeded_restore"
@@ -966,7 +1013,7 @@ pub fn run(mode: &str, request: &Request<'_>) -> Result<Json> {
                 "podmesh-c02-copy/1"
             },
         )?;
-        prerequisite_provenance(&origin, &contract.json)?;
+        prerequisite_provenance(&origin, &contract.json, &expected_plan_sha)?;
         if origin["migration_id"] != contract.json["migration_id"] {
             return Err(refusal("restoration_origin_migration_id_mismatch"));
         }
@@ -974,6 +1021,7 @@ pub fn run(mode: &str, request: &Request<'_>) -> Result<Json> {
     } else {
         None
     };
+    let dump_restore = origin_receipt.as_ref().map(|origin|checked_dump_restore(&contract,origin)).transpose()?;
     let mut report_file = snapshot::create_file(request.output)?;
     use std::io::{Seek, SeekFrom, Write};
     report_file
@@ -1024,7 +1072,7 @@ pub fn run(mode: &str, request: &Request<'_>) -> Result<Json> {
             || origin["plan_sha256"] != ctx.plan_sha
             || origin["target_resource_identity"] == contract.json["target_resource_identity"]
             || origin["database"] == contract.json["database"]
-            || state[0].text(6)? != contract::text(&origin, "target_identity_sha256")?
+            || state[0].text(6)? != contract::text(origin, "target_identity_sha256")?
         {
             return Err(refusal(
                 "restoration_lineage_new_resource_or_complete_mismatch",
@@ -1064,6 +1112,9 @@ pub fn run(mode: &str, request: &Request<'_>) -> Result<Json> {
     for (k, v) in [
         ("SQL_hashes", sql_hashes()),
         ("migration_id", contract.json["migration_id"].clone()),
+        ("resource_caps", contract.json["resource_caps"].clone()),
+        ("canonical_contract_sha256", json!(contract::CANONICAL_SHA)),
+        ("resource_caps_contract_sha256", json!(contract::CAPS_SHA)),
         ("source_manifest_sha256", json!(contract.source_sha256)),
         ("source_commit", contract.json["source_commit"].clone()),
         ("binary_sha256", contract.json["binary_sha256"].clone()),
@@ -1081,6 +1132,12 @@ pub fn run(mode: &str, request: &Request<'_>) -> Result<Json> {
         ("serving", json!(false)),
     ] {
         report.insert(k.into(), v);
+    }
+    if let Some(admin)=dump_restore {
+        report.insert("dump_restore_receipt".into(),contract.json["dump_restore_receipt"].clone());
+        report.insert("dump_restore_helper_sha256".into(),contract.json["dump_restore_helper_sha256"].clone());
+        report.insert("admin_dump_sha256".into(),admin["dump_sha256"].clone());
+        report.insert("admin_status".into(),admin["status"].clone());
     }
     let report = json!(report);
     report_file
@@ -1223,6 +1280,26 @@ mod tests {
         assert!(steps[2].contains("CREATE TABLE IF NOT EXISTS store_schema"));
         assert!(steps.last().unwrap().contains("VALUES('node',11,0)"));
         assert_eq!(sql_hashes().as_object().unwrap().len(), 24);
+        let manifest = protocol().unwrap();
+        let points = manifest["killpoints"].as_array().unwrap();
+        assert_eq!(
+            points
+                .iter()
+                .filter(|p| p
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("after_each_successor_ALTER:")))
+                .count(),
+            38
+        );
+        assert_eq!(
+            manifest["conditional_contract_fields"]["capability"],
+            json!(["admission_probe_directory"])
+        );
+        assert!(!manifest["required_contract_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "admission_probe_directory_for_capability"));
         assert_eq!(
             steps
                 .iter()
@@ -1232,21 +1309,60 @@ mod tests {
         );
     }
     #[test]
+    fn protocol_fields_construct_a_valid_contract_without_any_connect() {
+        let manifest=protocol().unwrap();
+        let mut candidate=serde_json::Map::new();
+        for key in manifest["required_contract_fields"].as_array().unwrap() {candidate.insert(key.as_str().unwrap().to_owned(),json!("synthetic-placeholder"));}
+        for (key,value) in [
+            ("schema",json!("podmesh-c02-fixture/1")),("status",json!("ready")),("server_execution_authorized",json!(true)),("role",json!("capability")),("migration_id",json!("campaign-global")),
+            ("canonical_contract_sha256",json!(contract::CANONICAL_SHA)),("resource_caps_contract_sha256",json!(contract::CAPS_SHA)),
+            ("source_manifest_sha256",json!("c".repeat(64))),("binary_sha256",json!("b".repeat(64))),("source_commit",json!("a".repeat(40))),
+            ("target_resource_identity",json!({"container_id":"synthetic-container","volume_name":"synthetic-volume","image_id":"synthetic-image"})),
+            ("resource_caps",serde_json::from_str(include_str!("../../../fixtures/C/copy-v1/resource-caps.json")).unwrap())
+        ] {candidate.insert(key.to_owned(),value);}
+        for key in ["connect_timeout_ms","lock_wait_timeout_seconds","statement_timeout_ms","maximum_campaign_seconds"] {candidate.insert(key.to_owned(),json!(1));}
+        let mut candidate=json!(candidate);
+        assert!(Contract::validate(&candidate,&["capability"]).is_err());
+        for key in manifest["conditional_contract_fields"]["capability"].as_array().unwrap(){candidate[key.as_str().unwrap()]=json!("/synthetic-private-probe");}
+        Contract::validate(&candidate,&["capability"]).unwrap();
+        let mut restore=candidate.clone();restore["role"]=json!("seeded_restore");
+        for key in ["dump_restore_receipt","dump_restore_helper_sha256"] {assert!(Contract::validate(&restore,&["seeded_restore"]).is_err());restore[key]=if key=="dump_restore_receipt"{json!({"path":"/private-admin","sha256":"d".repeat(64)})}else{json!("e".repeat(64))};}
+        Contract::validate(&restore,&["seeded_restore"]).unwrap();
+        for key in manifest["target_resource_identity_required_fields"].as_array().unwrap(){let mut missing=candidate.clone();missing["target_resource_identity"][key.as_str().unwrap()]=Json::Null;assert!(Contract::validate(&missing,&["capability"]).is_err());}
+    }
+    #[test]
     fn prerequisite_source_binary_input_or_sql_drift_is_refused() {
-        let contract = json!({"source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","source_manifest_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","SQL_hashes":sql_hashes()});
-        prerequisite_provenance(&contract, &contract).unwrap();
-        for key in [
-            "source_commit",
-            "binary_sha256",
-            "source_manifest_sha256",
-            "SQL_hashes",
-        ] {
-            let mut changed = contract.clone();
-            changed[key] = Json::Null;
-            assert!(prerequisite_provenance(&changed, &contract)
-                .unwrap_err()
-                .message
-                .contains("exact_source_binary_or_input"));
+        let contract = json!({"source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","source_manifest_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","SQL_hashes":sql_hashes(),"migration_id":"campaign-global","resource_caps":{"snapshot":123},"canonical_contract_sha256":contract::CANONICAL_SHA,"resource_caps_contract_sha256":contract::CAPS_SHA,"plan_sha256":"expected-plan"});
+        prerequisite_provenance(&contract,&contract,"expected-plan").unwrap();
+        for key in ["source_commit","binary_sha256","source_manifest_sha256","SQL_hashes","migration_id","resource_caps","canonical_contract_sha256","resource_caps_contract_sha256"] {
+            for replacement in [Json::Null,json!("swapped")] {
+                let mut changed=contract.clone();changed[key]=replacement;
+                assert!(prerequisite_provenance(&changed,&contract,"expected-plan").unwrap_err().message.contains("exact_source_binary_or_input"));
+            }
+        }
+        for replacement in [Json::Null,json!("other-plan")] {
+            let mut changed=contract.clone();changed["plan_sha256"]=replacement;
+            assert_eq!(prerequisite_provenance(&changed,&contract,"expected-plan").unwrap_err().message,"prerequisite_exact_plan_mismatch");
+        }
+    }
+    #[test]
+    fn admin_dump_lineage_swaps_refuse_before_any_connect() {
+        let source=json!({"database":"origin-db","container_id":"source-container","volume_name":"source-volume","image_id":"image"});
+        let target=json!({"database":"default-unused","container_id":"target-container","volume_name":"target-volume","image_id":"image"});
+        let spec=json!({"path":"private-origin","sha256":"pinned-origin"});
+        let contract=json!({"database":"restored-db","restore_origin_receipt":spec,"dump_restore_helper_sha256":"pinned-helper","target_resource_identity":target});
+        let origin=json!({"database":"origin-db","target_resource_identity":source});
+        let receipt=json!({"format":"podmesh-A-synthetic-dump-restore/1","status":"DUMP_RESTORED_TYPED_VERIFICATION_PENDING","serving":false,"identity_rebound":false,"typed_verification_proven":false,"origin_receipt":spec,"helper_sha256":"pinned-helper","restored_database":"restored-db"});
+        validate_dump_restore_link(&receipt,&contract,&origin,&source,&target).unwrap();
+        validate_dump_hash(&json!({"dump_sha256":"actual"}),"actual").unwrap();
+        assert_eq!(validate_dump_hash(&json!({"dump_sha256":"swapped"}),"actual").unwrap_err().message,"admin_dump_actual_bytes_checksum_mismatch");
+        assert!(validate_dump_hash(&json!({}),"actual").is_err());
+        for key in ["format","status","serving","identity_rebound","typed_verification_proven","origin_receipt","helper_sha256","restored_database"] {
+            for bad in [Json::Null,json!("swapped")] {let mut changed=receipt.clone();changed[key]=bad;assert!(validate_dump_restore_link(&changed,&contract,&origin,&source,&target).is_err());}
+        }
+        for key in ["container_id","volume_name","image_id"] {
+            let mut changed=target.clone();changed[key]=json!("swapped");assert!(validate_dump_restore_link(&receipt,&contract,&origin,&source,&changed).is_err());
+            let mut changed=source.clone();changed[key]=Json::Null;assert!(validate_dump_restore_link(&receipt,&contract,&origin,&changed,&target).is_err());
         }
     }
     #[test]
