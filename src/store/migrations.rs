@@ -125,6 +125,8 @@ pub fn apply(store: &mut dyn DurableStore) -> Result<Applied> {
 /// A store recorded at a version this build does not have is **refused**, not downgraded: the
 /// package was rolled back under a journal a later one wrote, and the later shape is the truth.
 pub fn apply_set(store: &mut dyn DurableStore, schema: &'static str, set: &'static [Migration]) -> Result<Applied> {
+    // Validate both dialect inventories and the complete batch grammar before any DDL.
+    checked_table_inventory(set)?;
     let engine = store.engine();
     let latest = set.len() as i64;
     super::ensure_schema_table(store)?;
@@ -150,92 +152,53 @@ pub fn apply_set(store: &mut dyn DurableStore, schema: &'static str, set: &'stat
     Ok(Applied { schema, from, to: latest, ran })
 }
 
-/// Every table the node's schema carries, in the order the set creates them. This is the list the
-/// storage inventory names, and what a caller checks a store against without reading a catalog.
-pub fn node_tables() -> Vec<&'static str> {
+/// Every node table in creation order, after validating both dialects and their batch grammar.
+/// A missing, additional, renamed or duplicate table refuses instead of producing a partial list.
+pub fn node_tables() -> Result<Vec<&'static str>> {
+    checked_table_inventory(NODE_MIGRATIONS)
+}
+
+fn table_inventory(set: &[Migration], engine: Engine) -> Result<Vec<&'static str>> {
     let mut tables = Vec::new();
-    for migration in NODE_MIGRATIONS {
-        for statement in sql_statements(migration.sql(Engine::Sqlite)) {
-            if let Some(name) = created_table(statement) {
+    for migration in set {
+        for statement in super::sql::statements(migration.sql(engine))? {
+            if let Some(name) = created_table(statement)? {
+                if tables.contains(&name) {
+                    return Err(Fault::Schema.error("a store table is declared more than once in its migration set"));
+                }
                 tables.push(name);
             }
         }
     }
-    tables
+    Ok(tables)
 }
 
-/// The table a `CREATE TABLE IF NOT EXISTS <name>(` statement creates, or none for anything else.
-/// The migration files are this crate's own text, included at compile time, so the shape is known.
-/// A leading `--` comment is skipped: the first table of each file is introduced that way.
-fn created_table(statement: &'static str) -> Option<&'static str> {
-    let mut words = strip_leading_line_comments(statement).split_whitespace();
-    for want in ["CREATE", "TABLE", "IF", "NOT", "EXISTS"] {
+fn checked_table_inventory(set: &[Migration]) -> Result<Vec<&'static str>> {
+    let sqlite = table_inventory(set, Engine::Sqlite)?;
+    let mariadb = table_inventory(set, Engine::Mariadb)?;
+    if sqlite != mariadb {
+        return Err(Fault::Schema.error("SQLite and MariaDB migration table inventories differ"));
+    }
+    Ok(sqlite)
+}
+
+/// The table created by the controlled CREATE TABLE IF NOT EXISTS grammar in this set.
+fn created_table(statement: &'static str) -> Result<Option<&'static str>> {
+    let mut words = super::sql::without_leading_comments(statement).split_whitespace();
+    if !words.next().is_some_and(|word| word.eq_ignore_ascii_case("CREATE"))
+        || !words.next().is_some_and(|word| word.eq_ignore_ascii_case("TABLE")) {
+        return Ok(None);
+    }
+    for want in ["IF", "NOT", "EXISTS"] {
         if !words.next().is_some_and(|word| word.eq_ignore_ascii_case(want)) {
-            return None;
+            return Err(Fault::Schema.error("store migration tables require CREATE TABLE IF NOT EXISTS"));
         }
     }
-    words.next()?.split('(').next()
-}
-
-fn strip_leading_line_comments(statement: &str) -> &str {
-    let mut rest = statement.trim_start();
-    while let Some(body) = rest.strip_prefix("--") {
-        rest = match body.find('\n') {
-            Some(end) => body[end + 1..].trim_start(),
-            None => "",
-        };
+    let name = words.next().unwrap_or_default().split('(').next().unwrap_or_default();
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(Fault::Schema.error("store migration table names must be plain identifiers"));
     }
-    rest
-}
-
-/// Split on statement-ending semicolons, not on the ones inside a `--` line comment or a quote.
-/// Inventory comments name two tables in one sentence; a naive `split(';')` cuts the `CREATE` away.
-fn sql_statements(sql: &str) -> Vec<&str> {
-    let mut statements = Vec::new();
-    let mut start = 0;
-    let bytes = sql.as_bytes();
-    let mut index = 0;
-    let mut quote: Option<u8> = None;
-    let mut comment = false;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if comment {
-            if byte == b'\n' {
-                comment = false;
-            }
-            index += 1;
-            continue;
-        }
-        if let Some(open) = quote {
-            if byte == b'\\' {
-                index += 2;
-                continue;
-            }
-            if byte == open {
-                quote = None;
-            }
-            index += 1;
-            continue;
-        }
-        match byte {
-            b'\'' | b'"' | b'`' => quote = Some(byte),
-            b'-' if bytes.get(index + 1) == Some(&b'-') => {
-                comment = true;
-                index += 2;
-                continue;
-            }
-            b';' => {
-                statements.push(&sql[start..index]);
-                start = index + 1;
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    if start < sql.len() {
-        statements.push(&sql[start..]);
-    }
-    statements
+    Ok(Some(name))
 }
 
 #[cfg(test)]
@@ -337,11 +300,24 @@ mod tests {
         assert_eq!(ids, ordered, "migrations are applied in the order of their names");
         assert_eq!(ids.len(), node_version() as usize);
 
-        let mut tables = node_tables();
+        let mut tables = node_tables().unwrap();
         tables.sort_unstable();
         let unique: std::collections::BTreeSet<&str> = tables.iter().copied().collect();
         assert_eq!(unique.len(), tables.len(), "a table is created by one migration only");
         assert_eq!(tables, INVENTORY, "the set carries the inventory's production tables");
+    }
+
+    #[test]
+    fn divergent_dialect_inventory_is_refused_before_any_schema_is_written() {
+        static MISSING: &[Migration] = &[Migration::split("0001-test", "CREATE TABLE IF NOT EXISTS held(id INTEGER);", "SELECT 1;")];
+        static EXTRA: &[Migration] = &[Migration::split("0001-test", "CREATE TABLE IF NOT EXISTS held(id INTEGER);", "CREATE TABLE IF NOT EXISTS held(id BIGINT); CREATE TABLE IF NOT EXISTS extra(id BIGINT);")];
+        static DUPLICATE: &[Migration] = &[Migration::portable("0001-test", "CREATE TABLE IF NOT EXISTS held(id INTEGER); CREATE TABLE IF NOT EXISTS held(id INTEGER);")];
+        static COMMENT: &[Migration] = &[Migration::portable("0001-test", "CREATE TABLE IF NOT EXISTS held(id INTEGER); /* hidden; statement */")];
+        for set in [MISSING, EXTRA, DUPLICATE, COMMENT] {
+            let mut store = memory();
+            assert_eq!(apply_set(&mut store, "test", set).unwrap_err().fault, Fault::Schema);
+            assert!(store.tables().unwrap().is_empty(), "validation must precede bootstrap/DDL");
+        }
     }
 
     #[test]

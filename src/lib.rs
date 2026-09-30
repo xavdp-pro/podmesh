@@ -27,7 +27,7 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -50,12 +50,21 @@ pub const STORE_PROFILE_ENVIRONMENT: &str = "PODMESH_STORE_PROFILE";
 /// behaviour is unchanged. A profile that cannot be read is never replaced by the default: an
 /// operator who wrote one is asking for it.
 pub fn store_profile(dir: &Path) -> Result<StoreConfig, Box<dyn std::error::Error>> {
-    let path = match std::env::var_os(STORE_PROFILE_ENVIRONMENT) {
-        Some(named) => PathBuf::from(named),
+    let named = std::env::var_os(STORE_PROFILE_ENVIRONMENT);
+    read_store_profile(dir, named.as_deref().map(Path::new))
+}
+
+fn read_store_profile(dir: &Path, named: Option<&Path>) -> Result<StoreConfig, Box<dyn std::error::Error>> {
+    let path = match named {
+        Some(named) => named.to_path_buf(),
         None => {
             let beside = dir.join(STORE_PROFILE_FILE);
-            if !beside.exists() {
-                return Ok(StoreConfig::for_state_dir(dir));
+            match fs::symlink_metadata(&beside) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(StoreConfig::for_state_dir(dir));
+                }
+                Err(error) => return Err(format!("The store profile {} could not be inspected: {error}", beside.display()).into()),
+                Ok(_) => {}
             }
             beside
         }
@@ -63,7 +72,7 @@ pub fn store_profile(dir: &Path) -> Result<StoreConfig, Box<dyn std::error::Erro
     let text = fs::read_to_string(&path).map_err(|e| format!("The store profile {} could not be read: {e}", path.display()))?;
     let document: Value =
         serde_json::from_str(&text).map_err(|e| format!("The store profile {} is not JSON: {e}", path.display()))?;
-    Ok(StoreConfig::from_json(&document, Some(dir))?)
+    Ok(StoreConfig::from_profile_json(&document, Some(dir))?)
 }
 
 /// A node's journal, open, as whichever engine its profile named.
@@ -130,8 +139,8 @@ impl NodeStore {
 /// migrations in `src/store/migrations/node/` are applied in order, and the store records which
 /// of them it has. An incomplete MariaDB profile is refused before anything is opened.
 pub fn open_node_store(dir: &Path, config: &StoreConfig) -> Result<NodeStore, Box<dyn std::error::Error>> {
-    fs::create_dir_all(dir)?;
     config.validate()?;
+    fs::create_dir_all(dir)?;
     let opened = match config.engine {
         Engine::Sqlite => {
             let mut store = SqliteStore::open(&config.sqlite)?;
@@ -326,7 +335,9 @@ fn durable_capabilities(engine: Engine) -> Value {
 /// contract reads. Module-owned status operations remain on the named refusal path with their
 /// module until that module is ported as a whole.
 fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
-    let operation = request.get("operation").and_then(Value::as_str).unwrap_or("");
+    let Some(operation) = request.get("operation").and_then(Value::as_str) else {
+        return json!({"ok":false,"observed_at":now(),"error_code":"invalid_request","error":"operation is a string"});
+    };
     if sqlite_only_operation(operation) {
         return json!({
             "ok": false,
@@ -339,6 +350,9 @@ fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
             "operation": operation,
             "store_engine": store.engine().as_str(),
         });
+    }
+    if !["capabilities", "identity", "inventory", "observations", "storage_status", "host_status", "universe_stats"].contains(&operation) {
+        return json!({"ok":false,"observed_at":now(),"error_code":"unsupported_operation","error":"Unsupported operation","operation":operation,"store_engine":store.engine().as_str()});
     }
     let result: Result<Value, Box<dyn std::error::Error>> = (|| {
         Ok(match operation {
@@ -375,7 +389,11 @@ fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
     })();
     match result {
         Ok(data) => json!({"ok":true,"observed_at":now(),"data":data}),
-        Err(error) => json!({"ok":false,"observed_at":now(),"error":error.to_string()}),
+        Err(error) => {
+            let code = error.downcast_ref::<store::StoreError>()
+                .map_or_else(|| "operation_failed".to_string(), |error| format!("store_{}", error.fault.as_str()));
+            json!({"ok":false,"observed_at":now(),"error_code":code,"error":error.to_string()})
+        }
     }
 }
 
@@ -543,6 +561,40 @@ mod api_store_tests {
     }
 
     #[test]
+    fn explicit_profile_files_are_strict_and_real_absence_keeps_legacy_sqlite() {
+        let root = std::env::temp_dir().join(format!("podmesh-strict-profile-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let absent_dir = root.join("absent-state");
+        assert_eq!(read_store_profile(&absent_dir, None).unwrap().engine, Engine::Sqlite);
+        assert!(!absent_dir.exists(), "reading an absent profile creates no state directory");
+        assert!(read_store_profile(&root, Some(&root.join("named-but-absent"))).is_err());
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(STORE_PROFILE_FILE);
+        for text in ["null", "{}", "{\"state_dir\":\"elsewhere\"}", "{\"store\":null}", "{\"store\":{\"engnie\":\"mariadb\"}}", "not JSON"] {
+            fs::write(&path, text).unwrap();
+            assert!(read_store_profile(&root, None).is_err(), "present malformed profile must refuse");
+            assert!(!root.join("state.sqlite").exists());
+        }
+        fs::write(&path, "{\"store\":{\"engine\":\"sqlite\"}}").unwrap();
+        assert_eq!(read_store_profile(&root, None).unwrap().engine, Engine::Sqlite);
+        fs::remove_file(&path).unwrap();
+        #[cfg(unix)] {
+            std::os::unix::fs::symlink(root.join("missing-target"), &path).unwrap();
+            assert!(read_store_profile(&root, None).is_err(), "a dangling profile symlink is not an absent profile");
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_mariadb_configuration_refuses_before_creating_state() {
+        let root = std::env::temp_dir().join(format!("podmesh-refused-state-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let config = StoreConfig { engine: Engine::Mariadb, ..StoreConfig::default() };
+        assert!(open_node_store(&root, &config).is_err());
+        assert!(!root.exists());
+    }
+
+    #[test]
     fn a_durable_node_serves_reads_and_names_the_sqlite_only_refusal() {
         let mut sqlite = SqliteStore::open_in_memory().unwrap();
         sqlite
@@ -572,5 +624,13 @@ mod api_store_tests {
         assert_eq!(refused["operation"], "create");
         assert_eq!(refused["store_engine"], "mariadb");
         assert!(refused["error"].as_str().unwrap().contains("still SQLite-only"));
+        let unknown = node.handle(&json!({"operation":"not_an_operation"}));
+        assert_eq!(unknown["error_code"], "unsupported_operation");
+        assert_eq!(node.handle(&json!({}))["error_code"], "invalid_request");
+        // Type faults remain named without pretending the adapter talks to a real server.
+        let mut malformed = SqliteStore::open_in_memory().unwrap();
+        malformed.execute_batch("CREATE TABLE metadata(`key` TEXT PRIMARY KEY, value TEXT); INSERT INTO metadata VALUES('host_uuid',NULL);").unwrap();
+        let mut node = NodeStore::Durable(Box::new(MariaDbAdapter(malformed)));
+        assert_eq!(node.handle(&json!({"operation":"identity"}))["error_code"], "store_type");
     }
 }

@@ -84,7 +84,7 @@ impl MariadbStore {
         conn.query_drop("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             .map_err(|e| fault_of(&e).error(format!("{target} refused REPEATABLE READ: {e}")))?;
         // Muse must-fix: refuse a server that does not flush the redo log on every commit.
-        // Session and global are both checked so a SESSION override cannot hide a GLOBAL=0/2.
+        // MariaDB 10.11 exposes this as GLOBAL-only; that effective setting must be 1.
         require_flush_log_at_commit(&mut conn, &target)?;
         Ok(Self { conn, target })
     }
@@ -115,7 +115,7 @@ impl DurableStore for MariadbStore {
     fn execute_batch(&mut self, sql: &str) -> Result<()> {
         // The server takes one statement per call unless multi-statement is on, and it is not:
         // a batch that arrives as one string is a batch the server would parse as one statement.
-        for statement in statements(sql) {
+        for statement in statements(sql)? {
             self.conn
                 .query_drop(&statement)
                 .map_err(|e| fault_of(&e).error(format!("{statement}: {e}")))?;
@@ -261,9 +261,9 @@ fn query_on<Q: Queryable>(queryable: &mut Q, sql: &str, params: &[Value]) -> Res
             .enumerate()
             .map(|(index, value)| match value {
                 Some(value) => from_mysql(value, binary.get(index).copied().unwrap_or(false)),
-                None => Value::Null,
+                None => Ok(Value::Null),
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         collected.push(Row::new(columns.clone().unwrap_or_default(), values));
     }
     Ok(collected)
@@ -288,13 +288,11 @@ fn to_mysql(value: &Value) -> MyValue {
 
 /// A server value as one of the five kinds. Bytes are text unless the column says they are not,
 /// or unless they are not text at all: a caller reading a `VARBINARY` gets its bytes back.
-fn from_mysql(value: MyValue, binary: bool) -> Value {
-    match value {
+fn from_mysql(value: MyValue, binary: bool) -> Result<Value> {
+    Ok(match value {
         MyValue::NULL => Value::Null,
         MyValue::Int(i) => Value::Integer(i),
-        MyValue::UInt(u) => {
-            i64::try_from(u).map_or_else(|_| Value::Text(u.to_string()), Value::Integer)
-        }
+        MyValue::UInt(u) => Value::try_from(u)?,
         MyValue::Float(f) => Value::Real(f64::from(f)),
         MyValue::Double(f) => Value::Real(f),
         MyValue::Bytes(bytes) if binary => Value::Blob(bytes),
@@ -310,7 +308,7 @@ fn from_mysql(value: MyValue, binary: bool) -> Value {
             if negative { "-" } else { "" },
             u32::from(hours) + days * 24
         )),
-    }
+    })
 }
 
 /// A name this store may put between backticks. Anything else is refused rather than quoted:
@@ -326,57 +324,9 @@ fn quoted(identifier: &str) -> Result<String> {
     Ok(format!("`{identifier}`"))
 }
 
-/// The statements a batch carries, split on the semicolons that end them -- not on the ones
-/// inside a quoted string, a quoted name or a comment.
-fn statements(sql: &str) -> Vec<String> {
-    let mut statements = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    let mut comment = false;
-    let mut characters = sql.chars().peekable();
-    while let Some(c) = characters.next() {
-        if comment {
-            if c == '\n' {
-                comment = false;
-                current.push(c);
-            }
-            continue;
-        }
-        match quote {
-            Some(open) => {
-                current.push(c);
-                if c == '\\' {
-                    if let Some(escaped) = characters.next() {
-                        current.push(escaped);
-                    }
-                } else if c == open {
-                    quote = None;
-                }
-            }
-            None => match c {
-                '\'' | '"' | '`' => {
-                    quote = Some(c);
-                    current.push(c);
-                }
-                '#' => comment = true,
-                '-' if characters.peek() == Some(&'-') => {
-                    characters.next();
-                    comment = true;
-                }
-                ';' => {
-                    if !current.trim().is_empty() {
-                        statements.push(current.trim().to_string());
-                    }
-                    current.clear();
-                }
-                _ => current.push(c),
-            },
-        }
-    }
-    if !current.trim().is_empty() {
-        statements.push(current.trim().to_string());
-    }
-    statements
+/// The same restricted batch grammar validated by the migration inventory.
+fn statements(sql: &str) -> Result<Vec<String>> {
+    super::sql::statements(sql).map(|statements| statements.into_iter().map(str::to_string).collect())
 }
 
 /// The server's error codes as the faults a caller decides on. 1205 is a row lock that waited
@@ -648,7 +598,7 @@ mod tests {
             "CREATE TABLE a(held VARCHAR(8)); -- a comment; not a statement\n\
              INSERT INTO a VALUES('one;two'); # another; comment\n\
              INSERT INTO a VALUES(\"three;four\");",
-        );
+        ).unwrap();
         assert_eq!(
             split,
             [
@@ -657,8 +607,19 @@ mod tests {
                 "INSERT INTO a VALUES(\"three;four\")",
             ]
         );
-        assert!(statements("  ;  ; ").is_empty());
-        assert_eq!(statements("SELECT 1").len(), 1);
+        assert!(statements("  ;  ; ").unwrap().is_empty());
+        assert_eq!(statements("SELECT 1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn mysql_unsigned_decode_is_fallible_without_kind_coercion() {
+        assert_eq!(from_mysql(MyValue::UInt(0), false).unwrap(), Value::Integer(0));
+        assert_eq!(from_mysql(MyValue::UInt(i64::MAX as u64), false).unwrap(), Value::Integer(i64::MAX));
+        for value in [i64::MAX as u64 + 1, u64::MAX] {
+            assert_eq!(from_mysql(MyValue::UInt(value), false).unwrap_err().fault, Fault::Type);
+        }
+        assert_eq!(from_mysql(MyValue::Int(i64::MIN), false).unwrap(), Value::Integer(i64::MIN));
+        assert_eq!(from_mysql(MyValue::Bytes(vec![0, 255]), true).unwrap(), Value::Blob(vec![0, 255]));
     }
 
     #[test]

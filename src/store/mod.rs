@@ -38,6 +38,7 @@ pub mod config;
 #[cfg(feature = "mariadb")]
 pub mod mariadb;
 pub mod migrations;
+mod sql;
 pub mod sqlite;
 
 pub use config::{Engine, MariadbConfig, SqliteConfig, StoreConfig};
@@ -200,9 +201,13 @@ impl From<i64> for Value {
     }
 }
 
-impl From<u64> for Value {
-    fn from(value: u64) -> Self {
-        Value::Integer(value as i64)
+impl TryFrom<u64> for Value {
+    type Error = StoreError;
+
+    fn try_from(value: u64) -> Result<Self> {
+        i64::try_from(value)
+            .map(Value::Integer)
+            .map_err(|_| Fault::Type.error("an unsigned integer exceeds the store's signed 64-bit range"))
     }
 }
 
@@ -482,6 +487,15 @@ pub fn schema_version(store: &mut dyn DurableStore, name: &str) -> Result<Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsigned_values_refuse_overflow_without_changing_their_kind() {
+        assert_eq!(Value::try_from(0_u64).unwrap(), Value::Integer(0));
+        assert_eq!(Value::try_from(i64::MAX as u64).unwrap(), Value::Integer(i64::MAX));
+        for value in [i64::MAX as u64 + 1, u64::MAX] {
+            assert_eq!(Value::try_from(value).unwrap_err().fault, Fault::Type);
+        }
+    }
 
     #[test]
     fn the_profile_decides_which_engine_opens() {

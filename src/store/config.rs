@@ -248,11 +248,27 @@ impl fmt::Debug for MariadbConfig {
 
 /// A `mysql://` URL with whatever password it carried replaced, for a message or a log line.
 pub fn redact(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
-    let Some((credentials, target)) = rest.split_once('@') else { return url.to_string() };
+    let Some((scheme, rest)) = url.split_once("://") else { return "[invalid DSN]".to_string() };
+    if scheme.is_empty() || !scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+        return "[invalid DSN]".to_string();
+    }
+    let Some((credentials, target)) = rest.rsplit_once('@') else {
+        // An invalid authority may contain an unterminated password. Do not echo it back.
+        return if rest.contains(':') {
+            format!("{scheme}://[redacted]")
+        } else {
+            format!("{scheme}://{}", rest.split(['?', '#']).next().unwrap_or_default())
+        };
+    };
+    // A query/fragment containing @ is ambiguous to this deliberately dependency-free redactor.
+    // Conceal the whole remainder rather than risk treating a password suffix as the host.
+    if credentials.contains(['?', '#']) {
+        return format!("{scheme}://[redacted]");
+    }
+    let target = target.split(['?', '#']).next().unwrap_or_default();
     match credentials.split_once(':') {
         Some((user, _)) => format!("{scheme}://{user}:***@{target}"),
-        None => url.to_string(),
+        None => format!("{scheme}://{credentials}@{target}"),
     }
 }
 
@@ -362,6 +378,28 @@ impl StoreConfig {
         Ok(config)
     }
 
+    /// An explicitly present store profile must name its engine and use recognized field names.
+    /// The legacy whole-configuration parser above retains defaults when no store was requested.
+    pub fn from_profile_json(document: &Json, state_dir: Option<&Path>) -> Result<Self> {
+        if !document.is_object() {
+            return Err(Fault::Type.error("a store profile is a JSON object"));
+        }
+        let store = document.get("store").unwrap_or(document);
+        recognized_fields(store, &["engine", "sqlite", "mariadb"], "store")?;
+        if string(store, "engine")?.is_none() {
+            return Err(Fault::Type.error("an explicitly present store profile must name store.engine"));
+        }
+        for (key, allowed) in [
+            ("sqlite", &["path", "busy_timeout_ms", "journal_mode"][..]),
+            ("mariadb", &["dsn", "host", "port", "socket", "user", "password_file", "password", "database", "connect_timeout_ms", "lock_wait_timeout_seconds"][..]),
+        ] {
+            if let Some(section) = store.get(key) {
+                recognized_fields(section, allowed, key)?;
+            }
+        }
+        Self::from_json(document, state_dir)
+    }
+
     /// What this profile is, in one line, for an observation or a refusal. Never a password.
     pub fn described(&self) -> String {
         match self.engine {
@@ -386,6 +424,14 @@ impl StoreConfig {
             Engine::Mariadb => self.mariadb.validate(),
         }
     }
+}
+
+fn recognized_fields(value: &Json, allowed: &[&str], section: &str) -> Result<()> {
+    let object = value.as_object().ok_or_else(|| Fault::Type.error(format!("{section} is an object")))?;
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(Fault::Type.error(format!("{section} contains an unrecognized field")));
+    }
+    Ok(())
 }
 
 fn member<'a>(value: &'a Json, key: &str) -> Result<Option<&'a Json>> {
@@ -566,10 +612,37 @@ mod tests {
     }
 
     #[test]
+    fn complex_or_malformed_dsn_credentials_are_never_echoed() {
+        for password in ["marker@tail", "marker:tail", "marker%40tail", "marker/tail"] {
+            let dsn = format!("mysql://u:{password}@host/db");
+            let masked = redact(&dsn);
+            assert_eq!(masked, "mysql://u:***@host/db");
+            assert!(!masked.contains("marker") && !masked.contains("tail"));
+        }
+        assert_eq!(redact("mysql://u:marker@tail@host/db"), "mysql://u:***@host/db");
+        for dsn in ["mysql://u:marker", "mysql://u:marker?tail@host/db", "mysql://u:marker@host/db?password=tail@host", "mysql://u:marker@host/db#token=tail"] {
+            let masked = redact(dsn);
+            assert!(!masked.contains("marker") && !masked.contains("tail"));
+        }
+    }
+
+    #[test]
+    fn an_explicit_profile_refuses_typos_and_requires_a_named_engine() {
+        for document in [json!(null), json!([]), json!({}), json!({"state_dir":"elsewhere"}), json!({"store":null}), json!({"store":{}}), json!({"engine":null}), json!({"engnie":"mariadb"}), json!({"engine":"mariadb","maria_db":{}}), json!({"engine":"sqlite","sqlite":{"pah":"elsewhere"}})] {
+            assert_eq!(StoreConfig::from_profile_json(&document, None).unwrap_err().fault, Fault::Type);
+        }
+        for document in [json!({"engine":"sqlite"}), json!({"store":{"engine":"sqlite"},"state_dir":"legacy"})] {
+            assert_eq!(StoreConfig::from_profile_json(&document, None).unwrap().engine, Engine::Sqlite);
+        }
+        // Generic legacy configuration parsing still preserves the existing SQLite default.
+        assert_eq!(StoreConfig::from_json(&json!({"state_dir":"legacy"}), None).unwrap().engine, Engine::Sqlite);
+    }
+
+    #[test]
     fn a_dsn_replaces_the_fields_and_is_never_printed_whole() {
         let config = MariadbConfig::from_dsn("mysql://podmesh-node:held@127.0.0.1:33061/podmesh-node");
         assert_eq!(config.url().unwrap(), "mysql://podmesh-node:held@127.0.0.1:33061/podmesh-node");
         assert_eq!(config.described(), "mysql://podmesh-node:***@127.0.0.1:33061/podmesh-node");
-        assert_eq!(redact("not a url"), "not a url");
+        assert_eq!(redact("not a url"), "[invalid DSN]");
     }
 }
