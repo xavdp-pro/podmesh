@@ -1,0 +1,2223 @@
+{
+  "fixture_version": "C02A-node-scalars/1",
+  "synthetic_only": true,
+  "customer_data": false,
+  "real_keys_or_credentials": false,
+  "kind": "Independent identical scalar insert/read fixtures, not a copy or migration",
+  "row_strategy": {
+    "row_0": "Nullable columns NULL; integer non-ID columns i64::MIN; text includes NFC/NFD/Unicode and unique column/row seed",
+    "row_1": "Nullable columns empty text/zero; integer ID 2; other integers zero",
+    "row_2": "All columns populated; integer non-ID columns i64::MAX; text includes emoji, Japanese, quote and semicolon",
+    "integer_id": "Explicit IDs 1,2,3 avoid AUTO_INCREMENT zero conversion",
+    "text_seed": "fx-t{table_index}-r{row_index}-c{column_index}-é中🙂e combining acute ; single quote",
+    "node_kinds": [
+      "integer",
+      "text",
+      "null"
+    ],
+    "auxiliary_probe_kinds": [
+      "null",
+      "integer",
+      "real",
+      "text",
+      "blob"
+    ],
+    "schema_validity": "Storage-compatible synthetic values only; not valid business authority, lease or publisher material"
+  },
+  "tables": [
+    {
+      "name": "activation_epochs",
+      "columns": [
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "authority_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "epoch",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "grant_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "replica_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "seen_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "activation_lease_history",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "holder_host_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "generation",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "event",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "boot_id",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "activation_leases",
+      "columns": [
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "holder_host_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "generation",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "acquired_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "expires_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "epoch",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "grant_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "activation_policy",
+      "columns": [
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "lease_seconds",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "takeover_margin_seconds",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "declared_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "desired_standbys",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "eligible_hosts",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "authorization_ref",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "authority_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "authority_key",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "authority_quorum",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "authority_serial",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "activation_policy_changes",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "from_digest",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "to_digest",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "how",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "certificate_digest",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "authorization_ref",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "collection_holds",
+      "columns": [
+        {
+          "name": "hold_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "scope",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "reason",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "declared_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "authorization_ref",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "released_at",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "released_by_operation",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "release_authorization_ref",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "garbage_collection_effects",
+      "columns": [
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "candidate_key",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 2
+        },
+        {
+          "name": "class",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "applied_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "result",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "garbage_collection_runs",
+      "columns": [
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "mode",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "authorization_ref",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "collector_version",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "policy_version",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "started_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "finished_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "record",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "metadata",
+      "columns": [
+        {
+          "name": "key",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "value",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "migration_authorizations",
+      "columns": [
+        {
+          "name": "authorization_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "checkpoint_operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "destination_host_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "handoff",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "handoff_sha256",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "state",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "updated_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "outcome",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "outcome_sha256",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "completed_by_operation",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "migration_collection_history",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "class",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "class_number",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "container_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "container_absent_at_collection",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "checkpoint_operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "collected_by_operation",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "collected_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "proof",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "migration_reservation_history",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "container_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "image_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "source_host_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "destination_host_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "container_started_at",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "state",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "updated_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "detail",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "archived_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "archived_by_operation",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "migration_reservations",
+      "columns": [
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "container_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "image_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "source_host_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "destination_host_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "container_started_at",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "state",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "updated_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "detail",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "migration_restore_claims",
+      "columns": [
+        {
+          "name": "authorization_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "handoff",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "handoff_sha256",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "source_host_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "source_container_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "image_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "state",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "container_id",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "updated_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "outcome",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "outcome_sha256",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "detail",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "migration_universe_tombstones",
+      "columns": [
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "class",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "class_number",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "container_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "container_absent_at_collection",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "checkpoint_operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "collected_by_operation",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "collected_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "proof",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "network_allocations",
+      "columns": [
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "network_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "ip",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "allocated_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "released_at",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "released_by",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "network_declaration",
+      "columns": [
+        {
+          "name": "network_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "prefix",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "pool",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "gateway",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "bridge",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "state",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "declared_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "authorization_ref",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "observed",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "nat_backend",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "network_effects",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "kind",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "key",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "owner",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "intent",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "state",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "changed_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "observed",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "network_peer_pools",
+      "columns": [
+        {
+          "name": "pool",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "via",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "network_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "network_routes",
+      "columns": [
+        {
+          "name": "ip",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "via",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "published_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "exclusive_resource",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "alias_universe_uuid",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "state",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "observations",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "observed_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "result",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "operation_attempts",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "started_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "finished_at",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "outcome",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "detail",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "operations",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "request",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "result",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "publisher_events",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "resource",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "event",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "detail",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "publisher_takeover_verified",
+      "columns": [
+        {
+          "name": "resource",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "epoch",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 2
+        },
+        {
+          "name": "generation",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "acquired_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "boot_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "authority_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "authority_key",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "proof",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "verified",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "verified_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "authority_quorum",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "authority_digest",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "publisher_transitions",
+      "columns": [
+        {
+          "name": "resource",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "state",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "epoch",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "changed_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "publishers",
+      "columns": [
+        {
+          "name": "resource",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "hostname",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "tunnel_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "credential",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "origin_port",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "declared_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "authorization_ref",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "recovery_point_final_captures",
+      "columns": [
+        {
+          "name": "recovery_point_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "container_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "captured_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "resumed_operation_id",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "resumed_at",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "recovery_point_live_captures",
+      "columns": [
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "container_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "recovery_point_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "began_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "state",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "detail",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "recovery_point_live_promote_attempts",
+      "columns": [
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "recovery_point_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "lease_generation",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "launched_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "state",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "detail",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "recovery_point_live_promotions",
+      "columns": [
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "recovery_point_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "container_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "lease_generation",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "restore_log_sha256",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "promoted_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "recovery_point_promotions",
+      "columns": [
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "restored_universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "recovery_point_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "container_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "lease_generation",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "promoted_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "recovery_point_restores",
+      "columns": [
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "restored_universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "recovery_point_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "source_universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "imported_image_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "container_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "manifest_sha256",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "rootfs_sha256",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "manifest_signed",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "restored_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "recovery_point_retained",
+      "columns": [
+        {
+          "name": "recovery_point_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "generation",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "path_class",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "manifest",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "manifest_sha256",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "rootfs_sha256",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "rootfs_bytes",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "prepare_operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "terminal_state",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "collected_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "collecting_operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "retention",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "recovery_point_retention",
+      "columns": [
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "keep_latest",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "minimum_age_seconds",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "declared_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "authorization_ref",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "recovery_point_staged",
+      "columns": [
+        {
+          "name": "recovery_point_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "generation",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "archive_sha256",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "archive_bytes",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "manifest_sha256",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "image_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "inbox",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "staged_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "discarded_at",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "discard_operation_id",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "promoted_operation_id",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "uncompressed_bytes",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "recovery_points",
+      "columns": [
+        {
+          "name": "recovery_point_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "universe_uuid",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "generation",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "parent_recovery_point_uuid",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "state",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "manifest_sha256",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "rootfs_sha256",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "rootfs_bytes",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "prepared_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "outbox",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "capture",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    },
+    {
+      "name": "secrets",
+      "columns": [
+        {
+          "name": "name",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 1
+        },
+        {
+          "name": "sha256",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "bytes",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "declared_at",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "authorization_ref",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        },
+        {
+          "name": "removed_at",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key_position": 0
+        },
+        {
+          "name": "state",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key_position": 0
+        }
+      ],
+      "rows": 3
+    }
+  ],
+  "released_sql_sha256": {
+    "src/store/migrations/node/0001-base.mariadb.sql": "ea625e4996d73e8c3023ff5a72a75d379b7f84cb2e8a38ad0012c66206d686e4",
+    "src/store/migrations/node/0001-base.sqlite.sql": "a848bf6481f0c591d9568dc1431f1e82aef018f62c59e52066b377d805c7b83c",
+    "src/store/migrations/node/0002-lifecycle.mariadb.sql": "12e2ff33399caded3e7d8b44b8a716736bc151214f758529ca667946e1453e17",
+    "src/store/migrations/node/0002-lifecycle.sqlite.sql": "92fffc6ca017dd5ab99fdbb2285aac3cb36ee954fbe3638f1c2dfd9dd45b8bd7",
+    "src/store/migrations/node/0003-migration.mariadb.sql": "a3ab00b086bb7944038e1eeee71c820954b961573bcb1a9be9640d032f7692d0",
+    "src/store/migrations/node/0003-migration.sqlite.sql": "ca6beeade8e0c83973b795779145b205c199af34803f67f5675d2f62a538ae9c",
+    "src/store/migrations/node/0004-activation.mariadb.sql": "bfee2c6b67f756e34fb56a5dfd76d2d975d6b7816999b6a43b802b4b20b56a8a",
+    "src/store/migrations/node/0004-activation.sqlite.sql": "c0497010e8bc5f13d8c6888b26fa4e4a11f66a7c7773a94bf8769fb5c65ef41c",
+    "src/store/migrations/node/0005-network.mariadb.sql": "654a2d055a9f2f8c37e5e2c2d744cc448256a14a19e0ca59ad51d4ecdf4ca38c",
+    "src/store/migrations/node/0005-network.sqlite.sql": "f60ef3bb474bd799a631bbfe6b73631a9651781778ebba9998b5108017512c11",
+    "src/store/migrations/node/0006-secrets.mariadb.sql": "73c4bceabea6161ea0c7ee7239b13762d8e3a3f063bb78a30fbfcb25f5ce1592",
+    "src/store/migrations/node/0006-secrets.sqlite.sql": "b6f1cdf1e9e2d7980f51ced203562c207de3f0e2f389e227a9e81dc2418adb8b",
+    "src/store/migrations/node/0007-publisher.mariadb.sql": "316341cec8157dadcebdc694ec369d889f41686a6360b3fecd09cd566a01b0df",
+    "src/store/migrations/node/0007-publisher.sqlite.sql": "7bb97a85c5c9473302d2b992b9afa4590a9774085938178b2ce25e1d46d162ab",
+    "src/store/migrations/node/0008-recovery-point.mariadb.sql": "5aa9c3bce22ea421d0b9cc62cddc0fcc9a587aa72092ed3a30bb686370e03e1f",
+    "src/store/migrations/node/0008-recovery-point.sqlite.sql": "3b2af41eac08c4f1a866be6902d901ba9dd725e17a2b8644331de9a5d8c4388c",
+    "src/store/migrations/node/0009-retention.mariadb.sql": "2b73c6e79b82e340947c8d648b02665eb11ace3e138eb91708cf0959e684406a",
+    "src/store/migrations/node/0009-retention.sqlite.sql": "d6ed44bc17fa5c8847074c4eb6a51b6f85aa9fc21ae95a566a96c81a18d6d1fd",
+    "src/store/migrations/node/0010-collector.mariadb.sql": "16ccea0d34bbd4d916588c9cbbb63e38f79d1b7a7c016e3d289ddb3e8f78ffb1",
+    "src/store/migrations/node/0010-collector.sqlite.sql": "1fa9b1c2a52e6839e77402bdca273c42f1911e795561f44b92665127d7277eb8"
+  }
+}

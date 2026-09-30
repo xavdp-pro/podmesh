@@ -40,6 +40,8 @@ pub mod mariadb;
 pub mod migrations;
 mod sql;
 pub mod sqlite;
+#[cfg(test)]
+mod parity_tests;
 
 pub use config::{Engine, MariadbConfig, SqliteConfig, StoreConfig};
 #[cfg(feature = "mariadb")]
