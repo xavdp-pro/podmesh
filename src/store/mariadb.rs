@@ -596,7 +596,7 @@ mod tests {
     fn a_batch_is_split_on_the_semicolons_that_end_statements() {
         let split = statements(
             "CREATE TABLE a(held VARCHAR(8)); -- a comment; not a statement\n\
-             INSERT INTO a VALUES('one;two'); # another; comment\n\
+             INSERT INTO a VALUES('one;two'); -- another; comment\n\
              INSERT INTO a VALUES(\"three;four\");",
         ).unwrap();
         assert_eq!(

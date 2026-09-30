@@ -321,6 +321,25 @@ mod tests {
     }
 
     #[test]
+    fn dialect_ambiguous_batches_are_refused_before_sqlite_ddl() {
+        const HIDDEN: &str = "CREATE TABLE IF NOT EXISTS alpha (v TEXT); INSERT INTO alpha VALUES ('x\\'); CREATE TABLE IF NOT EXISTS hidden (v TEXT); -- ' ;";
+        // This is valid SQLite SQL: its backslash does not escape the closing quote.
+        // A scanner using MySQL escapes would conceal the second CREATE TABLE.
+        let mut unguarded = memory();
+        unguarded.execute_batch(HIDDEN).unwrap();
+        assert_eq!(unguarded.tables().unwrap(), ["alpha", "hidden"]);
+
+        static BACKSLASH: &[Migration] = &[Migration::portable("0001-test", HIDDEN)];
+        static DASH: &[Migration] = &[Migration::portable("0001-test", "CREATE TABLE IF NOT EXISTS alpha(v TEXT); SELECT 1--2; CREATE TABLE IF NOT EXISTS hidden(v TEXT);")];
+        static HASH: &[Migration] = &[Migration::portable("0001-test", "CREATE TABLE IF NOT EXISTS alpha(v TEXT); # not a SQLite comment\nCREATE TABLE IF NOT EXISTS hidden(v TEXT);")];
+        for set in [BACKSLASH, DASH, HASH] {
+            let mut guarded = memory();
+            assert_eq!(apply_set(&mut guarded, "test", set).unwrap_err().fault, Fault::Schema);
+            assert!(guarded.tables().unwrap().is_empty(), "refusal must precede all DDL including bootstrap");
+        }
+    }
+
+    #[test]
     fn an_empty_store_is_brought_to_the_current_version_once() {
         let mut store = memory();
         let applied = apply(&mut store).unwrap();
