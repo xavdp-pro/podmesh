@@ -413,7 +413,11 @@ pub trait Transaction {
 /// writes to a file instead is the one failure this layer must never allow.
 pub fn open(config: &StoreConfig) -> Result<Box<dyn DurableStore>> {
     match config.engine {
-        Engine::Sqlite => Ok(Box::new(SqliteStore::open(&config.sqlite)?)),
+        Engine::Sqlite => {
+            let mut store = SqliteStore::open(&config.sqlite)?;
+            import::guard_normal(&mut store)?;
+            Ok(Box::new(store))
+        },
         #[cfg(feature = "mariadb")]
         Engine::Mariadb => {
             let mut store = MariadbStore::open(&config.mariadb)?;

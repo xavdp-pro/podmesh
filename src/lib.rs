@@ -140,9 +140,9 @@ impl NodeStore {
 /// of them it has. An incomplete MariaDB profile is refused before anything is opened.
 pub fn open_node_store(dir: &Path, config: &StoreConfig) -> Result<NodeStore, Box<dyn std::error::Error>> {
     config.validate()?;
-    fs::create_dir_all(dir)?;
     let opened = match config.engine {
         Engine::Sqlite => {
+            fs::create_dir_all(dir)?;
             let mut store = SqliteStore::open(&config.sqlite)?;
             migrations::apply(&mut store)?;
             bind_to_this_host(&mut store)?;
@@ -150,6 +150,8 @@ pub fn open_node_store(dir: &Path, config: &StoreConfig) -> Result<NodeStore, Bo
         }
         Engine::Mariadb => {
             let mut store = store::open(config)?;
+            // Store admission must refuse an import before preparing runtime paths.
+            fs::create_dir_all(dir)?;
             migrations::apply(store.as_mut())?;
             bind_to_this_host(store.as_mut())?;
             NodeStore::Durable(store)

@@ -153,12 +153,95 @@ pub fn capture(source: &Path, manifest: &Json, destination: &Path, caps: &Caps) 
     Ok(Snapshot{path:snapshot_path,seal})
 }
 
-pub fn open_sealed(path: &Path, seal: &Json) -> Result<Connection> {
+/// The connection reads a new private immutable object copied from the verified descriptor.
+/// Source path replacement or added sidecars cannot redirect SQLite's actual input object.
+pub struct SealedReader {
+    db: Connection,
+    pub identity: Json,
+    pub read_path: PathBuf,
+}
+
+impl std::ops::Deref for SealedReader {
+    type Target = Connection;
+    fn deref(&self) -> &Connection { &self.db }
+}
+
+fn reject_sidecars(path: &Path) -> Result<()> {
+    for suffix in ["-wal","-shm","-journal"] {
+        match fs::symlink_metadata(sidecar(path,suffix)) {
+            Ok(_) => return Err(refusal("sealed_snapshot_sidecar_present")),
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound => {},
+            Err(_) => return Err(refusal("sealed_snapshot_sidecar_check_failed")),
+        }
+    }
+    Ok(())
+}
+
+pub fn open_sealed(path: &Path, seal: &Json) -> Result<SealedReader> {
+    open_sealed_checked(path,seal,||{})
+}
+
+fn open_sealed_checked(path: &Path, seal: &Json, after_verify: impl FnOnce()) -> Result<SealedReader> {
+    use std::sync::atomic::{AtomicU64,Ordering};
+    static NEXT:AtomicU64=AtomicU64::new(0);
+    if seal["format"] != "podmesh-c02-private-snapshot/1" || seal["snapshot_bytes"].as_u64().filter(|n| *n <= 33_554_432).is_none() { return Err(refusal("sealed_snapshot_mismatch")); }
+    reject_sidecars(path)?;
     let mut file=read_regular(path)?;
-    if file.metadata().map_err(io_error)?.len()!=seal["snapshot_bytes"].as_u64().ok_or_else(|| refusal("sealed_snapshot_mismatch"))? { return Err(refusal("sealed_snapshot_mismatch")); }
+    let size=seal["snapshot_bytes"].as_u64().ok_or_else(||refusal("sealed_snapshot_mismatch"))?;
+    if file.metadata().map_err(io_error)?.len()!=size {return Err(refusal("sealed_snapshot_mismatch"));}
     let actual=fingerprint(&mut file)?;
     if actual["sha256"]!=seal["snapshot_sha256"] || actual["bytes"]!=seal["snapshot_bytes"] { return Err(refusal("sealed_snapshot_mismatch")); }
-    let db=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(sqlite_error)?;
+    after_verify();
+    reject_sidecars(path)?;
+    let named=fs::symlink_metadata(path).map_err(io_error)?;
+    if !named.is_file() || named.dev()!=actual["dev"].as_u64().unwrap_or(u64::MAX) || named.ino()!=actual["inode"].as_u64().unwrap_or(u64::MAX) {return Err(refusal("sealed_snapshot_identity_changed"));}
+    let directory=path.parent().ok_or_else(||refusal("invalid_snapshot_parent"))?.join(format!("reader-{}-{}",std::process::id(),NEXT.fetch_add(1,Ordering::Relaxed)));
+    fs::DirBuilder::new().mode(0o700).create(&directory).map_err(io_error)?;
+    let read_path=directory.join("read.sqlite");
+    let mut out=create_file(&read_path)?;
+    file.seek(SeekFrom::Start(0)).map_err(io_error)?;
+    if std::io::copy(&mut (&mut file).take(size+1),&mut out).map_err(io_error)?!=size {return Err(refusal("sealed_snapshot_mismatch"));}
+    out.sync_all().map_err(io_error)?;
+    fs::set_permissions(&read_path,fs::Permissions::from_mode(0o400)).map_err(io_error)?;
+    let identity=fingerprint(&mut read_regular(&read_path)?)?;
+    if identity["sha256"]!=seal["snapshot_sha256"] || fingerprint(&mut file)?!=actual {return Err(refusal("sealed_snapshot_mismatch"));}
+    reject_sidecars(path)?;
+    let named=fs::symlink_metadata(path).map_err(io_error)?;
+    if !named.is_file() || named.dev()!=actual["dev"].as_u64().unwrap_or(u64::MAX) || named.ino()!=actual["inode"].as_u64().unwrap_or(u64::MAX) {return Err(refusal("sealed_snapshot_identity_changed"));}
+    sync_directory(&directory)?;
+    let absolute=fs::canonicalize(&read_path).map_err(io_error)?;
+    let mut uri=String::from("file:");
+    for byte in absolute.as_os_str().as_encoded_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte,b'/'|b'_'|b'-'|b'.') {uri.push(*byte as char);} else {uri.push_str(&format!("%{byte:02X}"));}
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    let db=Connection::open_with_flags(uri,OpenFlags::SQLITE_OPEN_READ_ONLY|OpenFlags::SQLITE_OPEN_URI|OpenFlags::SQLITE_OPEN_NOFOLLOW).map_err(sqlite_error)?;
     db.execute_batch("BEGIN;").map_err(sqlite_error)?;
-    Ok(db)
+    let current=fingerprint(&mut read_regular(&read_path)?)?;
+    if current!=identity {return Err(refusal("private_reader_identity_changed"));}
+    Ok(SealedReader{db,identity,read_path})
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+    use crate::store::import::fixture;
+
+    #[test]
+    fn sealed_sidecars_and_post_verify_replacement_refuse() {
+        let root=std::env::temp_dir().join(format!("podmesh-sealed-reader-{}-{}",std::process::id(),crate::now()));
+        let manifest=fixture::create(&root).unwrap();let caps=fixture::development_caps().unwrap();
+        let captured=capture(&root.join("source.sqlite"),&manifest,&root.join("snapshot"),&caps).unwrap();
+        for suffix in ["-wal","-shm","-journal"] {
+            let companion=sidecar(&captured.path,suffix);create_file(&companion).unwrap();
+            assert_eq!(open_sealed(&captured.path,&captured.seal).err().unwrap().message,"sealed_snapshot_sidecar_present");
+            fs::remove_file(companion).unwrap();
+        }
+        let error=open_sealed_checked(&captured.path,&captured.seal,||{
+            fs::rename(&captured.path,captured.path.with_extension("old")).unwrap();
+            let mut replacement=create_file(&captured.path).unwrap();replacement.write_all(b"not-the-snapshot").unwrap();
+        }).err().unwrap();
+        assert_eq!(error.message,"sealed_snapshot_identity_changed");
+        fs::remove_dir_all(root).unwrap();
+    }
 }

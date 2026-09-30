@@ -1,6 +1,6 @@
 //! Version10 source inspection on an already-private stable snapshot, using raw SQLite classes.
 use super::{canonical, caps::Caps, refusal};
-use crate::store::{migrations, DurableStore, Engine, Result, SqliteStore, Value};
+use crate::store::{migrations, Engine, Result, SqliteStore, Value};
 use rusqlite::{types::ValueRef, Connection};
 use serde_json::{json, Value as Json};
 use std::collections::BTreeMap;
@@ -217,6 +217,7 @@ pub fn inspect(db: &Connection, caps: &Caps, snapshot_bytes: u64) -> Result<Plan
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::DurableStore;
 
     #[test]
     fn invalid_text_blob_real_and_null_have_original_class_reasons() {
@@ -240,5 +241,15 @@ mod tests {
         let expected = shape(db.connection()).unwrap();
         db.execute_batch("CREATE VIEW unexpected AS SELECT 1;").unwrap();
         assert_ne!(shape(db.connection()).unwrap(),expected);
+    }
+
+    #[test]
+    fn all_released_varchar_domains_match_fixed_successor_golden() {
+        let golden:Json=serde_json::from_str(include_str!("../../../fixtures/C/copy-v1/target-widths-v11.json")).unwrap();
+        let actual:serde_json::Map<String,Json>=widths().into_iter().map(|((table,column),n)|(format!("{table}.{column}"),json!(n))).collect();
+        assert_eq!(Json::Object(actual),golden["widths"]);
+        assert_eq!(widths()[&("metadata".into(),"key".into())],768);
+        assert_eq!(widths()[&("publishers".into(),"hostname".into())],255);
+        assert!(!widths().contains_key(&("network_effects".into(),"intent".into())));
     }
 }

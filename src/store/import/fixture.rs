@@ -87,6 +87,7 @@ mod tests {
         let caps=development_caps().unwrap(); let source_path=root.join("source.sqlite");
         let before=snapshot::bundle_manifest(&source_path,&caps).unwrap();
         let snapshot=snapshot::capture(&source_path,&manifest,&root.join("private-snapshot"),&caps).unwrap();
+        assert!(snapshot::capture(&source_path,&manifest,&root.join("private-snapshot"),&caps).is_err());
         assert_eq!(snapshot::bundle_manifest(&source_path,&caps).unwrap(),before);
         let db=snapshot::open_sealed(&snapshot.path,&snapshot.seal).unwrap();
         let plan=source::inspect(&db,&caps,snapshot.seal["snapshot_bytes"].as_u64().unwrap()).unwrap();
@@ -141,5 +142,25 @@ mod tests {
         assert_eq!(snapshot::capture(&path,&changed,&target,&caps).err().unwrap().message,"source_bundle_manifest_mismatch");
         assert!(!target.exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resource_caps_and_source_classes_refuse_before_target_work() {
+        let root=std::env::temp_dir().join(format!("podmesh-c02-input-limits-{}-{}",std::process::id(),crate::now()));
+        create(&root).unwrap();let db=Connection::open(root.join("source.sqlite")).unwrap();
+        let size=fs::metadata(root.join("source.sqlite")).unwrap().len();let caps=development_caps().unwrap();
+        for kind in ["snapshot","totalbytes","rows","tablebytes","tablerows","valuebytes","memory"] {
+            let mut limited=caps.clone();
+            match kind {"snapshot"=>limited.snapshot=1,"totalbytes"=>limited.scalar_bytes=1,"rows"=>limited.rows=1,"tablebytes"=>limited.table_bytes=1,"tablerows"=>limited.table_rows=1,"valuebytes"=>limited.value_bytes=1,"memory"=>limited.peak=1,_=>unreachable!()}
+            assert_eq!(source::inspect(&db,&limited,size).err().unwrap().message,"source_limit_exceeded", "{kind}");
+        }
+        for (value,code) in [("CAST(x'80' AS TEXT)","invalid_utf8_text"),("x'80'","unsupported_storage_class_blob")]{
+            db.execute_batch(&format!("UPDATE metadata SET value={value} WHERE key='CaseProbe';")).unwrap();
+            assert_eq!(source::inspect(&db,&caps,size).err().unwrap().message,code);
+        }
+        db.execute("UPDATE metadata SET value='synthetic' WHERE key='CaseProbe'",[]).unwrap();
+        db.execute("INSERT INTO metadata VALUES(NULL,'synthetic')",[]).unwrap();
+        assert_eq!(source::inspect(&db,&caps,size).err().unwrap().message,"null_in_nonnullable_column");
+        drop(db);fs::remove_dir_all(root).unwrap();
     }
 }

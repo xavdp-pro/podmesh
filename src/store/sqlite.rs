@@ -60,15 +60,18 @@ impl SqliteStore {
     }
 
     fn prepare(db: Connection, config: &SqliteConfig) -> Result<Self> {
-        db.busy_timeout(config.busy_timeout)
+        let mut store = Self { db };
+        store.db.busy_timeout(config.busy_timeout)
             .map_err(|e| fault_of(&e).error(format!("the busy timeout was refused: {e}")))?;
+        super::import::guard_normal(&mut store)?;
+        let db = &store.db;
         if config.journal_wal {
             // The pragma answers with the mode it settled on, so it is read as a query; a store
             // held in memory answers "memory" and that is not a failure.
             db.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
                 .map_err(|e| fault_of(&e).error(format!("write-ahead logging was refused: {e}")))?;
         }
-        Ok(Self { db })
+        Ok(store)
     }
 }
 

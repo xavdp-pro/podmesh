@@ -21,7 +21,7 @@ pub fn guard_normal(store: &mut dyn DurableStore) -> Result<()> {
         super::Engine::Sqlite => "SELECT name FROM sqlite_schema",
         super::Engine::Mariadb => "SELECT table_name FROM information_schema.tables WHERE table_schema=DATABASE()",
     };
-    if store.query(sql, &[])?.iter().any(|row| row.text(0).map(|name| name.starts_with("podmesh_import_")).unwrap_or(true)) {
+    if store.query(sql, &[])?.iter().any(|row| row.text(0).map(|name| name.to_ascii_lowercase().starts_with("podmesh_import_")).unwrap_or(true)) {
         return Err(refusal("import_non_serving: marked stores require separate explicit adoption"));
     }
     Ok(())
@@ -56,6 +56,24 @@ mod tests {
         db.execute_batch("CREATE VIEW podmesh_import_state AS SELECT 'COMPLETE' AS phase;").unwrap();
         assert!(migrations::apply(&mut db).is_err());
         assert!(db.tables().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sqlite_normal_open_refuses_before_wal_preparation() {
+        use crate::store::{StoreConfig, SqliteConfig};
+        use std::fs;
+        let path=std::env::temp_dir().join(format!("podmesh-marked-open-{}-{}.sqlite",std::process::id(),crate::now()));
+        let db=rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE PODMESH_IMPORT_STATE(phase TEXT); INSERT INTO PODMESH_IMPORT_STATE VALUES('COMPLETE');").unwrap();
+        drop(db);
+        let before=fs::read(&path).unwrap();
+        let sqlite=SqliteConfig{path:path.clone(),journal_wal:true,..SqliteConfig::default()};
+        assert!(SqliteStore::open(&sqlite).err().unwrap().message.contains("import_non_serving"));
+        let config=StoreConfig{sqlite,..StoreConfig::default()};
+        assert!(crate::store::open(&config).err().unwrap().message.contains("import_non_serving"));
+        assert_eq!(fs::read(&path).unwrap(),before);
+        assert!(!std::path::PathBuf::from(format!("{}-wal",path.display())).exists());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
