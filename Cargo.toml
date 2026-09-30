@@ -12,7 +12,7 @@ mariadb = ["dep:mysql"]
 
 [dependencies]
 serde_json = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 # The MariaDB client, synchronous like the rest of this tree, without TLS or a C compression
 # library: the node speaks to a store on its own host, over a loopback address or a local socket.
 mysql = { version = "28", default-features = false, features = ["minimal-rust"], optional = true }
@@ -21,4 +21,3 @@ ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] 
 # The digest of an authority quorum policy, which every certificate names (V3-2). Already in the build as
 # ed25519-dalek's own hash dependency; named here so the digest does not depend on a child process.
 sha2 = { version = "0.10", default-features = false }
-
