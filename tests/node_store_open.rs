@@ -177,3 +177,35 @@ fn a_build_without_the_backend_names_the_refusal() {
     let refused = podmesh::store::open(&config).err().expect("a build with no backend opens no MariaDB store");
     assert_eq!(refused.fault, podmesh::store::Fault::Unsupported);
 }
+
+/// A versioned SQLite journal seeded with representative rows: the source the
+/// offline migrate binary must copy exactly (row counts + logical SHA-256).
+/// `secrets` follows the versioned 0006 schema (declared_at, not the ad-hoc
+/// spike's mounted_at), so the copy path is exercised, not the refusal path.
+#[test]
+fn a_seeded_versioned_journal_is_the_migrate_copy_source() {
+    let Some(_) = machine_id() else {
+        eprintln!("skipped: this host has no /etc/machine-id to bind a journal to");
+        return;
+    };
+    let dir = scratch("seeded");
+    let db = podmesh::open_state(&dir).unwrap();
+    db.execute(
+        "INSERT INTO secrets(name, sha256, bytes, declared_at, operation_id, authorization_ref, removed_at, state) VALUES('s1', 'ab', 3, 1, 'op1', 'auth1', NULL, 'effective'), ('s2', 'cd', 4, 2, 'op2', 'auth2', NULL, 'effective')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO observations(observed_at, operation, result) VALUES(1, 'op1', 'ok'), (2, 'op2', 'ok')",
+        [],
+    )
+    .unwrap();
+    let secrets: i64 = db.query_row("SELECT COUNT(*) FROM secrets", [], |row| row.get(0)).unwrap();
+    assert_eq!(secrets, 2);
+    let version: i64 = db
+        .query_row("SELECT version FROM store_schema WHERE name = 'node'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, migrations::node_version());
+    drop(db);
+    eprintln!("seeded versioned journal: {}", dir.join("state.sqlite").display());
+}
