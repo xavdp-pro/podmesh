@@ -43,8 +43,11 @@
 //! `/run/podmesh-host/votes`, `<state>/manager-host/<name>/evidence` read-only at
 //! `/run/podmesh-host/evidence` (the operator's readmission evidence, which the replica cannot write),
 //! and the host's `/etc/machine-id` read-only at `/run/podmesh-host/machine-id`. A QEMU guest also gets
-//! its live generation witness read-only at `/run/podmesh-host/vmgenid` when the device exists. The caller names no
-//! path. The directories are made private (0700) and never removed by PodMesh. One universe holds a
+//! its live generation witness as two read-only file binds: at the canonical QEMU path and at
+//! `/run/podmesh-host/vmgenid` when the device exists. Both binds use the same live file, so the
+//! resident can compare its configured witness descriptor to the canonical namespace anchor.
+//! No sysfs directory or ordinary copy is exposed. The caller names no path.
+//! The directories are made private (0700) and never removed by PodMesh. One universe holds a
 //! name at a time: `create` refuses a name another container carries or whose directory is held, and
 //! `delete` renames the directory to `<name>.released`, which the next create of the name takes back,
 //! so a roll finds its key and ledger again only once the old universe is gone.
@@ -69,12 +72,19 @@ pub const LABEL_HOST_STATE: &str = "io.podmesh.manager-host-state";
 /// QEMU's VM generation ID lives outside the guest disk and changes on hypervisor rollback.
 const QEMU_GENERATION_ID: &str = "/sys/firmware/qemu_fw_cfg/by_name/etc/vmgenid_guid/raw";
 
-fn generation_mount(source: &std::path::Path) -> Option<[String; 2]> {
+/// Plan only the live QEMU file's binds; witness provenance and bytes are checked by the resident.
+/// Missing or unsuitable sources produce neither bind, never a copied or broader sysfs fallback.
+fn generation_mounts(source: &std::path::Path) -> Option<[String; 4]> {
     std::fs::symlink_metadata(source)
         .ok()
         .filter(|meta| meta.is_file())
         .map(|_| {
             [
+                "--mount".to_string(),
+                format!(
+                    "type=bind,src={},dst={QEMU_GENERATION_ID},ro=true",
+                    source.display()
+                ),
                 "--mount".to_string(),
                 format!(
                     "type=bind,src={},dst=/run/podmesh-host/vmgenid,ro=true",
@@ -189,8 +199,8 @@ fn claim_in(root: &std::path::Path, name: &str, holders: &[String]) -> Result<(V
         "--mount".to_string(),
         "type=bind,src=/etc/machine-id,dst=/run/podmesh-host/machine-id,ro=true".to_string(),
     ];
-    if let Some(mount) = generation_mount(std::path::Path::new(QEMU_GENERATION_ID)) {
-        args.extend(mount);
+    if let Some(mounts) = generation_mounts(std::path::Path::new(QEMU_GENERATION_ID)) {
+        args.extend(mounts);
     }
     Ok((args, format!("{LABEL_HOST_STATE}={name}")))
 }
@@ -465,7 +475,7 @@ pub(crate) const CONTROL_SOCKET_PATH: &str = CONTROL_SOCKET;
 mod tests {
     use super::*;
 
-    /// Proves: the three fixed host-state mounts and the optional QEMU generation witness.
+    /// Proves: the three fixed host-state mounts and the optional pair of live QEMU file binds.
     #[test]
     fn a_replicas_host_state_has_fixed_mounts() {
         let root = std::env::temp_dir().join(format!("podmesh-host-state-{}", std::process::id()));
@@ -477,8 +487,8 @@ mod tests {
             "--mount".to_string(), format!("type=bind,src={},dst=/run/podmesh-host/evidence,ro=true", root.join("lab-a/evidence").display()),
             "--mount".to_string(), "type=bind,src=/etc/machine-id,dst=/run/podmesh-host/machine-id,ro=true".to_string(),
         ];
-        if let Some(mount) = generation_mount(std::path::Path::new(QEMU_GENERATION_ID)) {
-            expected.extend(mount);
+        if let Some(mounts) = generation_mounts(std::path::Path::new(QEMU_GENERATION_ID)) {
+            expected.extend(mounts);
         }
         assert_eq!(args, expected);
         assert_eq!(label, "io.podmesh.manager-host-state=lab-a");
@@ -493,18 +503,45 @@ mod tests {
     }
 
     #[test]
-    fn hypervisor_generation_mount_is_read_only_and_rejects_a_symlink() {
+    fn hypervisor_generation_mounts_bind_the_same_file_read_only() {
         let root = std::env::temp_dir().join(format!("podmesh-gen-mount-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
         let source = root.join("vmgenid");
-        std::fs::write(&source, [1_u8; 16]).unwrap();
-        let mount = generation_mount(&source).unwrap();
-        assert_eq!(mount[0], "--mount");
-        assert!(mount[1].ends_with("dst=/run/podmesh-host/vmgenid,ro=true"));
+        // This ordinary file tests argument construction only, not QEMU witness acceptance.
+        std::fs::write(&source, [1_u8; 4096]).unwrap();
+        assert_eq!(
+            generation_mounts(&source).unwrap(),
+            [
+                "--mount".to_string(),
+                format!("type=bind,src={},dst={QEMU_GENERATION_ID},ro=true", source.display()),
+                "--mount".to_string(),
+                format!("type=bind,src={},dst=/run/podmesh-host/vmgenid,ro=true", source.display()),
+            ]
+        );
+        // Planning must not copy, truncate, or otherwise alter the source.
+        assert_eq!(std::fs::read(&source).unwrap(), [1_u8; 4096]);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hypervisor_generation_mounts_refuse_absence_directory_and_symlink() {
+        let root = std::env::temp_dir().join(format!("podmesh-gen-mount-refusal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let absent = root.join("absent");
+        assert!(generation_mounts(&absent).is_none());
+        assert!(!absent.exists(), "absence must not create a replacement witness");
+        assert!(generation_mounts(&root).is_none(), "a directory must not expose broader sysfs");
+        let source = root.join("raw");
+        std::fs::write(&source, [1_u8; 4096]).unwrap();
         let alias = root.join("alias");
         std::os::unix::fs::symlink(&source, &alias).unwrap();
-        assert!(generation_mount(&alias).is_none());
+        assert!(generation_mounts(&alias).is_none(), "the source's final component must not be a symlink");
+        let dangling = root.join("dangling");
+        std::os::unix::fs::symlink(&absent, &dangling).unwrap();
+        assert!(generation_mounts(&dangling).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
