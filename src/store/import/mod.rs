@@ -4,6 +4,11 @@ pub mod caps;
 pub mod source;
 pub mod snapshot;
 pub mod fixture;
+#[cfg(any(test, feature="mariadb"))]
+mod copy;
+pub mod contract;
+#[cfg(feature="mariadb")]
+pub mod target;
 
 use super::{DurableStore, Fault, Result};
 

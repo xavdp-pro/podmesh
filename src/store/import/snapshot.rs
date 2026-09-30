@@ -91,6 +91,12 @@ pub struct Snapshot {
 }
 
 pub fn capture(source: &Path, manifest: &Json, destination: &Path, caps: &Caps) -> Result<Snapshot> {
+    capture_observed(source,manifest,destination,caps,&mut |_|Ok(()))
+}
+
+/// Campaign fault observer operates only on private clone/seal boundaries. The original
+/// remains descriptor-only; errors and external SIGKILL never trigger original cleanup.
+pub fn capture_observed(source:&Path,manifest:&Json,destination:&Path,caps:&Caps,event:&mut dyn FnMut(&str)->Result<()>)->Result<Snapshot> {
     if manifest["synthetic_only"] != true || manifest["customer_data"] != false || manifest["real_keys_or_credentials"] != false
         || manifest["all_owners_and_maintenance_quiesced"] != true || manifest["generator"] != "podmesh-c02-synthetic/1"
         || manifest["source_path"].as_str() != source.to_str() {
@@ -119,6 +125,7 @@ pub fn capture(source: &Path, manifest: &Json, destination: &Path, caps: &Caps) 
     }
     sync_directory(destination)?;
     if bundle_manifest(source,caps)? != Json::Object(before.clone()) { return Err(refusal("source_file_drift")); }
+    event("after_source_bundle_clone")?;
     // First SQLite open: never the original path or its original companion files.
     let clone=Connection::open_with_flags(&clone_path,OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(sqlite_error)?;
     clone.execute_batch("BEGIN;").map_err(sqlite_error)?;
@@ -149,6 +156,7 @@ pub fn capture(source: &Path, manifest: &Json, destination: &Path, caps: &Caps) 
     fs::set_permissions(&snapshot_path,fs::Permissions::from_mode(0o400)).map_err(io_error)?;
     let seal=json!({"format":"podmesh-c02-private-snapshot/1","snapshot_sha256":record["sha256"],"snapshot_bytes":record["bytes"],"source_bundle_before":before,"source_bundle_after":manifest["bundle"],"source_manifest_sha256":canonical::hash(serde_json::to_vec(manifest).unwrap().as_slice()),"all_owners_quiesced":true});
     private_json(&destination.join("seal.json"),&seal)?;
+    event("after_snapshot_seal")?;
     drop(lease);
     Ok(Snapshot{path:snapshot_path,seal})
 }

@@ -145,6 +145,25 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_key_width_exhaustion_and_secret_material_refuse_before_copy() {
+        let root=std::env::temp_dir().join(format!("podmesh-c02-domain-{}-{}",std::process::id(),crate::now()));
+        create(&root).unwrap();let path=root.join("source.sqlite");let caps=development_caps().unwrap();
+        let db=Connection::open(&path).unwrap();
+        for (sql,value,reason) in [
+            ("INSERT INTO metadata VALUES(?,'synthetic')","🧭".repeat(769),"target_text_domain_exceeded"),
+            ("UPDATE publishers SET hostname=? WHERE resource=(SELECT resource FROM publishers LIMIT 1)","x".repeat(256),"target_text_domain_exceeded"),
+            ("UPDATE metadata SET value=? WHERE key=(SELECT key FROM metadata LIMIT 1)","PODMESH-GENUINE-SECRET-PROBE:synthetic-never-a-real-key".into(),"genuine_secret_material_refused"),
+        ] {
+            db.execute_batch("BEGIN").unwrap();db.execute(sql,[value]).unwrap();
+            assert_eq!(source::inspect(&db,&caps,fs::metadata(&path).unwrap().len()).err().unwrap().message,reason);
+            db.execute_batch("ROLLBACK").unwrap();
+        }
+        db.execute_batch("BEGIN; UPDATE observations SET id=9223372036854775807 WHERE id=10;").unwrap();
+        assert_eq!(source::inspect(&db,&caps,fs::metadata(&path).unwrap().len()).err().unwrap().message,"rowid_exhaustion_continuation_unsupported");
+        db.execute_batch("ROLLBACK").unwrap();drop(db);fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn resource_caps_and_source_classes_refuse_before_target_work() {
         let root=std::env::temp_dir().join(format!("podmesh-c02-input-limits-{}-{}",std::process::id(),crate::now()));
         create(&root).unwrap();let db=Connection::open(root.join("source.sqlite")).unwrap();
