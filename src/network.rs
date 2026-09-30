@@ -63,12 +63,7 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             alias_universe_uuid TEXT);",
     )?;
     for column in ["exclusive_resource", "alias_universe_uuid"] {
-        let present: bool = db.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('network_routes') WHERE name=?1",
-            [column],
-            |r| Ok(r.get::<_, i64>(0)? > 0),
-        )?;
-        if !present {
+        if !crate::store::catalog::connection::has_column(db, "network_routes", column)? {
             db.execute_batch(&format!("ALTER TABLE network_routes ADD COLUMN {column} TEXT;"))?;
         }
     }
@@ -77,9 +72,11 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
     // so a universe deleted and put back (promoted from a recovery point at its own address) could
     // never be allocated again either. Only a LIVE allocation is unique, per address and per
     // universe; the released rows are history. An older table is rebuilt once, keeping its rows.
-    let sql: Option<String> = db
-        .query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='network_allocations'", [], |r| r.get(0))
-        .optional()?;
+    //
+    // The question is what the table was *declared* with, which only SQLite keeps verbatim; the
+    // escape is named and explained in `store::catalog`. A store the migration set made is never
+    // in the state this repairs, on either engine.
+    let sql = crate::store::catalog::connection::table_definition(db, "network_allocations")?;
     if sql.is_some_and(|s| s.contains("UNIQUE") || s.contains("PRIMARY KEY")) {
         db.execute_batch(
             "DROP INDEX IF EXISTS network_allocations_live_ip;
@@ -454,12 +451,7 @@ fn ensure_ledger(db: &Connection) -> Result<(), Error> {
             observed TEXT);",
     )?;
     for (table, column) in [("network_routes", "state"), ("network_declaration", "observed"), ("network_declaration", "nat_backend")] {
-        let present: bool = db.query_row(
-            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?1"),
-            [column],
-            |r| Ok(r.get::<_, i64>(0)? > 0),
-        )?;
-        if !present {
+        if !crate::store::catalog::connection::has_column(db, table, column)? {
             db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT;"))?;
         }
     }

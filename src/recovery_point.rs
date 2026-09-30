@@ -135,21 +135,11 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
     )?;
     // The capture mode of a point, added beside the original columns: a journal from before live points gains
     // it with the mode every earlier point was made with.
-    let has_capture = {
-        let mut s = db.prepare("PRAGMA table_info(recovery_points)")?;
-        let names: Vec<String> = s.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<_, _>>()?;
-        names.iter().any(|n| n == "capture")
-    };
-    if !has_capture {
+    if !crate::store::catalog::connection::has_column(db, "recovery_points", "capture")? {
         db.execute("ALTER TABLE recovery_points ADD COLUMN capture TEXT NOT NULL DEFAULT 'stopped'", [])?;
     }
     // The uncompressed size a staging measured, reused by the promotion of the same verified bytes.
-    let staged_has_size: bool = db.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('recovery_point_staged') WHERE name='uncompressed_bytes'",
-        [],
-        |r| Ok(r.get::<_, i64>(0)? > 0),
-    )?;
-    if !staged_has_size {
+    if !crate::store::catalog::connection::has_column(db, "recovery_point_staged", "uncompressed_bytes")? {
         db.execute("ALTER TABLE recovery_point_staged ADD COLUMN uncompressed_bytes INTEGER", [])?;
     }
     Ok(())

@@ -98,21 +98,10 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
     )?;
     // The quorum a proof was verified under (V3-2). A row written before the field existed was verified
     // under a single key or none, which is what the empty default says.
-    let present: bool = db.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('publisher_takeover_verified') WHERE name='authority_quorum'",
-        [],
-        |r| Ok(r.get::<_, i64>(0)? > 0),
-    )?;
-    if !present {
-        db.execute_batch("ALTER TABLE publisher_takeover_verified ADD COLUMN authority_quorum TEXT NOT NULL DEFAULT '';")?;
-    }
-    let present: bool = db.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('publisher_takeover_verified') WHERE name='authority_digest'",
-        [],
-        |r| Ok(r.get::<_, i64>(0)? > 0),
-    )?;
-    if !present {
-        db.execute_batch("ALTER TABLE publisher_takeover_verified ADD COLUMN authority_digest TEXT NOT NULL DEFAULT '';")?;
+    for column in ["authority_quorum", "authority_digest"] {
+        if !crate::store::catalog::connection::has_column(db, "publisher_takeover_verified", column)? {
+            db.execute_batch(&format!("ALTER TABLE publisher_takeover_verified ADD COLUMN {column} TEXT NOT NULL DEFAULT '';"))?;
+        }
     }
     Ok(())
 }
