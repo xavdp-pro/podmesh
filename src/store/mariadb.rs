@@ -261,7 +261,7 @@ fn query_on<Q: Queryable>(queryable: &mut Q, sql: &str, params: &[Value]) -> Res
             .enumerate()
             .map(|(index, value)| match value {
                 Some(value) => from_mysql(value, binary.get(index).copied().unwrap_or(false)),
-                None => Ok(Value::Null),
+                None => Err(Fault::Type.error("missing_mysql_scalar: absent raw field is not SQL NULL")),
             })
             .collect::<Result<Vec<_>>>()?;
         collected.push(Row::new(columns.clone().unwrap_or_default(), values));
@@ -298,7 +298,7 @@ fn from_mysql(value: MyValue, binary: bool) -> Result<Value> {
         MyValue::Bytes(bytes) if binary => Value::Blob(bytes),
         MyValue::Bytes(bytes) => match String::from_utf8(bytes) {
             Ok(text) => Value::Text(text),
-            Err(not_text) => Value::Blob(not_text.into_bytes()),
+            Err(_) => return Err(Fault::Type.error("invalid_utf8_text: MariaDB nonbinary text bytes are not valid UTF8")),
         },
         MyValue::Date(year, month, day, hour, minute, second, micros) => Value::Text(format!(
             "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{micros:06}"
@@ -361,6 +361,13 @@ mod tests {
     use super::super::config::DSN_ENVIRONMENT;
     use super::super::{bootstrap, schema_version, BOOTSTRAP_VERSION};
     use super::*;
+
+    #[test]
+    fn invalid_target_text_is_refused_not_reclassified_as_blob() {
+        let err = from_mysql(MyValue::Bytes(vec![128]), false).unwrap_err();
+        assert!(err.message.contains("invalid_utf8_text"));
+        assert_eq!(from_mysql(MyValue::Bytes(vec![128]), true).unwrap(), Value::Blob(vec![128]));
+    }
 
     /// One MariaDB test at a time: they all write into the one database the DSN names, and each
     /// drops the tables it made. A poisoned lock is taken anyway -- the test that panicked has

@@ -85,6 +85,7 @@ pub const NODE_MIGRATIONS: &[Migration] = &[
     node!("0008-recovery-point"),
     node!("0009-retention"),
     node!("0010-collector"),
+    node!("0011-lossless-node-domain"),
 ];
 
 /// The version a store carries once the whole node set has been applied.
@@ -125,11 +126,17 @@ pub fn apply(store: &mut dyn DurableStore) -> Result<Applied> {
 /// A store recorded at a version this build does not have is **refused**, not downgraded: the
 /// package was rolled back under a journal a later one wrote, and the later shape is the truth.
 pub fn apply_set(store: &mut dyn DurableStore, schema: &'static str, set: &'static [Migration]) -> Result<Applied> {
+    super::import::guard_normal(store)?;
+    apply_set_inner(store, schema, set)
+}
+
+// Import-only mechanics. A checked ImportContext is the sole marked-store caller.
+pub(super) fn apply_set_inner(store: &mut dyn DurableStore, schema: &'static str, set: &'static [Migration]) -> Result<Applied> {
     // Validate both dialect inventories and the complete batch grammar before any DDL.
     checked_table_inventory(set)?;
     let engine = store.engine();
     let latest = set.len() as i64;
-    super::ensure_schema_table(store)?;
+    super::ensure_schema_table_unchecked(store)?;
     let from = super::schema_version(store, schema)?.unwrap_or(0);
     if from > latest {
         return Err(Fault::Schema.error(format!(
@@ -146,7 +153,7 @@ pub fn apply_set(store: &mut dyn DurableStore, schema: &'static str, set: &'stat
         store.execute_batch(migration.sql(engine))?;
         // Recorded after the statements it names, and each of them may be run again: a crash
         // between the two leaves the store at the previous version and the next open repeats it.
-        super::bootstrap(store, schema, version)?;
+        super::bootstrap_unchecked(store, schema, version)?;
         ran.push(migration.id);
     }
     Ok(Applied { schema, from, to: latest, ran })

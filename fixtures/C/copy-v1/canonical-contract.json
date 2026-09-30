@@ -1,0 +1,23 @@
+{
+  "schema": "podmesh.c02.canonical-contract.v1",
+  "version": "podmesh-c02-canonical/1",
+  "scope": "Exact scalar encoding for typedmultiset/count/SHA comparison. Nodeadapter onlyallowed kinds; fivekind auxiliarydomain remainsseparate. C02A oldencoding andrawproofs immutable.",
+  "byteorder": "big endian; lengthcounters unsigned checkedu64",
+  "table_encoding": [
+    "header bytes ASCII PODMESH-C02-CANONICAL followed by NUL then byte01",
+    "table name UTF8 framed by u64length",
+    "columncount u64",
+    "each columnname UTF8 framed by u64length in exact portablemanifest order",
+    "rowcount u64",
+    "row encodings sortedlexicographically as exactbytevectors, each framed by u64length, duplicatesretained"
+  ],
+  "row_encoding": [
+    "eachscalar in columnorder",
+    "Null tag00 no payload",
+    "Integer tag01 then signedi64 two-complement8bytesBE",
+    "Real tag02 then exact f64 IEEEbits8bytesBE; no NaN or signedzero normalization",
+    "Text tag03 then u64bytecount+exact validUTF8bytes, embeddedNUL/normalization/whitespace retained",
+    "Blob tag04 then u64bytecount+rawbytes"
+  ],
+  "comparison": "Compare complete sorted rowbytevectors and declaredcolumnidentity/count exactly, independently alsoSHA256oftableencoding. No hashonly acceptance or SQLcollation sort. NoJSONreserialization or unicode normalization."
+}

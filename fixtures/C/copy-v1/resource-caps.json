@@ -1,0 +1,15 @@
+{
+  "schema": "podmesh.c02.development-resource-caps.v1",
+  "scope": "Synthetic bounded development fixtures only. Required checkedpreflight before marker/schema/targetwrites, laterD4root mayreducecaps butneverautoenlarge. Notlarge-dataset qualification or OS/RSS enforcement.",
+  "total_original_bundle_bytes": 33554432,
+  "total_snapshot_bytes": 33554432,
+  "total_input_scalar_bytes": 16777216,
+  "total_rows": 10000,
+  "per_table_rows": 2000,
+  "per_table_scalar_bytes": 2097152,
+  "per_value_bytes": 262144,
+  "estimated_peak_memory_bytes": 536870912,
+  "checked_peak_formula": "8*(snapshot_bytes+total_input_scalar_bytes)+512*total_rows+128*total_cells+8MiB; allcheckedu64 operations, rejectoverflow/breach beforeDDL. Nativebinarycanonical buffers/typedvectors budget, actualRSS measuredlater; estimatenotproofagainstmaliciousoperator or allocator/systembehaviour.",
+  "nonstreaming": "Each table is one bounded complete transaction; futurechunkedimportneedsnew protocol. Zero/missing/negative/inconsistent contractlimits refuse.",
+  "runtime_bounds_deferred": "D4 pins actualperrequest/statement/campaignlimits and physicalcontainerbudget before anyserver; no currentDB/DSNauthorized."
+}

@@ -35,6 +35,7 @@
 //! ordered set with a file per engine.
 pub mod catalog;
 pub mod config;
+pub mod import;
 #[cfg(feature = "mariadb")]
 pub mod mariadb;
 pub mod migrations;
@@ -414,7 +415,11 @@ pub fn open(config: &StoreConfig) -> Result<Box<dyn DurableStore>> {
     match config.engine {
         Engine::Sqlite => Ok(Box::new(SqliteStore::open(&config.sqlite)?)),
         #[cfg(feature = "mariadb")]
-        Engine::Mariadb => Ok(Box::new(MariadbStore::open(&config.mariadb)?)),
+        Engine::Mariadb => {
+            let mut store = MariadbStore::open(&config.mariadb)?;
+            import::guard_normal(&mut store)?;
+            Ok(Box::new(store))
+        },
         #[cfg(not(feature = "mariadb"))]
         Engine::Mariadb => Err(Fault::Unsupported.error(
             "this build carries no MariaDB backend: build podmesh with the mariadb feature, or set store.engine to sqlite",
@@ -455,12 +460,22 @@ fn schema_ddl(engine: Engine) -> &'static str {
 /// It is the minimal thing an instance must answer for the node to consider it usable, and it is
 /// written to be run again on a store that already has it.
 pub fn ensure_schema_table(store: &mut dyn DurableStore) -> Result<()> {
+    import::guard_normal(store)?;
+    ensure_schema_table_unchecked(store)
+}
+
+fn ensure_schema_table_unchecked(store: &mut dyn DurableStore) -> Result<()> {
     store.execute_batch(schema_ddl(store.engine()))
 }
 
 /// Make the store carry [`SCHEMA_TABLE`], and record that `name` is at `version`.
 pub fn bootstrap(store: &mut dyn DurableStore, name: &str, version: i64) -> Result<()> {
-    ensure_schema_table(store)?;
+    import::guard_normal(store)?;
+    bootstrap_unchecked(store, name, version)
+}
+
+fn bootstrap_unchecked(store: &mut dyn DurableStore, name: &str, version: i64) -> Result<()> {
+    ensure_schema_table_unchecked(store)?;
     let applied_at = crate::now() as i64;
     // Delete then insert rather than an upsert: `ON CONFLICT` and `ON DUPLICATE KEY` are each
     // one engine's dialect, and the transaction makes the pair atomic on both.

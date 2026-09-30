@@ -1,4 +1,6 @@
-//! Synthetic scalar insert/read parity. These tests do not copy a journal or operate a node.
+//! Historical v10 synthetic scalar insert/read parity; immutable C02A fixture/schema route.
+//! These tests do not copy a journal or operate a node.
+const LEGACY_NODE_VERSION: usize = 10;
 use super::{migrations, DurableStore, Result, Row, SqliteStore, Value};
 use serde_json::{json, Value as Json};
 use sha2::{Digest, Sha256};
@@ -148,9 +150,9 @@ fn populate(store: &mut dyn DurableStore, table: &Json, index: usize) -> Result<
 
 fn checked_sqlite() -> SqliteStore {
     let mut store = SqliteStore::open_in_memory().unwrap();
-    migrations::apply(&mut store).unwrap();
+    migrations::apply_set(&mut store, migrations::NODE, &migrations::NODE_MIGRATIONS[..LEGACY_NODE_VERSION]).unwrap();
     let manifest = fixture();
-    for migration in migrations::NODE_MIGRATIONS {
+    for migration in &migrations::NODE_MIGRATIONS[..LEGACY_NODE_VERSION] {
         for engine in [crate::store::Engine::Sqlite, crate::store::Engine::Mariadb] {
             let path = format!(
                 "src/store/migrations/node/{}.{}.sql",
@@ -562,7 +564,7 @@ mod server {
             "DATABASE() must equal the named A02R fixture database before DDL",
         )?;
         report["actual_database_verified_before_ddl"] = json!(info[0].text(0)?);
-        migrations::apply(&mut maria)?;
+        migrations::apply_set(&mut maria, migrations::NODE, &migrations::NODE_MIGRATIONS[..LEGACY_NODE_VERSION])?;
         report["table_collations"]=cells(&maria.query("SELECT TABLE_NAME,TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME",&[])?);
         let manifest = fixture();
         let mut results = Vec::new();
