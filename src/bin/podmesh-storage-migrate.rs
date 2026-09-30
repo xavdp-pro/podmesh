@@ -1,12 +1,11 @@
 //! Explicit synthetic storage qualification CLI. No operational paths or DSN defaults.
 use podmesh::store::{
-    import::{canonical, fixture, snapshot, source},
+    import::{canonical, contract, fixture, snapshot, source},
     Fault, Result,
 };
 use serde_json::{json, Value as Json};
 use std::{
     collections::BTreeMap,
-    fs,
     path::{Path, PathBuf},
 };
 
@@ -15,14 +14,9 @@ fn error(code: &str) -> podmesh::store::StoreError {
 }
 
 fn read_json(path: &Path) -> Result<Json> {
-    let length = fs::metadata(path)
-        .map_err(|_| error("contract_file_missing"))?
-        .len();
-    if length > 1_048_576 {
-        return Err(error("contract_file_too_large"));
-    }
-    serde_json::from_slice(&fs::read(path).map_err(|_| error("contract_file_read_failed"))?)
-        .map_err(|_| error("contract_json_invalid"))
+    // One regular NOFOLLOW|NONBLOCK descriptor: bytes hashed and parsed together.
+    // Offline modes use the same bounded private input policy as server contracts.
+    contract::read_json(path, 1_048_576).map(|(value, _sha256)| value)
 }
 
 fn options(args: &[String]) -> Result<BTreeMap<String, PathBuf>> {
