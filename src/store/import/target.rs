@@ -66,6 +66,22 @@ fn digest(value: &Json) -> Result<String> {
         &serde_json::to_vec(value).map_err(|_| refusal("canonical_contract_json_failed"))?,
     ))
 }
+fn prerequisite_provenance(receipt: &Json, contract: &Json) -> Result<()> {
+    for key in [
+        "source_commit",
+        "binary_sha256",
+        "source_manifest_sha256",
+        "SQL_hashes",
+    ] {
+        if receipt[key] != contract[key] || receipt[key].is_null() {
+            return Err(refusal(
+                "prerequisite_exact_source_binary_or_input_mismatch",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn warnings(db: &mut dyn DurableStore) -> Result<()> {
     if !db.query("SHOW WARNINGS", &[])?.is_empty() {
         return Err(refusal("target_sql_warning_refused"));
@@ -924,6 +940,7 @@ pub fn run(mode: &str, request: &Request<'_>) -> Result<Json> {
         None
     };
     if let Some(cap) = &capability {
+        prerequisite_provenance(cap, &contract.json)?;
         if cap["SQL_hashes"] != sql_hashes()
             || cap["source_manifest_sha256"] != contract.source_sha256
             || cap["tables"] != contract.source["tables"]
@@ -932,6 +949,7 @@ pub fn run(mode: &str, request: &Request<'_>) -> Result<Json> {
         }
     }
     if let Some(restore) = &seeded {
+        prerequisite_provenance(restore, &contract.json)?;
         if restore["tables"] != contract.source["tables"]
             || restore["SQL_hashes"] != sql_hashes()
             || restore["restoration_kind"] != "seeded_restore"
@@ -939,6 +957,23 @@ pub fn run(mode: &str, request: &Request<'_>) -> Result<Json> {
             return Err(refusal("seeded_restore_prerequisite_mismatch"));
         }
     }
+    let origin_receipt = if mode == "restore-verify" {
+        let origin = contract.receipt(
+            "restore_origin_receipt",
+            if contract.json["role"] == "seeded_restore" {
+                "podmesh-c02-capability/1"
+            } else {
+                "podmesh-c02-copy/1"
+            },
+        )?;
+        prerequisite_provenance(&origin, &contract.json)?;
+        if origin["migration_id"] != contract.json["migration_id"] {
+            return Err(refusal("restoration_origin_migration_id_mismatch"));
+        }
+        Some(origin)
+    } else {
+        None
+    };
     let mut report_file = snapshot::create_file(request.output)?;
     use std::io::{Seek, SeekFrom, Write};
     report_file
@@ -977,14 +1012,9 @@ pub fn run(mode: &str, request: &Request<'_>) -> Result<Json> {
         json!({"format":"podmesh-c02-capability/1","status":"PASS","scope":"SYNTHETIC_CAPABILITY_NOT_FULL_C02","stages":stages,"target_shape":target_shape,"capacity_profile":profile(&effective),"table_copy":tables,"tables":contract.source["tables"],"probes":probes,"normal_admission_probes":[ctx.marker_only_probe,incomplete_admission,complete_admission],"verification":verification,"verification_root":root})
     } else if mode == "restore-verify" {
         let cap = capability.as_ref().unwrap();
-        let origin = contract.receipt(
-            "restore_origin_receipt",
-            if contract.json["role"] == "seeded_restore" {
-                "podmesh-c02-capability/1"
-            } else {
-                "podmesh-c02-copy/1"
-            },
-        )?;
+        let origin = origin_receipt
+            .as_ref()
+            .ok_or_else(|| refusal("restoration_origin_receipt_missing"))?;
         let verification = ctx.verify(&cap["target_shape"], true)?;
         let state = ctx.state()?;
         let root = digest(&verification)?;
@@ -1033,6 +1063,7 @@ pub fn run(mode: &str, request: &Request<'_>) -> Result<Json> {
         .ok_or_else(|| refusal("receipt_object_invalid"))?;
     for (k, v) in [
         ("SQL_hashes", sql_hashes()),
+        ("migration_id", contract.json["migration_id"].clone()),
         ("source_manifest_sha256", json!(contract.source_sha256)),
         ("source_commit", contract.json["source_commit"].clone()),
         ("binary_sha256", contract.json["binary_sha256"].clone()),
@@ -1144,6 +1175,16 @@ fn capability_probes(ctx: &mut ImportContext<'_>) -> Result<Json> {
         if (length == 768 && (!success || !warning_rows.is_empty())) || (length == 769 && success) {
             return Err(refusal("capability_full_index_boundary_failed"));
         }
+        let failure_fault = result.as_ref().err().map(|err| err.fault.as_str());
+        if length == 769
+            && result
+                .as_ref()
+                .err()
+                .is_none_or(|err| err.fault != crate::store::Fault::Type)
+        {
+            return Err(refusal("capability_overwidth_wrong_fault"));
+        }
+
         if success {
             let rows = tx.query(
                 "SELECT `key` FROM metadata WHERE `key`=?",
@@ -1154,7 +1195,7 @@ fn capability_probes(ctx: &mut ImportContext<'_>) -> Result<Json> {
             }
         }
         tx.rollback()?;
-        tests.push(json!({"probe":"metadata_full_index_boundary","characters":length,"utf8_bytes":length*4,"accepted":success,"warnings":encode_rows(warning_rows)?,"rollback":true}));
+        tests.push(json!({"probe":"metadata_full_index_boundary","characters":length,"utf8_bytes":length*4,"accepted":success,"failure_fault":failure_fault,"warnings":encode_rows(warning_rows)?,"rollback":true}));
     }
     let metadata = ctx
         .plan
@@ -1189,6 +1230,24 @@ mod tests {
                 .count(),
             11
         );
+    }
+    #[test]
+    fn prerequisite_source_binary_input_or_sql_drift_is_refused() {
+        let contract = json!({"source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","source_manifest_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","SQL_hashes":sql_hashes()});
+        prerequisite_provenance(&contract, &contract).unwrap();
+        for key in [
+            "source_commit",
+            "binary_sha256",
+            "source_manifest_sha256",
+            "SQL_hashes",
+        ] {
+            let mut changed = contract.clone();
+            changed[key] = Json::Null;
+            assert!(prerequisite_provenance(&changed, &contract)
+                .unwrap_err()
+                .message
+                .contains("exact_source_binary_or_input"));
+        }
     }
     #[test]
     fn no_contract_is_a_named_failure_not_a_server_skip() {
