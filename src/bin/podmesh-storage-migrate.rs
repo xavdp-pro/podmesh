@@ -2,7 +2,9 @@ use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "mariadb")]
-use podmesh::store::{node_tables, DurableStore, MariadbConfig, MariadbStore, Value};
+use podmesh::store::{
+    migrations::node_tables, DurableStore, MariadbConfig, MariadbStore, Value,
+};
 #[cfg(feature = "mariadb")]
 use rusqlite::types::ValueRef;
 #[cfg(feature = "mariadb")]
@@ -173,14 +175,15 @@ fn source_rows(
 
 #[cfg(feature = "mariadb")]
 fn source_columns(db: &Connection, table: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let mut statement = db.prepare(&format!(
+    let sql = format!(
         "SELECT name FROM pragma_table_info({}) ORDER BY cid",
         quoted_sqlite_literal(table)
-    ))?;
-    statement
+    );
+    let mut statement = db.prepare(&sql)?;
+    let names = statement
         .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(Into::into)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(names)
 }
 
 #[cfg(feature = "mariadb")]
