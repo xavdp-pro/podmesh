@@ -32,8 +32,10 @@ within its declared loss when a host is lost for good, with the guarantees state
   laboratory's real link flaps and VM pauses; measure them.
 - **C3** Images under Rule 11: pre-placement on eligible hosts, a cluster-controlled registry pulled by digest, or
   rebuild from a lock — which one PodMesh adopts, and the decision recorded.
-- **C4** Shared storage: on a CephFS test bed, whether client eviction/blocklisting gives a storage-level fence
-  PodMesh can call, and how a universe's data directory is bound to it.
+- ~~**C4** Shared storage: on a CephFS test bed, whether client eviction/blocklisting gives a storage-level fence
+  PodMesh can call, and how a universe's data directory is bound to it.~~ **Withdrawn by the operator on 23
+  September 2026: no CephFS.** Nothing found out under it is assumed; reopening it means finding it out again for
+  whatever mechanism replaces it.
 - **C5** Two hosts: the witness's form (a small service outside the cluster, possibly beside the Backup Server) and
   its failure rules.
 - **C6** Volumes and databases: which capture forms are application-consistent for the first real workloads.
@@ -50,7 +52,8 @@ within its declared loss when a host is lost for good, with the guarantees state
 5. **O5 — Losing a host for good.** Declaration, plan, spread execution, protection against return, readmission;
    campaign: a host destroyed (disk wiped), everything restored elsewhere, the host rebuilt and readmitted.
 6. **O6 — Topologies.** One host with a Backup Server, two hosts without and with a witness (C5), ten hosts enrolled at
-   once, shared storage (C4); campaign per topology; the guarantee statement verified against each.
+   once; campaign per topology; the guarantee statement verified against each. Shared storage left the target with
+   C4 on 23 September 2026; O6 closes without it.
 7. **O7 — Real data.** Volumes, databases, secrets, network identity (C6), the Backup Server and its off-site copy;
    campaign: restore a real application from the Backup Server after the loss of every host.
 8. **O8 — Growth without friction.** One-gesture enrollment of one or many hosts, gradual rebalancing, rolling upgrades;
