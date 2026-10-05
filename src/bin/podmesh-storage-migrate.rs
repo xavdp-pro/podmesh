@@ -20,7 +20,7 @@ fn read_json(path: &Path) -> Result<Json> {
 }
 
 fn options(args: &[String]) -> Result<BTreeMap<String, PathBuf>> {
-    if args.len() % 2 != 0 {
+    if !args.len().is_multiple_of(2) {
         return Err(error("explicit_named_paths_required"));
     }
     let mut out = BTreeMap::new();
