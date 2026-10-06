@@ -66,6 +66,66 @@ fn digest(value: &Json) -> Result<String> {
         &serde_json::to_vec(value).map_err(|_| refusal("canonical_contract_json_failed"))?,
     ))
 }
+
+fn select_schema_stage(stages: &[Json], actual_hash: &str, final_step: usize) -> Result<usize> {
+    let expected_count = final_step
+        .checked_add(1)
+        .ok_or_else(|| refusal("capability_stage_invalid"))?;
+    if stages.len() != expected_count {
+        return Err(refusal("capability_stage_invalid"));
+    }
+    for (position, stage) in stages.iter().enumerate() {
+        let step = stage["step"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok());
+        let hash = stage["shape_sha256"].as_str();
+        if step != Some(position)
+            || hash.is_none_or(|value| {
+                value.len() != 64
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        {
+            return Err(refusal("capability_stage_invalid"));
+        }
+    }
+
+    let mut matching = stages
+        .iter()
+        .enumerate()
+        .filter(|(_, stage)| stage["shape_sha256"] == actual_hash);
+    let (position, stage) = matching
+        .next()
+        .ok_or_else(|| refusal("target_unknown_or_ambiguous_partial_schema"))?;
+    if matching.next().is_some() {
+        return Err(refusal("target_unknown_or_ambiguous_partial_schema"));
+    }
+    let step = stage["step"]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| refusal("capability_stage_invalid"))?;
+    if step > final_step {
+        return Err(refusal("capability_stage_invalid"));
+    }
+    if step != position {
+        return Err(refusal("capability_stage_invalid"));
+    }
+    Ok(step)
+}
+
+fn validate_next_schema_stage(
+    stages: &[Json],
+    completed_step: usize,
+    actual_hash: &str,
+) -> Result<()> {
+    if stages.get(completed_step).is_none_or(|stage| {
+        stage["step"] != json!(completed_step) || stage["shape_sha256"] != actual_hash
+    }) {
+        return Err(refusal("target_ddl_stage_drift"));
+    }
+    Ok(())
+}
 fn prerequisite_provenance(receipt: &Json, contract: &Json, plan_sha: &str) -> Result<()> {
     for key in [
         "source_commit",
@@ -622,19 +682,8 @@ impl<'a> ImportContext<'a> {
         let stages = capability["stages"]
             .as_array()
             .ok_or_else(|| refusal("capability_stages_missing"))?;
-        let candidates: Vec<usize> = stages
-            .iter()
-            .filter(|v| v["shape_sha256"] == actual_hash)
-            .filter_map(|v| v["step"].as_u64().and_then(|n| usize::try_from(n).ok()))
-            .collect();
-        if candidates.len() != 1 {
-            return Err(refusal("target_unknown_or_ambiguous_partial_schema"));
-        }
-        let start = candidates[0];
         let statements = steps()?;
-        if start > statements.len() {
-            return Err(refusal("capability_stage_invalid"));
-        }
+        let start = select_schema_stage(stages, &actual_hash, statements.len())?;
         if start > 0 {
             if start == 1 {
                 self.initialize()?;
@@ -658,12 +707,7 @@ impl<'a> ImportContext<'a> {
         for (index, sql) in statements.iter().enumerate().skip(start) {
             self.apply_step(index, sql)?;
             let actual = digest(&shape(&mut self.db)?)?;
-            if stages
-                .get(index + 1)
-                .is_none_or(|v| v["step"] != json!(index + 1) || v["shape_sha256"] != actual)
-            {
-                return Err(refusal("target_ddl_stage_drift"));
-            }
+            validate_next_schema_stage(stages, index + 1, &actual)?;
         }
         let final_shape = shape(&mut self.db)?;
         if final_shape != capability["target_shape"] {
@@ -1272,6 +1316,172 @@ fn capability_probes(ctx: &mut ImportContext<'_>) -> Result<Json> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn schema_stage_selector_accepts_one_exact_pinned_stage() {
+        let stages = vec![
+            json!({"step":0,"shape_sha256":"a".repeat(64)}),
+            json!({"step":1,"shape_sha256":"b".repeat(64)}),
+            json!({"step":2,"shape_sha256":"c".repeat(64)}),
+        ];
+        assert_eq!(select_schema_stage(&stages, &"b".repeat(64), 2).unwrap(), 1);
+    }
+
+    #[test]
+    fn schema_stage_selector_accepts_initial_and_final_pinned_stages() {
+        let stages = vec![
+            json!({"step":0,"shape_sha256":"a".repeat(64)}),
+            json!({"step":1,"shape_sha256":"b".repeat(64)}),
+            json!({"step":2,"shape_sha256":"c".repeat(64)}),
+        ];
+        assert_eq!(select_schema_stage(&stages, &"a".repeat(64), 2).unwrap(), 0);
+        assert_eq!(select_schema_stage(&stages, &"c".repeat(64), 2).unwrap(), 2);
+    }
+
+    #[test]
+    fn schema_stage_selector_refuses_unknown_and_ambiguous_hashes() {
+        let unique = vec![
+            json!({"step":0,"shape_sha256":"a".repeat(64)}),
+            json!({"step":1,"shape_sha256":"b".repeat(64)}),
+            json!({"step":2,"shape_sha256":"c".repeat(64)}),
+        ];
+        assert_eq!(
+            select_schema_stage(&unique, &"d".repeat(64), 2)
+                .unwrap_err()
+                .message,
+            "target_unknown_or_ambiguous_partial_schema"
+        );
+        let ambiguous = vec![
+            json!({"step":0,"shape_sha256":"b".repeat(64)}),
+            json!({"step":1,"shape_sha256":"b".repeat(64)}),
+            json!({"step":2,"shape_sha256":"c".repeat(64)}),
+        ];
+        assert_eq!(
+            select_schema_stage(&ambiguous, &"b".repeat(64), 2)
+                .unwrap_err()
+                .message,
+            "target_unknown_or_ambiguous_partial_schema"
+        );
+    }
+
+    #[test]
+    fn schema_stage_selector_refuses_tampered_matching_stage() {
+        let missing_step = vec![
+            json!({"step":0,"shape_sha256":"a".repeat(64)}),
+            json!({"shape_sha256":"b".repeat(64)}),
+            json!({"step":2,"shape_sha256":"c".repeat(64)}),
+        ];
+        assert_eq!(
+            select_schema_stage(&missing_step, &"b".repeat(64), 2)
+                .unwrap_err()
+                .message,
+            "capability_stage_invalid"
+        );
+        let out_of_range = vec![
+            json!({"step":0,"shape_sha256":"a".repeat(64)}),
+            json!({"step":3,"shape_sha256":"b".repeat(64)}),
+            json!({"step":2,"shape_sha256":"c".repeat(64)}),
+        ];
+        assert_eq!(
+            select_schema_stage(&out_of_range, &"b".repeat(64), 2)
+                .unwrap_err()
+                .message,
+            "capability_stage_invalid"
+        );
+        let misnumbered = vec![
+            json!({"step":0,"shape_sha256":"a".repeat(64)}),
+            json!({"step":2,"shape_sha256":"b".repeat(64)}),
+        ];
+        assert_eq!(
+            select_schema_stage(&misnumbered, &"b".repeat(64), 2)
+                .unwrap_err()
+                .message,
+            "capability_stage_invalid"
+        );
+        let malformed_hash = vec![
+            json!({"step":0,"shape_sha256":"a".repeat(64)}),
+            json!({"step":1,"shape_sha256":"B".repeat(64)}),
+            json!({"step":2,"shape_sha256":"c".repeat(64)}),
+        ];
+        assert_eq!(
+            select_schema_stage(&malformed_hash, &"a".repeat(64), 2)
+                .unwrap_err()
+                .message,
+            "capability_stage_invalid"
+        );
+        for malformed in ["a".repeat(63), "a".repeat(65), format!("{}g", "a".repeat(63))] {
+            let bad_hash = vec![
+                json!({"step":0,"shape_sha256":malformed}),
+                json!({"step":1,"shape_sha256":"b".repeat(64)}),
+                json!({"step":2,"shape_sha256":"c".repeat(64)}),
+            ];
+            assert_eq!(
+                select_schema_stage(&bad_hash, &"a".repeat(64), 2)
+                    .unwrap_err()
+                    .message,
+                "capability_stage_invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_stage_selector_preflights_later_entries_before_accepting_current_stage() {
+        let current = json!({"step":0,"shape_sha256":"a".repeat(64)});
+        let later = json!({"step":1,"shape_sha256":"b".repeat(64)});
+        assert_eq!(
+            select_schema_stage(&[current.clone(), later.clone()], &"a".repeat(64), 2)
+                .unwrap_err()
+                .message,
+            "capability_stage_invalid"
+        );
+        let misnumbered_later = json!({"step":2,"shape_sha256":"b".repeat(64)});
+        assert_eq!(
+            select_schema_stage(
+                &[current, misnumbered_later, json!({"step":2,"shape_sha256":"c".repeat(64)})],
+                &"a".repeat(64),
+                2,
+            )
+            .unwrap_err()
+            .message,
+            "capability_stage_invalid"
+        );
+    }
+
+    #[test]
+    fn next_schema_stage_comparison_accepts_exact_and_refuses_drift_or_missing_stage() {
+        let exact = vec![
+            json!({"step":0,"shape_sha256":"a".repeat(64)}),
+            json!({"step":1,"shape_sha256":"b".repeat(64)}),
+        ];
+        assert!(validate_next_schema_stage(&exact, 1, &"b".repeat(64)).is_ok());
+
+        let changed = vec![
+            json!({"step":0,"shape_sha256":"a".repeat(64)}),
+            json!({"step":1,"shape_sha256":"c".repeat(64)}),
+        ];
+        assert_eq!(
+            validate_next_schema_stage(&changed, 1, &"b".repeat(64))
+                .unwrap_err()
+                .message,
+            "target_ddl_stage_drift"
+        );
+        assert_eq!(
+            validate_next_schema_stage(&exact[..1], 1, &"b".repeat(64))
+                .unwrap_err()
+                .message,
+            "target_ddl_stage_drift"
+        );
+        let misnumbered = vec![
+            json!({"step":0,"shape_sha256":"a".repeat(64)}),
+            json!({"step":2,"shape_sha256":"b".repeat(64)}),
+        ];
+        assert_eq!(
+            validate_next_schema_stage(&misnumbered, 1, &"b".repeat(64))
+                .unwrap_err()
+                .message,
+            "target_ddl_stage_drift"
+        );
+    }
+
     #[test]
     fn steps_are_marker_first_versioned_and_pin_all_released_bytes() {
         let steps = steps().unwrap();
