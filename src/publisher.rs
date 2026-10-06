@@ -569,7 +569,9 @@ fn connector_id(resource: &str) -> Option<String> {
 /// are effective, and the gate as three answers -- `Some(true)`, `Some(false)` when either is read
 /// absent, and `None` when neither is read absent and one could not be read. An unread alias is never
 /// an absent one (second review of V3-1): the follow tick counts it as unknown, it never resumes on it.
-fn service_here(db: &Connection, resource: &str) -> Result<(Option<(String, String)>, Option<bool>), Error> {
+type ServiceHere = (Option<(String, String)>, Option<bool>);
+
+fn service_here(db: &Connection, resource: &str) -> Result<ServiceHere, Error> {
     let row: Option<(String, Option<String>, Option<String>)> = db
         .query_row("SELECT ip,alias_universe_uuid,state FROM network_routes WHERE exclusive_resource=?1", [resource], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .optional()?;

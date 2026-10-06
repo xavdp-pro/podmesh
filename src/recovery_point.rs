@@ -1229,7 +1229,11 @@ pub(crate) fn promoted_live_container(db: &Connection, container_id: &str) -> Re
         .is_some())
 }
 
-fn staged_row(db: &Connection, point: &str) -> Result<Option<(String, String, Option<i64>, Option<String>, Option<String>, String, String, i64)>, Error> {
+type StagedRow = (String, String, Option<i64>, Option<String>, Option<String>, String, String, i64);
+type StagedViewRow = (String, String, i64, String, i64, String, String, String, i64, Option<i64>, Option<String>);
+type StagedForRow = (String, String, i64, String, i64, String, String, i64, Option<i64>, Option<String>);
+
+fn staged_row(db: &Connection, point: &str) -> Result<Option<StagedRow>, Error> {
     Ok(db
         .query_row(
             "SELECT universe_uuid,operation_id,discarded_at,discard_operation_id,promoted_operation_id,inbox,archive_sha256,archive_bytes
@@ -1243,7 +1247,7 @@ fn staged_row(db: &Connection, point: &str) -> Result<Option<(String, String, Op
 const STAGED_NOTE: &str = "a memory checkpoint restores as running processes, so no copy is created here: the archive is held, verified against its manifest, and restored only by recovery_point_promote under the lease";
 
 fn staged_view(db: &Connection, id: &str, replayed: bool) -> Result<Option<Value>, Error> {
-    let row: Option<(String, String, i64, String, i64, String, String, String, i64, Option<i64>, Option<String>)> = db
+    let row: Option<StagedViewRow> = db
         .query_row(
             "SELECT recovery_point_uuid,universe_uuid,generation,archive_sha256,archive_bytes,manifest_sha256,image_id,inbox,staged_at,discarded_at,promoted_operation_id
              FROM recovery_point_staged WHERE operation_id=?1",
@@ -1271,7 +1275,7 @@ fn staged_for(db: &Connection, uuid: &str) -> Result<Vec<Value>, Error> {
         "SELECT recovery_point_uuid,operation_id,generation,archive_sha256,archive_bytes,image_id,inbox,staged_at,discarded_at,promoted_operation_id
          FROM recovery_point_staged WHERE universe_uuid=?1 ORDER BY generation",
     )?;
-    let rows: Vec<(String, String, i64, String, i64, String, String, i64, Option<i64>, Option<String>)> = s
+    let rows: Vec<StagedForRow> = s
         .query_map([uuid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)))?
         .collect::<Result<_, _>>()?;
     let now = crate::now() as i64;

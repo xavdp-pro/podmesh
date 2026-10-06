@@ -121,7 +121,7 @@ pub(crate) fn last_intents(db: &Connection) -> Result<BTreeMap<String, LastInten
     let attempts = last_attempts(db)?;
     let mut intents: BTreeMap<String, LastIntent> = BTreeMap::new();
     let mut record = |uuid: &str, intent: Intent, position: i64, operation: &str, operation_id: &str| {
-        let newer = intents.get(uuid).map_or(true, |known| position > known.position);
+        let newer = intents.get(uuid).is_none_or(|known| position > known.position);
         if newer {
             intents.insert(
                 uuid.to_string(),
@@ -294,7 +294,7 @@ fn before_start(db: &Connection, uuid: &str, last: &LastIntent, f: &Facts) -> Re
     }
     // A live capture the service did not see to the end, or a live promotion it launched and never recorded,
     // after the last intent: retrying that operation settles it and keeps the memory a plain start discards.
-    let after_last = |id: &str| f.attempts.get(id).map_or(true, |p| *p >= last.position);
+    let after_last = |id: &str| f.attempts.get(id).is_none_or(|p| *p >= last.position);
     if table_exists(db, "recovery_point_live_captures")? {
         let mut stmt = db.prepare("SELECT operation_id FROM recovery_point_live_captures WHERE universe_uuid=?1 AND state='dumping'")?;
         let open: Vec<String> = stmt.query_map([uuid], |r| r.get(0))?.collect::<Result<_, _>>()?;
