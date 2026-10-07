@@ -52,8 +52,9 @@ def validate(path, salt=None):
             fail(f"unsupported directive {key}")
     if actual != expected:
         fail("network mode or address-family limits differ from the reviewed grammar")
-    if len(allows) != 2:
-        fail("exactly two peer /32 allowances are required")
+    loopback_store = "127.0.0.1/32"
+    if len(allows) not in (2, 3):
+        fail("exactly two peer /32 allowances are required, or two peers plus loopback store sidecar")
     addresses = []
     for value in allows:
         try:
@@ -63,6 +64,12 @@ def validate(path, salt=None):
         if network.version != 4 or network.prefixlen != 32:
             fail("peer allowance is not an IPv4 /32")
         addresses.append(str(network))
+    store_sidecar = False
+    if loopback_store in addresses:
+        if len(addresses) != 3:
+            fail("loopback store allowance is only permitted with exactly two peer /32 allowances")
+        store_sidecar = True
+        addresses = [value for value in addresses if value != loopback_store]
     if len(set(addresses)) != 2:
         fail("peer /32 allowances are duplicated")
     return {
@@ -78,6 +85,7 @@ def validate(path, salt=None):
         "address_families": ["AF_UNIX", "AF_INET"],
         "peer_allow_count": 2,
         "peer_allow_prefix_length": 32,
+        "store_sidecar_loopback_allow": store_sidecar,
     }
 
 

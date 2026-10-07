@@ -20,7 +20,9 @@ or wildcard bind fails the comparison.
 ## Boundaries
 
 The manager package remains disabled and has Restart=no. The activation
-fragment permits exactly two literal IPv4 peers:
+fragment permits exactly two literal IPv4 peers. When the host's store profile
+names `engine: mariadb` on loopback TCP (`127.0.0.1`, no `socket`), add one
+reviewed allowance for the local sidecar:
 
 ~~~ini
 [Service]
@@ -28,9 +30,11 @@ Environment=PODMESH_MANAGER_NETWORK_MODE=authenticated-static-peers
 RestrictAddressFamilies=AF_UNIX AF_INET
 IPAddressAllow=<peer-1>/32
 IPAddressAllow=<peer-2>/32
+IPAddressAllow=127.0.0.1/32
 ~~~
 
-The packaged IPAddressDeny=any remains in force. The collector checks the
+A MariaDB profile reached only through a Unix `socket` keeps the two-peer
+fragment. The packaged IPAddressDeny=any remains in force. The collector checks the
 effective systemd properties, not only the fragment text, and commits them
 without disclosing addresses. HMAC peer authentication remains the application
 security boundary: the configured systemd IP policy is not described as

@@ -137,6 +137,15 @@ dropin() {
     grep -Eq '(^| )PODMESH_MANAGER_NETWORK_MODE=authenticated-static-peers( |$)' <<<"$environment" || { echo 'Effective network mode is not authenticated-static-peers' >&2; return 1; }
     [ "$(tr ' ' '\n' <<<"$families" | sed '/^$/d' | sort | tr '\n' ' ')" = 'AF_INET AF_UNIX ' ] || { echo 'Effective address families differ from AF_UNIX and AF_INET' >&2; return 1; }
     expected_allow=$(jq -r '.network.peers[].endpoint | capture("^(?<address>[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+):[0-9]+$").address + "/32"' /etc/podmesh-manager/config.json | sort | tr '\n' ' ')
+    store=$(jq -er '.network.database_path' /etc/podmesh-manager/config.json)
+    store_profile=${PODMESH_STORE_PROFILE:-$(dirname -- "$store")/store.json}
+    if [ -f "$store_profile" ] && jq -e '(.store.engine // .engine) == "mariadb"' "$store_profile" >/dev/null; then
+      mhost=$(jq -r '.store.mariadb.host // .mariadb.host // "127.0.0.1"' "$store_profile")
+      msocket=$(jq -r '.store.mariadb.socket // .mariadb.socket // empty' "$store_profile")
+      if [ -z "$msocket" ] && [ "$mhost" = 127.0.0.1 ]; then
+        expected_allow=$(printf '%s\n%s' '127.0.0.1/32' "$(tr ' ' '\n' <<<"$expected_allow" | sed '/^$/d')") | sort | tr '\n' ' '
+      fi
+    fi
     actual_allow=$(tr ' ' '\n' <<<"$allows" | sed '/^$/d' | sort | tr '\n' ' ')
     [ "$actual_allow" = "$expected_allow" ] || { echo 'Effective IP allow-list differs from configured peers' >&2; return 1; }
     case "$(tr ' ' '\n' <<<"$denies" | sed '/^$/d' | sort | tr '\n' ' ')" in
@@ -146,7 +155,7 @@ dropin() {
     policy=$(printf '%s\0%s\0%s\0%s' "$environment" "$families" "$allows" "$denies" | commit_stdin effective-unit-network-policy)
     jq -cn --arg sha "$(commit_file dropin "$installed" | sed 's/^sha256://')" --arg fragment "$(sha256sum -- "$packaged"|awk '{print $1}')" --arg policy "$policy" --argjson limits "$limits" '{present:true,sha256:$sha,semantic_limits:$limits,packaged_fragment_sha256:$fragment,inherited_deny_all:true,effective_policy_configured:true,effective_policy_commitment:$policy}'
   else
-    jq -cn --arg fragment "$(sha256sum -- "$packaged"|awk '{print $1}')" '{present:false,sha256:null,semantic_limits:{network_mode:null,address_families:[],peer_allow_count:0,peer_allow_prefix_length:null},packaged_fragment_sha256:$fragment,inherited_deny_all:true,effective_policy_configured:false,effective_policy_commitment:null}'
+    jq -cn --arg fragment "$(sha256sum -- "$packaged"|awk '{print $1}')" '{present:false,sha256:null,semantic_limits:{network_mode:null,address_families:[],peer_allow_count:0,peer_allow_prefix_length:null,store_sidecar_loopback_allow:false},packaged_fragment_sha256:$fragment,inherited_deny_all:true,effective_policy_configured:false,effective_policy_commitment:null}'
   fi
 }
 listeners() {

@@ -70,6 +70,7 @@ def build_fixture(comparator: Path) -> dict[tuple[str, str], dict]:
                 "address_families": ["AF_UNIX", "AF_INET"],
                 "peer_allow_count": 2,
                 "peer_allow_prefix_length": 32,
+                "store_sidecar_loopback_allow": False,
                 "sha256": digest("dropin"),
             }
             if running
@@ -78,6 +79,7 @@ def build_fixture(comparator: Path) -> dict[tuple[str, str], dict]:
                 "address_families": [],
                 "peer_allow_count": 0,
                 "peer_allow_prefix_length": None,
+                "store_sidecar_loopback_allow": False,
             }
         )
 

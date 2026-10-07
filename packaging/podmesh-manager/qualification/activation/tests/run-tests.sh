@@ -65,9 +65,21 @@ IPAddressAllow=192.0.2.1/32
 IPAddressAllow=192.0.2.2/32
 EOF
 python3 "$root/validate-dropin.py" --dropin "$work/good.conf" > "$work/dropin.json"
-jq -e '.network_mode=="authenticated-static-peers" and .address_families==["AF_UNIX","AF_INET"] and .peer_allow_count==2 and .peer_allow_prefix_length==32' "$work/dropin.json" >/dev/null
+jq -e '.network_mode=="authenticated-static-peers" and .address_families==["AF_UNIX","AF_INET"] and .peer_allow_count==2 and .peer_allow_prefix_length==32 and .store_sidecar_loopback_allow==false' "$work/dropin.json" >/dev/null
+cat > "$work/mariadb-good.conf" <<'EOF'
+[Service]
+Environment=PODMESH_MANAGER_NETWORK_MODE=authenticated-static-peers
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressAllow=192.0.2.1/32
+IPAddressAllow=192.0.2.2/32
+IPAddressAllow=127.0.0.1/32
+EOF
+python3 "$root/validate-dropin.py" --dropin "$work/mariadb-good.conf" > "$work/mariadb-dropin.json"
+jq -e '.peer_allow_count==2 and .store_sidecar_loopback_allow==true' "$work/mariadb-dropin.json" >/dev/null
 printf '%s\n' '[Service]' 'Environment=PODMESH_MANAGER_NETWORK_MODE=authenticated-static-peers' 'RestrictAddressFamilies=AF_UNIX AF_INET' 'IPAddressAllow=192.0.2.1/24' 'IPAddressAllow=192.0.2.2/32' > "$work/bad.conf"
 if python3 "$root/validate-dropin.py" --dropin "$work/bad.conf" --quiet; then echo 'accepted non-/32 drop-in' >&2; exit 1; fi
+printf '%s\n' '[Service]' 'Environment=PODMESH_MANAGER_NETWORK_MODE=authenticated-static-peers' 'RestrictAddressFamilies=AF_UNIX AF_INET' 'IPAddressAllow=192.0.2.1/32' 'IPAddressAllow=192.0.2.2/32' 'IPAddressAllow=192.0.2.3/32' > "$work/bad-widened.conf"
+if python3 "$root/validate-dropin.py" --dropin "$work/bad-widened.conf" --quiet; then echo 'accepted unreviewed third peer drop-in' >&2; exit 1; fi
 
 python3 - "$work" <<'PY'
 import hashlib,json,pathlib,sys
@@ -80,7 +92,7 @@ shutdown={"schema_version":"podmesh-manager-graceful-shutdown/v1","typed_request
 def evidence(i,stage):
     running=stage in ("active-baseline","converged"); cleanup=stage=="post-cleanup"
     peers=[{"replica_id_commitment":replicas[j],"endpoint_commitment":c(f"endpoint-{j}"),"shared_key_commitment":keys[tuple(sorted((i,j)))]} for j in range(3) if j!=i]
-    limits={"network_mode":"authenticated-static-peers","address_families":["AF_UNIX","AF_INET"],"peer_allow_count":2,"peer_allow_prefix_length":32,"sha256":h("dropin")} if running else {"network_mode":None,"address_families":[],"peer_allow_count":0,"peer_allow_prefix_length":None}
+    limits={"network_mode":"authenticated-static-peers","address_families":["AF_UNIX","AF_INET"],"peer_allow_count":2,"peer_allow_prefix_length":32,"store_sidecar_loopback_allow":False,"sha256":h("dropin")} if running else {"network_mode":None,"address_families":[],"peer_allow_count":0,"peer_allow_prefix_length":None,"store_sidecar_loopback_allow":False}
     def inspect(history, hc, rc, ac, attempts, exchanges):
         exchanges = exchanges or []
         return {"store_present":True,"schema_version":4,"logical_manager_commitment":c("logical"),
@@ -148,8 +160,8 @@ jq -e '.status=="PASS" and (.canonical_convergence_evidenced|not) and .ha_claim=
 "$root/compare-evidence.py" "${three_args[@]}" > "$work/three.json"
 jq -e '.status=="PASS" and .canonical_convergence_evidenced and .ha_claim=="absent" and .schema_version=="podmesh-manager-live-activation-comparison/v3"' "$work/three.json" >/dev/null
 # The passing fixtures must exercise the bound hash rather than bypass it: five fields with the inner hash equal to the outer one while active, four fields while absent.
-jq -e '(.dropin.semantic_limits|length)==5 and .dropin.semantic_limits.sha256==.dropin.sha256' "$work/lab-a-active-baseline.json" >/dev/null
-jq -e '(.dropin.semantic_limits|length)==4 and (.dropin.semantic_limits|has("sha256")|not)' "$work/lab-a-pre-activation.json" >/dev/null
+jq -e '(.dropin.semantic_limits|length)==6 and .dropin.semantic_limits.sha256==.dropin.sha256' "$work/lab-a-active-baseline.json" >/dev/null
+jq -e '(.dropin.semantic_limits|length)==5 and (.dropin.semantic_limits|has("sha256")|not)' "$work/lab-a-pre-activation.json" >/dev/null
 
 reject_host() { local label=$1 filter=$2; jq "$filter | $derive_imported" "$work/lab-a-${3:-post-cleanup}.json" > "$work/bad.json"; sidecar "$work/bad.json"; local args=("${host_args[@]}"); case ${3:-post-cleanup} in pre-activation) args[3]="$work/bad.json";; active-baseline) args[5]="$work/bad.json";; converged) args[7]="$work/bad.json";; post-cleanup) args[9]="$work/bad.json";; esac; if "$root/compare-evidence.py" "${args[@]}" >/dev/null; then echo "accepted $label" >&2; exit 1; fi; }
 reject_three() { local label=$1 filter=$2 stage=$3; jq "$filter | $derive_imported" "$work/lab-a-$stage.json" > "$work/bad.json"; sidecar "$work/bad.json"; local args=("${three_args[@]}"); case $stage in active-baseline) args=(--phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work/bad.json" "$work/lab-b-active-baseline.json" "$work/lab-c-active-baseline.json" --converged "$work"/*-converged.json --cleanup "$work"/*-post-cleanup.json);; converged) args=(--phase three-host --pre "$work"/*-pre-activation.json --active-baseline "$work"/*-active-baseline.json --converged "$work/bad.json" "$work/lab-b-converged.json" "$work/lab-c-converged.json" --cleanup "$work"/*-post-cleanup.json);; esac; if "$root/compare-evidence.py" "${args[@]}" >/dev/null; then echo "accepted $label" >&2; exit 1; fi; }
@@ -169,7 +181,8 @@ reject_error 'active drop-in without validated hash' 'del(.dropin.semantic_limit
 reject_error 'malformed validated drop-in hash' '.dropin.semantic_limits.sha256="not-a-sha256"' active-baseline 'dropin.semantic_limits.sha256: invalid SHA-256'
 reject_error 'validated drop-in hash unbound from installed drop-in' '.dropin.semantic_limits.sha256="0000000000000000000000000000000000000000000000000000000000000000"' active-baseline 'validated drop-in hash is not the installed drop-in hash'
 reject_error 'absent drop-in carrying a validated hash' '.dropin.semantic_limits.sha256=null' pre-activation 'dropin.semantic_limits: unsafe shape'
-reject_host 'widened effective policy' '.dropin.semantic_limits.peer_allow_count=3' active-baseline
+reject_host 'widened effective policy' '.dropin.semantic_limits.store_sidecar_loopback_allow=true' active-baseline
+reject_host 'unreviewed third peer allowance' '.dropin.semantic_limits.peer_allow_count=3' active-baseline
 reject_host 'missing effective policy observation' '.dropin.effective_policy_configured=false' active-baseline
 reject_host 'infrastructure mutation during convergence' '.stability.firewall.commitment="sha256:0000000000000000000000000000000000000000000000000000000000000000"' converged
 reject_host 'manager restart during convergence' '.service.main_pid=999 | .manager_process.pid=999 | .service.invocation_commitment="sha256:0000000000000000000000000000000000000000000000000000000000000000"' converged
