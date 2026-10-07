@@ -57,9 +57,10 @@ pub(crate) const CLASS_RECOVERY_POINT_AFTER_RETENTION: &str = "recovery_point_ar
 
 /// Reservation states that still owe someone a decision. A settled reservation is a finished record: the
 /// collector counts it and leaves it alone.
-const OPEN_STATES: [&str; 6] = [
+const OPEN_STATES: [&str; 7] = [
     "reserved",
     mg::NESTED_INNER_RECONCILED,
+    mg::NESTED_VFS_STORE_BOUND,
     "checkpointing",
     "checkpointed",
     "checkpoint_failed",
