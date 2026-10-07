@@ -2,13 +2,16 @@
 //! laboratory request surface on [`DurableStore`]. SQLite keeps the file-backed [`Store`].
 
 use super::{
-    apply, corrupt_model, decode_fact_row, digest, enum_from_text, error, json,
-    mutation_operation_id, receipt_digest, receipt_metadata_for_request,
-    store_closed_state_untracked, validate_local_configuration, validate_receipt_metadata,
-    validate_receipt_operation_id, Configuration, DurableError, DurableResult, Executed,
-    ReceiptEvidence, ReceiptKind, ReceiptMetadata, Request, Response, Store, StoreClosedState,
-    StoreIntegrity, Topology,
+    apply, authenticated_import_receipt_id, corrupt_model, decode_fact_row, digest,
+    enum_from_text, error, json, mutation_operation_id, receipt_digest,
+    receipt_metadata_for_request, store_closed_state_untracked, validate_local_configuration,
+    validate_receipt_metadata, validate_receipt_operation_id, AuditDirection, AuditOutcome,
+    AuditPhase, AuthenticatedImport, Configuration, DurableError, DurableResult, Executed,
+    ExchangeAuditEvent, ReceiptEvidence, ReceiptKind, ReceiptMetadata, Request, Response,
+    Snapshot, Store, StoreClosedState, StoreIntegrity, Topology,
 };
+#[cfg(feature = "mariadb")]
+use super::journal_audit;
 use podmesh::store::{self, Row, StoreConfig, Transaction, Value};
 use podmesh::ManagerJournal;
 
@@ -372,6 +375,84 @@ impl MariaDbJournal {
         self.closed_state.clone()
     }
 
+    /// Imports an authenticated peer snapshot with the same contract as [`Store`].
+    ///
+    /// # Errors
+    /// Rejects invalid audit metadata, corrupt state, and failures before commit.
+    pub fn execute_authenticated_import(
+        &mut self,
+        wire_operation_id: &str,
+        snapshot: &Snapshot,
+        mut audit: ExchangeAuditEvent,
+    ) -> DurableResult<AuthenticatedImport> {
+        if audit.direction != AuditDirection::Inbound
+            || audit.phase != AuditPhase::InboundImportCommitted
+            || audit.outcome != AuditOutcome::Accepted
+            || audit.operation_id.as_deref() != Some(wire_operation_id)
+            || audit.authenticated_peer_id.is_none()
+            || audit.error_category.is_some()
+            || audit.reason_code.is_some()
+            || audit.local_receipt_operation_id.is_some()
+            || audit.local_receipt_sha256.is_some()
+            || audit.authenticated_peer_id.as_deref() != Some(snapshot.replica_id.as_str())
+        {
+            return Err(DurableError::InvalidAudit(
+                "accepted inbound import fields are inconsistent".into(),
+            ));
+        }
+        super::validate_token("wire operation ID", wire_operation_id)
+            .map_err(|problem| DurableError::InvalidAudit(problem.to_string()))?;
+        let local_operation_id = authenticated_import_receipt_id(
+            &self.topology,
+            &snapshot.replica_id,
+            wire_operation_id,
+        )
+        .map_err(|problem| DurableError::InvalidAudit(problem.to_string()))?;
+        let request = Request::Import {
+            operation_id: local_operation_id.clone(),
+            snapshot: snapshot.clone(),
+        };
+        let receipt_metadata = ReceiptMetadata {
+            kind: ReceiptKind::AuthenticatedImport,
+            source_replica_id: Some(snapshot.replica_id.clone()),
+            wire_operation_id: Some(wire_operation_id.into()),
+        };
+        let mut transaction = self.store.transaction().map_err(store_error)?;
+        journal_audit::prevalidate_authenticated_import_audit(
+            transaction.as_mut(),
+            &self.topology,
+            &self.replica_id,
+            &audit,
+            &local_operation_id,
+        )?;
+        let executed = execute_on_transaction(
+            transaction.as_mut(),
+            &self.configuration,
+            &self.topology,
+            &self.replica_id,
+            &request,
+            receipt_metadata,
+        )?;
+        let receipt = executed.receipt.as_ref().ok_or_else(|| {
+            DurableError::Corrupt("authenticated import has no receipt".into())
+        })?;
+        audit.local_receipt_operation_id = Some(receipt.operation_id.clone());
+        audit.local_receipt_sha256 = Some(receipt.sha256.clone());
+        audit.replayed = executed.replayed;
+        let evidence = journal_audit::insert_audit(
+            transaction.as_mut(),
+            &self.topology,
+            &self.replica_id,
+            &audit,
+            true,
+        )?;
+        transaction.commit().map_err(store_error)?;
+        Ok(AuthenticatedImport {
+            executed,
+            audit: evidence,
+        })
+    }
+
     /// MariaDB journals do not run SQLite file integrity verification in this slice.
     ///
     /// # Errors
@@ -517,6 +598,27 @@ impl ConfiguredStore {
             Self::Sqlite(store) => store.integrity(),
             #[cfg(feature = "mariadb")]
             Self::MariaDb(store) => store.integrity(),
+        }
+    }
+
+    /// Imports an authenticated peer snapshot on the active journal backend.
+    ///
+    /// # Errors
+    /// Rejects invalid audit metadata and failures before commit.
+    pub fn execute_authenticated_import(
+        &mut self,
+        wire_operation_id: &str,
+        snapshot: &Snapshot,
+        audit: ExchangeAuditEvent,
+    ) -> DurableResult<AuthenticatedImport> {
+        match self {
+            Self::Sqlite(store) => {
+                store.execute_authenticated_import(wire_operation_id, snapshot, audit)
+            }
+            #[cfg(feature = "mariadb")]
+            Self::MariaDb(store) => {
+                store.execute_authenticated_import(wire_operation_id, snapshot, audit)
+            }
         }
     }
 }

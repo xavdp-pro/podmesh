@@ -4533,6 +4533,9 @@ pub use inspect_profile::{
 };
 pub mod journal_profile;
 
+#[cfg(feature = "mariadb")]
+mod journal_audit;
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicBool;
