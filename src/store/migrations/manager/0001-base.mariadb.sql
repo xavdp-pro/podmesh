@@ -51,50 +51,35 @@ CREATE TABLE IF NOT EXISTS exchange_audit_events (
     CONSTRAINT exchange_audit_replayed CHECK (replayed IN (0, 1)),
     UNIQUE KEY exchange_audit_direction_attempt_phase (direction, attempt_id, phase)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Single-statement triggers: MariaDB batches split on ';' and must not use BEGIN…END here.
 DROP TRIGGER IF EXISTS facts_no_update;
 CREATE TRIGGER facts_no_update BEFORE UPDATE ON facts FOR EACH ROW
-BEGIN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'immutable fact';
-END;
 
 DROP TRIGGER IF EXISTS facts_no_delete;
 CREATE TRIGGER facts_no_delete BEFORE DELETE ON facts FOR EACH ROW
-BEGIN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'immutable fact';
-END;
 
 DROP TRIGGER IF EXISTS identity_no_update;
 CREATE TRIGGER identity_no_update BEFORE UPDATE ON identity FOR EACH ROW
-BEGIN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'immutable identity';
-END;
 
 DROP TRIGGER IF EXISTS identity_no_delete;
 CREATE TRIGGER identity_no_delete BEFORE DELETE ON identity FOR EACH ROW
-BEGIN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'immutable identity';
-END;
 
 DROP TRIGGER IF EXISTS receipts_no_update;
 CREATE TRIGGER receipts_no_update BEFORE UPDATE ON receipts FOR EACH ROW
-BEGIN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'immutable receipt';
-END;
 
 DROP TRIGGER IF EXISTS receipts_no_delete;
 CREATE TRIGGER receipts_no_delete BEFORE DELETE ON receipts FOR EACH ROW
-BEGIN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'immutable receipt';
-END;
 
 DROP TRIGGER IF EXISTS exchange_audit_events_no_update;
 CREATE TRIGGER exchange_audit_events_no_update BEFORE UPDATE ON exchange_audit_events FOR EACH ROW
-BEGIN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'immutable exchange audit event';
-END;
 
 DROP TRIGGER IF EXISTS exchange_audit_events_no_delete;
 CREATE TRIGGER exchange_audit_events_no_delete BEFORE DELETE ON exchange_audit_events FOR EACH ROW
-BEGIN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'immutable exchange audit event';
-END;
