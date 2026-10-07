@@ -85,6 +85,56 @@ pub fn store_profile(dir: &Path) -> Result<StoreConfig, Box<dyn std::error::Erro
     Ok(StoreConfig::from_json(&document, Some(dir))?)
 }
 
+/// A manager replica's durable store, open, as whichever engine its profile named.
+pub enum ManagerStore {
+    Sqlite(Connection),
+    Durable(Box<dyn DurableStore>),
+}
+
+impl ManagerStore {
+    pub fn engine(&self) -> Engine {
+        match self {
+            ManagerStore::Sqlite(_) => Engine::Sqlite,
+            ManagerStore::Durable(store) => store.engine(),
+        }
+    }
+
+    /// The connection `manager-ha` still takes, or a refusal naming why there is none.
+    pub fn into_connection(self) -> Result<Connection, Box<dyn std::error::Error>> {
+        match self {
+            ManagerStore::Sqlite(db) => Ok(db),
+            ManagerStore::Durable(store) => Err(format!(
+                "store.engine is {engine}: the manager journal opened and its schema is at version {version}, \
+                 but manager-ha still reads and writes the replica store as SQLite \
+                 (Phase 3 of docs/STORAGE-MARIADB-MIGRATION-PLAN.md ports it). \
+                 Keep database_path on a .sqlite file to run this replica.",
+                engine = store.engine(),
+                version = migrations::manager_version(),
+            )
+            .into()),
+        }
+    }
+}
+
+/// Open the manager replica journal under the profile it is configured with.
+pub fn open_manager_store(config: &StoreConfig) -> Result<ManagerStore, Box<dyn std::error::Error>> {
+    config.validate()?;
+    match config.engine {
+        Engine::Sqlite => {
+            let mut store = SqliteStore::open(&config.sqlite)?;
+            migrations::apply_manager(&mut store)?;
+            migrations::refuse_incomplete_manager_cutover(&mut store)?;
+            Ok(ManagerStore::Sqlite(store.into_connection()))
+        }
+        Engine::Mariadb => {
+            let mut store = store::open(config)?;
+            migrations::apply_manager(store.as_mut())?;
+            migrations::refuse_incomplete_manager_cutover(store.as_mut())?;
+            Ok(ManagerStore::Durable(store))
+        }
+    }
+}
+
 /// A node's journal, open, as whichever engine its profile named.
 pub enum NodeStore {
     /// The engine every node runs today: the `rusqlite` connection every module still takes.

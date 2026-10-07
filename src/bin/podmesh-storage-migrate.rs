@@ -1,11 +1,15 @@
-use podmesh::store::migrations::{self, node_tables, node_tables_through, node_version};
+use podmesh::store::migrations::{
+    self, manager_tables, manager_tables_through, manager_version, node_tables, node_tables_through,
+    node_version,
+};
+use podmesh::store::DurableStore;
 use rusqlite::{Connection, OpenFlags};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "mariadb")]
 use podmesh::store::{
-    bootstrap, schema_version, DurableStore, MariadbConfig, MariadbStore, Value, SCHEMA_TABLE,
+    bootstrap, schema_version, MariadbConfig, MariadbStore, Value, SCHEMA_TABLE,
 };
 #[cfg(feature = "mariadb")]
 use rusqlite::types::ValueRef;
@@ -13,21 +17,87 @@ use rusqlite::types::ValueRef;
 use sha2::{Digest, Sha256};
 
 const USAGE: &str = "\
-Usage: podmesh-storage-migrate --from-sqlite PATH --to-dsn URL [--dry-run] [--force]
+Usage: podmesh-storage-migrate --from-sqlite PATH --to-dsn URL [--role node|manager] [--dry-run] [--force]
 
 Copies an offline SQLite journal into the MariaDB database named by URL,
-through the versioned NODE_MIGRATIONS schema. The source is validated before
-any target mutation: future schema versions, unknown tables, and missing
-mandatory tables are refused. The target must contain no tables. --force
-DROPS EVERY TABLE in that database first; take and verify a backup before
-using it. Until copy and verification finish, store_schema.node_cutover = 0
-and the node refuses to open the target. The DSN is always redacted from
-output.";
+through the versioned schema for the role (node: NODE_MIGRATIONS; manager:
+MANAGER_MIGRATIONS). The source is validated before any target mutation:
+future schema versions, unknown tables, and missing mandatory tables are
+refused. The target must contain no tables. --force DROPS EVERY TABLE in that
+database first; take and verify a backup before using it. Until copy and
+verification finish, store_schema.<role>_cutover = 0 and the store refuses
+to open the target. The DSN is always redacted from output.";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MigrateRole {
+    Node,
+    Manager,
+}
+
+impl MigrateRole {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "node" => Ok(Self::Node),
+            "manager" => Ok(Self::Manager),
+            other => Err(format!("--role must be node or manager, not {other}")),
+        }
+    }
+
+    fn schema_name(self) -> &'static str {
+        match self {
+            Self::Node => migrations::NODE,
+            Self::Manager => migrations::MANAGER,
+        }
+    }
+
+    fn cutover_marker(self) -> &'static str {
+        match self {
+            Self::Node => migrations::CUTOVER,
+            Self::Manager => migrations::MANAGER_CUTOVER,
+        }
+    }
+
+    fn version(self) -> i64 {
+        match self {
+            Self::Node => node_version(),
+            Self::Manager => manager_version(),
+        }
+    }
+
+    fn tables(self) -> Vec<&'static str> {
+        match self {
+            Self::Node => node_tables(),
+            Self::Manager => manager_tables(),
+        }
+    }
+
+    fn tables_through(self, version: i64) -> Vec<&'static str> {
+        match self {
+            Self::Node => node_tables_through(version),
+            Self::Manager => manager_tables_through(version),
+        }
+    }
+
+    fn apply(self, store: &mut dyn DurableStore) -> podmesh::store::Result<migrations::Applied> {
+        match self {
+            Self::Node => migrations::apply(store),
+            Self::Manager => migrations::apply_manager(store),
+        }
+    }
+
+    fn store_label(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Manager => "manager",
+        }
+    }
+}
 
 #[derive(Debug, PartialEq)]
 struct Args {
     from_sqlite: PathBuf,
     to_dsn: String,
+    role: MigrateRole,
     dry_run: bool,
     force: bool,
 }
@@ -43,10 +113,18 @@ fn parse_args(values: &[String]) -> Result<Args, String> {
     let mut to_dsn = None;
     let mut dry_run = false;
     let mut force = false;
+    let mut role = MigrateRole::Node;
     let mut index = 0;
 
     while index < values.len() {
         match values[index].as_str() {
+            "--role" => {
+                index += 1;
+                let value = values
+                    .get(index)
+                    .ok_or_else(|| "--role requires node or manager".to_string())?;
+                role = MigrateRole::parse(value)?;
+            }
             "--from-sqlite" => {
                 index += 1;
                 let value = values
@@ -88,6 +166,7 @@ fn parse_args(values: &[String]) -> Result<Args, String> {
     Ok(Args {
         from_sqlite: from_sqlite.ok_or_else(|| "--from-sqlite is required".to_string())?,
         to_dsn: to_dsn.ok_or_else(|| "--to-dsn is required".to_string())?,
+        role,
         dry_run,
         force,
     })
@@ -105,11 +184,11 @@ fn quoted_identifier(name: &str) -> String {
 #[derive(Clone, Debug, PartialEq)]
 struct SourceJournal {
     counts: Vec<TableCount>,
-    /// Recorded `store_schema` version for `node`, when present.
+    /// Recorded `store_schema` version for this role, when present.
     version: Option<i64>,
 }
 
-fn inspect_sqlite(path: &Path) -> Result<SourceJournal, Box<dyn std::error::Error>> {
+fn inspect_sqlite(path: &Path, role: MigrateRole) -> Result<SourceJournal, Box<dyn std::error::Error>> {
     let db = open_source(path)?;
     let mut statement = db.prepare(
         "SELECT name
@@ -132,13 +211,26 @@ fn inspect_sqlite(path: &Path) -> Result<SourceJournal, Box<dyn std::error::Erro
 
     let version = if counts.iter().any(|table| table.name == "store_schema") {
         match db.query_row(
-            "SELECT version FROM store_schema WHERE name = 'node'",
-            [],
+            "SELECT version FROM store_schema WHERE name = ?1",
+            [role.schema_name()],
             |row| row.get::<_, i64>(0),
         ) {
             Ok(version) => Some(version),
             Err(rusqlite::Error::QueryReturnedNoRows) => None,
             Err(error) => return Err(error.into()),
+        }
+    } else if role == MigrateRole::Manager {
+        let legacy: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        match legacy {
+            0 => None,
+            3 => Some(manager_version()),
+            other => {
+                return Err(format!(
+                    "SQLite source carries PRAGMA user_version = {other}; this build knows manager schema version {latest} (legacy user_version 3)",
+                    latest = manager_version()
+                )
+                .into());
+            }
         }
     } else {
         None
@@ -157,13 +249,13 @@ fn inspect_sqlite(path: &Path) -> Result<SourceJournal, Box<dyn std::error::Erro
 ///   mandatory; later inventory tables may be absent (copied as empty).
 /// - A pre-schema journal may omit inventory tables, but must carry at least
 ///   one recognized node table.
-fn validate_source(journal: &SourceJournal) -> Result<(), Box<dyn std::error::Error>> {
+fn validate_source(journal: &SourceJournal, role: MigrateRole) -> Result<(), Box<dyn std::error::Error>> {
     let present: BTreeSet<&str> = journal
         .counts
         .iter()
         .map(|table| table.name.as_str())
         .collect();
-    let inventory: BTreeSet<&str> = node_tables().into_iter().collect();
+    let inventory: BTreeSet<&str> = role.tables().into_iter().collect();
     let allowed: BTreeSet<&str> = inventory
         .iter()
         .copied()
@@ -181,17 +273,19 @@ fn validate_source(journal: &SourceJournal) -> Result<(), Box<dyn std::error::Er
         .collect();
     if !unknown.is_empty() {
         return Err(format!(
-            "SQLite source has unknown tables not in the node inventory: {}",
+            "SQLite source has unknown tables not in the {} inventory: {}",
+            role.store_label(),
             unknown.join(", ")
         )
         .into());
     }
 
-    let latest = node_version();
+    let latest = role.version();
+    let label = role.store_label();
     match journal.version {
         Some(version) if version > latest => {
             return Err(format!(
-                "SQLite source carries node schema version {version} and this build knows {latest}: \
+                "SQLite source carries {label} schema version {version} and this build knows {latest}: \
                  a journal is never opened by a build older than the one that wrote it"
             )
             .into());
@@ -204,21 +298,21 @@ fn validate_source(journal: &SourceJournal) -> Result<(), Box<dyn std::error::Er
                 .collect();
             if !missing.is_empty() {
                 return Err(format!(
-                    "SQLite source at node schema version {version} is missing mandatory tables: {}",
+                    "SQLite source at {label} schema version {version} is missing mandatory tables: {}",
                     missing.join(", ")
                 )
                 .into());
             }
         }
         Some(version) => {
-            let mandatory = node_tables_through(version);
+            let mandatory = role.tables_through(version);
             let missing: Vec<&str> = mandatory
                 .into_iter()
                 .filter(|name| !present.contains(name))
                 .collect();
             if !missing.is_empty() {
                 return Err(format!(
-                    "SQLite source at node schema version {version} is missing tables that version requires: {}",
+                    "SQLite source at {label} schema version {version} is missing tables that version requires: {}",
                     missing.join(", ")
                 )
                 .into());
@@ -227,10 +321,10 @@ fn validate_source(journal: &SourceJournal) -> Result<(), Box<dyn std::error::Er
         None => {
             let recognized = present.iter().any(|name| inventory.contains(name));
             if !recognized {
-                return Err(
-                    "SQLite source has no store_schema.node version and no recognized node tables; refusing"
-                        .into(),
-                );
+                return Err(format!(
+                    "SQLite source has no store_schema.{label} version and no recognized {label} tables; refusing"
+                )
+                .into());
             }
         }
     }
@@ -379,17 +473,23 @@ fn clear_target(store: &mut MariadbStore) -> Result<(), Box<dyn std::error::Erro
 }
 
 #[cfg(feature = "mariadb")]
-fn mark_cutover_incomplete(store: &mut MariadbStore) -> Result<(), Box<dyn std::error::Error>> {
-    bootstrap(store, migrations::CUTOVER, migrations::CUTOVER_INCOMPLETE)?;
+fn mark_cutover_incomplete(
+    store: &mut MariadbStore,
+    role: MigrateRole,
+) -> Result<(), Box<dyn std::error::Error>> {
+    bootstrap(store, role.cutover_marker(), migrations::CUTOVER_INCOMPLETE)?;
     Ok(())
 }
 
 #[cfg(feature = "mariadb")]
-fn clear_cutover_marker(store: &mut MariadbStore) -> Result<(), Box<dyn std::error::Error>> {
+fn clear_cutover_marker(
+    store: &mut MariadbStore,
+    role: MigrateRole,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut tx = store.transaction()?;
     tx.execute(
         "DELETE FROM store_schema WHERE name = ?",
-        &[Value::from(migrations::CUTOVER)],
+        &[Value::from(role.cutover_marker())],
     )?;
     tx.commit()?;
     Ok(())
@@ -397,7 +497,7 @@ fn clear_cutover_marker(store: &mut MariadbStore) -> Result<(), Box<dyn std::err
 
 #[cfg(feature = "mariadb")]
 fn copy_to_mariadb(args: &Args, journal: &SourceJournal) -> Result<(), Box<dyn std::error::Error>> {
-    validate_source(journal)?;
+    validate_source(journal, args.role)?;
     let counts = &journal.counts;
     let source = open_source(&args.from_sqlite)?;
 
@@ -422,15 +522,15 @@ fn copy_to_mariadb(args: &Args, journal: &SourceJournal) -> Result<(), Box<dyn s
         clear_target(&mut target)?;
     }
 
-    // Incomplete before schema or data: a crash leaves the node refusing to open.
-    mark_cutover_incomplete(&mut target)?;
+    // Incomplete before schema or data: a crash leaves the store refusing to open.
+    mark_cutover_incomplete(&mut target, args.role)?;
     println!(
         "Cutover lock: {} = {}",
-        migrations::CUTOVER,
+        args.role.cutover_marker(),
         migrations::CUTOVER_INCOMPLETE
     );
 
-    let applied = migrations::apply(&mut target)?;
+    let applied = args.role.apply(&mut target)?;
     println!(
         "Schema: {} migrations applied ({} -> {})",
         applied.ran.len(),
@@ -438,9 +538,9 @@ fn copy_to_mariadb(args: &Args, journal: &SourceJournal) -> Result<(), Box<dyn s
         applied.to
     );
     // Re-assert after apply: migrations rewrite store_schema rows one by one.
-    mark_cutover_incomplete(&mut target)?;
+    mark_cutover_incomplete(&mut target, args.role)?;
 
-    let ordered = node_tables();
+    let ordered = args.role.tables();
     let mut prepared = Vec::new();
     for name in &ordered {
         let present = counts.iter().any(|count| &count.name == *name);
@@ -520,7 +620,8 @@ fn copy_to_mariadb(args: &Args, journal: &SourceJournal) -> Result<(), Box<dyn s
         if count != source_rows.len() as i64 || count != *expected {
             return Err(format!(
                 "row-count verification failed for {name}: SQLite={expected}, copied={count}; \
-                 cutover lock remains; node will refuse this target"
+                 cutover lock remains; the {role} store will refuse this target",
+                role = args.role.store_label()
             )
             .into());
         }
@@ -528,7 +629,8 @@ fn copy_to_mariadb(args: &Args, journal: &SourceJournal) -> Result<(), Box<dyn s
         if source_checksum != target_checksum {
             return Err(format!(
                 "logical SHA-256 verification failed for {name} (values or storage classes differ); \
-                 cutover lock remains; node will refuse this target"
+                 cutover lock remains; the {role} store will refuse this target",
+                role = args.role.store_label()
             )
             .into());
         }
@@ -544,9 +646,13 @@ fn copy_to_mariadb(args: &Args, journal: &SourceJournal) -> Result<(), Box<dyn s
         .into());
     }
 
-    clear_cutover_marker(&mut target)?;
-    if schema_version(&mut target, migrations::CUTOVER)?.is_some() {
-        return Err("failed to clear store_schema.node_cutover after verification".into());
+    clear_cutover_marker(&mut target, args.role)?;
+    if schema_version(&mut target, args.role.cutover_marker())?.is_some() {
+        return Err(format!(
+            "failed to clear store_schema.{} after verification",
+            args.role.cutover_marker()
+        )
+        .into());
     }
     // store_schema itself is not in node_tables(); ensure it remains.
     if !target
@@ -573,19 +679,23 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.dry_run {
         return run_dry(&args);
     }
-    let journal = inspect_sqlite(&args.from_sqlite)?;
-    validate_source(&journal)?;
+    let journal = inspect_sqlite(&args.from_sqlite, args.role)?;
+    validate_source(&journal, args.role)?;
     copy_to_mariadb(&args, &journal)
 }
 
 fn run_dry(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let journal = inspect_sqlite(&args.from_sqlite)?;
-    validate_source(&journal)?;
+    let journal = inspect_sqlite(&args.from_sqlite, args.role)?;
+    validate_source(&journal, args.role)?;
+    println!("Role: {}", args.role.store_label());
     println!("SQLite source: {}", args.from_sqlite.display());
     println!("MariaDB target: supplied via --to-dsn (value redacted)");
     match journal.version {
-        Some(version) => println!("Source node schema version: {version}"),
-        None => println!("Source node schema version: none (pre-schema journal)"),
+        Some(version) => println!("Source {} schema version: {version}", args.role.store_label()),
+        None => println!(
+            "Source {} schema version: none (pre-schema journal)",
+            args.role.store_label()
+        ),
     }
     println!("Tables: {}", journal.counts.len());
     for entry in &journal.counts {
@@ -641,10 +751,26 @@ mod tests {
             Args {
                 from_sqlite: PathBuf::from("/var/lib/podmesh/state.sqlite"),
                 to_dsn: "mysql://example.invalid/podmesh-node".into(),
+                role: MigrateRole::Node,
                 dry_run: true,
                 force: false,
             }
         );
+    }
+
+    #[test]
+    fn parses_manager_role() {
+        let values = [
+            "--role",
+            "manager",
+            "--from-sqlite",
+            "manager.sqlite",
+            "--to-dsn",
+            "mysql://example.invalid/podmesh-manager",
+            "--dry-run",
+        ]
+        .map(String::from);
+        assert_eq!(parse_args(&values).unwrap().role, MigrateRole::Manager);
     }
 
     #[test]
@@ -678,7 +804,7 @@ mod tests {
         .unwrap();
         drop(db);
 
-        let result = inspect_sqlite(&path).unwrap();
+        let result = inspect_sqlite(&path, MigrateRole::Node).unwrap();
         std::fs::remove_file(path).unwrap();
 
         assert_eq!(result.version, None);
@@ -695,7 +821,7 @@ mod tests {
                 },
             ]
         );
-        validate_source(&result).unwrap();
+        validate_source(&result, MigrateRole::Node).unwrap();
     }
 
     #[test]
@@ -726,9 +852,9 @@ mod tests {
                 .as_nanos()
         ));
         Connection::open(&path).unwrap();
-        let journal = inspect_sqlite(&path).unwrap();
+        let journal = inspect_sqlite(&path, MigrateRole::Node).unwrap();
         std::fs::remove_file(&path).unwrap();
-        let refused = validate_source(&journal).unwrap_err().to_string();
+        let refused = validate_source(&journal, MigrateRole::Node).unwrap_err().to_string();
         assert!(refused.contains("no user tables"), "{refused}");
     }
 
@@ -741,7 +867,7 @@ mod tests {
             }],
             version: None,
         };
-        let refused = validate_source(&unknown).unwrap_err().to_string();
+        let refused = validate_source(&unknown, MigrateRole::Node).unwrap_err().to_string();
         assert!(refused.contains("unknown tables"), "{refused}");
 
         let future = SourceJournal {
@@ -755,7 +881,7 @@ mod tests {
                 .collect(),
             version: Some(node_version() + 1),
         };
-        let refused = validate_source(&future).unwrap_err().to_string();
+        let refused = validate_source(&future, MigrateRole::Node).unwrap_err().to_string();
         assert!(refused.contains("older than the one that wrote it"), "{refused}");
     }
 
@@ -774,7 +900,33 @@ mod tests {
             ],
             version: Some(node_version()),
         };
-        let refused = validate_source(&journal).unwrap_err().to_string();
+        let refused = validate_source(&journal, MigrateRole::Node).unwrap_err().to_string();
         assert!(refused.contains("missing mandatory tables"), "{refused}");
+    }
+
+    #[test]
+    fn manager_legacy_user_version_three_maps_to_current_schema() {
+        let path = std::env::temp_dir().join(format!(
+            "podmesh-migrate-manager-legacy-{}-{}.sqlite",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "PRAGMA user_version = 3;
+             CREATE TABLE identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), replica_id TEXT NOT NULL, topology_json TEXT NOT NULL);
+             CREATE TABLE facts (event_id TEXT PRIMARY KEY, fact_json TEXT NOT NULL, sha256 TEXT NOT NULL);
+             CREATE TABLE receipts (operation_id TEXT PRIMARY KEY, kind TEXT NOT NULL, source_replica_id TEXT, wire_operation_id TEXT, request_json TEXT NOT NULL, response_json TEXT NOT NULL, sha256 TEXT NOT NULL);
+             CREATE TABLE exchange_audit_events (audit_event_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, wire_nonce TEXT NOT NULL, direction TEXT NOT NULL, phase TEXT NOT NULL, authenticated_peer_id TEXT, peer_claim TEXT, operation_id TEXT, request_frame_bytes INTEGER NOT NULL, request_announced_body_bytes INTEGER, request_sha256 TEXT, reply_frame_bytes INTEGER NOT NULL, reply_announced_body_bytes INTEGER, reply_sha256 TEXT, outcome TEXT NOT NULL, error_category TEXT, reason_code TEXT, local_receipt_operation_id TEXT, local_receipt_sha256 TEXT, remote_receipt_operation_id TEXT, remote_receipt_sha256 TEXT, replayed INTEGER NOT NULL CHECK(replayed IN (0, 1)), record_json TEXT NOT NULL, sha256 TEXT NOT NULL, UNIQUE(direction, attempt_id, phase));",
+        )
+        .unwrap();
+        drop(db);
+        let journal = inspect_sqlite(&path, MigrateRole::Manager).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(journal.version, Some(manager_version()));
+        validate_source(&journal, MigrateRole::Manager).unwrap();
     }
 }

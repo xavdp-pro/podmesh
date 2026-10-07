@@ -290,6 +290,14 @@ impl StoreConfig {
         }
     }
 
+    /// SQLite at the manager replica's `database_path` (legacy file semantics).
+    pub fn for_manager_sqlite_path(path: &Path) -> Self {
+        Self {
+            sqlite: SqliteConfig { path: path.to_path_buf(), ..SqliteConfig::default() },
+            ..Self::default()
+        }
+    }
+
     /// Read a profile from the node's JSON, either the whole document carrying a `store` object
     /// or that object alone. Everything absent keeps the default of [`StoreConfig::for_state_dir`]
     /// when a state directory is given, so an existing configuration file stays valid unchanged.

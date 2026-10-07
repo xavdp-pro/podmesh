@@ -35,9 +35,15 @@ use super::{DurableStore, Fault, Result};
 /// The schema name the node's set is recorded under in [`SCHEMA_TABLE`](super::SCHEMA_TABLE).
 pub const NODE: &str = "node";
 
+/// The schema name the manager replica store is recorded under in [`SCHEMA_TABLE`](super::SCHEMA_TABLE).
+pub const MANAGER: &str = "manager";
+
 /// Offline SQLite→MariaDB cutover marker in [`SCHEMA_TABLE`](super::SCHEMA_TABLE).
 /// While version is [`CUTOVER_INCOMPLETE`], the node must refuse to open the store.
 pub const CUTOVER: &str = "node_cutover";
+
+/// Manager cutover lock; same semantics as [`CUTOVER`] for `manager.sqlite`.
+pub const MANAGER_CUTOVER: &str = "manager_cutover";
 
 /// Recorded under [`CUTOVER`] until copy and verification finish.
 pub const CUTOVER_INCOMPLETE: i64 = 0;
@@ -79,6 +85,16 @@ macro_rules! node {
     };
 }
 
+macro_rules! manager {
+    ($id:literal) => {
+        Migration::split(
+            $id,
+            include_str!(concat!("migrations/manager/", $id, ".sqlite.sql")),
+            include_str!(concat!("migrations/manager/", $id, ".mariadb.sql")),
+        )
+    };
+}
+
 /// The node's schema, in order. The number in a file name is its version, and the set's length is
 /// the version a store carries once every one of them has been applied.
 pub const NODE_MIGRATIONS: &[Migration] = &[
@@ -98,6 +114,14 @@ pub const NODE_MIGRATIONS: &[Migration] = &[
 /// The version a store carries once the whole node set has been applied.
 pub fn node_version() -> i64 {
     NODE_MIGRATIONS.len() as i64
+}
+
+/// The manager replica's schema, in order (legacy SQLite `user_version` 3 == this set at version 1).
+pub const MANAGER_MIGRATIONS: &[Migration] = &[manager!("0001-base")];
+
+/// The version a manager store carries once the whole manager set has been applied.
+pub fn manager_version() -> i64 {
+    MANAGER_MIGRATIONS.len() as i64
 }
 
 /// What one call to [`apply`] found and what it did.
@@ -126,6 +150,11 @@ impl Applied {
 /// Bring a store up to the node's current schema, and record which version it now carries.
 pub fn apply(store: &mut dyn DurableStore) -> Result<Applied> {
     apply_set(store, NODE, NODE_MIGRATIONS)
+}
+
+/// Bring a store up to the manager replica's current schema.
+pub fn apply_manager(store: &mut dyn DurableStore) -> Result<Applied> {
+    apply_set(store, MANAGER, MANAGER_MIGRATIONS)
 }
 
 /// The same, for a named set: the manager's store follows in Phase 3 with a set of its own.
@@ -166,9 +195,23 @@ pub fn node_tables() -> Vec<&'static str> {
 
 /// Tables created by the first `version` migrations (1..=version). Version 0 is empty.
 pub fn node_tables_through(version: i64) -> Vec<&'static str> {
+    tables_through(NODE_MIGRATIONS, version)
+}
+
+/// Every table the manager inventory names.
+pub fn manager_tables() -> Vec<&'static str> {
+    manager_tables_through(manager_version())
+}
+
+/// Tables created by the first `version` manager migrations (1..=version). Version 0 is empty.
+pub fn manager_tables_through(version: i64) -> Vec<&'static str> {
+    tables_through(MANAGER_MIGRATIONS, version)
+}
+
+fn tables_through(set: &'static [Migration], version: i64) -> Vec<&'static str> {
     let mut tables = Vec::new();
     let limit = version.max(0) as usize;
-    for migration in NODE_MIGRATIONS.iter().take(limit) {
+    for migration in set.iter().take(limit) {
         for statement in sql_statements(migration.sql(Engine::Sqlite)) {
             if let Some(name) = created_table(statement) {
                 tables.push(name);
@@ -180,11 +223,20 @@ pub fn node_tables_through(version: i64) -> Vec<&'static str> {
 
 /// Refuse a store whose offline cutover never finished.
 pub fn refuse_incomplete_cutover(store: &mut dyn DurableStore) -> Result<()> {
-    if super::schema_version(store, CUTOVER)? == Some(CUTOVER_INCOMPLETE) {
-        return Err(Fault::Schema.error(
-            "offline cutover is incomplete (store_schema.node_cutover = 0): \
-             refuse to open; finish or re-run podmesh-storage-migrate with --force after a verified backup",
-        ));
+    refuse_incomplete_cutover_named(store, CUTOVER)
+}
+
+/// Refuse a manager store whose offline cutover never finished.
+pub fn refuse_incomplete_manager_cutover(store: &mut dyn DurableStore) -> Result<()> {
+    refuse_incomplete_cutover_named(store, MANAGER_CUTOVER)
+}
+
+fn refuse_incomplete_cutover_named(store: &mut dyn DurableStore, marker: &str) -> Result<()> {
+    if super::schema_version(store, marker)? == Some(CUTOVER_INCOMPLETE) {
+        return Err(Fault::Schema.error(format!(
+            "offline cutover is incomplete (store_schema.{marker} = 0): \
+             refuse to open; finish or re-run podmesh-storage-migrate with --force after a verified backup"
+        )));
     }
     Ok(())
 }
@@ -598,5 +650,76 @@ mod tests {
         let refused = refuse_incomplete_cutover(&mut store).unwrap_err();
         assert_eq!(refused.fault, Fault::Schema);
         assert!(refused.message.contains("incomplete"));
+    }
+
+    const MANAGER_INVENTORY: [&str; 4] = [
+        "exchange_audit_events",
+        "facts",
+        "identity",
+        "receipts",
+    ];
+
+    #[test]
+    fn the_manager_set_names_every_table_of_the_inventory() {
+        let ids: Vec<&str> = MANAGER_MIGRATIONS.iter().map(|migration| migration.id).collect();
+        assert_eq!(ids.len(), manager_version() as usize);
+        let mut tables = manager_tables();
+        tables.sort_unstable();
+        assert_eq!(tables, MANAGER_INVENTORY);
+    }
+
+    #[test]
+    fn an_empty_manager_store_is_brought_to_the_current_version_once() {
+        let mut store = memory();
+        let applied = apply_manager(&mut store).unwrap();
+        assert_eq!((applied.from, applied.to), (0, manager_version()));
+        assert_eq!(applied.ran.len(), MANAGER_MIGRATIONS.len());
+
+        let mut carried = store.tables().unwrap();
+        carried.retain(|table| table != super::super::SCHEMA_TABLE);
+        carried.sort_unstable();
+        assert_eq!(carried, MANAGER_INVENTORY);
+        assert_eq!(schema_version(&mut store, MANAGER).unwrap(), Some(manager_version()));
+
+        let again = apply_manager(&mut store).unwrap();
+        assert!(again.ran.is_empty());
+    }
+
+    #[test]
+    fn an_incomplete_manager_cutover_marker_is_refused() {
+        let mut store = memory();
+        apply_manager(&mut store).unwrap();
+        refuse_incomplete_manager_cutover(&mut store).unwrap();
+        super::super::bootstrap(&mut store, MANAGER_CUTOVER, CUTOVER_INCOMPLETE).unwrap();
+        let refused = refuse_incomplete_manager_cutover(&mut store).unwrap_err();
+        assert_eq!(refused.fault, Fault::Schema);
+        assert!(refused.message.contains("incomplete"));
+    }
+
+    #[cfg(feature = "mariadb")]
+    #[test]
+    fn a_mariadb_instance_carries_the_whole_manager_schema() {
+        use super::super::{config::DSN_ENVIRONMENT, mariadb::MariadbStore, MariadbConfig};
+
+        let _serialized = super::super::MARIADB_TEST_SERVER.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(config) = MariadbConfig::from_environment() else {
+            eprintln!("skipped: {DSN_ENVIRONMENT} names no MariaDB server");
+            return;
+        };
+        config.validate().expect("the DSN names a database to migrate in");
+        let mut store = MariadbStore::open(&config).expect("manager schema test database opens");
+        for table in MANAGER_INVENTORY.iter().chain([super::super::SCHEMA_TABLE].iter()) {
+            store.execute_batch(&format!("DROP TABLE IF EXISTS `{table}`;")).unwrap();
+        }
+        let applied = apply_manager(&mut store).unwrap();
+        assert_eq!((applied.from, applied.to), (0, manager_version()));
+        let mut carried = store.tables().unwrap();
+        carried.retain(|table| table != super::super::SCHEMA_TABLE);
+        carried.sort_unstable();
+        assert_eq!(carried, MANAGER_INVENTORY);
+        assert!(apply_manager(&mut store).unwrap().ran.is_empty());
+        for table in MANAGER_INVENTORY.iter().chain([super::super::SCHEMA_TABLE].iter()) {
+            store.execute_batch(&format!("DROP TABLE IF EXISTS `{table}`;")).unwrap();
+        }
     }
 }
