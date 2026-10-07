@@ -29,7 +29,7 @@ remote() { # remote <alias> <<'EOF' script EOF  — runs as root, logs everythin
 }
 op_id() { jq -er --arg a "$1" '.operation_ids[$a]' "$PLAN"; }
 value() { jq -er .observation_value "$PLAN"; }
-INSPECT_JQ='{h:.logical_history_sha256[0:16],history:.history_count,receipts:.receipt_count,audit:.audit_event_count,incomplete:(.incomplete_attempts|length),integrity:.sqlite_integrity_result,conflicts:(.conflicts|length),blocked:(.blocked_exclusive_resources|length)}'
+INSPECT_JQ='{h:.logical_history_sha256[0:16],history:.history_count,receipts:.receipt_count,audit:.audit_event_count,incomplete:(.incomplete_attempts|length),integrity:(.sqlite_integrity_result // .store_integrity_result),conflicts:(.conflicts|length),blocked:(.blocked_exclusive_resources|length)}'
 
 PHASE=${1:-}; shift || true
 case "$PHASE" in

@@ -97,6 +97,20 @@ def validate_attempt(v, label):
     if v["nonce_authority"]=="pre-authentication" and v["direction"]!="inbound":
         raise ValueError(f"{label}: an outbound attempt cannot carry a pre-authentication nonce")
 
+def normalize_inspection_integrity_alias(v, label):
+    # Phase 3 store profiles publish `store_integrity_result` in integrity JSON; sealed
+    # activation evidence keeps `sqlite_integrity_result`. Readers accept either for one release.
+    if not isinstance(v, dict) or "store_integrity_result" not in v:
+        return v
+    v = dict(v)
+    primary, alias = v.get("sqlite_integrity_result"), v.get("store_integrity_result")
+    if primary is not None and alias is not None and primary != alias:
+        raise ValueError(f"{label}: conflicting integrity results")
+    if primary is None and alias is not None:
+        v["sqlite_integrity_result"] = alias
+    del v["store_integrity_result"]
+    return v
+
 def validate_inspection(v, label):
     # Three states the collector can seal, and each is checked in full:
     #   None                  this capture did not inspect
@@ -107,6 +121,7 @@ def validate_inspection(v, label):
     # count or a commitment is refused, because that combination cannot be produced by
     # an honest collector and is precisely how an absent baseline would be forged.
     if v is None: return
+    v = normalize_inspection_integrity_alias(v, label)
     obj(v,label,("store_present",)+DERIVED)
     if not isinstance(v["store_present"], bool): raise ValueError(f"{label}.store_present: must be a boolean")
     if not v["store_present"]:

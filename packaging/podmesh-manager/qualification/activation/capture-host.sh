@@ -216,7 +216,8 @@ inspection() {
     # those versions separate prevents the widened projection from being sealed as v3.
     if .schema_version != 3 then error("unsupported candidate inspection schema") else
     {store_present:true,schema_version:4,logical_manager_commitment:$logical,replica_commitment:$replica,
-     logical_history_sha256,receipt_set_sha256,audit_set_sha256,sqlite_integrity_result,
+     logical_history_sha256,receipt_set_sha256,audit_set_sha256,
+     sqlite_integrity_result:(.sqlite_integrity_result // .store_integrity_result),
      history_count,receipt_count,audit_event_count,
      incomplete_attempt_count:(.incomplete_attempts|length),
      # The list, not only its length. Folding it to an integer is what made six of the
