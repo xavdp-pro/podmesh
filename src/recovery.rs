@@ -34,7 +34,13 @@ const SCOPE: &str = "experimental local restore: default rootful Podman store, t
 const NO_RESTART: &str = "nothing was started: the application is resumed only by migration_restore_local, and an ordinary start would begin it afresh without its checkpointed memory";
 /// States a reservation can be released from, abandoned from, and locally restored from.
 const RELEASABLE: [&str; 2] = ["checkpointed", "checkpoint_failed"];
-const ABANDONABLE: [&str; 4] = ["reserved", "checkpointing", "checkpoint_failed", "checkpointed"];
+const ABANDONABLE: [&str; 5] = [
+    "reserved",
+    mg::NESTED_INNER_RECONCILED,
+    "checkpointing",
+    "checkpoint_failed",
+    "checkpointed",
+];
 
 fn scope_unit(id: &str) -> String {
     format!("podmesh-restore-local-{id}.scope")

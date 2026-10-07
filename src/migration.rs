@@ -45,12 +45,42 @@ pub(crate) const SPACE_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const CONTAINER_STORAGE: &str = "/var/lib/containers/storage";
 const SCOPE: &str = "experimental source-side checkpoint: default rootful Podman store, network-disabled, mount-free, journal-owned container with musl processes, packaged podmesh-vzcriu 3.15.5.3 through its private-path shim";
 const SCOPE_NESTED_PREFLIGHT: &str = "experimental nested-lab preflight only: Rule 11 outer universe — privileged rootful Podman container, network-disabled, mount-free, journal-owned; inner Podman reconciliation and the checkpoint/restore chain are not implemented in this backend";
-const SCOPE_NESTED_LAB_CHECKPOINT: &str = "experimental nested-lab checkpoint: same outer-shape assess as migration_profile nested preflight; durable reservation and preflight artifacts, then refuses before suspension until inner Podman reconciliation and the kit-style checkpoint/restore chain are wired (docs/MIGRATION-INTEGRATION.md)";
+const SCOPE_NESTED_LAB_CHECKPOINT: &str = "experimental nested-lab checkpoint: same outer-shape assess as migration_profile nested preflight; durable reservation, preflight.json and inner Podman metadata reconciliation for the kit counter fixture when present, then refuses before outer suspension until nested VFS store binding and the destination restore chain are wired (docs/MIGRATION-INTEGRATION.md)";
 const NESTED_LAB_CHECKPOINT_GAPS: [&str; 3] = [
     "inner_podman_metadata_reconciliation",
     "nested_vfs_store_binding",
     "rule11_destination_restore_chain",
 ];
+const NESTED_LAB_GAPS_AFTER_INNER_RECONCILIATION: [&str; 2] = [
+    "nested_vfs_store_binding",
+    "rule11_destination_restore_chain",
+];
+/// Reservation state after the kit-style inner Podman proof and pre-checkpoint metadata reconcile succeed.
+pub(crate) const NESTED_INNER_RECONCILED: &str = "nested_inner_reconciled";
+const INNER_PODMAN_METADATA: &str = "inner_podman_metadata.json";
+/// Inner Podman inside the outer universe uses the kit's isolated VFS store (contrib/nested-podman).
+const INNER_PODMAN_CLI: &str =
+    "podman --storage-driver=vfs --cgroup-manager=cgroupfs --events-backend=file";
+const NESTED_COUNTER_INNER_NAME: &str = "counter";
+/// Kit reconcile script (node.py), run inside the outer container before outer checkpoint when the counter fixture is present.
+const NESTED_INNER_RECONCILE_PY: &str = r"import json, os, shutil, sys, tempfile
+from pathlib import Path
+expected=json.loads(sys.argv[1]); ident=expected['inner_id']; pid=expected['pid']
+p=Path('/run/crun')/ident/'status'; d=json.loads(p.read_text())
+assert d['pid']==pid, 'PID changed unexpectedly'
+cmd=Path('/proc/%d/cmdline'%pid).read_bytes()
+assert b'token=$(cat /proc/sys/kernel/random/uuid)' in cmd, 'Unexpected process'
+log=Path('/var/lib/containers/storage/vfs-containers')/ident/'userdata/ctr.log'
+assert expected['uuid'] in log.read_text(), 'Workload identity missing'
+start=int(Path('/proc/%d/stat'%pid).read_text().rsplit(')',1)[1].split()[19])
+backup=Path(tempfile.mkdtemp(prefix='podmesh-nested-reconcile-', dir='/tmp'))
+shutil.copy2(p,backup/'crun-status.json')
+alive=Path('/run/libpod/alive'); shutil.copy2(alive,backup/'alive')
+d['process-start-time']=start
+q=p.with_suffix('.migration-tmp'); q.write_text(json.dumps(d)); os.replace(q,p)
+alive.write_bytes(Path('/proc/sys/kernel/random/boot_id').read_bytes())
+print(json.dumps({'pid':pid,'start_time':start,'backup':str(backup)}))
+";
 const AUTHORITY: &str = "This checkpoint does not authorize restore on any host and does not release the reservation. Only migration_authorize_transfer issues a handoff, and only a verified destination outcome bound to it ends the reservation.";
 /// Which migration assess rules apply. Default flat scope refuses privileged containers; nested is preflight-only until a separate backend exists (docs/MIGRATION-INTEGRATION.md).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1028,30 +1058,295 @@ fn persist_checkpoint_reservation(
     reservation(db, uuid)?.ok_or_else(|| Error::from("Reservation not persisted"))
 }
 
-fn nested_lab_capture_pending_detail(uuid: &str, facts: &Value, r: &Reservation) -> Value {
-    json!({
+fn nested_lab_detail(
+    uuid: &str,
+    facts: &Value,
+    r: &Reservation,
+    gaps: &[&str],
+    effects: &str,
+    checkpoint_phase: &str,
+    extra: Value,
+) -> Value {
+    let mut detail = json!({
         "migration_profile": "nested",
         "universe_uuid": uuid,
         "scope": SCOPE_NESTED_LAB_CHECKPOINT,
-        "implementation_gaps": NESTED_LAB_CHECKPOINT_GAPS,
+        "checkpoint_phase": checkpoint_phase,
+        "implementation_gaps": gaps,
         "facts": facts,
         "reservation": r.view(),
-        "effects": "reservation and preflight.json only: no suspension, archive or manifest",
+        "effects": effects,
         "reference": "docs/MIGRATION-INTEGRATION.md required separation",
-    })
+    });
+    if let Some(obj) = detail.as_object_mut() {
+        if let Some(extra_obj) = extra.as_object() {
+            for (k, v) in extra_obj {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    detail
 }
 
-/// After a durable nested-lab reservation, refuse capture until the separate backend exists.
-fn refuse_nested_lab_before_capture(
+#[cfg_attr(not(test), allow(dead_code))]
+fn nested_lab_capture_pending_detail(uuid: &str, facts: &Value, r: &Reservation) -> Value {
+    nested_lab_detail(
+        uuid,
+        facts,
+        r,
+        &NESTED_LAB_CHECKPOINT_GAPS,
+        "reservation and preflight.json only: no inner Podman reconciliation, suspension, archive or manifest",
+        "reservation",
+        json!({}),
+    )
+}
+
+fn nested_lab_outer_suspend_pending_detail(uuid: &str, facts: &Value, r: &Reservation, inner: &Value) -> Value {
+    nested_lab_detail(
+        uuid,
+        facts,
+        r,
+        &NESTED_LAB_GAPS_AFTER_INNER_RECONCILIATION,
+        "reservation, preflight.json and inner_podman_metadata.json: inner Podman metadata reconciled for the kit counter fixture; no outer suspension, archive or manifest",
+        "before_outer_suspension",
+        json!({"inner_podman_metadata": inner}),
+    )
+}
+
+fn outer_podman_exec(outer: &str, shell: &str) -> Result<String, String> {
+    let out = Command::new("/usr/bin/podman")
+        .args(["exec", outer, "sh", "-c", shell])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Parse the kit counter workload's last log line: `<epoch> <uuid> <counter>`.
+pub(crate) fn parse_nested_counter_log_line(line: &str) -> Result<(String, u64), String> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    if fields.len() != 3 {
+        return Err(format!("counter log line has {} fields, expected 3", fields.len()));
+    }
+    let counter = fields[2]
+        .parse::<u64>()
+        .map_err(|e| format!("counter field is not an integer: {e}"))?;
+    Ok((fields[1].to_string(), counter))
+}
+
+fn nested_inner_podman_proof(outer: &str, expected_outer_id: &str) -> Result<Value, Vec<String>> {
+    let mut blockers = vec![];
+    let inspect = outer_podman_exec(
+        outer,
+        &format!("{INNER_PODMAN_CLI} inspect {NESTED_COUNTER_INNER_NAME}"),
+    );
+    let inner = match inspect {
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(Value::Array(items)) if !items.is_empty() => items[0].clone(),
+            Ok(_) => {
+                blockers.push(format!(
+                    "inner container {NESTED_COUNTER_INNER_NAME} inspect returned no container"
+                ));
+                Value::Null
+            }
+            Err(e) => {
+                blockers.push(format!("inner container inspect is not JSON: {e}"));
+                Value::Null
+            }
+        },
+        Err(e) => {
+            blockers.push(format!(
+                "inner Podman could not inspect container {NESTED_COUNTER_INNER_NAME}: {e}"
+            ));
+            Value::Null
+        }
+    };
+    let logs = outer_podman_exec(
+        outer,
+        &format!("{INNER_PODMAN_CLI} logs --tail=3 {NESTED_COUNTER_INNER_NAME}"),
+    );
+    let (uuid, counter, log_lines) = match logs {
+        Ok(text) => {
+            let lines = text.lines().filter(|l| !l.is_empty()).collect::<Vec<_>>();
+            match lines.last() {
+                Some(last) => match parse_nested_counter_log_line(last) {
+                    Ok((uuid, counter)) => (uuid, counter, lines.iter().map(|l| l.to_string()).collect()),
+                    Err(e) => {
+                        blockers.push(format!("inner counter log tail is unusable: {e}"));
+                        (String::new(), 0, vec![])
+                    }
+                },
+                None => {
+                    blockers.push("inner counter produced no log lines".into());
+                    (String::new(), 0, vec![])
+                }
+            }
+        }
+        Err(e) => {
+            blockers.push(format!("inner Podman could not read counter logs: {e}"));
+            (String::new(), 0, vec![])
+        }
+    };
+    let pid = inner["State"]["Pid"].as_i64().filter(|p| *p > 0);
+    if pid.is_none() && blockers.is_empty() {
+        blockers.push("inner counter container has no running PID".into());
+    }
+    if !blockers.is_empty() {
+        return Err(blockers);
+    }
+    Ok(json!({
+        "fixture": "vzcriu-kit-nested-counter",
+        "outer_container_id": expected_outer_id,
+        "inner_container_name": NESTED_COUNTER_INNER_NAME,
+        "inner_id": inner["Id"],
+        "pid": pid,
+        "workload_uuid": uuid,
+        "counter": counter,
+        "log_tail": log_lines,
+    }))
+}
+
+fn nested_inner_podman_reconcile(outer: &str, proof: &Value) -> Result<Value, Vec<String>> {
+    let payload = serde_json::to_string(proof).unwrap_or_else(|_| "{}".to_string());
+    let script = format!("{NESTED_INNER_RECONCILE_PY}\n");
+    let mut child = Command::new("/usr/bin/podman")
+        .args(["exec", "-i", outer, "python3", "-", &payload])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| vec![format!("inner Podman metadata reconcile could not start: {e}")])?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(script.as_bytes());
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| vec![format!("inner Podman metadata reconcile failed: {e}")])?;
+    if !out.status.success() {
+        return Err(vec![format!(
+            "inner Podman metadata reconcile failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )]);
+    }
+    match serde_json::from_str::<Value>(String::from_utf8_lossy(&out.stdout).trim()) {
+        Ok(v) => Ok(v),
+        Err(e) => Err(vec![format!("inner reconcile output is not JSON: {e}")]),
+    }
+}
+
+fn read_nested_inner_metadata(dir: &Path) -> Option<Value> {
+    let path = dir.join(INNER_PODMAN_METADATA);
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+}
+
+fn write_nested_inner_metadata(dir: &Path, document: &Value) -> Result<(), Error> {
+    write_private(
+        &dir.join(INNER_PODMAN_METADATA),
+        serde_json::to_string_pretty(document)?.as_bytes(),
+    )
+}
+
+fn nested_lab_inner_reconciliation(
+    db: &Connection,
+    uuid: &str,
+    outer: &str,
+    facts: &Value,
+    r: &Reservation,
+    dir: &Path,
+) -> Result<Value, Error> {
+    if r.state == NESTED_INNER_RECONCILED {
+        let inner = read_nested_inner_metadata(dir).unwrap_or(Value::Null);
+        return refuse_nested_lab_before_outer_suspend(db, uuid, facts, r, &inner);
+    }
+    if let Some(existing) = read_nested_inner_metadata(dir) {
+        if existing.get("status") == Some(&json!("verified")) {
+            set_state(db, uuid, NESTED_INNER_RECONCILED, &existing)?;
+            let inner = read_nested_inner_metadata(dir).unwrap_or(existing);
+            return refuse_nested_lab_before_outer_suspend(db, uuid, facts, r, &inner);
+        }
+    }
+    let proof = match nested_inner_podman_proof(outer, &r.container_id) {
+        Ok(p) => p,
+        Err(blockers) => {
+            let document = json!({
+                "status": "refused",
+                "checkpoint_phase": "inner_podman_metadata_reconciliation",
+                "blockers": blockers,
+                "observed_at": crate::now(),
+            });
+            write_nested_inner_metadata(dir, &document)?;
+            let detail = nested_lab_detail(
+                uuid,
+                facts,
+                r,
+                &NESTED_LAB_CHECKPOINT_GAPS,
+                "reservation, preflight.json and inner_podman_metadata.json refusal: no outer suspension",
+                "inner_podman_metadata_reconciliation",
+                json!({"inner_podman_metadata": document, "inner_reconciliation_blockers": blockers}),
+            );
+            set_state(db, uuid, "reserved", &detail)?;
+            return Err(failure(
+                "migration_checkpoint nested inner Podman metadata could not be reconciled; outer suspension refused",
+                detail,
+            ));
+        }
+    };
+    let reconcile = match nested_inner_podman_reconcile(outer, &proof) {
+        Ok(r) => r,
+        Err(blockers) => {
+            let document = json!({
+                "status": "refused",
+                "checkpoint_phase": "inner_podman_metadata_reconciliation",
+                "proof": proof,
+                "blockers": blockers,
+                "observed_at": crate::now(),
+            });
+            write_nested_inner_metadata(dir, &document)?;
+            let detail = nested_lab_detail(
+                uuid,
+                facts,
+                r,
+                &NESTED_LAB_CHECKPOINT_GAPS,
+                "reservation, preflight.json and inner_podman_metadata.json refusal: no outer suspension",
+                "inner_podman_metadata_reconciliation",
+                json!({"inner_podman_metadata": document, "inner_reconciliation_blockers": blockers}),
+            );
+            set_state(db, uuid, "reserved", &detail)?;
+            return Err(failure(
+                "migration_checkpoint nested inner Podman metadata could not be reconciled; outer suspension refused",
+                detail,
+            ));
+        }
+    };
+    let document = json!({
+        "status": "verified",
+        "checkpoint_phase": "inner_podman_metadata_reconciliation",
+        "proof": proof,
+        "reconcile": reconcile,
+        "observed_at": crate::now(),
+    });
+    write_nested_inner_metadata(dir, &document)?;
+    set_state(db, uuid, NESTED_INNER_RECONCILED, &document)?;
+    let updated = reservation(db, uuid)?.ok_or_else(|| Error::from("Reservation not found after inner reconcile"))?;
+    refuse_nested_lab_before_outer_suspend(db, uuid, facts, &updated, &document)
+}
+
+/// Inner metadata reconciled; outer suspension and archive are still refused.
+fn refuse_nested_lab_before_outer_suspend(
     db: &Connection,
     uuid: &str,
     facts: &Value,
     r: &Reservation,
+    inner: &Value,
 ) -> Result<Value, Error> {
-    let detail = nested_lab_capture_pending_detail(uuid, facts, r);
-    set_state(db, uuid, "reserved", &detail)?;
+    let detail = nested_lab_outer_suspend_pending_detail(uuid, facts, r, inner);
+    set_state(db, uuid, NESTED_INNER_RECONCILED, &detail)?;
     Err(failure(
-        "migration_checkpoint nested-lab backend is not implemented beyond reservation; inner Podman reconciliation and the checkpoint/restore chain are required before suspension",
+        "migration_checkpoint nested-lab refuses outer suspension until nested VFS store binding and the destination restore chain are wired",
         detail,
     ))
 }
@@ -1092,7 +1387,7 @@ fn checkpoint_nested_lab(
             }
             let dir = prepare_empty_artifact_dir(id)?;
             let r = persist_checkpoint_reservation(db, uuid, id, b, &a, &dir)?;
-            refuse_nested_lab_before_capture(db, uuid, &a.facts, &r)
+            nested_lab_inner_reconciliation(db, uuid, name, &a.facts, &r, &dir)
         }
     }
 }
@@ -1100,20 +1395,25 @@ fn checkpoint_nested_lab(
 fn nested_lab_resume(
     db: &Connection,
     uuid: &str,
-    _name: &str,
+    name: &str,
     b: &Binding,
     existing: Option<Value>,
     r: Reservation,
-    _dir: &Path,
+    dir: &Path,
 ) -> Result<Value, Error> {
-    if r.state != "reserved" {
+    if r.state != "reserved" && r.state != NESTED_INNER_RECONCILED {
         return Err(failure(
             format!(
-                "Nested-lab checkpoint cannot resume from reservation state {}; only reserved is supported before capture exists",
+                "Nested-lab checkpoint cannot resume from reservation state {}; only reserved or nested_inner_reconciled is supported before capture exists",
                 r.state
             ),
             json!({"reservation": r.view()}),
         ));
+    }
+    if r.state == NESTED_INNER_RECONCILED {
+        let inner = read_nested_inner_metadata(dir).unwrap_or(Value::Null);
+        let facts = json!({"migration_profile": "nested"});
+        return refuse_nested_lab_before_outer_suspend(db, uuid, &facts, &r, &inner);
     }
     let Some(c) = existing else {
         let detail = json!({"reason": "reserved source container is absent"});
@@ -1136,7 +1436,7 @@ fn nested_lab_resume(
             detail,
         ));
     }
-    refuse_nested_lab_before_capture(db, uuid, &a.facts, &r)
+    nested_lab_inner_reconciliation(db, uuid, name, &a.facts, &r, dir)
 }
 
 fn checkpoint_flat_store(
@@ -1536,8 +1836,9 @@ pub(crate) fn status(db: &Connection, request: &Value) -> Result<Value, Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        migration_shape_blockers, nested_lab_capture_pending_detail, MigrationProfile,
-        NESTED_LAB_CHECKPOINT_GAPS, Reservation,
+        migration_shape_blockers, nested_lab_capture_pending_detail, parse_nested_counter_log_line,
+        MigrationProfile, NESTED_LAB_CHECKPOINT_GAPS, NESTED_LAB_GAPS_AFTER_INNER_RECONCILIATION,
+        Reservation,
     };
     use serde_json::json;
 
@@ -1622,5 +1923,27 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .contains("preflight.json"));
+    }
+
+    #[test]
+    fn nested_counter_log_line_parses_kit_tail() {
+        let (uuid, counter) =
+            parse_nested_counter_log_line("1759850000 550e8400-e29b-41d4-a716-446655440000 42")
+                .unwrap();
+        assert_eq!(uuid, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(counter, 42);
+        assert!(parse_nested_counter_log_line("only two fields").is_err());
+    }
+
+    #[test]
+    fn nested_lab_gaps_shrink_after_inner_reconciliation() {
+        assert_eq!(NESTED_LAB_GAPS_AFTER_INNER_RECONCILIATION.len(), 2);
+        assert!(!NESTED_LAB_GAPS_AFTER_INNER_RECONCILIATION
+            .iter()
+            .any(|g| *g == "inner_podman_metadata_reconciliation"));
+        assert_eq!(
+            NESTED_LAB_CHECKPOINT_GAPS.len(),
+            NESTED_LAB_GAPS_AFTER_INNER_RECONCILIATION.len() + 1
+        );
     }
 }
