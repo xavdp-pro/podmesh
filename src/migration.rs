@@ -1245,6 +1245,46 @@ pub(crate) fn parse_nested_counter_log_line(line: &str) -> Result<(String, u64),
     Ok((fields[1].to_string(), counter))
 }
 
+fn nested_inner_counter_max_on_disk(outer: &str, inner_id: &str) -> u64 {
+    let path = format!(
+        "{INNER_PODMAN_GRAPH_ROOT}/vfs-containers/{inner_id}/userdata/ctr.log"
+    );
+    let text = outer_podman_exec(outer, &format!("test -r {path} && cat {path}")).unwrap_or_default();
+    let mut max = 0u64;
+    for line in text.lines().filter(|l| !l.is_empty()) {
+        if let Ok((_, counter)) = parse_nested_counter_log_line(line) {
+            max = max.max(counter);
+        }
+    }
+    max
+}
+
+fn nested_inner_counter_poll_after_quiesced_resume(
+    outer: &str,
+    outer_container_id: &str,
+    observed: u64,
+    expected: u64,
+) -> u64 {
+    let mut counter = observed;
+    if counter >= expected {
+        return counter;
+    }
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(expected.saturating_add(5));
+    while counter < expected && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if let Ok(proof) = nested_inner_podman_proof(outer, outer_container_id) {
+            counter = counter.max(
+                proof
+                    .get("counter")
+                    .and_then(|c| c.as_u64())
+                    .unwrap_or(0),
+            );
+        }
+    }
+    counter
+}
+
 fn nested_inner_podman_proof(outer: &str, expected_outer_id: &str) -> Result<Value, Vec<String>> {
     let mut blockers = vec![];
     let inspect = outer_podman_exec(
@@ -1487,11 +1527,32 @@ pub(crate) fn nested_destination_post_outer_restore(
     };
     let proof = nested_inner_podman_proof(outer_name, outer_container_id)
         .map_err(|blockers| Error::from(blockers.join("; ")))?;
-    let observed_counter = proof
+    let live_counter = proof
         .get("counter")
         .and_then(|c| c.as_u64())
         .ok_or_else(|| Error::from("inner counter proof after restore has no counter"))?;
+    let observed_counter = if quiesced {
+        let inner_id = proof
+            .get("inner_id")
+            .and_then(|id| id.as_str())
+            .ok_or_else(|| Error::from("inner counter proof after restore has no inner_id"))?;
+        let baseline = live_counter.max(nested_inner_counter_max_on_disk(outer_name, inner_id));
+        nested_inner_counter_poll_after_quiesced_resume(
+            outer_name,
+            outer_container_id,
+            baseline,
+            expected_counter,
+        )
+    } else {
+        live_counter
+    };
     let counter_continuity = if quiesced {
+        if observed_counter < expected_counter {
+            return Err(format!(
+                "inner counter after quiesced restore did not reach the source checkpoint value: observed {observed_counter}, source checkpoint had {expected_counter}"
+            )
+            .into());
+        }
         "inner_quiesced_before_capture: workload resumes from disk after outer restore; in-memory counter and workload UUID are not preserved"
     } else if observed_counter < expected_counter {
         return Err(format!(
