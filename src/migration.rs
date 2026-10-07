@@ -45,7 +45,7 @@ pub(crate) const SPACE_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const CONTAINER_STORAGE: &str = "/var/lib/containers/storage";
 const SCOPE: &str = "experimental source-side checkpoint: default rootful Podman store, network-disabled, mount-free, journal-owned container with musl processes, packaged podmesh-vzcriu 3.15.5.3 through its private-path shim";
 const SCOPE_NESTED_PREFLIGHT: &str = "experimental nested-lab preflight only: Rule 11 outer universe — privileged rootful Podman container, network-disabled, mount-free, journal-owned; inner Podman reconciliation and the checkpoint/restore chain are not implemented in this backend";
-const SCOPE_NESTED_LAB_CHECKPOINT: &str = "experimental nested-lab checkpoint gate: same outer-shape assess as migration_profile nested preflight; refuses before reservation until inner Podman reconciliation and the kit-style checkpoint/restore chain are wired as a separate backend (docs/MIGRATION-INTEGRATION.md)";
+const SCOPE_NESTED_LAB_CHECKPOINT: &str = "experimental nested-lab checkpoint: same outer-shape assess as migration_profile nested preflight; durable reservation and preflight artifacts, then refuses before suspension until inner Podman reconciliation and the kit-style checkpoint/restore chain are wired (docs/MIGRATION-INTEGRATION.md)";
 const NESTED_LAB_CHECKPOINT_GAPS: [&str; 3] = [
     "inner_podman_metadata_reconciliation",
     "nested_vfs_store_binding",
@@ -968,37 +968,175 @@ fn checkpoint_command(id: &str, container_id: &str, archive: &Path, stdout: fs::
     .0)
 }
 
-/// Nested-lab checkpoint entry: full assess with Rule 11 outer shape, then an explicit refusal before
-/// any reservation. Flat-store checkpoint is unchanged in `checkpoint_flat_store`.
-fn checkpoint_nested_lab(
+fn archive_superseded_reservation(db: &Connection, uuid: &str, id: &str) -> Result<(), Error> {
+    if let Some(r) = reservation(db, uuid)? {
+        if (r.state == RELEASED || r.state == COLLECTED) && r.operation_id != id {
+            let state = r.state.clone();
+            archive_reservation(db, uuid, id, &state)?;
+        }
+    }
+    Ok(())
+}
+
+fn prepare_empty_artifact_dir(id: &str) -> Result<PathBuf, Error> {
+    let dir = base()?.join(id);
+    match fs::symlink_metadata(&dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&dir)?,
+        Err(e) => return Err(e.into()),
+        Ok(m) if m.is_dir() && fs::read_dir(&dir)?.next().is_none() => {}
+        Ok(_) => {
+            return Err(
+                "An artifact directory for this operation exists without a reservation and is not empty; refusing to reuse it"
+                    .into(),
+            )
+        }
+    }
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    Ok(dir)
+}
+
+fn persist_checkpoint_reservation(
     db: &Connection,
     uuid: &str,
+    id: &str,
+    b: &Binding,
+    a: &Assessment,
+    dir: &Path,
+) -> Result<Reservation, Error> {
+    let now = crate::now() as i64;
+    let started_at = a.container["State"]["StartedAt"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    db.execute(
+        "INSERT INTO migration_reservations VALUES(?1,?2,?3,?4,?5,?6,?7,'reserved',?8,?8,NULL)",
+        params![
+            uuid,
+            id,
+            b.container_id,
+            b.image.trim_start_matches("sha256:"),
+            b.source_host,
+            b.destination,
+            started_at,
+            now
+        ],
+    )?;
+    write_private(
+        &dir.join("preflight.json"),
+        serde_json::to_string_pretty(&a.facts)?.as_bytes(),
+    )?;
+    reservation(db, uuid)?.ok_or_else(|| Error::from("Reservation not persisted"))
+}
+
+fn nested_lab_capture_pending_detail(uuid: &str, facts: &Value, r: &Reservation) -> Value {
+    json!({
+        "migration_profile": "nested",
+        "universe_uuid": uuid,
+        "scope": SCOPE_NESTED_LAB_CHECKPOINT,
+        "implementation_gaps": NESTED_LAB_CHECKPOINT_GAPS,
+        "facts": facts,
+        "reservation": r.view(),
+        "effects": "reservation and preflight.json only: no suspension, archive or manifest",
+        "reference": "docs/MIGRATION-INTEGRATION.md required separation",
+    })
+}
+
+/// After a durable nested-lab reservation, refuse capture until the separate backend exists.
+fn refuse_nested_lab_before_capture(
+    db: &Connection,
+    uuid: &str,
+    facts: &Value,
+    r: &Reservation,
+) -> Result<Value, Error> {
+    let detail = nested_lab_capture_pending_detail(uuid, facts, r);
+    set_state(db, uuid, "reserved", &detail)?;
+    Err(failure(
+        "migration_checkpoint nested-lab backend is not implemented beyond reservation; inner Podman reconciliation and the checkpoint/restore chain are required before suspension",
+        detail,
+    ))
+}
+
+/// Nested-lab checkpoint: assess, durable reservation (flat-store parity), then refuse before capture.
+fn checkpoint_nested_lab(
+    db: &Connection,
+    _attempt: i64,
+    id: &str,
+    uuid: &str,
+    name: &str,
     b: &Binding,
     existing: Option<Value>,
 ) -> Result<Value, Error> {
-    let a = assess(db, uuid, b, existing, false)?;
-    if !a.blockers.is_empty() {
+    archive_superseded_reservation(db, uuid, id)?;
+    let dir = base()?.join(id);
+    match reservation(db, uuid)? {
+        Some(r) if r.operation_id != id => Err(failure(
+            format!(
+                "Universe is already reserved by migration operation {} (state {})",
+                r.operation_id,
+                r.state
+            ),
+            json!({"reservation": r.view()}),
+        )),
+        Some(r) => nested_lab_resume(db, uuid, name, b, existing, r, &dir),
+        None => {
+            let a = assess(db, uuid, b, existing, false)?;
+            if !a.blockers.is_empty() {
+                return Err(failure(
+                    "Checkpoint preconditions not met; nothing was reserved, suspended or written",
+                    json!({
+                        "migration_profile": "nested",
+                        "blockers": a.blockers,
+                        "facts": a.facts,
+                    }),
+                ));
+            }
+            let dir = prepare_empty_artifact_dir(id)?;
+            let r = persist_checkpoint_reservation(db, uuid, id, b, &a, &dir)?;
+            refuse_nested_lab_before_capture(db, uuid, &a.facts, &r)
+        }
+    }
+}
+
+fn nested_lab_resume(
+    db: &Connection,
+    uuid: &str,
+    _name: &str,
+    b: &Binding,
+    existing: Option<Value>,
+    r: Reservation,
+    _dir: &Path,
+) -> Result<Value, Error> {
+    if r.state != "reserved" {
         return Err(failure(
-            "Checkpoint preconditions not met; nothing was reserved, suspended or written",
-            json!({
-                "migration_profile": "nested",
-                "blockers": a.blockers,
-                "facts": a.facts,
-            }),
+            format!(
+                "Nested-lab checkpoint cannot resume from reservation state {}; only reserved is supported before capture exists",
+                r.state
+            ),
+            json!({"reservation": r.view()}),
         ));
     }
-    Err(failure(
-        "migration_checkpoint nested-lab backend is not implemented beyond outer-shape assess; inner Podman reconciliation and the checkpoint/restore chain are required before reservation",
-        json!({
+    let Some(c) = existing else {
+        let detail = json!({"reason": "reserved source container is absent"});
+        set_state(db, uuid, "checkpoint_failed", &detail)?;
+        return Err(failure(
+            "The reserved source container is absent; nothing can be finalized or recaptured",
+            detail,
+        ));
+    };
+    let a = assess(db, uuid, b, Some(c), false)?;
+    if !a.blockers.is_empty() {
+        let detail = json!({
             "migration_profile": "nested",
-            "universe_uuid": uuid,
-            "scope": SCOPE_NESTED_LAB_CHECKPOINT,
-            "implementation_gaps": NESTED_LAB_CHECKPOINT_GAPS,
+            "blockers": a.blockers,
             "facts": a.facts,
-            "effects": "none: no reservation, suspension or artifact",
-            "reference": "docs/MIGRATION-INTEGRATION.md required separation",
-        }),
-    ))
+        });
+        set_state(db, uuid, "checkpoint_failed", &detail)?;
+        return Err(failure(
+            "Checkpoint preconditions are no longer met; nothing was suspended",
+            detail,
+        ));
+    }
+    refuse_nested_lab_before_capture(db, uuid, &a.facts, &r)
 }
 
 fn checkpoint_flat_store(
@@ -1011,16 +1149,7 @@ fn checkpoint_flat_store(
     existing: Option<Value>,
 ) -> Result<Value, Error> {
     let dir = base()?.join(id);
-    // A released or collected reservation holds nothing and must not block a new checkpoint of the same
-    // universe: it is archived, with its history and its preserved artifacts, and this operation reserves
-    // afresh. The tombstone of a collected universe is untouched by that — the identity stays protected
-    // against a blind create, while the universe itself may be checkpointed and migrated again.
-    if let Some(r) = reservation(db, uuid)? {
-        if (r.state == RELEASED || r.state == COLLECTED) && r.operation_id != id {
-            let state = r.state.clone();
-            archive_reservation(db, uuid, id, &state)?;
-        }
-    }
+    archive_superseded_reservation(db, uuid, id)?;
     match reservation(db, uuid)? {
         Some(r) if r.operation_id != id => Err(failure(
             format!(
@@ -1038,38 +1167,8 @@ fn checkpoint_flat_store(
                     json!({"blockers": a.blockers, "facts": a.facts}),
                 ));
             }
-            match fs::symlink_metadata(&dir) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&dir)?,
-                Err(e) => return Err(e.into()),
-                // A service crash between creating the directory and persisting the reservation leaves it
-                // empty; nothing was suspended, so it is reused. Anything else is refused.
-                Ok(m) if m.is_dir() && fs::read_dir(&dir)?.next().is_none() => {}
-                Ok(_) => {
-                    return Err(
-                        "An artifact directory for this operation exists without a reservation and is not empty; refusing to reuse it"
-                            .into(),
-                    )
-                }
-            }
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
-            let now = crate::now() as i64;
-            let started_at = a.container["State"]["StartedAt"].as_str().unwrap_or("").to_string();
-            // The reservation is durable before anything can suspend the source.
-            db.execute(
-                "INSERT INTO migration_reservations VALUES(?1,?2,?3,?4,?5,?6,?7,'reserved',?8,?8,NULL)",
-                params![
-                    uuid,
-                    id,
-                    b.container_id,
-                    b.image.trim_start_matches("sha256:"),
-                    b.source_host,
-                    b.destination,
-                    started_at,
-                    now
-                ],
-            )?;
-            write_private(&dir.join("preflight.json"), serde_json::to_string_pretty(&a.facts)?.as_bytes())?;
-            let r = reservation(db, uuid)?.ok_or("Reservation not persisted")?;
+            let dir = prepare_empty_artifact_dir(id)?;
+            let r = persist_checkpoint_reservation(db, uuid, id, b, &a, &dir)?;
             capture(db, attempt, id, uuid, name, &dir, &r)
         }
     }
@@ -1085,7 +1184,7 @@ pub(crate) fn checkpoint(
     existing: Option<Value>,
 ) -> Result<Value, Error> {
     match b.profile {
-        MigrationProfile::Nested => checkpoint_nested_lab(db, uuid, b, existing),
+        MigrationProfile::Nested => checkpoint_nested_lab(db, attempt, id, uuid, name, b, existing),
         MigrationProfile::Flat => checkpoint_flat_store(db, attempt, id, uuid, name, b, existing),
     }
 }
@@ -1436,7 +1535,10 @@ pub(crate) fn status(db: &Connection, request: &Value) -> Result<Value, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{migration_shape_blockers, MigrationProfile};
+    use super::{
+        migration_shape_blockers, nested_lab_capture_pending_detail, MigrationProfile,
+        NESTED_LAB_CHECKPOINT_GAPS, Reservation,
+    };
     use serde_json::json;
 
     fn fixture(privileged: bool) -> serde_json::Value {
@@ -1492,5 +1594,33 @@ mod tests {
         let c = fixture(true);
         assert!(migration_shape_blockers(&c, MigrationProfile::Nested).is_empty());
         assert!(!migration_shape_blockers(&c, MigrationProfile::Flat).is_empty());
+    }
+
+    #[test]
+    fn nested_lab_pending_detail_lists_gaps_and_reservation() {
+        let r = Reservation {
+            operation_id: "op-nested-1".into(),
+            container_id: "abc".repeat(21),
+            image_id: "img".into(),
+            source_host: "00000000-0000-0000-0000-000000000001".into(),
+            destination: "00000000-0000-0000-0000-000000000002".into(),
+            started_at: "2026-10-07T00:00:00Z".into(),
+            state: "reserved".into(),
+            created_at: 1,
+            updated_at: 1,
+            detail: None,
+        };
+        let facts = json!({"migration_profile": "nested"});
+        let detail = nested_lab_capture_pending_detail("11111111-1111-1111-1111-111111111111", &facts, &r);
+        assert_eq!(detail["universe_uuid"], "11111111-1111-1111-1111-111111111111");
+        assert_eq!(detail["reservation"]["state"], "reserved");
+        assert_eq!(
+            detail["implementation_gaps"].as_array().map(|a| a.len()),
+            Some(NESTED_LAB_CHECKPOINT_GAPS.len())
+        );
+        assert!(detail["effects"]
+            .as_str()
+            .unwrap_or("")
+            .contains("preflight.json"));
     }
 }
