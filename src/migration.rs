@@ -44,7 +44,32 @@ pub(crate) const SPACE_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 // Podman keeps the uncompressed checkpoint image files (--keep) under the container storage.
 pub(crate) const CONTAINER_STORAGE: &str = "/var/lib/containers/storage";
 const SCOPE: &str = "experimental source-side checkpoint: default rootful Podman store, network-disabled, mount-free, journal-owned container with musl processes, packaged podmesh-vzcriu 3.15.5.3 through its private-path shim";
+const SCOPE_NESTED_PREFLIGHT: &str = "experimental nested-lab preflight only: Rule 11 outer universe — privileged rootful Podman container, network-disabled, mount-free, journal-owned; inner Podman reconciliation and the checkpoint/restore chain are not implemented in this backend";
 const AUTHORITY: &str = "This checkpoint does not authorize restore on any host and does not release the reservation. Only migration_authorize_transfer issues a handoff, and only a verified destination outcome bound to it ends the reservation.";
+/// Which migration assess rules apply. Default flat scope refuses privileged containers; nested is preflight-only until a separate backend exists (docs/MIGRATION-INTEGRATION.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MigrationProfile {
+    Flat,
+    Nested,
+}
+impl MigrationProfile {
+    pub(crate) fn parse(raw: &str) -> Result<Self, Error> {
+        match raw {
+            "flat" => Ok(Self::Flat),
+            "nested" => Ok(Self::Nested),
+            other => Err(format!(
+                "migration_profile must be flat or nested, not {other}"
+            )
+            .into()),
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::Nested => "nested",
+        }
+    }
+}
 /// Reservation states this file, `recovery.rs` and `collector.rs` share.
 pub(crate) const RELEASED: &str = "released";
 pub(crate) const ABANDONED: &str = "abandoned";
@@ -60,6 +85,7 @@ pub(crate) struct Binding<'a> {
     pub image: &'a str,
     pub source_host: &'a str,
     pub destination: &'a str,
+    pub profile: MigrationProfile,
 }
 
 static MIGRATIONS: OnceLock<PathBuf> = OnceLock::new();
@@ -648,6 +674,35 @@ fn space_facts(container_id: &str, memory: u64, blockers: &mut Vec<String>) -> R
     }
     Ok(json!({"available_bytes": available_bytes, "required_bytes": required, "writable_layer_bytes": size_rw}))
 }
+/// Container shape rules for migration assess. Flat scope refuses privileged outer containers; nested requires them.
+pub(crate) fn migration_shape_blockers(c: &Value, profile: MigrationProfile) -> Vec<String> {
+    let mut blockers = vec![];
+    match profile {
+        MigrationProfile::Flat => {
+            if c["HostConfig"]["Privileged"].as_bool() != Some(false) {
+                blockers.push("container is privileged or its privilege mode is unknown".into());
+            }
+        }
+        MigrationProfile::Nested => {
+            if c["HostConfig"]["Privileged"].as_bool() != Some(true) {
+                blockers.push(
+                    "nested profile requires a privileged outer container (Rule 11 outer universe)"
+                        .into(),
+                );
+            }
+        }
+    }
+    if c["HostConfig"]["NetworkMode"].as_str() != Some("none") {
+        blockers.push("network mode is not none".into());
+    }
+    if c["Mounts"].as_array().map(|m| !m.is_empty()).unwrap_or(true) {
+        blockers.push("container has volumes or bind mounts".into());
+    }
+    if c["Config"]["Tty"].as_bool() == Some(true) {
+        blockers.push("containers with a TTY are outside the qualified scope".into());
+    }
+    blockers
+}
 fn assess(db: &Connection, uuid: &str, b: &Binding, existing: Option<Value>, allow_frozen: bool) -> Result<Assessment, Error> {
     let c = existing.ok_or("Universe container not found")?;
     lc::owned(db, &c, uuid, "Migration source")?;
@@ -675,18 +730,7 @@ fn assess(db: &Connection, uuid: &str, b: &Binding, existing: Option<Value>, all
             "container state {state} is not running; only a running process can be checkpointed"
         ));
     }
-    if c["HostConfig"]["NetworkMode"].as_str() != Some("none") {
-        blockers.push("network mode is not none".into());
-    }
-    if c["Mounts"].as_array().map(|m| !m.is_empty()).unwrap_or(true) {
-        blockers.push("container has volumes or bind mounts".into());
-    }
-    if c["HostConfig"]["Privileged"].as_bool() != Some(false) {
-        blockers.push("container is privileged or its privilege mode is unknown".into());
-    }
-    if c["Config"]["Tty"].as_bool() == Some(true) {
-        blockers.push("containers with a TTY are outside the qualified scope".into());
-    }
+    blockers.extend(migration_shape_blockers(&c, b.profile));
     let runtime = runtime_facts(&mut blockers);
     let (processes, space) = if state == "running" {
         let (processes, memory) = process_facts(&c, &mut blockers, allow_frozen);
@@ -695,9 +739,10 @@ fn assess(db: &Connection, uuid: &str, b: &Binding, existing: Option<Value>, all
     } else {
         (Value::Null, Value::Null)
     };
-    let facts = json!({"observed_at": crate::now(), "host_uuid": host, "container": lc::state_view(&c), "image_id": image,
+    let facts = json!({"observed_at": crate::now(), "host_uuid": host, "migration_profile": b.profile.as_str(),
+        "container": lc::state_view(&c), "image_id": image,
         "network_mode": c["HostConfig"]["NetworkMode"], "log_driver": c["HostConfig"]["LogConfig"]["Type"],
-        "runtime": runtime, "processes": processes, "space": space});
+        "privileged": c["HostConfig"]["Privileged"], "runtime": runtime, "processes": processes, "space": space});
     Ok(Assessment {
         container: c,
         blockers,
@@ -714,11 +759,16 @@ pub(crate) fn preflight(db: &Connection, uuid: &str, b: &Binding, existing: Opti
             r.operation_id, r.state
         ));
     }
+    let scope = match b.profile {
+        MigrationProfile::Flat => SCOPE,
+        MigrationProfile::Nested => SCOPE_NESTED_PREFLIGHT,
+    };
     Ok(
         json!({"status": "verified", "operation": "migration_preflight", "universe_uuid": uuid,
+        "migration_profile": b.profile.as_str(),
         "compatible": a.blockers.is_empty(), "blockers": a.blockers, "facts": a.facts,
         "reservation": reserved.map(|r| r.view()),
-        "effects": "none: preflight does not reserve, suspend, signal or write artifacts", "scope": SCOPE}),
+        "effects": "none: preflight does not reserve, suspend, signal or write artifacts", "scope": scope}),
     )
 }
 
@@ -921,6 +971,12 @@ pub(crate) fn checkpoint(
     b: &Binding,
     existing: Option<Value>,
 ) -> Result<Value, Error> {
+    if b.profile == MigrationProfile::Nested {
+        return Err(failure(
+            "migration_checkpoint is not implemented for migration_profile nested; use preflight only until the nested-lab backend exists",
+            json!({"migration_profile": "nested"}),
+        ));
+    }
     let dir = base()?.join(id);
     // A released or collected reservation holds nothing and must not block a new checkpoint of the same
     // universe: it is archived, with its history and its preserved artifacts, and this operation reserves
@@ -1328,4 +1384,56 @@ pub(crate) fn status(db: &Connection, request: &Value) -> Result<Value, Error> {
             "preconditions_observed": observed,
         },
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{migration_shape_blockers, MigrationProfile};
+    use serde_json::json;
+
+    fn fixture(privileged: bool) -> serde_json::Value {
+        json!({
+            "HostConfig": {"NetworkMode": "none", "Privileged": privileged},
+            "Mounts": [],
+            "Config": {"Tty": false}
+        })
+    }
+
+    #[test]
+    fn flat_refuses_privileged_outer() {
+        let blockers = migration_shape_blockers(&fixture(true), MigrationProfile::Flat);
+        assert!(
+            blockers
+                .iter()
+                .any(|b| b.contains("privileged") || b.contains("Privileged")),
+            "{blockers:?}"
+        );
+        assert!(migration_shape_blockers(&fixture(false), MigrationProfile::Flat).is_empty());
+    }
+
+    #[test]
+    fn nested_requires_privileged_outer() {
+        assert!(migration_shape_blockers(&fixture(false), MigrationProfile::Nested)
+            .iter()
+            .any(|b| b.contains("privileged outer")));
+        assert!(migration_shape_blockers(&fixture(true), MigrationProfile::Nested).is_empty());
+    }
+
+    #[test]
+    fn nested_still_refuses_network_and_mounts() {
+        let mut c = fixture(true);
+        c["HostConfig"]["NetworkMode"] = json!("bridge");
+        assert!(
+            migration_shape_blockers(&c, MigrationProfile::Nested)
+                .iter()
+                .any(|b| b.contains("network"))
+        );
+        c = fixture(true);
+        c["Mounts"] = json!([{"Type": "bind"}]);
+        assert!(
+            migration_shape_blockers(&c, MigrationProfile::Nested)
+                .iter()
+                .any(|b| b.contains("mount"))
+        );
+    }
 }

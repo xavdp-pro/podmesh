@@ -293,11 +293,11 @@ fn stopped(c: &Value) -> Result<(), Error> {
     }
     Ok(())
 }
-/// Seconds since the Unix epoch for Podman's UTC timestamps (`YYYY-MM-DDTHH:MM:SS[.frac]Z`).
+/// Seconds since the Unix epoch for Podman container timestamps
+/// (`YYYY-MM-DDTHH:MM:SS[.frac]Z` or the same with a numeric zone suffix `±HH:MM`).
 pub(crate) fn epoch(ts: &str) -> Option<i64> {
     let b = ts.as_bytes();
-    if b.len() < 20
-        || !ts.ends_with('Z')
+    if b.len() < 19
         || b[4] != b'-'
         || b[7] != b'-'
         || b[10] != b'T'
@@ -315,7 +315,19 @@ pub(crate) fn epoch(ts: &str) -> Option<i64> {
     let yoe = y - era * 400;
     let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some((era * 146097 + doe - 719468) * 86400 + hh * 3600 + mm * 60 + ss)
+    let mut secs = (era * 146097 + doe - 719468) * 86400 + hh * 3600 + mm * 60 + ss;
+    if !ts.ends_with('Z') {
+        let zone = ts.get(19..)?;
+        let pos = zone.rfind('+').or_else(|| zone.rfind('-'))?;
+        let sign = if zone.as_bytes()[pos] == b'+' { 1i64 } else { -1i64 };
+        let off = zone.get(pos + 1..)?;
+        if off.len() != 5 || off.as_bytes().get(2) != Some(&b':') {
+            return None;
+        }
+        let (oh, om) = (off.get(0..2)?.parse::<i64>().ok()?, off.get(3..5)?.parse::<i64>().ok()?);
+        secs -= sign * (oh * 3600 + om * 60);
+    }
+    Some(secs)
 }
 /// The observed container state, without claims about anything not observed.
 pub(crate) fn state_view(c: &Value) -> Value {
@@ -576,11 +588,17 @@ fn parse<'a>(
             if source_host == destination {
                 return Err("destination_host_uuid must differ from source_host_uuid".into());
             }
+            let profile = match request.get("migration_profile") {
+                None | Some(Value::Null) => migration::MigrationProfile::Flat,
+                Some(Value::String(raw)) => migration::MigrationProfile::parse(raw)?,
+                _ => return Err("migration_profile must be a string (flat or nested)".into()),
+            };
             let binding = Binding {
                 container_id,
                 image,
                 source_host,
                 destination,
+                profile,
             };
             if operation == "migration_preflight" {
                 Params::MigrationPreflight(binding)
@@ -2966,7 +2984,11 @@ mod tests {
         assert_eq!(epoch("2024-02-29T12:00:00Z"), Some(1_709_208_000));
         // Observed on the lab: StartedAt of a container whose start event had time 1789150856.
         assert_eq!(epoch("2026-09-11T18:20:56.109581375Z"), Some(1_789_150_856));
-        assert_eq!(epoch("2026-09-11T18:20:56+02:00"), None);
+        assert_eq!(epoch("2026-09-11T18:20:56+02:00"), Some(1_789_150_856));
+        assert_eq!(
+            epoch("2026-10-07T20:24:33.526747397+02:00"),
+            epoch("2026-10-07T20:24:33+02:00"),
+        );
         assert!(epoch("0001-01-01T00:00:00Z").is_some_and(|t| t < 0));
     }
     #[test]
