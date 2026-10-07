@@ -43,4 +43,5 @@ records, reviews and decisions in a private companion repository; nothing here d
   [STORAGE-MARIADB-MIGRATION-PLAN.md](STORAGE-MARIADB-MIGRATION-PLAN.md) — which engine carries a
   node's journal, and the migration from the SQLite file to a MariaDB instance per functional role.
 - [ACCEPTANCE-TEST-PLAN.md](ACCEPTANCE-TEST-PLAN.md) — the acceptance gates and their required evidence.
+- [PUBLIC-CLAIMS-PATH-B-2026-10-07.md](PUBLIC-CLAIMS-PATH-B-2026-10-07.md) — sanitized move/replicate claims for site, wiki and summaries (assembly 2026-10-07).
 - [../AGENTS.md](../AGENTS.md) — what belongs in this repository, in the private companion, and in neither.

@@ -25,6 +25,8 @@ Current qualified status (standalone Linux mode). Gates 1–5 are partially exer
 
 **Read this with its date (2026-09-18).** The published package is now `0.1.0~experimental7`, installed on the three laboratory hosts, and the paragraphs above have not been rewritten for experimental6 or experimental7: they state what experimental4 and experimental5 carried. A published package is not a qualified one, and this document says only what was exercised.
 
+**Assembly branch note (2026-10-07).** On `cursor/assembly-2026-10-07`, maintainers recorded **one** nested outer-universe **move** and **one** two-host **replicate** campaign (stopped and live planned switchover) under the PodMesh API contract. That evidence is **not** a rewrite of gate 6 or gate 8 qualification for the published Debian package; it is development-tree proof with explicit fixture limits. Public wording: `docs/PUBLIC-CLAIMS-PATH-B-2026-10-07.md`. Detailed reports remain in the private workshop.
+
 Networking (including unique clone IPs), volumes, purge, clean-host installation, gate 7 and gate 8 are not validated through PodMesh. A reservation is not fencing. The maintainers keep the exact scope and its evidence with the laboratory records. Earlier standalone migration-kit experiments do not satisfy these service acceptance gates.
 
 The same contracts must ultimately be checked in standalone Linux mode and ShaperOS-integrated mode. Passing one mode does not validate the other.
