@@ -1,14 +1,18 @@
 //! MariaDB manager journal entry path: open through `podmesh::open_manager_store` and serve the
 //! laboratory request surface on [`DurableStore`]. SQLite keeps the file-backed [`Store`].
 
+use std::sync::Arc;
+use std::time::Instant;
+
 use super::{
-    apply, authenticated_import_receipt_id, corrupt_model, decode_fact_row, digest,
-    enum_from_text, error, json, mutation_operation_id, receipt_digest,
-    receipt_metadata_for_request, store_closed_state_untracked, validate_local_configuration,
+    apply, authenticated_import_receipt_id, closed_state, corrupt_model, decode_fact_row, digest,
+    enum_from_text, error, inspect_profile, integrity_state, json, lock, mutation_operation_id,
+    receipt_digest, receipt_metadata_for_request, validate_local_configuration,
     validate_receipt_metadata, validate_receipt_operation_id, AuditDirection, AuditOutcome,
     AuditPhase, AuthenticatedImport, Configuration, DurableError, DurableResult, Executed,
     ExchangeAuditEvent, ReceiptEvidence, ReceiptKind, ReceiptMetadata, Request, Response,
-    Snapshot, Store, StoreClosedState, StoreIntegrity, Topology,
+    Snapshot, Store, StoreClosedState, StoreIntegrity, StoreIntegrityEntry, Topology,
+    VerifiedPositions,
 };
 #[cfg(feature = "mariadb")]
 use super::journal_audit;
@@ -271,7 +275,7 @@ pub struct MariaDbJournal {
     configuration: Configuration,
     topology: Topology,
     replica_id: String,
-    closed_state: StoreClosedState,
+    integrity: Arc<StoreIntegrityEntry>,
 }
 
 impl MariaDbJournal {
@@ -300,13 +304,39 @@ impl MariaDbJournal {
             }
         };
         ensure_identity(store.as_mut(), &topology, replica_id)?;
-        Ok(Self {
+        let integrity = Arc::new(StoreIntegrityEntry::default());
+        let mut journal = Self {
             store,
             configuration,
             topology,
             replica_id: replica_id.into(),
-            closed_state: store_closed_state_untracked(),
-        })
+            integrity,
+        };
+        journal.run_full_verification(true)?;
+        Ok(journal)
+    }
+
+    fn run_full_verification(&mut self, replace_positions: bool) -> DurableResult<()> {
+        let integrity = Arc::clone(&self.integrity);
+        let _pass = lock(&integrity.full_pass, "full verification lock")?;
+        integrity.refuse_if_failed()?;
+        let started = Instant::now();
+        let check = self.store.integrity_check().map_err(store_error)?;
+        if !check.ok {
+            return Err(integrity.fail_closed(DurableError::Corrupt(
+                "MariaDB store integrity check failed".into(),
+            )));
+        }
+        let mut transaction = self.store.transaction().map_err(store_error)?;
+        inspect_profile::verify_mariadb_journal_rows(
+            transaction.as_mut(),
+            &self.topology,
+            &self.replica_id,
+        )
+        .map_err(|problem| integrity.fail_closed_if_corrupt(problem))?;
+        transaction.commit().map_err(store_error)?;
+        integrity.record_full_verification(VerifiedPositions::default(), started, replace_positions)?;
+        Ok(())
     }
 
     /// Applies one laboratory request in a single durable transaction.
@@ -322,6 +352,7 @@ impl MariaDbJournal {
     /// # Errors
     /// Returns durable refusals from the active backend.
     pub fn execute_with_receipt(&mut self, request: &Request) -> DurableResult<Executed> {
+        self.integrity.refuse_if_failed()?;
         let receipt_metadata = receipt_metadata_for_request(request);
         let mut transaction = self.store.transaction().map_err(store_error)?;
         let executed = execute_on_transaction(
@@ -331,7 +362,8 @@ impl MariaDbJournal {
             &self.replica_id,
             request,
             receipt_metadata,
-        )?;
+        )
+        .map_err(|problem| self.integrity.fail_closed_if_corrupt(problem))?;
         transaction.commit().map_err(store_error)?;
         Ok(executed)
     }
@@ -341,6 +373,7 @@ impl MariaDbJournal {
     /// # Errors
     /// Returns store faults and corrupt receipt rows.
     pub fn highest_local_observation(&mut self) -> DurableResult<Option<u64>> {
+        self.integrity.refuse_if_failed()?;
         let logical_manager_id = self.topology.logical_manager_id();
         let observe_kind = enum_text(&ReceiptKind::Observe)?;
         let mut transaction = self.store.transaction().map_err(store_error)?;
@@ -353,26 +386,27 @@ impl MariaDbJournal {
         let mut highest = None;
         for row in rows {
             let stored = read_stored_receipt(&row)?;
-            verify_stored_receipt(logical_manager_id, &stored)?;
+            verify_stored_receipt(logical_manager_id, &stored)
+                .map_err(|problem| self.integrity.fail_closed_if_corrupt(problem))?;
             let response = serde_json::from_str(&stored.response_json).map_err(error)?;
             if let Response::Observed { fact } = response {
                 if fact.origin_replica_id == self.replica_id {
                     highest = highest.max(Some(fact.producer_sequence));
                 }
             } else {
-                return Err(DurableError::Corrupt(
+                return Err(self.integrity.fail_closed_if_corrupt(DurableError::Corrupt(
                     "stored observe receipt does not record an observation".into(),
-                ));
+                )));
             }
         }
         transaction.commit().map_err(store_error)?;
         Ok(highest)
     }
 
-    /// Process-local closed state (untracked for MariaDB in this slice).
+    /// Process-local closed state for this journal in this process.
     #[must_use]
     pub fn closed_state(&self) -> StoreClosedState {
-        self.closed_state.clone()
+        StoreClosedState(Arc::clone(&self.integrity))
     }
 
     /// Imports an authenticated peer snapshot with the same contract as [`Store`].
@@ -385,6 +419,7 @@ impl MariaDbJournal {
         snapshot: &Snapshot,
         mut audit: ExchangeAuditEvent,
     ) -> DurableResult<AuthenticatedImport> {
+        self.integrity.refuse_if_failed()?;
         if audit.direction != AuditDirection::Inbound
             || audit.phase != AuditPhase::InboundImportCommitted
             || audit.outcome != AuditOutcome::Accepted
@@ -453,23 +488,27 @@ impl MariaDbJournal {
         })
     }
 
-    /// MariaDB journals do not run SQLite file integrity verification in this slice.
+    /// Verifies CHECK TABLE on the MariaDB journal and every stored fact, receipt
+    /// and audit row in one read transaction.
     ///
     /// # Errors
-    /// Never fails in this slice.
+    /// Returns verification failures that close this journal for the rest of the
+    /// process, or a storage error that prevented the pass.
     pub fn verify_full(&mut self) -> DurableResult<()> {
-        Ok(())
+        self.run_full_verification(false)
     }
 
-    /// Reports no SQLite file integrity state for this journal.
+    /// Reports the integrity state of this journal in this process.
     ///
     /// # Errors
-    /// Never fails in this slice.
+    /// Reports a poisoned integrity lock.
     pub fn integrity(&self) -> DurableResult<StoreIntegrity> {
+        let failure = closed_state(&self.integrity)?.clone();
+        let state = integrity_state(&self.integrity)?;
         Ok(StoreIntegrity {
-            full_verifications: 0,
-            last_full_verification_age: None,
-            failure: None,
+            full_verifications: state.full_verifications,
+            last_full_verification_age: state.last_full_verification.map(|at| at.elapsed()),
+            failure,
         })
     }
 }

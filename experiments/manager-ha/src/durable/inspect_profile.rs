@@ -248,6 +248,19 @@ fn load_replica_transaction(
 }
 
 #[cfg(feature = "mariadb")]
+pub(super) fn verify_mariadb_journal_rows(
+    transaction: &mut dyn Transaction,
+    topology: &Topology,
+    replica_id: &str,
+) -> DurableResult<()> {
+    begin_mariadb_inspection(transaction, topology, replica_id)?;
+    verify_receipts_transaction(transaction, topology.logical_manager_id())?;
+    load_replica_transaction(transaction, topology, replica_id)?;
+    load_audits_transaction(transaction, topology, replica_id)?;
+    Ok(())
+}
+
+#[cfg(feature = "mariadb")]
 fn begin_mariadb_inspection(
     transaction: &mut dyn Transaction,
     topology: &Topology,
@@ -379,8 +392,7 @@ fn inspect_mariadb_read_only(
     }
     let integrity_result = integrity.result().to_string();
     let mut transaction = store.transaction().map_err(store_error)?;
-    begin_mariadb_inspection(transaction.as_mut(), &topology, replica_id)?;
-    verify_receipts_transaction(transaction.as_mut(), topology.logical_manager_id())?;
+    verify_mariadb_journal_rows(transaction.as_mut(), &topology, replica_id)?;
     let replica = load_replica_transaction(transaction.as_mut(), &topology, replica_id)?;
     let audits = load_audits_transaction(transaction.as_mut(), &topology, replica_id)?;
     let receipts = load_receipt_evidence_transaction(transaction.as_mut())?;
