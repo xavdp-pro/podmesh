@@ -16,6 +16,7 @@ records, reviews and decisions in a private companion repository; nothing here d
 
 ## Operate
 - [PREPARE-A-HOST.md](PREPARE-A-HOST.md) — the validated host target, installation and storage recommendations.
+- [MANAGER-DEPLOYMENT.md](MANAGER-DEPLOYMENT.md) — the `podmesh-manager` Debian package boundary and laboratory activation checklist.
 - [OPERATIONS.md](OPERATIONS.md) — the experimental tools: moving, replicating, guarding and taking over universes.
 - [LOCAL-API.md](LOCAL-API.md) — every operation of the host's local API, its fields, refusals and replay rules.
 
