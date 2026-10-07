@@ -71,7 +71,8 @@ assert d['pid']==pid, 'PID changed unexpectedly'
 cmd=Path('/proc/%d/cmdline'%pid).read_bytes()
 assert b'token=$(cat /proc/sys/kernel/random/uuid)' in cmd, 'Unexpected process'
 log=Path('/var/lib/containers/storage/vfs-containers')/ident/'userdata/ctr.log'
-assert expected['uuid'] in log.read_text(), 'Workload identity missing'
+workload_uuid=expected.get('uuid', expected.get('workload_uuid'))
+assert workload_uuid and workload_uuid in log.read_text(), 'Workload identity missing'
 start=int(Path('/proc/%d/stat'%pid).read_text().rsplit(')',1)[1].split()[19])
 backup=Path(tempfile.mkdtemp(prefix='podmesh-nested-reconcile-', dir='/tmp'))
 shutil.copy2(p,backup/'crun-status.json')
