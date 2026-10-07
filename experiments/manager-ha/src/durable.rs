@@ -1661,7 +1661,7 @@ fn execute_transaction(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-struct ReceiptMetadata {
+pub(super) struct ReceiptMetadata {
     kind: ReceiptKind,
     source_replica_id: Option<String>,
     wire_operation_id: Option<String>,
@@ -2032,10 +2032,10 @@ fn receipt_digest(
     ))?))
 }
 
-const RECEIPT_COLUMNS: &str =
+pub(super) const RECEIPT_COLUMNS: &str =
     "operation_id, kind, source_replica_id, wire_operation_id, request_json, response_json, sha256";
 
-struct StoredReceipt {
+pub(super) struct StoredReceipt {
     operation_id: String,
     kind: String,
     source_replica_id: Option<String>,
@@ -2057,7 +2057,7 @@ fn read_receipt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredReceipt> 
     })
 }
 
-fn verify_receipt_row(logical_manager_id: &str, receipt: &StoredReceipt) -> DurableResult<()> {
+pub(super) fn verify_receipt_row(logical_manager_id: &str, receipt: &StoredReceipt) -> DurableResult<()> {
     let metadata = ReceiptMetadata {
         kind: enum_from_text(&receipt.kind)
             .map_err(|_| DurableError::Corrupt("stored receipt kind is invalid".into()))?,
@@ -2920,7 +2920,7 @@ fn verify_audit_receipt_link(
 }
 
 /// The local receipt an audit event references: its identity and digest.
-fn local_receipt_reference(event: &ExchangeAuditEvent) -> Option<(&str, &str)> {
+pub(super) fn local_receipt_reference(event: &ExchangeAuditEvent) -> Option<(&str, &str)> {
     event
         .local_receipt_operation_id
         .as_deref()
@@ -2929,7 +2929,7 @@ fn local_receipt_reference(event: &ExchangeAuditEvent) -> Option<(&str, &str)> {
 
 /// Checks an audit event's local receipt reference against the metadata of the
 /// stored receipt with that identity and digest, `None` when there is none.
-fn check_audit_receipt_link(
+pub(super) fn check_audit_receipt_link(
     event: &ExchangeAuditEvent,
     metadata: Option<ReceiptMetadata>,
 ) -> DurableResult<()> {
@@ -3569,6 +3569,21 @@ fn verify_loaded_audit(
     record_json: &str,
     sha256: String,
 ) -> DurableResult<ExchangeAuditEvidence> {
+    verify_stored_audit_evidence(topology, replica_id, event, record_json, sha256, |event| {
+        verify_audit_receipt_link(connection, event).map_err(|problem| {
+            DurableError::Corrupt(format!("stored audit receipt link is invalid: {problem}"))
+        })
+    })
+}
+
+pub(super) fn verify_stored_audit_evidence(
+    topology: &Topology,
+    replica_id: &str,
+    event: ExchangeAuditEvent,
+    record_json: &str,
+    sha256: String,
+    check_receipt_link: impl FnOnce(&ExchangeAuditEvent) -> DurableResult<()>,
+) -> DurableResult<ExchangeAuditEvidence> {
     validate_audit(&event)
         .map_err(|problem| DurableError::Corrupt(format!("stored audit is invalid: {problem}")))?;
     validate_audit_identity(topology, replica_id, &event).map_err(|problem| {
@@ -3589,13 +3604,11 @@ fn verify_loaded_audit(
             "stored audit record or hash mismatch".into(),
         ));
     }
-    verify_audit_receipt_link(connection, &event).map_err(|problem| {
-        DurableError::Corrupt(format!("stored audit receipt link is invalid: {problem}"))
-    })?;
+    check_receipt_link(&event)?;
     Ok(ExchangeAuditEvidence { event, sha256 })
 }
 
-const AUDIT_COLUMNS: &str = "audit_event_id, attempt_id, wire_nonce, direction, phase,
+pub(super) const AUDIT_COLUMNS: &str = "audit_event_id, attempt_id, wire_nonce, direction, phase,
     authenticated_peer_id, peer_claim, operation_id, request_frame_bytes,
     request_announced_body_bytes, request_sha256, reply_frame_bytes,
     reply_announced_body_bytes, reply_sha256, outcome, error_category, reason_code,
@@ -3728,7 +3741,7 @@ fn verify_appended_audits(
     Ok(position)
 }
 
-fn verify_audit_sequences(audits: &[ExchangeAuditEvidence]) -> DurableResult<()> {
+pub(super) fn verify_audit_sequences(audits: &[ExchangeAuditEvidence]) -> DurableResult<()> {
     audit_sequence_problem(audits.iter().map(|entry| &entry.event))
         .map_or(Ok(()), |detail| Err(DurableError::Corrupt(detail)))
 }
@@ -3824,6 +3837,17 @@ pub fn inspect_read_only(
     configuration: &Configuration,
     replica_id: &str,
 ) -> DurableResult<CanonicalStoreInspection> {
+    let profile_dir = path
+        .parent()
+        .ok_or_else(|| DurableError::Storage("database path has no parent".into()))?;
+    inspect_profile::inspect_read_only_resolved(profile_dir, path, configuration, replica_id)
+}
+
+pub(super) fn inspect_sqlite_read_only(
+    path: &Path,
+    configuration: &Configuration,
+    replica_id: &str,
+) -> DurableResult<CanonicalStoreInspection> {
     require_regular_nonsymlink(path)?;
     let topology = validate_local_configuration(configuration, replica_id)?;
     let (_source, mut connection) = open_inspection_source(path)?;
@@ -3843,8 +3867,30 @@ pub fn inspect_read_only(
     let replica = load(&transaction, &topology, replica_id)?;
     let audits = load_audits(&transaction, &topology, replica_id)?;
     let receipts = load_receipt_evidence(&transaction)?;
+    let inspection = finish_canonical_inspection(
+        &topology,
+        replica_id,
+        replica,
+        audits,
+        receipts,
+        version,
+        integrity,
+    )?;
+    transaction.commit().map_err(error)?;
+    Ok(inspection)
+}
+
+pub(super) fn finish_canonical_inspection(
+    topology: &Topology,
+    replica_id: &str,
+    replica: Replica,
+    audits: Vec<ExchangeAuditEvidence>,
+    receipts: Vec<ReceiptEvidence>,
+    schema_version: u32,
+    sqlite_integrity_result: String,
+) -> DurableResult<CanonicalStoreInspection> {
     let ordered_facts: Vec<_> = replica.history.values().cloned().collect();
-    let logical_history_sha256 = logical_history_sha256(&topology, &ordered_facts)?;
+    let logical_history_sha256 = logical_history_sha256(topology, &ordered_facts)?;
     let receipt_set_sha256 = digest(&json(&("podmesh-manager-ha-receipt-set/1", &receipts))?);
     let audit_set_sha256 = digest(&json(&("podmesh-manager-ha-audit-set/1", &audits))?);
     let incomplete_attempts = incomplete_attempts(&audits)?;
@@ -3864,8 +3910,8 @@ pub fn inspect_read_only(
         .map(|receipt| receipt.operation_id.clone())
         .collect();
     let view = replica.materialize();
-    let inspection = CanonicalStoreInspection {
-        schema_version: version,
+    Ok(CanonicalStoreInspection {
+        schema_version,
         logical_manager_id: topology.logical_manager_id().into(),
         replica_id: replica_id.into(),
         history_count: ordered_facts.len(),
@@ -3882,10 +3928,8 @@ pub fn inspect_read_only(
         audit_set_sha256,
         incomplete_attempts,
         unaudited_import_receipt_ids,
-        sqlite_integrity_result: integrity,
-    };
-    transaction.commit().map_err(error)?;
-    Ok(inspection)
+        sqlite_integrity_result,
+    })
 }
 
 /// Verifies and returns the facts of an existing manager store through the same
@@ -3902,6 +3946,22 @@ pub fn inspect_read_only(
 /// Rejects missing/non-regular stores, schema or identity mismatch, a facts
 /// table whose rowids are not contiguous from 1, and any corrupt fact.
 pub fn inspect_facts_read_only(
+    path: &Path,
+    configuration: &Configuration,
+    replica_id: &str,
+) -> DurableResult<FactsInspection> {
+    let profile_dir = path
+        .parent()
+        .ok_or_else(|| DurableError::Storage("database path has no parent".into()))?;
+    inspect_profile::inspect_facts_read_only_resolved(
+        profile_dir,
+        path,
+        configuration,
+        replica_id,
+    )
+}
+
+pub(super) fn inspect_sqlite_facts_read_only(
     path: &Path,
     configuration: &Configuration,
     replica_id: &str,
@@ -4021,7 +4081,7 @@ pub fn facts_history_sha256(
     logical_history_sha256(&topology, ordered_facts)
 }
 
-fn logical_history_sha256(topology: &Topology, ordered_facts: &[Fact]) -> DurableResult<String> {
+pub(super) fn logical_history_sha256(topology: &Topology, ordered_facts: &[Fact]) -> DurableResult<String> {
     let topology_sha256 = digest(&json(topology)?);
     Ok(digest(&json(&(
         "podmesh-manager-ha-logical-history/1",
@@ -4466,6 +4526,11 @@ CREATE TRIGGER exchange_audit_events_no_delete BEFORE DELETE ON exchange_audit_e
 PRAGMA user_version=3;
 ";
 
+pub mod inspect_profile;
+pub use inspect_profile::{
+    inspect_facts_read_only_resolved, inspect_read_only_resolved,
+    manager_store_profile_absent_sqlite_file_ok,
+};
 pub mod journal_profile;
 
 #[cfg(test)]

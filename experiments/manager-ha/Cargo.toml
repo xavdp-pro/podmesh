@@ -18,6 +18,7 @@ podmesh = { path = "../..", default-features = false }
 
 [dev-dependencies]
 tempfile = { version = "3", default-features = false }
+podmesh = { path = "../..", features = ["mariadb"] }
 
 [lib]
 path = "src/lib.rs"

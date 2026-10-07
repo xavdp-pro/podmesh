@@ -1,6 +1,9 @@
 //! Strict offline validation and explicit network opt-in for the package candidate.
 use crate::{Configuration, Result};
-use podmesh_manager_ha_lab::durable::{inspect_facts_read_only, inspect_read_only};
+use podmesh_manager_ha_lab::durable::{
+    inspect_facts_read_only_resolved, inspect_read_only_resolved,
+    manager_store_profile_absent_sqlite_file_ok,
+};
 use std::{
     ffi::{OsStr, OsString},
     fs,
@@ -58,14 +61,17 @@ pub fn execute(arguments: impl Iterator<Item = OsString>) -> Result<()> {
         let network = &config.network;
         // The facts alone, verified: an output and a verification that do not grow
         // with the exchange audit table, for readers that need nothing else.
+        let profile_dir = state;
         let inspection = if options.facts_only {
-            serde_json::to_string(&inspect_facts_read_only(
+            serde_json::to_string(&inspect_facts_read_only_resolved(
+                profile_dir,
                 &network.database_path,
                 &network.manager,
                 &network.replica_id,
             )?)?
         } else {
-            serde_json::to_string(&inspect_read_only(
+            serde_json::to_string(&inspect_read_only_resolved(
+                profile_dir,
                 &network.database_path,
                 &network.manager,
                 &network.replica_id,
@@ -283,7 +289,9 @@ fn validate_state_paths(
     if db.parent() != Some(state) {
         return Err("database must be a direct child of the declared state directory".into());
     }
-    trusted_file(db, database_missing_allowed)?;
+    let sqlite_missing_allowed = database_missing_allowed
+        || manager_store_profile_absent_sqlite_file_ok(state, db);
+    trusted_file(db, sqlite_missing_allowed)?;
     if database_missing_allowed {
         trusted_file(&db.with_extension("resident-lock"), true)?;
     }
