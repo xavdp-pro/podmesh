@@ -227,6 +227,7 @@ def validate(v,label):
     semantic=("network_mode","address_families","peer_allow_count","peer_allow_prefix_length","store_sidecar_loopback_allow")
     active={"network_mode":"authenticated-static-peers","address_families":["AF_UNIX","AF_INET"],"peer_allow_count":2,"peer_allow_prefix_length":32,"store_sidecar_loopback_allow":False}
     active_mariadb={**active,"store_sidecar_loopback_allow":True}
+    active_mariadb_single={"network_mode":"authenticated-static-peers","address_families":["AF_UNIX","AF_INET"],"peer_allow_count":0,"peer_allow_prefix_length":32,"store_sidecar_loopback_allow":True}
     absent={"network_mode":None,"address_families":[],"peer_allow_count":0,"peer_allow_prefix_length":None,"store_sidecar_loopback_allow":False}
     if d["present"]:
         sha(d["sha256"],f"{label}.dropin.sha256"); commit(d["effective_policy_commitment"],f"{label}.dropin.effective_policy_commitment")
@@ -235,7 +236,7 @@ def validate(v,label):
         sha(limits["sha256"],f"{label}.dropin.semantic_limits.sha256")
         if limits["sha256"] != d["sha256"]: raise ValueError(f"{label}.dropin.semantic_limits.sha256: validated drop-in hash is not the installed drop-in hash")
         contracted={f:limits[f] for f in semantic}
-        if contracted not in (active,active_mariadb) or not d["inherited_deny_all"] or not d["effective_policy_configured"]: raise ValueError(f"{label}.dropin: effective policy differs from contract")
+        if contracted not in (active,active_mariadb,active_mariadb_single) or not d["inherited_deny_all"] or not d["effective_policy_configured"]: raise ValueError(f"{label}.dropin: effective policy differs from contract")
     else:
         limits=obj(d["semantic_limits"],f"{label}.dropin.semantic_limits",semantic)
         if d["sha256"] is not None or limits != absent or d["effective_policy_configured"] or d["effective_policy_commitment"] is not None: raise ValueError(f"{label}.dropin: absent drop-in carries effective semantics")

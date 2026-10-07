@@ -80,6 +80,14 @@ IPAddressAllow=127.0.0.1/32
 EOF
 python3 "$root/validate-dropin.py" --dropin "$work/mariadb-good.conf" > "$work/mariadb-dropin.json"
 jq -e '.peer_allow_count==2 and .store_sidecar_loopback_allow==true' "$work/mariadb-dropin.json" >/dev/null
+cat > "$work/mariadb-single-good.conf" <<'EOF'
+[Service]
+Environment=PODMESH_MANAGER_NETWORK_MODE=authenticated-static-peers
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressAllow=127.0.0.1/32
+EOF
+python3 "$root/validate-dropin.py" --dropin "$work/mariadb-single-good.conf" > "$work/mariadb-single-dropin.json"
+jq -e '.peer_allow_count==0 and .store_sidecar_loopback_allow==true' "$work/mariadb-single-dropin.json" >/dev/null
 printf '%s\n' '[Service]' 'Environment=PODMESH_MANAGER_NETWORK_MODE=authenticated-static-peers' 'RestrictAddressFamilies=AF_UNIX AF_INET' 'IPAddressAllow=192.0.2.1/24' 'IPAddressAllow=192.0.2.2/32' > "$work/bad.conf"
 if python3 "$root/validate-dropin.py" --dropin "$work/bad.conf" --quiet; then echo 'accepted non-/32 drop-in' >&2; exit 1; fi
 printf '%s\n' '[Service]' 'Environment=PODMESH_MANAGER_NETWORK_MODE=authenticated-static-peers' 'RestrictAddressFamilies=AF_UNIX AF_INET' 'IPAddressAllow=192.0.2.1/32' 'IPAddressAllow=192.0.2.2/32' 'IPAddressAllow=192.0.2.3/32' > "$work/bad-widened.conf"

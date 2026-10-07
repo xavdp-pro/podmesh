@@ -143,10 +143,11 @@ dropin() {
       mhost=$(jq -r '.store.mariadb.host // .mariadb.host // "127.0.0.1"' "$store_profile")
       msocket=$(jq -r '.store.mariadb.socket // .mariadb.socket // empty' "$store_profile")
       if [ -z "$msocket" ] && [ "$mhost" = 127.0.0.1 ]; then
-        expected_allow=$(printf '%s\n%s' '127.0.0.1/32' "$(tr ' ' '\n' <<<"$expected_allow" | sed '/^$/d')") | sort | tr '\n' ' '
+        expected_allow=$(printf '%s\n%s' '127.0.0.1/32' "$(tr ' ' '\n' <<<"$expected_allow" | sed '/^$/d')" | sort | tr '\n' ' ')
       fi
     fi
-    actual_allow=$(tr ' ' '\n' <<<"$allows" | sed '/^$/d' | sort | tr '\n' ' ')
+    actual_allow=$(tr ' ' '\n' <<<"$allows" | sed '/^$/d' | sort | tr '\n' ' ' | sed 's/ $//')
+    expected_allow=$(tr ' ' '\n' <<<"$expected_allow" | sed '/^$/d' | sort | tr '\n' ' ' | sed 's/ $//')
     [ "$actual_allow" = "$expected_allow" ] || { echo 'Effective IP allow-list differs from configured peers' >&2; return 1; }
     case "$(tr ' ' '\n' <<<"$denies" | sed '/^$/d' | sort | tr '\n' ' ')" in
       '0.0.0.0/0 ::/0 '|'any ') ;;

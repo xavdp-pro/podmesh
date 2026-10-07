@@ -53,8 +53,11 @@ def validate(path, salt=None):
     if actual != expected:
         fail("network mode or address-family limits differ from the reviewed grammar")
     loopback_store = "127.0.0.1/32"
-    if len(allows) not in (2, 3):
-        fail("exactly two peer /32 allowances are required, or two peers plus loopback store sidecar")
+    if len(allows) not in (1, 2, 3):
+        fail(
+            "exactly two peer /32 allowances are required, or two peers plus loopback store sidecar, "
+            "or loopback store sidecar alone for a single-replica MariaDB profile"
+        )
     addresses = []
     for value in allows:
         try:
@@ -65,12 +68,18 @@ def validate(path, salt=None):
             fail("peer allowance is not an IPv4 /32")
         addresses.append(str(network))
     store_sidecar = False
-    if loopback_store in addresses:
+    peer_allow_count = 2
+    if len(addresses) == 1 and addresses[0] == loopback_store:
+        store_sidecar = True
+        peer_allow_count = 0
+    elif loopback_store in addresses:
         if len(addresses) != 3:
             fail("loopback store allowance is only permitted with exactly two peer /32 allowances")
         store_sidecar = True
         addresses = [value for value in addresses if value != loopback_store]
-    if len(set(addresses)) != 2:
+        if len(set(addresses)) != 2:
+            fail("peer /32 allowances are duplicated")
+    elif len(set(addresses)) != 2:
         fail("peer /32 allowances are duplicated")
     return {
         # A salted commitment, not a bare digest. The drop-in's content is a fixed
@@ -83,7 +92,7 @@ def validate(path, salt=None):
         "sha256": commitment(raw, salt),
         "network_mode": "authenticated-static-peers",
         "address_families": ["AF_UNIX", "AF_INET"],
-        "peer_allow_count": 2,
+        "peer_allow_count": peer_allow_count,
         "peer_allow_prefix_length": 32,
         "store_sidecar_loopback_allow": store_sidecar,
     }
