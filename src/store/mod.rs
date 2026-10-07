@@ -353,7 +353,7 @@ impl Integrity {
 ///
 /// Every statement takes `?` placeholders bound by position. A method takes `&mut self` because
 /// a connection is a conversation: one statement at a time, in order, on one connection.
-pub trait DurableStore {
+pub trait DurableStore: Send {
     fn engine(&self) -> Engine;
 
     /// A statement that changes rows; the count the engine reports.
