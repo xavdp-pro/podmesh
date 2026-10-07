@@ -48,6 +48,12 @@ pub fn all() -> Value {
     put("host_status", op("read", "none", "this host's CPU count, load averages, memory, swap, uptime and storage, read now", Some(vec![])));
     put("universe_stats", op("read", "none", "every PodMesh universe on this host: CPU over a short sample, memory and its limit, CPU allowance, processes, disk written", Some(vec![])));
     put("storage_status", op("read", "none", "what carries Podman's storage on this host and whether a universe's space can grow there", Some(vec![])));
+    put("volume_declare", op("universe", "reservation", "declares how much dedicated data volume a stopped universe is entitled to on a host whose Podman storage can grow", Some(vec![
+        int("capacity_bytes", true, 1024 * 1024, None, "bytes, from 1 MiB up to the filesystem size carrying Podman's storage"),
+    ])));
+    put("volume_grow", op("universe", "reservation", "raises a declared universe volume's capacity within what the host's growable storage still reports", Some(vec![
+        int("additional_bytes", true, 1024 * 1024, None, "bytes to add, from 1 MiB"),
+    ])));
 
     put("create", op("universe", "reservation", "a stopped container for a new universe, from a local image, on the isolated or the managed network", Some(vec![
         f("image", "string", true, "a local image by digest: sha256:<64 hex>"),

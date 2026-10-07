@@ -329,6 +329,8 @@ fn sqlite_only_operation(operation: &str) -> bool {
             | "boot_restore"
             | "boot_restore_status"
             | "migration_status"
+            | "volume_declare"
+            | "volume_grow"
     )
 }
 
@@ -464,7 +466,7 @@ fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
                     .collect::<store::Result<Vec<_>>>()?;
                 json!({"observations": observations})
             }
-            "storage_status" => storage::status()?,
+            "storage_status" => storage::status(None)?,
             "host_status" => health::host_status()?,
             "universe_stats" => health::universe_stats()?,
             _ => return Err("Unsupported operation".into()),
@@ -542,14 +544,15 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
             | "recovery_point_resume" => recovery_point::execute(db, request)?,
             "boot_restore" | "boot_restore_status" => boot_restore::execute(db, request)?,
             "migration_status" => migration::status(db, request)?,
-            "storage_status" => storage::status()?,
+            "volume_declare" | "volume_grow" => storage::execute(db, request)?,
+            "storage_status" => storage::status(Some(db))?,
             "host_status" => health::host_status()?,
             "universe_stats" => health::universe_stats()?,
             "capabilities" => json!({
                 "schemas": schema::all(),
                 "schema_version": "podmesh-operation-schema/1",
                 "version":option_env!("PODMESH_PACKAGE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
-                "operations":["capabilities","identity","inventory","observations","activation_require","activation_acquire","activation_renew","activation_release","activation_supersede","activation_status","activation_fence","activation_fence_preview","recovery_point_prepare","recovery_point_status","recovery_point_restore","recovery_point_promote","recovery_point_stage","recovery_point_discard","recovery_point_resume","create","delete","clone","start","stop","pause","resume","resources","storage_status","host_status","universe_stats"],
+                "operations":["capabilities","identity","inventory","observations","activation_require","activation_acquire","activation_renew","activation_release","activation_supersede","activation_status","activation_fence","activation_fence_preview","recovery_point_prepare","recovery_point_status","recovery_point_restore","recovery_point_promote","recovery_point_stage","recovery_point_discard","recovery_point_resume","create","delete","clone","start","stop","pause","resume","resources","storage_status","volume_declare","volume_grow","host_status","universe_stats"],
                 "experimental_operations":["migration_preflight","migration_checkpoint","migration_status","migration_authorize_transfer",
                     "migration_complete_transfer","migration_retire_source","migration_release","migration_abandon","migration_restore_local",
                     "migration_destination_preflight","migration_restore","migration_restore_abort",

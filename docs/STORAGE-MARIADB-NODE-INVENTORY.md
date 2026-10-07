@@ -3,7 +3,7 @@
 Status: Phase 2 preparation at `1bc73fc`. This inventories production
 `state.sqlite` DDL under `src/`; it is not a MariaDB qualification record.
 
-**All 38 tables below are now carried by the versioned migration set** in
+**All 39 tables below are now carried by the versioned migration set** in
 `src/store/migrations/node/`, in SQLite and MariaDB dialects, applied by
 `open_state` and recorded in `store_schema`. The table below still says which
 module owns each one and what made it a risk; the risks marked as
@@ -33,7 +33,7 @@ table.
 
 ## Production tables
 
-There are **38 unique production tables**.
+There are **39 unique production tables**.
 
 | Owning module | Tables | Migration risk |
 | --- | --- | --- |
@@ -47,6 +47,7 @@ There are **38 unique production tables**.
 | `recovery_point.rs` | `recovery_points`, `recovery_point_restores`, `recovery_point_promotions`, `recovery_point_staged`, `recovery_point_live_captures`, `recovery_point_final_captures`, `recovery_point_live_promote_attempts`, `recovery_point_live_promotions` | Runtime PRAGMA inspection adds capture mode and uncompressed size; operation and recovery-point uniqueness guard replay. |
 | `retention.rs` | `recovery_point_retention`, `collection_holds`, `recovery_point_retained` | Active holds and immutable retained-point records must keep nullable release fields and exact manifest text. |
 | `collector.rs` | `garbage_collection_runs`, `garbage_collection_effects` | Append-only run records and per-candidate effect rows rely on atomic progress recording and a compound primary key. |
+| `storage.rs` | `universe_volume_declarations` | Per-universe declared capacity; grow metadata nullable until the first `volume_grow`. |
 
 ## Cross-cutting risks
 

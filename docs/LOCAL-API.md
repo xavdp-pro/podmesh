@@ -86,9 +86,22 @@ the `backend` — `zfs`, `btrfs`, `lvm-thin`, `lvm`, `plain` — and whether it 
 not the system's root filesystem), the filesystem's sizes from df, and the operator's rule applied
 (2026-09-16): a universe's space may `growth: possible` only on a dedicated LVM, ZFS or Btrfs
 volume; on a filesystem shared with the system, or a dedicated one that does not know how to grow,
-it is `refused` with the reason. Universe volumes, `volume_declare` and `volume_grow` come with the
-dedicated storage; today a universe keeps its data in its container's layer, and the result says so.
-On the laboratory hosts, whose storage sits on the ext4 root, the answer is `refused`.
+it is `refused` with the reason. On the laboratory hosts, whose storage sits on the ext4 root,
+the answer is `refused`.
+
+`volume_declare` and `volume_grow` are journaled universe mutations gated like `resources`. They
+apply the same host growth rule: refused while Podman's storage shares the system root or sits on
+a backend that cannot grow. When growth is `possible`, they record a declared `capacity_bytes`
+in the journal only — no per-universe block device is attached in this build. Both require a
+stopped universe that this host's journal owns.
+
+```json
+{"operation": "volume_declare", "operation_id": "...", "universe_uuid": "...", "authorization_ref": "...", "capacity_bytes": 1073741824}
+{"operation": "volume_grow", "operation_id": "...", "universe_uuid": "...", "authorization_ref": "...", "additional_bytes": 1073741824}
+```
+
+`storage_status` lists every declaration under `universe_volumes.declarations` when read through the
+SQLite API.
 
 ## Pause and resume
 

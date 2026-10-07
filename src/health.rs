@@ -22,7 +22,7 @@ pub fn host_status() -> Result<Value, Error> {
     let load: Vec<f64> = std::fs::read_to_string("/proc/loadavg").unwrap_or_default().split_whitespace().take(3).filter_map(|v| v.parse().ok()).collect();
     let uptime = std::fs::read_to_string("/proc/uptime").ok().and_then(|u| u.split_whitespace().next().and_then(|v| v.parse::<f64>().ok())).map(|s| s as u64);
     let hostname = read(std::path::Path::new("/proc/sys/kernel/hostname"));
-    let storage = crate::storage::status().unwrap_or_else(|e| json!({"error": e.to_string()}));
+    let storage = crate::storage::status(None).unwrap_or_else(|e| json!({"error": e.to_string()}));
     Ok(json!({
         "hostname": hostname,
         "cpu_count": std::thread::available_parallelism().map(|n| n.get()).ok(),

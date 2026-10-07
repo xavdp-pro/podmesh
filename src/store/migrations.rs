@@ -92,6 +92,7 @@ pub const NODE_MIGRATIONS: &[Migration] = &[
     node!("0008-recovery-point"),
     node!("0009-retention"),
     node!("0010-collector"),
+    node!("0011-universe-volume"),
 ];
 
 /// The version a store carries once the whole node set has been applied.
@@ -269,8 +270,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     /// Every table the node's storage inventory names (`docs/STORAGE-MARIADB-NODE-INVENTORY.md`).
-    /// The inventory counts 38 production tables; the set carries all of them.
-    const INVENTORY: [&str; 38] = [
+    /// The inventory counts 39 production tables; the set carries all of them.
+    const INVENTORY: [&str; 39] = [
         "activation_epochs",
         "activation_lease_history",
         "activation_leases",
@@ -309,6 +310,7 @@ mod tests {
         "recovery_point_staged",
         "recovery_points",
         "secrets",
+        "universe_volume_declarations",
     ];
 
     fn memory() -> SqliteStore {
@@ -412,6 +414,7 @@ mod tests {
         crate::recovery_point::ensure_schema(&lazy).unwrap();
         crate::retention::ensure_schema(&lazy).unwrap();
         crate::collector::ensure_schema(&lazy).unwrap();
+        crate::storage::ensure_schema(&lazy).unwrap();
 
         let mut made_by_migrations = shape(&migrated);
         made_by_migrations.remove(super::super::SCHEMA_TABLE);
@@ -439,6 +442,7 @@ mod tests {
         crate::recovery_point::ensure_schema(&db).unwrap();
         crate::retention::ensure_schema(&db).unwrap();
         crate::collector::ensure_schema(&db).unwrap();
+        crate::storage::ensure_schema(&db).unwrap();
         assert_eq!(shape(&db), before);
     }
 
