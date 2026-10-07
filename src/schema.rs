@@ -52,6 +52,7 @@ pub fn all() -> Value {
     put("create", op("universe", "reservation", "a stopped container for a new universe, from a local image, on the isolated or the managed network", Some(vec![
         f("image", "string", true, "a local image by digest: sha256:<64 hex>"),
         f("command", "string[]", true, "the command, as a list of strings"),
+        en("universe_profile", false, &["flat", "nested"], "flat is the default packaged scope; nested is Rule 11 outer (privileged, isolated network only)"),
         en("network_profile", true, &["isolated", "managed"], "isolated has no network; managed joins the host's declared pool"),
         f("network_address", "string", false, "an address in the host's pool, for the managed profile"),
         f("secrets", "object[]", false, "declared secrets to mount: [{name, target}]"),

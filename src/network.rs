@@ -22,6 +22,10 @@ pub const PROFILE_MANAGED: &str = "managed";
 pub const LABEL_PROFILE: &str = "io.podmesh.network-profile";
 pub const LABEL_IP: &str = "io.podmesh.universe-ip";
 pub const LABEL_NETWORK: &str = "io.podmesh.network-uuid";
+/// Rule 11 outer universe shape (`docs/EXPERIMENTAL-SCOPE.md`): flat is the default journal-owned container; nested is a privileged outer with isolated network only.
+pub const UNIVERSE_PROFILE_FLAT: &str = "flat";
+pub const UNIVERSE_PROFILE_NESTED: &str = "nested";
+pub const LABEL_UNIVERSE_PROFILE: &str = "io.podmesh.universe-profile";
 /// The one bridge a host carries for its pool; the name says what it is and nothing about a prefix.
 pub const BRIDGE: &str = "podmesh-managed";
 /// The nftables table that keeps Podman's source NAT off traffic inside the logical prefix.

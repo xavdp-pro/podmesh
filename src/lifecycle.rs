@@ -85,6 +85,7 @@ enum Params<'a> {
     Create {
         image: &'a str,
         command: Vec<&'a str>,
+        universe_profile: &'a str,
         profile: &'a str,
         address: Option<&'a str>,
         /// Podman `--secret` arguments and the label naming them, from `secrets::mounts`.
@@ -189,6 +190,32 @@ pub(crate) fn token(value: &str) -> Result<(), Error> {
         return Err("Identifier must contain 1-80 ASCII letters, digits or hyphens".into());
     }
     Ok(())
+}
+
+/// `universe_profile` on `create`: flat (default) or nested Rule 11 outer (privileged, isolated network only).
+pub(crate) fn parse_universe_profile(
+    request: &Value,
+    network_profile: &str,
+) -> Result<&'static str, Error> {
+    let profile = match request.get("universe_profile") {
+        None | Some(Value::Null) => crate::network::UNIVERSE_PROFILE_FLAT,
+        Some(value) => value
+            .as_str()
+            .ok_or("universe_profile must be a string")?,
+    };
+    match profile {
+        crate::network::UNIVERSE_PROFILE_FLAT => Ok(crate::network::UNIVERSE_PROFILE_FLAT),
+        crate::network::UNIVERSE_PROFILE_NESTED => {
+            if network_profile != crate::network::PROFILE_ISOLATED {
+                return Err(
+                    "universe_profile nested requires network_profile isolated (Rule 11 outer universe)"
+                        .into(),
+                );
+            }
+            Ok(crate::network::UNIVERSE_PROFILE_NESTED)
+        }
+        other => Err(format!("universe_profile must be flat or nested, not {other}").into()),
+    }
 }
 pub(crate) fn is_uuid(v: &str) -> bool {
     v.len() == 36
@@ -462,6 +489,7 @@ fn parse<'a>(
             if address.is_some() && profile != crate::network::PROFILE_MANAGED {
                 return Err("network_address is only meaningful with the managed profile".into());
             }
+            let universe_profile = parse_universe_profile(request, profile)?;
             // Secrets are mounted from Podman's store, never from an image: names and targets only.
             let secrets = crate::secrets::mounts(db, request)?;
             // A manager replica's host state: its vote directory, the operator's evidence directory and
@@ -480,6 +508,7 @@ fn parse<'a>(
             Params::Create {
                 image,
                 command,
+                universe_profile,
                 profile,
                 address,
                 secrets,
@@ -1546,6 +1575,7 @@ fn parse_store<'a>(
             if address.is_some() && profile != crate::network::PROFILE_MANAGED {
                 return Err("network_address is only meaningful with the managed profile".into());
             }
+            let universe_profile = parse_universe_profile(request, profile)?;
             let secrets = db.secret_mounts(request)?;
             let host_state = request
                 .get("manager_host_state")
@@ -1562,6 +1592,7 @@ fn parse_store<'a>(
             Params::Create {
                 image,
                 command,
+                universe_profile,
                 profile,
                 address,
                 secrets,
@@ -2033,6 +2064,7 @@ fn perform_managed(
         Params::Create {
             image,
             command,
+            universe_profile,
             profile,
             address,
             secrets,
@@ -2045,6 +2077,7 @@ fn perform_managed(
             existing,
             image,
             command,
+            universe_profile,
             profile,
             *address,
             secrets,
@@ -2076,6 +2109,7 @@ fn create(
     existing: Option<Value>,
     image: &str,
     command: &[&str],
+    universe_profile: &str,
     profile: &str,
     address: Option<&str>,
     secrets: &(Vec<String>, Option<String>),
@@ -2090,7 +2124,12 @@ fn create(
         let label = format!("{UNIVERSE}={uuid}");
         let provenance = format!("{CREATION}={id}");
         let profile_label = format!("{}={profile}", crate::network::LABEL_PROFILE);
+        let universe_profile_label =
+            format!("{}={universe_profile}", crate::network::LABEL_UNIVERSE_PROFILE);
         let mut args = vec!["create", "--pull=never"];
+        if universe_profile == crate::network::UNIVERSE_PROFILE_NESTED {
+            args.push("--privileged");
+        }
         // The managed profile: one stable address allocated to the universe UUID from this host's
         // pool, on the host's bridge. The isolated profile: no network, as every lot before had it.
         let managed = if profile == crate::network::PROFILE_MANAGED {
@@ -2127,6 +2166,8 @@ fn create(
             &provenance,
             "--label",
             &profile_label,
+            "--label",
+            &universe_profile_label,
         ]);
         for a in &secrets.0 {
             args.push(a.as_str());
@@ -2193,7 +2234,7 @@ fn create(
         }
     }
     Ok(
-        json!({"status":"verified","state":c["State"]["Status"],"universe_uuid":uuid,"container_id":c["Id"],"network":network,"started":false}),
+        json!({"status":"verified","state":c["State"]["Status"],"universe_uuid":uuid,"universe_profile":universe_profile,"container_id":c["Id"],"network":network,"started":false}),
     )
 }
 fn delete(
@@ -2996,6 +3037,31 @@ mod tests {
         assert!(is_uuid("16926159-bf59-4537-8f6e-5cfea52540ea"));
         assert!(!is_uuid("16926159-bf59-4537-8f6e-5cfea52540e"));
         assert!(!is_uuid("16926159xbf59-4537-8f6e-5cfea52540ea"));
+    }
+
+    #[test]
+    fn universe_profile_parse() {
+        use super::parse_universe_profile;
+        use crate::network::{PROFILE_ISOLATED, PROFILE_MANAGED, UNIVERSE_PROFILE_FLAT, UNIVERSE_PROFILE_NESTED};
+        use serde_json::json;
+
+        assert_eq!(
+            parse_universe_profile(&json!({}), PROFILE_ISOLATED).unwrap(),
+            UNIVERSE_PROFILE_FLAT
+        );
+        assert_eq!(
+            parse_universe_profile(
+                &json!({"universe_profile": "nested"}),
+                PROFILE_ISOLATED
+            )
+            .unwrap(),
+            UNIVERSE_PROFILE_NESTED
+        );
+        assert!(parse_universe_profile(
+            &json!({"universe_profile": "nested"}),
+            PROFILE_MANAGED
+        )
+        .is_err());
     }
 
     #[cfg(feature = "mariadb")]
