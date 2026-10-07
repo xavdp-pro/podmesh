@@ -328,6 +328,37 @@ fn publish(db: &Connection, uuid: &str, r: &Reservation, a: &Authorization, resu
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
         files[file] = json!({"bytes": fs::metadata(&target)?.len(), "sha256": expected});
     }
+    let manifest: Value = serde_json::from_slice(&fs::read(source.join(mg::MANIFEST))?)?;
+    if mg::nested_checkpoint_manifest(&manifest) {
+        let sidecars = manifest
+            .get("nested_sidecars")
+            .and_then(|v| v.as_object())
+            .ok_or("The nested manifest lacks nested_sidecars; nothing was published")?;
+        for entry in sidecars.values() {
+            let file = entry
+                .get("file")
+                .and_then(|f| f.as_str())
+                .ok_or("A nested_sidecars entry lacks a file name")?;
+            let expected = entry
+                .get("sha256")
+                .and_then(|h| h.as_str())
+                .filter(|h| is_sha256(h))
+                .ok_or_else(|| format!("The nested_sidecars entry for {file} lacks a SHA-256"))?;
+            let target = out.join(file);
+            if !(regular_file(&target)?.is_some() && mg::sha256(&target)? == expected) {
+                mg::copy_private(&source.join(file), &target)?;
+                let copied = mg::sha256(&target)?;
+                if copied != expected {
+                    return Err(failure(
+                        format!("The {file} copied to the outbox hashes to {copied}, not the manifest's {expected}; the authorization stays recorded and the copy can be retried"),
+                        json!({"authorization_id": a.authorization_id, "file": file}),
+                    ));
+                }
+            }
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+            files[file] = json!({"bytes": fs::metadata(&target)?.len(), "sha256": expected});
+        }
+    }
     let target = out.join(HANDOFF);
     if !(regular_file(&target)?.is_some() && mg::sha256(&target)? == a.handoff_sha256) {
         mg::write_private(&target, a.handoff.as_bytes())?;

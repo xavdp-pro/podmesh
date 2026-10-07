@@ -45,8 +45,8 @@ pub(crate) const SPACE_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const CONTAINER_STORAGE: &str = "/var/lib/containers/storage";
 const SCOPE: &str = "experimental source-side checkpoint: default rootful Podman store, network-disabled, mount-free, journal-owned container with musl processes, packaged podmesh-vzcriu 3.15.5.3 through its private-path shim";
 const SCOPE_NESTED_PREFLIGHT: &str = "experimental nested-lab preflight only: Rule 11 outer universe — privileged rootful Podman container, network-disabled, mount-free, journal-owned; inner Podman reconciliation and the checkpoint/restore chain are not implemented in this backend";
-const SCOPE_NESTED_LAB_CHECKPOINT: &str = "experimental nested-lab checkpoint: same outer-shape assess as migration_profile nested preflight; durable reservation, preflight.json, inner Podman metadata reconciliation for the kit counter fixture when present, nested VFS store binding assessment and binding artifact, Rule 11 destination restore chain assessment and artifact, outer checkpoint capture with the packaged podmesh-vzcriu runtime in its own scope when preflight passes, archive/manifest/hashes under the state directory with nested sidecars recorded; nested destination restore hooks and the two-host move chain are not implemented (docs/MIGRATION-INTEGRATION.md)";
-const SCOPE_NESTED_OUTER_CHECKPOINT: &str = "experimental nested-lab outer checkpoint capture: privileged Rule 11 outer universe suspended with the packaged podmesh-vzcriu runtime; inner Podman metadata, VFS binding and destination-restore-chain artifacts are carried in the manifest; destination nested restore is not implemented";
+const SCOPE_NESTED_LAB_CHECKPOINT: &str = "experimental nested-lab checkpoint: same outer-shape assess as migration_profile nested preflight; durable reservation, preflight.json, inner Podman metadata reconciliation for the kit counter fixture when present, nested VFS store binding assessment and binding artifact, Rule 11 destination restore chain assessment and artifact, outer checkpoint capture with the packaged podmesh-vzcriu runtime in its own scope when preflight passes, archive/manifest/hashes under the state directory with nested sidecars recorded; the two-host carry/restore/complete chain is not implemented (docs/MIGRATION-INTEGRATION.md)";
+const SCOPE_NESTED_OUTER_CHECKPOINT: &str = "experimental nested-lab outer checkpoint capture: privileged Rule 11 outer universe suspended with the packaged podmesh-vzcriu runtime; inner Podman metadata, VFS binding and destination-restore-chain artifacts are carried in the manifest; destination nested restore execution and the two-host move chain are not implemented";
 const NESTED_LAB_CHECKPOINT_GAPS: [&str; 4] = [
     "inner_podman_metadata_reconciliation",
     "nested_vfs_store_binding",
@@ -63,8 +63,13 @@ const NESTED_LAB_GAPS_AFTER_VFS_STORE_BINDING: [&str; 2] = [
     "nested_outer_checkpoint_capture",
 ];
 const NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_CHAIN: [&str; 0] = [];
+/// Gaps remaining immediately after outer capture, before destination restore hooks existed (tests only).
+#[allow(dead_code)]
 const NESTED_LAB_GAPS_AFTER_OUTER_CHECKPOINT_CAPTURE: [&str; 2] = [
     "nested_destination_restore_hooks",
+    "two_host_checkpoint_carry_restore_complete",
+];
+pub(crate) const NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS: [&str; 1] = [
     "two_host_checkpoint_carry_restore_complete",
 ];
 /// Reservation state after the kit-style inner Podman proof and pre-checkpoint metadata reconcile succeed.
@@ -77,7 +82,13 @@ const INNER_PODMAN_METADATA: &str = "inner_podman_metadata.json";
 const NESTED_VFS_STORE_BINDING: &str = "nested_vfs_store_binding.json";
 const RULE11_DESTINATION_RESTORE_CHAIN: &str = "rule11_destination_restore_chain.json";
 const NESTED_OUTER_CHECKPOINT_PLAN: &str = "nested_outer_checkpoint_plan.json";
-const NESTED_MANIFEST_FORMAT: &str = "podmesh-nested-source-checkpoint/1";
+pub(crate) const NESTED_MANIFEST_FORMAT: &str = "podmesh-nested-source-checkpoint/1";
+pub(crate) const NESTED_CHECKPOINT_SIDECAR_FILES: [&str; 4] = [
+    INNER_PODMAN_METADATA,
+    NESTED_VFS_STORE_BINDING,
+    RULE11_DESTINATION_RESTORE_CHAIN,
+    NESTED_OUTER_CHECKPOINT_PLAN,
+];
 /// Inner Podman graph root inside the outer universe (default rootful store layout).
 const INNER_PODMAN_GRAPH_ROOT: &str = "/var/lib/containers/storage";
 /// Inner Podman inside the outer universe uses the kit's isolated VFS store (contrib/nested-podman).
@@ -1187,8 +1198,8 @@ fn nested_lab_after_outer_checkpoint_detail(
         uuid,
         facts,
         r,
-        &NESTED_LAB_GAPS_AFTER_OUTER_CHECKPOINT_CAPTURE,
-        "reservation, preflight.json, nested sidecars, nested_outer_checkpoint_plan.json, checkpoint.tar.zst and manifest.json: outer checkpoint captured on the source; nested destination restore hooks and the two-host carry/restore/complete chain are not implemented",
+        &NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS,
+        "reservation, preflight.json, nested sidecars, nested_outer_checkpoint_plan.json, checkpoint.tar.zst and manifest.json: outer checkpoint captured on the source; destination restore hooks are implemented on the peer at preflight; the two-host carry/restore/complete chain is not implemented",
         "nested_outer_checkpoint_captured",
         json!({
             "inner_podman_metadata": inner,
@@ -1394,7 +1405,107 @@ pub(crate) fn nested_outer_checkpoint_capture_assess(
         "status": "verified",
         "checkpoint_phase": "nested_outer_checkpoint_capture",
         "scope": SCOPE_NESTED_OUTER_CHECKPOINT,
-        "note": "Source-side plan only: outer suspension uses the same packaged runtime and scope isolation as flat-store migration_checkpoint; nested destination restore hooks remain unimplemented.",
+        "note": "Source-side plan only: outer suspension uses the same packaged runtime and scope isolation as flat-store migration_checkpoint; destination restore hooks are assessed on the peer host at preflight.",
+        "observed_at": crate::now(),
+    }))
+}
+
+pub(crate) fn nested_checkpoint_manifest(manifest: &Value) -> bool {
+    manifest["format"].as_str() == Some(NESTED_MANIFEST_FORMAT)
+        || manifest["migration_profile"].as_str() == Some("nested")
+}
+
+/// Destination-side assessment of the typed restore hooks Rule 11 nested moves require.
+pub(crate) fn nested_destination_restore_hooks_assess(
+    manifest: &Value,
+    archive_config: &Value,
+    sidecars_in_inbox: &Value,
+) -> Result<Value, Vec<String>> {
+    let mut blockers = vec![];
+    if !nested_checkpoint_manifest(manifest) {
+        blockers.push("manifest is not a nested-lab source checkpoint".into());
+    }
+    let privileged = archive_config
+        .get("privileged")
+        .and_then(|v| v.as_bool())
+        .or_else(|| {
+            archive_config
+                .get("hostConfig")
+                .and_then(|h| h.get("privileged"))
+                .and_then(|v| v.as_bool())
+        })
+        .or_else(|| {
+            archive_config
+                .get("HostConfig")
+                .and_then(|h| h.get("Privileged"))
+                .and_then(|v| v.as_bool())
+        });
+    if privileged != Some(true) {
+        blockers.push("archive configuration does not show a privileged outer universe".into());
+    }
+    let nested_sidecars = match manifest.get("nested_sidecars").and_then(|v| v.as_object()) {
+        Some(o) => o,
+        None => {
+            blockers.push("manifest lacks nested_sidecars".into());
+            return Err(blockers);
+        }
+    };
+    for file in NESTED_CHECKPOINT_SIDECAR_FILES {
+        let entry = match nested_sidecars
+            .values()
+            .find(|e| e.get("file").and_then(|f| f.as_str()) == Some(file))
+        {
+            Some(e) => e,
+            None => {
+                blockers.push(format!("manifest nested_sidecars does not name {file}"));
+                continue;
+            }
+        };
+        let expected = match entry
+            .get("sha256")
+            .and_then(|s| s.as_str())
+            .filter(|h| h.len() == 64)
+        {
+            Some(h) => h,
+            None => {
+                blockers.push(format!("manifest nested_sidecars entry for {file} lacks sha256"));
+                continue;
+            }
+        };
+        let observed = sidecars_in_inbox
+            .get(file)
+            .and_then(|v| v.get("sha256"))
+            .and_then(|s| s.as_str());
+        if observed != Some(expected) {
+            blockers.push(format!(
+                "inbox sidecar {file} is missing or does not match the manifest (expected sha256 {expected})"
+            ));
+        }
+    }
+    if !blockers.is_empty() {
+        return Err(blockers);
+    }
+    Ok(json!({
+        "status": "verified",
+        "checkpoint_phase": "nested_destination_restore_hooks",
+        "binding_model": "two_host_serial_handoff",
+        "note": "Destination-phase hook assessment only: inbox sidecars match the nested manifest and the archive names a privileged outer universe. migration_restore for nested profile does not run outer checkpoint restore or inner Podman reconciliation yet.",
+        "required_operations": [
+            "migration_destination_preflight",
+            "migration_restore",
+            "migration_complete_transfer"
+        ],
+        "api_hooks": {
+            "migration_destination_preflight": {
+                "status": "assessed_on_destination",
+                "nested_profile": "sidecars_and_manifest_verified"
+            },
+            "migration_restore": {
+                "status": "not_invoked",
+                "nested_profile": "unimplemented_on_destination"
+            }
+        },
+        "implementation_gaps": NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS,
         "observed_at": crate::now(),
     }))
 }
@@ -2587,8 +2698,8 @@ fn finalize_nested(
             "nested_outer_checkpoint_plan": inner_sha(NESTED_OUTER_CHECKPOINT_PLAN),
         },
         "destination_restore": {
-            "nested_profile": "unimplemented_on_destination",
-            "implementation_gaps": NESTED_LAB_GAPS_AFTER_OUTER_CHECKPOINT_CAPTURE,
+            "nested_profile": "hooks_assessed_on_destination_at_preflight",
+            "implementation_gaps": NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS,
         },
         "scope": SCOPE_NESTED_OUTER_CHECKPOINT, "authority": AUTHORITY,
     });
@@ -2602,7 +2713,7 @@ fn finalize_nested(
             "archive_sha256": archive_sha256,
             "manifest_sha256": manifest_sha256,
             "migration_profile": "nested",
-            "implementation_gaps": NESTED_LAB_GAPS_AFTER_OUTER_CHECKPOINT_CAPTURE,
+            "implementation_gaps": NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS,
         }),
     )?;
     let mut source = lc::state_view(&c);
@@ -2631,7 +2742,7 @@ fn finalize_nested(
         "finalized_after_interruption": resumed,
         "reservation": {"state": "checkpointed"},
         "checkpoint_phase": "nested_outer_checkpoint_captured",
-        "implementation_gaps": NESTED_LAB_GAPS_AFTER_OUTER_CHECKPOINT_CAPTURE,
+        "implementation_gaps": NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS,
         "nested_checkpoint_detail": after,
         "authority": AUTHORITY, "scope": SCOPE_NESTED_OUTER_CHECKPOINT,
     }))
@@ -2789,11 +2900,12 @@ pub(crate) fn status(db: &Connection, request: &Value) -> Result<Value, Error> {
 mod tests {
     use super::{
         migration_shape_blockers, nested_lab_capture_pending_detail,
-        nested_outer_checkpoint_capture_assess, nested_rule11_destination_restore_chain_assess,
-        parse_nested_counter_log_line, MigrationProfile, NESTED_LAB_CHECKPOINT_GAPS,
-        NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_CHAIN, NESTED_LAB_GAPS_AFTER_INNER_RECONCILIATION,
+        nested_destination_restore_hooks_assess, nested_outer_checkpoint_capture_assess,
+        nested_rule11_destination_restore_chain_assess, parse_nested_counter_log_line, MigrationProfile,
+        NESTED_LAB_CHECKPOINT_GAPS, NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_CHAIN,
+        NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS, NESTED_LAB_GAPS_AFTER_INNER_RECONCILIATION,
         NESTED_LAB_GAPS_AFTER_OUTER_CHECKPOINT_CAPTURE, NESTED_LAB_GAPS_AFTER_VFS_STORE_BINDING,
-        Reservation,
+        NESTED_MANIFEST_FORMAT, Reservation,
     };
     use serde_json::json;
 
@@ -2938,6 +3050,48 @@ mod tests {
             NESTED_LAB_GAPS_AFTER_OUTER_CHECKPOINT_CAPTURE[1],
             "two_host_checkpoint_carry_restore_complete"
         );
+    }
+
+    #[test]
+    fn nested_lab_gaps_shrink_after_destination_restore_hooks() {
+        assert_eq!(NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS.len(), 1);
+        assert_eq!(
+            NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS[0],
+            "two_host_checkpoint_carry_restore_complete"
+        );
+        assert!(!NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS
+            .iter()
+            .any(|g| *g == "nested_destination_restore_hooks"));
+    }
+
+    #[test]
+    fn nested_destination_hooks_assess_requires_manifest_sidecars_and_privileged_archive() {
+        let manifest = json!({
+            "format": NESTED_MANIFEST_FORMAT,
+            "migration_profile": "nested",
+            "nested_sidecars": {
+                "inner_podman_metadata": {"file": "inner_podman_metadata.json", "sha256": "a".repeat(64)},
+                "nested_vfs_store_binding": {"file": "nested_vfs_store_binding.json", "sha256": "b".repeat(64)},
+                "rule11_destination_restore_chain": {"file": "rule11_destination_restore_chain.json", "sha256": "c".repeat(64)},
+                "nested_outer_checkpoint_plan": {"file": "nested_outer_checkpoint_plan.json", "sha256": "d".repeat(64)},
+            }
+        });
+        let archive = json!({"hostConfig": {"privileged": true}});
+        let inbox = json!({
+            "inner_podman_metadata.json": {"sha256": "a".repeat(64)},
+            "nested_vfs_store_binding.json": {"sha256": "b".repeat(64)},
+            "rule11_destination_restore_chain.json": {"sha256": "c".repeat(64)},
+            "nested_outer_checkpoint_plan.json": {"sha256": "d".repeat(64)},
+        });
+        let doc = nested_destination_restore_hooks_assess(&manifest, &archive, &inbox).unwrap();
+        assert_eq!(doc["status"], "verified");
+        assert_eq!(doc["checkpoint_phase"], "nested_destination_restore_hooks");
+        assert!(nested_destination_restore_hooks_assess(
+            &manifest,
+            &json!({"hostConfig": {"privileged": false}}),
+            &inbox,
+        )
+        .is_err());
     }
 
     #[test]

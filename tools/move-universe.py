@@ -85,7 +85,9 @@ def main():
                                                      destination_host_uuid=B.identity))
         auth_id = authorization['authorization_id']
         t0 = time.time()
-        delivery = transfer(A, B, auth_id)
+        outbox = A.call('boxes', authorization=auth_id)['outbox'][auth_id]
+        carry_files = tuple(f for f in outbox if f != '_mode')
+        delivery = transfer(A, B, auth_id, files=carry_files)
         steps.append({'step': 'carry', 'host': 'workstation', 'ok': True, 'seconds': round(time.time() - t0, 2),
                       'files': {f: v.get('sha256', '')[:12] for f, v in delivery['files'].items()}})
         step('preflight', B, request('migration_destination_preflight', u, ref, authorization_id=auth_id))

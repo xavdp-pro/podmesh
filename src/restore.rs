@@ -21,6 +21,7 @@ use std::{
 const RESTORE_SECONDS: u64 = 300;
 const UNIVERSE_LABEL: &str = "io.podmesh.universe";
 const SCOPE: &str = "experimental destination restore: default rootful Podman store, handoff-bound archive restored with the packaged podmesh-vzcriu 3.15.5.3 through its private-path shim, network-disabled and mount-free universe";
+const SCOPE_NESTED_DESTINATION_PREFLIGHT: &str = "experimental nested-lab destination preflight: handoff-bound nested source checkpoint manifest and inbox sidecars assessed for Rule 11 restore hooks; migration_restore for privileged outer plus inner Podman reconciliation is not implemented";
 
 pub(crate) struct Claim {
     pub authorization_id: String,
@@ -534,6 +535,7 @@ fn assess(db: &Connection, uuid: &str, authorization: &str, named: Option<&Value
     let inbox = tr::inbox(authorization)?;
     let archive = inbox.join(mg::ARCHIVE);
     let mut archive_facts = json!({"present": false});
+    let mut checkpoint_config = Value::Null;
     let mut uncompressed = None;
     match tr::regular_file(&archive) {
         Ok(Some(size)) => {
@@ -548,6 +550,7 @@ fn assess(db: &Connection, uuid: &str, authorization: &str, named: Option<&Value
                 // Only intact bytes are opened: the configuration Podman will import must name this universe and source.
                 match archive_contents(&archive) {
                     Ok((config, entries)) => {
+                        checkpoint_config = config.clone();
                         let label = config["labels"][UNIVERSE_LABEL].as_str();
                         if config["id"].as_str() != Some(s("source_container_id"))
                             || config["rootfsImageID"].as_str() != Some(image)
@@ -583,6 +586,8 @@ fn assess(db: &Connection, uuid: &str, authorization: &str, named: Option<&Value
     }
     let manifest = inbox.join(mg::MANIFEST);
     let mut manifest_facts = json!({"present": false});
+    let mut manifest_document = Value::Null;
+    let mut nested_destination_hooks = Value::Null;
     match tr::regular_file(&manifest) {
         Ok(Some(_)) => {
             let sha = mg::sha256(&manifest)?;
@@ -592,6 +597,7 @@ fn assess(db: &Connection, uuid: &str, authorization: &str, named: Option<&Value
                 blockers.push(format!("the manifest in the inbox (sha256 {sha}) does not match the handoff"));
             } else {
                 let m: Value = serde_json::from_slice(&fs::read(&manifest)?).unwrap_or(Value::Null);
+                manifest_document = m.clone();
                 for (field, agrees) in [
                     ("operation_id", m["operation_id"].as_str() == Some(s("checkpoint_operation_id"))),
                     ("universe_uuid", m["universe_uuid"].as_str() == Some(s("universe_uuid"))),
@@ -618,6 +624,36 @@ fn assess(db: &Connection, uuid: &str, authorization: &str, named: Option<&Value
         Ok(None) => blockers.push("the manifest is missing from the inbox".into()),
         Err(e) => blockers.push(format!("the manifest in the inbox is unusable: {e}")),
     }
+    let migration_profile = if mg::nested_checkpoint_manifest(&manifest_document) {
+        let mut sidecars_in_inbox = json!({});
+        for file in mg::NESTED_CHECKPOINT_SIDECAR_FILES {
+            let path = inbox.join(file);
+            match tr::regular_file(&path) {
+                Ok(Some(_)) => {
+                    let sha = mg::sha256(&path)?;
+                    sidecars_in_inbox[file] = json!({"present": true, "sha256": sha});
+                }
+                Ok(None) => sidecars_in_inbox[file] = json!({"present": false}),
+                Err(e) => {
+                    sidecars_in_inbox[file] = json!({"present": false, "error": e.to_string()});
+                }
+            }
+        }
+        match mg::nested_destination_restore_hooks_assess(
+            &manifest_document,
+            &checkpoint_config,
+            &sidecars_in_inbox,
+        ) {
+            Ok(hooks) => nested_destination_hooks = hooks,
+            Err(extra) => blockers.extend(extra),
+        }
+        blockers.push(
+            "migration_restore for nested Rule 11 universes is not implemented on the destination".into(),
+        );
+        Some("nested")
+    } else {
+        None
+    };
     let state_required = v["archive"]["bytes"].as_u64().unwrap_or(0).saturating_add(mg::SPACE_MARGIN_BYTES);
     let state_available = mg::available_bytes(mg::base()?);
     if state_available < state_required {
@@ -647,6 +683,8 @@ fn assess(db: &Connection, uuid: &str, authorization: &str, named: Option<&Value
         "handoff": v, "name_occupied_by": named.map(lc::state_view), "labelled_containers": labelled,
         "reservation": reservation.as_ref().map(|r| r.view()), "image_present": image_present, "runtime": runtime,
         "archive": archive_facts, "manifest": manifest_facts,
+        "migration_profile": migration_profile,
+        "nested_destination_restore_hooks": nested_destination_hooks,
         "space": {"state_directory": {"available_bytes": state_available, "required_bytes": state_required},
                   "graph_root": {"path": graph_root, "available_bytes": graph_available, "required_bytes": graph_required}},
     });
@@ -659,10 +697,18 @@ fn assess(db: &Connection, uuid: &str, authorization: &str, named: Option<&Value
 
 pub(crate) fn preflight(db: &Connection, uuid: &str, authorization: &str, existing: Option<Value>) -> Result<Value, Error> {
     let a = assess(db, uuid, authorization, existing.as_ref(), None)?;
+    let nested = a.facts.get("migration_profile").and_then(|v| v.as_str()) == Some("nested");
     Ok(json!({
         "status": "verified", "operation": "migration_destination_preflight", "universe_uuid": uuid, "authorization_id": authorization,
         "compatible": a.blockers.is_empty(), "blockers": a.blockers, "facts": a.facts,
-        "effects": "none: preflight does not claim, copy, create or restore anything", "scope": SCOPE,
+        "effects": "none: preflight does not claim, copy, create or restore anything",
+        "scope": if nested { SCOPE_NESTED_DESTINATION_PREFLIGHT } else { SCOPE },
+        "migration_profile": a.facts.get("migration_profile").cloned().unwrap_or(Value::Null),
+        "implementation_gaps": if nested {
+            json!(mg::NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS)
+        } else {
+            Value::Null
+        },
     }))
 }
 
