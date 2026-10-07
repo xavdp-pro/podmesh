@@ -15,3 +15,7 @@ created by `src/store/migrations/manager/` and recorded in `store_schema` under 
 Offline cutover uses `store_schema.manager_cutover = 0` until
 `podmesh-storage-migrate --role manager` finishes copy and verification; until then
 `open_manager_store` refuses the target.
+
+MariaDB profiles open through [`ManagerStore::into_journal`] and
+`experiments/manager-ha` [`ConfiguredStore`] (feature `mariadb`). Legacy code that
+still calls [`ManagerStore::into_connection`] on MariaDB is refused by name.

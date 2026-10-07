@@ -91,6 +91,13 @@ pub enum ManagerStore {
     Durable(Box<dyn DurableStore>),
 }
 
+/// How `manager-ha` opens the manager journal: SQLite keeps a `rusqlite` connection; MariaDB
+/// keeps the durable store contract (`experiments/manager-ha` journal profile entry path).
+pub enum ManagerJournal {
+    Sqlite(Connection),
+    Durable(Box<dyn DurableStore>),
+}
+
 impl ManagerStore {
     pub fn engine(&self) -> Engine {
         match self {
@@ -99,21 +106,49 @@ impl ManagerStore {
         }
     }
 
-    /// The connection `manager-ha` still takes, or a refusal naming why there is none.
+    /// Hand the journal to `manager-ha` or resident wiring without assuming a file-backed engine.
+    pub fn into_journal(self) -> ManagerJournal {
+        match self {
+            ManagerStore::Sqlite(db) => ManagerJournal::Sqlite(db),
+            ManagerStore::Durable(store) => ManagerJournal::Durable(store),
+        }
+    }
+
+    /// Legacy SQLite file path for code that still takes `rusqlite::Connection` directly.
+    ///
+    /// MariaDB profiles must use [`ManagerStore::into_journal`] and the `manager-ha` journal
+    /// profile opener (`ConfiguredStore::open` with the `mariadb` feature), not this method.
     pub fn into_connection(self) -> Result<Connection, Box<dyn std::error::Error>> {
         match self {
             ManagerStore::Sqlite(db) => Ok(db),
             ManagerStore::Durable(store) => Err(format!(
                 "store.engine is {engine}: the manager journal opened and its schema is at version {version}, \
-                 but manager-ha still reads and writes the replica store as SQLite \
-                 (Phase 3 of docs/STORAGE-MARIADB-MIGRATION-PLAN.md ports it). \
-                 Keep database_path on a .sqlite file to run this replica.",
+                 but this API still returns only a SQLite connection. \
+                 Use ManagerStore::into_journal and experiments/manager-ha with store profile engine mariadb \
+                 (Phase 3 of docs/STORAGE-MARIADB-MIGRATION-PLAN.md). \
+                 Keep database_path on a .sqlite file for the legacy file path.",
                 engine = store.engine(),
                 version = migrations::manager_version(),
             )
             .into()),
         }
     }
+}
+
+/// Resolve the manager replica store profile beside a state directory.
+///
+/// When `store.json` is present (or [`STORE_PROFILE_ENVIRONMENT`] names a file), that profile is
+/// read. Otherwise the journal is SQLite at `sqlite_database_path`, which is what resident
+/// configuration names today as `network.database_path`.
+pub fn resolve_manager_store_profile(
+    profile_dir: &Path,
+    sqlite_database_path: &Path,
+) -> Result<StoreConfig, Box<dyn std::error::Error>> {
+    let named = profile_dir.join(STORE_PROFILE_FILE);
+    if std::env::var_os(STORE_PROFILE_ENVIRONMENT).is_some() || named.exists() {
+        return store_profile(profile_dir);
+    }
+    Ok(StoreConfig::for_manager_sqlite_path(sqlite_database_path))
 }
 
 /// Open the manager replica journal under the profile it is configured with.

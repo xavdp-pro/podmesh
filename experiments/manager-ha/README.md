@@ -76,6 +76,22 @@ cargo clippy --locked --all-targets --manifest-path experiments/manager-ha/Cargo
 cargo fmt --manifest-path experiments/manager-ha/Cargo.toml -- --check
 ```
 
+### MariaDB store profile (Phase 3 slice)
+
+The file-backed CLI (`podmesh-manager-ha-lab DATABASE …`) remains SQLite. A MariaDB
+manager journal opens through the same `store.json` profile as `podmesh::open_manager_store`:
+
+- `ConfiguredStore::open_resolved(profile_dir, legacy_sqlite_path, configuration, replica_id)`
+  reads `store.json` when present, otherwise opens the SQLite file at `legacy_sqlite_path`.
+- Build with `--features mariadb` and set `PODMESH_MARIADB_DSN` for integration tests.
+
+```sh
+cargo test --features mariadb --manifest-path experiments/manager-ha/Cargo.toml mariadb_profile
+```
+
+Resident and the CLI are not wired to the profile yet; authenticated import, audit, and
+file integrity semantics remain SQLite-only until a later slice.
+
 ## Durable process API
 
 SQLite plus an append-only event history is selected **for this isolated laboratory

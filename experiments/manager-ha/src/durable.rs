@@ -4457,6 +4457,9 @@ CREATE TRIGGER exchange_audit_events_no_delete BEFORE DELETE ON exchange_audit_e
 PRAGMA user_version=3;
 ";
 
+#[cfg(feature = "mariadb")]
+pub mod journal_profile;
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicBool;

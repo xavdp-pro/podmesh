@@ -5,6 +5,9 @@
 
 pub mod durable;
 
+#[cfg(feature = "mariadb")]
+pub use durable::journal_profile::{ConfiguredStore, MariaDbJournal};
+
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
