@@ -39,6 +39,8 @@ def main():
     p.add_argument('--universe', required=True)
     p.add_argument('--reference', default='move-universe-tool')
     p.add_argument('--keep-source', action='store_true', help='leave the stopped, checkpointed container on the source')
+    p.add_argument('--migration-profile', default='flat', choices=('flat', 'nested'),
+                   help='flat (default): network-disabled outer only; nested: Rule 11 privileged outer with kit inner counter')
     args = p.parse_args()
     control = control_dir('podmesh-move-')
     socket_path = os.environ.get('PODMESH_SOCKET', '/run/podmesh/api.sock')
@@ -75,11 +77,16 @@ def main():
             return done(1, 'refused', 'no such universe on the source', steps)
         if c['HostConfig'].get('NetworkMode') != 'none' or (c.get('Mounts') or []):
             return done(1, 'refused', 'only a network-disabled, mount-free universe is moved today: the destination restore is qualified for that shape alone; a managed-network universe is not moved yet', steps)
+        if args.migration_profile == 'nested' and c['HostConfig'].get('Privileged') is not True:
+            return done(1, 'refused', 'nested migration_profile requires a privileged outer universe (Rule 11)', steps)
+        if args.migration_profile == 'flat' and c['HostConfig'].get('Privileged') is not False:
+            return done(1, 'refused', 'flat migration_profile refuses a privileged outer container', steps)
         if c['State']['Status'] != 'running':
             return done(1, 'refused', f"the universe is {c['State']['Status']}; a move captures a running universe", steps)
         steps.append({'step': 'inspect', 'host': 'source', 'ok': True, 'container_id': c['Id'], 'image': c['Image'], 'network_mode': 'none'})
         checkpoint_request = request('migration_checkpoint', u, ref, container_id=c['Id'], image='sha256:' + c['Image'].removeprefix('sha256:'),
-                                     source_host_uuid=A.identity, destination_host_uuid=B.identity)
+                                     source_host_uuid=A.identity, destination_host_uuid=B.identity,
+                                     migration_profile=args.migration_profile)
         step('checkpoint', A, checkpoint_request)
         authorization = step('authorize', A, request('migration_authorize_transfer', u, ref, checkpoint_operation_id=checkpoint_request['operation_id'],
                                                      destination_host_uuid=B.identity))
@@ -90,7 +97,9 @@ def main():
         delivery = transfer(A, B, auth_id, files=carry_files)
         steps.append({'step': 'carry', 'host': 'workstation', 'ok': True, 'seconds': round(time.time() - t0, 2),
                       'files': {f: v.get('sha256', '')[:12] for f, v in delivery['files'].items()}})
-        step('preflight', B, request('migration_destination_preflight', u, ref, authorization_id=auth_id))
+        preflight = step('preflight', B, request('migration_destination_preflight', u, ref, authorization_id=auth_id))
+        if args.migration_profile == 'nested' and not preflight.get('compatible'):
+            return done(1, 'refused', 'nested destination preflight is not compatible', steps, blockers=preflight.get('blockers'))
         restored = step('restore', B, request('migration_restore', u, ref, authorization_id=auth_id))
         transfer(B, A, auth_id, files=('outcome.json',))
         steps.append({'step': 'carry-outcome', 'host': 'workstation', 'ok': True})

@@ -21,7 +21,8 @@ use std::{
 const RESTORE_SECONDS: u64 = 300;
 const UNIVERSE_LABEL: &str = "io.podmesh.universe";
 const SCOPE: &str = "experimental destination restore: default rootful Podman store, handoff-bound archive restored with the packaged podmesh-vzcriu 3.15.5.3 through its private-path shim, network-disabled and mount-free universe";
-const SCOPE_NESTED_DESTINATION_PREFLIGHT: &str = "experimental nested-lab destination preflight: handoff-bound nested source checkpoint manifest and inbox sidecars assessed for Rule 11 restore hooks; migration_restore for privileged outer plus inner Podman reconciliation is not implemented";
+const SCOPE_NESTED_DESTINATION_PREFLIGHT: &str = "experimental nested-lab destination preflight: handoff-bound nested source checkpoint manifest and inbox sidecars assessed for Rule 11 restore; migration_restore runs privileged outer checkpoint restore plus inner Podman reconciliation for the kit counter fixture when present";
+const SCOPE_NESTED_DESTINATION_RESTORE: &str = "experimental nested-lab destination restore: privileged Rule 11 outer universe restored with the packaged podmesh-vzcriu runtime, then inner Podman metadata reconciled for the kit counter fixture when the inbox carries verified inner_podman_metadata.json; counter continuity is verified against the source checkpoint proof";
 
 pub(crate) struct Claim {
     pub authorization_id: String,
@@ -647,9 +648,12 @@ fn assess(db: &Connection, uuid: &str, authorization: &str, named: Option<&Value
             Ok(hooks) => nested_destination_hooks = hooks,
             Err(extra) => blockers.extend(extra),
         }
-        blockers.push(
-            "migration_restore for nested Rule 11 universes is not implemented on the destination".into(),
-        );
+        let inner_path = inbox.join("inner_podman_metadata.json");
+        if let Ok(text) = fs::read_to_string(&inner_path) {
+            if let Ok(doc) = serde_json::from_str::<Value>(&text) {
+                blockers.extend(mg::nested_destination_outer_restore_blockers(&doc));
+            }
+        }
         Some("nested")
     } else {
         None
@@ -803,9 +807,21 @@ pub(crate) fn restore(
         ],
     )?;
     mg::write_private(&dir.join("preflight.json"), serde_json::to_string_pretty(&a.facts)?.as_bytes())?;
+    if a.facts.get("migration_profile").and_then(|v| v.as_str()) == Some("nested") {
+        for file in mg::NESTED_CHECKPOINT_SIDECAR_FILES {
+            mg::copy_private(&inbox.join(file), &dir.join(file))?;
+        }
+    }
     let k = claim(db, authorization)?.ok_or("Restore claim not persisted")?;
     let graph = a.facts["space"]["graph_root"].clone();
     launch(db, attempt, id, uuid, name, &k, &dir, false, &graph)
+}
+
+fn read_nested_inner_sidecar(dir: &Path) -> Result<Value, Error> {
+    let path = dir.join("inner_podman_metadata.json");
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("inner_podman_metadata.json is missing from the operation directory: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("inner_podman_metadata.json is not JSON: {e}").into())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -925,6 +941,10 @@ fn finalize(
     let log_preserved = observed
         .as_ref()
         .is_some_and(|c| mg::copy_podman_log(c, "RestoreLog", "restore.log", &log));
+    let nested_manifest = fs::read_to_string(dir.join(mg::MANIFEST))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .filter(|m| mg::nested_checkpoint_manifest(m));
     if let Err(reason) = verify(k, observed.as_ref(), &log, log_preserved) {
         let stderr = mg::read_bounded(&dir.join(format!("restore-attempt-{launched}.stderr"))).unwrap_or_default();
         let detail = json!({"reason": reason, "attempt": attempt, "launched_attempt": launched, "exit_code": exit,
@@ -961,17 +981,28 @@ fn finalize(
     }
     let c = observed.ok_or("Restored container not observable")?;
     let container_id = c["Id"].as_str().unwrap_or("").to_string();
+    let nested_inner = if nested_manifest.is_some() {
+        let source_inner = read_nested_inner_sidecar(dir)?;
+        Some(mg::nested_destination_post_outer_restore(name, &container_id, &source_inner)?)
+    } else {
+        None
+    };
     mg::write_private(&dir.join("restore.log"), &mg::read_bounded(&log)?)?;
     let now = crate::now() as i64;
     let tx = db.unchecked_transaction()?;
     let archived = mg::archive_transferred(&tx, uuid, id)?;
+    let mut verified_detail = json!({"verified_at": now, "verified_attempt": attempt, "launched_attempt": launched, "exit_code": exit,
+            "reservation_history_archived": archived, "restore_log_sha256": mg::sha256(&log)?, "prevention": prevention});
+    if let Some(inner) = nested_inner {
+        verified_detail["nested_destination_inner_reconcile"] = inner;
+        verified_detail["migration_profile"] = json!("nested");
+    }
     merge_claim(
         &tx,
         &k.authorization_id,
         "restored",
         Some(&container_id),
-        &json!({"verified_at": now, "verified_attempt": attempt, "launched_attempt": launched, "exit_code": exit,
-            "reservation_history_archived": archived, "restore_log_sha256": mg::sha256(&log)?, "prevention": prevention}),
+        &verified_detail,
     )?;
     let k = claim(&tx, &k.authorization_id)?.ok_or("Restore claim disappeared")?;
     let outcome = outcome_text(
@@ -987,7 +1018,7 @@ fn finalize(
     set_outcome(&tx, &k.authorization_id, &outcome)?;
     tx.commit()?;
     let k = claim(db, &k.authorization_id)?.ok_or("Restore claim disappeared")?;
-    restored_result(uuid, &k, dir, resumed)
+    restored_result(uuid, &k, dir, resumed, nested_manifest.is_some())
 }
 
 fn outcome_text(k: &Claim, operation: &str, result: &str, container: Option<&str>, observation: Value, now: i64) -> Result<String, Error> {
@@ -1015,7 +1046,7 @@ fn publish_outcome(k: &Claim) -> Result<Value, Error> {
     }
     Ok(json!({"file": target, "sha256": sha, "bytes": text.len()}))
 }
-fn restored_result(uuid: &str, k: &Claim, dir: &Path, resumed: bool) -> Result<Value, Error> {
+fn restored_result(uuid: &str, k: &Claim, dir: &Path, resumed: bool, nested: bool) -> Result<Value, Error> {
     let outcome_file = publish_outcome(k)?;
     let outcome: Value = serde_json::from_str(k.outcome.as_deref().unwrap_or("null"))?;
     let handoff: Value = serde_json::from_str(&k.handoff)?;
@@ -1040,7 +1071,9 @@ fn restored_result(uuid: &str, k: &Claim, dir: &Path, resumed: bool) -> Result<V
         "artifact_directory": dir, "archive": handoff["archive"],
         "reservation_history_archived": detail["reservation_history_archived"], "finalized_after_interruption": resumed,
         "ownership": "this verified migration_restore binds the universe UUID to the restored container ID in this host's journal",
-        "scope": SCOPE,
+        "scope": if nested { SCOPE_NESTED_DESTINATION_RESTORE } else { SCOPE },
+        "migration_profile": if nested { json!("nested") } else { Value::Null },
+        "nested_destination_inner_reconcile": detail.get("nested_destination_inner_reconcile").cloned().unwrap_or(Value::Null),
     }))
 }
 /// Closes a claim as `not_restored` and records its outcome in one transaction, before the outcome file is
@@ -1082,7 +1115,13 @@ fn resume(db: &Connection, attempt: i64, id: &str, uuid: &str, name: &str, k: Cl
     }
     let dir = mg::base()?.join(id);
     match k.state.as_str() {
-        "restored" => restored_result(uuid, &k, &dir, true),
+        "restored" => {
+            let nested = fs::read_to_string(dir.join(mg::MANIFEST))
+                .ok()
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                .is_some_and(|m| mg::nested_checkpoint_manifest(&m));
+            restored_result(uuid, &k, &dir, true, nested)
+        }
         "not_restored" => Err(failure(
             "This restore claim is closed as not_restored: this host will not restore the authorization; a new authorization is required",
             json!({"restore_claim": k.view()}),

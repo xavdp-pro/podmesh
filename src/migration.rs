@@ -69,7 +69,9 @@ const NESTED_LAB_GAPS_AFTER_OUTER_CHECKPOINT_CAPTURE: [&str; 2] = [
     "nested_destination_restore_hooks",
     "two_host_checkpoint_carry_restore_complete",
 ];
-pub(crate) const NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS: [&str; 1] = [
+pub(crate) const NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS: [&str; 0] = [];
+/// Remaining product gap after outer capture and destination restore hooks until a verified two-host move closes G3.
+pub(crate) const NESTED_LAB_GAPS_UNTIL_TWO_HOST_MOVE_COMPLETE: [&str; 1] = [
     "two_host_checkpoint_carry_restore_complete",
 ];
 /// Reservation state after the kit-style inner Podman proof and pre-checkpoint metadata reconcile succeed.
@@ -1198,8 +1200,8 @@ fn nested_lab_after_outer_checkpoint_detail(
         uuid,
         facts,
         r,
-        &NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS,
-        "reservation, preflight.json, nested sidecars, nested_outer_checkpoint_plan.json, checkpoint.tar.zst and manifest.json: outer checkpoint captured on the source; destination restore hooks are implemented on the peer at preflight; the two-host carry/restore/complete chain is not implemented",
+        &NESTED_LAB_GAPS_UNTIL_TWO_HOST_MOVE_COMPLETE,
+        "reservation, preflight.json, nested sidecars, nested_outer_checkpoint_plan.json, checkpoint.tar.zst and manifest.json: outer checkpoint captured on the source; destination restore hooks are implemented on the peer at preflight; the two-host carry/restore/complete chain is not verified end-to-end",
         "nested_outer_checkpoint_captured",
         json!({
             "inner_podman_metadata": inner,
@@ -1302,6 +1304,68 @@ fn nested_inner_podman_proof(outer: &str, expected_outer_id: &str) -> Result<Val
         "workload_uuid": uuid,
         "counter": counter,
         "log_tail": log_lines,
+    }))
+}
+
+/// Blockers for restoring a nested exported checkpoint when the kit inner Podman fixture was checkpointed.
+/// Lab observation (2026-10-07): CRIU restore fails replaying inner VFS overlay mounts (`fill_overlayfs_info`, exit -52)
+/// for both `podman container restore --import` and in-place `--keep` restore on the same host.
+pub(crate) fn nested_destination_outer_restore_blockers(inner_sidecar: &Value) -> Vec<String> {
+    if inner_sidecar.get("status") == Some(&json!("verified"))
+        && inner_sidecar.get("proof").is_some()
+    {
+        return vec![
+            "nested outer checkpoint restore is not qualified when inner Podman VFS overlay mounts are present: CRIU restore fails overlay mount replay on the lab (fill_overlayfs_info, exit -52)".into(),
+        ];
+    }
+    vec![]
+}
+
+/// After a verified outer restore on the destination, reconcile inner Podman metadata and prove counter continuity.
+pub(crate) fn nested_destination_post_outer_restore(
+    outer_name: &str,
+    outer_container_id: &str,
+    source_inner_metadata: &Value,
+) -> Result<Value, Error> {
+    if source_inner_metadata.get("status") != Some(&json!("verified")) {
+        return Err("source inner_podman_metadata sidecar is not verified".into());
+    }
+    let proof_doc = source_inner_metadata
+        .get("proof")
+        .ok_or_else(|| Error::from("source inner_podman_metadata has no proof"))?;
+    let expected_counter = proof_doc
+        .get("counter")
+        .and_then(|c| c.as_u64())
+        .ok_or_else(|| Error::from("source inner_podman_metadata proof has no counter"))?;
+    let workload_uuid = proof_doc.get("workload_uuid").and_then(|u| u.as_str());
+    let proof = nested_inner_podman_proof(outer_name, outer_container_id)
+        .map_err(|blockers| Error::from(blockers.join("; ")))?;
+    let observed_counter = proof
+        .get("counter")
+        .and_then(|c| c.as_u64())
+        .ok_or_else(|| Error::from("inner counter proof after restore has no counter"))?;
+    if observed_counter < expected_counter {
+        return Err(format!(
+            "inner counter regressed after restore: observed {observed_counter}, source checkpoint had {expected_counter}"
+        )
+        .into());
+    }
+    if let Some(uuid) = workload_uuid {
+        if proof.get("workload_uuid").and_then(|u| u.as_str()) != Some(uuid) {
+            return Err("inner workload UUID does not match the source checkpoint proof".into());
+        }
+    }
+    let reconcile = nested_inner_podman_reconcile(outer_name, &proof)
+        .map_err(|blockers| Error::from(blockers.join("; ")))?;
+    Ok(json!({
+        "status": "verified",
+        "restore_phase": "destination_inner_podman_metadata_reconciliation",
+        "source_counter_at_checkpoint": expected_counter,
+        "observed_counter_after_outer_restore": observed_counter,
+        "counter_continuity": "observed_gte_source_checkpoint",
+        "proof": proof,
+        "reconcile": reconcile,
+        "observed_at": crate::now(),
     }))
 }
 
@@ -1489,7 +1553,7 @@ pub(crate) fn nested_destination_restore_hooks_assess(
         "status": "verified",
         "checkpoint_phase": "nested_destination_restore_hooks",
         "binding_model": "two_host_serial_handoff",
-        "note": "Destination-phase hook assessment only: inbox sidecars match the nested manifest and the archive names a privileged outer universe. migration_restore for nested profile does not run outer checkpoint restore or inner Podman reconciliation yet.",
+        "note": "Destination-phase hook assessment: inbox sidecars match the nested manifest and the archive names a privileged outer universe. migration_restore runs outer checkpoint restore with the packaged runtime, then inner Podman metadata reconciliation for the kit counter fixture when present.",
         "required_operations": [
             "migration_destination_preflight",
             "migration_restore",
@@ -1501,8 +1565,8 @@ pub(crate) fn nested_destination_restore_hooks_assess(
                 "nested_profile": "sidecars_and_manifest_verified"
             },
             "migration_restore": {
-                "status": "not_invoked",
-                "nested_profile": "unimplemented_on_destination"
+                "status": "implementation_present_runtime_unqualified",
+                "nested_profile": "privileged_outer_restore_plus_inner_podman_reconcile_after_outer_verified"
             }
         },
         "implementation_gaps": NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS,
@@ -2713,7 +2777,7 @@ fn finalize_nested(
             "archive_sha256": archive_sha256,
             "manifest_sha256": manifest_sha256,
             "migration_profile": "nested",
-            "implementation_gaps": NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS,
+            "implementation_gaps": NESTED_LAB_GAPS_UNTIL_TWO_HOST_MOVE_COMPLETE,
         }),
     )?;
     let mut source = lc::state_view(&c);
@@ -2742,7 +2806,7 @@ fn finalize_nested(
         "finalized_after_interruption": resumed,
         "reservation": {"state": "checkpointed"},
         "checkpoint_phase": "nested_outer_checkpoint_captured",
-        "implementation_gaps": NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS,
+        "implementation_gaps": NESTED_LAB_GAPS_UNTIL_TWO_HOST_MOVE_COMPLETE,
         "nested_checkpoint_detail": after,
         "authority": AUTHORITY, "scope": SCOPE_NESTED_OUTER_CHECKPOINT,
     }))
@@ -3054,14 +3118,17 @@ mod tests {
 
     #[test]
     fn nested_lab_gaps_shrink_after_destination_restore_hooks() {
-        assert_eq!(NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS.len(), 1);
-        assert_eq!(
-            NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS[0],
-            "two_host_checkpoint_carry_restore_complete"
-        );
+        assert_eq!(NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS.len(), 0);
         assert!(!NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS
             .iter()
             .any(|g| *g == "nested_destination_restore_hooks"));
+    }
+
+    #[test]
+    fn nested_destination_outer_restore_blockers_name_inner_vfs_overlay_gap() {
+        let verified = json!({"status": "verified", "proof": {"counter": 1}});
+        assert!(!super::nested_destination_outer_restore_blockers(&verified).is_empty());
+        assert!(super::nested_destination_outer_restore_blockers(&json!({"status": "refused"})).is_empty());
     }
 
     #[test]
@@ -3086,6 +3153,10 @@ mod tests {
         let doc = nested_destination_restore_hooks_assess(&manifest, &archive, &inbox).unwrap();
         assert_eq!(doc["status"], "verified");
         assert_eq!(doc["checkpoint_phase"], "nested_destination_restore_hooks");
+        assert_eq!(
+            doc["api_hooks"]["migration_restore"]["nested_profile"],
+            "privileged_outer_restore_plus_inner_podman_reconcile_after_outer_verified"
+        );
         assert!(nested_destination_restore_hooks_assess(
             &manifest,
             &json!({"hostConfig": {"privileged": false}}),
