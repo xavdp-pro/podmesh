@@ -2984,7 +2984,7 @@ mod tests {
         assert_eq!(epoch("2024-02-29T12:00:00Z"), Some(1_709_208_000));
         // Observed on the lab: StartedAt of a container whose start event had time 1789150856.
         assert_eq!(epoch("2026-09-11T18:20:56.109581375Z"), Some(1_789_150_856));
-        assert_eq!(epoch("2026-09-11T18:20:56+02:00"), Some(1_789_150_856));
+        assert_eq!(epoch("2026-09-11T18:20:56+02:00"), Some(1_789_143_656));
         assert_eq!(
             epoch("2026-10-07T20:24:33.526747397+02:00"),
             epoch("2026-10-07T20:24:33+02:00"),
