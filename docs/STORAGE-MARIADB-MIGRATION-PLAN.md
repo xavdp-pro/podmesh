@@ -142,9 +142,11 @@ by `PODMESH_MARIADB_DSN`.
    where used).
 3. Replace hard-coded `state.sqlite` in `lib.rs` with configured store.
 4. Add offline tool `podmesh-storage-migrate`:
-   - read-only open SQLite source;
-   - bulk copy or logical export into empty MariaDB target;
-   - row-count and checksum spot checks per table;
+   - read-only open SQLite source; validate version, refuse unknown tables and
+     missing mandatory tables **before** any target mutation;
+   - set `store_schema.node_cutover = 0` until copy+verify finish (node open refuses);
+   - bulk copy of every inventory table in **one** transaction into empty MariaDB;
+   - row-count and logical checksum checks per table; clear cutover lock only after;
    - refuse if target non-empty unless `--force` with backup mandate.
 5. **Backup script** for node role: `mariadb-dump` scoped to node database; document
    in `docs/BACKUP-AND-RESTORE.md` (new or extended).

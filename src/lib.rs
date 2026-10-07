@@ -147,12 +147,14 @@ pub fn open_node_store(
         Engine::Sqlite => {
             let mut store = SqliteStore::open(&config.sqlite)?;
             migrations::apply(&mut store)?;
+            migrations::refuse_incomplete_cutover(&mut store)?;
             bind_to_this_host(&mut store)?;
             NodeStore::Sqlite(store.into_connection())
         }
         Engine::Mariadb => {
             let mut store = store::open(config)?;
             migrations::apply(store.as_mut())?;
+            migrations::refuse_incomplete_cutover(store.as_mut())?;
             bind_to_this_host(store.as_mut())?;
             NodeStore::Durable(store)
         }

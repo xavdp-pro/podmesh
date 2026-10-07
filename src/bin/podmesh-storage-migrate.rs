@@ -1,9 +1,11 @@
+use podmesh::store::migrations::{self, node_tables, node_tables_through, node_version};
 use rusqlite::{Connection, OpenFlags};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "mariadb")]
 use podmesh::store::{
-    migrations::node_tables, DurableStore, MariadbConfig, MariadbStore, Value,
+    bootstrap, schema_version, DurableStore, MariadbConfig, MariadbStore, Value, SCHEMA_TABLE,
 };
 #[cfg(feature = "mariadb")]
 use rusqlite::types::ValueRef;
@@ -14,9 +16,13 @@ const USAGE: &str = "\
 Usage: podmesh-storage-migrate --from-sqlite PATH --to-dsn URL [--dry-run] [--force]
 
 Copies an offline SQLite journal into the MariaDB database named by URL,
-through the versioned NODE_MIGRATIONS schema. The target must contain no
-tables. --force DROPS EVERY TABLE in that database first; take and verify
-a backup before using it. The DSN is always redacted from output.";
+through the versioned NODE_MIGRATIONS schema. The source is validated before
+any target mutation: future schema versions, unknown tables, and missing
+mandatory tables are refused. The target must contain no tables. --force
+DROPS EVERY TABLE in that database first; take and verify a backup before
+using it. Until copy and verification finish, store_schema.node_cutover = 0
+and the node refuses to open the target. The DSN is always redacted from
+output.";
 
 #[derive(Debug, PartialEq)]
 struct Args {
@@ -96,7 +102,14 @@ fn quoted_identifier(name: &str) -> String {
     quoted_sqlite_identifier(name)
 }
 
-fn inspect_sqlite(path: &Path) -> Result<Vec<TableCount>, Box<dyn std::error::Error>> {
+#[derive(Clone, Debug, PartialEq)]
+struct SourceJournal {
+    counts: Vec<TableCount>,
+    /// Recorded `store_schema` version for `node`, when present.
+    version: Option<i64>,
+}
+
+fn inspect_sqlite(path: &Path) -> Result<SourceJournal, Box<dyn std::error::Error>> {
     let db = open_source(path)?;
     let mut statement = db.prepare(
         "SELECT name
@@ -108,14 +121,120 @@ fn inspect_sqlite(path: &Path) -> Result<Vec<TableCount>, Box<dyn std::error::Er
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
 
-    names
+    let counts = names
         .into_iter()
         .map(|name| {
             let sql = format!("SELECT COUNT(*) FROM {}", quoted_sqlite_identifier(&name));
             let rows = db.query_row(&sql, [], |row| row.get(0))?;
             Ok(TableCount { name, rows })
         })
-        .collect()
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+
+    let version = if counts.iter().any(|table| table.name == "store_schema") {
+        match db.query_row(
+            "SELECT version FROM store_schema WHERE name = 'node'",
+            [],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(version) => Some(version),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
+
+    Ok(SourceJournal { counts, version })
+}
+
+/// Validate the SQLite source before any MariaDB mutation.
+///
+/// - Empty / foreign files are refused.
+/// - Future `node` schema versions are refused.
+/// - Tables outside the node inventory (except `store_schema`) are refused.
+/// - At the current version, every inventory table must exist.
+/// - At an older recorded version *N*, only tables from migrations 1..=N are
+///   mandatory; later inventory tables may be absent (copied as empty).
+/// - A pre-schema journal may omit inventory tables, but must carry at least
+///   one recognized node table.
+fn validate_source(journal: &SourceJournal) -> Result<(), Box<dyn std::error::Error>> {
+    let present: BTreeSet<&str> = journal
+        .counts
+        .iter()
+        .map(|table| table.name.as_str())
+        .collect();
+    let inventory: BTreeSet<&str> = node_tables().into_iter().collect();
+    let allowed: BTreeSet<&str> = inventory
+        .iter()
+        .copied()
+        .chain(std::iter::once("store_schema"))
+        .collect();
+
+    if present.is_empty() {
+        return Err("SQLite source carries no user tables; refusing an empty or foreign file".into());
+    }
+
+    let unknown: Vec<&str> = present
+        .iter()
+        .copied()
+        .filter(|name| !allowed.contains(name))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "SQLite source has unknown tables not in the node inventory: {}",
+            unknown.join(", ")
+        )
+        .into());
+    }
+
+    let latest = node_version();
+    match journal.version {
+        Some(version) if version > latest => {
+            return Err(format!(
+                "SQLite source carries node schema version {version} and this build knows {latest}: \
+                 a journal is never opened by a build older than the one that wrote it"
+            )
+            .into());
+        }
+        Some(version) if version == latest => {
+            let missing: Vec<&str> = inventory
+                .iter()
+                .copied()
+                .filter(|name| !present.contains(name))
+                .collect();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "SQLite source at node schema version {version} is missing mandatory tables: {}",
+                    missing.join(", ")
+                )
+                .into());
+            }
+        }
+        Some(version) => {
+            let mandatory = node_tables_through(version);
+            let missing: Vec<&str> = mandatory
+                .into_iter()
+                .filter(|name| !present.contains(name))
+                .collect();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "SQLite source at node schema version {version} is missing tables that version requires: {}",
+                    missing.join(", ")
+                )
+                .into());
+            }
+        }
+        None => {
+            let recognized = present.iter().any(|name| inventory.contains(name));
+            if !recognized {
+                return Err(
+                    "SQLite source has no store_schema.node version and no recognized node tables; refusing"
+                        .into(),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn open_source(path: &Path) -> Result<Connection, rusqlite::Error> {
@@ -260,8 +379,26 @@ fn clear_target(store: &mut MariadbStore) -> Result<(), Box<dyn std::error::Erro
 }
 
 #[cfg(feature = "mariadb")]
-fn copy_to_mariadb(args: &Args, counts: &[TableCount]) -> Result<(), Box<dyn std::error::Error>> {
-    use podmesh::store::migrations;
+fn mark_cutover_incomplete(store: &mut MariadbStore) -> Result<(), Box<dyn std::error::Error>> {
+    bootstrap(store, migrations::CUTOVER, migrations::CUTOVER_INCOMPLETE)?;
+    Ok(())
+}
+
+#[cfg(feature = "mariadb")]
+fn clear_cutover_marker(store: &mut MariadbStore) -> Result<(), Box<dyn std::error::Error>> {
+    let mut tx = store.transaction()?;
+    tx.execute(
+        "DELETE FROM store_schema WHERE name = ?",
+        &[Value::from(migrations::CUTOVER)],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+#[cfg(feature = "mariadb")]
+fn copy_to_mariadb(args: &Args, journal: &SourceJournal) -> Result<(), Box<dyn std::error::Error>> {
+    validate_source(journal)?;
+    let counts = &journal.counts;
     let source = open_source(&args.from_sqlite)?;
 
     let config = MariadbConfig::from_dsn(&args.to_dsn);
@@ -285,8 +422,14 @@ fn copy_to_mariadb(args: &Args, counts: &[TableCount]) -> Result<(), Box<dyn std
         clear_target(&mut target)?;
     }
 
-    // The versioned schema, not a heated DDL guess: the same NODE_MIGRATIONS
-    // the node opens, in MariaDB dialect.
+    // Incomplete before schema or data: a crash leaves the node refusing to open.
+    mark_cutover_incomplete(&mut target)?;
+    println!(
+        "Cutover lock: {} = {}",
+        migrations::CUTOVER,
+        migrations::CUTOVER_INCOMPLETE
+    );
+
     let applied = migrations::apply(&mut target)?;
     println!(
         "Schema: {} migrations applied ({} -> {})",
@@ -294,16 +437,24 @@ fn copy_to_mariadb(args: &Args, counts: &[TableCount]) -> Result<(), Box<dyn std
         applied.from,
         applied.to
     );
+    // Re-assert after apply: migrations rewrite store_schema rows one by one.
+    mark_cutover_incomplete(&mut target)?;
 
     let ordered = node_tables();
+    let mut prepared = Vec::new();
     for name in &ordered {
-        let entry = counts
+        let present = counts.iter().any(|count| &count.name == *name);
+        let columns = if present {
+            source_columns(&source, name)?
+        } else {
+            Vec::new()
+        };
+        let expected = counts
             .iter()
-            .find(|count| &count.name == name)
+            .find(|count| &count.name == *name)
             .map(|count| count.rows)
             .unwrap_or(0);
-        let columns = source_columns(&source, name).unwrap_or_default();
-        if columns.is_empty() && entry > 0 {
+        if columns.is_empty() && expected > 0 {
             return Err(format!("SQLite source has no readable columns for {name}").into());
         }
         let rows = if columns.is_empty() {
@@ -311,7 +462,23 @@ fn copy_to_mariadb(args: &Args, counts: &[TableCount]) -> Result<(), Box<dyn std
         } else {
             source_rows(&source, name, &columns)?
         };
-        if !rows.is_empty() {
+        if rows.len() as i64 != expected {
+            return Err(format!(
+                "SQLite source row count for {name} changed during read: expected {expected}, got {}",
+                rows.len()
+            )
+            .into());
+        }
+        prepared.push((*name, columns, rows, expected));
+    }
+
+    // One transaction for every row of every table: commit all or leave nothing.
+    {
+        let mut transaction = target.transaction()?;
+        for (name, columns, rows, _) in &prepared {
+            if rows.is_empty() {
+                continue;
+            }
             let names = columns
                 .iter()
                 .map(|column| quoted_mariadb_identifier(column))
@@ -322,32 +489,27 @@ fn copy_to_mariadb(args: &Args, counts: &[TableCount]) -> Result<(), Box<dyn std
                 "INSERT INTO {} ({names}) VALUES ({placeholders})",
                 quoted_mariadb_identifier(name)?
             );
-            let mut transaction = target.transaction()?;
-            for row in &rows {
+            for row in rows {
                 transaction.execute(&insert, row)?;
             }
-            transaction.commit()?;
         }
+        transaction.commit()?;
+    }
+    for (name, _, rows, _) in &prepared {
         println!("Copied {name}: {} rows", rows.len());
     }
 
-    for name in &ordered {
-        let columns = source_columns(&source, name).unwrap_or_default();
-        let source_rows = if columns.is_empty() {
-            Vec::new()
-        } else {
-            source_rows(&source, name, &columns)?
-        };
-        let source_checksum = logical_checksum(&source_rows);
+    for (name, columns, source_rows, expected) in &prepared {
+        let source_checksum = logical_checksum(source_rows);
         let quoted = quoted_mariadb_identifier(name)?;
-        let list = columns
-            .iter()
-            .map(|column| quoted_mariadb_identifier(column))
-            .collect::<Result<Vec<_>, _>>()?
-            .join(", ");
         let target_rows: Vec<Vec<Value>> = if columns.is_empty() {
             Vec::new()
         } else {
+            let list = columns
+                .iter()
+                .map(|column| quoted_mariadb_identifier(column))
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ");
             target
                 .query(&format!("SELECT {list} FROM {quoted}"), &[])?
                 .into_iter()
@@ -355,43 +517,55 @@ fn copy_to_mariadb(args: &Args, counts: &[TableCount]) -> Result<(), Box<dyn std
                 .collect()
         };
         let count = target_rows.len() as i64;
-        let expected = counts
-            .iter()
-            .find(|count| &count.name == name)
-            .map(|count| count.rows)
-            .unwrap_or(0);
-        if count != source_rows.len() as i64 || count != expected {
+        if count != source_rows.len() as i64 || count != *expected {
             return Err(format!(
-                "row-count verification failed for {name}: SQLite={expected}, copied={count}"
+                "row-count verification failed for {name}: SQLite={expected}, copied={count}; \
+                 cutover lock remains; node will refuse this target"
             )
             .into());
         }
         let target_checksum = logical_checksum(&target_rows);
         if source_checksum != target_checksum {
             return Err(format!(
-                "logical SHA-256 verification failed for {name} (values or storage classes differ)"
+                "logical SHA-256 verification failed for {name} (values or storage classes differ); \
+                 cutover lock remains; node will refuse this target"
             )
             .into());
         }
         println!("Verified {name}: {count} rows, logical sha256={source_checksum}");
     }
+
     let integrity = target.integrity_check()?;
     if !integrity.ok {
         return Err(format!(
-            "MariaDB integrity check failed: {}",
+            "MariaDB integrity check failed: {}; cutover lock remains",
             integrity.findings.join("; ")
         )
         .into());
     }
+
+    clear_cutover_marker(&mut target)?;
+    if schema_version(&mut target, migrations::CUTOVER)?.is_some() {
+        return Err("failed to clear store_schema.node_cutover after verification".into());
+    }
+    // store_schema itself is not in node_tables(); ensure it remains.
+    if !target
+        .tables()?
+        .iter()
+        .any(|table| table == SCHEMA_TABLE)
+    {
+        return Err("store_schema missing after cutover".into());
+    }
+
     println!(
-        "Migration complete: {} tables copied and checked; MariaDB integrity OK",
+        "Migration complete: {} tables copied and checked; cutover lock cleared; MariaDB integrity OK",
         ordered.len()
     );
     Ok(())
 }
 
 #[cfg(not(feature = "mariadb"))]
-fn copy_to_mariadb(_args: &Args, _counts: &[TableCount]) -> Result<(), Box<dyn std::error::Error>> {
+fn copy_to_mariadb(_args: &Args, _journal: &SourceJournal) -> Result<(), Box<dyn std::error::Error>> {
     Err("copy mode requires a build with --features mariadb".into())
 }
 
@@ -399,22 +573,30 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.dry_run {
         return run_dry(&args);
     }
-    let tables = inspect_sqlite(&args.from_sqlite)?;
-    copy_to_mariadb(&args, &tables)
+    let journal = inspect_sqlite(&args.from_sqlite)?;
+    validate_source(&journal)?;
+    copy_to_mariadb(&args, &journal)
 }
 
 fn run_dry(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let counts = inspect_sqlite(&args.from_sqlite)?;
+    let journal = inspect_sqlite(&args.from_sqlite)?;
+    validate_source(&journal)?;
     println!("SQLite source: {}", args.from_sqlite.display());
     println!("MariaDB target: supplied via --to-dsn (value redacted)");
-    println!("Tables: {}", counts.len());
-    for entry in &counts {
+    match journal.version {
+        Some(version) => println!("Source node schema version: {version}"),
+        None => println!("Source node schema version: none (pre-schema journal)"),
+    }
+    println!("Tables: {}", journal.counts.len());
+    for entry in &journal.counts {
         println!("  {}: {} rows", entry.name, entry.rows);
     }
     println!("Plan:");
-    println!("  1. Verify that the MariaDB target has no user tables.");
-    println!("  2. Create the versioned MariaDB schema.");
-    println!("  3. Copy each table and compare row counts and checksums.");
+    println!("  1. Source already validated (version, unknown tables, mandatory tables).");
+    println!("  2. Verify that the MariaDB target has no user tables.");
+    println!("  3. Set cutover lock, create the versioned MariaDB schema.");
+    println!("  4. Copy every table in one transaction; verify counts and checksums.");
+    println!("  5. Clear cutover lock only after verification.");
     println!("Dry run only: MariaDB was not contacted and no data was changed.");
     Ok(())
 }
@@ -488,10 +670,10 @@ mod tests {
         ));
         let db = Connection::open(&path).unwrap();
         db.execute_batch(
-            "CREATE TABLE alpha(id INTEGER PRIMARY KEY);
-             CREATE TABLE beta(value TEXT NOT NULL);
-             INSERT INTO alpha VALUES(1);
-             INSERT INTO beta VALUES('one'),('two');",
+            "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE observations(id INTEGER PRIMARY KEY, observed_at INTEGER NOT NULL, operation TEXT NOT NULL, result TEXT NOT NULL);
+             INSERT INTO metadata VALUES('host_uuid', 'x');
+             INSERT INTO observations(observed_at, operation, result) VALUES(1, 'op', 'ok'), (2, 'op', 'ok');",
         )
         .unwrap();
         drop(db);
@@ -499,19 +681,21 @@ mod tests {
         let result = inspect_sqlite(&path).unwrap();
         std::fs::remove_file(path).unwrap();
 
+        assert_eq!(result.version, None);
         assert_eq!(
-            result,
+            result.counts,
             vec![
                 TableCount {
-                    name: "alpha".into(),
+                    name: "metadata".into(),
                     rows: 1
                 },
                 TableCount {
-                    name: "beta".into(),
+                    name: "observations".into(),
                     rows: 2
                 },
             ]
         );
+        validate_source(&result).unwrap();
     }
 
     #[test]
@@ -529,5 +713,68 @@ mod tests {
             parse_args(&values).unwrap_err(),
             "--force cannot be combined with --dry-run"
         );
+    }
+
+    #[test]
+    fn refuses_an_empty_sqlite_file() {
+        let path = std::env::temp_dir().join(format!(
+            "podmesh-migrate-empty-{}-{}.sqlite",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        Connection::open(&path).unwrap();
+        let journal = inspect_sqlite(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let refused = validate_source(&journal).unwrap_err().to_string();
+        assert!(refused.contains("no user tables"), "{refused}");
+    }
+
+    #[test]
+    fn refuses_unknown_tables_and_future_versions() {
+        let unknown = SourceJournal {
+            counts: vec![TableCount {
+                name: "not_a_node_table".into(),
+                rows: 1,
+            }],
+            version: None,
+        };
+        let refused = validate_source(&unknown).unwrap_err().to_string();
+        assert!(refused.contains("unknown tables"), "{refused}");
+
+        let future = SourceJournal {
+            counts: node_tables()
+                .into_iter()
+                .chain(std::iter::once("store_schema"))
+                .map(|name| TableCount {
+                    name: name.into(),
+                    rows: 0,
+                })
+                .collect(),
+            version: Some(node_version() + 1),
+        };
+        let refused = validate_source(&future).unwrap_err().to_string();
+        assert!(refused.contains("older than the one that wrote it"), "{refused}");
+    }
+
+    #[test]
+    fn refuses_missing_mandatory_tables_at_current_version() {
+        let journal = SourceJournal {
+            counts: vec![
+                TableCount {
+                    name: "store_schema".into(),
+                    rows: 1,
+                },
+                TableCount {
+                    name: "metadata".into(),
+                    rows: 0,
+                },
+            ],
+            version: Some(node_version()),
+        };
+        let refused = validate_source(&journal).unwrap_err().to_string();
+        assert!(refused.contains("missing mandatory tables"), "{refused}");
     }
 }

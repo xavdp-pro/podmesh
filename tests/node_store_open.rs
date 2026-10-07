@@ -6,7 +6,7 @@
 //!
 //! Every case uses a state directory of its own under the system's scratch, and none of them
 //! touches `/var/lib/podmesh`.
-use podmesh::store::{migrations, Engine, MariadbConfig, StoreConfig};
+use podmesh::store::{migrations, bootstrap, Engine, MariadbConfig, SqliteConfig, SqliteStore, StoreConfig};
 use std::{fs, path::PathBuf};
 
 fn scratch(name: &str) -> PathBuf {
@@ -176,6 +176,34 @@ fn a_build_without_the_backend_names_the_refusal() {
     let config = StoreConfig { engine: Engine::Mariadb, mariadb: MariadbConfig::from_dsn("mysql://u@127.0.0.1:1/d"), ..StoreConfig::default() };
     let refused = podmesh::store::open(&config).err().expect("a build with no backend opens no MariaDB store");
     assert_eq!(refused.fault, podmesh::store::Fault::Unsupported);
+}
+
+/// An interrupted offline cutover must not be served: `node_cutover = 0` refuses open.
+#[test]
+fn an_incomplete_cutover_marker_refuses_open() {
+    let Some(_) = machine_id() else {
+        eprintln!("skipped: this host has no /etc/machine-id to bind a journal to");
+        return;
+    };
+    let dir = scratch("cutover-incomplete");
+    let _db = podmesh::open_state(&dir).unwrap();
+    drop(_db);
+    let mut store = SqliteStore::open(&SqliteConfig {
+        path: dir.join("state.sqlite"),
+        ..SqliteConfig::default()
+    })
+    .unwrap();
+    bootstrap(
+        &mut store,
+        migrations::CUTOVER,
+        migrations::CUTOVER_INCOMPLETE,
+    )
+    .unwrap();
+    drop(store);
+
+    let refused = podmesh::open_state(&dir).unwrap_err().to_string();
+    assert!(refused.contains("incomplete"), "{refused}");
+    let _ = fs::remove_dir_all(&dir);
 }
 
 /// A versioned SQLite journal seeded with representative rows: the source the

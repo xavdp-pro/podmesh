@@ -35,6 +35,13 @@ use super::{DurableStore, Fault, Result};
 /// The schema name the node's set is recorded under in [`SCHEMA_TABLE`](super::SCHEMA_TABLE).
 pub const NODE: &str = "node";
 
+/// Offline SQLite→MariaDB cutover marker in [`SCHEMA_TABLE`](super::SCHEMA_TABLE).
+/// While version is [`CUTOVER_INCOMPLETE`], the node must refuse to open the store.
+pub const CUTOVER: &str = "node_cutover";
+
+/// Recorded under [`CUTOVER`] until copy and verification finish.
+pub const CUTOVER_INCOMPLETE: i64 = 0;
+
 /// One step of a schema, in the dialect of each engine that carries it.
 pub struct Migration {
     /// The file name without its engine and extension, e.g. `0004-activation`. Ordered by it.
@@ -153,8 +160,14 @@ pub fn apply_set(store: &mut dyn DurableStore, schema: &'static str, set: &'stat
 /// Every table the node's schema carries, in the order the set creates them. This is the list the
 /// storage inventory names, and what a caller checks a store against without reading a catalog.
 pub fn node_tables() -> Vec<&'static str> {
+    node_tables_through(node_version())
+}
+
+/// Tables created by the first `version` migrations (1..=version). Version 0 is empty.
+pub fn node_tables_through(version: i64) -> Vec<&'static str> {
     let mut tables = Vec::new();
-    for migration in NODE_MIGRATIONS {
+    let limit = version.max(0) as usize;
+    for migration in NODE_MIGRATIONS.iter().take(limit) {
         for statement in sql_statements(migration.sql(Engine::Sqlite)) {
             if let Some(name) = created_table(statement) {
                 tables.push(name);
@@ -162,6 +175,17 @@ pub fn node_tables() -> Vec<&'static str> {
         }
     }
     tables
+}
+
+/// Refuse a store whose offline cutover never finished.
+pub fn refuse_incomplete_cutover(store: &mut dyn DurableStore) -> Result<()> {
+    if super::schema_version(store, CUTOVER)? == Some(CUTOVER_INCOMPLETE) {
+        return Err(Fault::Schema.error(
+            "offline cutover is incomplete (store_schema.node_cutover = 0): \
+             refuse to open; finish or re-run podmesh-storage-migrate with --force after a verified backup",
+        ));
+    }
+    Ok(())
 }
 
 /// The table a `CREATE TABLE IF NOT EXISTS <name>(` statement creates, or none for anything else.
@@ -547,5 +571,28 @@ mod tests {
         let refused = apply(&mut store).unwrap_err();
         assert_eq!(refused.fault, Fault::Schema);
         assert!(refused.message.contains("older than the one that wrote it"));
+    }
+
+    #[test]
+    fn node_tables_through_follows_the_migration_prefix() {
+        assert!(node_tables_through(0).is_empty());
+        assert_eq!(node_tables_through(node_version()), node_tables());
+        let first = node_tables_through(1);
+        assert!(!first.is_empty());
+        assert!(first.len() < node_tables().len());
+        for name in &first {
+            assert!(node_tables().contains(name));
+        }
+    }
+
+    #[test]
+    fn an_incomplete_cutover_marker_is_refused() {
+        let mut store = memory();
+        apply(&mut store).unwrap();
+        refuse_incomplete_cutover(&mut store).unwrap();
+        super::super::bootstrap(&mut store, CUTOVER, CUTOVER_INCOMPLETE).unwrap();
+        let refused = refuse_incomplete_cutover(&mut store).unwrap_err();
+        assert_eq!(refused.fault, Fault::Schema);
+        assert!(refused.message.contains("incomplete"));
     }
 }
