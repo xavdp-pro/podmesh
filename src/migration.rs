@@ -1308,17 +1308,117 @@ fn nested_inner_podman_proof(outer: &str, expected_outer_id: &str) -> Result<Val
 }
 
 /// Blockers for restoring a nested exported checkpoint when the kit inner Podman fixture was checkpointed.
-/// Lab observation (2026-10-07): CRIU restore fails replaying inner VFS overlay mounts (`fill_overlayfs_info`, exit -52)
-/// for both `podman container restore --import` and in-place `--keep` restore on the same host.
+/// Lab observation (2026-10-07): CRIU restore fails replaying inner Podman overlay mounts (`fill_overlayfs_info`, exit -52)
+/// while the inner container mount tree is active. Stopping the inner container before outer capture (`outer_capture_quiesce`)
+/// was observed to allow restore on lab-a/b; in-memory counter continuity is not preserved across that quiesce.
 pub(crate) fn nested_destination_outer_restore_blockers(inner_sidecar: &Value) -> Vec<String> {
     if inner_sidecar.get("status") == Some(&json!("verified"))
         && inner_sidecar.get("proof").is_some()
+        && inner_sidecar
+            .get("outer_capture_quiesce")
+            .and_then(|q| q.get("status"))
+            != Some(&json!("verified"))
     {
         return vec![
-            "nested outer checkpoint restore is not qualified when inner Podman VFS overlay mounts are present: CRIU restore fails overlay mount replay on the lab (fill_overlayfs_info, exit -52)".into(),
+            "nested outer checkpoint restore is not qualified when inner Podman overlay mounts were active at outer capture: CRIU restore fails overlay mount replay on the lab (fill_overlayfs_info, exit -52); stop the inner fixture before outer checkpoint".into(),
         ];
     }
     vec![]
+}
+
+/// Stop the kit inner counter before outer CRIU capture so overlay mounts are not live in the dump.
+fn nested_inner_podman_quiesce_for_outer_capture(outer: &str) -> Result<Value, Error> {
+    if let Err(e) = outer_podman_exec(
+        outer,
+        &format!("{INNER_PODMAN_CLI} stop {NESTED_COUNTER_INNER_NAME}"),
+    ) {
+        return Err(format!(
+            "inner Podman could not stop {NESTED_COUNTER_INNER_NAME} before outer capture: {e}"
+        )
+        .into());
+    }
+    let status = outer_podman_exec(
+        outer,
+        &format!(
+            "{INNER_PODMAN_CLI} inspect {NESTED_COUNTER_INNER_NAME} --format '{{{{.State.Status}}}}'"
+        ),
+    )
+    .map_err(|e| {
+        Error::from(format!(
+            "inner Podman could not inspect {NESTED_COUNTER_INNER_NAME} after stop: {e}"
+        ))
+    })?;
+    let running = outer_podman_exec(
+        outer,
+        &format!(
+            "{INNER_PODMAN_CLI} inspect {NESTED_COUNTER_INNER_NAME} --format '{{{{.State.Running}}}}'"
+        ),
+    )
+    .map_err(|e| {
+        Error::from(format!(
+            "inner Podman could not read running state for {NESTED_COUNTER_INNER_NAME}: {e}"
+        ))
+    })?;
+    if status.trim() == "running" || running.trim() == "true" {
+        return Err(format!(
+            "inner container {NESTED_COUNTER_INNER_NAME} is still running after stop (status={})",
+            status.trim()
+        )
+        .into());
+    }
+    Ok(json!({
+        "status": "verified",
+        "checkpoint_phase": "inner_podman_quiesced_for_outer_capture",
+        "inner_container_name": NESTED_COUNTER_INNER_NAME,
+        "inner_state": status.trim(),
+        "reason": "inner Podman uses overlay mounts even with vfs graph driver; CRIU cannot replay them while the inner container is running",
+        "observed_at": crate::now(),
+    }))
+}
+
+fn nested_quiesce_inner_sidecar_for_outer_capture(
+    outer: &str,
+    dir: &Path,
+    sidecars: &mut Value,
+) -> Result<(), Error> {
+    let inner = sidecars
+        .get("inner_podman_metadata")
+        .cloned()
+        .unwrap_or(Value::Null);
+    if inner.get("status") != Some(&json!("verified")) || inner.get("proof").is_none() {
+        return Ok(());
+    }
+    if inner
+        .get("outer_capture_quiesce")
+        .and_then(|q| q.get("status"))
+        == Some(&json!("verified"))
+    {
+        return Ok(());
+    }
+    let quiesce = nested_inner_podman_quiesce_for_outer_capture(outer)?;
+    let mut updated = inner;
+    if let Some(obj) = updated.as_object_mut() {
+        obj.insert("outer_capture_quiesce".into(), quiesce);
+    }
+    write_nested_inner_metadata(dir, &updated)?;
+    if let Some(obj) = sidecars.as_object_mut() {
+        obj.insert("inner_podman_metadata".into(), updated);
+    }
+    Ok(())
+}
+
+fn nested_inner_podman_resume_after_quiesced_capture(outer: &str) -> Result<(), Error> {
+    outer_podman_exec(
+        outer,
+        &format!("{INNER_PODMAN_CLI} start {NESTED_COUNTER_INNER_NAME}"),
+    )
+    .map_err(|e| {
+        Error::from(format!(
+            "inner Podman could not start {NESTED_COUNTER_INNER_NAME} after outer restore: {e}"
+        ))
+    })?;
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    Ok(())
 }
 
 /// After a verified outer restore on the destination, reconcile inner Podman metadata and prove counter continuity.
@@ -1338,31 +1438,49 @@ pub(crate) fn nested_destination_post_outer_restore(
         .and_then(|c| c.as_u64())
         .ok_or_else(|| Error::from("source inner_podman_metadata proof has no counter"))?;
     let workload_uuid = proof_doc.get("workload_uuid").and_then(|u| u.as_str());
+    let quiesced = source_inner_metadata
+        .get("outer_capture_quiesce")
+        .and_then(|q| q.get("status"))
+        == Some(&json!("verified"));
+    if quiesced {
+        nested_inner_podman_resume_after_quiesced_capture(outer_name)?;
+    }
     let proof = nested_inner_podman_proof(outer_name, outer_container_id)
         .map_err(|blockers| Error::from(blockers.join("; ")))?;
     let observed_counter = proof
         .get("counter")
         .and_then(|c| c.as_u64())
         .ok_or_else(|| Error::from("inner counter proof after restore has no counter"))?;
-    if observed_counter < expected_counter {
+    let counter_continuity = if quiesced {
+        "inner_quiesced_before_capture: workload resumes from disk after outer restore; in-memory counter and workload UUID are not preserved"
+    } else if observed_counter < expected_counter {
         return Err(format!(
             "inner counter regressed after restore: observed {observed_counter}, source checkpoint had {expected_counter}"
         )
         .into());
-    }
-    if let Some(uuid) = workload_uuid {
-        if proof.get("workload_uuid").and_then(|u| u.as_str()) != Some(uuid) {
-            return Err("inner workload UUID does not match the source checkpoint proof".into());
+    } else {
+        "observed_gte_source_checkpoint"
+    };
+    if !quiesced {
+        if let Some(uuid) = workload_uuid {
+            if proof.get("workload_uuid").and_then(|u| u.as_str()) != Some(uuid) {
+                return Err("inner workload UUID does not match the source checkpoint proof".into());
+            }
         }
     }
-    let reconcile = nested_inner_podman_reconcile(outer_name, &proof)
-        .map_err(|blockers| Error::from(blockers.join("; ")))?;
+    let reconcile = if quiesced {
+        Value::Null
+    } else {
+        nested_inner_podman_reconcile(outer_name, &proof)
+            .map_err(|blockers| Error::from(blockers.join("; ")))?
+    };
     Ok(json!({
         "status": "verified",
         "restore_phase": "destination_inner_podman_metadata_reconciliation",
         "source_counter_at_checkpoint": expected_counter,
         "observed_counter_after_outer_restore": observed_counter,
-        "counter_continuity": "observed_gte_source_checkpoint",
+        "counter_continuity": counter_continuity,
+        "outer_capture_quiesce": source_inner_metadata.get("outer_capture_quiesce").cloned().unwrap_or(Value::Null),
         "proof": proof,
         "reconcile": reconcile,
         "observed_at": crate::now(),
@@ -2283,6 +2401,8 @@ fn capture_nested(
     sidecars: &Value,
 ) -> Result<Value, Error> {
     set_state(db, uuid, "checkpointing", &json!({"attempt": attempt, "migration_profile": "nested"}))?;
+    let mut sidecars = sidecars.clone();
+    nested_quiesce_inner_sidecar_for_outer_capture(name, dir, &mut sidecars)?;
     let archive = dir.join(ARCHIVE);
     if archive.exists() {
         fs::rename(&archive, dir.join(format!("{ARCHIVE}.partial-before-attempt-{attempt}")))?;
@@ -2312,7 +2432,7 @@ fn capture_nested(
             detail,
         ));
     }
-    finalize_nested(db, id, uuid, name, dir, r, false, sidecars)
+    finalize_nested(db, id, uuid, name, dir, r, false, &sidecars)
 }
 
 /// Nested-lab checkpoint: assess, durable reservation (flat-store parity), then outer capture when ready.
@@ -3128,6 +3248,12 @@ mod tests {
     fn nested_destination_outer_restore_blockers_name_inner_vfs_overlay_gap() {
         let verified = json!({"status": "verified", "proof": {"counter": 1}});
         assert!(!super::nested_destination_outer_restore_blockers(&verified).is_empty());
+        let quiesced = json!({
+            "status": "verified",
+            "proof": {"counter": 1},
+            "outer_capture_quiesce": {"status": "verified"},
+        });
+        assert!(super::nested_destination_outer_restore_blockers(&quiesced).is_empty());
         assert!(super::nested_destination_outer_restore_blockers(&json!({"status": "refused"})).is_empty());
     }
 
