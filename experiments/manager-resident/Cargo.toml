@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+default = []
+mariadb = ["podmesh-manager-ha-lab/mariadb"]
+
 [dependencies]
 podmesh-manager-ha-lab = { path = "../manager-ha" }
 podmesh-manager-network-lab = { path = "../manager-network" }
@@ -20,6 +24,7 @@ ed25519-dalek = { version = "2.1", default-features = false, features = ["std", 
 [dev-dependencies]
 tempfile = "3"
 hmac = "0.12"
+podmesh = { path = "../..", features = ["mariadb"] }
 
 [lints.rust]
 unsafe_code = "forbid"

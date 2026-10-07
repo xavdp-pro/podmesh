@@ -40,7 +40,8 @@ use crate::{
     Configuration,
 };
 use podmesh_manager_ha_lab::{
-    durable::{Request, Response, Store},
+    durable::{Request, Response},
+    ConfiguredStore,
     Fact,
 };
 use serde::{Deserialize, Serialize};
@@ -348,7 +349,7 @@ fn decision_refused(error: &'static str, code: &str, detail: &str) -> Vec<u8> {
 }
 
 /// Every fact of this replica's store.
-fn export(store: &impl Fn() -> Result<Store>) -> Result<Vec<Fact>> {
+fn export(store: &impl Fn() -> Result<ConfiguredStore>) -> Result<Vec<Fact>> {
     match store()?.execute(&Request::Export {})? {
         Response::Snapshot { snapshot } => Ok(snapshot.facts),
         _ => Err("unexpected export response".into()),
@@ -555,7 +556,7 @@ impl VoteRuntime {
         &self,
         operation: VoteOperation,
         uid: u32,
-        store: impl Fn() -> Result<Store>,
+        store: impl Fn() -> Result<ConfiguredStore>,
         replica_id: &str,
     ) -> Vec<u8> {
         let started = std::time::Instant::now();
@@ -573,7 +574,7 @@ impl VoteRuntime {
         &self,
         operation: VoteOperation,
         uid: u32,
-        store: impl Fn() -> Result<Store>,
+        store: impl Fn() -> Result<ConfiguredStore>,
         replica_id: &str,
     ) -> Vec<u8> {
         // Reading and proposing need no signer: a replica whose ledger cannot sign still tells what
@@ -614,7 +615,7 @@ impl VoteRuntime {
         operation_id: &str,
         evidence_sha256: &BTreeMap<String, String>,
         uid: u32,
-        store: impl Fn() -> Result<Store>,
+        store: impl Fn() -> Result<ConfiguredStore>,
         replica_id: &str,
     ) -> Vec<u8> {
         let config = &self.config;
@@ -756,7 +757,7 @@ impl VoteRuntime {
         operation_id: &str,
         payload: &Value,
         facts: &[Fact],
-        store: &impl Fn() -> Result<Store>,
+        store: &impl Fn() -> Result<ConfiguredStore>,
         replica_id: &str,
     ) -> std::result::Result<Recorded, LedgerRefusal> {
         if let Some(recorded) = self.recorded_vote(signer, payload, facts, replica_id) {
@@ -806,7 +807,7 @@ impl VoteRuntime {
         signer: &Signer,
         operation_id: &str,
         payload: &Value,
-        store: &impl Fn() -> Result<Store>,
+        store: &impl Fn() -> Result<ConfiguredStore>,
         replica_id: &str,
     ) -> Vec<u8> {
         let Ok(facts) = export(store) else {
@@ -835,7 +836,7 @@ impl VoteRuntime {
         &self,
         operation_id: &str,
         payload: &Value,
-        store: &impl Fn() -> Result<Store>,
+        store: &impl Fn() -> Result<ConfiguredStore>,
         replica_id: &str,
     ) -> Vec<u8> {
         let refused = |code: &str, detail: &str| decision_refused("proposal_refused", code, detail);
@@ -931,7 +932,7 @@ impl VoteRuntime {
     }
 
     /// What this replica's store says about one resource's decision.
-    fn read(&self, resource: &str, store: &impl Fn() -> Result<Store>) -> Vec<u8> {
+    fn read(&self, resource: &str, store: &impl Fn() -> Result<ConfiguredStore>) -> Vec<u8> {
         let Some(rules) = self
             .config
             .decisions
@@ -978,7 +979,7 @@ impl VoteRuntime {
     /// The store could not be read; nothing was voted.
     pub(crate) fn decide_once(
         &self,
-        store: impl Fn() -> Result<Store>,
+        store: impl Fn() -> Result<ConfiguredStore>,
         replica_id: &str,
     ) -> Result<usize> {
         let started = std::time::Instant::now();
@@ -999,7 +1000,11 @@ impl VoteRuntime {
         outcome
     }
 
-    fn decide_pass(&self, store: &impl Fn() -> Result<Store>, replica_id: &str) -> Result<usize> {
+    fn decide_pass(
+        &self,
+        store: &impl Fn() -> Result<ConfiguredStore>,
+        replica_id: &str,
+    ) -> Result<usize> {
         let Some(d) = &self.config.decisions else {
             return Ok(0);
         };

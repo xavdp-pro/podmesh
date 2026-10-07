@@ -2,14 +2,17 @@
 //! laboratory request surface on [`DurableStore`]. SQLite keeps the file-backed [`Store`].
 
 use super::{
-    apply, corrupt_model, decode_fact_row, digest, error, json, mutation_operation_id,
-    receipt_digest, receipt_metadata_for_request, validate_local_configuration,
+    apply, corrupt_model, decode_fact_row, digest, enum_from_text, error, json,
+    mutation_operation_id, receipt_digest, receipt_metadata_for_request,
+    store_closed_state_untracked, validate_local_configuration, validate_receipt_metadata,
     validate_receipt_operation_id, Configuration, DurableError, DurableResult, Executed,
-    ReceiptEvidence, ReceiptMetadata, Request, Response, Store, Topology,
+    ReceiptEvidence, ReceiptKind, ReceiptMetadata, Request, Response, Store, StoreClosedState,
+    StoreIntegrity, Topology,
 };
 use podmesh::store::{self, Row, StoreConfig, Transaction, Value};
 use podmesh::ManagerJournal;
 
+#[allow(clippy::needless_pass_by_value)]
 fn store_error(problem: store::StoreError) -> DurableError {
     DurableError::Storage(problem.to_string())
 }
@@ -83,13 +86,14 @@ fn load_replica(
         let encoded = row.text(1).map_err(store_error)?;
         let hash = row.text(2).map_err(store_error)?;
         replica
-            .ingest(decode_fact_row(&id, &encoded, &hash)?)
+            .ingest(decode_fact_row(id, encoded, hash)?)
             .map_err(corrupt_model)?;
     }
     Ok(replica)
 }
 
 struct StoredReceipt {
+    operation_id: String,
     request_json: String,
     kind: String,
     source_replica_id: Option<String>,
@@ -100,6 +104,7 @@ struct StoredReceipt {
 
 fn read_stored_receipt(row: &Row) -> DurableResult<StoredReceipt> {
     Ok(StoredReceipt {
+        operation_id: row.text(0).map_err(store_error)?.to_string(),
         kind: row.text(1).map_err(store_error)?.to_string(),
         source_replica_id: optional_text(row, 2)?,
         wire_operation_id: optional_text(row, 3)?,
@@ -119,7 +124,7 @@ fn stored_receipt(
             &[Value::from(operation_id)],
         )
         .map_err(store_error)?;
-    Ok(rows.first().map(read_stored_receipt).transpose()?)
+    rows.first().map(read_stored_receipt).transpose()
 }
 
 fn execute_on_transaction(
@@ -196,13 +201,11 @@ fn execute_on_transaction(
                     receipt_metadata
                         .source_replica_id
                         .as_deref()
-                        .map(Value::from)
-                        .unwrap_or(Value::Null),
+                        .map_or(Value::Null, Value::from),
                     receipt_metadata
                         .wire_operation_id
                         .as_deref()
-                        .map(Value::from)
-                        .unwrap_or(Value::Null),
+                        .map_or(Value::Null, Value::from),
                     Value::from(&request_json),
                     Value::from(&response_json),
                     Value::from(sha256.as_str()),
@@ -231,12 +234,41 @@ fn execute_on_transaction(
     })
 }
 
+fn verify_stored_receipt(logical_manager_id: &str, receipt: &StoredReceipt) -> DurableResult<()> {
+    let metadata = ReceiptMetadata {
+        kind: enum_from_text(&receipt.kind)
+            .map_err(|_| DurableError::Corrupt("stored receipt kind is invalid".into()))?,
+        source_replica_id: receipt.source_replica_id.clone(),
+        wire_operation_id: receipt.wire_operation_id.clone(),
+    };
+    validate_receipt_metadata(
+        logical_manager_id,
+        &receipt.operation_id,
+        &receipt.request_json,
+        &metadata,
+    )?;
+    if receipt_digest(
+        logical_manager_id,
+        &receipt.operation_id,
+        &metadata,
+        &receipt.request_json,
+        &receipt.response_json,
+    )? != receipt.sha256
+    {
+        return Err(DurableError::Corrupt("stored receipt hash mismatch".into()));
+    }
+    serde_json::from_str::<Response>(&receipt.response_json)
+        .map_err(|_| DurableError::Corrupt("stored receipt response is invalid".into()))?;
+    Ok(())
+}
+
 /// A manager journal opened from a store profile on MariaDB.
 pub struct MariaDbJournal {
     store: Box<dyn store::DurableStore>,
     configuration: Configuration,
     topology: Topology,
     replica_id: String,
+    closed_state: StoreClosedState,
 }
 
 impl MariaDbJournal {
@@ -270,6 +302,7 @@ impl MariaDbJournal {
             configuration,
             topology,
             replica_id: replica_id.into(),
+            closed_state: store_closed_state_untracked(),
         })
     }
 
@@ -278,6 +311,14 @@ impl MariaDbJournal {
     /// # Errors
     /// Returns the same refusals as the file-backed [`Store`] for supported requests.
     pub fn execute(&mut self, request: &Request) -> DurableResult<Response> {
+        Ok(self.execute_with_receipt(request)?.response)
+    }
+
+    /// Same contract as [`Store::execute_with_receipt`].
+    ///
+    /// # Errors
+    /// Returns durable refusals from the active backend.
+    pub fn execute_with_receipt(&mut self, request: &Request) -> DurableResult<Executed> {
         let receipt_metadata = receipt_metadata_for_request(request);
         let mut transaction = self.store.transaction().map_err(store_error)?;
         let executed = execute_on_transaction(
@@ -289,7 +330,66 @@ impl MariaDbJournal {
             receipt_metadata,
         )?;
         transaction.commit().map_err(store_error)?;
-        Ok(executed.response)
+        Ok(executed)
+    }
+
+    /// Same contract as [`Store::highest_local_observation`].
+    ///
+    /// # Errors
+    /// Returns store faults and corrupt receipt rows.
+    pub fn highest_local_observation(&mut self) -> DurableResult<Option<u64>> {
+        let logical_manager_id = self.topology.logical_manager_id();
+        let observe_kind = enum_text(&ReceiptKind::Observe)?;
+        let mut transaction = self.store.transaction().map_err(store_error)?;
+        let rows = transaction
+            .query(
+                "SELECT operation_id, kind, source_replica_id, wire_operation_id, request_json, response_json, sha256 FROM receipts WHERE kind = ?",
+                &[Value::from(&observe_kind)],
+            )
+            .map_err(store_error)?;
+        let mut highest = None;
+        for row in rows {
+            let stored = read_stored_receipt(&row)?;
+            verify_stored_receipt(logical_manager_id, &stored)?;
+            let response = serde_json::from_str(&stored.response_json).map_err(error)?;
+            if let Response::Observed { fact } = response {
+                if fact.origin_replica_id == self.replica_id {
+                    highest = highest.max(Some(fact.producer_sequence));
+                }
+            } else {
+                return Err(DurableError::Corrupt(
+                    "stored observe receipt does not record an observation".into(),
+                ));
+            }
+        }
+        transaction.commit().map_err(store_error)?;
+        Ok(highest)
+    }
+
+    /// Process-local closed state (untracked for MariaDB in this slice).
+    #[must_use]
+    pub fn closed_state(&self) -> StoreClosedState {
+        self.closed_state.clone()
+    }
+
+    /// MariaDB journals do not run SQLite file integrity verification in this slice.
+    ///
+    /// # Errors
+    /// Never fails in this slice.
+    pub fn verify_full(&mut self) -> DurableResult<()> {
+        Ok(())
+    }
+
+    /// Reports no SQLite file integrity state for this journal.
+    ///
+    /// # Errors
+    /// Never fails in this slice.
+    pub fn integrity(&self) -> DurableResult<StoreIntegrity> {
+        Ok(StoreIntegrity {
+            full_verifications: 0,
+            last_full_verification_age: None,
+            failure: None,
+        })
     }
 }
 
@@ -359,6 +459,64 @@ impl ConfiguredStore {
             Self::Sqlite(store) => store.execute(request),
             #[cfg(feature = "mariadb")]
             Self::MariaDb(store) => store.execute(request),
+        }
+    }
+
+    /// Applies one request and returns durable receipt evidence for mutations.
+    ///
+    /// # Errors
+    /// Returns durable refusals from the active backend.
+    pub fn execute_with_receipt(&mut self, request: &Request) -> DurableResult<Executed> {
+        match self {
+            Self::Sqlite(store) => store.execute_with_receipt(request),
+            #[cfg(feature = "mariadb")]
+            Self::MariaDb(store) => store.execute_with_receipt(request),
+        }
+    }
+
+    /// Highest local `observe` sequence, or `None` when this replica appended none.
+    ///
+    /// # Errors
+    /// Returns store faults and corrupt receipt rows.
+    pub fn highest_local_observation(&mut self) -> DurableResult<Option<u64>> {
+        match self {
+            Self::Sqlite(store) => store.highest_local_observation(),
+            #[cfg(feature = "mariadb")]
+            Self::MariaDb(store) => store.highest_local_observation(),
+        }
+    }
+
+    /// The closed state of this journal in this process.
+    #[must_use]
+    pub fn closed_state(&self) -> StoreClosedState {
+        match self {
+            Self::Sqlite(store) => store.closed_state(),
+            #[cfg(feature = "mariadb")]
+            Self::MariaDb(store) => store.closed_state(),
+        }
+    }
+
+    /// Repeats complete store verification where the backend supports it.
+    ///
+    /// # Errors
+    /// Returns verification failures that close SQLite-backed journals.
+    pub fn verify_full(&mut self) -> DurableResult<()> {
+        match self {
+            Self::Sqlite(store) => store.verify_full(),
+            #[cfg(feature = "mariadb")]
+            Self::MariaDb(store) => store.verify_full(),
+        }
+    }
+
+    /// Observable integrity state of this journal in this process.
+    ///
+    /// # Errors
+    /// Reports a poisoned integrity lock on SQLite-backed journals.
+    pub fn integrity(&self) -> DurableResult<StoreIntegrity> {
+        match self {
+            Self::Sqlite(store) => store.integrity(),
+            #[cfg(feature = "mariadb")]
+            Self::MariaDb(store) => store.integrity(),
         }
     }
 }

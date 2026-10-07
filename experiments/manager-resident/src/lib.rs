@@ -1,9 +1,10 @@
 //! Bounded resident replication laboratory. No executable control authority.
 use fs2::FileExt;
 use podmesh_manager_ha_lab::durable::{
-    DurableError, RefusalReason, Request, Response, Store, StoreClosedState,
+    DurableError, RefusalReason, Request, Response, StoreClosedState,
     DEFAULT_FULL_VERIFICATION_INTERVAL,
 };
+use podmesh_manager_ha_lab::ConfiguredStore;
 use podmesh_manager_network_lab::{
     ConfigurationFile, ErrorSource, ServedDecision, ServedImport, ServedRefusal,
 };
@@ -720,8 +721,14 @@ impl Drop for AppendJobGuard {
     }
 }
 
-fn store(config: &Configuration) -> Result<Store> {
-    Ok(Store::open(
+fn store(config: &Configuration) -> Result<ConfiguredStore> {
+    let profile_dir = config
+        .network
+        .database_path
+        .parent()
+        .ok_or("database path has no parent directory for store profile")?;
+    Ok(ConfiguredStore::open_resolved(
+        profile_dir,
         &config.network.database_path,
         config.network.manager.clone(),
         &config.network.replica_id,
@@ -1684,9 +1691,9 @@ enum PassFailure {
 /// opens return that failure whatever its class, from a pass that could not run.
 fn verify_store_once(
     config: &Configuration,
-    known: &mut Store,
+    known: &mut ConfiguredStore,
 ) -> std::result::Result<(), PassFailure> {
-    let classify = |known: &Store, problem: DurableError| {
+    let classify = |known: &ConfiguredStore, problem: DurableError| {
         let closed = matches!(problem, DurableError::Corrupt(_))
             || known
                 .integrity()
@@ -1697,17 +1704,13 @@ fn verify_store_once(
             PassFailure::NotRun(problem)
         }
     };
-    match Store::open(
-        &config.network.database_path,
-        config.network.manager.clone(),
-        &config.network.replica_id,
-    ) {
-        Ok(mut store) => {
-            let result = store.verify_full();
-            *known = store;
+    match store(config) {
+        Ok(mut opened) => {
+            let result = opened.verify_full();
+            *known = opened;
             result.map_err(|problem| classify(known, problem))
         }
-        Err(problem) => Err(classify(known, problem)),
+        Err(problem) => Err(classify(known, DurableError::Storage(problem.to_string()))),
     }
 }
 
@@ -1719,7 +1722,7 @@ fn verify_store_once(
 /// run is retried after a backoff that starts at the exchange interval and
 /// doubles up to the maximum backoff, never later than the next regular pass
 /// would have run, so the detection interval does not silently grow.
-fn verify_store_periodically(config: &Configuration, shared: &Shared, mut known: Store) {
+fn verify_store_periodically(config: &Configuration, shared: &Shared, mut known: ConfiguredStore) {
     let interval = config.full_verification_interval();
     let first_retry = Duration::from_millis(config.interval_ms).min(interval);
     let last_retry = Duration::from_millis(config.max_backoff_ms).min(interval);

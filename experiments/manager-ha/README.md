@@ -89,8 +89,10 @@ manager journal opens through the same `store.json` profile as `podmesh::open_ma
 cargo test --features mariadb --manifest-path experiments/manager-ha/Cargo.toml mariadb_profile
 ```
 
-Resident and the CLI are not wired to the profile yet; authenticated import, audit, and
-file integrity semantics remain SQLite-only until a later slice.
+The resident opens the journal through `ConfiguredStore::open_resolved` beside
+`network.database_path` (see `experiments/manager-resident`). The file-backed CLI
+(`podmesh-manager-ha-lab DATABASE …`) is not wired yet; authenticated import, audit, and
+file integrity semantics on MariaDB remain SQLite-only until a later slice.
 
 ## Durable process API
 

@@ -270,6 +270,15 @@ impl StoreClosedState {
     }
 }
 
+static UNTRACKED_INTEGRITY: OnceLock<Arc<StoreIntegrityEntry>> = OnceLock::new();
+
+/// Closed-state handle for journals without SQLite file integrity (MariaDB profile).
+pub(crate) fn store_closed_state_untracked() -> StoreClosedState {
+    StoreClosedState(Arc::clone(
+        UNTRACKED_INTEGRITY.get_or_init(|| Arc::new(StoreIntegrityEntry::default())),
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
@@ -4457,7 +4466,6 @@ CREATE TRIGGER exchange_audit_events_no_delete BEFORE DELETE ON exchange_audit_e
 PRAGMA user_version=3;
 ";
 
-#[cfg(feature = "mariadb")]
 pub mod journal_profile;
 
 #[cfg(test)]
