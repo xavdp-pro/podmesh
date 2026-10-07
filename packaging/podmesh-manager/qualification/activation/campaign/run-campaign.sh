@@ -106,28 +106,63 @@ preserve)  # preserve <alias>: copy the raw store after the manager stopped, and
 set -euo pipefail; export LC_ALL=C; umask 077
 systemctl is-active podmesh-manager.service >/dev/null 2>&1 && { echo "manager still active; a store is preserved only at rest"; exit 3; }
 d=$E/$a/preserved-store; install -d -m 0700 -o root -g root -- \$d
-for f in manager.sqlite manager.sqlite-wal manager.sqlite-shm; do [ -e /var/lib/podmesh-manager/\$f ] && cp -p -- /var/lib/podmesh-manager/\$f \$d/\$f; done
-(cd \$d && sha256sum manager.sqlite* > SHA256SUMS)
-# The candidate refuses a database that is not a direct child of the declared state directory, so the
-# copy is inspected under a private configuration rebuilt from the installed one with only that path
-# changed; the configuration copy holds peer material and lives only inside the removed temporary directory.
-w=\$(mktemp -d); cp -- \$d/manager.sqlite* \$w/
-jq --arg p "\$w/manager.sqlite" '.network.database_path=\$p' /etc/podmesh-manager/config.json > \$w/config.json
-chown -R podmesh-manager:podmesh-manager \$w; chmod 700 \$w; chmod 600 \$w/config.json
-runuser -u podmesh-manager -- /usr/lib/podmesh-manager/podmesh-managerd --inspect-store --config \$w/config.json --state-dir \$w > $E/$a/derived-inspection.json
-rm -rf -- \$w
+store=\$(jq -er '.network.database_path' /etc/podmesh-manager/config.json)
+store_dir=\$(dirname -- "\$store")
+profile="\${PODMESH_STORE_PROFILE:-\$store_dir/store.json}"
+if [ -f "\$profile" ] && jq -e '(.store.engine // .engine) == "mariadb"' "\$profile" >/dev/null 2>&1; then
+  cp -p -- "\$profile" "\$d/store.json"
+  db=\$(jq -er '.store.mariadb.database // .mariadb.database // .database' "\$profile")
+  passwd_file=\$(jq -r '.store.mariadb.password_file // .mariadb.password_file // empty' "\$profile")
+  [ -n "\$passwd_file" ] && [ -f "\$passwd_file" ] || passwd_file="\$store_dir/passwd"
+  [ -f "\$passwd_file" ] || { echo "MariaDB preserve: password file missing"; exit 1; }
+  if grep -qE '^\[(client|mysqldump)\]' "\$passwd_file"; then
+    mariadb-dump --defaults-extra-file="\$passwd_file" --single-transaction "\$db" > "\$d/manager-mariadb.sql"
+  else
+    host=\$(jq -r '.store.mariadb.host // .mariadb.host // "127.0.0.1"' "\$profile")
+    port=\$(jq -r '.store.mariadb.port // .mariadb.port // 3306' "\$profile")
+    user=\$(jq -r '.store.mariadb.user // .mariadb.user // "podmesh-manager"' "\$profile")
+    mariadb-dump -h"\$host" -P"\$port" -u"\$user" -p"\$(<"\$passwd_file")" --single-transaction "\$db" > "\$d/manager-mariadb.sql"
+  fi
+  (cd "\$d" && sha256sum store.json manager-mariadb.sql > SHA256SUMS)
+  w=\$(mktemp -d); cp -p -- "\$d/store.json" "\$w/store.json"
+  jq '.' /etc/podmesh-manager/config.json > "\$w/config.json"
+  chown -R podmesh-manager:podmesh-manager "\$w"; chmod 700 "\$w"; chmod 600 "\$w/config.json" "\$w/store.json"
+  runuser -u podmesh-manager -- /usr/lib/podmesh-manager/podmesh-managerd --inspect-store --config "\$w/config.json" --state-dir "\$w" > $E/$a/derived-inspection.json
+  rm -rf -- "\$w"
+  echo "store:     \$(cat "\$d/SHA256SUMS" | cut -c1-16 | tr '\n' ' ') sql_bytes=\$(stat -c %s "\$d/manager-mariadb.sql")"
+else
+  for f in manager.sqlite manager.sqlite-wal manager.sqlite-shm; do [ -e /var/lib/podmesh-manager/\$f ] && cp -p -- /var/lib/podmesh-manager/\$f \$d/\$f; done
+  (cd \$d && sha256sum manager.sqlite* > SHA256SUMS)
+  # The candidate refuses a database that is not a direct child of the declared state directory, so the
+  # copy is inspected under a private configuration rebuilt from the installed one with only that path
+  # changed; the configuration copy holds peer material and lives only inside the removed temporary directory.
+  w=\$(mktemp -d); cp -- \$d/manager.sqlite* \$w/
+  jq --arg p "\$w/manager.sqlite" '.network.database_path=\$p' /etc/podmesh-manager/config.json > \$w/config.json
+  chown -R podmesh-manager:podmesh-manager \$w; chmod 700 \$w; chmod 600 \$w/config.json
+  runuser -u podmesh-manager -- /usr/lib/podmesh-manager/podmesh-managerd --inspect-store --config \$w/config.json --state-dir \$w > $E/$a/derived-inspection.json
+  rm -rf -- \$w
+  echo "store:     \$(cat \$d/SHA256SUMS | cut -c1-16 | tr '\n' ' ') bytes=\$(stat -c %s \$d/manager.sqlite)"
+fi
 sha256sum $E/$a/derived-inspection.json > $E/$a/derived-inspection.json.sha256
-echo "store:     \$(cat \$d/SHA256SUMS | cut -c1-16 | tr '\n' ' ') bytes=\$(stat -c %s \$d/manager.sqlite)"
 echo "derived:   \$(jq -c '$INSPECT_JQ' $E/$a/derived-inspection.json)"
 EOF
   ;;
 fetch)  # copy the evidence, sidecars, preserved stores and derived inspections to the identical local path, then verify
   for a in lab-a lab-b lab-c; do
     mkdir -p "$E/$a/preserved-store"; chmod 700 "$E/$a" "$E/$a/preserved-store"
-    for f in pre-activation.json pre-activation.json.sha256 active-baseline.json active-baseline.json.sha256 converged.json converged.json.sha256 post-cleanup.json post-cleanup.json.sha256 activation-ledger.json derived-inspection.json derived-inspection.json.sha256 preserved-store/SHA256SUMS preserved-store/manager.sqlite; do
-      ssh -o BatchMode=yes -o UserKnownHostsFile="$K" "lab@$(host_of "$a")" "sudo -n cat $E/$a/$f" > "$E/$a/$f"
+    common="pre-activation.json pre-activation.json.sha256 active-baseline.json active-baseline.json.sha256 converged.json converged.json.sha256 post-cleanup.json post-cleanup.json.sha256 activation-ledger.json derived-inspection.json derived-inspection.json.sha256 preserved-store/SHA256SUMS"
+    host=$(host_of "$a")
+    if ssh -o BatchMode=yes -o UserKnownHostsFile="$K" "lab@$host" "sudo -n test -f $E/$a/preserved-store/manager-mariadb.sql"; then
+      store_files="preserved-store/store.json preserved-store/manager-mariadb.sql"
+    else
+      store_files="preserved-store/manager.sqlite"
+    fi
+    for f in $common $store_files; do
+      ssh -o BatchMode=yes -o UserKnownHostsFile="$K" "lab@$host" "sudo -n cat $E/$a/$f" > "$E/$a/$f"
     done
-    for f in manager.sqlite-wal manager.sqlite-shm; do ssh -o BatchMode=yes -o UserKnownHostsFile="$K" "lab@$(host_of "$a")" "sudo -n cat $E/$a/preserved-store/$f 2>/dev/null" > "$E/$a/preserved-store/$f" || true; [ -s "$E/$a/preserved-store/$f" ] || rm -f "$E/$a/preserved-store/$f"; done
+    if [ -f "$E/$a/preserved-store/manager.sqlite" ]; then
+      for f in manager.sqlite-wal manager.sqlite-shm; do ssh -o BatchMode=yes -o UserKnownHostsFile="$K" "lab@$host" "sudo -n cat $E/$a/preserved-store/$f 2>/dev/null" > "$E/$a/preserved-store/$f" || true; [ -s "$E/$a/preserved-store/$f" ] || rm -f "$E/$a/preserved-store/$f"; done
+    fi
     (cd "$E/$a" && sha256sum -c -- *.json.sha256 && cd preserved-store && sha256sum -c SHA256SUMS)
   done;;
 compare)

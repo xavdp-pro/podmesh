@@ -6,6 +6,9 @@ trap 'rm -rf -- "$work"' EXIT
 
 bash -n "$root/capture-host.sh"
 bash -n "$root/activate-host.sh"
+bash -n "$root/campaign/run-campaign.sh"
+rg -q 'manager-mariadb\.sql' "$root/campaign/run-campaign.sh"
+rg -q '\(\.store\.engine // \.engine\) == "mariadb"' "$root/campaign/run-campaign.sh"
 rg -q 'host_alias.*package_version.*binary_sha256' "$root/activate-host.sh"
 rg -q 'Prepared ledger found an unowned temporary drop-in' "$root/activate-host.sh"
 rg -q 'ledger_sum.recovered' "$root/activate-host.sh"
