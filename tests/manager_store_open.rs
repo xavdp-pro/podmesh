@@ -103,3 +103,39 @@ fn a_mariadb_manager_journal_opens_and_exposes_the_durable_backend() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Read-only lab probe: `Integrity::to_json()` / `store_integrity_result` on a live MariaDB manager DB.
+#[cfg(feature = "mariadb")]
+#[test]
+fn live_manager_mariadb_fixture_reports_store_integrity_result() {
+    if std::env::var("PODMESH_G6_INTEGRITY_PROBE").as_deref() != Ok("1") {
+        eprintln!("skipped: set PODMESH_G6_INTEGRITY_PROBE=1 for G6 lab integrity qual");
+        return;
+    }
+    let Some(mariadb) = MariadbConfig::from_environment() else {
+        eprintln!("skipped: PODMESH_MARIADB_DSN names no MariaDB server");
+        return;
+    };
+    let dir = scratch("mariadb-integrity-probe");
+    let path = dir.join("manager.sqlite");
+    let config = StoreConfig {
+        engine: Engine::Mariadb,
+        mariadb,
+        ..StoreConfig::for_manager_sqlite_path(&path)
+    };
+
+    let opened = podmesh::open_manager_store(&config).unwrap();
+    let mut store = match opened.into_journal() {
+        podmesh::ManagerJournal::Durable(store) => store,
+        podmesh::ManagerJournal::Sqlite(_) => panic!("MariaDB profile opened as SQLite"),
+    };
+    let integrity = store.integrity_check().unwrap();
+    eprintln!(
+        "store_integrity_json={}",
+        serde_json::to_string(&integrity.to_json()).unwrap_or_else(|_| "{}".into())
+    );
+    assert!(integrity.ok, "{:?}", integrity.findings);
+    assert_eq!(integrity.to_json()["store_integrity_result"], "ok");
+    assert_eq!(integrity.to_json()["engine"], "mariadb");
+    assert!(!path.exists(), "probe must not create a sqlite sidecar file");
+}
