@@ -4,6 +4,9 @@ This repository carries what is needed to understand, build, qualify and operate
 records, reviews and decisions in a private companion repository; nothing here depends on it.
 
 ## Direction
+- [SIMPLE-PRODUCTION-PATH.md](SIMPLE-PRODUCTION-PATH.md) — **A** container life → **B** move + replicate → **C** later.
+- [ASSEMBLY-2026-10-07.md](ASSEMBLY-2026-10-07.md) — current assembly line (node MariaDB).
+- [FUNCTIONAL-UNITS.md](FUNCTIONAL-UNITS.md) — `podmesh-node` / `podmesh-manager` under SEP22.
 - [../INTENT.md](../INTENT.md) — the purpose, actors, the human-agent contract and the delivery discipline.
 - [IDEAL-SCENE.md](IDEAL-SCENE.md) — what PodMesh ought to be: goal, purposes, the invariants, the valuable final
   products, the ideal scene per area and per topology (one host to ten and more, with or without shared storage).
