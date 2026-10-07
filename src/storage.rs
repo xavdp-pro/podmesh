@@ -275,7 +275,7 @@ fn ensure_stopped_owned(db: &Connection, uuid: &str) -> Result<Value, Error> {
         return Err("No such universe on this host".into());
     };
     lc::owned(db, &c, uuid, "universe")?;
-    let state = c["State"].as_str().unwrap_or("");
+    let state = lc::status(&c);
     if !lc::STOPPED.contains(&state) {
         return Err(format!("volume operations require a stopped universe; this one is {state}").into());
     }
