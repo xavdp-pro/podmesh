@@ -45,6 +45,12 @@ pub(crate) const SPACE_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const CONTAINER_STORAGE: &str = "/var/lib/containers/storage";
 const SCOPE: &str = "experimental source-side checkpoint: default rootful Podman store, network-disabled, mount-free, journal-owned container with musl processes, packaged podmesh-vzcriu 3.15.5.3 through its private-path shim";
 const SCOPE_NESTED_PREFLIGHT: &str = "experimental nested-lab preflight only: Rule 11 outer universe — privileged rootful Podman container, network-disabled, mount-free, journal-owned; inner Podman reconciliation and the checkpoint/restore chain are not implemented in this backend";
+const SCOPE_NESTED_LAB_CHECKPOINT: &str = "experimental nested-lab checkpoint gate: same outer-shape assess as migration_profile nested preflight; refuses before reservation until inner Podman reconciliation and the kit-style checkpoint/restore chain are wired as a separate backend (docs/MIGRATION-INTEGRATION.md)";
+const NESTED_LAB_CHECKPOINT_GAPS: [&str; 3] = [
+    "inner_podman_metadata_reconciliation",
+    "nested_vfs_store_binding",
+    "rule11_destination_restore_chain",
+];
 const AUTHORITY: &str = "This checkpoint does not authorize restore on any host and does not release the reservation. Only migration_authorize_transfer issues a handoff, and only a verified destination outcome bound to it ends the reservation.";
 /// Which migration assess rules apply. Default flat scope refuses privileged containers; nested is preflight-only until a separate backend exists (docs/MIGRATION-INTEGRATION.md).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -962,7 +968,40 @@ fn checkpoint_command(id: &str, container_id: &str, archive: &Path, stdout: fs::
     .0)
 }
 
-pub(crate) fn checkpoint(
+/// Nested-lab checkpoint entry: full assess with Rule 11 outer shape, then an explicit refusal before
+/// any reservation. Flat-store checkpoint is unchanged in `checkpoint_flat_store`.
+fn checkpoint_nested_lab(
+    db: &Connection,
+    uuid: &str,
+    b: &Binding,
+    existing: Option<Value>,
+) -> Result<Value, Error> {
+    let a = assess(db, uuid, b, existing, false)?;
+    if !a.blockers.is_empty() {
+        return Err(failure(
+            "Checkpoint preconditions not met; nothing was reserved, suspended or written",
+            json!({
+                "migration_profile": "nested",
+                "blockers": a.blockers,
+                "facts": a.facts,
+            }),
+        ));
+    }
+    Err(failure(
+        "migration_checkpoint nested-lab backend is not implemented beyond outer-shape assess; inner Podman reconciliation and the checkpoint/restore chain are required before reservation",
+        json!({
+            "migration_profile": "nested",
+            "universe_uuid": uuid,
+            "scope": SCOPE_NESTED_LAB_CHECKPOINT,
+            "implementation_gaps": NESTED_LAB_CHECKPOINT_GAPS,
+            "facts": a.facts,
+            "effects": "none: no reservation, suspension or artifact",
+            "reference": "docs/MIGRATION-INTEGRATION.md required separation",
+        }),
+    ))
+}
+
+fn checkpoint_flat_store(
     db: &Connection,
     attempt: i64,
     id: &str,
@@ -971,12 +1010,6 @@ pub(crate) fn checkpoint(
     b: &Binding,
     existing: Option<Value>,
 ) -> Result<Value, Error> {
-    if b.profile == MigrationProfile::Nested {
-        return Err(failure(
-            "migration_checkpoint is not implemented for migration_profile nested; use preflight only until the nested-lab backend exists",
-            json!({"migration_profile": "nested"}),
-        ));
-    }
     let dir = base()?.join(id);
     // A released or collected reservation holds nothing and must not block a new checkpoint of the same
     // universe: it is archived, with its history and its preserved artifacts, and this operation reserves
@@ -1039,6 +1072,21 @@ pub(crate) fn checkpoint(
             let r = reservation(db, uuid)?.ok_or("Reservation not persisted")?;
             capture(db, attempt, id, uuid, name, &dir, &r)
         }
+    }
+}
+
+pub(crate) fn checkpoint(
+    db: &Connection,
+    attempt: i64,
+    id: &str,
+    uuid: &str,
+    name: &str,
+    b: &Binding,
+    existing: Option<Value>,
+) -> Result<Value, Error> {
+    match b.profile {
+        MigrationProfile::Nested => checkpoint_nested_lab(db, uuid, b, existing),
+        MigrationProfile::Flat => checkpoint_flat_store(db, attempt, id, uuid, name, b, existing),
     }
 }
 
@@ -1435,5 +1483,14 @@ mod tests {
                 .iter()
                 .any(|b| b.contains("mount"))
         );
+    }
+
+    /// Outer shape from `podmesh-lab/records/slice-b-move-2026-10-07/nested-shape-inspect.txt`
+    /// (`Privileged=true`, `network=none`, no mounts).
+    #[test]
+    fn slice_b_rule11_outer_shape_passes_nested_preflight_assess() {
+        let c = fixture(true);
+        assert!(migration_shape_blockers(&c, MigrationProfile::Nested).is_empty());
+        assert!(!migration_shape_blockers(&c, MigrationProfile::Flat).is_empty());
     }
 }

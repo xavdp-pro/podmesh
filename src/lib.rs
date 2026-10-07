@@ -41,6 +41,17 @@ pub fn now() -> u64 {
         .as_secs()
 }
 
+/// Read-only outer-container shape rules for `migration_preflight` / `migration_checkpoint` assess.
+/// Integration tests and lab fixtures use this without opening Podman.
+pub fn migration_shape_blockers_for_profile(
+    container: &Value,
+    migration_profile: &str,
+) -> Result<Vec<String>, String> {
+    let profile = migration::MigrationProfile::parse(migration_profile)
+        .map_err(|e| e.to_string())?;
+    Ok(migration::migration_shape_blockers(container, profile))
+}
+
 /// The file a node's store profile is read from, under its state directory, when it is there.
 /// A node with no such file keeps the journal it has: SQLite, in `state.sqlite` beside it.
 pub const STORE_PROFILE_FILE: &str = "store.json";
@@ -545,7 +556,7 @@ pub fn handle(db: &Connection, request: &Value) -> Value {
                     "garbage_collect_plan","garbage_collect_apply","collection_retention_declare","collection_hold_declare","collection_hold_release","collection_status","network_declare","network_undeclare","network_route_publish","network_route_withdraw","network_route_resume","network_reapply","network_status","boot_restore","boot_restore_status","manager_status","manager_decision","manager_observe","manager_vote_ledger_init","manager_vote_ledger_mark_unadmitted","manager_vote_ledger_readmit","manager_decision_propose","secret_declare","secret_remove","secret_status","publisher_declare","publisher_start","publisher_stop","publisher_status","publisher_observed"],
                 "experimental_contracts":{
                     "migration_preflight":"read-only compatibility report bound to universe UUID, container ID, image ID, source and destination host UUIDs, optional migration_profile flat (default) or nested (Rule 11 outer preflight only); no reservation, suspension or artifact",
-                    "migration_checkpoint":"source: fresh checks before suspension, durable reservation, checkpoint with the packaged podmesh-vzcriu runtime in its own scope, archive/manifest/hashes under the state directory; never an authorization to restore",
+                    "migration_checkpoint":"source: migration_profile flat (default) runs fresh checks, durable reservation, checkpoint with the packaged podmesh-vzcriu runtime in its own scope, archive/manifest/hashes under the state directory; migration_profile nested runs the nested-lab assess gate and refuses before reservation until the separate nested-lab backend exists; never an authorization to restore",
                     "migration_status":"read-only reservation, fresh observation, artifact re-hash, transfer authorizations, restore claims, archived reservations and which recovery operations the observed state permits",
                     "migration_authorize_transfer":"source: checkpointed -> transfer_authorized after re-hashing the artifacts and observing the checkpointed source; authorization recorded first, then archive, manifest and handoff in outbox/<authorization_id>/",
                     "migration_complete_transfer":"source: inbox/<authorization_id>/outcome.json bound to this handoff; restored -> transferred, not_restored -> checkpointed with the authorization ended; any mismatch refused without state change",
