@@ -117,6 +117,19 @@ q=p.with_suffix('.migration-tmp'); q.write_text(json.dumps(d)); os.replace(q,p)
 alive.write_bytes(Path('/proc/sys/kernel/random/boot_id').read_bytes())
 print(json.dumps({'pid':pid,'start_time':start,'backup':str(backup)}))
 ";
+/// Clears stale inner Podman runtime state after outer CRIU restore so `podman start` accepts the current boot ID.
+const NESTED_INNER_RUN_STATE_RECONCILE_PY: &str = r"import json, shutil
+from pathlib import Path
+boot=Path('/proc/sys/kernel/random/boot_id').read_bytes()
+cleared=[]
+for d in (Path('/run/containers/storage'), Path('/run/libpod')):
+    if d.exists():
+        shutil.rmtree(d)
+        cleared.append(str(d))
+    d.mkdir(parents=True, exist_ok=True)
+Path('/run/libpod/alive').write_bytes(boot)
+print(json.dumps({'cleared': cleared, 'boot_id_bytes': len(boot)}))
+";
 const AUTHORITY: &str = "This checkpoint does not authorize restore on any host and does not release the reservation. Only migration_authorize_transfer issues a handoff, and only a verified destination outcome bound to it ends the reservation.";
 /// Which migration assess rules apply. Default flat scope refuses privileged containers; nested is preflight-only until a separate backend exists (docs/MIGRATION-INTEGRATION.md).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1407,7 +1420,35 @@ fn nested_quiesce_inner_sidecar_for_outer_capture(
     Ok(())
 }
 
-fn nested_inner_podman_resume_after_quiesced_capture(outer: &str) -> Result<(), Error> {
+fn nested_inner_podman_reconcile_run_state_after_outer_restore(outer: &str) -> Result<Value, Error> {
+    let script = format!("{NESTED_INNER_RUN_STATE_RECONCILE_PY}\n");
+    let mut child = Command::new("/usr/bin/podman")
+        .args(["exec", "-i", outer, "python3", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::from(format!("inner Podman run-state reconcile could not start: {e}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(script.as_bytes());
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| Error::from(format!("inner Podman run-state reconcile failed: {e}")))?;
+    if !out.status.success() {
+        return Err(Error::from(format!(
+            "inner Podman run-state reconcile failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    match serde_json::from_str::<Value>(String::from_utf8_lossy(&out.stdout).trim()) {
+        Ok(v) => Ok(v),
+        Err(e) => Err(Error::from(format!("inner run-state reconcile output is not JSON: {e}"))),
+    }
+}
+
+fn nested_inner_podman_resume_after_quiesced_capture(outer: &str) -> Result<Value, Error> {
+    let run_state = nested_inner_podman_reconcile_run_state_after_outer_restore(outer)?;
     outer_podman_exec(
         outer,
         &format!("{INNER_PODMAN_CLI} start {NESTED_COUNTER_INNER_NAME}"),
@@ -1418,7 +1459,7 @@ fn nested_inner_podman_resume_after_quiesced_capture(outer: &str) -> Result<(), 
         ))
     })?;
     std::thread::sleep(std::time::Duration::from_secs(2));
-    Ok(())
+    Ok(run_state)
 }
 
 /// After a verified outer restore on the destination, reconcile inner Podman metadata and prove counter continuity.
@@ -1442,9 +1483,11 @@ pub(crate) fn nested_destination_post_outer_restore(
         .get("outer_capture_quiesce")
         .and_then(|q| q.get("status"))
         == Some(&json!("verified"));
-    if quiesced {
-        nested_inner_podman_resume_after_quiesced_capture(outer_name)?;
-    }
+    let run_state_reconcile = if quiesced {
+        Some(nested_inner_podman_resume_after_quiesced_capture(outer_name)?)
+    } else {
+        None
+    };
     let proof = nested_inner_podman_proof(outer_name, outer_container_id)
         .map_err(|blockers| Error::from(blockers.join("; ")))?;
     let observed_counter = proof
@@ -1481,6 +1524,7 @@ pub(crate) fn nested_destination_post_outer_restore(
         "observed_counter_after_outer_restore": observed_counter,
         "counter_continuity": counter_continuity,
         "outer_capture_quiesce": source_inner_metadata.get("outer_capture_quiesce").cloned().unwrap_or(Value::Null),
+        "run_state_reconcile": run_state_reconcile.unwrap_or(Value::Null),
         "proof": proof,
         "reconcile": reconcile,
         "observed_at": crate::now(),
@@ -3242,6 +3286,12 @@ mod tests {
         assert!(!NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_HOOKS
             .iter()
             .any(|g| *g == "nested_destination_restore_hooks"));
+    }
+
+    #[test]
+    fn nested_inner_run_state_reconcile_script_clears_podman_run_roots() {
+        assert!(super::NESTED_INNER_RUN_STATE_RECONCILE_PY.contains("/run/containers/storage"));
+        assert!(super::NESTED_INNER_RUN_STATE_RECONCILE_PY.contains("/run/libpod/alive"));
     }
 
     #[test]
