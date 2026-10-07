@@ -15,7 +15,8 @@ rg -q 'ledger_sum.recovered' "$root/activate-host.sh"
 rg -q 'write_ledger start-failed' "$root/activate-host.sh"
 rg -q 'RECOVERED_NOT_QUALIFIED' "$root/activate-host.sh"
 rg -q 'cleanup_restart:true' "$root/activate-host.sh"
-python3 -m py_compile "$root/compare-evidence.py" "$root/validate-dropin.py" "$root/graceful-shutdown.py" "$root/wait-ready.py" "$root/append-observation.py"
+python3 -m py_compile "$root/compare-evidence.py" "$root/validate-dropin.py" "$root/graceful-shutdown.py" "$root/wait-ready.py" "$root/append-observation.py" "$root/preflight-store-identity.py"
+python3 "$root/tests/test_preflight_store_identity.py" -q
 # The comparator joins replica IDs, the logical manager ID and endpoints across observation sites. A value the
 # collector commits under a site-specific label, or a right label over the wrong value, can never join, and the
 # synthetic fixtures below cannot notice: they commit every identity under one label by construction. So the
@@ -54,8 +55,11 @@ python3 "$root/tests/test_helpers.py" -q
 rg -q '/run/podmesh-manager-qualification' "$root/activate-host.sh"
 rg -q '/etc/podmesh-manager/.manager2-activation-started' "$root/activate-host.sh"
 marker_line=$(rg -n '^  mark_activation_started$' "$root/activate-host.sh" | head -1 | cut -d: -f1)
+preflight_line=$(rg -n 'preflight-store-identity\.py' "$root/activate-host.sh" | head -1 | cut -d: -f1)
 start_line=$(rg -n '^  if ! systemctl start podmesh-manager.service' "$root/activate-host.sh" | head -1 | cut -d: -f1)
 [ "$marker_line" -lt "$start_line" ] || { echo 'activation marker is not written before systemctl start' >&2; exit 1; }
+[ "$preflight_line" -lt "$start_line" ] || { echo 'store identity preflight is not run before systemctl start' >&2; exit 1; }
+rg -q 'preflight-store-identity\.py' "$root/capture-host.sh" || { echo 'capture-host.sh does not call store identity preflight before inspect-store' >&2; exit 1; }
 
 cat > "$work/good.conf" <<'EOF'
 [Service]

@@ -97,6 +97,7 @@ if [ "$mode" = activate ]; then
   systemctl daemon-reload
   write_ledger dropin-installed "$(jq -n --arg dropin "$expected" '{dropin_sha256:$dropin}')"
   mark_activation_started
+  "$root/preflight-store-identity.py" || { echo 'Store identity preflight failed; run the resumable rollback mode' >&2; exit 1; }
   if ! systemctl start podmesh-manager.service; then
     start_failure=$(systemctl show podmesh-manager.service --no-page -p ActiveState -p SubState -p MainPID -p Result -p ExecMainCode -p ExecMainStatus | sha256sum | awk '{print $1}')
     write_ledger start-failed "$(jq -n --arg dropin "$expected" --arg failure "$start_failure" '{dropin_sha256:$dropin,start_failure_state_sha256:$failure}')"
@@ -118,6 +119,7 @@ if [ "$mode" = resume-cleanup ]; then
   expected=$(jq -r '.dropin_sha256' "$ledger")
   [ -f "$dropin" ] && [ ! -L "$dropin" ] && [ "$(sha256sum -- "$dropin"|awk '{print $1}')" = "$expected" ] || { echo 'Cleanup restart requires the exact activation drop-in' >&2; exit 1; }
   mark_activation_started
+  "$root/preflight-store-identity.py" || { echo 'Store identity preflight failed; retaining evidence and drop-in' >&2; exit 1; }
   systemctl start podmesh-manager.service || { echo 'Cleanup-only restart failed; retaining evidence and drop-in' >&2; exit 1; }
   "$root/wait-ready.py" > "$evidence/cleanup-restart-readiness.json" || { echo 'Cleanup-only restart readiness failed; retaining the live manager' >&2; exit 1; }
   shutdown_report=$evidence/graceful-shutdown.json

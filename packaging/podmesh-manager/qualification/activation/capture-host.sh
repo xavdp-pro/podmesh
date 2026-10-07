@@ -206,6 +206,10 @@ inspection() {
     jq -cn '{store_present:false,schema_version:null,logical_manager_commitment:null,replica_commitment:null,logical_history_sha256:null,receipt_set_sha256:null,audit_set_sha256:null,sqlite_integrity_result:null,history_count:null,receipt_count:null,audit_event_count:null,incomplete_attempt_count:null,incomplete_attempts:null,unaudited_import_receipt_count:null,unaudited_import_receipt_commitments:null,imported_operation_commitments:null}'
     return
   fi
+  if ! python3 "$root/preflight-store-identity.py"; then
+    echo 'Read-only canonical inspection refused: store identity disagrees with installed configuration' >&2
+    return 1
+  fi
   raw=$(runuser -u podmesh-manager -- /usr/lib/podmesh-manager/podmesh-managerd --inspect-store --config /etc/podmesh-manager/config.json --state-dir /var/lib/podmesh-manager) || { echo 'Read-only canonical inspection failed' >&2; return 1; }
   # The store is read ONCE. Two projections derive from that single read, so the published
   # inspection and the published exchanges can never describe two different moments.
