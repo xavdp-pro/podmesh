@@ -34,10 +34,11 @@ const SCOPE: &str = "experimental local restore: default rootful Podman store, t
 const NO_RESTART: &str = "nothing was started: the application is resumed only by migration_restore_local, and an ordinary start would begin it afresh without its checkpointed memory";
 /// States a reservation can be released from, abandoned from, and locally restored from.
 const RELEASABLE: [&str; 2] = ["checkpointed", "checkpoint_failed"];
-const ABANDONABLE: [&str; 6] = [
+const ABANDONABLE: [&str; 7] = [
     "reserved",
     mg::NESTED_INNER_RECONCILED,
     mg::NESTED_VFS_STORE_BOUND,
+    mg::NESTED_DESTINATION_RESTORE_CHAIN_ASSESSED,
     "checkpointing",
     "checkpoint_failed",
     "checkpointed",

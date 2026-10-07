@@ -45,23 +45,32 @@ pub(crate) const SPACE_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const CONTAINER_STORAGE: &str = "/var/lib/containers/storage";
 const SCOPE: &str = "experimental source-side checkpoint: default rootful Podman store, network-disabled, mount-free, journal-owned container with musl processes, packaged podmesh-vzcriu 3.15.5.3 through its private-path shim";
 const SCOPE_NESTED_PREFLIGHT: &str = "experimental nested-lab preflight only: Rule 11 outer universe — privileged rootful Podman container, network-disabled, mount-free, journal-owned; inner Podman reconciliation and the checkpoint/restore chain are not implemented in this backend";
-const SCOPE_NESTED_LAB_CHECKPOINT: &str = "experimental nested-lab checkpoint: same outer-shape assess as migration_profile nested preflight; durable reservation, preflight.json, inner Podman metadata reconciliation for the kit counter fixture when present, nested VFS store binding assessment and binding artifact, then refuses before outer suspension until the destination restore chain is wired (docs/MIGRATION-INTEGRATION.md)";
-const NESTED_LAB_CHECKPOINT_GAPS: [&str; 3] = [
+const SCOPE_NESTED_LAB_CHECKPOINT: &str = "experimental nested-lab checkpoint: same outer-shape assess as migration_profile nested preflight; durable reservation, preflight.json, inner Podman metadata reconciliation for the kit counter fixture when present, nested VFS store binding assessment and binding artifact, Rule 11 destination restore chain assessment and artifact, then refuses before outer suspension until nested outer checkpoint capture exists (docs/MIGRATION-INTEGRATION.md)";
+const NESTED_LAB_CHECKPOINT_GAPS: [&str; 4] = [
     "inner_podman_metadata_reconciliation",
     "nested_vfs_store_binding",
     "rule11_destination_restore_chain",
+    "nested_outer_checkpoint_capture",
 ];
-const NESTED_LAB_GAPS_AFTER_INNER_RECONCILIATION: [&str; 2] = [
+const NESTED_LAB_GAPS_AFTER_INNER_RECONCILIATION: [&str; 3] = [
     "nested_vfs_store_binding",
     "rule11_destination_restore_chain",
+    "nested_outer_checkpoint_capture",
 ];
-const NESTED_LAB_GAPS_AFTER_VFS_STORE_BINDING: [&str; 1] = ["rule11_destination_restore_chain"];
+const NESTED_LAB_GAPS_AFTER_VFS_STORE_BINDING: [&str; 2] = [
+    "rule11_destination_restore_chain",
+    "nested_outer_checkpoint_capture",
+];
+const NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_CHAIN: [&str; 1] = ["nested_outer_checkpoint_capture"];
 /// Reservation state after the kit-style inner Podman proof and pre-checkpoint metadata reconcile succeed.
 pub(crate) const NESTED_INNER_RECONCILED: &str = "nested_inner_reconciled";
 /// Reservation state after host outer / inner VFS store binding is assessed and recorded.
 pub(crate) const NESTED_VFS_STORE_BOUND: &str = "nested_vfs_store_bound";
+/// Reservation state after the Rule 11 destination restore chain is assessed on the source host.
+pub(crate) const NESTED_DESTINATION_RESTORE_CHAIN_ASSESSED: &str = "nested_destination_restore_chain_assessed";
 const INNER_PODMAN_METADATA: &str = "inner_podman_metadata.json";
 const NESTED_VFS_STORE_BINDING: &str = "nested_vfs_store_binding.json";
+const RULE11_DESTINATION_RESTORE_CHAIN: &str = "rule11_destination_restore_chain.json";
 /// Inner Podman graph root inside the outer universe (default rootful store layout).
 const INNER_PODMAN_GRAPH_ROOT: &str = "/var/lib/containers/storage";
 /// Inner Podman inside the outer universe uses the kit's isolated VFS store (contrib/nested-podman).
@@ -1108,21 +1117,49 @@ fn nested_lab_capture_pending_detail(uuid: &str, facts: &Value, r: &Reservation)
     )
 }
 
-fn nested_lab_outer_suspend_after_vfs_binding_detail(
+fn nested_lab_rule11_chain_refusal_detail(
     uuid: &str,
     facts: &Value,
     r: &Reservation,
     inner: &Value,
     binding: &Value,
+    chain: &Value,
 ) -> Value {
     nested_lab_detail(
         uuid,
         facts,
         r,
         &NESTED_LAB_GAPS_AFTER_VFS_STORE_BINDING,
-        "reservation, preflight.json, inner_podman_metadata.json and nested_vfs_store_binding.json: host default-store outer and inner VFS store binding assessed; no outer suspension, archive or manifest",
+        "reservation, preflight.json, inner_podman_metadata.json and nested_vfs_store_binding.json: host default-store outer and inner VFS store binding assessed; Rule 11 destination restore chain not verified; no outer suspension, archive or manifest",
+        "rule11_destination_restore_chain",
+        json!({
+            "inner_podman_metadata": inner,
+            "nested_vfs_store_binding": binding,
+            "rule11_destination_restore_chain": chain,
+        }),
+    )
+}
+
+fn nested_lab_before_outer_suspension_detail(
+    uuid: &str,
+    facts: &Value,
+    r: &Reservation,
+    inner: &Value,
+    binding: &Value,
+    chain: &Value,
+) -> Value {
+    nested_lab_detail(
+        uuid,
+        facts,
+        r,
+        &NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_CHAIN,
+        "reservation, preflight.json, inner_podman_metadata.json, nested_vfs_store_binding.json and rule11_destination_restore_chain.json: source-side preparation complete; no outer suspension, archive or manifest",
         "before_outer_suspension",
-        json!({"inner_podman_metadata": inner, "nested_vfs_store_binding": binding}),
+        json!({
+            "inner_podman_metadata": inner,
+            "nested_vfs_store_binding": binding,
+            "rule11_destination_restore_chain": chain,
+        }),
     )
 }
 
@@ -1268,6 +1305,20 @@ fn read_nested_vfs_store_binding(dir: &Path) -> Option<Value> {
     fs::read_to_string(&path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
+}
+
+fn read_rule11_destination_restore_chain(dir: &Path) -> Option<Value> {
+    let path = dir.join(RULE11_DESTINATION_RESTORE_CHAIN);
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+}
+
+fn write_rule11_destination_restore_chain(dir: &Path, document: &Value) -> Result<(), Error> {
+    write_private(
+        &dir.join(RULE11_DESTINATION_RESTORE_CHAIN),
+        serde_json::to_string_pretty(document)?.as_bytes(),
+    )
 }
 
 fn write_nested_vfs_store_binding(dir: &Path, document: &Value) -> Result<(), Error> {
@@ -1434,6 +1485,59 @@ pub(crate) fn nested_vfs_store_binding_assess(
     }))
 }
 
+/// Source-side assessment of the typed destination restore chain Rule 11 nested moves require.
+pub(crate) fn nested_rule11_destination_restore_chain_assess(
+    source_host: &str,
+    destination_host: &str,
+    vfs_binding: &Value,
+    inner_metadata: &Value,
+) -> Result<Value, Vec<String>> {
+    let mut blockers = vec![];
+    if source_host.is_empty() {
+        blockers.push("source_host_uuid is missing from the reservation".into());
+    }
+    if destination_host.is_empty() {
+        blockers.push("destination_host_uuid is missing from the reservation".into());
+    }
+    if source_host == destination_host {
+        blockers.push("destination_host_uuid must differ from source_host_uuid".into());
+    }
+    if vfs_binding.get("status") != Some(&json!("verified")) {
+        blockers.push("nested VFS store binding is not verified".into());
+    }
+    if inner_metadata.get("status") != Some(&json!("verified")) {
+        blockers.push("inner Podman metadata is not verified".into());
+    }
+    if !blockers.is_empty() {
+        return Err(blockers);
+    }
+    Ok(json!({
+        "status": "verified",
+        "checkpoint_phase": "rule11_destination_restore_chain",
+        "binding_model": "two_host_serial_handoff",
+        "source_host_uuid": source_host,
+        "destination_host_uuid": destination_host,
+        "note": "Source-phase assessment only: documents the typed API chain the destination must honor for Rule 11 nested universes. Packaged flat-store migration_destination_preflight and migration_restore do not cover privileged outer plus inner VFS restore; nested destination hooks remain unimplemented.",
+        "required_operations": [
+            "migration_authorize_transfer",
+            "migration_destination_preflight",
+            "migration_restore",
+            "migration_complete_transfer"
+        ],
+        "api_hooks": {
+            "migration_destination_preflight": {
+                "status": "not_invoked_on_source",
+                "nested_profile": "unimplemented_on_destination"
+            },
+            "migration_restore": {
+                "status": "not_invoked_on_source",
+                "nested_profile": "unimplemented_on_destination"
+            }
+        },
+        "observed_at": crate::now(),
+    }))
+}
+
 fn nested_lab_inner_reconciliation(
     db: &Connection,
     uuid: &str,
@@ -1446,10 +1550,10 @@ fn nested_lab_inner_reconciliation(
         let inner = read_nested_inner_metadata(dir).unwrap_or(Value::Null);
         return nested_lab_vfs_store_binding(db, uuid, outer, facts, r, dir, &inner);
     }
-    if r.state == NESTED_VFS_STORE_BOUND {
+    if r.state == NESTED_VFS_STORE_BOUND || r.state == NESTED_DESTINATION_RESTORE_CHAIN_ASSESSED {
         let inner = read_nested_inner_metadata(dir).unwrap_or(Value::Null);
         let binding = read_nested_vfs_store_binding(dir).unwrap_or(Value::Null);
-        return refuse_nested_lab_after_vfs_binding(db, uuid, facts, r, &inner, &binding);
+        return nested_lab_destination_restore_chain(db, uuid, facts, r, dir, &inner, &binding);
     }
     if let Some(existing) = read_nested_inner_metadata(dir) {
         if existing.get("status") == Some(&json!("verified")) {
@@ -1533,15 +1637,15 @@ fn nested_lab_vfs_store_binding(
     dir: &Path,
     inner: &Value,
 ) -> Result<Value, Error> {
-    if r.state == NESTED_VFS_STORE_BOUND {
+    if r.state == NESTED_VFS_STORE_BOUND || r.state == NESTED_DESTINATION_RESTORE_CHAIN_ASSESSED {
         let binding = read_nested_vfs_store_binding(dir).unwrap_or(Value::Null);
-        return refuse_nested_lab_after_vfs_binding(db, uuid, facts, r, inner, &binding);
+        return nested_lab_destination_restore_chain(db, uuid, facts, r, dir, inner, &binding);
     }
     if let Some(existing) = read_nested_vfs_store_binding(dir) {
         if existing.get("status") == Some(&json!("verified")) {
             set_state(db, uuid, NESTED_VFS_STORE_BOUND, &existing)?;
             let updated = reservation(db, uuid)?.ok_or_else(|| Error::from("Reservation not found after VFS binding"))?;
-            return refuse_nested_lab_after_vfs_binding(db, uuid, facts, &updated, inner, &existing);
+            return nested_lab_destination_restore_chain(db, uuid, facts, &updated, dir, inner, &existing);
         }
     }
     match nested_vfs_store_binding_assess(outer, &r.container_id, inner) {
@@ -1549,7 +1653,7 @@ fn nested_lab_vfs_store_binding(
             write_nested_vfs_store_binding(dir, &document)?;
             set_state(db, uuid, NESTED_VFS_STORE_BOUND, &document)?;
             let updated = reservation(db, uuid)?.ok_or_else(|| Error::from("Reservation not found after VFS binding"))?;
-            refuse_nested_lab_after_vfs_binding(db, uuid, facts, &updated, inner, &document)
+            nested_lab_destination_restore_chain(db, uuid, facts, &updated, dir, inner, &document)
         }
         Err(blockers) => {
             let document = json!({
@@ -1581,19 +1685,88 @@ fn nested_lab_vfs_store_binding(
     }
 }
 
-/// VFS store binding recorded; outer suspension and archive are still refused.
-fn refuse_nested_lab_after_vfs_binding(
+fn nested_lab_destination_restore_chain(
+    db: &Connection,
+    uuid: &str,
+    facts: &Value,
+    r: &Reservation,
+    dir: &Path,
+    inner: &Value,
+    binding: &Value,
+) -> Result<Value, Error> {
+    if r.state == NESTED_DESTINATION_RESTORE_CHAIN_ASSESSED {
+        let chain = read_rule11_destination_restore_chain(dir).unwrap_or(Value::Null);
+        return refuse_nested_lab_before_outer_suspension(db, uuid, facts, r, inner, binding, &chain);
+    }
+    if let Some(existing) = read_rule11_destination_restore_chain(dir) {
+        if existing.get("status") == Some(&json!("verified")) {
+            set_state(db, uuid, NESTED_DESTINATION_RESTORE_CHAIN_ASSESSED, &existing)?;
+            let updated = reservation(db, uuid)?
+                .ok_or_else(|| Error::from("Reservation not found after Rule 11 destination chain assess"))?;
+            return refuse_nested_lab_before_outer_suspension(
+                db,
+                uuid,
+                facts,
+                &updated,
+                inner,
+                binding,
+                &existing,
+            );
+        }
+    }
+    match nested_rule11_destination_restore_chain_assess(
+        &r.source_host,
+        &r.destination,
+        binding,
+        inner,
+    ) {
+        Ok(document) => {
+            write_rule11_destination_restore_chain(dir, &document)?;
+            set_state(db, uuid, NESTED_DESTINATION_RESTORE_CHAIN_ASSESSED, &document)?;
+            let updated = reservation(db, uuid)?
+                .ok_or_else(|| Error::from("Reservation not found after Rule 11 destination chain assess"))?;
+            refuse_nested_lab_before_outer_suspension(db, uuid, facts, &updated, inner, binding, &document)
+        }
+        Err(blockers) => {
+            let document = json!({
+                "status": "refused",
+                "checkpoint_phase": "rule11_destination_restore_chain",
+                "blockers": blockers,
+                "observed_at": crate::now(),
+            });
+            write_rule11_destination_restore_chain(dir, &document)?;
+            let detail = nested_lab_rule11_chain_refusal_detail(
+                uuid,
+                facts,
+                r,
+                inner,
+                binding,
+                &document,
+            );
+            set_state(db, uuid, NESTED_VFS_STORE_BOUND, &detail)?;
+            Err(failure(
+                "migration_checkpoint nested Rule 11 destination restore chain could not be assessed; outer suspension refused",
+                detail,
+            ))
+        }
+    }
+}
+
+/// Rule 11 destination chain assessed on the source; outer checkpoint capture is still refused.
+fn refuse_nested_lab_before_outer_suspension(
     db: &Connection,
     uuid: &str,
     facts: &Value,
     r: &Reservation,
     inner: &Value,
     binding: &Value,
+    chain: &Value,
 ) -> Result<Value, Error> {
-    let detail = nested_lab_outer_suspend_after_vfs_binding_detail(uuid, facts, r, inner, binding);
-    set_state(db, uuid, NESTED_VFS_STORE_BOUND, &detail)?;
+    let detail =
+        nested_lab_before_outer_suspension_detail(uuid, facts, r, inner, binding, chain);
+    set_state(db, uuid, NESTED_DESTINATION_RESTORE_CHAIN_ASSESSED, &detail)?;
     Err(failure(
-        "migration_checkpoint nested-lab refuses outer suspension until the destination restore chain is wired",
+        "migration_checkpoint nested-lab refuses outer suspension until nested outer checkpoint capture exists",
         detail,
     ))
 }
@@ -1648,20 +1821,24 @@ fn nested_lab_resume(
     r: Reservation,
     dir: &Path,
 ) -> Result<Value, Error> {
-    if r.state != "reserved" && r.state != NESTED_INNER_RECONCILED && r.state != NESTED_VFS_STORE_BOUND {
+    if r.state != "reserved"
+        && r.state != NESTED_INNER_RECONCILED
+        && r.state != NESTED_VFS_STORE_BOUND
+        && r.state != NESTED_DESTINATION_RESTORE_CHAIN_ASSESSED
+    {
         return Err(failure(
             format!(
-                "Nested-lab checkpoint cannot resume from reservation state {}; only reserved, nested_inner_reconciled or nested_vfs_store_bound is supported before capture exists",
+                "Nested-lab checkpoint cannot resume from reservation state {}; only reserved, nested_inner_reconciled, nested_vfs_store_bound or nested_destination_restore_chain_assessed is supported before capture exists",
                 r.state
             ),
             json!({"reservation": r.view()}),
         ));
     }
-    if r.state == NESTED_VFS_STORE_BOUND {
+    if r.state == NESTED_VFS_STORE_BOUND || r.state == NESTED_DESTINATION_RESTORE_CHAIN_ASSESSED {
         let inner = read_nested_inner_metadata(dir).unwrap_or(Value::Null);
         let binding = read_nested_vfs_store_binding(dir).unwrap_or(Value::Null);
         let facts = json!({"migration_profile": "nested"});
-        return refuse_nested_lab_after_vfs_binding(db, uuid, &facts, &r, &inner, &binding);
+        return nested_lab_destination_restore_chain(db, uuid, &facts, &r, dir, &inner, &binding);
     }
     if r.state == NESTED_INNER_RECONCILED {
         let inner = read_nested_inner_metadata(dir).unwrap_or(Value::Null);
@@ -2089,9 +2266,11 @@ pub(crate) fn status(db: &Connection, request: &Value) -> Result<Value, Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        migration_shape_blockers, nested_lab_capture_pending_detail, parse_nested_counter_log_line,
-        MigrationProfile, NESTED_LAB_CHECKPOINT_GAPS, NESTED_LAB_GAPS_AFTER_INNER_RECONCILIATION,
-        NESTED_LAB_GAPS_AFTER_VFS_STORE_BINDING, Reservation,
+        migration_shape_blockers, nested_lab_capture_pending_detail,
+        nested_rule11_destination_restore_chain_assess, parse_nested_counter_log_line,
+        MigrationProfile, NESTED_LAB_CHECKPOINT_GAPS, NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_CHAIN,
+        NESTED_LAB_GAPS_AFTER_INNER_RECONCILIATION, NESTED_LAB_GAPS_AFTER_VFS_STORE_BINDING,
+        Reservation,
     };
     use serde_json::json;
 
@@ -2190,7 +2369,7 @@ mod tests {
 
     #[test]
     fn nested_lab_gaps_shrink_after_inner_reconciliation() {
-        assert_eq!(NESTED_LAB_GAPS_AFTER_INNER_RECONCILIATION.len(), 2);
+        assert_eq!(NESTED_LAB_GAPS_AFTER_INNER_RECONCILIATION.len(), 3);
         assert!(!NESTED_LAB_GAPS_AFTER_INNER_RECONCILIATION
             .iter()
             .any(|g| *g == "inner_podman_metadata_reconciliation"));
@@ -2202,7 +2381,7 @@ mod tests {
 
     #[test]
     fn nested_lab_gaps_shrink_after_vfs_store_binding() {
-        assert_eq!(NESTED_LAB_GAPS_AFTER_VFS_STORE_BINDING.len(), 1);
+        assert_eq!(NESTED_LAB_GAPS_AFTER_VFS_STORE_BINDING.len(), 2);
         assert_eq!(
             NESTED_LAB_GAPS_AFTER_VFS_STORE_BINDING[0],
             "rule11_destination_restore_chain"
@@ -2214,5 +2393,47 @@ mod tests {
             NESTED_LAB_GAPS_AFTER_INNER_RECONCILIATION.len(),
             NESTED_LAB_GAPS_AFTER_VFS_STORE_BINDING.len() + 1
         );
+    }
+
+    #[test]
+    fn nested_lab_gaps_shrink_after_destination_restore_chain() {
+        assert_eq!(NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_CHAIN.len(), 1);
+        assert_eq!(
+            NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_CHAIN[0],
+            "nested_outer_checkpoint_capture"
+        );
+        assert!(!NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_CHAIN
+            .iter()
+            .any(|g| *g == "rule11_destination_restore_chain"));
+        assert_eq!(
+            NESTED_LAB_GAPS_AFTER_VFS_STORE_BINDING.len(),
+            NESTED_LAB_GAPS_AFTER_DESTINATION_RESTORE_CHAIN.len() + 1
+        );
+    }
+
+    #[test]
+    fn nested_rule11_destination_chain_assess_requires_verified_artifacts() {
+        let binding = json!({"status": "verified"});
+        let inner = json!({"status": "verified"});
+        let doc = nested_rule11_destination_restore_chain_assess(
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+            &binding,
+            &inner,
+        )
+        .unwrap();
+        assert_eq!(doc["status"], "verified");
+        assert_eq!(doc["checkpoint_phase"], "rule11_destination_restore_chain");
+        assert!(doc["api_hooks"]["migration_restore"]["nested_profile"]
+            .as_str()
+            .unwrap()
+            .contains("unimplemented"));
+        assert!(nested_rule11_destination_restore_chain_assess(
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000001",
+            &binding,
+            &inner,
+        )
+        .is_err());
     }
 }
