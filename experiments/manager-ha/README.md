@@ -248,7 +248,9 @@ and checksums.
 
 The executable is a one-request process boundary: database path, local
 configuration path and replica ID are operator-supplied arguments; one JSON request
-is read from stdin through EOF, and one JSON response is written to stdout. Exit
+is read from stdin through EOF, and one JSON response is written to stdout. The stdin
+path opens through [`ConfiguredStore::open_resolved`](src/durable/journal_profile.rs)
+beside the legacy sqlite path (`store.json` may name MariaDB). Exit
 code 0 means success; exit code 1 accompanies an `error` object. A separate
 external read-only form is available:
 

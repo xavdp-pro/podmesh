@@ -5,7 +5,8 @@ use std::{
     process::ExitCode,
 };
 
-use podmesh_manager_ha_lab::durable::{inspect_read_only, Configuration, Request, Store};
+use podmesh_manager_ha_lab::durable::{inspect_read_only, Configuration, Request};
+use podmesh_manager_ha_lab::ConfiguredStore;
 
 fn main() -> ExitCode {
     match run() {
@@ -43,8 +44,13 @@ fn run() -> Result<String, String> {
         serde_json::from_slice(&bounded(std::fs::File::open(&args[2]).map_err(error)?)?)
             .map_err(error)?;
     let request: Request = serde_json::from_slice(&bounded(io::stdin().lock())?).map_err(error)?;
-    // Validate the request before opening or creating the state file.
-    let mut store = Store::open(Path::new(&args[1]), configuration, &args[3])?;
+    let database_path = Path::new(&args[1]);
+    let profile_dir = database_path
+        .parent()
+        .ok_or_else(|| "database path has no parent".to_string())?;
+    // Resolve `store.json` beside the legacy sqlite path (MariaDB profile or file-backed SQLite).
+    let mut store =
+        ConfiguredStore::open_resolved(profile_dir, database_path, configuration, &args[3])?;
     serde_json::to_string(&store.execute(&request)?).map_err(error)
 }
 
