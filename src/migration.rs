@@ -117,18 +117,15 @@ q=p.with_suffix('.migration-tmp'); q.write_text(json.dumps(d)); os.replace(q,p)
 alive.write_bytes(Path('/proc/sys/kernel/random/boot_id').read_bytes())
 print(json.dumps({'pid':pid,'start_time':start,'backup':str(backup)}))
 ";
-/// Clears stale inner Podman runtime state after outer CRIU restore so `podman start` accepts the current boot ID.
-const NESTED_INNER_RUN_STATE_RECONCILE_PY: &str = r"import json, shutil
+/// Refreshes inner Podman boot-ID cache after outer CRIU restore so `podman start` accepts the namespace boot ID.
+const NESTED_INNER_RUN_STATE_RECONCILE_PY: &str = r"import json
 from pathlib import Path
 boot=Path('/proc/sys/kernel/random/boot_id').read_bytes()
-cleared=[]
-for d in (Path('/run/containers/storage'), Path('/run/libpod')):
-    if d.exists():
-        shutil.rmtree(d)
-        cleared.append(str(d))
-    d.mkdir(parents=True, exist_ok=True)
-Path('/run/libpod/alive').write_bytes(boot)
-print(json.dumps({'cleared': cleared, 'boot_id_bytes': len(boot)}))
+alive=Path('/run/libpod/alive')
+alive.parent.mkdir(parents=True, exist_ok=True)
+prior=alive.read_bytes() if alive.exists() else b''
+alive.write_bytes(boot)
+print(json.dumps({'boot_id_bytes': len(boot), 'alive_refreshed': prior != boot}))
 ";
 const AUTHORITY: &str = "This checkpoint does not authorize restore on any host and does not release the reservation. Only migration_authorize_transfer issues a handoff, and only a verified destination outcome bound to it ends the reservation.";
 /// Which migration assess rules apply. Default flat scope refuses privileged containers; nested is preflight-only until a separate backend exists (docs/MIGRATION-INTEGRATION.md).
@@ -3289,9 +3286,9 @@ mod tests {
     }
 
     #[test]
-    fn nested_inner_run_state_reconcile_script_clears_podman_run_roots() {
-        assert!(super::NESTED_INNER_RUN_STATE_RECONCILE_PY.contains("/run/containers/storage"));
+    fn nested_inner_run_state_reconcile_script_refreshes_libpod_alive() {
         assert!(super::NESTED_INNER_RUN_STATE_RECONCILE_PY.contains("/run/libpod/alive"));
+        assert!(super::NESTED_INNER_RUN_STATE_RECONCILE_PY.contains("boot_id"));
     }
 
     #[test]
