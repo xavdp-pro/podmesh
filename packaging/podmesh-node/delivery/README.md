@@ -126,10 +126,16 @@ not enabled: an abrupt termination before recording readiness requires ownership
 review. Actual host boot/API boot-pass activation needs a separate explicit mandate
 and qualification; this recipe never enables a unit, requests reboot or fabricates
 an API boot-return result. Stop records actual container PID/running/exit/OOM/finish
-observations and refuses success after a force-kill. `podmeshd` has no typed
-clean-shutdown API in this pin: SIGTERM/process exit is not proof of a drained
-journal. The runtime owner must inspect pending attempts and prove restart/replay;
-this recipe does not claim that stop completed every in-flight operation.
+observations and refuses success after a force-kill. `podmeshd` handles SIGTERM
+and SIGINT even as the private container's PID 1. The handler only requests a stop;
+the serial API loop stops admitting work and lets an already admitted synchronous
+store/provider request finish and return its actual result before exiting normally.
+An accepted connection whose request has not been admitted may receive a
+`Daemon stopping` refusal. Existing read/write bounds still apply. An in-flight
+operation exceeding the service stop budget can still be force-killed, which the
+controller refuses to report as a successful stop. No typed clean-shutdown API or
+global journal drain is claimed: pending attempts from earlier failures remain
+unchanged. The runtime owner must inspect them and prove restart/replay.
 
 ## Bounded rollback of the same package
 
