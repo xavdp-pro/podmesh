@@ -21,6 +21,9 @@ class PreservedStorePaths(unittest.TestCase):
         maria = maria.split('\nelse\n', 1)[0]
         command = next(line.strip() for line in maria.splitlines() if line.strip().startswith("jq "))
         program = re.search(r"'([^']*)'", command).group(1)
+        # This command lives in an unquoted SSH heredoc. Its escaped dollar
+        # reaches the remote shell as a literal dollar, then jq receives $p.
+        program = program.replace("\\$", "$")
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp)
             original = {"network": {"database_path": "/var/lib/podmesh-manager/manager.sqlite",
