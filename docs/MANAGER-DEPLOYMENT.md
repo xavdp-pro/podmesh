@@ -159,7 +159,16 @@ topology mismatch between the protected configuration and the opened store; see
 `packaging/podmesh-manager/qualification/activation/preflight-store-topology.py`
 against the SQLite source (`--from-sqlite`) so `identity.topology_json` is
 canonical `manager_ha::Topology` JSON (not a legacy lab placeholder); add
-`--config` when the post-migrate host configuration is already frozen. Transport configuration,
+`--config` when the post-migrate host configuration is already frozen. On each G6 field host,
+run the bundled checklist (topology then identity, fail-closed) before migrate:
+
+```sh
+sudo packaging/podmesh-manager/qualification/activation/g6-pre-migrate-checklist.sh \
+  --from-sqlite /var/lib/podmesh-manager/manager.sqlite \
+  --config /etc/podmesh-manager/config.json
+```
+
+Transport configuration,
 known peers and current inline pair keys are supplied only through the protected
 operator-owned configuration file. Received data must never enroll a peer, choose a
 filesystem path, change a configuration path or widen a replica's scope.

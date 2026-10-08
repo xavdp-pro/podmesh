@@ -7,6 +7,7 @@ trap 'rm -rf -- "$work"' EXIT
 bash -n "$root/capture-host.sh"
 bash -n "$root/activate-host.sh"
 bash -n "$root/check-op10-vzcriu-kernel.sh"
+bash -n "$root/g6-pre-migrate-checklist.sh"
 bash -n "$root/campaign/run-campaign.sh"
 python3 -m py_compile "$root/campaign/validate-campaign-plan.py"
 python3 "$root/campaign/validate-campaign-plan.py" "$root/campaign/campaign-plan.example.json" >/dev/null
