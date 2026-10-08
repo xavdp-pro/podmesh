@@ -49,13 +49,12 @@ preflight responsibility; this is a new isolated scope, never an implicit cutove
 No host account is created or reassigned and no existing service is stopped.
 The runroot is the root-owned0700 child `r` inside the same protected instance
 root. Its computed byte length must be at most50 before any bundle read/provider
-effect, matching the observed CT Podman4.3.1 constraint. With the fixed instance
-base,15-character scopes exactly fit. Use new short scopes such as
-`mn-a-20261008` and `mr-a-20261008`; previous manager225/long restore scopes refuse.
+effect. With the fixed instance base,15-character scopes exactly fit.
+Scopes such as `example-source` and `example-restore` fit this bound;
+longer scopes refuse before creating state.
 The runroot remains in receipt-bound storage.conf and full capture inventory;
-there is no external/shared path or hidden path shim. Nodeca0 remains frozen and
-requires a separate pre-install path-length audit/fix if its scope exceeds the
-same installed-engine limit. VM5.4.2's actual limit is still a separate proof.
+there is no external/shared path or hidden path shim. Verify path constraints
+against the installed engine before creating either declared unit.
 Host prerequisites are Python3.11 or later, Podman, systemd, `iproute2`
 (`/usr/sbin/ip` and `/usr/bin/ss`), GNU tar, libc6>=2.34 and libgcc-s1. Package dependencies
 declare them; no tool installation occurs during controller execution.
@@ -167,10 +166,9 @@ two independent package assemblies from the same pinned inputs and full control/
 payload/ownership/license/NOTICE/no-secret audit. Runtime must then qualify the same
 verified `.deb` for install/start/stop/restart/refusal/rollback and independently check
 actual UID, image/process hashes, store, mounts, cgroups, bridge/publication, typed
-shutdown, private SQL/AUTH journals and retained data. The completed earlier manager
-campaign proves its immutable binary/image journal behavior, not this new installer's
-lifecycle. No runtime action, vote, production activation or previous campaign replay
-is authorized by this README alone.
+shutdown, private SQL/AUTH journals and retained data. Binary/image journal tests
+do not establish the installer's lifecycle. This README defines product commands;
+runtime execution and activation require an operator's deployment mandate.
 
 The actual startup/failed-start scenario must exercise the `Type=simple`
 launcher/`ExecStartPost` boundary: a launcher PID alone is not container readiness.
@@ -182,19 +180,19 @@ fixture or automatic signal fallback substitutes for this VM proof.
 
 ## Native same-host recovery candidate
 
-The earlier `225848f015df` package is historical. Native recovery requires a new
-immutable recipe/package. Binary `6ba91890...`, application OCI and private DB OCI
-remain exact unchanged inputs. Nine package payload files include `recovery.py`;
+Native recovery uses an immutable recipe/package and the exact binary,
+application OCI and private DB OCI pins declared above.
+Nine package payload files include `recovery.py`;
 there are no maintscripts, auto-start, accounts or embedded private inputs.
 
-Only a newly created campaign instance of this same native package can be a source.
+Only a newly created instance of this same native package can be a source.
 The source and target use the same actual machine-id, original replica/host UUIDs,
 logical topology, HMAC pair keys and configuration grants. Target scope, resource
 IDs, bridge, units and receipt are new. Source endpoint is released then reused;
 nonlocal peers keep their exact original configuration. No recursive recovery,
 different-host migration, new daemon, raw libpod editing or receipt adoption exists.
 
-Explicit root commands, subject to pilot/runtime execution authorization:
+Explicit root commands under the operator's deployment mandate:
 
 ```sh
 python3 "$BUNDLE/instance.py" --scope "$SOURCE_SCOPE" capture --capture-id "$CAPTURE_UUID"
@@ -232,12 +230,12 @@ source release. APP/infra writable diffs must be empty; DB diffs are limited to
 writable layer cannot be justified by retaining its raw archive. Installed Podman
 must prove `network_config_dir` and `network create --interface-name` support;
 each scope has a hash-derived private bridge and only its own network metadata.
-CT/VM must observe the actual supported layout; a synthetic fixture is insufficient.
+Qualification must observe the actual supported layout; a synthetic fixture is insufficient.
 The validator checks the actual closed schema and identities, rather than accepting
 or rejecting by version number alone. Engine version is recorded as provenance;
-release/restore/verify require it unchanged. CT4.3.1 fixture evidence cannot qualify
-VM5.4.2 execution: that campaign must present its actual state to the same strict
-validator and prove the full SQL/functional restoration. Any different or unknown
+release/restore/verify require it unchanged. A stopped fixture on one engine version
+does not qualify nominal execution on another. The deployment must present its
+actual state to the strict validator and prove full SQL/functional restoration. Any different or unknown
 metadata path still refuses; there is no implicit version upgrade or schema fallback.
 
 Off-guest verification checkpoint has exactly these fields:
@@ -276,22 +274,21 @@ proof continuation. Runtime must independently query both remote SQL stores; loc
 acknowledgements alone do not qualify the fleet. No HA, Maker/Logger or selected
 release qualification is inferred from this helper.
 
-## CT9110 gates for the new recipe
+## Qualification gates
 
-Run the existing `test_delivery.py` recorder suite and `test_recovery.py` on CT9110
-only. Recovery suite includes one deliberately allowed bounded GNU tar process for
+Run `test_delivery.py` and `test_recovery.py` on the explicitly designated build
+host. Recovery suite includes one deliberately allowed bounded GNU tar process for
 the sparse/xattr/hardlink roundtrip; reject all other real subprocesses. It covers
 configuration/graphroot/layer closure, durable-layer refusal, scope ownership,
 all-history preservation, strict fresh two-peer catchup, receipt links and unsafe
 archive members. Recorder suite additionally covers partial-import APP start refusal.
-These source tests have not been run on NOW7.
 
-Before package acceptance, CT must run a separate real MariaDB roundtrip using the
+Before package acceptance, run a separate real MariaDB roundtrip using the
 exact pinned DB image and native helper `oracle`, `sql_dump`, `immutable_rows`,
 `trigger_rows` through actual UID1103. Provision two isolated private DB servers
 with explicit app credentials, exact controller hostnames and no ambient DSN or
 shared state. Confirm both initially have zero application tables/triggers. Seed
-SOURCE through the exact 6ba binary fixture with schema3, eight triggers and all
+SOURCE through the pinned product binary with schema3, eight triggers and all
 five tables populated (including genuine observation and accepted AUTH journal).
 Persist source SQL rows/identity/grants/trigger metadata, stop its APP with typed
 ack, require zero pending exchanges, and export the helper's exact deterministic dump.
@@ -302,9 +299,9 @@ rows. Passwords stay in protected mounted files, never argv/log/public evidence.
 Use separately owned fresh namespaces and cleanup evidence. Fixture SQL roundtrip
 is an engineering gate; it does not replace the same-package VM functional journey.
 
-Pilot reviews source before CT dispatch. CT builds two identical packages from the
-new pinned source, audits nine payloads/manifest/root ownership/control-only/dependencies
+Review committed source before dispatch. Build two identical packages from the
+pinned source, audit nine payloads/manifest/root ownership/control-only/dependencies
 and preserves previous artifacts. Runtime then qualifies that exact package's fresh
 install/start/stop/rollback-repeat, full closed capture/release/empty-target restore,
-actual PID/UID/binary/image identity and fresh original-peer SQL convergence. All
-stages remain pending until their independent evidence is read and verified.
+actual PID/UID/binary/image identity and fresh original-peer SQL convergence.
+Acceptance requires independently verified evidence for every stage.

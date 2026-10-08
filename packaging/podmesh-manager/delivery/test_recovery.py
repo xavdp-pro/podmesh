@@ -1,7 +1,7 @@
-"""CT9110 only: bounded filesystem regressions; never invoke host providers.
+"""Bounded filesystem regressions; never invoke host providers.
 
 The GNU tar roundtrip is intentional. All other tests use local temporary data
-and reject any subprocess. No import or execution is authorized on NOW7.
+and reject any subprocess. Use an explicitly designated isolated test host.
 """
 import copy
 import importlib.util
