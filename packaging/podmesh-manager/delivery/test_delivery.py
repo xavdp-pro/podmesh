@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tarfile
@@ -23,6 +24,18 @@ builder=load("manager_delivery_builder","build-deb.py")
 
 
 class ManagerDeliveryTests(unittest.TestCase):
+    def test_runroot_length_refuses_before_any_process_or_bundle_read(self):
+        with patch.object(instance,"run") as commands, patch.object(subprocess,"run") as processes:
+            for scope in ("manager225-a-20261008", "manager-native-restore-a-20261008"):
+                with self.assertRaises(instance.Refusal):
+                    instance.Instance(scope)
+            commands.assert_not_called()
+            processes.assert_not_called()
+        longest=instance.BASE/("a"*15)
+        self.assertEqual(len(os.fsencode(instance.private_runroot(longest))),50)
+        with self.assertRaises(instance.Refusal):
+            instance.private_runroot(instance.BASE/("a"*16))
+
     def topology(self):
         machine="11111111111111111111111111111111"
         local="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
@@ -125,6 +138,36 @@ class ManagerDeliveryTests(unittest.TestCase):
             with patch.object(instance,"run") as commands:
                 with self.assertRaises(instance.Refusal):
                     candidate.rollback()
+                commands.assert_not_called()
+
+    def test_partial_sql_import_cannot_start_application(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate=self.candidate(Path(directory))
+            candidate.r["recovery"]={"stage":"sql-import-intent"}
+            candidate.unitcheck=lambda:None
+            candidate.check_container=lambda role:None
+            with patch.object(instance,"run") as commands:
+                with self.assertRaises(instance.Refusal):
+                    candidate.hook("app","permit")
+                commands.assert_not_called()
+
+    def test_captured_source_cannot_restart_via_unit_condition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate=self.candidate(Path(directory))
+            candidate.unitcheck=lambda:None
+            candidate.check_container=lambda role:None
+            for phase in ("capture-in-progress","capture-stopped","rolled-back"):
+                candidate.r["phase"]=phase
+                with self.assertRaises(instance.Refusal):
+                    candidate.hook("app","permit")
+
+    def test_control_append_requires_verified_native_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate=self.candidate(Path(directory))
+            candidate.r["recovery"]={"stage":"sql-import-intent"}
+            with patch.object(instance,"run") as commands:
+                with self.assertRaises(instance.Refusal):
+                    candidate.control_request({"operation":"append_observation"})
                 commands.assert_not_called()
 
     def test_replaced_labels_and_id_refuse(self):

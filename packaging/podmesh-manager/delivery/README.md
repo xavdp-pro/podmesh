@@ -34,21 +34,30 @@ Before creating output, the builder verifies exact archives, source manifest,
 config/platform/entrypoint/account, descriptor sizes/hashes and each uncompressed
 rootfs diff ID. It reads tar members without extracting paths. Both archives and
 the exact executable are copied into a versioned payload-only package with the
-controller, public manifest, README, LICENSE and NOTICE. No source compilation,
+controller, native recovery helper, public manifest, README, LICENSE and NOTICE. No source compilation,
 pull, tag, account, service, maintscript, credential, private configuration, live
 store or automatic activation is part of package construction/install. Node
 packaging is a separate immutable delivery recipe and remains unchanged.
 
 ## Operator inputs and new instance
 
-Use an absent lowercase scope of1–32ASCII letters/digits/hyphens beginning with a
+Use an absent lowercase scope of1–15ASCII letters/digits/hyphens beginning with a
 letter. The controller refuses another non-rolled-back instance, existing scope
 paths/units/resources, conflicting numeric UID/GID1103 and an active/enabled legacy
 `podmesh-manager.service`. Other externally named manager services are a runtime-owner
 preflight responsibility; this is a new isolated scope, never an implicit cutover.
 No host account is created or reassigned and no existing service is stopped.
+The runroot is the root-owned0700 child `r` inside the same protected instance
+root. Its computed byte length must be at most50 before any bundle read/provider
+effect, matching the observed CT Podman4.3.1 constraint. With the fixed instance
+base,15-character scopes exactly fit. Use new short scopes such as
+`mn-a-20261008` and `mr-a-20261008`; previous manager225/long restore scopes refuse.
+The runroot remains in receipt-bound storage.conf and full capture inventory;
+there is no external/shared path or hidden path shim. Nodeca0 remains frozen and
+requires a separate pre-install path-length audit/fix if its scope exceeds the
+same installed-engine limit. VM5.4.2's actual limit is still a separate proof.
 Host prerequisites are Python3.11 or later, Podman, systemd, `iproute2`
-(`/usr/sbin/ip` and `/usr/bin/ss`), libc6>=2.34 and libgcc-s1. Package dependencies
+(`/usr/sbin/ip` and `/usr/bin/ss`), GNU tar, libc6>=2.34 and libgcc-s1. Package dependencies
 declare them; no tool installation occurs during controller execution.
 
 Provide existing regular root-owned0600 files:
@@ -170,3 +179,132 @@ Podman exec125 (container/transport failure) from SQL client1 (connection/access
 not ready). Neither is a successful readiness result. Preserve any failure trace
 and correct an actual startup defect before candidate acceptance; no fake ready
 fixture or automatic signal fallback substitutes for this VM proof.
+
+## Native same-host recovery candidate
+
+The earlier `225848f015df` package is historical. Native recovery requires a new
+immutable recipe/package. Binary `6ba91890...`, application OCI and private DB OCI
+remain exact unchanged inputs. Nine package payload files include `recovery.py`;
+there are no maintscripts, auto-start, accounts or embedded private inputs.
+
+Only a newly created campaign instance of this same native package can be a source.
+The source and target use the same actual machine-id, original replica/host UUIDs,
+logical topology, HMAC pair keys and configuration grants. Target scope, resource
+IDs, bridge, units and receipt are new. Source endpoint is released then reused;
+nonlocal peers keep their exact original configuration. No recursive recovery,
+different-host migration, new daemon, raw libpod editing or receipt adoption exists.
+
+Explicit root commands, subject to pilot/runtime execution authorization:
+
+```sh
+python3 "$BUNDLE/instance.py" --scope "$SOURCE_SCOPE" capture --capture-id "$CAPTURE_UUID"
+# Runtime exports/verifies capture.json, source-full.tar, store.sql and every OCI
+# off guest, then supplies an independently verified root0600 checkpoint.
+python3 "$BUNDLE/instance.py" --scope "$SOURCE_SCOPE" release-for-restore \
+  --capture "$CAPTURE_DIRECTORY" --transfer "$TRANSFER_CHECKPOINT"
+python3 "$BUNDLE/instance.py" --scope "$NEW_TARGET_SCOPE" restore \
+  --capture "$CAPTURE_DIRECTORY" --network-plan "$NEW_TARGET_NETWORK_PLAN" \
+  --recovery-id "$RECOVERY_UUID"
+python3 "$BUNDLE/instance.py" --scope "$NEW_TARGET_SCOPE" start
+python3 "$BUNDLE/instance.py" --scope "$NEW_TARGET_SCOPE" verify-restored \
+  --operation-id "$FRESH_OPERATION_UUID"
+```
+
+Capture requires a started source with its DB available. It first refuses extra configuration, API files, foreign graphroot resources
+or unknown VFS layers. Actual typed APP shutdown is required; the DB remains live
+for a complete application-account dump and all five table/trigger snapshots.
+Zero unresolved outbound requests/inbound replies is mandatory. After clean stop,
+the capture preserves the complete instance tree, metadata (UID/GID/mode/mtime,
+xattrs/ACLs, sparse extents, hardlink groups, symlinks), root configuration,
+both physical volumes, images and observed units/resources. Access times are not
+part of equality. An original observation owned by the original grant holder is
+required for preserved operation replay. No fabricated qualification scope/grant.
+An intent and `capture-in-progress` phase are saved before shutdown. The APP unit
+condition refuses both that phase and `capture-stopped`, including direct unit
+start. An interrupted capture preserves its intent and requires diagnosis; it is
+never reset to Started or automatically resumed.
+
+The bounded VFS inventory is explicit: storage JSON resource IDs, complete parent
+layer chains, exact payload layer directories, exact two `_data` volume trees and
+named engine metadata/lock files. Unknown layout/content refuses before
+source release. APP/infra writable diffs must be empty; DB diffs are limited to
+`/run`, `/tmp`, `/var/run`, `/var/tmp`. Extra durable configuration or a durable
+writable layer cannot be justified by retaining its raw archive. Installed Podman
+must prove `network_config_dir` and `network create --interface-name` support;
+each scope has a hash-derived private bridge and only its own network metadata.
+CT/VM must observe the actual supported layout; a synthetic fixture is insufficient.
+The validator checks the actual closed schema and identities, rather than accepting
+or rejecting by version number alone. Engine version is recorded as provenance;
+release/restore/verify require it unchanged. CT4.3.1 fixture evidence cannot qualify
+VM5.4.2 execution: that campaign must present its actual state to the same strict
+validator and prove the full SQL/functional restoration. Any different or unknown
+metadata path still refuses; there is no implicit version upgrade or schema fallback.
+
+Off-guest verification checkpoint has exactly these fields:
+`verified_offguest:true`, `manifest_sha256`, `archive_sha256`, `sql_sha256`.
+It is an explicit root operator attestation; helper does not contact off-guest
+storage. Release saves an intent before its own controller rollback, verifies units,
+non-volume resources, bridge and endpoint gone, and records live rolled-back receipt
+hash alongside the unchanged captured receipt. Retained source data is never erased
+and source APP must never resume. A partial release preserves the intent/state and
+requires diagnosis; no automatic source restart or forged completion.
+
+Restore reconstructs the complete immutable input in a distinct protected staging
+tree, using named-member archive validation and manifest-defined creation. Hardlink
+groups accept GNU tar's first occurrence independently of lexical manifest anchors.
+No archive-controlled path extraction. Every configuration input, image, volume,
+container, infra, network and unit has explicit old/new identity or equality mapping.
+Supported engine paths/locks/PIDs are regenerated; raw source graphroot remains
+immutable evidence and is not the target's live libpod database.
+
+APP volume and both private configuration trees are restored with their complete
+metadata. DB physical bytes are retained in immutable
+input; the declared exception uses a NEW final DB volume, proves application user
+1103 access with zero tables/triggers, imports the exact dump and compares all five
+tables, schema3, eight immutable triggers/DEFINER/grants and deterministic full dump
+before APP can start. It never empties an existing copied DB volume. Partial import
+keeps `sql-import-intent`; both controller and APP ExecCondition refuse activation.
+No alternate SQL-only/images-only restoration fallback exists.
+
+Functional verification proves original operation request/result/receipt replay,
+then persists one absent operation's intent before a real UID1103 append in the
+original owned scope. It binds the result/receipt and actual new fact/hash to SQL,
+preserves every old row in all five tables, retains identity/schema and triggers,
+requires `every_peer` catchup and fresh linked authenticated receipt acknowledgements
+from both original peers for the complete new history. PID changes refuse retained
+proof continuation. Runtime must independently query both remote SQL stores; local
+acknowledgements alone do not qualify the fleet. No HA, Maker/Logger or selected
+release qualification is inferred from this helper.
+
+## CT9110 gates for the new recipe
+
+Run the existing `test_delivery.py` recorder suite and `test_recovery.py` on CT9110
+only. Recovery suite includes one deliberately allowed bounded GNU tar process for
+the sparse/xattr/hardlink roundtrip; reject all other real subprocesses. It covers
+configuration/graphroot/layer closure, durable-layer refusal, scope ownership,
+all-history preservation, strict fresh two-peer catchup, receipt links and unsafe
+archive members. Recorder suite additionally covers partial-import APP start refusal.
+These source tests have not been run on NOW7.
+
+Before package acceptance, CT must run a separate real MariaDB roundtrip using the
+exact pinned DB image and native helper `oracle`, `sql_dump`, `immutable_rows`,
+`trigger_rows` through actual UID1103. Provision two isolated private DB servers
+with explicit app credentials, exact controller hostnames and no ambient DSN or
+shared state. Confirm both initially have zero application tables/triggers. Seed
+SOURCE through the exact 6ba binary fixture with schema3, eight triggers and all
+five tables populated (including genuine observation and accepted AUTH journal).
+Persist source SQL rows/identity/grants/trigger metadata, stop its APP with typed
+ack, require zero pending exchanges, and export the helper's exact deterministic dump.
+Prove TARGET empty with `oracle(empty=True)`, import exact dump bytes as app UID1103,
+then require dump hash/full rows/trigger/DEFINER/grant equality. Attempt UPDATE and
+DELETE of a known immutable fact and require actual trigger refusal with unchanged
+rows. Passwords stay in protected mounted files, never argv/log/public evidence.
+Use separately owned fresh namespaces and cleanup evidence. Fixture SQL roundtrip
+is an engineering gate; it does not replace the same-package VM functional journey.
+
+Pilot reviews source before CT dispatch. CT builds two identical packages from the
+new pinned source, audits nine payloads/manifest/root ownership/control-only/dependencies
+and preserves previous artifacts. Runtime then qualifies that exact package's fresh
+install/start/stop/rollback-repeat, full closed capture/release/empty-target restore,
+actual PID/UID/binary/image identity and fresh original-peer SQL convergence. All
+stages remain pending until their independent evidence is read and verified.

@@ -4,6 +4,7 @@ import argparse
 import fcntl
 import grp
 import hashlib
+import importlib.util
 import ipaddress
 import uuid
 import json
@@ -17,15 +18,24 @@ import struct
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 BASE = Path("/var/lib/podmesh-manager-private")
 UNITS = Path("/etc/systemd/system")
 BUNDLE = Path(__file__).resolve().parent
 LABEL = "io.podmesh.private-instance"
+RUNROOT_MAX_BYTES = 50
 
 
 class Refusal(RuntimeError):
     pass
+
+
+def private_runroot(root):
+    path = root / "r"
+    require(len(os.fsencode(path)) <= RUNROOT_MAX_BYTES,
+            "private runroot exceeds observed engine50-byte limit; choose a shorter new scope")
+    return path
 
 
 def require(condition, message):
@@ -89,8 +99,9 @@ def run(args, env=None, okay=(0,), timeout=90):
 
 class Instance:
     def __init__(self,scope):
-        require(re.fullmatch(r"[a-z][a-z0-9-]{0,31}",scope),"invalid instance scope")
+        require(re.fullmatch(r"[a-z][a-z0-9-]{0,14}",scope),"invalid instance scope; maximum15ASCII characters")
         self.scope,self.root = scope,BASE/scope
+        private_runroot(self.root)
         self.prefix = "podmesh-manager-private-"+scope
         self.receipt = self.root/"instance.json"
         self.manifest = json.loads((BUNDLE/"bundle.json").read_text())
@@ -146,6 +157,8 @@ class Instance:
             require(item["Id"]==identity,"resource identity differs")
         if kind=="network":
             require(item["id"]==self.r["network_id"],"network identity differs")
+            if "bridge_interface" in self.r:
+                require(item["network_interface"]==self.r["bridge_interface"],"network bridge identity differs")
         return item
 
     def unitcheck(self):
@@ -201,7 +214,7 @@ class Instance:
         require(set(plan)=={"subnet","gateway","pod_ip","peer_container_port","peer_publish"},"unknown network plan fields")
         return subnet
 
-    def prepare(self,a):
+    def prepare(self,a,recovery=None):
         for get in (pwd.getpwuid,grp.getgrgid):
             try:
                 account=get(1103)
@@ -226,6 +239,9 @@ class Instance:
         plan=json.loads(a.network_plan.read_text())
         machine=Path("/etc/machine-id").read_text().strip()
         subnet=self.validate_inputs(config,plan,machine)
+        bridge="pm"+hashlib.sha256((self.scope+":"+self.manifest["bundle"]).encode()).hexdigest()[:12]
+        links=json.loads(run(["/usr/sbin/ip","-j","link","show"]).stdout)
+        require(all(link["ifname"]!=bridge for link in links),"private bridge interface already exists")
         routes=json.loads(run(["/usr/sbin/ip","-j","route","show","table","all"]).stdout)
         addresses=json.loads(run(["/usr/sbin/ip","-j","address","show"]).stdout)
         for route in routes:
@@ -246,7 +262,7 @@ class Instance:
             passwords.append(value)
         require(passwords[0]!=passwords[1],"application and administrator credentials must differ")
         self.root.mkdir(mode=0o700)
-        for name,uid in (("app-config",1103),("api",1103),("db-admin",0),("runroot",0),("tmp",0)):
+        for name,uid in (("app-config",1103),("api",1103),("db-admin",0),("r",0),("tmp",0),("networks",0)):
             (self.root/name).mkdir(mode=0o700)
             os.chown(self.root/name,uid,uid)
         write(self.root/"app-config/config.json",json.dumps(config)+"\n",uid=1103,gid=1103)
@@ -256,16 +272,26 @@ class Instance:
         write(self.root/"app-config/passwd",passwords[0],uid=1103,gid=1103)
         write(self.root/"db-admin/passwd",passwords[1])
         write(self.root/"network-plan.json",json.dumps(plan)+"\n")
-        write(self.root/"storage.conf",f'[storage]\ndriver="vfs"\ngraphroot="{self.root}/graphroot"\nrunroot="{self.root}/runroot"\n')
-        write(self.root/"containers.conf",f'[engine]\ntmp_dir="{self.root}/tmp"\n')
+        write(self.root/"storage.conf",f'[storage]\ndriver="vfs"\ngraphroot="{self.root}/graphroot"\nrunroot="{private_runroot(self.root)}"\n')
+        write(self.root/"containers.conf",f'[engine]\ntmp_dir="{self.root}/tmp"\n[network]\nnetwork_config_dir="{self.root}/networks"\n')
         self.r={"scope":self.scope,"bundle":self.manifest["bundle"],"machine_id":machine,"phase":"preparing",
-                "units":{},"resources":[],"network_plan":plan,"replica_id":config["network"]["replica_id"],
+                "units":{},"resources":[],"network_plan":plan,"bridge_interface":bridge,"replica_id":config["network"]["replica_id"],
                 "root_hashes":{n:sha(self.root/n) for n in ("storage.conf","containers.conf","network-plan.json","db-admin/passwd")},
                 "app_hashes":{n:sha(self.root/"app-config"/n) for n in ("config.json","store.json","passwd")}}
+        if recovery is not None:
+            self.r["recovery"]=recovery
         jsonwrite(self.receipt,self.r)
         for archive,image in (("application.oci.tar",self.manifest["application_image"]),("database.oci.tar",self.manifest["database_image"])):
             self.podman("load","--input",BUNDLE/archive,timeout=300)
             require(image_id(json.loads(self.podman("image","inspect",image).stdout)[0]["Id"])==image_id(image),"loaded image differs")
+        if recovery is not None:
+            for entry in recovery["image_inputs"]:
+                path=Path(entry["path"])
+                protected(path,0o600)
+                require(sha(path)==entry["sha256"],"captured image transport changed")
+                self.podman("load","--input",path,timeout=300)
+                require(image_id(json.loads(self.podman("image","inspect",entry["image_id"]).stdout)[0]["Id"])
+                        ==entry["image_id"],"captured image identity changed")
         labels=["--label",LABEL+"="+self.scope,"--label","io.podmesh.bundle="+self.r["bundle"]]
         def create(kind,name,options,image=None,command=()):
             require(self.inspect(kind,name) is None,"resource already exists")
@@ -295,8 +321,11 @@ class Instance:
             for existing in network.get("subnets",[]):
                 candidate=ipaddress.ip_network(existing["subnet"])
                 require(candidate.version!=4 or not subnet.overlaps(candidate),"bridge overlaps configured network")
-        network=create("network",self.prefix+"-net",["--subnet",str(subnet),"--gateway",plan["gateway"]])
+        network=create("network",self.prefix+"-net",["--subnet",str(subnet),"--gateway",plan["gateway"],"--interface-name",bridge])
+        require(self.owned("network",network)["network_interface"]==bridge,"private bridge name differs")
         options=["--network",network,"--ip",plan["pod_ip"],"--share=net"]
+        if recovery is not None:
+            options += ["--infra-image",recovery["infra_image"]]
         if plan["peer_publish"]:
             publication=plan["peer_publish"]
             options += ["--publish",f'{publication["host_ip"]}:{publication["host_port"]}:{plan["peer_container_port"]}/tcp']
@@ -319,7 +348,7 @@ class Instance:
         self.check_container("db")
         self.check_container("app")
         self.generate_units()
-        self.r["phase"]="prepared"
+        self.r["phase"]="recovery-incomplete" if recovery is not None else "prepared"
         self.save()
         run(["/usr/bin/systemctl","daemon-reload"])
 
@@ -346,6 +375,9 @@ class Instance:
         require(pod is not None and item["Pod"]==self.r["pod"] and host["NetworkMode"]=="container:"+pod["InfraContainerID"],"private pod namespace differs")
         infra=self.inspect("container",pod["InfraContainerID"])
         require(infra is not None and infra["Id"]==pod["InfraContainerID"] and infra["Pod"]==self.r["pod"],"infra identity differs")
+        require(not infra["Mounts"],"infra must not carry inherited application/database volumes")
+        infra_image=json.loads(self.podman("image","inspect",infra["Image"]).stdout)[0]
+        require(not infra_image["Config"].get("Volumes"),"infra image declares inherited volumes; real pause image required")
         # Infra is the only endpoint publication carrier. Never allow DB3306.
         published=infra["HostConfig"].get("PortBindings") or {}
         grant=self.r["network_plan"]["peer_publish"]
@@ -379,10 +411,16 @@ class Instance:
 
     def control_api(self,operation):
         require(operation in ("status","shutdown"),"only product control/readiness operations allowed")
+        return self.control_request({"operation":operation})
+
+    def control_request(self,request):
+        require(request.get("operation") in ("status","shutdown","append_observation"),"unsupported control operation")
+        if request.get("operation")=="append_observation":
+            require(self.r.get("recovery",{}).get("stage")=="state-verified", "append proof requires verified recovery")
         self.check_container("app")
         script='id -u; id -g; id -un; exec socat -t 10 -T 10 STDIO UNIX-CONNECT:/run/podmesh-manager/control.sock'
         result=self.podman("exec","-i","--user=1103:1103",self.r["app"],"/bin/sh","-eu","-c",script,
-                           input_data=json.dumps({"operation":operation}).encode(),timeout=15)
+                           input_data=json.dumps(request).encode(),timeout=15)
         require(len(result.stdout)<=65536,"control response exceeds bound")
         lines=result.stdout.decode().splitlines()
         require(len(lines)>=4 and lines[:3]==["1103","1103","podmesh-manager"],"actual control caller differs")
@@ -465,6 +503,7 @@ class Instance:
                    f"ExecStart=/usr/bin/podman start --attach {self.r['db']}\nExecStartPost={helper} hook --role db --event ready\n"
                    f"ExecStop=/usr/bin/podman stop --time 20 {self.r['db']}\nTimeoutStartSec=90\nTimeoutStopSec=30\nRestart=no\n")
         texts[app]=(f"[Unit]\nDescription=Private manager application\nPartOf={target}\nRequires={db}\nAfter={db}\n[Service]\nType=simple\nUser=root\n{common}"
+                    f"ExecCondition={helper} hook --role app --event permit\n"
                     f"ExecStart=/usr/bin/podman start --attach --sig-proxy=false {self.r['app']}\nExecStartPost={helper} hook --role app --event ready\n"
                     f"ExecStop={helper} hook --role app --event stop\nTimeoutStartSec=90\nTimeoutStopSec=45\nKillMode=process\nSendSIGKILL=no\nRestart=no\n")
         for name,text in texts.items():
@@ -476,6 +515,12 @@ class Instance:
         self.read()
         self.unitcheck()
         self.check_container(role)
+        if role=="app" and event=="permit":
+            require(self.r["phase"] in ("prepared","started","stopped","restored-stopped"),
+                    "source capture or incomplete instance cannot start application")
+            require(not self.r.get("recovery") or self.r["recovery"].get("stage")=="state-verified",
+                    "incomplete recovery cannot start application")
+            return
         if role=="db":
             require(event=="ready","unsupported database callback")
             self.wait_db()
@@ -499,7 +544,9 @@ class Instance:
 
     def control(self,action):
         self.read()
-        require(self.r["phase"] in ("prepared","started","stopped"),"instance incomplete or rolled back")
+        require(self.r["phase"] in ("prepared","started","stopped","restored-stopped"),"instance incomplete or rolled back")
+        require(not self.r.get("recovery") or self.r["recovery"].get("stage")=="state-verified",
+                "incomplete recovery cannot start application")
         self.unitcheck()
         for record in self.r["resources"]:
             require(record["id"] and self.owned(record["kind"],record["id"]),"recorded resource missing")
@@ -576,14 +623,25 @@ def main():
     prep.add_argument("--database-root-password",required=True,type=Path)
     for name in ("start","stop","rollback","status"):
         sub.add_parser(name)
+    capture=sub.add_parser("capture",help="Typed stop and immutable complete recovery capture")
+    capture.add_argument("--capture-id",required=True)
+    release=sub.add_parser("release-for-restore",help="Release only own source after verified offguest capture")
+    release.add_argument("--capture",required=True,type=Path)
+    release.add_argument("--transfer",required=True,type=Path)
+    restore=sub.add_parser("restore",help="Same-host original-replica rebind into a NEW target scope")
+    restore.add_argument("--capture",required=True,type=Path)
+    restore.add_argument("--network-plan",required=True,type=Path)
+    restore.add_argument("--recovery-id",required=True)
+    verify=sub.add_parser("verify-restored",help="Replay preserved receipt and execute one fresh bounded observation")
+    verify.add_argument("--operation-id",required=True)
     hook=sub.add_parser("hook",help=argparse.SUPPRESS)
     hook.add_argument("--role",choices=("app","db"),required=True)
-    hook.add_argument("--event",choices=("ready","stop"),required=True)
+    hook.add_argument("--event",choices=("ready","stop","permit"),required=True)
     a=parser.parse_args()
     require(os.geteuid()==0,"separate root operator required")
     os.umask(0o077)
     candidate=Instance(a.scope)
-    if a.action=="prepare":
+    if a.action in ("prepare","restore"):
         if not BASE.exists():
             BASE.mkdir(mode=0o700)
         protected(BASE,0o700)
@@ -600,6 +658,23 @@ def main():
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         if a.action=="prepare":
             candidate.prepare(a)
+        elif a.action in ("capture","release-for-restore","restore","verify-restored"):
+            path=BUNDLE/"recovery.py"
+            require("recovery.py" in candidate.manifest["payload_sha256"],"native recovery payload missing")
+            spec=importlib.util.spec_from_file_location("podmesh_manager_recovery",path)
+            module=importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            api=SimpleNamespace(BASE=BASE,UNITS=UNITS,Instance=Instance,run=run,write=write,
+                                jsonwrite=jsonwrite,protected=protected,image_id=image_id)
+            action={"capture":module.capture,"release-for-restore":module.release,
+                    "restore":module.restore,"verify-restored":module.verify}[a.action]
+            try:
+                result=action(candidate,a,api)
+            except ValueError as error:
+                raise Refusal("native recovery refused: "+str(error)) from None
+            except (KeyError,TypeError,OSError):
+                raise Refusal("native recovery refused; preserve private inputs, intents and observed state") from None
+            print(json.dumps(result))
         elif a.action in ("start","stop"):
             candidate.control(a.action)
         elif a.action=="rollback":

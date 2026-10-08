@@ -115,6 +115,7 @@ def main():
         shutil.copyfile(a.kit / name, payload / name)
     shutil.copyfile(a.database_oci, payload / "database.oci.tar")
     shutil.copyfile(source_dir / "instance.py", payload / "instance.py")
+    shutil.copyfile(source_dir / "recovery.py", payload / "recovery.py")
     shutil.copyfile(source_dir / "README.md", payload / "README.md")
     shutil.copyfile(source_dir.parents[2] / "LICENSE", payload / "LICENSE")
     shutil.copyfile(source_dir.parents[2] / "NOTICE", payload / "NOTICE")
@@ -132,7 +133,7 @@ def main():
     control.mkdir()
     (control / "control").write_text(
         f"Package: podmesh-manager-private-{bundle}\nVersion: 0.1.0\nArchitecture: amd64\n"
-        "Maintainer: PodMesh maintainers\nDepends: python3 (>= 3.11), podman, systemd, iproute2, libc6 (>= 2.34), libgcc-s1\n"
+        "Maintainer: PodMesh maintainers\nDepends: python3 (>= 3.11), podman, systemd, iproute2, tar, libc6 (>= 2.34), libgcc-s1\n"
         "Description: Immutable private manager and owning database\n"
         " Installation supplies payloads only. Explicit root operator prepares a new instance.\n")
     # No maintscripts, accounts, credentials, service files or automatic activation.
