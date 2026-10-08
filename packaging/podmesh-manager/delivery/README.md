@@ -316,6 +316,13 @@ OCI version, owning layer/sandbox and mounts bound to the declared private root.
 Container-bound runroot health/log/network/previous-PID files and empty
 `tmp/persist` are classified explicitly. Previous PID bytes are retained as
 historical metadata; actual container PID0 establishes process quiescence.
+The native 5.4.2 `tmp/alive` file contains the kernel boot ID: exactly one
+canonical lowercase UUID followed by a newline (37 bytes). Its root-owned
+mode0644 regular file and the empty `alive.lck` are retained unchanged, with
+no symlinks or hard links accepted. The marker is historical engine metadata;
+it is neither a process-liveness proof nor compared to the validator host's
+boot ID. Malformed markers and nonempty locks refuse. This contract follows
+[Podman's tagged boot-ID implementation](https://github.com/containers/podman/blob/v5.4.2/libpod/runtime_linux.go).
 The observed `vfs-containers/volatile-containers.json` and
 `vfs-layers/volatile-layers.json` are root-owned mode0600 regular files containing
 exactly the two bytes `[]`. They are inventoried and preserved; nonempty state,

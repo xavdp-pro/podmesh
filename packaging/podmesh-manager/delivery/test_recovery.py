@@ -151,6 +151,48 @@ class RealEngineLayoutTests(unittest.TestCase):
             path.write_bytes(original)
         self.check()
 
+    def test_real_boot_identity_and_empty_lock_refuse_unclassified_state(self):
+        root, obj = self.fixture()
+        before = recovery.tree(root)
+        alive, lock = root / "tmp/alive", root / "tmp/alive.lck"
+        original = alive.read_bytes()
+        self.assertEqual(len(original), 37)
+        self.assertEqual(lock.read_bytes(), b"")
+        self.check()
+        try:
+            for value in (b"", original[:-1], original.upper(), b"x" * 36 + b"\n",
+                          original + b"foreign-state"):
+                alive.write_bytes(value)
+                with self.assertRaisesRegex(ValueError, "boot identity metadata"):
+                    self.check()
+            alive.write_bytes(original)
+            alive.chmod(0o666)
+            with self.assertRaisesRegex(ValueError, "liveness metadata"):
+                self.check()
+            alive.chmod(0o644)
+            alive.unlink()
+            alive.symlink_to(root / "graphroot/db.sql")
+            with self.assertRaisesRegex(ValueError, "liveness metadata"):
+                self.check()
+            alive.unlink()
+            alive.write_bytes(original)
+            alive.chmod(0o644)
+            with tempfile.TemporaryDirectory() as temporary:
+                os.link(alive, Path(temporary) / "boot-marker-link")
+                with self.assertRaisesRegex(ValueError, "liveness metadata"):
+                    self.check()
+            lock.write_bytes(b"foreign-state")
+            with self.assertRaisesRegex(ValueError, "liveness metadata"):
+                self.check()
+        finally:
+            if alive.is_symlink():
+                alive.unlink()
+            alive.write_bytes(original)
+            alive.chmod(0o644)
+            lock.write_bytes(b"")
+        self.assertEqual(recovery.tree(root), before)
+        self.check()
+
     def test_real_nullable_sql_infra_requires_exact_json_observed_identity_and_role(self):
         root, obj = self.fixture()
         database = root / "graphroot/db.sql"

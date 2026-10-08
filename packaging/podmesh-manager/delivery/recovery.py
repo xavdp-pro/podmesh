@@ -518,7 +518,24 @@ def closed_runtime(root, containers, version="synthetic-test-only"):
         if path.name in ("exits", "persist"):
             require(path.is_dir() and not path.is_symlink() and not any(path.iterdir()), "unmapped exit records")
         else:
-            require(stat.S_ISREG(path.lstat().st_mode) and path.stat().st_size == 0, "engine liveness metadata differs")
+            item = path.lstat()
+            require(stat.S_ISREG(item.st_mode) and (version != "5.4.2" or
+                    (item.st_uid == item.st_gid == 0 and item.st_nlink == 1
+                     and stat.S_IMODE(item.st_mode) == 0o644)),
+                    "engine liveness metadata differs")
+            if path.name == "alive" and version == "5.4.2":
+                # Podman caches the kernel boot ID here, not a process ID.
+                # Preserve the source marker; never compare it to this host's boot.
+                require(item.st_size == 37, "engine boot identity metadata differs")
+                encoded = path.read_bytes()
+                try:
+                    boot_id = str(uuid.UUID(encoded[:36].decode("ascii")))
+                except (ValueError, UnicodeError):
+                    raise ValueError("engine boot identity metadata differs") from None
+                require(encoded == boot_id.encode("ascii") + b"\n",
+                        "engine boot identity metadata differs")
+            else:
+                require(item.st_size == 0, "engine liveness metadata differs")
 
 
 def engine_version(instance):
