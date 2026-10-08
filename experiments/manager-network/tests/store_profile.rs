@@ -177,6 +177,98 @@ fn real_private_mariadb_connect_refusal_persists_terminal_after_reopen() {
 
 #[cfg(feature = "mariadb")]
 #[test]
+fn real_private_mariadb_uncertain_history_dump_restore_and_useful_replay() {
+    use podmesh::store::{self, Engine, MariadbConfig, StoreConfig};
+    use podmesh_manager_ha_lab::{durable::{AuditPhase, Request}, ConfiguredStore};
+    use std::{io::Write, os::unix::fs::OpenOptionsExt, process::{Command, Stdio}, sync::mpsc, thread};
+
+    assert!(std::env::var_os("PODMESH_STORE_PROFILE").is_none());
+    let dsns = ["PODMESH_MARIADB_DSN", "PODMESH_MARIADB_PEER_DSN", "PODMESH_MARIADB_RESTORE_DSN"]
+        .map(|name| std::env::var(name).expect("three fresh private MariaDB servers required"));
+    assert!(dsns[0] != dsns[1] && dsns[0] != dsns[2] && dsns[1] != dsns[2]);
+    let directories = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    for (directory, dsn) in directories.iter().zip(&dsns) {
+        let profile = StoreConfig { engine: Engine::Mariadb, mariadb: MariadbConfig::from_dsn(dsn.clone()),
+                                    ..StoreConfig::default() };
+        let mut raw = store::open(&profile).unwrap();
+        assert!(raw.query("SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE()", &[])
+                   .unwrap().is_empty(), "fresh private database required");
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+            .open(directory.path().join("store.json")).unwrap();
+        file.write_all(serde_json::to_string(&serde_json::json!({"store":{"engine":"mariadb","mariadb":{"dsn":dsn}}}))
+            .unwrap().as_bytes()).unwrap();
+    }
+    let unused = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+    let source = configuration(directories[0].path(), 1, unused);
+    let peer = configuration(directories[1].path(), 2, unused);
+    let restored = configuration(directories[2].path(), 1, unused);
+    let original = Request::Observe { operation_id: "preserved-observation".into(), scope: "scope1".into(),
+        subject: "uncertain-history".into(), exclusive_resource: None, active_claim: false, value: "original".into() };
+    let open = |config: &ConfigurationFile| ConfiguredStore::open_resolved(
+        config.database_path.parent().unwrap(), &config.database_path, config.manager.clone(), &config.replica_id).unwrap();
+    let inspect = |config: &ConfigurationFile| podmesh_manager_ha_lab::durable::inspect_profile::inspect_read_only_resolved(
+        config.database_path.parent().unwrap(), &config.database_path, &config.manager, &config.replica_id).unwrap();
+    let original_receipt = open(&source).execute(&original).unwrap();
+    let (send, receive) = mpsc::channel();
+    let peer_config = peer.clone();
+    let worker = thread::spawn(move || peer_config.open().unwrap().serve_once_drop_reply_after_decision(|address| {
+        send.send(address).unwrap(); Ok(())
+    }));
+    let mut sender = source.clone();
+    sender.peers[0].endpoint = receive.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert!(sender.open().unwrap().sync_to("r2", "uncertain-operation", "initial-nonce").is_err());
+    assert!(worker.join().unwrap().is_err());
+    let captured = inspect(&source);
+    assert_eq!(captured.incomplete_attempts.len(), 1);
+    assert_eq!(captured.incomplete_attempts[0].last_phase, AuditPhase::OutboundRequestPrepared);
+    assert_eq!(inspect(&peer).incomplete_attempts[0].last_phase, AuditPhase::InboundImportCommitted);
+
+    // Explicit isolated-fixture executables run native mariadb-dump / mariadb as
+    // the application account, with credentials supplied privately by the test
+    // host. No default host, DSN parsing, SQL rewriting or synthetic terminal.
+    let dump_path = std::env::var_os("PODMESH_TEST_SQL_DUMP_EXECUTABLE").expect("private native dump wrapper required");
+    let import_path = std::env::var_os("PODMESH_TEST_SQL_IMPORT_EXECUTABLE").expect("private native import wrapper required");
+    let restored_dump_path = std::env::var_os("PODMESH_TEST_SQL_RESTORED_DUMP_EXECUTABLE").expect("private restored dump wrapper required");
+    assert!(Path::new(&dump_path).is_absolute() && Path::new(&import_path).is_absolute()
+            && Path::new(&restored_dump_path).is_absolute());
+    let dump = Command::new(&dump_path).output().unwrap();
+    assert!(dump.status.success(), "native dump failed; inspect protected fixture evidence");
+    assert!(!dump.stdout.is_empty() && dump.stdout.len() <= 128 * 1024 * 1024);
+    let mut importer = Command::new(&import_path).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    importer.stdin.take().unwrap().write_all(&dump.stdout).unwrap();
+    assert!(importer.wait().unwrap().success(), "native import failed; inspect protected fixture evidence");
+    let restored_dump = Command::new(&restored_dump_path).output().unwrap();
+    assert!(restored_dump.status.success());
+    assert!(restored_dump.stdout == dump.stdout, "native deterministic SQL dump differs before application use");
+    let imported = inspect(&restored);
+    assert_eq!(serde_json::to_value(&captured).unwrap(), serde_json::to_value(&imported).unwrap(),
+               "full canonical history must be equal before application use");
+    let replay = open(&restored).execute(&original).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.response, original_receipt.response);
+    assert_eq!(replay.receipt, original_receipt.receipt);
+    let fresh = Request::Observe { operation_id: "fresh-after-restore".into(), scope: "scope1".into(),
+        subject: "fresh-restoration-use".into(), exclusive_resource: None, active_claim: false, value: "fresh".into() };
+    assert!(!open(&restored).execute(&fresh).unwrap().replayed);
+    let (send, receive) = mpsc::channel();
+    let peer_config = peer.clone();
+    let worker = thread::spawn(move || peer_config.open().unwrap().serve_once_reporting_address(|address| {
+        send.send(address).unwrap(); Ok(())
+    }));
+    let mut sender = restored.clone();
+    sender.peers[0].endpoint = receive.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    sender.open().unwrap().sync_to("r2", "fresh-restored-exchange", "fresh-nonce").unwrap();
+    worker.join().unwrap().unwrap();
+    let useful = inspect(&restored);
+    assert_eq!(useful.history_count, captured.history_count + 1);
+    assert_eq!(useful.incomplete_attempts, captured.incomplete_attempts);
+    for row in &captured.ordered_audit_events { assert!(useful.ordered_audit_events.contains(row)); }
+    assert_eq!(inspect(&peer).history_count, useful.history_count);
+    for directory in &directories { no_sqlite(directory.path()); }
+}
+
+#[cfg(feature = "mariadb")]
+#[test]
 fn real_private_mariadb_authenticated_exchange_has_one_journal_and_no_sqlite() {
     use podmesh::store::{self, Engine, MariadbConfig, StoreConfig};
     use podmesh_manager_ha_lab::{durable::Request, ConfiguredStore};

@@ -224,7 +224,16 @@ python3 "$BUNDLE/instance.py" --scope "$NEW_TARGET_SCOPE" verify-restored \
 Capture requires a started source with its DB available. It first refuses extra configuration, API files, foreign graphroot resources
 or unknown VFS layers. Actual typed APP shutdown is required; the DB remains live
 for a complete application-account dump and all five table/trigger snapshots.
-Zero unresolved outbound requests/inbound replies is mandatory. After clean stop,
+After actual clean typed APP shutdown has joined all workers, the exact application
+image performs `--inspect-store` as UID/GID1103 in an ephemeral container in the
+own DB pod with read-only configuration/state mounts. DurableStore validates the
+entire history, audit checksums, receipt links and every admissible audit prefix;
+the recovery helper does not implement a second phase validator. Valid historical
+uncertainty is retained as an exact inventory of incomplete attempts and all
+their canonical audit records/checksums. This includes inbound observation,
+decision and prepared-reply prefixes as well as prepared outbound requests.
+No terminal outcome is fabricated and no retry rewrites the original attempt.
+After clean stop,
 the capture preserves the complete instance tree, metadata (UID/GID/mode/mtime,
 xattrs/ACLs, sparse extents, hardlink groups, symlinks), root configuration,
 both physical volumes, images and observed units/resources. Access times are not
@@ -234,6 +243,39 @@ An intent and `capture-in-progress` phase are saved before shutdown. The APP uni
 condition refuses both that phase and `capture-stopped`, including direct unit
 start. An interrupted capture preserves its intent and requires diagnosis; it is
 never reset to Started or automatically resumed.
+
+Before target APP start, canonical uncertainty inventory, full deterministic SQL
+dump, every immutable table row and all triggers must equal the capture exactly.
+Loss, alteration, synthetic completion or addition of uncertainty refuses import.
+After original receipt replay and a fresh observation acknowledged by both peers,
+`verify-restored` requests typed APP shutdown and inspects the quiescent store
+again. Historical uncertainty must remain exactly equal to the capture; any new
+incomplete attempt refuses qualification. The proof explicitly records the APP
+as cleanly stopped after this useful restoration check. The DB then stops cleanly
+and the receipt returns to `restored-stopped`; an explicit `start` can resume it.
+The ephemeral inspector must be absent before and after inspection. Failed
+inspection preserves evidence and refuses progress; it does not repair SQL.
+Existing instance receipts remain bound to their original bundle. A corrected
+helper/package is qualified on new scopes; it never adopts an older bundle's
+instance or rewrites its receipt.
+
+The capture contract is `manager-full-capture/v2`; older captures without the
+explicit uncertainty inventory are refused rather than reinterpreted. A targeted
+isolated regression, `real_private_mariadb_uncertain_history_dump_restore_and_useful_replay`,
+requires three distinct fresh private servers through `PODMESH_MARIADB_DSN`,
+`PODMESH_MARIADB_PEER_DSN`, and `PODMESH_MARIADB_RESTORE_DSN`, with no inherited
+`PODMESH_STORE_PROFILE`. It deliberately drops one authenticated reply after a
+durable decision, performs a native SQL dump/import into the empty target,
+compares the full deterministic dumps and canonical inspection before use,
+then replays the original receipt and replicates a fresh observation while
+retaining the original incomplete attempt unchanged. It requires absolute paths
+to isolated application-account wrappers in `PODMESH_TEST_SQL_DUMP_EXECUTABLE`,
+`PODMESH_TEST_SQL_IMPORT_EXECUTABLE`, and `PODMESH_TEST_SQL_RESTORED_DUMP_EXECUTABLE`.
+The dump wrappers use the flags in `recovery.py`'s `DUMP` contract, including
+`--skip-comments --skip-dump-date --order-by-primary --skip-extended-insert`,
+and the import wrapper consumes SQL on stdin. Credentials stay in protected
+fixture inputs; no wrapper prints them. This regression proves the store path;
+exact-package native lifecycle and functional recovery remain separate checks.
 
 The bounded VFS inventory is explicit: storage JSON resource IDs, complete parent
 layer chains, exact payload layer directories, exact two `_data` volume trees and

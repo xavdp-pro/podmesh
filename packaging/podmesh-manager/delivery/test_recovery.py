@@ -33,7 +33,7 @@ class RecoveryTests(unittest.TestCase):
                 return "\n".join(recovery.TABLES) + "\n"
             if "information_schema.TRIGGERS" in statement:
                 return "8\n"
-            if "information_schema.ROUTINES" in statement or "FROM exchange_audit_events a" in statement:
+            if "information_schema.ROUTINES" in statement:
                 return "0\n0\n"
             if statement.startswith("SELECT version FROM store_schema"):
                 return marker + "\n"
@@ -43,11 +43,95 @@ class RecoveryTests(unittest.TestCase):
                 return "GRANT ALL PRIVILEGES ON `podmesh-manager`.* TO `podmesh-manager`@`%`\n"
             self.fail("unexpected oracle SQL")
         marker = "1"
-        with patch.object(recovery, "query", side_effect=results):
+        with patch.object(recovery, "query", side_effect=results), patch.object(
+                recovery, "inspect_quiescent_store", return_value={"incomplete_attempts": [], "ordered_audit_events": []}):
             self.assertEqual(recovery.oracle(instance)["tables"], recovery.TABLES)
             marker = "3"
             with self.assertRaisesRegex(ValueError, "DurableStore migration version"):
                 recovery.oracle(instance)
+
+    def uncertainty(self):
+        # Shape returned by the product's canonical validator, not a replacement
+        # validation machine. Include all inbound prefix classes, not just replies.
+        attempts, rows = [], []
+        for direction, phase in (("outbound", "outbound_request_prepared"),
+                                 ("inbound", "inbound_request_observed"),
+                                 ("inbound", "inbound_import_committed"),
+                                 ("inbound", "inbound_refusal_recorded"),
+                                 ("inbound", "inbound_reply_prepared")):
+            identifier = "attempt:" + phase
+            attempts.append({"direction": direction, "attempt_id": identifier,
+                             "wire_nonce": "nonce-" + phase, "wire_operation_id": None, "last_phase": phase})
+            rows.append({"event": {"audit_event_id": "audit-" + phase, "direction": direction,
+                                   "attempt_id": identifier, "phase": phase}, "sha256": "a" * 64})
+        return {"incomplete_attempts": attempts, "ordered_audit_events": rows}
+
+    def test_uncertainty_retains_exact_canonical_attempts_and_all_prefix_evidence(self):
+        inspection = self.uncertainty()
+        # A multi-row prefix must retain every predecessor, not just its last row.
+        predecessor = copy.deepcopy(inspection["ordered_audit_events"][-1])
+        predecessor["event"]["audit_event_id"] = "predecessor"
+        predecessor["event"]["phase"] = "inbound_request_observed"
+        inspection["ordered_audit_events"].append(predecessor)
+        inventory = recovery.uncertainty_inventory(inspection)
+        self.assertEqual(len(inventory["attempts"]), 5)
+        self.assertEqual(len(inventory["audit_events"]), 6)
+        self.assertEqual(set(row["sha256"] for row in inventory["audit_events"]), {"a" * 64})
+        recovery.same_uncertainty(inventory, copy.deepcopy(inventory))
+
+    def test_uncertainty_refuses_loss_alteration_addition_and_synthetic_completion(self):
+        original = recovery.uncertainty_inventory(self.uncertainty())
+        lost = copy.deepcopy(original)
+        lost["attempts"].pop()
+        altered = copy.deepcopy(original)
+        altered["audit_events"][0]["sha256"] = "b" * 64
+        added = copy.deepcopy(original)
+        added["attempts"].append({"attempt_id": "new"})
+        completed = {"type": original["type"], "attempts": [], "audit_events": []}
+        for candidate in (lost, altered, added, completed):
+            with self.subTest(candidate=candidate), self.assertRaisesRegex(ValueError, "uncertainty lost, altered or added"):
+                recovery.same_uncertainty(original, candidate)
+
+    def test_uncertainty_refuses_duplicate_or_missing_canonical_evidence(self):
+        inspection = self.uncertainty()
+        inspection["incomplete_attempts"].append(inspection["incomplete_attempts"][0])
+        with self.assertRaisesRegex(ValueError, "duplicate canonical"):
+            recovery.uncertainty_inventory(inspection)
+        inspection = self.uncertainty()
+        inspection["ordered_audit_events"].pop()
+        with self.assertRaisesRegex(ValueError, "lacks audit evidence"):
+            recovery.uncertainty_inventory(inspection)
+
+    def test_canonical_recovery_inspection_refuses_live_app_before_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            instance = SimpleNamespace(root=Path(directory), check_container=lambda role:
+                {"State": {"Running": True, "Pid": 42, "ExitCode": 0}},
+                podman=lambda *args, **kwargs: self.fail("live APP must prevent provider call"))
+            with self.assertRaisesRegex(ValueError, "quiescent clean APP"):
+                recovery.inspect_quiescent_store(instance)
+
+    def test_canonical_recovery_inspection_reuses_exact_image_read_only_and_propagates_invalid_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            calls = []
+            inspection = dict(self.uncertainty(), replica_id="original")
+            def provider(*args, **kwargs):
+                calls.append(args)
+                return SimpleNamespace(stdout=json.dumps(inspection).encode())
+            instance = SimpleNamespace(root=Path(directory), prefix="owned", scope="scope",
+                r={"bundle": "immutable", "pod": "own-pod", "replica_id": "original"},
+                manifest={"application_image": "sha256:" + "a" * 64},
+                check_container=lambda role: {"State": {"Running": False, "Pid": 0, "ExitCode": 0}},
+                inspect=lambda *args: None, podman=provider)
+            self.assertEqual(recovery.inspect_quiescent_store(instance), inspection)
+            command = calls[0]
+            for argument in ("--rm", "--user=1103:1103", "--read-only", "--inspect-store",
+                             "owned-app:/var/lib/podmesh-manager:ro", "own-pod", instance.manifest["application_image"]):
+                self.assertIn(argument, command)
+            def invalid(*args, **kwargs):
+                raise ValueError("canonical store corrupt: invalid audit prefix")
+            instance.podman = invalid
+            with self.assertRaisesRegex(ValueError, "invalid audit prefix"):
+                recovery.inspect_quiescent_store(instance)
 
     def test_engine_version_provenance_does_not_substitute_for_schema_validation(self):
         calls = []

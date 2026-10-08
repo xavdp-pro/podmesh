@@ -285,16 +285,57 @@ def oracle(instance, empty=False):
                 "manager DurableStore migration version differs")
         require(query(instance, "SELECT replica_id FROM identity WHERE singleton=1;").strip() == instance.r["replica_id"],
                 "SQL replica identity differs")
-        pending = query(instance,
-            "SELECT COUNT(*) FROM exchange_audit_events a WHERE a.phase='outbound_request_prepared' "
-            "AND NOT EXISTS(SELECT 1 FROM exchange_audit_events b WHERE b.direction=a.direction "
-            "AND b.attempt_id=a.attempt_id AND b.phase='outbound_exchange_completed');"
-            "SELECT COUNT(*) FROM exchange_audit_events a WHERE a.phase='inbound_reply_prepared' "
-            "AND NOT EXISTS(SELECT 1 FROM exchange_audit_events b WHERE b.direction=a.direction "
-            "AND b.attempt_id=a.attempt_id AND b.phase='inbound_reply_write_observed');").splitlines()
-        require(pending == ["0", "0"], "unresolved authenticated exchanges prevent capture/import")
-    return {"identity": identity, "tables": tables, "triggers": triggers,
-            "grants": query(instance, "SHOW GRANTS FOR CURRENT_USER;").splitlines()}
+    result = {"identity": identity, "tables": tables, "triggers": triggers,
+              "grants": query(instance, "SHOW GRANTS FOR CURRENT_USER;").splitlines()}
+    if not empty:
+        result["historical_uncertainty"] = uncertainty_inventory(inspect_quiescent_store(instance))
+    return result
+
+
+def inspect_quiescent_store(instance):
+    """Reuse DurableStore's full read-only validation, never a second phase machine."""
+    state = instance.check_container("app")["State"]
+    require(not state["Running"] and state["Pid"] == 0 and state["ExitCode"] == 0
+            and not state.get("OOMKilled", False) and not (instance.root / "api/control.sock").exists(),
+            "canonical recovery inspection requires quiescent clean APP")
+    name = instance.prefix + "-inspection"
+    require(instance.inspect("container", name) is None, "inspection resource already exists; retain it")
+    result = instance.podman("run", "--rm", "--name", name,
+        "--label", "io.podmesh.private-instance=" + instance.scope,
+        "--label", "io.podmesh.bundle=" + instance.r["bundle"],
+        "--pod", instance.r["pod"], "--pull=never", "--image-volume=ignore",
+        "--user=1103:1103", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+        "--pid=private", "--ipc=private", "--uts=private", "--read-only", "--read-only-tmpfs=false",
+        "--memory=512m", "--memory-swap=512m", "--cpus=1",
+        "--volume", instance.prefix + "-app:/var/lib/podmesh-manager:ro",
+        "--volume", str(instance.root / "app-config") + ":/etc/podmesh-manager:ro",
+        "--env=PODMESH_STORE_PROFILE=/etc/podmesh-manager/store.json",
+        "--entrypoint=/usr/lib/podmesh-manager/podmesh-managerd", instance.manifest["application_image"],
+        "--config", "/etc/podmesh-manager/config.json", "--state-dir", "/var/lib/podmesh-manager",
+        "--inspect-store", timeout=120)
+    require(instance.inspect("container", name) is None, "inspection resource not removed; retain state")
+    require(0 < len(result.stdout) <= MAX_SQL, "canonical inspection exceeds bound")
+    inspection = json.loads(result.stdout)
+    require(inspection["replica_id"] == instance.r["replica_id"], "canonical replica identity differs")
+    return inspection
+
+
+def uncertainty_inventory(inspection):
+    """The canonical inspector has already validated every row, link and prefix."""
+    attempts = inspection["incomplete_attempts"]
+    keys = {(item["direction"], item["attempt_id"]) for item in attempts}
+    require(len(keys) == len(attempts), "duplicate canonical incomplete attempt")
+    events = [row for row in inspection["ordered_audit_events"]
+              if (row["event"]["direction"], row["event"]["attempt_id"]) in keys]
+    require({(row["event"]["direction"], row["event"]["attempt_id"]) for row in events} == keys,
+            "canonical incomplete attempt lacks audit evidence")
+    return {"type": "manager-historical-uncertainty/v1",
+            "attempts": sorted(attempts, key=lambda item: (item["direction"], item["attempt_id"])),
+            "audit_events": sorted(events, key=lambda row: row["event"]["audit_event_id"])}
+
+
+def same_uncertainty(captured, observed):
+    require(captured == observed, "historical uncertainty lost, altered or added")
 
 
 def immutable_rows(instance):
@@ -732,7 +773,7 @@ def capture(instance, a, api):
     with archive.open("rb") as stream:
         os.fsync(stream.fileno())
     require(tree(instance.root) == rows, "source changed during complete capture")
-    manifest = {"type": "manager-full-capture/v1", "capture_id": capture_id,
+    manifest = {"type": "manager-full-capture/v2", "capture_id": capture_id,
                 "scope": instance.scope, "bundle": instance.r["bundle"],
                 "machine_id": instance.r["machine_id"], "replica_id": instance.r["replica_id"],
                 "receipt": instance.r, "receipt_sha256": digest(instance.receipt),
@@ -749,7 +790,10 @@ def load_capture(path, api):
     exact(manifest, ("type", "capture_id", "scope", "bundle", "machine_id", "replica_id", "receipt",
                      "receipt_sha256", "archive_sha256", "sql_sha256", "tree", "volume_paths", "image_files",
                      "sql_identity", "writable_layers"))
-    require(manifest["type"] == "manager-full-capture/v1", "unknown capture contract")
+    require(manifest["type"] == "manager-full-capture/v2", "unknown capture contract; exact uncertainty inventory required")
+    exact(manifest["sql_identity"]["historical_uncertainty"], ("type", "attempts", "audit_events"))
+    require(manifest["sql_identity"]["historical_uncertainty"]["type"] == "manager-historical-uncertainty/v1",
+            "unknown historical uncertainty contract")
     require(manifest["scope"] == manifest["receipt"]["scope"]
             and manifest["bundle"] == manifest["receipt"]["bundle"]
             and manifest["replica_id"] == manifest["receipt"]["replica_id"]
@@ -950,6 +994,7 @@ def restore(instance, a, api):
     instance.podman("exec", "-i", "--user=1103:1103", instance.r["db"], "/bin/sh", "-eu", "-c", script,
                     input_data=sql, timeout=120)
     imported = oracle(instance)
+    same_uncertainty(manifest["sql_identity"]["historical_uncertainty"], imported["historical_uncertainty"])
     require(imported["grants"] == manifest["sql_identity"]["grants"], "SQL privileges/DEFINER compatibility changed")
     require(hashlib.sha256(sql_dump(instance)).hexdigest() == manifest["sql_sha256"],
             "full SQL schema/rows/triggers differ before application start")
@@ -1047,13 +1092,22 @@ def verify(instance, a, api):
         except ValueError:
             time.sleep(0.2)
     require(matched is not None, "fresh nominal effect not acknowledged by both authenticated peers")
+    # A live valid prefix may still be in flight. Join all workers through the
+    # typed shutdown before classifying new uncertainty as historical.
+    instance.shutdown_app()
     preserved_rows(manifest["sql_identity"]["immutable_rows"], immutable_rows(instance))
     identity = oracle(instance)
+    same_uncertainty(manifest["sql_identity"]["historical_uncertainty"], identity["historical_uncertainty"])
     identity.pop("grants")
+    instance.stop_units()
+    instance.r["phase"] = "restored-stopped"
+    instance.save()
     proof = {"type": "manager-restored-functional/v1", "recovery_id": origin["recovery_id"],
              "capture_manifest_sha256": origin["manifest_sha256"], "operation_id": op,
              "status": status, "sql_identity": identity, "replay": replay, "nominal": response,
              "peer_receipt_links": matched,
+             "application_after_proof": "typed-shutdown-clean-stopped",
+             "database_after_proof": "clean-stopped",
              "peer_convergence": "local fresh-history acknowledgements proved; independent peer SQL verification required",
              "scope": "restored replica proof; not complete fleet restoration or HA"}
     file = instance.root / "restored-functional.json"
