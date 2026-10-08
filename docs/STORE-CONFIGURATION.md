@@ -17,6 +17,15 @@ and secret declare/remove/status. Ask `capabilities` for the supported set.
 Other module-owned operations return `store_engine_unsupported`: volume declaration
 and growth, boot restore, migration and recovery points still require SQLite.
 Startup publisher withdrawal and network reconciliation are also SQLite-only.
+Before opening the API socket, a durable node refuses any rows in network/publisher
+tables, any network/publisher operation history, or any managed-network operation.
+Historical rows also refuse; the guard cannot infer that their host effects are gone.
+Unreadable/malformed journal requests or failed guard queries refuse startup.
+Preserve the journal and reconcile using a compatible implementation before cutover;
+deleting history to pass this guard is not an approved migration. This is a journal
+precondition, not cleanup of active host effects. Qualification additionally requires
+an isolated host scope with no residual unjournaled managed network or publisher
+services. The guard does not prove their absence or port these modules.
 This is a partial cutover, not a complete A/B production path. The legacy
 `open_state`/`into_connection` API still refuses a MariaDB journal because it returns
 a `rusqlite::Connection`. No MariaDB profile silently falls back to SQLite.

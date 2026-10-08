@@ -205,6 +205,15 @@ impl NodeStore {
         }
     }
 
+    /// Refuse a durable lifecycle candidate that needs an unported startup reconciler.
+    /// This check reads only the journal, before the daemon opens its API socket.
+    pub fn validate_startup_scope(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let NodeStore::Durable(store) = self {
+            validate_durable_startup_scope(store.as_mut())?;
+        }
+        Ok(())
+    }
+
     /// The connection the node's operations take, or a refusal naming why there is none.
     ///
     /// This is where Phase 2 stops. The node's schema is versioned and installs on both engines,
@@ -226,6 +235,46 @@ impl NodeStore {
             .into()),
         }
     }
+}
+
+/// Conservative candidate precondition until publisher/network startup reconciliation is ported.
+/// Historical rows also refuse: their absence from the host cannot be inferred from a journal.
+fn validate_durable_startup_scope(
+    store: &mut dyn DurableStore,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for table in [
+        "network_declaration",
+        "network_peer_pools",
+        "network_allocations",
+        "network_routes",
+        "network_effects",
+        "publishers",
+        "publisher_events",
+        "publisher_transitions",
+        "publisher_takeover_verified",
+    ] {
+        if store
+            .query_one(&format!("SELECT 1 FROM {table} LIMIT 1"), &[])?
+            .is_some()
+        {
+            return Err(format!("store_engine_unsupported: durable startup refused because {table} contains state requiring SQLite-only publisher/network reconciliation; preserve this journal and reconcile with a compatible implementation before cutover").into());
+        }
+    }
+    for row in store.query("SELECT request FROM operations", &[])? {
+        let request: Value = serde_json::from_str(row.text(0)?).map_err(|_| {
+            "durable startup refused: cannot establish publisher/network scope from an invalid journal request"
+        })?;
+        let operation = request["operation"]
+            .as_str()
+            .ok_or("durable startup refused: journal request has no operation identity")?;
+        if operation.starts_with("network_")
+            || operation.starts_with("publisher_")
+            || request["network_profile"].as_str() == Some(network::PROFILE_MANAGED)
+        {
+            return Err("store_engine_unsupported: durable startup refused because operation history includes publisher/network effects not supported by this candidate; preserve and reconcile the original state before cutover".into());
+        }
+    }
+    Ok(())
 }
 
 /// Open the node's journal under the profile it is configured with, and bring its schema up.

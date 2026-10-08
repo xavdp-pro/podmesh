@@ -22,6 +22,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let profile = podmesh::store_profile(&dir)?;
     eprintln!("PodMesh store: {}", profile.described());
     let mut store = podmesh::open_node_store(&dir, &profile)?;
+    // Do not expose a lifecycle API over restored effects we cannot reconcile.
+    store.validate_startup_scope()?;
     // A connector whose lease lapsed while this daemon was down is still publishing: its unit is
     // systemd's. It is withdrawn first, connector and mark, in one journaled operation, before the
     // network reconciliation and before anything is served.
@@ -38,8 +40,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         eprintln!(
-            "PodMesh startup mutation refusal: store_engine_unsupported; \
-             publisher withdrawal and network reconciliation are still SQLite-only"
+            "PodMesh durable lifecycle startup: publisher/network journal preconditions checked; \
+             their reconciliation remains unavailable"
         );
     }
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
