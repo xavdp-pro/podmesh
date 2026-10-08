@@ -11,10 +11,15 @@ state directory, as it always has. What Phase 2 added is that the journal's *sch
 ordered set of migrations applied at every open, on whichever engine the profile names, and that
 `store.engine` is read: a node configured for MariaDB opens that instance and migrates it.
 
-**What it does not yet do** is run from MariaDB. The node's operations still take a
-`rusqlite::Connection`, so a node whose profile says `mariadb` opens the instance, brings its schema
-up, and then refuses to serve, naming why. Failing closed is the point: a node that believes it
-writes to a server and writes to a file instead is the one failure this layer must not allow.
+**The daemon serves the operations ported to `DurableStore` from MariaDB.** These
+include local reads, lifecycle create/delete/clone/start/stop/pause/resume/resources,
+and secret declare/remove/status. Ask `capabilities` for the supported set.
+Other module-owned operations return `store_engine_unsupported`: volume declaration
+and growth, boot restore, migration and recovery points still require SQLite.
+Startup publisher withdrawal and network reconciliation are also SQLite-only.
+This is a partial cutover, not a complete A/B production path. The legacy
+`open_state`/`into_connection` API still refuses a MariaDB journal because it returns
+a `rusqlite::Connection`. No MariaDB profile silently falls back to SQLite.
 
 ## Where the profile is read from
 
