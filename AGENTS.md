@@ -27,9 +27,11 @@ obligations as binding requirements, not optional background context.
 
 - Corpus location: https://github.com/xavdp-pro/SHAPER-OS-V1.15
 - Immutable revision: `173ae591988e1f71a33f65289fc26b9de4aaf3d7` (`main`, resolved 2026-10-07; the corpus read for this adoption was that commit, clean detached worktree)
-- Adoption scope: ongoing development of the PodMesh product in this repository and of the maintainers' workshop in `xavdp-pro/podmesh-lab`. Covers design, implementation, documentation, tests and evidence for the local node, the replicated manager and laboratory qualification. Does not convert PodMesh into a SHAPER universe (Vault/Logger/Queue/Maestro) or rebuild the laboratory. Node-store MariaDB cutover is authorized on `cursor/assembly-2026-10-07`; manager-store MariaDB waits for the node.
+- Adoption scope: ongoing development of the PodMesh product in this repository and of the maintainers' workshop in `xavdp-pro/podmesh-lab`. Covers design, implementation, documentation, tests and evidence for the local node, the replicated manager and laboratory qualification. Does not convert PodMesh into a SHAPER universe (Vault/Logger/Queue/Maestro) or rebuild the laboratory. Node and manager private-MariaDB delivery proceeds in bounded committed slices; an old assembly branch or a workstation gate is not the delivery authority.
 - Declared architectural roles and applicable profiles: optional manager of SHAPER `nested` universes (Rule 11), without governor or maker authority; per-host PodMesh node; active manager replica whose activation depends on an externally issued lease and epoch. Standalone Podman operation remains valid. Profile `SEP22-CONTAINER-MARIADB` applies. The durable roles **`podmesh-node`** and **`podmesh-manager`** are declared functional units under that profile (Rules 4 and 26): one responsibility, isolated Podman boundary, private MariaDB **server instance** each, slug = system user = DB user = database. See `docs/FUNCTIONAL-UNITS.md`.
-- Production path: `docs/SIMPLE-PRODUCTION-PATH.md` — **A** container life, then **B** move + replicate, **C** later. Assembly branch: `cursor/assembly-2026-10-07`.
+- Architecture context: `xavdp-pro/shaper-three-layers` at `a8eddf95b30a5952267990928e65c5e9c61131f8`. Its layer and authority distinctions supplement, never replace, the adopted V1.15 obligations. Host privileges are delegated execution capabilities, not governance authority.
+- Production path: `docs/SIMPLE-PRODUCTION-PATH.md` — **A** container life, then **B** move + replicate, **C** later. Commit source before building; carry that immutable pin, artifact manifest and hashes through runtime qualification. Build/test hosts are explicit deployment inputs, never an operator workstation prerequisite.
+- Application identity and private store stay inside each declared unit boundary. A privileged host adapter is a separate, scoped capability provider; it does not become the application account, own its database, or acquire Governor/Maker authority. See `docs/FUNCTIONAL-UNITS.md`.
 - Existing conformity gaps (do not expand into campaigns from this list):
   - Supervision adapter not qualified (`docs/SHAPER-SUPERVISION.md`).
   - Published package ≠ qualified package (`ACCEPTANCE-TEST-PLAN.md` note 2026-09-18).
@@ -37,7 +39,7 @@ obligations as binding requirements, not optional background context.
   - `INTENT.md`: still missing Rule 0B / Rule 7 headers — add on next edit of that file.
   - Epoch gate and guardian still on a workstation (ideal-scene departure 2 / A5) — separate mandate.
   - Gate 4 HELD; no vote keys from this assembly.
-  - Node MariaDB (`podmesh-node`) in progress on the assembly branch; manager MariaDB after; one server instance per slug.
+  - Node MariaDB serves the ported lifecycle slice; volume and boot-return call sites still need porting. Manager journal engineering proofs do not establish a replicated deployment or authenticated functional restore. One private server instance per unit; qualification belongs to the exact candidate.
 - Outside this mandate: arming vote keys, closing laboratory gates, production HA promotion, reference universe, editing the pinned SHAPER corpus.
 
 Follow the corpus's AGENTS.md, LAW.md, governing map and reading contract.
