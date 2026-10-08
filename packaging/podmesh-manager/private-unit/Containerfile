@@ -1,25 +1,33 @@
 # Application wrapper only. The owning private pod runs its database separately.
-# Keep this base identical to the independently pinned private MariaDB server image.
-FROM docker.io/library/mariadb@sha256:53ef799caed285438d88678b529b4ff24406d4788f47ab8a74bb2212c707899a
+# Confirmed Linux/amd64 registry manifest; config image ID is sha256:53ef799c... .
+FROM docker.io/library/mariadb@sha256:93fc3fe333b6cdfb061425869c2c3a5bb2851c0c74dbebc2c940f024e7482d76
 ARG MANAGER_BINARY_SHA256
-ARG SOURCE_REVISION
+ARG BINARY_SOURCE_REVISION
+ARG RECIPE_REVISION
 COPY podmesh-managerd /usr/lib/podmesh-manager/podmesh-managerd
 RUN test "${#MANAGER_BINARY_SHA256}" -eq 64 \
  && case "$MANAGER_BINARY_SHA256" in *[!0-9a-f]*) exit 1;; esac \
- && test "${#SOURCE_REVISION}" -eq 40 \
- && case "$SOURCE_REVISION" in *[!0-9a-f]*) exit 1;; esac \
+ && test "${#BINARY_SOURCE_REVISION}" -eq 40 \
+ && case "$BINARY_SOURCE_REVISION" in *[!0-9a-f]*) exit 1;; esac \
+ && test "${#RECIPE_REVISION}" -eq 40 \
+ && case "$RECIPE_REVISION" in *[!0-9a-f]*) exit 1;; esac \
  && printf '%s  %s\n' "$MANAGER_BINARY_SHA256" /usr/lib/podmesh-manager/podmesh-managerd | sha256sum --check --strict - \
+ && command -v id && command -v socat && command -v mariadb && command -v mariadb-dump \
  && groupadd --gid 1103 podmesh-manager \
  && useradd --uid 1103 --gid 1103 --no-create-home --home-dir /var/lib/podmesh-manager --shell /usr/sbin/nologin podmesh-manager \
  && chmod 0755 /usr/lib/podmesh-manager/podmesh-managerd \
- && mkdir -p /etc/podmesh-manager /var/lib/podmesh-manager /run/podmesh-manager \
+ && mkdir -p /etc/podmesh-manager /var/lib/podmesh-manager /run/podmesh-manager /usr/share/podmesh-manager \
+ && dpkg-query --show --showformat='${Package}\t${Version}\n' > /usr/share/podmesh-manager/image-packages.tsv \
  && chown 1103:1103 /etc/podmesh-manager /var/lib/podmesh-manager /run/podmesh-manager \
  && chmod 0700 /etc/podmesh-manager /var/lib/podmesh-manager /run/podmesh-manager
 LABEL org.opencontainers.image.title="podmesh-manager private-unit application" \
-      org.opencontainers.image.revision="$SOURCE_REVISION" \
+      org.opencontainers.image.revision="$RECIPE_REVISION" \
+      io.podmesh.binary-source-revision="$BINARY_SOURCE_REVISION" \
       io.podmesh.manager-binary-sha256="$MANAGER_BINARY_SHA256" \
       io.podmesh.functional-slug="podmesh-manager" \
       io.podmesh.application-uid="1103"
 USER podmesh-manager:podmesh-manager
+RUN test "$(id -u)" = 1103 && test "$(id -g)" = 1103 \
+ && id && socat -V && mariadb --version && mariadb-dump --version
 ENTRYPOINT ["/usr/lib/podmesh-manager/podmesh-managerd"]
 CMD ["--config", "/etc/podmesh-manager/config.json", "--state-dir", "/var/lib/podmesh-manager", "--runtime-dir", "/run/podmesh-manager"]

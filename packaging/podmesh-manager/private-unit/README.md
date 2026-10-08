@@ -3,8 +3,12 @@
 This is a bounded candidate recipe, not an installer or a SHAPER integration
 claim. It reuses the exact CT-built `podmesh-managerd` binary, without compilation
 or downloads in the recipe. The base and the separate database container both use
-`docker.io/library/mariadb@sha256:53ef799caed285438d88678b529b4ff24406d4788f47ab8a74bb2212c707899a`.
-The inherited database entrypoint is replaced; the application container never
+`docker.io/library/mariadb@sha256:93fc3fe333b6cdfb061425869c2c3a5bb2851c0c74dbebc2c940f024e7482d76`.
+This is the confirmed Linux/amd64 registry manifest for MariaDB 11.8.9 on Ubuntu
+24.04; its local config image ID is
+`sha256:53ef799caed285438d88678b529b4ff24406d4788f47ab8a74bb2212c707899a`.
+A config ID is not a registry pull digest. Verify both identities and platform on
+the build host before construction. The inherited database entrypoint is replaced; the application container never
 starts a database. A colliding UID/GID or account refuses the image build rather
 than modifying an upstream identity.
 
@@ -13,17 +17,22 @@ than modifying an upstream identity.
 On the declared build host, create a private clean context containing this
 `Containerfile` and only the exact manifest-selected executable named
 `podmesh-managerd`. Require its manifest SHA-256 and the complete committed source
-revision. For example, with explicitly supplied values:
+revision of that executable's source, independently from the recipe revision.
+The pinned base already supplies `id`, `socat`, `mariadb` and `mariadb-dump`; the
+recipe checks their execution as UID/GID 1103 and stores all resolved package
+versions in `/usr/share/podmesh-manager/image-packages.tsv`. No Python or package
+installation is required by this wrapper. For example, with supplied values:
 
 ```sh
-podman build --pull=never --file "$CONTEXT/Containerfile" \
+podman build --platform linux/amd64 --pull=never --file "$CONTEXT/Containerfile" \
   --build-arg MANAGER_BINARY_SHA256="$MANAGER_BINARY_SHA256" \
-  --build-arg SOURCE_REVISION="$SOURCE_REVISION" \
+  --build-arg BINARY_SOURCE_REVISION="$BINARY_SOURCE_REVISION" \
+  --build-arg RECIPE_REVISION="$RECIPE_REVISION" \
   --tag "$APPLICATION_IMAGE" "$CONTEXT"
 ```
 
-The recipe verifies the copied bytes before changing their mode. Record source
-revision, binary hash, base digest, application image ID/digest, OCI export hash
+The recipe verifies the copied bytes before changing their mode. Record binary source
+revision and recipe revision separately, binary hash, base manifest/config ID/platform, application image ID/digest, OCI export hash
 and container user in the build manifest. Export that built image; runtime loads
 and runs the same export and verifies image identity. A rebuilt sibling image is
 not the qualified artifact. A hash label alone is not provenance: compare the
@@ -69,7 +78,7 @@ podman run --detach --name "$DB_CONTAINER" --pod "$UNIT_POD" \
   --mount "type=bind,source=$DB_INIT_DIR,destination=/docker-entrypoint-initdb.d,ro=true" \
   --mount "type=bind,source=$DB_ADMIN_SECRET,destination=/run/secrets/db-admin,ro=true" \
   --env MARIADB_ROOT_PASSWORD_FILE=/run/secrets/db-admin \
-  docker.io/library/mariadb@sha256:53ef799caed285438d88678b529b4ff24406d4788f47ab8a74bb2212c707899a
+  docker.io/library/mariadb@sha256:93fc3fe333b6cdfb061425869c2c3a5bb2851c0c74dbebc2c940f024e7482d76
 # Check private DB readiness and scoped application credentials before starting app.
 podman run --detach --name "$APP_CONTAINER" --pod "$UNIT_POD" \
   --mount "type=volume,source=$APP_VOLUME,destination=/var/lib/podmesh-manager" \
