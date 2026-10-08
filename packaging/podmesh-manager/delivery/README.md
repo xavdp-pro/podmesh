@@ -286,12 +286,49 @@ writable layer cannot be justified by retaining its raw archive. Installed Podma
 must prove `network_config_dir` and `network create --interface-name` support;
 each scope has a hash-derived private bridge and only its own network metadata.
 Qualification must observe the actual supported layout; a synthetic fixture is insufficient.
-The validator checks the actual closed schema and identities, rather than accepting
-or rejecting by version number alone. Engine version is recorded as provenance;
+The validator checks the actual closed schema and identities. Engine version is recorded as provenance;
 release/restore/verify require it unchanged. A stopped fixture on one engine version
 does not qualify nominal execution on another. The deployment must present its
 actual state to the strict validator and prove full SQL/functional restoration. Any different or unknown
 metadata path still refuses; there is no implicit version upgrade or schema fallback.
+
+The `bounded-private-vfs/v2` inventory distinguishes the engine's Bolt database
+from the supported Podman **5.4.2 SQLite** bookkeeping layout. `graphroot/db.sql`
+is the engine state database, separate from the private MariaDB application store.
+Read-only SQLite inspection checks integrity, foreign keys, the exact twelve-table
+schema fingerprint, schema version, private root/path bindings, observed pod/
+container/image/volume identities and the absence of active exec sessions or
+engine secret dependencies. Unknown sidecars, schema objects, resource identities
+or SQLite engine versions refuse. No database file is removed, edited or migrated.
+Exit diagnostics may include removed ephemeral inspectors; their bounded typed
+records are captured faithfully as engine history and never treated as live pods.
+
+For this layout, `secrets/` must contain only a root-owned empty `secrets.lock`;
+nonempty engine secret stores require a separately defined preservation contract.
+The observed OCI `userdata/config.json` is a bounded regular file with a known
+OCI version, owning layer/sandbox and mounts bound to the declared private root.
+Container-bound runroot health/log/network/previous-PID files and empty
+`tmp/persist` are classified explicitly. Previous PID bytes are retained as
+historical metadata; actual container PID0 establishes process quiescence.
+Every source byte and its metadata remains in the complete sealed archive.
+Restore preserves that source copy unchanged and explicitly records a newly
+generated engine database/layout for newly observed target resources; it never
+rewrites source SQLite IDs or uses the old engine database as the target's live
+state. The target engine backend must match the captured backend.
+
+The schema contract follows the tagged
+[Podman 5.4.2 SQLite implementation](https://github.com/containers/podman/blob/v5.4.2/libpod/sqlite_state_internal.go),
+including its creation constraints and namespace relationships. Targeted
+`RealEngineLayoutTests` require `PODMESH_ENGINE_LAYOUT_FIXTURE`, an absolute path
+to a protected descriptor with `isolated_metadata_copy:true`, `root`, `version`,
+`images`, `containers`, `volumes`, `pod` and `database_sha256`. The isolated test
+host reconstructs only original stopped engine metadata and empty payload/volume
+directories from the verified source capture, keeping the original root path
+bindings. The pass case calls both graphroot and stopped-runtime validators;
+mutating refusals act only on that disposable copied metadata and restore original
+bytes. These checks need neither a new engine nor a complete multi-gigabyte source
+tree on the test host. Full native capture/restore remains required on the actual
+engine and exact package; fixture passage is not that proof.
 
 Off-guest verification checkpoint has exactly these fields:
 `verified_offguest:true`, `manifest_sha256`, `archive_sha256`, `sql_sha256`.

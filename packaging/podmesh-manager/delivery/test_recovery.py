@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import os
+import sqlite3
 from pathlib import Path
 import subprocess
 import tarfile
@@ -20,6 +21,93 @@ HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("manager_native_recovery", HERE / "recovery.py")
 recovery = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(recovery)
+
+
+class RealEngineLayoutTests(unittest.TestCase):
+    """Require a private isolated copy of real engine metadata, never a live root.
+
+    The fixture host reconstructs only metadata and payload/volume directories
+    from a stopped capture, preserving root path bindings and original bytes.
+    No private application inputs, image layer bytes or provider calls are needed.
+    """
+    def fixture(self):
+        descriptor = Path(os.environ["PODMESH_ENGINE_LAYOUT_FIXTURE"])
+        obj = json.loads(descriptor.read_text())
+        self.assertTrue(obj["isolated_metadata_copy"])
+        self.assertEqual(obj["version"], "5.4.2")
+        root = Path(obj["root"])
+        self.assertTrue(root.is_absolute())
+        return root, obj
+
+    def check(self):
+        root, obj = self.fixture()
+        layout = recovery.closed_graphroot(root, set(obj["images"]), set(obj["containers"]),
+            set(obj["volumes"]), obj["version"], obj["pod"], "sqlite")
+        recovery.closed_runtime(root, set(obj["containers"]), obj["version"])
+        return layout
+
+    def test_real_stopped_sqlite_graphroot_and_runtime_pass_without_rewriting(self):
+        root, obj = self.fixture()
+        before = recovery.tree(root)
+        with patch.object(subprocess, "run", side_effect=AssertionError("provider forbidden")):
+            result = self.check()
+        self.assertEqual(result["engine_sqlite"]["sha256"], obj["database_sha256"])
+        self.assertEqual(result["engine_secrets"], "empty-lock-only")
+        self.assertEqual(result["engine_database_backend"], "sqlite")
+        self.assertEqual(recovery.tree(root), before)
+
+    def test_real_engine_database_unknown_schema_resource_and_sidecar_refuse(self):
+        root, obj = self.fixture()
+        database = root / "graphroot/db.sql"
+        original = database.read_bytes()
+        try:
+            for statement in ("CREATE TABLE foreign_state(value TEXT)",
+                              "INSERT INTO IDNamespace VALUES ('" + "f" * 64 + "')"):
+                try:
+                    with sqlite3.connect(database) as connection:
+                        connection.execute(statement)
+                    connection.close()
+                    with self.assertRaisesRegex(ValueError, "schema|resource identity"):
+                        self.check()
+                finally:
+                    database.write_bytes(original)
+            sidecar = database.with_name("db.sql-wal")
+            sidecar.write_bytes(b"preserve-unknown-sidecar")
+            try:
+                with self.assertRaisesRegex(ValueError, "sidecar|graphroot component"):
+                    self.check()
+            finally:
+                sidecar.unlink()
+        finally:
+            database.write_bytes(original)
+        self.assertEqual(recovery.digest(database), obj["database_sha256"])
+
+    def test_real_empty_secrets_unknown_runtime_and_oci_mount_refuse(self):
+        root, obj = self.fixture()
+        secret = root / "graphroot/secrets/secrets.json"
+        secret.write_bytes(b"{}")
+        try:
+            with self.assertRaisesRegex(ValueError, "secret store"):
+                self.check()
+        finally:
+            secret.unlink()
+        unknown = root / "tmp/persist/foreign-state"
+        unknown.write_bytes(b"preserve")
+        try:
+            with self.assertRaisesRegex(ValueError, "exit records"):
+                self.check()
+        finally:
+            unknown.unlink()
+        configuration = next((root / "graphroot/vfs-containers").glob("*/userdata/config.json"))
+        original = configuration.read_bytes()
+        try:
+            config = json.loads(original)
+            config["mounts"].append({"type": "bind", "source": "/foreign/private", "destination": "/foreign"})
+            configuration.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, "OCI bookkeeping mount"):
+                self.check()
+        finally:
+            configuration.write_bytes(original)
 
 
 class RecoveryTests(unittest.TestCase):
