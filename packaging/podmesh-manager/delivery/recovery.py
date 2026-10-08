@@ -560,9 +560,10 @@ def writable_scaffolding(rows, read_bytes, source_root, bindings, diffs, version
                     and len(mount["options"]) == len(options) and set(mount["options"]) == options,
                     "etc mount binding differs")
             source_row = rows.get(str(source.relative_to(source_root)))
-            require(source_row is not None and source_row["uid"] == source_row["gid"] == 0
-                    and not source_row["mode"] & 0o022
-                    and source_row["kind"] == ("directory" if destination == "/etc/podmesh-manager" else "file"),
+            application_config = destination == "/etc/podmesh-manager"
+            require(source_row is not None and source_row["uid"] == source_row["gid"] == (1103 if application_config else 0)
+                    and (source_row["mode"] == 0o700 if application_config else not source_row["mode"] & 0o022)
+                    and source_row["kind"] == ("directory" if application_config else "file"),
                     "etc mount source unavailable")
         base = etc_component(rows, "graphroot/vfs/dir/" + parent + "/etc")
         current = etc_component(rows, "graphroot/vfs/dir/" + layer + "/etc")

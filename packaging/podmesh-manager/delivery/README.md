@@ -350,6 +350,9 @@ mode0777 `mtab` symlink to `/proc/mounts`. When the infra image has no `/etc`,
 the created root-owned mode0755 directory may contain only that link and
 root-owned mode0700 empty `hostname`, `hosts` and `resolv.conf` files. Each file
 is tied to the owning container/pod's declared OCI bind source and options.
+The APP's `/etc/podmesh-manager` mount binds exactly the private `app-config`
+directory owned by account1103:1103 with mode0700; engine-generated host files
+remain root-owned. These ownership contracts are distinct and preserved.
 Extra files, changed existing content or metadata, foreign mounts, nonempty
 placeholders, wrong links or mismatched layer/image identities refuse.
 The v3 manifest retains all differences, complete physical bytes and metadata,

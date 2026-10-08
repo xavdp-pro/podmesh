@@ -346,6 +346,12 @@ class RealWritableScaffoldingTests(unittest.TestCase):
         with patch.object(subprocess, "run", side_effect=AssertionError("provider forbidden")):
             proof = self.proof(rows)
             self.assertEqual(set(proof), {"app", "db", "infra"})
+            self.assertEqual((rows["app-config"]["uid"], rows["app-config"]["gid"], rows["app-config"]["mode"]),
+                             (1103, 1103, 0o700))
+            changed = copy.deepcopy(rows)
+            changed["app-config"].update(uid=0, gid=0)
+            with self.assertRaisesRegex(ValueError, "etc mount source unavailable"):
+                self.proof(changed)
             self.assertEqual(proof["infra"]["image_etc_entries"], 0)
             self.assertEqual(proof["infra"]["container_etc_entries"], 5)
             for role, changes in diffs.items():
