@@ -6,7 +6,7 @@ publish = false
 
 [features]
 default = []
-mariadb = ["podmesh-manager-ha-lab/mariadb"]
+mariadb = ["podmesh-manager-ha-lab/mariadb", "podmesh-manager-network-lab/mariadb"]
 
 [dependencies]
 podmesh-manager-ha-lab = { path = "../manager-ha" }
