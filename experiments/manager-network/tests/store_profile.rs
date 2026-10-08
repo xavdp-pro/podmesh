@@ -208,7 +208,7 @@ fn real_private_mariadb_uncertain_history_dump_restore_and_useful_replay() {
         config.database_path.parent().unwrap(), &config.database_path, config.manager.clone(), &config.replica_id).unwrap();
     let inspect = |config: &ConfigurationFile| podmesh_manager_ha_lab::durable::inspect_profile::inspect_read_only_resolved(
         config.database_path.parent().unwrap(), &config.database_path, &config.manager, &config.replica_id).unwrap();
-    let original_receipt = open(&source).execute(&original).unwrap();
+    let original_receipt = open(&source).execute_with_receipt(&original).unwrap();
     let (send, receive) = mpsc::channel();
     let peer_config = peer.clone();
     let worker = thread::spawn(move || peer_config.open().unwrap().serve_once_drop_reply_after_decision(|address| {
@@ -243,13 +243,13 @@ fn real_private_mariadb_uncertain_history_dump_restore_and_useful_replay() {
     let imported = inspect(&restored);
     assert_eq!(serde_json::to_value(&captured).unwrap(), serde_json::to_value(&imported).unwrap(),
                "full canonical history must be equal before application use");
-    let replay = open(&restored).execute(&original).unwrap();
+    let replay = open(&restored).execute_with_receipt(&original).unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.response, original_receipt.response);
     assert_eq!(replay.receipt, original_receipt.receipt);
     let fresh = Request::Observe { operation_id: "fresh-after-restore".into(), scope: "scope1".into(),
         subject: "fresh-restoration-use".into(), exclusive_resource: None, active_claim: false, value: "fresh".into() };
-    assert!(!open(&restored).execute(&fresh).unwrap().replayed);
+    assert!(!open(&restored).execute_with_receipt(&fresh).unwrap().replayed);
     let (send, receive) = mpsc::channel();
     let peer_config = peer.clone();
     let worker = thread::spawn(move || peer_config.open().unwrap().serve_once_reporting_address(|address| {
