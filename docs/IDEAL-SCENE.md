@@ -116,9 +116,12 @@ the class behaves as *stay* and the guarantee statement says so.
 - **Volumes, databases, secrets and network identity** are covered by the same guarantee as the container: an
   application-consistent recovery point for the data, a dump for a database, secrets restorable from the operator's
   store by name, addresses and routes transferable.
-- **Shared replicated storage when present** (CephFS or equivalent): the data layer replicates the data; PodMesh
-  moves only the container and its memory, and uses the storage's own fencing (client eviction or blocklisting)
-  as the strongest exclusivity mechanism. When absent, copies and the Backup Server do the same job.
+- **Shared replicated storage is outside the scope PodMesh certifies** (operator decision, 23 September 2026: no
+  CephFS). Copies and the Backup Server carry the whole job of data protection and exclusivity on every topology
+  this document certifies. PodMesh still runs on hosts whose data happens to sit on such storage, and purpose 4
+  still holds, but it claims no storage-level fence and no failover without copying data, and it never presents a
+  storage's own replication as one of its guarantees. Should the operator reopen this, it returns as a conditional
+  target with its own mechanism, its own campaign and its own guarantee statement, and nothing here is assumed.
 
 ### 5.6 Losing a host for good
 1. An agent, under a mandate, declares the host lost; the decision is recorded by the majority (or by the operator
@@ -169,7 +172,7 @@ storage and states the guarantees; the tandem does not configure them by hand.
 | **Two hosts with a witness** (the Backup Server can carry it) | everything above; automatic failover for failover-class universes, decided by the side that holds the witness; the witness lost alone stops nothing | a cut that also isolates the witness from both hosts: no automatic decision |
 | **Three to nine hosts** | a majority manager; automatic failover per class; spread restoration after a declared loss; copies across failure domains | automatic decisions on a side without majority |
 | **Ten or more, or many added at once** | the same, with an odd number of voting replicas across failure domains and the others following; bulk enrollment; gradual rebalancing | nothing more than three to nine hosts guarantee: scale adds capacity and placement choices, not new guarantees |
-| **Any of the above with shared replicated storage** | data replication by the storage; failover without copying data; exclusivity enforced by the storage's client fencing | memory continuity still needs a checkpoint; storage outages are storage outages |
+| **Any of the above with shared replicated storage** | *withdrawn from certification, 23 September 2026 (no CephFS)*: nothing is claimed for this topology | the guarantee statement says plainly that PodMesh proves nothing here, and offers no storage-level fence; treat such a host as its topology above, protected by copies and the Backup Server |
 
 ## 7. Statistics that tell whether the scene is being reached
 
