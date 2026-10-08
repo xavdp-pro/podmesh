@@ -701,7 +701,10 @@ def closed_graphroot(root, images, containers, volumes, version="synthetic-test-
         names = row.get("big-data-names", [])
         sizes, digests = row.get("big-data-sizes", {}), row.get("big-data-digests", {})
         if row.get("metadata"):
-            require(json.loads(row["metadata"]) == {"signatures-sizes": {row["digest"]: []}},
+            signature_metadata = json.loads(row["metadata"])
+            unsigned_native = (version == "5.4.2" and signature_metadata == {}
+                and set(names) == {"manifest", "manifest-" + row["digest"], "sha256:" + image})
+            require(unsigned_native or signature_metadata == {"signatures-sizes": {row["digest"]: []}},
                     "unmapped image metadata/signature state")
         require(set(names) == set(sizes) == set(digests), "image big-data metadata incomplete")
         require(all(name == "manifest" or name == "sha256:" + image

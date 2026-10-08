@@ -130,6 +130,27 @@ class RealEngineLayoutTests(unittest.TestCase):
                 path.chmod(mode)
         self.check()
 
+    def test_real_unsigned_image_unknown_metadata_and_signature_state_refuse(self):
+        root, obj = self.fixture()
+        path = root / "graphroot/vfs-images/images.json"
+        original = path.read_bytes()
+        try:
+            for state in ({"unknown-state": True}, {"signatures-sizes": {"foreign": [1]}}):
+                rows = json.loads(original)
+                rows[0]["metadata"] = json.dumps(state)
+                path.write_text(json.dumps(rows))
+                with self.assertRaisesRegex(ValueError, "image metadata/signature state"):
+                    self.check()
+            rows = json.loads(original)
+            self.assertEqual(json.loads(rows[0]["metadata"]), {})
+            rows[0]["big-data-names"].append("signature-" + rows[0]["digest"].removeprefix("sha256:"))
+            path.write_text(json.dumps(rows))
+            with self.assertRaisesRegex(ValueError, "image metadata/signature state"):
+                self.check()
+        finally:
+            path.write_bytes(original)
+        self.check()
+
 
 class RecoveryTests(unittest.TestCase):
     def test_oracle_uses_durable_migration_marker_not_legacy_history_version(self):

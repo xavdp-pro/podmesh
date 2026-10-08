@@ -314,6 +314,12 @@ The observed `vfs-containers/volatile-containers.json` and
 `vfs-layers/volatile-layers.json` are root-owned mode0600 regular files containing
 exactly the two bytes `[]`. They are inventoried and preserved; nonempty state,
 symlinks and unknown volatile files refuse rather than being deleted or ignored.
+The unsigned 5.4.2 image metadata object may be exactly `{}` only when its
+big-data names contain exactly the image config digest, current manifest digest
+and `manifest`, with their declared sizes and hashes verified against all three
+files. This does not require a legacy `signatures-sizes` field absent from the
+native engine. Additional metadata, signature blobs or nonempty signature state
+are refused; all original image metadata and blobs remain captured unchanged.
 Every source byte and its metadata remains in the complete sealed archive.
 Restore preserves that source copy unchanged and explicitly records a newly
 generated engine database/layout for newly observed target resources; it never
