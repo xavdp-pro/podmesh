@@ -65,6 +65,7 @@ fn invalid_explicit_profile_refuses_without_creating_sqlite() {
     no_sqlite(directory.path());
 }
 
+#[cfg(feature = "mariadb")]
 #[test]
 fn unavailable_explicit_mariadb_profile_refuses_without_sqlite_fallback() {
     assert!(std::env::var_os("PODMESH_STORE_PROFILE").is_none());
@@ -73,19 +74,39 @@ fn unavailable_explicit_mariadb_profile_refuses_without_sqlite_fallback() {
     let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let endpoint = listener.local_addr().unwrap();
     drop(listener);
-    let profile = serde_json::json!({"store":{"engine":"mariadb","mariadb":{"host":"127.0.0.1","port":endpoint.port(),"user":"podmesh-manager","database":"unavailable-test","connect_timeout_ms":100}}});
+    let dsn = format!(
+        "mysql://fixture:fixture@127.0.0.1:{}/unavailable-test",
+        endpoint.port()
+    );
+    podmesh::store::MariadbConfig::from_dsn(dsn.clone())
+        .validate()
+        .unwrap();
+    let profile = serde_json::json!({"store":{"engine":"mariadb","mariadb":{"dsn":dsn,"connect_timeout_ms":100}}});
     std::fs::write(
         directory.path().join("store.json"),
         serde_json::to_vec(&profile).unwrap(),
     )
     .unwrap();
-    assert!(configuration(
+    let resolved = podmesh::resolve_manager_store_profile(
+        directory.path(),
+        &directory.path().join("manager.sqlite"),
+    )
+    .unwrap();
+    resolved.mariadb.validate().unwrap();
+    let result = configuration(
         directory.path(),
         1,
-        SocketAddr::from((Ipv4Addr::LOCALHOST, 9))
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
     )
-    .open()
-    .is_err());
+    .open();
+    let problem = match result {
+        Ok(_) => panic!("unavailable MariaDB must refuse"),
+        Err(problem) => problem,
+    };
+    assert!(
+        problem.to_string().contains("could not be opened"),
+        "must reach the MariaDB connection, not profile validation"
+    );
     no_sqlite(directory.path());
 }
 
