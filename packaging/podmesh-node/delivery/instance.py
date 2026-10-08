@@ -287,7 +287,7 @@ class Instance:
         protected(mount)
         os.chown(mount, 1102, 1102)
         mount.chmod(0o700)
-        pod = create("pod", self.prefix, ["--network=none", "--share=net"])
+        pod = create("pod", self.prefix, ["--network=none", "--share=net", "--userns=host"])
         self.r["pod"] = pod
         self.save()
         # Container create has a different CLI ordering (image after options).
@@ -310,7 +310,7 @@ class Instance:
                   "--env=MARIADB_ROOT_PASSWORD_FILE=/run/db-admin/passwd", "--env=MARIADB_PASSWORD_FILE=/run/app-config/passwd",
                   "--env=MARIADB_USER=podmesh-node", "--env=MARIADB_DATABASE=podmesh-node"],
                   ["mariadbd", "--bind-address=127.0.0.1"])
-        container("app", self.manifest["application_image"], ["--user=1102:1102", "--userns=host",
+        container("app", self.manifest["application_image"], ["--user=1102:1102",
                   "--read-only", "--read-only-tmpfs=false",
                   "--cap-drop=ALL", "--security-opt=no-new-privileges", "--memory=512m", "--memory-swap=512m", "--cpus=1",
                   "--volume", appvol+":/var/lib/podmesh-node", "--volume", str(self.root / "app-config")+":/etc/podmesh-node:ro",

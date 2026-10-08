@@ -323,7 +323,7 @@ class Instance:
                 require(candidate.version!=4 or not subnet.overlaps(candidate),"bridge overlaps configured network")
         network=create("network",self.prefix+"-net",["--subnet",str(subnet),"--gateway",plan["gateway"],"--interface-name",bridge])
         require(self.owned("network",network)["network_interface"]==bridge,"private bridge name differs")
-        options=["--network",network,"--ip",plan["pod_ip"],"--share=net"]
+        options=["--network",network,"--ip",plan["pod_ip"],"--share=net","--userns=host"]
         if recovery is not None:
             options += ["--infra-image",recovery["infra_image"]]
         if plan["peer_publish"]:
@@ -339,7 +339,7 @@ class Instance:
                    "--env=MARIADB_DATABASE=podmesh-manager","--env=MARIADB_PASSWORD_FILE=/run/app-passwd",
                    "--env=MARIADB_ROOT_PASSWORD_FILE=/run/db-admin/passwd"],self.manifest["database_image"],["mariadbd","--bind-address=127.0.0.1"])
         self.r["app"]=create("container",self.prefix+"-app",[*common,"--hostname",self.prefix+"-app",
-                   "--user=1103:1103","--userns=host","--cap-drop=ALL","--security-opt=no-new-privileges",
+                   "--user=1103:1103","--cap-drop=ALL","--security-opt=no-new-privileges",
                    "--read-only","--read-only-tmpfs=false","--volume",appvol+":/var/lib/podmesh-manager",
                    "--volume",str(self.root/"app-config")+":/etc/podmesh-manager:ro","--volume",str(self.root/"api")+":/run/podmesh-manager",
                    "--env=PODMESH_STORE_PROFILE=/etc/podmesh-manager/store.json","--env=PODMESH_MANAGER_NETWORK_MODE=authenticated-static-peers"],
