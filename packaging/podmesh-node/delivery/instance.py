@@ -248,6 +248,7 @@ class Instance:
             path = self.root / name
             path.mkdir(mode=mode)
             os.chown(path, uid, gid)
+            path.chmod(mode)
         write(self.root / "app-config/passwd", secrets[0], uid=1102, gid=1102)
         profile = {"engine":"mariadb", "mariadb":{"host":"127.0.0.1", "port":3306,
                    "user":"podmesh-node", "database":"podmesh-node", "password_file":"/etc/podmesh-node/passwd"}}
