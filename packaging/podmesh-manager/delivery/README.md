@@ -300,6 +300,12 @@ schema fingerprint, schema version, private root/path bindings, observed pod/
 container/image/volume identities and the absence of active exec sessions or
 engine secret dependencies. Unknown sidecars, schema objects, resource identities
 or SQLite engine versions refuse. No database file is removed, edited or migrated.
+Podman 5.4.2 saves the infra identity in `PodState.JSON.InfraContainerID` while
+its initial SQL `InfraContainerID` column may remain NULL. Validation requires
+the JSON identity to equal the infra container observed by Podman and the unique
+container whose persisted `pause` (IsInfra) flag is true. A non-NULL SQL column
+must agree. Missing, foreign, non-infra or contradictory identities refuse;
+the validator neither fills the column nor fabricates an identity.
 Exit diagnostics may include removed ephemeral inspectors; their bounded typed
 records are captured faithfully as engine history and never treated as live pods.
 
@@ -331,7 +337,7 @@ The schema contract follows the tagged
 including its creation constraints and namespace relationships. Targeted
 `RealEngineLayoutTests` require `PODMESH_ENGINE_LAYOUT_FIXTURE`, an absolute path
 to a protected descriptor with `isolated_metadata_copy:true`, `root`, `version`,
-`images`, `containers`, `volumes`, `pod` and `database_sha256`. The isolated test
+`images`, `containers`, `volumes`, `pod`, `infra` and `database_sha256`. The isolated test
 host reconstructs only original stopped engine metadata and empty payload/volume
 directories from the verified source capture, keeping the original root path
 bindings. The pass case calls both graphroot and stopped-runtime validators;

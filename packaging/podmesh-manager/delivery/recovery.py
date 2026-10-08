@@ -563,7 +563,7 @@ def closed_oci_config(path, root, layer, containers, volumes):
                 for mount in config["mounts"]), "unmapped OCI bookkeeping mount")
 
 
-def closed_sqlite_engine(root, images, containers, volumes, pod_id):
+def closed_sqlite_engine(root, images, containers, volumes, pod_id, infra_id):
     """Podman 5.4.2 engine bookkeeping only; never the application store.
 
     The schema fingerprint covers all twelve CREATE statements and constraints
@@ -576,6 +576,7 @@ def closed_sqlite_engine(root, images, containers, volumes, pod_id):
             and 0 < item.st_size <= MAX_SQL, "engine SQLite file metadata differs")
     before = digest(path)
     require(pod_id and pod_id not in containers, "observed engine pod identity required")
+    require(infra_id in containers, "observed engine infra container identity required")
     # The observed rollback-journal layout has no durable sidecars. Never ignore
     # a WAL, SHM or journal, or use immutable=1 to pretend one does not exist.
     require(not any(path.with_name(path.name + suffix).exists() for suffix in ("-wal", "-shm", "-journal")),
@@ -607,11 +608,15 @@ def closed_sqlite_engine(root, images, containers, volumes, pod_id):
                 ("VolumeConfig", "Name", volumes), ("VolumeState", "Name", volumes)):
             require({row[0] for row in connection.execute('SELECT "' + field + '" FROM "' + table + '"')} == expected,
                     "unmapped engine SQLite resource identity")
+        infra_containers = set()
         for identifier, name, pod, encoded in connection.execute("SELECT ID,Name,PodID,JSON FROM ContainerConfig"):
             config = json.loads(encoded)
             require(config["id"] == identifier and config["name"] == name and config.get("pod") == pod == pod_id
                     and config.get("rootfsImageID") in images and not config.get("secrets") and not config.get("secret_env"),
                     "engine container configuration or secret dependency differs")
+            if config.get("pause") is True:
+                infra_containers.add(identifier)
+        require(infra_containers == {infra_id}, "engine infra container role differs")
         for identifier, name, encoded in connection.execute("SELECT ID,Name,JSON FROM PodConfig"):
             config = json.loads(encoded)
             require(config["id"] == identifier and config["name"] == name, "engine pod JSON identity differs")
@@ -621,8 +626,13 @@ def closed_sqlite_engine(root, images, containers, volumes, pod_id):
                     and config.get("volumeDriver") in ("", "local")
                     and config.get("mountPoint") == str(graph / "volumes" / name / "_data"),
                     "engine volume JSON binding differs")
-        require(all(infra in containers for (infra,) in connection.execute("SELECT InfraContainerID FROM PodState")),
-                "engine infra container identity differs")
+        # SavePod in Podman 5.4.2 updates JSON, not the nullable SQL infra
+        # column populated at AddPod time. Bind JSON to the observed infra and
+        # its unique IsInfra (pause) role; never fill or repair the SQL column.
+        for identifier, column_infra, encoded in connection.execute("SELECT ID,InfraContainerID,JSON FROM PodState"):
+            state = json.loads(encoded)
+            require(identifier == pod_id and state.get("InfraContainerID") == infra_id
+                    and column_infra in (None, infra_id), "engine infra container identity differs")
         require(all(a in containers and b in containers for a, b in connection.execute("SELECT ID,DependencyID FROM ContainerDependency"))
                 and all(a in containers and b in volumes for a, b in connection.execute("SELECT ContainerID,VolumeName FROM ContainerVolume")),
                 "engine dependency/volume binding differs")
@@ -637,10 +647,10 @@ def closed_sqlite_engine(root, images, containers, volumes, pod_id):
         connection.close()
     require(digest(path) == before, "engine SQLite changed during read-only classification")
     return {"path": "db.sql", "sha256": before, "bytes": item.st_size, "schema_sha256": schema_sha,
-            "row_counts": counts, "exit_record_ids": [row[0] for row in exits]}
+            "row_counts": counts, "infra_container_id": infra_id, "exit_record_ids": [row[0] for row in exits]}
 
 
-def closed_graphroot(root, images, containers, volumes, version="synthetic-test-only", pod_id=None, database_backend="boltdb"):
+def closed_graphroot(root, images, containers, volumes, version="synthetic-test-only", pod_id=None, database_backend="boltdb", infra_id=None):
     """Bounded containers/storage VFS layout; unknown versions/layouts refuse.
 
     This classifies every path, including children. JSON metadata must refer only
@@ -776,7 +786,7 @@ def closed_graphroot(root, images, containers, volumes, version="synthetic-test-
     engine_files = set() if database_backend == "sqlite" else {"bolt_state.db"}
     require(directory.is_dir() and not directory.is_symlink()
             and {p.name for p in directory.iterdir()} <= engine_files, "unmapped libpod bookkeeping component")
-    sqlite_inventory = closed_sqlite_engine(root, images, containers, volumes, pod_id) if database_backend == "sqlite" else None
+    sqlite_inventory = closed_sqlite_engine(root, images, containers, volumes, pod_id, infra_id) if database_backend == "sqlite" else None
     secrets = graph / "secrets"
     require(database_backend != "sqlite" or secrets.exists(), "observed SQLite engine secret-lock store missing")
     if secrets.exists() or secrets.is_symlink():
@@ -828,7 +838,7 @@ def capture(instance, a, api):
     before.append(instance.inspect("container", pod_before["InfraContainerID"]))
     closed_graphroot(instance.root, {api.image_id(item["Image"]) for item in before},
                      {item["Id"] for item in before}, {instance.prefix + "-app", instance.prefix + "-db"}, version,
-                     pod_before["Id"], backend)
+                     pod_before["Id"], backend, pod_before["InfraContainerID"])
     instance.unitcheck()
     for name in instance.r["units"]:
         require(not api.run(["/usr/bin/systemctl", "show", "--property=DropInPaths", "--value", name]).stdout.strip(),
@@ -881,7 +891,7 @@ def capture(instance, a, api):
     require(set(instance.podman("volume", "ls", "--quiet").stdout.decode().split())
             == {instance.prefix + "-app", instance.prefix + "-db"}, "unmapped durable volume")
     layout = closed_graphroot(instance.root, allowed_images, {item["Id"] for item in inspect.values()},
-                              {instance.prefix + "-app", instance.prefix + "-db"}, version, pod["Id"], backend)
+                              {instance.prefix + "-app", instance.prefix + "-db"}, version, pod["Id"], backend, pod["InfraContainerID"])
     network_files = {p.name for p in (instance.root / "networks").iterdir()}
     require(instance.prefix + "-net.json" in network_files
             and network_files <= {instance.prefix + "-net.json", "cni.lock", "netavark.lock"},
@@ -1075,7 +1085,7 @@ def restore(instance, a, api):
     target_containers.append(instance.inspect("container", target_pod["InfraContainerID"]))
     target_layout = closed_graphroot(instance.root, {api.image_id(item["Image"]) for item in target_containers},
         {item["Id"] for item in target_containers}, {instance.prefix + "-app", instance.prefix + "-db"},
-        source_layout["engine_version"], target_pod["Id"], source_layout["engine_database_backend"])
+        source_layout["engine_version"], target_pod["Id"], source_layout["engine_database_backend"], target_pod["InfraContainerID"])
     origin["mapping"].append({"component": "engine-state-database", "source": source_layout,
         "target": target_layout, "behavior": "source-bytes-sealed-in-full-copy; target-regenerated-for-new-observed-resources"})
     instance.save()

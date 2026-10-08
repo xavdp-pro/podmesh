@@ -42,7 +42,7 @@ class RealEngineLayoutTests(unittest.TestCase):
     def check(self):
         root, obj = self.fixture()
         layout = recovery.closed_graphroot(root, set(obj["images"]), set(obj["containers"]),
-            set(obj["volumes"]), obj["version"], obj["pod"], "sqlite")
+            set(obj["volumes"]), obj["version"], obj["pod"], "sqlite", obj["infra"])
         recovery.closed_runtime(root, set(obj["containers"]), obj["version"])
         return layout
 
@@ -149,6 +149,58 @@ class RealEngineLayoutTests(unittest.TestCase):
                 self.check()
         finally:
             path.write_bytes(original)
+        self.check()
+
+    def test_real_nullable_sql_infra_requires_exact_json_observed_identity_and_role(self):
+        root, obj = self.fixture()
+        database = root / "graphroot/db.sql"
+        original = database.read_bytes()
+        connection = sqlite3.connect(database)
+        try:
+            column, encoded = connection.execute("SELECT InfraContainerID,JSON FROM PodState").fetchone()
+        finally:
+            connection.close()
+        self.assertIsNone(column)
+        state = json.loads(encoded)
+        self.assertEqual(state["InfraContainerID"], obj["infra"])
+        self.check()
+        noninfra = next(identifier for identifier in obj["containers"] if identifier != obj["infra"])
+        try:
+            for value in (None, "f" * 64, noninfra):
+                changed = dict(state, InfraContainerID=value)
+                connection = sqlite3.connect(database)
+                try:
+                    connection.execute("UPDATE PodState SET JSON=?", (json.dumps(changed),))
+                    connection.commit()
+                finally:
+                    connection.close()
+                try:
+                    with self.assertRaisesRegex(ValueError, "infra container identity"):
+                        self.check()
+                finally:
+                    database.write_bytes(original)
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute("UPDATE PodState SET InfraContainerID=?", (noninfra,))
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(ValueError, "infra container identity"):
+                self.check()
+            database.write_bytes(original)
+            connection = sqlite3.connect(database)
+            try:
+                encoded = connection.execute("SELECT JSON FROM ContainerConfig WHERE ID=?", (obj["infra"],)).fetchone()[0]
+                config = dict(json.loads(encoded), pause=False)
+                connection.execute("UPDATE ContainerConfig SET JSON=? WHERE ID=?", (json.dumps(config), obj["infra"]))
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(ValueError, "infra container role"):
+                self.check()
+        finally:
+            database.write_bytes(original)
+        self.assertEqual(recovery.digest(database), obj["database_sha256"])
         self.check()
 
 
