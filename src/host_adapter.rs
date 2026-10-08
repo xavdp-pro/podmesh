@@ -1706,6 +1706,65 @@ mod real_effect_tests {
             request("delete", &format!("delete-{nonce}"), &nonce),
         );
         assert!(policy.inspect(&nonce).unwrap().is_none());
+        // Model an interrupted host create with correct ownership labels but a wrong
+        // namespace. Observing/refusing it must not turn into success on retry.
+        let invalid_uuid = fs::read_to_string("/proc/sys/kernel/random/uuid")
+            .unwrap()
+            .trim()
+            .to_string();
+        let invalid_id = format!("invalid-{invalid_uuid}");
+        let mut invalid_intent = request("create", &invalid_id, &invalid_uuid);
+        invalid_intent["image"] = json!(image);
+        invalid_intent["command"] = json!(["true"]);
+        invalid_intent["network_profile"] = json!("isolated");
+        let invalid_action = json!({"kind":"create","uuid":invalid_uuid,"image":digest(&image).unwrap(),"command":["true"],"labels":{"io.podmesh.universe":invalid_uuid,"io.podmesh.creation-operation":invalid_id,"io.podmesh.network-profile":"isolated","io.podmesh.universe-profile":"flat"}});
+        use sha2::{Digest, Sha256};
+        let hash = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&invalid_action).unwrap())
+        );
+        policy.write_record(&invalid_uuid, &json!({"operation_id":invalid_id,"action_sha256":hash,"container_id":null,"base_image":digest(&image).unwrap()})).unwrap();
+        let malformed = command(
+            30,
+            &[
+                "create".into(),
+                "--pull=never".into(),
+                "--network=none".into(),
+                "--image-volume=ignore".into(),
+                "--ipc=host".into(),
+                "--name".into(),
+                format!("podmesh-{invalid_uuid}"),
+                "--label".into(),
+                format!("{SCOPE_LABEL}={}", policy.scope),
+                "--label".into(),
+                format!("{ACTION_LABEL}={hash}"),
+                "--label".into(),
+                format!("io.podmesh.creation-operation={invalid_id}"),
+                "--label".into(),
+                format!("io.podmesh.universe={invalid_uuid}"),
+                "--label".into(),
+                "io.podmesh.universe-profile=flat".into(),
+                image.clone(),
+                "true".into(),
+            ],
+        )
+        .unwrap();
+        assert!(malformed.status.success());
+        cleanup
+            .ids
+            .push(String::from_utf8(malformed.stdout).unwrap().trim().into());
+        for _ in 0..2 {
+            let refused = execute(
+                &policy,
+                &json!({"protocol":PROTOCOL,"action":invalid_action,"intent":invalid_intent}),
+            )
+            .unwrap_err();
+            assert!(refused.to_string().contains("private namespace envelope"));
+        }
+        assert!(
+            policy.inspect(&invalid_uuid).unwrap().is_some(),
+            "refusal never removes a container"
+        );
         // Replacing a previously bound container name cannot inherit adapter ownership.
         let replace = command(
             30,
