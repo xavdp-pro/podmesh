@@ -35,7 +35,7 @@ def validate_plan(plan):
     require(plan.get("protocol") == "podmesh-private-node-proof/1", "unknown proof plan")
     require(re.fullmatch(r"sha256:[0-9a-f]{64}", plan["image"]), "immutable local image required")
     require(plan["profile"] in ("flat", "nested"), "unknown universe profile")
-    require(isinstance(plan["mandate"], str) and plan["mandate"], "explicit mandate required")
+    require(isinstance(plan["mandate"], str) and 0 < len(plan["mandate"].encode()) <= 2048, "explicit bounded mandate required")
     for field in ("universe_uuid", "clone_uuid"):
         require(str(uuid.UUID(plan[field])) == plan[field], "canonical universe identity required")
     require(plan["universe_uuid"] != plan["clone_uuid"], "distinct clone identity required")
@@ -145,6 +145,7 @@ class Driver:
     def exercise(self, request):
         first = self.ok(request)
         stored = self.journal(request)
+        require(first == stored["result"], "API outcome must equal persisted SQL result")
         operation = request["operation"]
         if operation in ("start", "resume"):
             require(first.get("running") is True, "running effect must actually be observed")
@@ -161,6 +162,7 @@ class Driver:
         require(first.get("replayed") is not True, "first operation must be new")
         replay = self.ok(request)
         require(replay.get("replayed") is True and replay.get("historical") is True, "explicit historical replay required")
+        require(replay.get("original_result") == stored["result"], "replay must return the original SQL result")
         require(self.journal(request) == stored, "replay must not rewrite outcome or add attempts")
         return first
 
@@ -199,7 +201,8 @@ class Driver:
             before = {r["operation_id"]: self.journal(r) for r in planned}
             require(all(before[r["operation_id"]] == baseline.get(r["operation_id"]) for r in planned), "recovered journal must match saved source SQL evidence before replay")
             for request in planned:
-                require(self.ok(request).get("replayed") is True, "same ID must replay after external recovery")
+                replay = self.ok(request)
+                require(replay.get("replayed") is True and replay.get("original_result") == before[request["operation_id"]]["result"], "same ID must replay original SQL result after external recovery")
                 require(self.journal(request) == before[request["operation_id"]], "recovery replay must preserve SQL evidence")
             inventory = self.ok({"operation": "inventory"})
             original_id = baseline[planned[0]["operation_id"]]["result"]["container_id"]
@@ -277,7 +280,7 @@ def main():
         driver.phase()
     except Exception as problem:
         # No command stderr, DSN, password or profile contents in evidence or stdout.
-        driver.record("phase_failed", {"error_type": type(problem).__name__})
+        driver.record("phase_failed", {"error_type": type(problem).__name__, "local_assertion": str(problem) if type(problem) is RuntimeError else None})
         raise RuntimeError("phase failed; private evidence retained") from None
     finally:
         driver.file.close()
