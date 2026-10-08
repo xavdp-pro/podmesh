@@ -10,15 +10,16 @@ import shutil
 import subprocess
 import tarfile
 
-SOURCE = "3199d784a6177fa7652588833091b35ab88ba5c9"
-APP = "505fdb59685c41e32551fc31bf9f4206b13a4e13af6df9ace0e1b6d4fadb0dc6"
+SOURCE = "64238f882550100414172d68ab326c6d2a8bee8d"
+PROVIDER_SOURCE = "3199d784a6177fa7652588833091b35ab88ba5c9"
+APP = "b54869f450d0cbe3723e594f69513e6641f9435f946c3a9cd924e19e8db2f057"
 DB = "53ef799caed285438d88678b529b4ff24406d4788f47ab8a74bb2212c707899a"
 DB_ARCHIVE = "087a378584383840073ebc347e383229f9765572785b7b4cbf09f22a274b4efb"
 DB_MANIFEST = "sha256:4ca2b8d82f602cefca23a2f270a591c6b27e27d81d5e32ca8ecdf92cdad50a15"
 PINNED = {
-    "podmeshd": "45f92c5f92a54da5b921dce42b92083a7ee2cb2ab9bc5d94a55488e1d2b89d45",
+    "podmeshd": "3e0f7ba793f022343877c55957953ac494c29c6c5f1e0a3d85697def4c8af7b0",
     "podmesh-host-adapter": "cbd329c2400b7a919498e16012e393b26f24c22fd9bbf9478299eece35630d73",
-    "application.oci.tar": "9f829ac0b5966cde343ff5f6647e3ab8ecf65ef4389e5ee868310f6af88f03ca",
+    "application.oci.tar": "4bc1b7dc704a452795376f8c09c25dec9898b426b5919e22e744842600914158",
 }
 
 
@@ -104,6 +105,7 @@ def main():
     shutil.copyfile(source_dir.parents[2] / "LICENSE", payload / "LICENSE")
     shutil.copyfile(source_dir.parents[2] / "NOTICE", payload / "NOTICE")
     public = {"bundle": bundle, "binary_source_revision": SOURCE,
+              "provider_source_revision": PROVIDER_SOURCE,
               "recipe_revision": a.recipe_revision, "application_image": "sha256:" + APP,
               "database_image": "sha256:" + DB,
               "application_manifest": app_manifest, "database_manifest": db_manifest,
