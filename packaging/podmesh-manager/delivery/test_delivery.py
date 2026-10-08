@@ -195,6 +195,22 @@ class ManagerDeliveryTests(unittest.TestCase):
                 with self.assertRaises(instance.Refusal):
                     candidate.rollback()
 
+    def test_created_pod_plan_is_distinct_from_running_network_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate=self.candidate(Path(directory))
+            candidate.r["network_plan"]={"pod_ip":"10.203.72.2","gateway":"10.203.72.1"}
+            pod={"InfraConfig":{"HostNetwork":False,"Networks":[candidate.prefix+"-net"],"StaticIP":"10.203.72.2"}}
+            infra={"State":{"Running":False},"NetworkSettings":{"Networks":{}}}
+            candidate.check_infra_network(pod,infra)
+            infra["State"]["Running"]=True
+            with self.assertRaises(instance.Refusal):
+                candidate.check_infra_network(pod,infra)
+            infra["NetworkSettings"]["Networks"]={candidate.prefix+"-net":{"IPAddress":"10.203.72.2","Gateway":"10.203.72.1"}}
+            candidate.check_infra_network(pod,infra)
+            infra["NetworkSettings"]["Networks"][candidate.prefix+"-net"]["IPAddress"]="10.203.72.3"
+            with self.assertRaises(instance.Refusal):
+                candidate.check_infra_network(pod,infra)
+
     def test_oci_compressed_integrity_does_not_replace_rootfs_binding(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/"wrong-rootfs.tar"

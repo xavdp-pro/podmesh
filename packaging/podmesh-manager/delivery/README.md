@@ -107,7 +107,10 @@ namespace, its upstream service identity initializes a new separate volume.
 Only the declared peer endpoint can be published by the infra container. Container,
 pod/infra, exact peer publication and bridge/subnet identity are inspected. No
 DB publication is permitted. Deployment must independently verify actual bridge
-routing and the absence of unintended exposure.
+routing and the absence of unintended exposure. Before start, inspection checks
+the declared private network/static-IP plan; it does not claim an assigned namespace.
+Once infra runs, readiness additionally requires the exact actual network, IP and
+gateway. A created pod is not a live network observation.
 
 The application is actual numeric1103:1103, rootfs read-only without automatic tmpfs,
 capabilities dropped, no-new-privileges and host user namespace. It gets exactly

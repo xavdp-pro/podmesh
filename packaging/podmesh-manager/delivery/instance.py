@@ -357,16 +357,25 @@ class Instance:
         net=self.owned("network",self.prefix+"-net")
         require(net is not None and net["name"]==self.prefix+"-net","private bridge identity differs")
         require(net["subnets"]==[{"subnet":self.r["network_plan"]["subnet"],"gateway":self.r["network_plan"]["gateway"]}],"private bridge subnet differs")
-        attached=infra["NetworkSettings"]["Networks"]
-        require(set(attached)=={self.prefix+"-net"},"infra joined an undeclared network")
-        actual=attached[self.prefix+"-net"]
-        require(actual["IPAddress"]==self.r["network_plan"]["pod_ip"] and actual["Gateway"]==self.r["network_plan"]["gateway"],
-                "infra bridge addresses differ")
+        self.check_infra_network(pod,infra)
         if role=="app":
             require(item["Config"]["User"]=="1103:1103" and host["ReadonlyRootfs"] and not item.get("EffectiveCaps",[]) and "no-new-privileges" in host["SecurityOpt"],"application isolation differs")
             env=dict(s.split("=",1) for s in item["Config"]["Env"])
             require(env.get("PODMESH_STORE_PROFILE")=="/etc/podmesh-manager/store.json" and env.get("PODMESH_MANAGER_NETWORK_MODE")=="authenticated-static-peers","application profile/network mode differs")
         return item
+
+    def check_infra_network(self,pod,infra):
+        # Creation is not an observation of an assigned network namespace. Verify
+        # the immutable planned scope first, and actual addresses once running.
+        declared=pod["InfraConfig"]
+        require(not declared["HostNetwork"] and declared["Networks"]==[self.prefix+"-net"]
+                and declared["StaticIP"]==self.r["network_plan"]["pod_ip"],"planned pod network differs")
+        if infra["State"]["Running"]:
+            attached=infra["NetworkSettings"]["Networks"]
+            require(set(attached)=={self.prefix+"-net"},"infra joined an undeclared network")
+            actual=attached[self.prefix+"-net"]
+            require(actual["IPAddress"]==self.r["network_plan"]["pod_ip"]
+                    and actual["Gateway"]==self.r["network_plan"]["gateway"],"actual infra bridge addresses differ")
 
     def control_api(self,operation):
         require(operation in ("status","shutdown"),"only product control/readiness operations allowed")
