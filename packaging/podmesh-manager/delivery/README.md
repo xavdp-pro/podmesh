@@ -259,8 +259,9 @@ Existing instance receipts remain bound to their original bundle. A corrected
 helper/package is qualified on new scopes; it never adopts an older bundle's
 instance or rewrites its receipt.
 
-The capture contract is `manager-full-capture/v2`; older captures without the
-explicit uncertainty inventory are refused rather than reinterpreted. A targeted
+The capture contract is `manager-full-capture/v3`; older captures without the
+explicit uncertainty inventory and sealed writable scaffolding proof are refused
+rather than reinterpreted. A targeted
 isolated regression, `real_private_mariadb_uncertain_history_dump_restore_and_useful_replay`,
 requires three distinct fresh private servers through `PODMESH_MARIADB_DSN`,
 `PODMESH_MARIADB_PEER_DSN`, and `PODMESH_MARIADB_RESTORE_DSN`, with no inherited
@@ -331,6 +332,40 @@ The targeted metadata test recreates the observed running IPC shape on its
 private copy, checks preflight passage and stopped refusal, then removes only
 its own test objects and proves the original tree remains exact. It does not
 claim to exercise real engine shutdown; that transition requires native VM proof.
+Podman 5.4.2's `diff --format=json` CLI returns an object with optional
+`changed`, `added` and `deleted` arrays of paths (an empty object means no
+changes). Capture translates only that known representation into canonical
+`Path`/`Kind` rows, using modify=0, add=1 and delete=2. Every path and group
+survives conversion, including repeated paths; unknown fields or malformed
+arrays refuse. The existing writable-state rules then apply: APP/infra must
+have no changes, and DB differences must remain within the declared transient
+paths. A real durable change still refuses, with no SQL-only fallback.
+Sealed manifests store every canonical row. This contract follows the tagged
+[Podman CLI diff encoder](https://github.com/containers/podman/blob/v5.4.2/cmd/podman/diff/diff.go).
+The sole supported `/etc` structural difference is proved against the complete
+image-final-layer and container-writable-layer trees. Existing entries retain
+their file hashes, metadata, xattrs, hardlinks and symlink targets exactly; only
+the `/etc` directory mtime may differ. The only added entry is a root-owned
+mode0777 `mtab` symlink to `/proc/mounts`. When the infra image has no `/etc`,
+the created root-owned mode0755 directory may contain only that link and
+root-owned mode0700 empty `hostname`, `hosts` and `resolv.conf` files. Each file
+is tied to the owning container/pod's declared OCI bind source and options.
+Extra files, changed existing content or metadata, foreign mounts, nonempty
+placeholders, wrong links or mismatched layer/image identities refuse.
+The v3 manifest retains all differences, complete physical bytes and metadata,
+and a per-role `writable_scaffolding` proof. Release/restore regenerate this
+proof from the sealed full-tree inventory and hash-bound engine/OCI JSON read
+as data from the archive. They compare the regenerated proof exactly; a claimed
+exception without that evidence is refused. No source file or diff is erased.
+Targeted `RealWritableScaffoldingTests` require a protected descriptor named by
+`PODMESH_WRITABLE_SCAFFOLD_FIXTURE`, with `isolated_metadata_copy:true`, `root`,
+`version`, actual stopped role `bindings`, `pod` and original CLI `diffs`.
+The isolated host preserves actual `/etc` subtree contents/metadata and the
+necessary engine/OCI JSON and mount-source metadata only. Tests regenerate
+`recovery.tree` on that private copy; a Runtime forensic index is not assumed
+to have the same schema. Coverage includes all groups/kinds, actual structural
+passage, durable/metadata/mount tampering refusals and v3 sealed-proof loading.
+That metadata proof does not replace full native capture/restoration.
 The native 5.4.2 `tmp/alive` file contains the kernel boot ID: exactly one
 canonical lowercase UUID followed by a newline (37 bytes). Its root-owned
 mode0644 regular file and the empty `alive.lck` are retained unchanged, with

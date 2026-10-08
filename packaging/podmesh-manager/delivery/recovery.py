@@ -428,12 +428,44 @@ def sql_dump(instance):
     return result.stdout
 
 
-def safe_diff(rows, role):
+def cli_diff_rows(value, version):
+    """Translate the tagged native CLI representation at capture's boundary."""
+    if version == "5.4.2":
+        groups = (("changed", 0), ("added", 1), ("deleted", 2))
+        require(isinstance(value, dict) and set(value) <= {name for name, _ in groups},
+                "unclassified engine writable layer JSON")
+        rows = []
+        for name, kind in groups:
+            paths = value.get(name, [])
+            require(isinstance(paths, list) and all(isinstance(path, str) for path in paths),
+                    "unclassified engine writable layer JSON")
+            rows.extend({"Path": path, "Kind": kind} for path in paths)
+        value = rows
+    require(isinstance(value, list), "writable layer inventory unavailable")
+    return value
+
+
+def cli_writable_diff(value, role, version):
+    return safe_diff(cli_diff_rows(value, version), role)
+
+
+def safe_diff(rows, role, scaffolding=None):
     require(isinstance(rows, list), "writable layer inventory unavailable")
+    require(all(isinstance(row, dict) and set(row) == {"Path", "Kind"}
+                and isinstance(row["Path"], str) and type(row["Kind"]) is int
+                and row["Kind"] in (0, 1, 2) for row in rows), "invalid canonical writable layer row")
+    remaining = rows
+    if scaffolding is not None:
+        require(scaffolding["role"] == role and scaffolding["type"] == "engine-etc-scaffolding/v1",
+                "writable scaffolding role differs")
+        etc = [row for row in rows if row.get("Path") == "/etc"]
+        require(etc == [{"Path": "/etc", "Kind": scaffolding["diff_kind"]}],
+                "writable scaffolding diff differs")
+        remaining = [row for row in rows if row.get("Path") != "/etc"]
     if role in ("app", "infra"):
-        require(not rows, "unmapped durable application/infra writable layer")
+        require(not remaining, "unmapped durable application/infra writable layer")
     else:
-        for row in rows:
+        for row in remaining:
             path = row.get("Path")
             require(isinstance(path, str) and Path(path).is_absolute() and ".." not in Path(path).parts,
                     "invalid writable layer path")
@@ -441,6 +473,132 @@ def safe_diff(rows, role):
                         for prefix in ("/run", "/tmp", "/var/run", "/var/tmp")),
                     "unmapped database writable layer; no SQL-only fallback")
     return rows
+
+
+def row_hash(rows):
+    return hashlib.sha256(json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def etc_component(rows, prefix):
+    """Preserve symlinks as data; require file hardlinks confined to this tree."""
+    result = {}
+    for name, row in rows.items():
+        if name == prefix or name.startswith(prefix + "/"):
+            key = "." if name == prefix else name[len(prefix) + 1:]
+            value = dict(row)
+            if value["kind"] == "file":
+                anchor = value["hardlink"]
+                require(anchor.startswith(prefix + "/"), "etc hardlink escapes its component")
+                value["hardlink"] = anchor[len(prefix) + 1:]
+            result[key] = value
+    return result
+
+
+def writable_scaffolding(rows, read_bytes, source_root, bindings, diffs, version):
+    """Regenerate the proof from physical or hash-bound sealed tree data."""
+    require(set(bindings) == set(diffs) == {"app", "db", "infra"}, "writable role bindings incomplete")
+    def data(name):
+        row = rows.get(name)
+        require(row is not None and row["kind"] == "file" and row["uid"] == row["gid"] == 0
+                and not row["mode"] & 0o022 and row["hardlink"] == name
+                and 0 < row["size"] <= 8 * 1024 ** 2,
+                "sealed engine JSON unavailable")
+        raw = read_bytes(name)
+        require(len(raw) == row["size"] and hashlib.sha256(raw).hexdigest() == row["sha256"],
+                "sealed engine JSON hash differs")
+        return json.loads(raw)
+    if not any(row.get("Path") == "/etc" for changes in diffs.values() for row in changes):
+        return {}
+    require(version == "5.4.2", "unclassified engine etc scaffolding version")
+    metadata = {}
+    for kind in ("containers", "images", "layers"):
+        values = data("graphroot/vfs-" + kind + "/" + kind + ".json")
+        require(isinstance(values, list), "engine resource metadata differs")
+        metadata[kind] = {row["id"]: row for row in values}
+        require(len(metadata[kind]) == len(values), "duplicate engine resource identity")
+    ids = {item["Id"] for item in bindings.values()}
+    require(len(ids) == 3, "writable role identities differ")
+    infra = bindings["infra"]["Id"]
+    result = {}
+    for role, item in bindings.items():
+        if not any(row.get("Path") == "/etc" for row in diffs[role]):
+            continue
+        cid, image = item["Id"], item["Image"].removeprefix("sha256:")
+        container = metadata["containers"].get(cid)
+        parent_image = metadata["images"].get(image)
+        require(container is not None and parent_image is not None and container["image"] == image,
+                "writable image binding differs")
+        layer, parent = container["layer"], parent_image["layer"]
+        require(all(isinstance(value, str) and len(value) == 64
+                    and all(character in "0123456789abcdef" for character in value)
+                    for value in (cid, image, layer, parent)), "noncanonical writable resource identity")
+        require(metadata["layers"].get(layer, {}).get("parent") == parent
+                and parent in metadata["layers"], "writable parent layer differs")
+        config_name = "graphroot/vfs-containers/" + cid + "/userdata/config.json"
+        config = data(config_name)
+        require(config["ociVersion"] == "1.2.0"
+                and config["root"]["path"] == str(source_root / "graphroot/vfs/dir" / layer)
+                and config["annotations"].get("io.container.manager") == "libpod",
+                "writable OCI root binding differs")
+        mounts = [mount for mount in config["mounts"] if mount["destination"].startswith("/etc")]
+        expected = {"/etc/hostname", "/etc/hosts", "/etc/resolv.conf"}
+        if role == "app":
+            expected.add("/etc/podmesh-manager")
+        require(len(mounts) == len(expected) and {mount["destination"] for mount in mounts} == expected,
+                "unclassified etc mount destinations")
+        for mount in mounts:
+            destination = mount["destination"]
+            if destination == "/etc/podmesh-manager":
+                source, options = source_root / "app-config", {"ro", "rprivate", "rbind"}
+            else:
+                owner = cid if destination == "/etc/hostname" else infra
+                source = source_root / "r/vfs-containers" / owner / "userdata" / Path(destination).name
+                options = {"bind", "rprivate"}
+                if role == "app":
+                    options |= {"ro", "nosuid", "noexec", "nodev"}
+            require(mount["type"] == "bind" and mount["source"] == str(source)
+                    and len(mount["options"]) == len(options) and set(mount["options"]) == options,
+                    "etc mount binding differs")
+            source_row = rows.get(str(source.relative_to(source_root)))
+            require(source_row is not None and source_row["uid"] == source_row["gid"] == 0
+                    and not source_row["mode"] & 0o022
+                    and source_row["kind"] == ("directory" if destination == "/etc/podmesh-manager" else "file"),
+                    "etc mount source unavailable")
+        base = etc_component(rows, "graphroot/vfs/dir/" + parent + "/etc")
+        current = etc_component(rows, "graphroot/vfs/dir/" + layer + "/etc")
+        require("." in current and current["."]["kind"] == "directory", "writable etc directory missing")
+        mtab = current.get("mtab", {})
+        require("mtab" not in base and mtab.get("kind") == "symlink" and mtab.get("link") == "/proc/mounts"
+                and mtab.get("mode") == 0o777 and mtab.get("uid") == mtab.get("gid") == 0
+                and mtab.get("xattrs") == {}, "unclassified etc mount table")
+        if base:
+            require(set(current) == set(base) | {"mtab"}, "unmapped etc entries")
+            for name, original in base.items():
+                observed = current[name]
+                if name == ".":
+                    original = {key: value for key, value in original.items() if key != "mtime_ns"}
+                    observed = {key: value for key, value in observed.items() if key != "mtime_ns"}
+                require(observed == original, "durable etc content or metadata differs")
+            kind = 0
+        else:
+            require(role == "infra" and set(current) == {".", "mtab", "hostname", "hosts", "resolv.conf"},
+                    "unmapped added etc directory")
+            directory = current["."]
+            require(directory["mode"] == 0o755 and directory["uid"] == directory["gid"] == 0
+                    and directory["xattrs"] == {}, "added etc directory metadata differs")
+            for name in ("hostname", "hosts", "resolv.conf"):
+                row = current[name]
+                require(row["kind"] == "file" and row["mode"] == 0o700 and row["uid"] == row["gid"] == 0
+                        and row["size"] == 0 and row["sha256"] == hashlib.sha256(b"").hexdigest()
+                        and row["xattrs"] == {} and row["hardlink"] == name and row["extents"] == [],
+                        "unclassified etc mount placeholder")
+            kind = 1
+        result[role] = {"type": "engine-etc-scaffolding/v1", "role": role, "container_id": cid,
+            "image_id": image, "writable_layer": layer, "image_layer": parent,
+            "oci_config_sha256": rows[config_name]["sha256"], "etc_mounts": mounts,
+            "image_etc_sha256": row_hash(base), "container_etc_sha256": row_hash(current),
+            "image_etc_entries": len(base), "container_etc_entries": len(current), "diff_kind": kind}
+    return result
 
 
 def observation_scope(config, replica, previous):
@@ -913,7 +1071,7 @@ def capture(instance, a, api):
         require(not item["State"]["Running"] and item["State"]["Pid"] == 0, "source process remains")
     closed_inputs(instance.root, stopped=True)
     closed_runtime(instance.root, {item["Id"] for item in inspect.values()}, version)
-    diffs = {role: safe_diff(json.loads(instance.podman("diff", "--format=json", item["Id"]).stdout), role)
+    diffs = {role: cli_diff_rows(json.loads(instance.podman("diff", "--format=json", item["Id"]).stdout), version)
              for role, item in inspect.items()}
     allowed_images = {api.image_id(item["Image"]) for item in inspect.values()}
     images = json.loads(instance.podman("images", "--all", "--no-trunc", "--format=json").stdout)
@@ -924,6 +1082,10 @@ def capture(instance, a, api):
             == {instance.prefix + "-app", instance.prefix + "-db"}, "unmapped durable volume")
     layout = closed_graphroot(instance.root, allowed_images, {item["Id"] for item in inspect.values()},
                               {instance.prefix + "-app", instance.prefix + "-db"}, version, pod["Id"], backend, pod["InfraContainerID"])
+    scaffolding = writable_scaffolding(tree(instance.root), lambda name: (instance.root / name).read_bytes(),
+                                      instance.root, inspect, diffs, version)
+    for role, changes in diffs.items():
+        safe_diff(changes, role, scaffolding.get(role))
     network_files = {p.name for p in (instance.root / "networks").iterdir()}
     require(instance.prefix + "-net.json" in network_files
             and network_files <= {instance.prefix + "-net.json", "cni.lock", "netavark.lock"},
@@ -965,6 +1127,9 @@ def capture(instance, a, api):
     instance.r["phase"] = "capture-stopped"
     instance.save()
     rows = tree(instance.root)
+    require(writable_scaffolding(rows, lambda name: (instance.root / name).read_bytes(),
+                                instance.root, inspect, diffs, version) == scaffolding,
+            "writable scaffolding changed before complete capture")
     require(shutil.disk_usage(output).free >= 2 * validate_tree(rows) + 256 * 1024 ** 2,
             "capture capacity insufficient")
     for prefix in volume_paths.values():
@@ -976,13 +1141,13 @@ def capture(instance, a, api):
     with archive.open("rb") as stream:
         os.fsync(stream.fileno())
     require(tree(instance.root) == rows, "source changed during complete capture")
-    manifest = {"type": "manager-full-capture/v2", "capture_id": capture_id,
+    manifest = {"type": "manager-full-capture/v3", "capture_id": capture_id,
                 "scope": instance.scope, "bundle": instance.r["bundle"],
                 "machine_id": instance.r["machine_id"], "replica_id": instance.r["replica_id"],
                 "receipt": instance.r, "receipt_sha256": digest(instance.receipt),
                 "archive_sha256": digest(archive), "sql_sha256": digest(output / "store.sql"),
                 "tree": rows, "volume_paths": volume_paths, "image_files": image_files,
-                "sql_identity": sql_identity, "writable_layers": diffs}
+                "sql_identity": sql_identity, "writable_layers": diffs, "writable_scaffolding": scaffolding}
     api.jsonwrite(output / "capture.json", manifest)
     return {"state": "capture-stopped", "capture": str(output), "manifest_sha256": digest(output / "capture.json")}
 
@@ -992,8 +1157,8 @@ def load_capture(path, api):
     manifest = document(path / "capture.json")
     exact(manifest, ("type", "capture_id", "scope", "bundle", "machine_id", "replica_id", "receipt",
                      "receipt_sha256", "archive_sha256", "sql_sha256", "tree", "volume_paths", "image_files",
-                     "sql_identity", "writable_layers"))
-    require(manifest["type"] == "manager-full-capture/v2", "unknown capture contract; exact uncertainty inventory required")
+                     "sql_identity", "writable_layers", "writable_scaffolding"))
+    require(manifest["type"] == "manager-full-capture/v3", "unknown capture contract; sealed writable proof required")
     exact(manifest["sql_identity"]["historical_uncertainty"], ("type", "attempts", "audit_events"))
     require(manifest["sql_identity"]["historical_uncertainty"]["type"] == "manager-historical-uncertainty/v1",
             "unknown historical uncertainty contract")
@@ -1005,14 +1170,36 @@ def load_capture(path, api):
     validate_tree(manifest["tree"])
     require(manifest["tree"]["instance.json"]["sha256"] == manifest["receipt_sha256"],
             "captured receipt hash differs from full tree")
-    for role, rows in manifest["writable_layers"].items():
-        safe_diff(rows, role)
     require(set(manifest["writable_layers"]) == {"app", "db", "infra"}, "writable layer inventory incomplete")
     for name, value in {"source-full.tar": manifest["archive_sha256"], "store.sql": manifest["sql_sha256"],
                         **manifest["image_files"]}.items():
         require(Path(name).name == name, "unsafe capture member")
         private(path / name)
         require(digest(path / name) == value, "capture content hash differs")
+    require(Path(manifest["scope"]).name == manifest["scope"], "unsafe capture scope")
+    with tarfile.open(path / "source-full.tar", "r:") as archive:
+        def sealed(name):
+            member = archive.getmember(manifest["scope"] + "/" + name)
+            row = manifest["tree"].get(name)
+            require(row is not None and row["kind"] == "file" and member.isfile()
+                    and member.size == row["size"] <= 8 * 1024 ** 2, "sealed proof member differs")
+            raw = archive.extractfile(member).read()
+            require(hashlib.sha256(raw).hexdigest() == row["sha256"], "sealed proof member hash differs")
+            return raw
+        components = json.loads(sealed("recovery-components.json"))
+        bindings = components["containers"]
+        require(bindings["app"]["Id"] == manifest["receipt"]["app"]
+                and bindings["db"]["Id"] == manifest["receipt"]["db"]
+                and components["pod"]["Id"] == manifest["receipt"]["pod"]
+                and bindings["infra"]["Id"] == components["pod"]["InfraContainerID"],
+                "sealed writable resource bindings differ")
+        require(all(not item["State"]["Running"] and item["State"]["Pid"] == 0
+                    for item in bindings.values()), "sealed writable source is not stopped")
+        proof = writable_scaffolding(manifest["tree"], sealed, api.BASE / manifest["scope"], bindings,
+            manifest["writable_layers"], components["storage_layout"]["engine_version"])
+        require(proof == manifest["writable_scaffolding"], "sealed writable scaffolding proof differs")
+        for role, changes in manifest["writable_layers"].items():
+            safe_diff(changes, role, proof.get(role))
     return manifest
 
 

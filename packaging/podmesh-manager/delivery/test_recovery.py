@@ -321,6 +321,132 @@ class RealEngineLayoutTests(unittest.TestCase):
         self.check()
 
 
+class RealWritableScaffoldingTests(unittest.TestCase):
+    """Use a private copy of actual stopped /etc trees and engine JSON only."""
+    def fixture(self):
+        obj = json.loads(Path(os.environ["PODMESH_WRITABLE_SCAFFOLD_FIXTURE"]).read_text())
+        self.assertTrue(obj["isolated_metadata_copy"])
+        self.assertEqual(obj["version"], "5.4.2")
+        root = Path(obj["root"])
+        self.assertTrue(root.is_absolute())
+        diffs = {role: recovery.cli_diff_rows(value, obj["version"]) for role, value in obj["diffs"].items()}
+        return root, obj, diffs
+
+    def proof(self, rows=None, replacements=None):
+        root, obj, diffs = self.fixture()
+        rows = recovery.tree(root) if rows is None else rows
+        replacements = replacements or {}
+        return recovery.writable_scaffolding(rows,
+            lambda name: replacements[name] if name in replacements else (root / name).read_bytes(),
+            root, obj["bindings"], diffs, obj["version"])
+
+    def test_actual_etc_scaffolding_preserves_all_rows_and_refuses_mutations(self):
+        root, obj, diffs = self.fixture()
+        rows = recovery.tree(root)
+        with patch.object(subprocess, "run", side_effect=AssertionError("provider forbidden")):
+            proof = self.proof(rows)
+            self.assertEqual(set(proof), {"app", "db", "infra"})
+            self.assertEqual(proof["infra"]["image_etc_entries"], 0)
+            self.assertEqual(proof["infra"]["container_etc_entries"], 5)
+            for role, changes in diffs.items():
+                self.assertEqual(len(changes), sum(len(group) for group in obj["diffs"][role].values()))
+                self.assertEqual(recovery.safe_diff(changes, role, proof[role]), changes)
+                with self.assertRaises(ValueError):
+                    recovery.safe_diff(changes, role)
+            for role in ("app", "db"):
+                prefix = "graphroot/vfs/dir/" + proof[role]["writable_layer"] + "/etc"
+                ordinary = next(name for name, row in rows.items()
+                                if name.startswith(prefix + "/") and row["kind"] == "file")
+                changed = copy.deepcopy(rows)
+                changed[ordinary]["sha256"] = "0" * 64
+                with self.assertRaisesRegex(ValueError, "durable etc"):
+                    self.proof(changed)
+                changed = copy.deepcopy(rows)
+                changed[prefix]["xattrs"] = {"user.foreign": "eA=="}
+                with self.assertRaisesRegex(ValueError, "durable etc"):
+                    self.proof(changed)
+                changed = copy.deepcopy(rows)
+                changed[prefix + "/mtab"]["link"] = "/foreign/mounts"
+                with self.assertRaisesRegex(ValueError, "mount table"):
+                    self.proof(changed)
+            prefix = "graphroot/vfs/dir/" + proof["infra"]["writable_layer"] + "/etc"
+            changed = copy.deepcopy(rows)
+            changed[prefix + "/hosts"]["size"] = 1
+            with self.assertRaisesRegex(ValueError, "mount placeholder"):
+                self.proof(changed)
+            changed = copy.deepcopy(rows)
+            changed[prefix + "/foreign"] = dict(changed[prefix + "/mtab"])
+            with self.assertRaisesRegex(ValueError, "added etc directory"):
+                self.proof(changed)
+            name = "graphroot/vfs-containers/" + proof["app"]["container_id"] + "/userdata/config.json"
+            config = json.loads((root / name).read_bytes())
+            next(m for m in config["mounts"] if m["destination"] == "/etc/hosts")["source"] = "/foreign/hosts"
+            raw = json.dumps(config).encode()
+            changed = copy.deepcopy(rows)
+            changed[name].update(size=len(raw), sha256=recovery.hashlib.sha256(raw).hexdigest())
+            with self.assertRaisesRegex(ValueError, "etc mount binding"):
+                self.proof(changed, {name: raw})
+        self.assertEqual(recovery.tree(root), rows)
+
+    def test_sealed_v3_regenerates_scaffolding_and_refuses_proof_or_json_tampering(self):
+        root, obj, diffs = self.fixture()
+        before = recovery.tree(root)
+        proof = self.proof(before)
+        receipt = {"scope": root.name, "bundle": "isolated-fixture", "machine_id": "fixture",
+                   "replica_id": "fixture", "app": obj["bindings"]["app"]["Id"],
+                   "db": obj["bindings"]["db"]["Id"], "pod": obj["pod"]["Id"]}
+        components = {"containers": obj["bindings"], "pod": obj["pod"],
+                      "storage_layout": {"engine_version": obj["version"]}}
+        generated = {"instance.json": json.dumps(receipt).encode(),
+                     "recovery-components.json": json.dumps(components).encode()}
+        rows = copy.deepcopy(before)
+        for name, raw in generated.items():
+            rows[name] = {"kind": "file", "mode": 0o600, "uid": 0, "gid": 0, "mtime_ns": 0,
+                          "xattrs": {}, "size": len(raw), "sha256": recovery.hashlib.sha256(raw).hexdigest(),
+                          "extents": [[0, len(raw)]], "hardlink": name}
+        api = SimpleNamespace(BASE=root.parent, protected=lambda path, mode: self.assertEqual(path.stat().st_mode & 0o777, mode))
+        with tempfile.TemporaryDirectory(dir=root.parent) as temporary:
+            capture = Path(temporary)
+            with tarfile.open(capture / "source-full.tar", "w", format=tarfile.PAX_FORMAT) as archive:
+                for name in sorted(before):
+                    if name not in generated:
+                        archive.add(root / name, arcname=root.name if name == "." else root.name + "/" + name,
+                                    recursive=False)
+                for name, raw in generated.items():
+                    member = tarfile.TarInfo(root.name + "/" + name)
+                    member.size, member.mode = len(raw), 0o600
+                    archive.addfile(member, io.BytesIO(raw))
+            (capture / "store.sql").write_bytes(b"isolated data-only load test")
+            for name in ("source-full.tar", "store.sql"):
+                (capture / name).chmod(0o600)
+            manifest = {"type": "manager-full-capture/v3", "capture_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                        **{key: receipt[key] for key in ("scope", "bundle", "machine_id", "replica_id")},
+                        "receipt": receipt, "receipt_sha256": rows["instance.json"]["sha256"],
+                        "archive_sha256": recovery.digest(capture / "source-full.tar"),
+                        "sql_sha256": recovery.digest(capture / "store.sql"), "tree": rows,
+                        "volume_paths": {}, "image_files": {}, "writable_layers": diffs,
+                        "writable_scaffolding": proof, "sql_identity": {"historical_uncertainty":
+                            {"type": "manager-historical-uncertainty/v1", "attempts": [], "audit_events": []}}}
+            path = capture / "capture.json"
+            def save(value):
+                path.write_text(json.dumps(value))
+                path.chmod(0o600)
+            save(manifest)
+            self.assertEqual(recovery.load_capture(capture, api), manifest)
+            changed = copy.deepcopy(manifest)
+            changed["writable_scaffolding"]["app"]["image_etc_sha256"] = "0" * 64
+            save(changed)
+            with self.assertRaisesRegex(ValueError, "scaffolding proof differs"):
+                recovery.load_capture(capture, api)
+            changed = copy.deepcopy(manifest)
+            name = "graphroot/vfs-containers/" + proof["app"]["container_id"] + "/userdata/config.json"
+            changed["tree"][name]["sha256"] = "0" * 64
+            save(changed)
+            with self.assertRaisesRegex(ValueError, "hash differs"):
+                recovery.load_capture(capture, api)
+        self.assertEqual(recovery.tree(root), before)
+
+
 class RecoveryTests(unittest.TestCase):
     def test_oracle_uses_durable_migration_marker_not_legacy_history_version(self):
         instance = SimpleNamespace(prefix="owned", r={"replica_id": "original"})
@@ -528,6 +654,36 @@ class RecoveryTests(unittest.TestCase):
         for role, path in (("db", "/etc/extra-state"), ("app", "/tmp/state"), ("infra", "/run/state")):
             with self.assertRaises(ValueError):
                 recovery.safe_diff([{"Path": path, "Kind": 1}], role)
+
+    def test_native_cli_diff_groups_preserve_every_path_kind_and_durable_refusal(self):
+        for role in ("app", "db", "infra"):
+            self.assertEqual(recovery.cli_writable_diff(json.loads('{}\n'), role, "5.4.2"), [])
+        native = {"changed": ["/run", "/tmp/repeated"],
+                  "added": ["/run/mysqld", "/tmp/repeated"], "deleted": ["/var/tmp/old"]}
+        expected = [{"Path": "/run", "Kind": 0}, {"Path": "/tmp/repeated", "Kind": 0},
+                    {"Path": "/run/mysqld", "Kind": 1}, {"Path": "/tmp/repeated", "Kind": 1},
+                    {"Path": "/var/tmp/old", "Kind": 2}]
+        original = copy.deepcopy(native)
+        self.assertEqual(recovery.cli_writable_diff(native, "db", "5.4.2"), expected)
+        self.assertEqual(native, original)
+        self.assertEqual(recovery.safe_diff(expected, "db"), expected)
+        # The sealed manifest still requires canonical lists, never CLI objects.
+        with self.assertRaisesRegex(ValueError, "inventory unavailable"):
+            recovery.safe_diff(native, "db")
+        for group in ("changed", "added", "deleted"):
+            for role, path in (("app", "/tmp/state"), ("infra", "/run/state"),
+                               ("db", "/etc/extra-state"), ("db", "/var/lib/mysql/state")):
+                with self.assertRaisesRegex(ValueError, "unmapped"):
+                    recovery.cli_writable_diff({group: [path]}, role, "5.4.2")
+            for path in ("relative", "/run/../etc/state"):
+                with self.assertRaisesRegex(ValueError, "invalid writable layer path"):
+                    recovery.cli_writable_diff({group: [path]}, "db", "5.4.2")
+        for malformed in (None, [], "", {"foreign": []}, {"added": None},
+                          {"changed": "/run"}, {"deleted": [None]}, {"added": [{}]}):
+            with self.assertRaisesRegex(ValueError, "unclassified engine writable layer JSON"):
+                recovery.cli_writable_diff(malformed, "db", "5.4.2")
+        with self.assertRaisesRegex(ValueError, "inventory unavailable"):
+            recovery.cli_writable_diff({}, "db", "4.3.1")
 
     def test_original_scope_owner_required(self):
         config = {"network": {"manager": {"grants": [{"scope": "custom/source", "owner_replica_id": "original"}]}}}
