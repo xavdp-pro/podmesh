@@ -14,6 +14,7 @@ use super::{
     Response, Snapshot, Store, StoreClosedState, StoreIntegrity, StoreIntegrityEntry, Topology,
     VerifiedPositions,
 };
+#[cfg(feature = "mariadb")]
 use super::journal_audit;
 use podmesh::store::{self, Row, StoreConfig, Transaction, Value};
 use podmesh::ManagerJournal;
@@ -269,6 +270,7 @@ fn verify_stored_receipt(logical_manager_id: &str, receipt: &StoredReceipt) -> D
 }
 
 /// A manager journal opened from a store profile on MariaDB.
+#[cfg(feature = "mariadb")]
 pub struct MariaDbJournal {
     store: Box<dyn store::DurableStore>,
     configuration: Configuration,
@@ -277,6 +279,7 @@ pub struct MariaDbJournal {
     integrity: Arc<StoreIntegrityEntry>,
 }
 
+#[cfg(feature = "mariadb")]
 impl MariaDbJournal {
     /// Opens through [`podmesh::open_manager_store`] and binds identity for this replica.
     ///
