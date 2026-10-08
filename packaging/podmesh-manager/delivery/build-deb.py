@@ -132,7 +132,7 @@ def main():
     control.mkdir()
     (control / "control").write_text(
         f"Package: podmesh-manager-private-{bundle}\nVersion: 0.1.0\nArchitecture: amd64\n"
-        "Maintainer: PodMesh maintainers\nDepends: python3 (>= 3.11), podman, systemd, libc6 (>= 2.34), libgcc-s1\n"
+        "Maintainer: PodMesh maintainers\nDepends: python3 (>= 3.11), podman, systemd, iproute2, libc6 (>= 2.34), libgcc-s1\n"
         "Description: Immutable private manager and owning database\n"
         " Installation supplies payloads only. Explicit root operator prepares a new instance.\n")
     # No maintscripts, accounts, credentials, service files or automatic activation.

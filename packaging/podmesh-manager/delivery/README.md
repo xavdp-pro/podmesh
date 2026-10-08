@@ -47,6 +47,9 @@ paths/units/resources, conflicting numeric UID/GID1103 and an active/enabled leg
 `podmesh-manager.service`. Other externally named manager services are a runtime-owner
 preflight responsibility; this is a new isolated scope, never an implicit cutover.
 No host account is created or reassigned and no existing service is stopped.
+Host prerequisites are Python3.11 or later, Podman, systemd, `iproute2`
+(`/usr/sbin/ip` and `/usr/bin/ss`), libc6>=2.34 and libgcc-s1. Package dependencies
+declare them; no tool installation occurs during controller execution.
 
 Provide existing regular root-owned0600 files:
 
@@ -159,3 +162,11 @@ shutdown, private SQL/AUTH journals and retained data. The completed earlier man
 campaign proves its immutable binary/image journal behavior, not this new installer's
 lifecycle. No runtime action, vote, production activation or previous campaign replay
 is authorized by this README alone.
+
+The actual startup/failed-start scenario must exercise the `Type=simple`
+launcher/`ExecStartPost` boundary: a launcher PID alone is not container readiness.
+Observe the real container Running/PID/socket/SQL transitions; distinguish
+Podman exec125 (container/transport failure) from SQL client1 (connection/access
+not ready). Neither is a successful readiness result. Preserve any failure trace
+and correct an actual startup defect before candidate acceptance; no fake ready
+fixture or automatic signal fallback substitutes for this VM proof.
