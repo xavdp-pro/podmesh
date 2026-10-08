@@ -33,7 +33,7 @@ checks every descriptor size/digest. No pull, build, tag or runtime activation.
 
 A package has a name and `/usr/lib/podmesh-node-private/<bundle>/` path containing
 both source and recipe revision prefixes. It contains exact executables, both
-OCI archives, the controller, this document and a public payload manifest. No
+OCI archives, the controller, this document, the product license and a public payload manifest. No
 maintainer scripts, host account creation, service installation, credentials,
 profiles, live data, policy grants or automatic service activation. Dependencies
 are external host prerequisites. Archive provenance and licensing notices remain
@@ -115,7 +115,8 @@ hashes and actual container PID. DB access uses numeric1102 `podman exec`, expli
 TCP parameters and a file-read credential in the child environment; no credential
 in argv or copied child stderr. No new readiness sidecar is created.
 
-Start failure stops only the own target and retains private state. Stop removes no
+Start failure explicitly stops each own service and target and retains private state,
+including when the target is already inactive/failed. Stop removes no
 workload, volume, image or journal. Socket cleanup only removes a recorded socket
 inode/owner after its recorded service has stopped; a replaced or unrecorded
 endpoint refuses and remains for review. Automatic daemon restart is deliberately

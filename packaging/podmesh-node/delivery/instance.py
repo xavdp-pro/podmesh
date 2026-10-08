@@ -197,6 +197,12 @@ class Instance:
             protected(path, 0o644)
             require(sha(path) == digest, "unit modified externally; preserve it")
 
+    def stop_units(self):
+        # An inactive/failed target can still have active dependencies. Request
+        # explicit stops for each recorded own service, ordered by systemd.
+        if self.r["units"]:
+            run(["/usr/bin/systemctl", "stop", *self.r["units"]], okay=(0,5), timeout=120)
+
     def prepare(self, a):
         for database in (pwd.getpwuid, grp.getgrgid):
             try:
@@ -427,11 +433,11 @@ class Instance:
             try:
                 run(["/usr/bin/systemctl", "start", target], timeout=240)
             except (Refusal, subprocess.TimeoutExpired):
-                run(["/usr/bin/systemctl", "stop", target], timeout=120)
+                self.stop_units()
                 raise Refusal("start failed; own control plane stopped, state retained")
             self.r["phase"] = "started"
         else:
-            run(["/usr/bin/systemctl", "stop", target], timeout=120)
+            self.stop_units()
             self.r["stop_observations"] = {}
             for role in ("app","db"):
                 item = self.owned("container",self.r[role])
@@ -464,7 +470,7 @@ class Instance:
                         "interrupted creation has no observed ID; explicit ownership review required")
             else:
                 self.owned(record["kind"], record["id"])
-        run(["/usr/bin/systemctl", "stop", self.prefix+".target"], okay=(0,5), timeout=120)
+        self.stop_units()
         self.assert_no_workloads()  # Close the API/create race before removal.
         for name in self.r["units"]:
             run(["/usr/bin/systemctl", "disable", name], okay=(0,1))

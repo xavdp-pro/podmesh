@@ -101,6 +101,7 @@ def main():
     shutil.copyfile(a.database_oci, payload / "database.oci.tar")
     shutil.copyfile(source_dir / "instance.py", payload / "instance.py")
     shutil.copyfile(source_dir / "README.md", payload / "README.md")
+    shutil.copyfile(source_dir.parents[2] / "LICENSE", payload / "LICENSE")
     public = {"bundle": bundle, "binary_source_revision": SOURCE,
               "recipe_revision": a.recipe_revision, "application_image": "sha256:" + APP,
               "database_image": "sha256:" + DB,

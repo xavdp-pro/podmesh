@@ -127,6 +127,34 @@ class DeliveryTests(unittest.TestCase):
             self.assertEqual(candidate.r["phase"],"prepared")
             self.assertEqual(candidate.r["stop_observations"]["app"]["ExitCode"],137)
 
+    def test_inactive_target_still_stops_all_recorded_services(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = self.candidate(Path(directory))
+            names = [candidate.prefix+suffix for suffix in
+                     (".target","-app.service","-db.service","-provider.service")]
+            candidate.r["units"] = dict.fromkeys(names,"unchanged-hash")
+            with patch.object(instance,"run") as commands:
+                candidate.stop_units()
+            self.assertEqual(commands.call_args.args[0],["/usr/bin/systemctl","stop",*names])
+
+    def test_workload_race_after_stop_prevents_any_removal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = self.candidate(Path(directory))
+            def refuse_on_second_call():
+                refuse_on_second_call.calls += 1
+                if refuse_on_second_call.calls == 2:
+                    raise instance.Refusal("create raced with API shutdown")
+            refuse_on_second_call.calls = 0
+            candidate.assert_no_workloads = refuse_on_second_call
+            candidate.r["resources"] = [{"kind":"container","name":"app-name","id":"app-original"}]
+            candidate.owned = lambda *args:{"State":{"Running":False}}
+            seen = []
+            candidate.podman = lambda *args:seen.append(args)
+            with patch.object(instance,"run"):
+                with self.assertRaises(instance.Refusal):
+                    candidate.rollback()
+            self.assertEqual(seen,[])
+
     def test_oci_descriptor_mismatch_refuses_without_extracting(self):
         with tempfile.TemporaryDirectory() as directory:
             archive = Path(directory)/"wrong.tar"
