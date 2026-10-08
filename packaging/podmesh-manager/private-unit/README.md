@@ -24,7 +24,7 @@ versions in `/usr/share/podmesh-manager/image-packages.tsv`. No Python or packag
 installation is required by this wrapper. For example, with supplied values:
 
 ```sh
-podman build --platform linux/amd64 --pull=never --file "$CONTEXT/Containerfile" \
+podman build --network=none --platform linux/amd64 --pull=never --file "$CONTEXT/Containerfile" \
   --build-arg MANAGER_BINARY_SHA256="$MANAGER_BINARY_SHA256" \
   --build-arg BINARY_SOURCE_REVISION="$BINARY_SOURCE_REVISION" \
   --build-arg RECIPE_REVISION="$RECIPE_REVISION" \
