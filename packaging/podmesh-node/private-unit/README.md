@@ -4,6 +4,9 @@ Status: executable candidate increment; qualification pending. This supplies the
 application wrapper and the separate `podmesh-host-adapter` binary's inputs. It is
 not a full installer, a host cutover or completion of the product target.
 [HOST-ADAPTER-CONTRACT.md](../../../docs/HOST-ADAPTER-CONTRACT.md) owns the boundary.
+The [immutable delivery recipe](../delivery/README.md) packages those exact
+candidate bytes with an explicit new-instance install/start/stop/rollback
+controller. Package construction and runtime qualification are separate gates.
 
 The application is `podmesh-node`, non-login UID/GID 1102, inside a dedicated private
 Podman pod with its own MariaDB server and separate owned application/DB volumes.
