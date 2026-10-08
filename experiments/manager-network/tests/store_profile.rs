@@ -153,7 +153,7 @@ fn real_private_mariadb_connect_refusal_persists_terminal_after_reopen() {
     let audit = podmesh_manager_ha_lab::durable::inspect_profile::inspect_read_only_resolved(
         directory.path(), &config.database_path, &config.manager, &config.replica_id
     ).unwrap();
-    assert_eq!(audit.audit_event_count, 2);
+    assert_eq!(audit.audit_event_count, 2, "connect refusal must persist its terminal: {problem}");
     assert!(audit.incomplete_attempts.is_empty());
     let terminal = audit.ordered_audit_events.iter().find(|evidence| {
         evidence.event.phase == AuditPhase::OutboundExchangeCompleted
