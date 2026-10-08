@@ -1,0 +1,28 @@
+# Static / synthetic activation qualification (no rootful podman or live hosts).
+name: podmesh-manager activation qual (non-root)
+
+on:
+  pull_request:
+    branches:
+      - cursor/assembly-2026-10-07
+      - main
+  push:
+    branches:
+      - cursor/assembly-2026-10-07
+      - main
+
+jobs:
+  activation-qual-static:
+    name: activation qual (static, no podman)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tooling (jq, ripgrep)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq ripgrep
+
+      - name: Run activation qualification tests
+        run: |
+          bash packaging/podmesh-manager/qualification/activation/tests/run-tests.sh
