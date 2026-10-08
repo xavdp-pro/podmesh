@@ -454,6 +454,116 @@ class RealWritableScaffoldingTests(unittest.TestCase):
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_unprepared_version_probe_is_neutral_only_and_configured_probe_remains_private(self):
+        instance = SimpleNamespace(podman=lambda *args: SimpleNamespace(stdout=b"podman version 5.4.2\n"))
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "absent-target"
+            calls = []
+            def recorder(args, **kwargs):
+                calls.append((args, kwargs))
+                self.assertEqual(args, ["/usr/bin/podman", "--version"])
+                self.assertEqual(kwargs["env"], {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+                                                "HOME": "/root", "LANG": "C.UTF-8"})
+                self.assertFalse(target.exists())
+                return SimpleNamespace(returncode=0, stdout=b"podman version 5.4.2\n")
+            with patch.object(subprocess, "run", side_effect=recorder):
+                self.assertEqual(recovery.engine_version(instance, bootstrap=True), "5.4.2")
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(target.exists())
+            with patch.object(subprocess, "run", side_effect=AssertionError("unconfigured command forbidden")):
+                self.assertEqual(recovery.engine_version(instance), "5.4.2")
+            for result in (SimpleNamespace(returncode=1, stdout=b""),
+                           SimpleNamespace(returncode=0, stdout=b"unknown engine\n")):
+                with patch.object(subprocess, "run", return_value=result):
+                    with self.assertRaises(ValueError):
+                        recovery.engine_version(instance, bootstrap=True)
+
+    def test_extraction_only_resume_requires_exact_tree_absent_target_and_no_later_members(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            stage, target, capture = base / "stage", base / "target", base / "capture"
+            stage.mkdir(mode=0o700)
+            original = stage / "source"
+            original.mkdir(mode=0o700)
+            payload = original / "preserved"
+            payload.write_bytes(b"immutable source copy")
+            payload.chmod(0o600)
+            capture.mkdir(mode=0o700)
+            (capture / "capture.json").write_bytes(b"sealed test manifest")
+            rows = recovery.tree(original)
+            manifest = {"tree": rows, "scope": "source"}
+            api = SimpleNamespace(protected=lambda path, mode: self.assertEqual(path.stat().st_mode & 0o777, mode))
+            enough = SimpleNamespace(free=2 * recovery.validate_tree(rows) + 256 * 1024 ** 2)
+            with patch.object(recovery, "restore_archive", side_effect=AssertionError("must not reextract")), \
+                 patch.object(recovery.shutil, "disk_usage", return_value=enough):
+                path, proof = recovery.extracted_source_stage(stage, target, manifest, capture, api)
+                self.assertEqual(path, original)
+                self.assertEqual(proof["source_tree_sha256"], recovery.row_hash(rows))
+                self.assertEqual(recovery.tree(original), rows)
+                target.mkdir()
+                with self.assertRaisesRegex(ValueError, "target must remain absent"):
+                    recovery.extracted_source_stage(stage, target, manifest, capture, api)
+                target.rmdir()
+                later = stage / "configuration"
+                later.write_bytes(b"later checkpoint")
+                with self.assertRaisesRegex(ValueError, "extraction-only"):
+                    recovery.extracted_source_stage(stage, target, manifest, capture, api)
+                later.unlink()
+                payload.write_bytes(b"changed source copy")
+                with self.assertRaisesRegex(ValueError, "checkpoint differs"):
+                    recovery.extracted_source_stage(stage, target, manifest, capture, api)
+
+    def test_exact_original_ff_capsule_corrective_binding_and_payload_drift_refusal(self):
+        directory = Path(os.environ["PODMESH_CORRECTIVE_SOURCE_CAPSULE"])
+        source = json.loads((directory / "bundle.json").read_text())
+        target = copy.deepcopy(source)
+        target["bundle"] = "6ba91890a8ff-corrective-fixture"
+        target["payload_sha256"]["recovery.py"] = recovery.digest(HERE / "recovery.py")
+        target["payload_sha256"]["README.md"] = recovery.digest(HERE / "README.md")
+        manifest = {"type": "manager-full-capture/v3", "bundle": source["bundle"],
+                    "capture_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+        def protect(path, mode=None):
+            item = path.lstat()
+            self.assertFalse(path.is_symlink())
+            self.assertEqual(item.st_uid, 0)
+            self.assertFalse(item.st_mode & 0o022)
+        original, lineage = recovery.corrective_capture_binding(manifest, target,
+            directory.parent / target["bundle"], protect)
+        self.assertEqual(original, source)
+        self.assertEqual(lineage["mode"], "verified-ff236c-corrective-rebind")
+        self.assertFalse(lineage["source_receipt_mutated"])
+        for name in ("instance.py", "podmesh-managerd", "application.oci.tar", "database.oci.tar"):
+            changed = copy.deepcopy(target)
+            changed["payload_sha256"][name] = "0" * 64
+            with self.assertRaisesRegex(ValueError, "executable payload differs"):
+                recovery.corrective_capsule_fields(source, changed)
+        changed = copy.deepcopy(source)
+        changed["recipe_revision"] = "0" * 40
+        with self.assertRaisesRegex(ValueError, "unsupported corrective source"):
+            recovery.corrective_capsule_fields(changed, target)
+        changed = copy.deepcopy(source)
+        changed["payload_sha256"]["recovery.py"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "unsupported corrective source"):
+            recovery.corrective_capsule_fields(changed, target)
+        changed = copy.deepcopy(target)
+        changed["application_image"] = "sha256:" + "0" * 64
+        with self.assertRaisesRegex(ValueError, "runtime payload identity differs"):
+            recovery.corrective_capsule_fields(source, changed)
+        changed = dict(manifest, type="manager-full-capture/v2")
+        with self.assertRaisesRegex(ValueError, "unsupported corrective capture"):
+            recovery.corrective_capture_binding(changed, target, directory.parent / target["bundle"], protect)
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            capsule = parent / source["bundle"]
+            capsule.mkdir(mode=0o700)
+            (capsule / "bundle.json").write_text(json.dumps(source))
+            (capsule / "bundle.json").chmod(0o600)
+            first = next(iter(source["payload_sha256"]))
+            (capsule / first).write_bytes(b"tampered original payload")
+            (capsule / first).chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "original corrective capsule payload changed"):
+                recovery.corrective_capture_binding(manifest, target, parent / target["bundle"], protect)
+
     def test_oracle_uses_durable_migration_marker_not_legacy_history_version(self):
         instance = SimpleNamespace(prefix="owned", r={"replica_id": "original"})
         def results(candidate, statement):

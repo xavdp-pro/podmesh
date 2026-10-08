@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import stat
+import subprocess
 import tarfile
 import time
 import uuid
@@ -697,8 +698,15 @@ def closed_runtime(root, containers, version="synthetic-test-only"):
                 require(item.st_size == 0, "engine liveness metadata differs")
 
 
-def engine_version(instance):
-    line = instance.podman("--version").stdout.decode().strip()
+def engine_version(instance, bootstrap=False):
+    if bootstrap:
+        result = subprocess.run(["/usr/bin/podman", "--version"],
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root", "LANG": "C.UTF-8"},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90, check=False)
+        require(result.returncode == 0, "unconfigured engine version probe failed")
+    else:
+        result = instance.podman("--version")
+    line = result.stdout.decode().strip()
     require(line.startswith("podman version ") and len(line.split()) == 3,
             "engine version unavailable")
     version = line.split()[2]
@@ -1244,6 +1252,79 @@ def release(instance, a, api):
     return proof
 
 
+def corrective_capsule_fields(source, target):
+    """One corrective source revision; never a general bundle migration."""
+    require(source["bundle"] == "6ba91890a8ff-ff236c15fcdd"
+            and source["recipe_revision"] == "ff236c15fcdd97cfb5eee1a6a7d08efd008d07b0"
+            and source["payload_sha256"].get("recovery.py") ==
+                "8251c1c16bc8f09a9e8a3ee660adb704be39c15d3419afad4a2dded20909419f",
+            "unsupported corrective source capsule")
+    for key in ("binary_source_revision", "application_image", "application_manifest",
+                "database_image", "database_manifest", "base_registry_digest"):
+        require(source[key] == target[key], "corrective runtime payload identity differs")
+    require(set(source["payload_sha256"]) == set(target["payload_sha256"]),
+            "corrective capsule members differ")
+    for name, value in source["payload_sha256"].items():
+        if name not in {"README.md", "recovery.py"}:
+            require(value == target["payload_sha256"][name], "corrective executable payload differs")
+
+
+def corrective_capture_binding(manifest, target, bundle_directory, protect):
+    lineage = {"type": "manager-corrective-capture-lineage/v1", "source_bundle": manifest["bundle"],
+               "target_bundle": target["bundle"], "capture_id": manifest["capture_id"],
+               "source_receipt_mutated": False}
+    if manifest["bundle"] == target["bundle"]:
+        lineage["mode"] = "same-bundle"
+        return target, lineage
+    require(manifest["type"] == "manager-full-capture/v3"
+            and manifest["bundle"] == "6ba91890a8ff-ff236c15fcdd", "unsupported corrective capture lineage")
+    directory = bundle_directory.parent / manifest["bundle"]
+    require(directory.is_dir() and not directory.is_symlink(), "original corrective capsule unavailable")
+    protect(directory)
+    file = directory / "bundle.json"
+    protect(file)
+    require(file.is_file() and not file.is_symlink() and file.stat().st_size <= MAX_SQL,
+            "original corrective capsule manifest differs")
+    source = json.loads(file.read_text())
+    corrective_capsule_fields(source, target)
+    for name, expected in source["payload_sha256"].items():
+        require(name and name.isascii() and all(character.isalnum() or character in "._-" for character in name)
+                and Path(name).name == name, "unsafe original capsule member")
+        payload = directory / name
+        protect(payload)
+        require(payload.is_file() and not payload.is_symlink() and digest(payload) == expected,
+                "original corrective capsule payload changed")
+    lineage.update(mode="verified-ff236c-corrective-rebind", source_recipe_revision=source["recipe_revision"],
+                   source_capsule_sha256=digest(file), source_helper_sha256=source["payload_sha256"]["recovery.py"],
+                   target_helper_sha256=target["payload_sha256"]["recovery.py"],
+                   preserved_payloads=sorted(set(source["payload_sha256"]) - {"README.md", "recovery.py"}))
+    return source, lineage
+
+
+def extracted_source_stage(stage, target, manifest, capture_path, api):
+    require(not target.exists() and not target.is_symlink(), "recovery target must remain absent")
+    require(not stage.is_symlink(), "recovery stage must not be a symlink")
+    original = stage / "source"
+    if stage.exists():
+        api.protected(stage, 0o700)
+        require({path.name for path in stage.iterdir()} == {"source"}
+                and original.is_dir() and not original.is_symlink(),
+                "only extraction-only recovery checkpoint may resume")
+        api.protected(original, 0o700)
+        require(tree(original) == manifest["tree"], "extracted source checkpoint differs from sealed capture")
+        require(shutil.disk_usage(stage).free >= 2 * validate_tree(manifest["tree"]) + 256 * 1024 ** 2,
+                "resumed recovery capacity insufficient")
+        return original, {"type": "manager-extracted-source-resume/v1", "target_absent": True,
+            "stage": str(stage), "source_tree_sha256": row_hash(manifest["tree"]),
+            "capture_manifest_sha256": digest(capture_path / "capture.json")}
+    stage.mkdir(mode=0o700)
+    original.mkdir(mode=0o700)
+    require(shutil.disk_usage(stage).free >= 3 * validate_tree(manifest["tree"]) + 256 * 1024 ** 2,
+            "recovery capacity insufficient")
+    restore_archive(capture_path / "source-full.tar", manifest["tree"], manifest["scope"], original)
+    return original, None
+
+
 def restore(instance, a, api):
     manifest = load_capture(a.capture, api)
     released = document(a.capture / "release.json")
@@ -1254,12 +1335,16 @@ def restore(instance, a, api):
             and released["captured_receipt_sha256"] == manifest["receipt_sha256"]
             and released["source_scope"] == manifest["scope"], "release lineage differs")
     source = api.Instance(manifest["scope"])
+    source_manifest, lineage = corrective_capture_binding(manifest, instance.manifest,
+        Path(__file__).resolve().parent, api.protected)
+    # Read the released source with its verified original capsule. Never modify
+    # its receipt or bind it to the target's bundle.
+    source.manifest = source_manifest
     source.read()
     require(source.r["phase"] == "rolled-back" and digest(source.receipt) == released["rolled_back_receipt_sha256"],
             "live source must remain released")
-    require(instance.scope != source.scope and manifest["bundle"] == instance.manifest["bundle"]
-            and manifest["machine_id"] == Path("/etc/machine-id").read_text().strip(),
-            "only same-package same-real-host rebind is supported")
+    require(instance.scope != source.scope and manifest["machine_id"] == Path("/etc/machine-id").read_text().strip(),
+            "only proven-capsule same-real-host rebind is supported")
     recovery_id = canonical_uuid(a.recovery_id)
     plan = document(a.network_plan)
     require(plan["peer_publish"] == manifest["receipt"]["network_plan"]["peer_publish"]
@@ -1270,15 +1355,10 @@ def restore(instance, a, api):
         inputs.mkdir(mode=0o700)
     api.protected(inputs, 0o700)
     stage = inputs / recovery_id
-    require(not stage.exists() and not instance.root.exists(), "new recovery identity and absent target required")
-    stage.mkdir(mode=0o700)
-    original = stage / "source"
-    original.mkdir(mode=0o700)
-    require(shutil.disk_usage(stage).free >= 3 * validate_tree(manifest["tree"]) + 256 * 1024 ** 2,
-            "recovery capacity insufficient")
-    restore_archive(a.capture / "source-full.tar", manifest["tree"], source.scope, original)
+    original, resume = extracted_source_stage(stage, instance.root, manifest, a.capture, api)
     source_layout = json.loads((original / "recovery-components.json").read_text())["storage_layout"]
-    require(engine_version(instance) == source_layout["engine_version"],
+    version = engine_version(instance, bootstrap=True)
+    require(version == source_layout["engine_version"],
             "engine changed since source capture; explicit layout qualification required")
     config = json.loads((original / "app-config/config.json").read_text())
     api.Instance.validate_inputs(config, plan, manifest["machine_id"])
@@ -1288,7 +1368,8 @@ def restore(instance, a, api):
         api.write(dest, (original / file).read_bytes())
         setattr(a, key, dest)
     origin = {"type": "manager-recovery-rebind/v1", "recovery_id": recovery_id,
-              "engine_version": engine_version(instance),
+              "engine_version": version, "corrective_capture_lineage": lineage,
+              "extracted_source_resume": resume,
               "source_capture": str(a.capture), "manifest_sha256": digest(a.capture / "capture.json"),
               "source_receipt_sha256": manifest["receipt_sha256"], "release_sha256": digest(a.capture / "release.json"),
               "original_replica_id": manifest["replica_id"], "full_source_copy": str(original),

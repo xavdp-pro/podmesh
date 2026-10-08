@@ -257,7 +257,38 @@ The ephemeral inspector must be absent before and after inspection. Failed
 inspection preserves evidence and refuses progress; it does not repair SQL.
 Existing instance receipts remain bound to their original bundle. A corrected
 helper/package is qualified on new scopes; it never adopts an older bundle's
-instance or rewrites its receipt.
+instance or rewrites its receipt. The explicit corrective capture bridge below
+reads a released source with its own verified capsule and creates a new target.
+
+Restore's initial engine version probe uses only `/usr/bin/podman --version`
+in a minimal PATH/HOME/LANG environment. It does not reference nonexistent target
+configuration or open an unconfigured engine. Once the target is prepared, all
+engine operations continue through that instance's private configuration.
+The observed extraction-only checkpoint can resume with the same `--recovery-id`
+only while the target remains absent and the protected stage contains exactly
+one real `source` directory whose complete physical tree equals the sealed
+manifest, including file bytes, metadata, sparse extents and links. Any extra
+stage member, changed source tree or existing target refuses. The verified copy
+is reused without re-extraction; capacity accounts for the copy already present.
+The new target's recovery proof records `extracted_source_resume` explicitly.
+
+A cross-bundle corrective rebind is supported only from the v3 source capsule
+`6ba91890a8ff-ff236c15fcdd` at recipe
+`ff236c15fcdd97cfb5eee1a6a7d08efd008d07b0`, with its exact recovery helper hash.
+The original installed capsule must remain protected and every original payload
+must match its manifest. Binary revision, controller, binary, OCI archives,
+image/manifest/base identities, licenses and capsule member set must equal the
+new target's; only `recovery.py` and `README.md` may differ. Other source versions
+or executable changes refuse. The released source is read with that original
+verified manifest in memory, without saving or changing its receipt. Existing
+capture, release and rolled-back receipt hashes must still agree. The new target
+records `corrective_capture_lineage`, source capsule/helper hashes, target helper
+hash and preserved members. This is a bounded correction of restore preparation,
+not a general instance migration or helper replacement inside an old package.
+The focused capsule test requires `PODMESH_CORRECTIVE_SOURCE_CAPSULE` to name the
+actual verified ff capsule on the isolated test host; it does not forge original
+runtime payload hashes or execute those payloads. Version-probe and extraction
+checkpoint tests use recorders and private temporary data only.
 
 The capture contract is `manager-full-capture/v3`; older captures without the
 explicit uncertainty inventory and sealed writable scaffolding proof are refused
