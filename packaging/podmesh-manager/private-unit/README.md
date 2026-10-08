@@ -7,6 +7,11 @@ or downloads in the recipe. The base and the separate database container both us
 This is the confirmed Linux/amd64 registry manifest for MariaDB 11.8.9 on Ubuntu
 24.04; its local config image ID is
 `sha256:53ef799caed285438d88678b529b4ff24406d4788f47ab8a74bb2212c707899a`.
+The [separate private delivery recipe](../delivery/README.md) packages exact
+existing executable/OCI bytes with explicit new-instance preparation and
+install/start/stop/rollback supervision. That installer's source and package
+lifecycle require their own qualification; the previous binary/image campaign
+does not qualify a new installation recipe.
 A config ID is not a registry pull digest. Verify both identities and platform on
 the build host before construction. The inherited database entrypoint is replaced; the application container never
 starts a database. A colliding UID/GID or account refuses the image build rather
