@@ -95,7 +95,7 @@ class RealEngineLayoutTests(unittest.TestCase):
                 path.unlink()
                 os.mkfifo(path, 0o640)
                 path.chmod(0o640)
-                with tempfile.TemporaryDirectory() as temporary:
+                with tempfile.TemporaryDirectory(dir=root.parent) as temporary:
                     os.link(path, Path(temporary) / "foreign-link")
                     with self.assertRaisesRegex(ValueError, "running container IPC metadata"):
                         self.check("running-preflight")
