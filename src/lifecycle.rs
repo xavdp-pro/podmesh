@@ -1745,6 +1745,84 @@ pub(crate) fn fault(point: &str) -> Result<(), Error> {
     Ok(())
 }
 
+pub(crate) fn reserved_store_gate(
+    store: &mut dyn DurableStore,
+    uuid: &str,
+    operation: &str,
+) -> Result<(), Error> {
+    DurableLifecycleDb { store }.refuse_reserved(uuid, operation)
+}
+
+/// Host-wide durable operation journal. Pending intent commits before the first child effect;
+/// child lifecycle calls keep their own durable identities and attempts on retry.
+pub(crate) fn journaled_store(
+    store: &mut dyn DurableStore,
+    request: &Value,
+    run: impl FnOnce(&mut dyn DurableStore) -> Result<Value, Error>,
+) -> Result<Value, Error> {
+    if let Some(result) = historical_store_result(store, request)? {
+        return Ok(result);
+    }
+    let id = text(request, "operation_id")?;
+    let attempt = {
+        let mut tx = store.transaction()?;
+        if tx
+            .query_one(
+                "SELECT id FROM operations WHERE id = ?",
+                &[Stored::from(id)],
+            )?
+            .is_none()
+        {
+            tx.execute(
+                "INSERT INTO operations(id, request, status, result) VALUES(?, ?, 'pending', NULL)",
+                &[Stored::from(id), Stored::from(request.to_string())],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO operation_attempts(operation_id, started_at) VALUES(?, ?)",
+            &[Stored::from(id), Stored::from(crate::now() as i64)],
+        )?;
+        let attempt = tx
+            .query_one(
+                "SELECT id FROM operation_attempts WHERE operation_id = ? ORDER BY id DESC LIMIT 1",
+                &[Stored::from(id)],
+            )?
+            .ok_or("Missing durable attempt")?
+            .integer(0)?;
+        tx.commit()?;
+        attempt
+    };
+    let outcome = run(store);
+    let mut tx = store.transaction()?;
+    let (status, result) = match &outcome {
+        Ok(result) => ("verified", result.clone()),
+        Err(error) => ("failed", json!({"error":error.to_string()})),
+    };
+    tx.execute(
+        "UPDATE operations SET status = ?, result = ? WHERE id = ?",
+        &[
+            Stored::from(status),
+            Stored::from(result.to_string()),
+            Stored::from(id),
+        ],
+    )?;
+    tx.execute(
+        "UPDATE operation_attempts SET finished_at = ?, outcome = ?, detail = ? WHERE id = ?",
+        &[
+            Stored::from(crate::now() as i64),
+            Stored::from(status),
+            if outcome.is_err() {
+                Stored::from(result.to_string())
+            } else {
+                Stored::Null
+            },
+            Stored::from(attempt),
+        ],
+    )?;
+    tx.commit()?;
+    outcome
+}
+
 /// Shared durable ownership/reservation gates, also used by bounded volume mutations.
 pub(crate) fn volume_store_gates(
     store: &mut dyn DurableStore,

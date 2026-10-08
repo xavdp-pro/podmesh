@@ -19,7 +19,16 @@ and dedicated growable-storage gates; they declare capacity only, not new block
 devices. Pending intent commits first; capacity, verified result and completed
 attempt commit together, so retries repeat no growth. `storage_status` reads
 declarations from the configured journal. Other module-owned operations return
-`store_engine_unsupported`: boot restore, migration and recovery points still require SQLite.
+`store_engine_unsupported`: migration and recovery points still require SQLite.
+`boot_restore` and `boot_restore_status` use the same journal-derived pass planner
+on both engines. On MariaDB the supported boot-return slice is isolated, ungated
+universes: imported lease/epoch policies and managed-network universes are blocked,
+as are quarantined copies, recovery points without policy, holding reservations,
+unresolved restore claims and unfinished captures/promotions. Child starts retain
+a stable per-boot ID and their first saved mandate, execute through existing durable
+lifecycle gates, and repeat no verified start. A pass commits intent before children
+and its terminal result afterward. A reboot or actual host-start proof is separate
+from engineering tests with controlled observations.
 Startup publisher withdrawal and network reconciliation are also SQLite-only.
 Before opening the API socket, a durable node refuses any rows in network/publisher
 tables, any network/publisher operation history, or any managed-network operation.

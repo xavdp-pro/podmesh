@@ -216,19 +216,17 @@ impl NodeStore {
 
     /// The connection the node's operations take, or a refusal naming why there is none.
     ///
-    /// This is where Phase 2 stops. The node's schema is versioned and installs on both engines,
-    /// and the profile decides which one is opened -- but `handle` and every module below it
-    /// still speak `rusqlite`, so a journal that is not a file has nothing to hand them. A node
-    /// configured for MariaDB is refused here, by name, rather than served from a file it was not
-    /// configured to use.
+    /// Compatibility escape for callers that still require a SQLite connection.
+    /// MariaDB callers retain NodeStore and use its ported operation dispatch; this
+    /// conversion cannot represent their journal and never substitutes a file.
     pub fn into_connection(self) -> Result<Connection, Box<dyn std::error::Error>> {
         match self {
             NodeStore::Sqlite(db) => Ok(db),
             NodeStore::Durable(store) => Err(format!(
                 "store.engine is {engine}: the journal opened and its schema is at version {version}, \
-                 but this build's operations still read and write the node's journal as SQLite \
+                 but this compatibility API returns only a SQLite connection \
                  (Phase 2 of docs/STORAGE-MARIADB-MIGRATION-PLAN.md ports them). \
-                 Set store.engine to sqlite to run this node.",
+                 Retain NodeStore and use NodeStore::handle for the ported MariaDB operation slice.",
                 engine = store.engine(),
                 version = migrations::node_version(),
             )
@@ -460,8 +458,6 @@ fn sqlite_only_operation(operation: &str) -> bool {
             | "recovery_point_stage"
             | "recovery_point_discard"
             | "recovery_point_resume"
-            | "boot_restore"
-            | "boot_restore_status"
             | "migration_status"
     )
 }
@@ -496,13 +492,15 @@ fn durable_capabilities(engine: Engine) -> Value {
             "resources",
             "volume_declare",
             "volume_grow",
+            "boot_restore",
+            "boot_restore_status",
             "secret_declare",
             "secret_remove",
             "secret_status",
         ],
         "store_engine": engine.as_str(),
         "unsupported_error_code": "store_engine_unsupported",
-        "scope": "read-only local API, lifecycle create/delete/clone/start/stop/pause/resume/resources, bounded volume declarations/growth, and secret_declare/secret_remove/secret_status; other module-owned mutations remain SQLite-only",
+        "scope": "read-only local API, lifecycle create/delete/clone/start/stop/pause/resume/resources, bounded volume declarations/growth, isolated ungated boot_restore/status, and secret_declare/secret_remove/secret_status; other module-owned mutations remain SQLite-only",
     })
 }
 
@@ -515,9 +513,11 @@ fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
         .get("operation")
         .and_then(Value::as_str)
         .unwrap_or("");
-    if durable_lifecycle_operation(operation) || matches!(operation, "volume_declare" | "volume_grow") {
+    if durable_lifecycle_operation(operation) || matches!(operation, "volume_declare" | "volume_grow" | "boot_restore" | "boot_restore_status") {
         let result = if matches!(operation, "volume_declare" | "volume_grow") {
             storage::execute_store(store, request)
+        } else if matches!(operation, "boot_restore" | "boot_restore_status") {
+            boot_restore::execute_store(store, request)
         } else {
             lifecycle::execute_store(store, request)
         };

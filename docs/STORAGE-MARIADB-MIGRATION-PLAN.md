@@ -144,8 +144,10 @@ legacy SQLite dispatch and sends MariaDB requests through `handle_durable`.
 with pending intent committed before Podman and terminal operation/attempt updates
 in one transaction. Secret metadata and local read APIs also use `DurableStore`.
 Volume declaration/growth and storage-status declarations now use `DurableStore`,
-with capacity/result/attempt committed atomically; `boot_restore`/status still need
-porting for container-life slice A. Migration, recovery-point, network, publisher
+with capacity/result/attempt committed atomically. `boot_restore`/status share the
+pass planner across engines; MariaDB boot-return supports isolated ungated universes
+and refuses imported activation and managed-network state. Real host return and
+functional restoration remain qualification requirements for container-life slice A. Migration, recovery-point, network, publisher
 and manager control modules retain explicit unsupported refusals on MariaDB.
 Startup network/publisher reconciliation is likewise refused; opening/migrating a
 schema is not full node qualification. The compatibility `open_state` API still
