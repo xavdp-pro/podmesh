@@ -66,4 +66,12 @@ Slice A op 10 (`tests/check-boot-restore.py`) exercises boot-time restore on the
 /opt/podmesh-vzcriu-kit/bin/criu check
 ```
 
+Operators may run the packaged gate script (root, read-only) before `tests/check-boot-restore.py`:
+
+```sh
+sudo packaging/podmesh-manager/qualification/activation/check-op10-vzcriu-kernel.sh
+```
+
+It prints `uname -r`, runs kit `criu check` with the same `PATH` as the lab runbook, and exits non-zero on the known **7.0.14-6-pve** vDSO pairing or any `criu check` failure.
+
 A **PASS** from `criu check` is a hard prerequisite for live capture and for claiming op 10 verified; structural preflight or an operator reboot gate alone do not substitute for suite **PASS**. Proxmox VE **7.0.x** kernels on the lab controller recorded **FAIL** for the **packaged** CRIU 3.15 runtime (`kerndat` / vDSO — Linux dual-`vvar` layout; upstream fix in CRIU 4.0+). That is a kernel **plus pinned runtime** pairing issue, not missing APT packages. Operator qualification on the same host: boot an already-installed alternative kernel (lab used **6.8.12-36-pve** before trying Debian **6.12**), re-run the kit command above until **PASS**, then run the boot-restore suite; roll back the default kernel after closure if the hypervisor must return to **7.0.14-6-pve**. Private lab runbook: `podmesh-lab` record `op10-pve-vdso-research-2026-10-08.md` and `op10-p3-kernel-inventory-2026-10-08.md`. Do not report op 10 PASS without a completed suite run on a host where kit `criu check` passes.
