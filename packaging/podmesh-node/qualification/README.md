@@ -97,7 +97,9 @@ as independently observed unless separate held-provider evidence was captured.
    `booted_at`, clock observation and the private SQL/records. Runtime enables the
    separately authorized private-app boot pass under the exact mandate and reboots
    its own declared guest. A provider/app restart alone does not satisfy this leg.
-   Run `after-boot --previous-boot-id "$BEFORE_BOOT_ID"`. Host boot ID must change,
+   Run `after-boot --boot-baseline "$ARM_BOOT_JSONL"` (an optional copied
+   `--previous-boot-id` must match this saved observation). Host boot ID must change
+   from the baseline tied to this exact plan,
    and the stable child start row must already be verified before this probe. Two
    explicit/replayed boot passes must add no child start attempt. Runtime also
    captures actual fresh running container/kernel state and startup logs. The

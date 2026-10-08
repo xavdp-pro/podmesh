@@ -213,9 +213,17 @@ class Driver:
             self.exercise(request)
             self.record("before_external_boot", self.ok({"operation": "boot_restore_status"}))
         elif self.args.phase == "after-boot":
-            require(self.args.previous_boot_id, "previous actual host boot ID required")
+            require(self.args.boot_baseline, "saved arm-boot evidence required")
+            evidence = [json.loads(line) for line in self.args.boot_baseline.read_text().splitlines()]
+            observed = [item["data"] for item in evidence if item["kind"] == "before_external_boot"]
+            inputs = [item["data"] for item in evidence if item["kind"] == "inputs"]
+            require(len(observed) == len(inputs) == 1 and inputs[0]["plan_sha256"] == hashlib.sha256(self.args.plan.read_bytes()).hexdigest(), "boot baseline must belong to this exact proof plan")
+            previous = observed[0]["boot_id"]
+            require(str(uuid.UUID(previous)) == previous, "baseline must carry a real canonical boot identity")
+            if self.args.previous_boot_id:
+                require(self.args.previous_boot_id == previous, "copied boot ID must match saved observation")
             status = self.ok({"operation": "boot_restore_status"})
-            require(status["boot_id"] != self.args.previous_boot_id, "host boot ID must actually change")
+            require(status["boot_id"] != previous, "host boot ID must actually change from saved observation")
             target = self.plan["universe_uuid"]
             child_id = "boot-" + status["boot_id"].replace("-", "") + "-" + target.replace("-", "")
             rows = self.sql("SELECT request,status FROM operations WHERE id='" + token(child_id) + "';")
@@ -261,6 +269,7 @@ def main():
     run.add_argument("--source-revision", required=True)
     run.add_argument("--application-uid", type=int, default=1102)
     run.add_argument("--previous-boot-id")
+    run.add_argument("--boot-baseline", type=Path)
     run.add_argument("--expected-server-hostname", required=True)
     run.add_argument("--expected-database", required=True)
     run.add_argument("--baseline", type=Path)
