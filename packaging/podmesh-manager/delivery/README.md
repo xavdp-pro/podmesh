@@ -343,6 +343,14 @@ records are captured faithfully as engine history and never treated as live pods
 
 For this layout, `secrets/` must contain only a root-owned empty `secrets.lock`;
 nonempty engine secret stores require a separately defined preservation contract.
+The restore check immediately after preparation has an explicit `prepared-target`
+phase for Podman 5.4.2 SQLite. Only there may the lazily initialized `secrets/`
+directory be absent. All three native container inspections must report `created`,
+PID0, no active/error flags and zero lifecycle timestamps; the corresponding
+SQLite rows must independently report state1, exit0, zero PIDs and zero lifecycle
+timestamps. The existing zero-secret-dependency checks still apply. Any present
+secret store retains the same empty-lock-only contract. This phase neither
+creates engine files nor relaxes running-preflight or stopped capture checks.
 The observed OCI `userdata/config.json` is a bounded regular file with a known
 OCI version, owning layer/sandbox and mounts bound to the declared private root.
 Container-bound runroot health/log/network/previous-PID files and empty

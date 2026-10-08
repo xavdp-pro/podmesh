@@ -747,7 +747,7 @@ def closed_oci_config(path, root, layer, containers, volumes):
                 for mount in config["mounts"]), "unmapped OCI bookkeeping mount")
 
 
-def closed_sqlite_engine(root, images, containers, volumes, pod_id, infra_id):
+def closed_sqlite_engine(root, images, containers, volumes, pod_id, infra_id, phase="stopped"):
     """Podman 5.4.2 engine bookkeeping only; never the application store.
 
     The schema fingerprint covers all twelve CREATE statements and constraints
@@ -801,6 +801,15 @@ def closed_sqlite_engine(root, images, containers, volumes, pod_id, infra_id):
             if config.get("pause") is True:
                 infra_containers.add(identifier)
         require(infra_containers == {infra_id}, "engine infra container role differs")
+        if phase == "prepared-target":
+            for identifier, status, code, encoded in connection.execute("SELECT ID,State,ExitCode,JSON FROM ContainerState"):
+                state = json.loads(encoded)
+                require(identifier in containers and status == 1 and code == 0 and state.get("state") == 1
+                        and all(state.get(key, 0) == 0 for key in ("pid", "conmonPid"))
+                        and all(state.get(key) == "0001-01-01T00:00:00Z" for key in ("startedTime", "finishedTime"))
+                        and all(state.get(key, "0001-01-01T00:00:00Z") == "0001-01-01T00:00:00Z"
+                                for key in ("checkpointedTime", "restoredTime")),
+                        "prepared target SQLite container has lifecycle history")
         for identifier, name, encoded in connection.execute("SELECT ID,Name,JSON FROM PodConfig"):
             config = json.loads(encoded)
             require(config["id"] == identifier and config["name"] == name, "engine pod JSON identity differs")
@@ -834,15 +843,29 @@ def closed_sqlite_engine(root, images, containers, volumes, pod_id, infra_id):
             "row_counts": counts, "infra_container_id": infra_id, "exit_record_ids": [row[0] for row in exits]}
 
 
-def closed_graphroot(root, images, containers, volumes, version="synthetic-test-only", pod_id=None, database_backend="boltdb", infra_id=None, phase="stopped"):
+def closed_graphroot(root, images, containers, volumes, version="synthetic-test-only", pod_id=None, database_backend="boltdb", infra_id=None, phase="stopped", prepared_observations=None):
     """Bounded containers/storage VFS layout; unknown versions/layouts refuse.
 
     This classifies every path, including children. JSON metadata must refer only
     to the observed images, three containers, and their complete parent layers.
     No arbitrary file is accepted merely because it lives under graphroot.
     """
-    require(phase in ("stopped", "running-preflight"), "unclassified graphroot lifecycle phase")
+    require(phase in ("stopped", "running-preflight", "prepared-target"), "unclassified graphroot lifecycle phase")
     require(database_backend in ("boltdb", "sqlite"), "unclassified engine database backend")
+    if phase == "prepared-target":
+        require(version == "5.4.2" and database_backend == "sqlite", "unclassified prepared target engine")
+        require(isinstance(prepared_observations, list) and len(prepared_observations) == len(containers) == 3
+                and {item.get("Id") for item in prepared_observations} == containers,
+                "prepared target observed container identities differ")
+        for item in prepared_observations:
+            state = item.get("State", {})
+            require(state.get("Status") == "created" and state.get("Pid") == 0
+                    and all(state.get(key) is False for key in ("Running", "Paused", "Restarting", "OOMKilled", "Dead"))
+                    and state.get("ExitCode") == 0 and state.get("Error") == ""
+                    and all(state.get(key) == "0001-01-01T00:00:00Z" for key in ("StartedAt", "FinishedAt"))
+                    and all(state.get(key, "0001-01-01T00:00:00Z") == "0001-01-01T00:00:00Z"
+                            for key in ("CheckpointedAt", "RestoredAt")),
+                    "prepared target observed container has lifecycle history")
     graph = root / "graphroot"
     require(graph.is_dir() and not graph.is_symlink(), "private VFS graphroot missing")
     allowed = {"vfs", "vfs-images", "vfs-layers", "vfs-containers", "volumes", "libpod",
@@ -983,9 +1006,10 @@ def closed_graphroot(root, images, containers, volumes, version="synthetic-test-
     engine_files = set() if database_backend == "sqlite" else {"bolt_state.db"}
     require(directory.is_dir() and not directory.is_symlink()
             and {p.name for p in directory.iterdir()} <= engine_files, "unmapped libpod bookkeeping component")
-    sqlite_inventory = closed_sqlite_engine(root, images, containers, volumes, pod_id, infra_id) if database_backend == "sqlite" else None
+    sqlite_inventory = closed_sqlite_engine(root, images, containers, volumes, pod_id, infra_id, phase) if database_backend == "sqlite" else None
     secrets = graph / "secrets"
-    require(database_backend != "sqlite" or secrets.exists(), "observed SQLite engine secret-lock store missing")
+    require(database_backend != "sqlite" or phase == "prepared-target" or secrets.exists(),
+            "observed SQLite engine secret-lock store missing")
     if secrets.exists() or secrets.is_symlink():
         require(secrets.is_dir() and not secrets.is_symlink() and secrets.stat().st_uid == secrets.stat().st_gid == 0
                 and stat.S_IMODE(secrets.stat().st_mode) == 0o700
@@ -1011,6 +1035,8 @@ def closed_graphroot(root, images, containers, volumes, version="synthetic-test-
                 "engine metadata is not regular")
     return {"layout": "bounded-private-vfs/v2", "engine_version": version, "engine_database_backend": database_backend,
             "engine_sqlite": sqlite_inventory, "engine_secrets": "empty-lock-only" if secrets.exists() else "absent",
+            **({"lifecycle_phase": "prepared-target", "never_started_container_ids": sorted(containers)}
+               if phase == "prepared-target" else {}),
             "vfs_volatile": volatile_metadata,
             "image_ids": sorted(images),
             "container_ids": sorted(containers), "layer_ids": sorted(reachable), "volume_names": sorted(volumes),
@@ -1386,7 +1412,8 @@ def restore(instance, a, api):
     target_containers.append(instance.inspect("container", target_pod["InfraContainerID"]))
     target_layout = closed_graphroot(instance.root, {api.image_id(item["Image"]) for item in target_containers},
         {item["Id"] for item in target_containers}, {instance.prefix + "-app", instance.prefix + "-db"},
-        source_layout["engine_version"], target_pod["Id"], source_layout["engine_database_backend"], target_pod["InfraContainerID"])
+        source_layout["engine_version"], target_pod["Id"], source_layout["engine_database_backend"], target_pod["InfraContainerID"],
+        phase="prepared-target", prepared_observations=target_containers)
     origin["mapping"].append({"component": "engine-state-database", "source": source_layout,
         "target": target_layout, "behavior": "source-bytes-sealed-in-full-copy; target-regenerated-for-new-observed-resources"})
     instance.save()

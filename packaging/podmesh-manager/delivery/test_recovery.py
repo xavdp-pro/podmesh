@@ -321,6 +321,104 @@ class RealEngineLayoutTests(unittest.TestCase):
         self.check()
 
 
+class RealPreparedTargetTests(unittest.TestCase):
+    """Require an isolated copy of a native never-started target's metadata."""
+    def fixture(self):
+        obj = json.loads(Path(os.environ["PODMESH_PREPARED_TARGET_FIXTURE"]).read_text())
+        self.assertTrue(obj["isolated_metadata_copy"])
+        self.assertEqual(obj["version"], "5.4.2")
+        root = Path(obj["root"])
+        self.assertTrue(root.is_absolute())
+        self.assertFalse((root / "graphroot/secrets").exists())
+        return root, obj
+
+    def check(self, root, obj, phase="prepared-target", observations=None, backend="sqlite", version="5.4.2"):
+        return recovery.closed_graphroot(root, set(obj["images"]), set(obj["containers"]),
+            set(obj["volumes"]), version, obj["pod"], backend, obj["infra"], phase=phase,
+            prepared_observations=obj["observations"] if observations is None else observations)
+
+    def test_native_never_started_target_allows_absent_lazy_secret_store_only_in_prepared_phase(self):
+        root, obj = self.fixture()
+        before = recovery.tree(root)
+        with patch.object(subprocess, "run", side_effect=AssertionError("provider forbidden")):
+            result = self.check(root, obj)
+            self.assertEqual(result["engine_secrets"], "absent")
+            self.assertEqual(result["engine_sqlite"]["sha256"], obj["database_sha256"])
+            for phase in ("stopped", "running-preflight"):
+                with self.assertRaisesRegex(ValueError, "secret-lock store missing"):
+                    self.check(root, obj, phase)
+            for backend, version in (("boltdb", "5.4.2"), ("sqlite", "5.4.3")):
+                with self.assertRaisesRegex(ValueError, "prepared target engine"):
+                    self.check(root, obj, backend=backend, version=version)
+            with self.assertRaisesRegex(ValueError, "observed container identities"):
+                self.check(root, obj, observations=[])
+            for field, value in (("Status", "exited"), ("Pid", 7), ("Running", True),
+                                 ("StartedAt", "2026-01-01T00:00:00Z"), ("FinishedAt", None),
+                                 ("RestoredAt", "2026-01-01T00:00:00Z")):
+                observations = copy.deepcopy(obj["observations"])
+                observations[0]["State"][field] = value
+                with self.assertRaisesRegex(ValueError, "observed container has lifecycle history"):
+                    self.check(root, obj, observations=observations)
+        self.assertEqual(recovery.tree(root), before)
+
+    def test_native_prepared_target_sql_history_secret_dependency_and_unclassified_store_refuse(self):
+        root, obj = self.fixture()
+        before = recovery.tree(root)
+        database = root / "graphroot/db.sql"
+        original = database.read_bytes()
+        times = (database.stat().st_atime_ns, database.stat().st_mtime_ns)
+        identifier = obj["containers"][0]
+        try:
+            for field, value in (("state", 5), ("pid", 7), ("conmonPid", 8),
+                                 ("startedTime", "2026-01-01T00:00:00Z"), ("finishedTime", None)):
+                with sqlite3.connect(database) as connection:
+                    encoded = connection.execute("SELECT JSON FROM ContainerState WHERE ID=?", (identifier,)).fetchone()[0]
+                    state = dict(json.loads(encoded), **{field: value})
+                    connection.execute("UPDATE ContainerState SET JSON=? WHERE ID=?", (json.dumps(state), identifier))
+                connection.close()
+                with self.assertRaisesRegex(ValueError, "SQLite container has lifecycle history"):
+                    self.check(root, obj)
+                database.write_bytes(original)
+            for field in ("State", "ExitCode"):
+                with sqlite3.connect(database) as connection:
+                    connection.execute("UPDATE ContainerState SET " + field + "=? WHERE ID=?", (9, identifier))
+                connection.close()
+                with self.assertRaisesRegex(ValueError, "SQLite container has lifecycle history"):
+                    self.check(root, obj)
+                database.write_bytes(original)
+            with sqlite3.connect(database) as connection:
+                encoded = connection.execute("SELECT JSON FROM ContainerConfig WHERE ID=?", (identifier,)).fetchone()[0]
+                config = dict(json.loads(encoded), secrets=[{"Name": "unclassified"}])
+                connection.execute("UPDATE ContainerConfig SET JSON=? WHERE ID=?", (json.dumps(config), identifier))
+            connection.close()
+            with self.assertRaisesRegex(ValueError, "secret dependency"):
+                self.check(root, obj)
+        finally:
+            database.write_bytes(original)
+            os.utime(database, ns=times)
+        graph = root / "graphroot"
+        graph_times = (graph.stat().st_atime_ns, graph.stat().st_mtime_ns)
+        secrets = graph / "secrets"
+        try:
+            secrets.symlink_to(database)
+            with self.assertRaisesRegex(ValueError, "secret store"):
+                self.check(root, obj)
+            secrets.unlink()
+            secrets.mkdir(mode=0o700)
+            (secrets / "secrets.json").write_bytes(b"{}")
+            with self.assertRaisesRegex(ValueError, "secret store"):
+                self.check(root, obj)
+        finally:
+            if secrets.is_symlink():
+                secrets.unlink()
+            elif secrets.exists():
+                (secrets / "secrets.json").unlink()
+                secrets.rmdir()
+            os.utime(graph, ns=graph_times)
+        self.assertEqual(recovery.tree(root), before)
+        self.check(root, obj)
+
+
 class RealWritableScaffoldingTests(unittest.TestCase):
     """Use a private copy of actual stopped /etc trees and engine JSON only."""
     def fixture(self):
