@@ -139,6 +139,32 @@ class Instance:
     def save(self):
         jsonwrite(self.receipt,self.r,replace=True)
 
+    def bind_failed_rollback_bundle(self,path):
+        require(path.is_absolute() and path.parent==BUNDLE.parent and path!=BUNDLE,
+                "original rollback bundle must be another installed bundle")
+        protected(path)
+        protected(path/"bundle.json")
+        manifest=json.loads((path/"bundle.json").read_text())
+        require(manifest["bundle"]==path.name,"original bundle path differs")
+        for name,digest in manifest["payload_sha256"].items():
+            require(re.fullmatch(r"[a-zA-Z0-9._-]+",name),"invalid original bundle member")
+            protected(path/name)
+            require(sha(path/name)==digest,"original bundle payload differs")
+        for field in ("binary_source_revision","application_image","database_image",
+                      "application_manifest","database_manifest"):
+            require(manifest[field]==self.manifest[field],"original application/database identity differs")
+        self.manifest=manifest
+        self.failed_rollback_bundle=path
+
+    def check_failed_rollback(self):
+        require(self.r["phase"]=="prepared" and not (self.root/"ready-app.json").exists()
+                and not (self.root/"api/control.sock").exists(),"original instance reached readiness or another phase")
+        for role in ("app","db"):
+            item=self.owned("container",self.r[role])
+            require(item and not item["State"]["Running"] and item["State"]["Pid"]==0
+                    and not item["State"].get("OOMKilled",False),"original instance remains active or OOM")
+            require(role=="app" or item["State"]["ExitCode"]==0,"original database exit was not clean")
+
     def inspect(self,kind,identity):
         result=self.podman(kind,"exists",identity,okay=(0,1))
         if result.returncode==1:
@@ -592,6 +618,8 @@ class Instance:
         self.read()
         if self.r["phase"]=="rolled-back":
             return
+        if hasattr(self,"failed_rollback_bundle"):
+            self.check_failed_rollback()
         for name,digest in self.r["units"].items():
             path=UNITS/name
             if path.exists():
@@ -636,8 +664,11 @@ def main():
     prep.add_argument("--network-plan",required=True,type=Path)
     prep.add_argument("--application-password",required=True,type=Path)
     prep.add_argument("--database-root-password",required=True,type=Path)
-    for name in ("start","stop","rollback","status"):
+    for name in ("start","stop","status"):
         sub.add_parser(name)
+    rollback=sub.add_parser("rollback")
+    rollback.add_argument("--original-bundle",type=Path,
+                          help="Verify and clean an installed bundle's inactive never-ready instance")
     capture=sub.add_parser("capture",help="Typed stop and immutable complete recovery capture")
     capture.add_argument("--capture-id",required=True)
     release=sub.add_parser("release-for-restore",help="Release only own source after verified offguest capture")
@@ -656,6 +687,8 @@ def main():
     require(os.geteuid()==0,"separate root operator required")
     os.umask(0o077)
     candidate=Instance(a.scope)
+    if a.action=="rollback" and a.original_bundle is not None:
+        candidate.bind_failed_rollback_bundle(a.original_bundle)
     if a.action in ("prepare","restore"):
         if not BASE.exists():
             BASE.mkdir(mode=0o700)

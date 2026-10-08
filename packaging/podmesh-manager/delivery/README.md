@@ -165,6 +165,14 @@ with runningfalse/PID0/noOOM, while retaining its actual exit in the receipt as
 `rollback_application_exit` with `clean_shutdown=false`. It still requires DB
 exit0 and typed shutdown for a running application. This cleanup does not qualify
 stop or capture; their clean-exit requirements remain unchanged.
+For an older installed bundle whose instance never became ready, the new verified
+controller can use `rollback --original-bundle /usr/lib/podmesh-manager-private/OLD`.
+It verifies that bundle's complete payload manifest and unchanged application/DB
+identities, then uses the original receipt, units and resource ownership checks.
+Only a prepared instance with no readiness marker/socket and stopped PID0/noOOM
+application/database is accepted; DB exit0 remains required. This is cleanup by
+the new compatibility tool, not successful rollback by the old controller or an
+upgrade/start/capture path across bundles. Retained SQL facts are not rewritten.
 
 Before activation, declared build host runs syntax and focused recorder regressions,
 two independent package assemblies from the same pinned inputs and full control/

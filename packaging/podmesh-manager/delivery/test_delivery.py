@@ -223,6 +223,47 @@ class ManagerDeliveryTests(unittest.TestCase):
             self.assertEqual(candidate.r["phase"],"rolled-back")
             self.assertEqual(candidate.r["resources"][1]["id"],"app-data")
 
+    def test_original_bundle_cleanup_requires_intact_payload_and_never_ready_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            original=root/"old-bundle"
+            original.mkdir()
+            payload=original/"instance.py"
+            payload.write_bytes(b"original controller")
+            identities={name:"same-identity" for name in ("binary_source_revision","application_image",
+                "database_image","application_manifest","database_manifest")}
+            manifest=dict(identities,bundle=original.name,
+                          payload_sha256={payload.name:hashlib.sha256(payload.read_bytes()).hexdigest()})
+            (original/"bundle.json").write_text(json.dumps(manifest))
+            candidate=self.candidate(root/"scope")
+            candidate.root.mkdir()
+            candidate.manifest=dict(identities,bundle="new-bundle")
+            with patch.object(instance,"BUNDLE",root/"new-bundle"),patch.object(instance,"protected"):
+                with self.assertRaises(instance.Refusal):
+                    candidate.bind_failed_rollback_bundle(root/"elsewhere"/original.name)
+                payload.write_bytes(b"changed controller")
+                with self.assertRaises(instance.Refusal):
+                    candidate.bind_failed_rollback_bundle(original)
+                payload.write_bytes(b"original controller")
+                candidate.bind_failed_rollback_bundle(original)
+            self.assertEqual(candidate.manifest,manifest)
+            candidate.r.update(app="app-original",db="db-original")
+            state={"State":{"Running":False,"Pid":0,"ExitCode":0,"OOMKilled":False}}
+            candidate.owned=lambda *args:state
+            candidate.check_failed_rollback()
+            for phase in ("started","stopped","restored-stopped"):
+                candidate.r["phase"]=phase
+                with self.assertRaises(instance.Refusal):
+                    candidate.check_failed_rollback()
+            candidate.r["phase"]="prepared"
+            state["State"]["Pid"]=7
+            with self.assertRaises(instance.Refusal):
+                candidate.check_failed_rollback()
+            state["State"]["Pid"]=0
+            (candidate.root/"ready-app.json").write_text("{}")
+            with self.assertRaises(instance.Refusal):
+                candidate.check_failed_rollback()
+
     def test_changed_unit_refuses_before_any_service_stop(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)
