@@ -400,8 +400,17 @@ class Instance:
         # Creation is not an observation of an assigned network namespace. Verify
         # the immutable planned scope first, and actual addresses once running.
         declared=pod["InfraConfig"]
-        require(not declared["HostNetwork"] and declared["Networks"]==[self.prefix+"-net"]
-                and declared["StaticIP"]==self.r["network_plan"]["pod_ip"],"planned pod network differs")
+        require(not declared["HostNetwork"] and declared["Networks"]==[self.prefix+"-net"],"planned pod network differs")
+        planned_ip=declared["StaticIP"]
+        if planned_ip=="":
+            # Podman 5.4 records --ip in the pod command while StaticIP is empty.
+            # This proves creation intent only; assigned addresses are checked below.
+            command=pod.get("CreateCommand",[])
+            require(isinstance(command,list) and all(isinstance(arg,str) for arg in command),"pod creation command absent")
+            options=[i for i,arg in enumerate(command) if arg=="--ip" or arg.startswith("--ip=")]
+            require(len(options)==1 and command[options[0]]=="--ip" and options[0]+1<len(command),"pod creation IP ambiguous or absent")
+            planned_ip=command[options[0]+1]
+        require(planned_ip==self.r["network_plan"]["pod_ip"],"planned pod network differs")
         if infra["State"]["Running"]:
             attached=infra["NetworkSettings"]["Networks"]
             require(set(attached)=={self.prefix+"-net"},"infra joined an undeclared network")

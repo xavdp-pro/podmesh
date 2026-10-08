@@ -254,6 +254,29 @@ class ManagerDeliveryTests(unittest.TestCase):
             with self.assertRaises(instance.Refusal):
                 candidate.check_infra_network(pod,infra)
 
+    def test_empty_static_ip_uses_recorded_intent_and_still_checks_running_addresses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate=self.candidate(Path(directory))
+            candidate.r["network_plan"]={"pod_ip":"10.203.72.2","gateway":"10.203.72.1"}
+            # Observed Podman 5.4 schema before start: no assigned IP or IPAMConfig.
+            command=["/usr/bin/podman","pod","create","--network",candidate.prefix+"-net","--ip","10.203.72.2"]
+            pod={"InfraConfig":{"HostNetwork":False,"Networks":[candidate.prefix+"-net"],"StaticIP":""},"CreateCommand":command}
+            infra={"State":{"Running":False},"NetworkSettings":{"Networks":{candidate.prefix+"-net":{"IPAddress":"","Gateway":"","IPAMConfig":None}}}}
+            candidate.check_infra_network(pod,infra)
+            for invalid in ([],command[:-1],command[:-1]+["10.203.72.3"],command+["--ip=10.203.72.3"],command+["--ip","10.203.72.2"]):
+                pod["CreateCommand"]=invalid
+                with self.assertRaises(instance.Refusal):
+                    candidate.check_infra_network(pod,infra)
+            pod["CreateCommand"]=command
+            infra["State"]["Running"]=True
+            with self.assertRaises(instance.Refusal):
+                candidate.check_infra_network(pod,infra)
+            infra["NetworkSettings"]["Networks"][candidate.prefix+"-net"].update(IPAddress="10.203.72.2",Gateway="10.203.72.1")
+            candidate.check_infra_network(pod,infra)
+            infra["NetworkSettings"]["Networks"][candidate.prefix+"-net"]["Gateway"]="10.203.72.3"
+            with self.assertRaises(instance.Refusal):
+                candidate.check_infra_network(pod,infra)
+
     def test_oci_compressed_integrity_does_not_replace_rootfs_binding(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/"wrong-rootfs.tar"
