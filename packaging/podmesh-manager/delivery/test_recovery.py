@@ -155,6 +155,8 @@ class RealEngineLayoutTests(unittest.TestCase):
         root, obj = self.fixture()
         before = recovery.tree(root)
         alive, lock = root / "tmp/alive", root / "tmp/alive.lck"
+        timestamps = {path: (path.stat().st_atime_ns, path.stat().st_mtime_ns)
+                      for path in (alive, lock, alive.parent)}
         original = alive.read_bytes()
         self.assertEqual(len(original), 37)
         self.assertEqual(lock.read_bytes(), b"")
@@ -190,6 +192,10 @@ class RealEngineLayoutTests(unittest.TestCase):
             alive.write_bytes(original)
             alive.chmod(0o644)
             lock.write_bytes(b"")
+            # Replacing the symlink also changes its parent's directory mtime.
+            # Restore all metadata changed by this test before exact comparison.
+            for path, times in timestamps.items():
+                os.utime(path, ns=times, follow_symlinks=False)
         self.assertEqual(recovery.tree(root), before)
         self.check()
 
