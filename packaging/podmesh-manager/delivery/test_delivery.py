@@ -192,6 +192,37 @@ class ManagerDeliveryTests(unittest.TestCase):
                 candidate.rollback()
                 commands.assert_not_called()
 
+    def test_rollback_retains_failed_application_exit_without_qualifying_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate=self.candidate(Path(directory))
+            candidate.r.update(app="app-original",db="db-original")
+            candidate.r["resources"]=[{"kind":"container","name":"own-app","id":"app-original"},
+                                      {"kind":"volume","name":"app-data","id":"app-data"}]
+            states={"app-original":{"State":{"Running":False,"Pid":0,"ExitCode":1,
+                                                "OOMKilled":False,"FinishedAt":"observed-finish"}},
+                    "db-original":{"State":{"Running":False,"Pid":0,"ExitCode":0,"OOMKilled":False}}}
+            candidate.owned=lambda kind,identity:states[identity] if kind=="container" else {}
+            candidate.no_foreign_containers=lambda:None
+            removed=[]
+            candidate.podman=lambda *args:removed.append(args)
+            with patch.object(instance,"run"):
+                with self.assertRaises(instance.Refusal):
+                    candidate.stop_units()
+                for role,field,value in (("app-original","Pid",7),("app-original","OOMKilled",True),
+                                         ("db-original","ExitCode",1)):
+                    previous=states[role]["State"][field]
+                    states[role]["State"][field]=value
+                    with self.assertRaises(instance.Refusal):
+                        candidate.stop_units(for_rollback=True)
+                    states[role]["State"][field]=previous
+                candidate.rollback()
+            self.assertEqual(removed,[("container","rm","app-original")])
+            self.assertEqual(candidate.r["rollback_application_exit"],{
+                "container_id":"app-original","exit_code":1,"finished_at":"observed-finish",
+                "clean_shutdown":False})
+            self.assertEqual(candidate.r["phase"],"rolled-back")
+            self.assertEqual(candidate.r["resources"][1]["id"],"app-data")
+
     def test_changed_unit_refuses_before_any_service_stop(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)

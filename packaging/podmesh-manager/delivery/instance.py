@@ -538,7 +538,7 @@ class Instance:
         else:
             self.shutdown_app()
 
-    def stop_units(self):
+    def stop_units(self,for_rollback=False):
         if self.r.get("app"):
             item=self.owned("container",self.r["app"])
             if item and item["State"]["Running"]:
@@ -549,7 +549,13 @@ class Instance:
             if self.r.get(role):
                 item=self.owned("container",self.r[role])
                 require(item is None or (not item["State"]["Running"] and item["State"]["Pid"]==0
-                        and item["State"]["ExitCode"]==0 and not item["State"].get("OOMKilled",False)),"unit remains active or exited uncleanly")
+                        and (item["State"]["ExitCode"]==0 or (for_rollback and role=="app"))
+                        and not item["State"].get("OOMKilled",False)),"unit remains active or exited uncleanly")
+                if item and for_rollback and role=="app" and item["State"]["ExitCode"]!=0:
+                    self.r["rollback_application_exit"]={"container_id":self.r["app"],
+                        "exit_code":item["State"]["ExitCode"],"finished_at":item["State"].get("FinishedAt"),
+                        "clean_shutdown":False}
+                    self.save()
 
     def control(self,action):
         self.read()
@@ -597,7 +603,7 @@ class Instance:
                 self.owned(record["kind"],record["id"])
             else:
                 require(self.inspect(record["kind"],record["name"]) is None,"interrupted creation lacks observed ID; do not adopt it")
-        self.stop_units()
+        self.stop_units(for_rollback=True)
         self.no_foreign_containers()
         for name in self.r["units"]:
             run(["/usr/bin/systemctl","disable",name],okay=(0,1))

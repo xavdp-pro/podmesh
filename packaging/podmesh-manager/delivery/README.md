@@ -160,6 +160,11 @@ identity receipt and readiness/shutdown evidence remain. No shared image prune,
 recursive deletion, account change or legacy service administration. Repeated
 completed rollback is inert. Recovery/upgrade against retained identities is a
 separate path; rollback is not journal/history erasure or a fresh-ID substitution.
+Rollback can also remove an owned application that has already exited nonzero,
+with runningfalse/PID0/noOOM, while retaining its actual exit in the receipt as
+`rollback_application_exit` with `clean_shutdown=false`. It still requires DB
+exit0 and typed shutdown for a running application. This cleanup does not qualify
+stop or capture; their clean-exit requirements remain unchanged.
 
 Before activation, declared build host runs syntax and focused recorder regressions,
 two independent package assemblies from the same pinned inputs and full control/
