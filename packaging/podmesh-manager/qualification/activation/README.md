@@ -77,6 +77,8 @@ transition is a separate prerequisite under config-transition/.
 Store identity is established by inspecting the configured backend. An absent
 legacy SQLite path proves a fresh store only when no store profile is named;
 MariaDB profiles must still be inspected and refused on identity mismatch.
+Inspection never bootstraps or upgrades a MariaDB journal: absent, older or newer
+schema versions and incomplete cutovers refuse without applying migrations.
 When deriving inspection from a temporary configuration, its `network.database_path`
 must remain a direct child of the declared temporary state directory, including
 for MariaDB. A MariaDB-derived inspection reads the configured server at rest;
