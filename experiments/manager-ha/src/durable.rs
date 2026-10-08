@@ -4528,7 +4528,7 @@ pub use inspect_profile::{
 };
 pub mod journal_profile;
 
-#[cfg(feature = "mariadb")]
+// Portable DurableStore transaction helpers also compile in SQLite-only builds.
 mod journal_audit;
 
 #[cfg(test)]

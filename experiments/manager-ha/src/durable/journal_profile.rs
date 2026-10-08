@@ -14,7 +14,6 @@ use super::{
     Response, Snapshot, Store, StoreClosedState, StoreIntegrity, StoreIntegrityEntry, Topology,
     VerifiedPositions,
 };
-#[cfg(feature = "mariadb")]
 use super::journal_audit;
 use podmesh::store::{self, Row, StoreConfig, Transaction, Value};
 use podmesh::ManagerJournal;
