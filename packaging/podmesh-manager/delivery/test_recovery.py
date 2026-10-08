@@ -23,6 +23,32 @@ spec.loader.exec_module(recovery)
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_oracle_uses_durable_migration_marker_not_legacy_history_version(self):
+        instance = SimpleNamespace(prefix="owned", r={"replica_id": "original"})
+        def results(candidate, statement):
+            self.assertIs(candidate, instance)
+            if statement.startswith("SELECT CURRENT_USER()"):
+                return "podmesh-manager@%\tpodmesh-manager\towned-db\n"
+            if statement == "SHOW TABLES;":
+                return "\n".join(recovery.TABLES) + "\n"
+            if "information_schema.TRIGGERS" in statement:
+                return "8\n"
+            if "information_schema.ROUTINES" in statement or "FROM exchange_audit_events a" in statement:
+                return "0\n0\n"
+            if statement.startswith("SELECT version FROM store_schema"):
+                return marker + "\n"
+            if statement.startswith("SELECT replica_id FROM identity"):
+                return "original\n"
+            if statement == "SHOW GRANTS FOR CURRENT_USER;":
+                return "GRANT ALL PRIVILEGES ON `podmesh-manager`.* TO `podmesh-manager`@`%`\n"
+            self.fail("unexpected oracle SQL")
+        marker = "1"
+        with patch.object(recovery, "query", side_effect=results):
+            self.assertEqual(recovery.oracle(instance)["tables"], recovery.TABLES)
+            marker = "3"
+            with self.assertRaisesRegex(ValueError, "DurableStore migration version"):
+                recovery.oracle(instance)
+
     def test_engine_version_provenance_does_not_substitute_for_schema_validation(self):
         calls = []
         def provider(*args):

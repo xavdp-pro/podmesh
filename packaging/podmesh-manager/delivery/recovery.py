@@ -280,8 +280,9 @@ def oracle(instance, empty=False):
                   "SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA=DATABASE();").splitlines() == ["0", "0"],
             "unmapped routine/event state")
     if not empty:
-        require(query(instance, "SELECT version FROM store_schema WHERE name='manager';").strip() == "3",
-                "manager schema version differs")
+        # DurableStore migration1 implements legacy manager history schema3.
+        require(query(instance, "SELECT version FROM store_schema WHERE name='manager';").strip() == "1",
+                "manager DurableStore migration version differs")
         require(query(instance, "SELECT replica_id FROM identity WHERE singleton=1;").strip() == instance.r["replica_id"],
                 "SQL replica identity differs")
         pending = query(instance,

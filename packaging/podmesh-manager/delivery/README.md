@@ -259,10 +259,13 @@ APP volume and both private configuration trees are restored with their complete
 metadata. DB physical bytes are retained in immutable
 input; the declared exception uses a NEW final DB volume, proves application user
 1103 access with zero tables/triggers, imports the exact dump and compares all five
-tables, schema3, eight immutable triggers/DEFINER/grants and deterministic full dump
+tables, manager history schema3, eight immutable triggers/DEFINER/grants and deterministic full dump
 before APP can start. It never empties an existing copied DB volume. Partial import
 keeps `sql-import-intent`; both controller and APP ExecCondition refuse activation.
 No alternate SQL-only/images-only restoration fallback exists.
+The history schema number3 is the legacy SQLite journal version. DurableStore
+records this manager schema as migration version1 in `store_schema`; recovery
+requires that exact marker and preserves its original `applied_at` value.
 
 Functional verification proves original operation request/result/receipt replay,
 then persists one absent operation's intent before a real UID1103 append in the
@@ -288,7 +291,8 @@ exact pinned DB image and native helper `oracle`, `sql_dump`, `immutable_rows`,
 `trigger_rows` through actual UID1103. Provision two isolated private DB servers
 with explicit app credentials, exact controller hostnames and no ambient DSN or
 shared state. Confirm both initially have zero application tables/triggers. Seed
-SOURCE through the pinned product binary with schema3, eight triggers and all
+SOURCE through the pinned product binary with history schema3, DurableStore
+manager migration version1, eight triggers and all
 five tables populated (including genuine observation and accepted AUTH journal).
 Persist source SQL rows/identity/grants/trigger metadata, stop its APP with typed
 ack, require zero pending exchanges, and export the helper's exact deterministic dump.
