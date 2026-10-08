@@ -64,7 +64,8 @@ persistent application volume at `/var/lib/podmesh-node`, and a private writable
 runtime directory at `/run/podmesh-node` (tmpfs UID/GID1102 mode0700). The application
 volume must be numerically owned by 1102; configure only new volumes, never chown
 existing host state. Start the host provider and DB first, verify private DB access,
-then start the exact application image with all capabilities dropped and
+then start the exact application image with `--image-volume=ignore` (the base
+inherits `/var/lib/mysql` VOLUME metadata), all capabilities dropped and
 `no-new-privileges`. No app privilege or database admin credential is required.
 
 Setting `PODMESH_HOST_ADAPTER_SOCKET` requires an explicit MariaDB profile and

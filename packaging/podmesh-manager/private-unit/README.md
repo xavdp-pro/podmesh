@@ -80,13 +80,18 @@ podman run --detach --name "$DB_CONTAINER" --pod "$UNIT_POD" \
   --env MARIADB_ROOT_PASSWORD_FILE=/run/secrets/db-admin \
   docker.io/library/mariadb@sha256:93fc3fe333b6cdfb061425869c2c3a5bb2851c0c74dbebc2c940f024e7482d76
 # Check private DB readiness and scoped application credentials before starting app.
-podman run --detach --name "$APP_CONTAINER" --pod "$UNIT_POD" \
+podman run --detach --image-volume=ignore --name "$APP_CONTAINER" --pod "$UNIT_POD" \
   --mount "type=volume,source=$APP_VOLUME,destination=/var/lib/podmesh-manager" \
   --mount "type=bind,source=$PRIVATE_CONFIG_DIR,destination=/etc/podmesh-manager,ro=true" \
   --tmpfs /run/podmesh-manager:rw,mode=0700,uid=1103,gid=1103 \
   --cap-drop ALL --security-opt no-new-privileges \
   "$APPLICATION_IMAGE_ID"
 ```
+
+The application inherits upstream `/var/lib/mysql` VOLUME metadata;
+`--image-volume=ignore` prevents an undeclared anonymous database volume. The
+explicit app volume remains; the separate DB uses its owned database volume.
+EXPOSE metadata publishes no port itself; never publish the private DB port.
 
 All variables are required deployment inputs, not laboratory defaults. The DB init
 material creates the scoped user/database and is private, separately authorized,

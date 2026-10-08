@@ -46,6 +46,21 @@ Privileged execution cannot widen a human/parent mandate or grant Governor/Maker
 power. The existing host-root `podmeshd` packaging is a transitional implementation,
 not proof of this separation or of an isolated functional unit.
 
+## Source interfaces for private candidates
+
+The [node recipe](../packaging/podmesh-node/private-unit/README.md) uses actual
+application UID/GID1102 and its own private server. Separate `podmesh-host-adapter`
+owns root policy and retained host identity records; boot facts/lifecycle cross that
+typed boundary. Nested grants bind exact UUID/base image and explicitly declared
+empty host mounts, namespace and privileged device envelope, not inner continuity.
+The [manager recipe](../packaging/podmesh-manager/private-unit/README.md) uses
+application UID/GID1103 and a separate private server; network/resident resolve the
+same backend with no SQLite fallback. These are candidate inputs, not complete
+installers or runtime qualification. Application containers suppress inherited
+image volumes; only declared owned app/DB volumes belong to the boundary. The
+[node proof scenario](../packaging/podmesh-node/qualification/README.md) leaves
+host/VM/recovery actions to the separately authorized runtime owner.
+
 ## Delivery and proof
 
 1. Commit an immutable source candidate and build/package those bytes on an explicit

@@ -43,6 +43,28 @@ This is a partial cutover, not a complete A/B production path. The legacy
 `open_state`/`into_connection` API still refuses a MariaDB journal because it returns
 a `rusqlite::Connection`. No MariaDB profile silently falls back to SQLite.
 
+## Private application boundaries
+
+When `PODMESH_HOST_ADAPTER_SOCKET` is configured, the node application requires
+MariaDB and a non-system application identity. Host effects/observations use the
+scoped typed provider in [HOST-ADAPTER-CONTRACT.md](HOST-ADAPTER-CONTRACT.md), with
+no local Podman fallback. This surface excludes secrets and scoped universe
+statistics until those capabilities are ported. Isolated nested lifecycle requires
+host-owned UUID/base-image/empty-host-mount grants; that does not qualify inner
+workload continuity, migration or replication. Each boot pass reads validated
+host machine/boot/btime/clock facts once through the provider. See the
+[node recipe](../packaging/podmesh-node/private-unit/README.md) and
+[product proof scenario](../packaging/podmesh-node/qualification/README.md).
+
+Manager resident and network resolve the same profile beside
+`network.database_path` or from explicitly named `PODMESH_STORE_PROFILE`.
+Observations, snapshot export, authenticated import, receipts and exchange audits
+use that backend. MariaDB import commits facts/receipt/import audit atomically;
+other exchange phases commit into the same private journal. A rejected profile or
+failed MariaDB connection never opens `manager.sqlite` as fallback. The `mariadb`
+feature propagates through resident/network/HA; without it a MariaDB profile
+refuses and the SQLite-only build remains usable.
+
 ## Where the profile is read from
 
 A node reads its profile from `store.json` under its state directory (`/var/lib/podmesh/store.json`
