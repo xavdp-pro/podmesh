@@ -104,6 +104,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut bytes = Vec::new();
         let mut byte = [0];
         let response = loop {
+            // A partial/trickled frame has not been admitted to the store.
+            // Do not let successive bounded reads postpone termination forever.
+            if STOP_REQUESTED.load(Ordering::Relaxed) {
+                break serde_json::json!({"ok":false,"error":"Daemon stopping"});
+            }
             match stream.read(&mut byte) {
                 Ok(0) => break serde_json::json!({"ok":false,"error":"Incomplete request"}),
                 Ok(_) => {
