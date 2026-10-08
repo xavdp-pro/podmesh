@@ -364,6 +364,8 @@ class RealPreparedTargetTests(unittest.TestCase):
     def test_native_prepared_target_sql_history_secret_dependency_and_unclassified_store_refuse(self):
         root, obj = self.fixture()
         before = recovery.tree(root)
+        graph = root / "graphroot"
+        graph_times = (graph.stat().st_atime_ns, graph.stat().st_mtime_ns)
         database = root / "graphroot/db.sql"
         original = database.read_bytes()
         times = (database.stat().st_atime_ns, database.stat().st_mtime_ns)
@@ -396,8 +398,6 @@ class RealPreparedTargetTests(unittest.TestCase):
         finally:
             database.write_bytes(original)
             os.utime(database, ns=times)
-        graph = root / "graphroot"
-        graph_times = (graph.stat().st_atime_ns, graph.stat().st_mtime_ns)
         secrets = graph / "secrets"
         try:
             secrets.symlink_to(database)
