@@ -18,8 +18,9 @@ rg -q 'ledger_sum.recovered' "$root/activate-host.sh"
 rg -q 'write_ledger start-failed' "$root/activate-host.sh"
 rg -q 'RECOVERED_NOT_QUALIFIED' "$root/activate-host.sh"
 rg -q 'cleanup_restart:true' "$root/activate-host.sh"
-python3 -m py_compile "$root/compare-evidence.py" "$root/validate-dropin.py" "$root/graceful-shutdown.py" "$root/wait-ready.py" "$root/append-observation.py" "$root/preflight-store-identity.py"
+python3 -m py_compile "$root/compare-evidence.py" "$root/validate-dropin.py" "$root/graceful-shutdown.py" "$root/wait-ready.py" "$root/append-observation.py" "$root/preflight-store-identity.py" "$root/preflight-store-topology.py"
 python3 "$root/tests/test_preflight_store_identity.py" -q
+python3 "$root/tests/test_preflight_store_topology.py" -q
 # The comparator joins replica IDs, the logical manager ID and endpoints across observation sites. A value the
 # collector commits under a site-specific label, or a right label over the wrong value, can never join, and the
 # synthetic fixtures below cannot notice: they commit every identity under one label by construction. So the
