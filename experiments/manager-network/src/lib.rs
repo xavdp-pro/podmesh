@@ -3708,6 +3708,16 @@ mod tests {
         assert_eq!(error.category(), ErrorCategory::Unavailable);
         assert_eq!(error.source(), ErrorSource::Local);
         assert!(error.connection_attempted());
+        let audit = inspection(&r1);
+        assert_eq!(audit.audit_event_count, 2, "connect refusal must persist its terminal");
+        assert!(audit.incomplete_attempts.is_empty());
+        let terminal = audit.ordered_audit_events.iter().find(|evidence| {
+            evidence.event.phase == AuditPhase::OutboundExchangeCompleted
+        }).unwrap();
+        assert_eq!(terminal.event.outcome, AuditOutcome::Unavailable);
+        assert_eq!(terminal.event.reason_code, Some(RefusalReason::TransportUnavailable));
+        assert_eq!(terminal.event.request_frame_bytes, 0);
+        assert_eq!(terminal.event.reply_frame_bytes, 0);
     }
 
     #[test]

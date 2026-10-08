@@ -112,6 +112,71 @@ fn unavailable_explicit_mariadb_profile_refuses_without_sqlite_fallback() {
 
 #[cfg(feature = "mariadb")]
 #[test]
+fn real_private_mariadb_connect_refusal_persists_terminal_after_reopen() {
+    use podmesh::store::{self, Engine, MariadbConfig, StoreConfig};
+    use podmesh_manager_ha_lab::durable::{AuditOutcome, AuditPhase, RefusalReason};
+    use podmesh_manager_network_lab::{ErrorCategory, ErrorSource};
+    use std::{io::Write, net::TcpListener, os::unix::fs::OpenOptionsExt};
+
+    assert!(std::env::var_os("PODMESH_STORE_PROFILE").is_none());
+    let dsn = std::env::var("PODMESH_MARIADB_DSN").expect("fresh private MariaDB required");
+    let profile = StoreConfig {
+        engine: Engine::Mariadb,
+        mariadb: MariadbConfig::from_dsn(dsn.clone()),
+        ..StoreConfig::default()
+    };
+    let mut raw = store::open(&profile).unwrap();
+    assert!(raw.query(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE()", &[]
+    ).unwrap().is_empty(), "fresh private database required");
+    drop(raw);
+    let directory = tempfile::tempdir().unwrap();
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+        .open(directory.path().join("store.json")).unwrap();
+    file.write_all(serde_json::to_string(&serde_json::json!({
+        "store":{"engine":"mariadb","mariadb":{"dsn":dsn}}
+    })).unwrap().as_bytes()).unwrap();
+    drop(file);
+    // Reserve an ephemeral TCP endpoint, then close it: the real connect must fail.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    drop(listener);
+    let config = configuration(directory.path(), 1, endpoint);
+    let mut node = config.open().unwrap();
+    let problem = node.sync_to("r2", "connect-refused", "connect-refused-nonce").unwrap_err();
+    assert_eq!(problem.category(), ErrorCategory::Unavailable);
+    assert_eq!(problem.source(), ErrorSource::Local);
+    assert!(problem.connection_attempted());
+    drop(node);
+    // Reopen the actual private store; an error category alone cannot prove its terminal.
+    drop(config.open().unwrap());
+    let audit = podmesh_manager_ha_lab::durable::inspect_profile::inspect_read_only_resolved(
+        directory.path(), &config.database_path, &config.manager, &config.replica_id
+    ).unwrap();
+    assert_eq!(audit.audit_event_count, 2);
+    assert!(audit.incomplete_attempts.is_empty());
+    let terminal = audit.ordered_audit_events.iter().find(|evidence| {
+        evidence.event.phase == AuditPhase::OutboundExchangeCompleted
+    }).unwrap();
+    assert_eq!(terminal.event.outcome, AuditOutcome::Unavailable);
+    assert_eq!(terminal.event.reason_code, Some(RefusalReason::TransportUnavailable));
+    assert!(terminal.event.authenticated_peer_id.is_none());
+    assert_eq!(terminal.event.request_frame_bytes, 0);
+    assert_eq!(terminal.event.reply_frame_bytes, 0);
+    let mut raw = store::open(&profile).unwrap();
+    let row = raw.query_one(
+        "SELECT outcome,error_category,reason_code,request_frame_bytes,reply_frame_bytes FROM exchange_audit_events WHERE phase='outbound_exchange_completed'", &[]
+    ).unwrap().unwrap();
+    assert_eq!(row.text(0).unwrap(), "unavailable");
+    assert_eq!(row.text(1).unwrap(), "unavailable");
+    assert_eq!(row.text(2).unwrap(), "transport_unavailable");
+    assert_eq!(row.integer(3).unwrap(), 0);
+    assert_eq!(row.integer(4).unwrap(), 0);
+    no_sqlite(directory.path());
+}
+
+#[cfg(feature = "mariadb")]
+#[test]
 fn real_private_mariadb_authenticated_exchange_has_one_journal_and_no_sqlite() {
     use podmesh::store::{self, Engine, MariadbConfig, StoreConfig};
     use podmesh_manager_ha_lab::{durable::Request, ConfiguredStore};
