@@ -27,7 +27,7 @@ fn clean_lifecycle_history_passes_without_mutating_the_store() {
         .unwrap();
     let mut node = NodeStore::Durable(Box::new(store));
     node.validate_startup_scope().unwrap();
-    let NodeStore::Durable(store) = node else {
+    let NodeStore::Durable(mut store) = node else {
         panic!("durable store")
     };
     assert_eq!(
@@ -44,7 +44,7 @@ fn effective_interrupted_and_historical_network_effects_all_refuse() {
         let mut node = NodeStore::Durable(Box::new(store));
         let error = node.validate_startup_scope().unwrap_err().to_string();
         assert!(error.contains("network_effects"), "{error}");
-        let NodeStore::Durable(store) = node else {
+        let NodeStore::Durable(mut store) = node else {
             panic!("durable store")
         };
         assert_eq!(
