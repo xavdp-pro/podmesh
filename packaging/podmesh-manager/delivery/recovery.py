@@ -1413,7 +1413,8 @@ def restore(instance, a, api):
     target_layout = closed_graphroot(instance.root, {api.image_id(item["Image"]) for item in target_containers},
         {item["Id"] for item in target_containers}, {instance.prefix + "-app", instance.prefix + "-db"},
         source_layout["engine_version"], target_pod["Id"], source_layout["engine_database_backend"], target_pod["InfraContainerID"],
-        phase="prepared-target", prepared_observations=target_containers)
+        phase="prepared-target" if source_layout["engine_database_backend"] == "sqlite" else "stopped",
+        prepared_observations=target_containers)
     origin["mapping"].append({"component": "engine-state-database", "source": source_layout,
         "target": target_layout, "behavior": "source-bytes-sealed-in-full-copy; target-regenerated-for-new-observed-resources"})
     instance.save()
