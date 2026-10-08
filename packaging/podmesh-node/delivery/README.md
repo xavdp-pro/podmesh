@@ -33,7 +33,9 @@ checks every descriptor size/digest. No pull, build, tag or runtime activation.
 
 A package has a name and `/usr/lib/podmesh-node-private/<bundle>/` path containing
 both source and recipe revision prefixes. It contains exact executables, both
-OCI archives, the controller, this document, the product license and a public payload manifest. No
+OCI archives, the controller, this document, the product LICENSE and NOTICE, and
+a public payload manifest. Both product licensing files are covered by payload
+hashes in that manifest. No
 maintainer scripts, host account creation, service installation, credentials,
 profiles, live data, policy grants or automatic service activation. Dependencies
 are external host prerequisites. Archive provenance and licensing notices remain
