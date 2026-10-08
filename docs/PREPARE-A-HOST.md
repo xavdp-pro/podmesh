@@ -57,3 +57,13 @@ stopped while its archive is built. Installation preflight must display which ca
 class is available and must never reformat or repurpose an existing disk automatically.
 
 For containers, Alpine is preferred where tested. That preference does not change the Debian host package target.
+
+## Boot-restore acceptance (G2 op 10, controller host)
+
+Slice A op 10 (`tests/check-boot-restore.py`) exercises boot-time restore on the **same host** that runs the `podmesh` controller (live capture, host reboot, post-boot verification). That path requires the packaged private migration runtime: install **`podmesh-vzcriu`** (and its helper shim) from the same signed repository, then confirm the qualified CRIU binary passes on **this kernel**:
+
+```sh
+/opt/podmesh-vzcriu-kit/bin/criu check
+```
+
+A **PASS** from `criu check` is a hard prerequisite for live capture and for claiming op 10 verified; structural preflight or an operator reboot gate alone do not substitute for suite **PASS**. Proxmox VE kernels are not guaranteed to pass — laboratory evidence on **7.0.14-6-pve** recorded **FAIL** for this check (see private lab record `op10-acceptance-criteria-2026-10-08.md`). Do not report op 10 PASS without a completed suite run on a host where `criu check` passes.
