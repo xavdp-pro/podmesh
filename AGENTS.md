@@ -39,7 +39,7 @@ obligations as binding requirements, not optional background context.
   - `INTENT.md`: still missing Rule 0B / Rule 7 headers — add on next edit of that file.
   - Epoch gate and guardian still on a workstation (ideal-scene departure 2 / A5) — separate mandate.
   - Gate 4 HELD; no vote keys from this assembly.
-  - Node MariaDB serves the ported lifecycle slice; volume and boot-return call sites still need porting. Manager journal engineering proofs do not establish a replicated deployment or authenticated functional restore. One private server instance per unit; qualification belongs to the exact candidate.
+  - Node MariaDB serves the ported lifecycle slice; bounded volume declarations also use DurableStore; boot-return call sites still need porting. Manager journal engineering proofs do not establish a replicated deployment or authenticated functional restore. One private server instance per unit; qualification belongs to the exact candidate.
 - Outside this mandate: arming vote keys, closing laboratory gates, production HA promotion, reference universe, editing the pinned SHAPER corpus.
 
 Follow the corpus's AGENTS.md, LAW.md, governing map and reading contract.

@@ -9,6 +9,7 @@
 //! device per universe in this build.
 use crate::lifecycle as lc;
 use crate::migration as mg;
+use crate::store::{DurableStore, Transaction, Value as Stored};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::process::Command;
@@ -360,6 +361,108 @@ fn perform(db: &Connection, request: &Value) -> Result<Value, Error> {
     }
 }
 
+/// Host facts retain their existing meaning; journal declarations are read through the profile.
+pub fn status_store(store: &mut dyn DurableStore) -> Result<Value, Error> {
+    let mut result = status(None)?;
+    let rows = store.query("SELECT universe_uuid, capacity_bytes, declared_at FROM universe_volume_declarations ORDER BY universe_uuid", &[])?;
+    let declarations = rows.into_iter().map(|row| -> Result<Value, Error> {
+        Ok(json!({"universe_uuid": row.text(0)?, "capacity_bytes": row.integer(1)?, "declared_at": row.integer(2)?}))
+    }).collect::<Result<Vec<_>, _>>()?;
+    result["universe_volumes"] = json!({"declarations": declarations, "note": "declared capacities recorded by volume_declare and volume_grow on this host; a separate block device per universe is not attached in this build"});
+    Ok(result)
+}
+
+pub fn execute_store(store: &mut dyn DurableStore, request: &Value) -> Result<Value, Error> {
+    let operation = lc::text(request, "operation")?;
+    if !matches!(operation, "volume_declare" | "volume_grow") {
+        return Err("Unsupported storage mutation".into());
+    }
+    let uuid = lc::text(request, "universe_uuid")?;
+    lc::token(uuid)?;
+    lc::text(request, "authorization_ref")?;
+    if let Some(result) = lc::historical_store_result(store, request)? {
+        return Ok(result);
+    }
+    let container =
+        lc::inspect(&format!("podmesh-{uuid}"))?.ok_or("No such universe on this host")?;
+    lc::volume_store_gates(store, uuid, operation, &container)?;
+    let state = lc::status(&container);
+    if !lc::STOPPED.contains(&state) {
+        return Err(
+            format!("volume operations require a stopped universe; this one is {state}").into(),
+        );
+    }
+    let assessment = assess_host_growth()?;
+    refuse_unless_growth_possible(&assessment)?;
+    mutate_store(store, request, &assessment)
+}
+
+fn mutate_store(
+    store: &mut dyn DurableStore,
+    request: &Value,
+    assessment: &GrowthAssessment,
+) -> Result<Value, Error> {
+    lc::journaled_store_transaction(store, request, |tx| perform_store(tx, request, assessment))
+}
+
+fn perform_store(
+    tx: &mut dyn Transaction,
+    request: &Value,
+    assessment: &GrowthAssessment,
+) -> Result<Value, Error> {
+    let uuid = lc::text(request, "universe_uuid")?;
+    let id = lc::text(request, "operation_id")?;
+    let reference = lc::text(request, "authorization_ref")?;
+    let operation = lc::text(request, "operation")?;
+    let current = tx.query_one(
+        "SELECT capacity_bytes FROM universe_volume_declarations WHERE universe_uuid = ?",
+        &[Stored::from(uuid)],
+    )?;
+    let now = crate::now() as i64;
+    match operation {
+        "volume_declare" => {
+            if current.is_some() {
+                return Err(
+                    "a volume is already declared for this universe; use volume_grow".into(),
+                );
+            }
+            let capacity = request["capacity_bytes"]
+                .as_u64()
+                .ok_or("capacity_bytes is required")?;
+            capacity_bound(capacity, assessment)?;
+            tx.execute("INSERT INTO universe_volume_declarations(universe_uuid, capacity_bytes, declared_at, declare_operation_id, declare_authorization_ref) VALUES(?, ?, ?, ?, ?)", &[Stored::from(uuid), Stored::from(capacity), Stored::from(now), Stored::from(id), Stored::from(reference)])?;
+            Ok(
+                json!({"action":"declared", "universe_uuid":uuid, "capacity_bytes":capacity, "host_growth":assessment.growth, "backend":assessment.backend, "scope":"journal declaration only; no per-universe block device is attached in this build"}),
+            )
+        }
+        "volume_grow" => {
+            let current = current
+                .ok_or("no volume declared for this universe; use volume_declare first")?
+                .integer(0)?;
+            let current =
+                u64::try_from(current).map_err(|_| "invalid negative declared capacity")?;
+            let additional = request["additional_bytes"]
+                .as_u64()
+                .ok_or("additional_bytes is required")?;
+            if additional < MIN_CAPACITY_BYTES {
+                return Err(format!(
+                    "additional_bytes must be an integer from {MIN_CAPACITY_BYTES} bytes"
+                )
+                .into());
+            }
+            let capacity = current
+                .checked_add(additional)
+                .ok_or("capacity_bytes overflow")?;
+            capacity_bound(capacity, assessment)?;
+            tx.execute("UPDATE universe_volume_declarations SET capacity_bytes = ?, last_grow_operation_id = ?, last_grown_at = ? WHERE universe_uuid = ?", &[Stored::from(capacity), Stored::from(id), Stored::from(now), Stored::from(uuid)])?;
+            Ok(
+                json!({"action":"grown", "universe_uuid":uuid, "previous_capacity_bytes":current, "capacity_bytes":capacity, "additional_bytes":additional, "host_growth":assessment.growth, "backend":assessment.backend, "scope":"journal declaration only; no per-universe block device is attached in this build"}),
+            )
+        }
+        _ => Err("Unsupported storage mutation".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,5 +524,169 @@ mod tests {
         let grown = declaration(&db, uuid).unwrap().unwrap();
         assert_eq!(grown["capacity_bytes"], 7_000_000);
         assert_eq!(grown["last_grow_operation_id"], "grow");
+    }
+}
+
+#[cfg(test)]
+mod durable_tests {
+    use super::*;
+    use crate::store::{migrations, SqliteStore};
+
+    fn assessment() -> GrowthAssessment {
+        GrowthAssessment {
+            graph_root: "/fixture".into(),
+            backend: "lvm".into(),
+            dedicated: true,
+            growth: "possible",
+            reason: String::new(),
+            filesystem_size_bytes: Some(32 * MIN_CAPACITY_BYTES),
+        }
+    }
+
+    fn request(operation: &str, id: &str) -> Value {
+        json!({"operation":operation, "operation_id":id,
+            "universe_uuid":"789f5e24-e248-42aa-923b-a701f814de52", "authorization_ref":"volume-store-engineering-fixture"})
+    }
+
+    // Execute the actual durable journal path with a controlled host assessment. This proves
+    // SQL/order/replay semantics, not Podman ownership or a growable runtime host.
+    fn round_trip(store: &mut dyn DurableStore) {
+        let mut declare = request("volume_declare", "volume-store-declare");
+        declare["capacity_bytes"] = json!(2 * MIN_CAPACITY_BYTES);
+        mutate_store(store, &declare, &assessment()).unwrap();
+        let mut grow = request("volume_grow", "volume-store-grow");
+        grow["additional_bytes"] = json!(MIN_CAPACITY_BYTES);
+        let result = mutate_store(store, &grow, &assessment()).unwrap();
+        assert_eq!(result["capacity_bytes"], 3 * MIN_CAPACITY_BYTES);
+        let replay = mutate_store(store, &grow, &assessment()).unwrap();
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(store.query_one("SELECT capacity_bytes FROM universe_volume_declarations WHERE universe_uuid = ?", &[Stored::from(declare["universe_uuid"].as_str().unwrap())]).unwrap().unwrap().integer(0).unwrap(), (3 * MIN_CAPACITY_BYTES) as i64);
+        assert_eq!(store.query_one("SELECT COUNT(*) FROM operation_attempts WHERE operation_id = 'volume-store-grow'", &[]).unwrap().unwrap().integer(0).unwrap(), 1);
+        grow["additional_bytes"] = json!(2 * MIN_CAPACITY_BYTES);
+        assert!(mutate_store(store, &grow, &assessment())
+            .unwrap_err()
+            .to_string()
+            .contains("different request"));
+        let mut excessive = request("volume_grow", "volume-store-overflow");
+        excessive["additional_bytes"] = json!(u64::MAX);
+        assert!(mutate_store(store, &excessive, &assessment()).is_err());
+        assert_eq!(store.query_one("SELECT capacity_bytes FROM universe_volume_declarations WHERE universe_uuid = ?", &[Stored::from(declare["universe_uuid"].as_str().unwrap())]).unwrap().unwrap().integer(0).unwrap(), (3 * MIN_CAPACITY_BYTES) as i64);
+        assert_eq!(
+            store
+                .query_one(
+                    "SELECT status FROM operations WHERE id = 'volume-store-overflow'",
+                    &[]
+                )
+                .unwrap()
+                .unwrap()
+                .text(0)
+                .unwrap(),
+            "failed"
+        );
+    }
+
+    #[test]
+    fn durable_volumes_replay_once_and_refuse_changed_ids_and_overflow() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        migrations::apply(&mut store).unwrap();
+        round_trip(&mut store);
+    }
+
+    #[test]
+    fn interrupted_pending_volume_intent_can_finish_once() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        migrations::apply(&mut store).unwrap();
+        let mut declare = request("volume_declare", "volume-store-pending");
+        declare["capacity_bytes"] = json!(2 * MIN_CAPACITY_BYTES);
+        store
+            .execute(
+                "INSERT INTO operations VALUES(?, ?, 'pending', NULL)",
+                &[
+                    Stored::from("volume-store-pending"),
+                    Stored::from(declare.to_string()),
+                ],
+            )
+            .unwrap();
+        store.execute("INSERT INTO operation_attempts(operation_id, started_at) VALUES('volume-store-pending', 0)", &[]).unwrap();
+        mutate_store(&mut store, &declare, &assessment()).unwrap();
+        assert_eq!(
+            mutate_store(&mut store, &declare, &assessment()).unwrap()["replayed"],
+            true
+        );
+        assert_eq!(
+            store
+                .query_one("SELECT COUNT(*) FROM universe_volume_declarations", &[])
+                .unwrap()
+                .unwrap()
+                .integer(0)
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.query_one("SELECT COUNT(*) FROM operation_attempts WHERE operation_id = 'volume-store-pending'", &[]).unwrap().unwrap().integer(0).unwrap(), 2);
+    }
+
+    #[test]
+    fn partial_mutation_rolls_back_before_failure_and_retry() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        migrations::apply(&mut store).unwrap();
+        let request = request("volume_declare", "volume-store-rollback");
+        let error = lc::journaled_store_transaction(&mut store, &request, |tx| {
+            tx.execute("INSERT INTO universe_volume_declarations VALUES('rollback-fixture', 2097152, 0, 'volume-store-rollback', 'fixture', NULL, NULL)", &[])?;
+            Err("controlled interruption before verified result".into())
+        }).unwrap_err();
+        assert!(error.to_string().contains("controlled interruption"));
+        assert!(store.query_one("SELECT 1 FROM universe_volume_declarations WHERE universe_uuid = 'rollback-fixture'", &[]).unwrap().is_none());
+        assert_eq!(
+            store
+                .query_one(
+                    "SELECT status FROM operations WHERE id = 'volume-store-rollback'",
+                    &[]
+                )
+                .unwrap()
+                .unwrap()
+                .text(0)
+                .unwrap(),
+            "failed"
+        );
+        lc::journaled_store_transaction(&mut store, &request, |_| Ok(json!({"recovered":true})))
+            .unwrap();
+        let replay = lc::journaled_store_transaction(&mut store, &request, |_| {
+            panic!("verified replay must not run mutation")
+        })
+        .unwrap();
+        assert_eq!(replay["historical"], true);
+    }
+
+    #[cfg(feature = "mariadb")]
+    #[test]
+    fn real_mariadb_volume_journal_when_a_server_is_named() {
+        use crate::store::{MariadbConfig, MariadbStore};
+        let _serialized = crate::store::MARIADB_TEST_SERVER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(config) = MariadbConfig::from_environment() else {
+            eprintln!("skipped: PODMESH_MARIADB_DSN names no isolated test server");
+            return;
+        };
+        let mut store = MariadbStore::open(&config).expect("named MariaDB test server opens");
+        migrations::apply(&mut store).unwrap();
+        assert!(store.query_one("SELECT 1 FROM universe_volume_declarations WHERE universe_uuid = '789f5e24-e248-42aa-923b-a701f814de52'", &[]).unwrap().is_none(), "use a fresh isolated test database");
+        round_trip(&mut store);
+        store.execute("DELETE FROM universe_volume_declarations WHERE universe_uuid = '789f5e24-e248-42aa-923b-a701f814de52'", &[]).unwrap();
+        for id in [
+            "volume-store-declare",
+            "volume-store-grow",
+            "volume-store-overflow",
+        ] {
+            store
+                .execute(
+                    "DELETE FROM operation_attempts WHERE operation_id = ?",
+                    &[Stored::from(id)],
+                )
+                .unwrap();
+            store
+                .execute("DELETE FROM operations WHERE id = ?", &[Stored::from(id)])
+                .unwrap();
+        }
     }
 }

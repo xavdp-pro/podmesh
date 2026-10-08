@@ -13,9 +13,13 @@ ordered set of migrations applied at every open, on whichever engine the profile
 
 **The daemon serves the operations ported to `DurableStore` from MariaDB.** These
 include local reads, lifecycle create/delete/clone/start/stop/pause/resume/resources,
-and secret declare/remove/status. Ask `capabilities` for the supported set.
-Other module-owned operations return `store_engine_unsupported`: volume declaration
-and growth, boot restore, migration and recovery points still require SQLite.
+bounded volume declaration/growth and secret declare/remove/status. Ask `capabilities`
+for the supported set. Volume changes retain stopped-owned-universe, reservation
+and dedicated growable-storage gates; they declare capacity only, not new block
+devices. Pending intent commits first; capacity, verified result and completed
+attempt commit together, so retries repeat no growth. `storage_status` reads
+declarations from the configured journal. Other module-owned operations return
+`store_engine_unsupported`: boot restore, migration and recovery points still require SQLite.
 Startup publisher withdrawal and network reconciliation are also SQLite-only.
 Before opening the API socket, a durable node refuses any rows in network/publisher
 tables, any network/publisher operation history, or any managed-network operation.

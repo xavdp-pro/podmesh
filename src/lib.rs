@@ -463,8 +463,6 @@ fn sqlite_only_operation(operation: &str) -> bool {
             | "boot_restore"
             | "boot_restore_status"
             | "migration_status"
-            | "volume_declare"
-            | "volume_grow"
     )
 }
 
@@ -496,13 +494,15 @@ fn durable_capabilities(engine: Engine) -> Value {
             "pause",
             "resume",
             "resources",
+            "volume_declare",
+            "volume_grow",
             "secret_declare",
             "secret_remove",
             "secret_status",
         ],
         "store_engine": engine.as_str(),
         "unsupported_error_code": "store_engine_unsupported",
-        "scope": "read-only local API, lifecycle create/delete/clone/start/stop/pause/resume/resources, and secret_declare/secret_remove/secret_status; other module-owned mutations remain SQLite-only",
+        "scope": "read-only local API, lifecycle create/delete/clone/start/stop/pause/resume/resources, bounded volume declarations/growth, and secret_declare/secret_remove/secret_status; other module-owned mutations remain SQLite-only",
     })
 }
 
@@ -515,8 +515,12 @@ fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
         .get("operation")
         .and_then(Value::as_str)
         .unwrap_or("");
-    if durable_lifecycle_operation(operation) {
-        let result = lifecycle::execute_store(store, request);
+    if durable_lifecycle_operation(operation) || matches!(operation, "volume_declare" | "volume_grow") {
+        let result = if matches!(operation, "volume_declare" | "volume_grow") {
+            storage::execute_store(store, request)
+        } else {
+            lifecycle::execute_store(store, request)
+        };
         let response = match result {
             Ok(data) => json!({"ok":true,"observed_at":now(),"data":data}),
             Err(error) => {
@@ -600,7 +604,7 @@ fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
                     .collect::<store::Result<Vec<_>>>()?;
                 json!({"observations": observations})
             }
-            "storage_status" => storage::status(None)?,
+            "storage_status" => storage::status_store(store)?,
             "host_status" => health::host_status()?,
             "universe_stats" => health::universe_stats()?,
             _ => return Err("Unsupported operation".into()),

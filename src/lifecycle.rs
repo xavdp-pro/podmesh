@@ -1745,6 +1745,114 @@ pub(crate) fn fault(point: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Shared durable ownership/reservation gates, also used by bounded volume mutations.
+pub(crate) fn volume_store_gates(
+    store: &mut dyn DurableStore,
+    uuid: &str,
+    operation: &str,
+    container: &Value,
+) -> Result<(), Error> {
+    let mut db = DurableLifecycleDb { store };
+    db.refuse_reserved(uuid, operation)?;
+    db.owned(container, uuid, "universe")
+}
+
+/// Read a verified result before any host observation or mutation. IDs bind the whole request.
+pub(crate) fn historical_store_result(
+    store: &mut dyn DurableStore,
+    request: &Value,
+) -> Result<Option<Value>, Error> {
+    let id = text(request, "operation_id")?;
+    token(id)?;
+    let Some(row) = store.query_one(
+        "SELECT request, status, result FROM operations WHERE id = ?",
+        &[Stored::from(id)],
+    )?
+    else {
+        return Ok(None);
+    };
+    if row.text(0)? != request.to_string() {
+        return Err("Operation ID already belongs to a different request".into());
+    }
+    if row.text(1)? != "verified" {
+        return Ok(None);
+    }
+    let mut result: Value = serde_json::from_str(row.text(2)?)?;
+    result["replayed"] = json!(true);
+    result["historical"] = json!(true);
+    result["notice"] = json!("this is the result persisted when the operation was verified, not current state; a replay repeats no effect");
+    Ok(Some(result))
+}
+
+/// Journal a pure store mutation. Commit pending intent first; mutation and verified result
+/// then commit together. A failed closure rolls back its writes before failure is recorded.
+/// Unlike a host effect, a capacity update must never survive without its replay result.
+pub(crate) fn journaled_store_transaction(
+    store: &mut dyn DurableStore,
+    request: &Value,
+    run: impl FnOnce(&mut dyn crate::store::Transaction) -> Result<Value, Error>,
+) -> Result<Value, Error> {
+    if let Some(result) = historical_store_result(store, request)? {
+        return Ok(result);
+    }
+    let id = text(request, "operation_id")?;
+    let attempt = {
+        let mut tx = store.transaction()?;
+        if tx
+            .query_one(
+                "SELECT id FROM operations WHERE id = ?",
+                &[Stored::from(id)],
+            )?
+            .is_none()
+        {
+            tx.execute(
+                "INSERT INTO operations(id, request, status, result) VALUES(?, ?, 'pending', NULL)",
+                &[Stored::from(id), Stored::from(request.to_string())],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO operation_attempts(operation_id, started_at) VALUES(?, ?)",
+            &[Stored::from(id), Stored::from(crate::now() as i64)],
+        )?;
+        let attempt = tx
+            .query_one(
+                "SELECT id FROM operation_attempts WHERE operation_id = ? ORDER BY id DESC LIMIT 1",
+                &[Stored::from(id)],
+            )?
+            .ok_or("Missing durable attempt")?
+            .integer(0)?;
+        tx.commit()?;
+        attempt
+    };
+    let mut tx = store.transaction()?;
+    match run(tx.as_mut()) {
+        Ok(result) => {
+            tx.execute(
+                "UPDATE operations SET status = 'verified', result = ? WHERE id = ?",
+                &[Stored::from(result.to_string()), Stored::from(id)],
+            )?;
+            tx.execute(
+                "UPDATE operation_attempts SET finished_at = ?, outcome = 'verified' WHERE id = ?",
+                &[Stored::from(crate::now() as i64), Stored::from(attempt)],
+            )?;
+            tx.commit()?;
+            Ok(result)
+        }
+        Err(error) => {
+            tx.rollback()?;
+            let record = json!({"error": error.to_string()}).to_string();
+            let mut tx = store.transaction()?;
+            tx.execute(
+                "UPDATE operations SET status = 'failed', result = ? WHERE id = ?",
+                &[Stored::from(&record), Stored::from(id)],
+            )?;
+            tx.execute("UPDATE operation_attempts SET finished_at = ?, outcome = 'failed', detail = ? WHERE id = ?", &[Stored::from(crate::now() as i64), Stored::from(record), Stored::from(attempt)])?;
+            tx.commit()?;
+            Err(error)
+        }
+    }
+}
+
 pub(crate) fn journaled(
     db: &Connection,
     request: &Value,
