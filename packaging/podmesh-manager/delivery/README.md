@@ -310,6 +310,10 @@ OCI version, owning layer/sandbox and mounts bound to the declared private root.
 Container-bound runroot health/log/network/previous-PID files and empty
 `tmp/persist` are classified explicitly. Previous PID bytes are retained as
 historical metadata; actual container PID0 establishes process quiescence.
+The observed `vfs-containers/volatile-containers.json` and
+`vfs-layers/volatile-layers.json` are root-owned mode0600 regular files containing
+exactly the two bytes `[]`. They are inventoried and preserved; nonempty state,
+symlinks and unknown volatile files refuse rather than being deleted or ignored.
 Every source byte and its metadata remains in the complete sealed archive.
 Restore preserves that source copy unchanged and explicitly records a newly
 generated engine database/layout for newly observed target resources; it never

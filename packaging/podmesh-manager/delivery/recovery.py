@@ -657,6 +657,7 @@ def closed_graphroot(root, images, containers, volumes, version="synthetic-test-
         allowed.add("db.sql")
     require({p.name for p in graph.iterdir()} <= allowed, "unmapped graphroot component")
     metadata_rows = {}
+    volatile_metadata = []
     for kind, expected in (("images", images), ("containers", containers), ("layers", None)):
         directory = graph / ("vfs-" + kind)
         require(directory.is_dir() and not directory.is_symlink(), "VFS metadata directory missing")
@@ -676,6 +677,18 @@ def closed_graphroot(root, images, containers, volumes, version="synthetic-test-
         if expected is not None:
             require(ids == expected, "unmapped VFS resource identity")
         known = {kind + ".json", kind + ".lock"}
+        if version == "5.4.2" and kind in ("containers", "layers"):
+            volatile_name = "volatile-" + kind + ".json"
+            known.add(volatile_name)
+            volatile = directory / volatile_name
+            if volatile.exists() or volatile.is_symlink():
+                item = volatile.lstat()
+                require(stat.S_ISREG(item.st_mode) and item.st_uid == item.st_gid == 0
+                        and stat.S_IMODE(item.st_mode) == 0o600 and item.st_nlink == 1
+                        and item.st_size == 2 and volatile.read_bytes() == b"[]",
+                        "unclassified volatile VFS state")
+                volatile_metadata.append({"path": str(volatile.relative_to(graph)), "bytes": 2,
+                    "sha256": digest(volatile), "state": "empty-array"})
         if kind in ("images", "containers"):
             known |= ids
         else:
@@ -788,6 +801,7 @@ def closed_graphroot(root, images, containers, volumes, version="synthetic-test-
                 "engine metadata is not regular")
     return {"layout": "bounded-private-vfs/v2", "engine_version": version, "engine_database_backend": database_backend,
             "engine_sqlite": sqlite_inventory, "engine_secrets": "empty-lock-only" if secrets.exists() else "absent",
+            "vfs_volatile": volatile_metadata,
             "image_ids": sorted(images),
             "container_ids": sorted(containers), "layer_ids": sorted(reachable), "volume_names": sorted(volumes),
             "image_bigdata": bigdata}

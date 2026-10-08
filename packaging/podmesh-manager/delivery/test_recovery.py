@@ -109,6 +109,27 @@ class RealEngineLayoutTests(unittest.TestCase):
         finally:
             configuration.write_bytes(original)
 
+    def test_real_empty_volatile_metadata_nonempty_and_symlink_refuse(self):
+        root, obj = self.fixture()
+        for name in ("vfs-containers/volatile-containers.json", "vfs-layers/volatile-layers.json"):
+            path = root / "graphroot" / name
+            original, mode = path.read_bytes(), path.stat().st_mode & 0o777
+            self.assertEqual(original, b"[]")
+            try:
+                path.write_bytes(b'[{"id":"foreign"}]')
+                with self.assertRaisesRegex(ValueError, "volatile VFS state"):
+                    self.check()
+                path.unlink()
+                path.symlink_to(root / "graphroot/db.sql")
+                with self.assertRaisesRegex(ValueError, "volatile VFS state"):
+                    self.check()
+            finally:
+                if path.is_symlink():
+                    path.unlink()
+                path.write_bytes(original)
+                path.chmod(mode)
+        self.check()
+
 
 class RecoveryTests(unittest.TestCase):
     def test_oracle_uses_durable_migration_marker_not_legacy_history_version(self):
