@@ -1,0 +1,21 @@
+{
+  "schema": "podmesh-manager-live-activation-campaign-plan/v1",
+  "campaign": "g6-example-three-host-manager2-qualification-TEST-NET",
+  "host_order": ["lab-a", "lab-b", "lab-c"],
+  "operation_ids": {
+    "lab-a": "op-example01laba0001",
+    "lab-b": "op-example02labb0002",
+    "lab-c": "op-example03labc0003"
+  },
+  "observation_value": "example-campaign-probe-value-TEST-NET",
+  "convergence_wait": {
+    "max_polls": 120,
+    "poll_seconds": 5
+  },
+  "does_not_qualify": [
+    "high availability, fencing, or automatic failover",
+    "production deployment or long-running viability",
+    "DNS, routing, or host-loss recovery beyond the reviewed G2 fragment",
+    "exclusive activation or manager HA claims"
+  ]
+}

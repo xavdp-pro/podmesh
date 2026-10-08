@@ -7,3 +7,4 @@ __pycache__/
 # and it is the only input that exercises a four-row inbound exchange. Ignoring it made
 # tests/test-fold.sh unrunnable from a clean checkout, which defeats an independent review.
 !tests/fixtures/audit-events-from-campaign.json
+!campaign/campaign-plan.example.json

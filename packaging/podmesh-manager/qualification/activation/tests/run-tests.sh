@@ -7,6 +7,8 @@ trap 'rm -rf -- "$work"' EXIT
 bash -n "$root/capture-host.sh"
 bash -n "$root/activate-host.sh"
 bash -n "$root/campaign/run-campaign.sh"
+python3 -m py_compile "$root/campaign/validate-campaign-plan.py"
+python3 "$root/campaign/validate-campaign-plan.py" "$root/campaign/campaign-plan.example.json" >/dev/null
 rg -q 'manager-mariadb\.sql' "$root/campaign/run-campaign.sh"
 rg -q '\(\.store\.engine // \.engine\) == "mariadb"' "$root/campaign/run-campaign.sh"
 rg -q 'host_alias.*package_version.*binary_sha256' "$root/activate-host.sh"

@@ -29,3 +29,14 @@ Environment (all private, none in Git): `PODMESH_CAMPAIGN_DIR`, `PODMESH_CAMPAIG
 (alias to SSH target), `PODMESH_CAMPAIGN_KNOWN_HOSTS`, `PODMESH_CAMPAIGN_REMOTE_DIR`,
 `PODMESH_CAMPAIGN_HARNESS` (default `harness6`), `PODMESH_CAMPAIGN_CANDIDATE`. The plan
 (`campaign-plan.json`) carries the frozen operation IDs, scopes and the convergence rule.
+
+Public shape only: copy `campaign-plan.example.json` from this directory into the private
+campaign workdir as `campaign-plan.json`, then replace every placeholder operation ID and the
+observation value with the operator-frozen values for that run (never commit real IDs, salt, or
+hostnames). On the G6 workstation harness described in the lab record
+`g6-campaign-harness-staging.md`, that path is
+`campaign-harness/workdir/campaign-g6-lab/campaign-plan.json` after `env.sh` sets
+`PODMESH_CAMPAIGN_DIR`. Validate the file with
+`python3 validate-campaign-plan.py campaign-plan.json` before sourcing `env.sh` or calling
+`run-campaign.sh` (live `campaign` remains gated on private salt, verification, drop-in, and
+host mirrors).
