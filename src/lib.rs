@@ -12,6 +12,7 @@ mod signing;
 // The journal's engine, named once (docs/STORE-CONFIGURATION.md). Public so that the tools and
 // the manager tree may open a store; `storage` below is Podman's graph, not this.
 mod health;
+pub mod host_adapter;
 mod storage;
 pub mod store;
 pub use manager::control_relay;
@@ -315,7 +316,11 @@ pub fn open_node_store(
 /// engine's, so the row is read and then written inside a transaction, which is the same fact on
 /// both. One process opens a node's journal, so there is no second writer to race here.
 fn bind_to_this_host(store: &mut dyn DurableStore) -> Result<(), Box<dyn std::error::Error>> {
-    let machine = fs::read_to_string("/etc/machine-id")?.trim().to_string();
+    let machine = if host_adapter::configured() {
+        host_adapter::host_identity()?.machine
+    } else {
+        fs::read_to_string("/etc/machine-id")?.trim().to_string()
+    };
     let uuid = fs::read_to_string("/proc/sys/kernel/random/uuid")?
         .trim()
         .to_string();
@@ -358,6 +363,7 @@ pub fn open_state(dir: &Path) -> Result<Connection, Box<dyn std::error::Error>> 
     open_node_store(dir, &store_profile(dir)?)?.into_connection()
 }
 fn inventory() -> Result<Value, Box<dyn std::error::Error>> {
+    if host_adapter::configured() { return Ok(serde_json::from_slice(&host_adapter::run_podman(&["ps", "--all", "--format", "json"])?.stdout)?); }
     // Fixed command; no caller-controlled shell or command arguments.
     let mut child = Command::new("/usr/bin/podman")
         .args(["ps", "--all", "--format", "json"])
@@ -470,7 +476,7 @@ fn durable_lifecycle_operation(operation: &str) -> bool {
 }
 
 fn durable_capabilities(engine: Engine) -> Value {
-    json!({
+    let mut capabilities = json!({
         "schemas": schema::all(),
         "schema_version": "podmesh-operation-schema/1",
         "version": option_env!("PODMESH_PACKAGE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
@@ -501,7 +507,21 @@ fn durable_capabilities(engine: Engine) -> Value {
         "store_engine": engine.as_str(),
         "unsupported_error_code": "store_engine_unsupported",
         "scope": "read-only local API, lifecycle create/delete/clone/start/stop/pause/resume/resources, bounded volume declarations/growth, isolated ungated boot_restore/status, and secret_declare/secret_remove/secret_status; other module-owned mutations remain SQLite-only",
-    })
+    });
+    if host_adapter::configured() {
+        capabilities["operations"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|v| {
+                !matches!(
+                    v.as_str(),
+                    Some("secret_declare" | "secret_remove" | "secret_status" | "universe_stats")
+                )
+            });
+        capabilities["host_adapter_protocol"] = json!("podmesh-host-capability/1");
+        capabilities["host_adapter_scope"] = json!("isolated lifecycle including explicit host-owned nested UUID/image grants and mount-free cloning; managed network/secrets/host-state mounts/scoped statistics and migration/replication effects unported");
+    }
+    capabilities
 }
 
 /// Local API carried by a non-SQLite journal.
@@ -513,6 +533,9 @@ fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
         .get("operation")
         .and_then(Value::as_str)
         .unwrap_or("");
+    if host_adapter::configured() && matches!(operation, "secret_declare" | "secret_remove" | "secret_status" | "universe_stats") {
+        return json!({"ok":false,"observed_at":now(),"error_code":"host_capability_unsupported","error":"operation is not ported to the private node host adapter","operation":operation});
+    }
     if durable_lifecycle_operation(operation) || matches!(operation, "volume_declare" | "volume_grow" | "boot_restore" | "boot_restore_status") {
         let result = if matches!(operation, "volume_declare" | "volume_grow") {
             storage::execute_store(store, request)
@@ -605,7 +628,7 @@ fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
                 json!({"observations": observations})
             }
             "storage_status" => storage::status_store(store)?,
-            "host_status" => health::host_status()?,
+            "host_status" => if host_adapter::configured() { host_adapter::fact("host_status", None)? } else { health::host_status()? },
             "universe_stats" => health::universe_stats()?,
             _ => return Err("Unsupported operation".into()),
         })

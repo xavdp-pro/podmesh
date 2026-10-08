@@ -161,11 +161,19 @@ pub(crate) fn last_intents(db: &Connection) -> Result<BTreeMap<String, LastInten
 
 /// This boot's identity, as the kernel gives it.
 fn boot_id() -> Result<String, Error> {
-    Ok(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim().to_string())
+    if crate::host_adapter::configured() {
+        return Ok(crate::host_adapter::host_identity()?.boot);
+    }
+    Ok(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+        .trim()
+        .to_string())
 }
 
 /// When this boot began, in seconds since the Unix epoch, on the wall clock as it reads now.
 pub(crate) fn boot_time() -> Option<i64> {
+    if crate::host_adapter::configured() {
+        return crate::host_adapter::host_identity().ok()?.booted;
+    }
     std::fs::read_to_string("/proc/stat")
         .ok()?
         .lines()
@@ -181,8 +189,14 @@ pub(crate) fn start_operation_id(boot_id: &str, uuid: &str) -> String {
 
 /// Whether the system clock is known to be synchronized: `Some(true)` or `Some(false)` from systemd,
 /// `None` when it cannot be read, which is treated as not known.
-fn clock_synchronized() -> Option<bool> {
-    let out = Command::new("timedatectl").args(["show", "-p", "NTPSynchronized", "--value"]).output().ok()?;
+pub(crate) fn clock_synchronized() -> Option<bool> {
+    if crate::host_adapter::configured() {
+        return crate::host_adapter::host_identity().ok()?.clock;
+    }
+    let out = Command::new("timedatectl")
+        .args(["show", "-p", "NTPSynchronized", "--value"])
+        .output()
+        .ok()?;
     match String::from_utf8_lossy(&out.stdout).trim() {
         "yes" => Some(true),
         "no" => Some(false),
@@ -202,6 +216,14 @@ fn container_names() -> Result<HashSet<String>, Error> {
         .collect())
 }
 
+fn boot_facts() -> Result<(String, Option<i64>, Option<bool>), Error> {
+    if crate::host_adapter::configured() {
+        let host = crate::host_adapter::host_identity()?;
+        return Ok((host.boot, host.booted, host.clock));
+    }
+    Ok((boot_id()?, boot_time(), clock_synchronized()))
+}
+
 /// What a pass knows for all its universes: read once.
 struct Facts {
     boot: String,
@@ -212,7 +234,14 @@ struct Facts {
 }
 
 fn facts(db: &Connection) -> Result<Facts, Error> {
-    Ok(Facts { boot: boot_id()?, booted: boot_time(), names: container_names()?, attempts: last_attempts(db)?, clock: clock_synchronized() })
+    let (boot, booted, clock) = boot_facts()?;
+    Ok(Facts {
+        boot,
+        booted,
+        names: container_names()?,
+        attempts: last_attempts(db)?,
+        clock,
+    })
 }
 
 /// The decision a pass reaches before issuing a start: a reason not to, or leave to the start.
@@ -797,12 +826,13 @@ impl BootJournal for DurableBootJournal<'_> {
         Ok(intents)
     }
     fn facts(&mut self) -> Result<Facts, Error> {
+        let (boot, booted, clock) = boot_facts()?;
         Ok(Facts {
-            boot: boot_id()?,
-            booted: boot_time(),
+            boot,
+            booted,
             names: container_names()?,
             attempts: self.attempts()?,
-            clock: clock_synchronized(),
+            clock,
         })
     }
     fn before(&mut self, uuid: &str, last: &LastIntent, f: &Facts) -> Result<Before, Error> {

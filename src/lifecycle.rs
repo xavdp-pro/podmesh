@@ -247,6 +247,7 @@ fn empty_scratch() -> Result<(), Error> {
     Ok(())
 }
 pub(crate) fn run_podman(timeout: u64, args: &[&str]) -> Result<Output, Error> {
+    if crate::host_adapter::configured() { return crate::host_adapter::run_podman(args); }
     // GNU timeout bounds this process group; no shell evaluates caller input.
     let limit = timeout.to_string();
     let scratch = SCRATCH
@@ -283,6 +284,7 @@ fn label<'a>(c: &'a Value, key: &str) -> Option<&'a str> {
     c["Config"]["Labels"][key].as_str()
 }
 pub(crate) fn inspect(name: &str) -> Result<Option<Value>, Error> {
+    if crate::host_adapter::configured() { return crate::host_adapter::inspect(name); }
     let all: Value = serde_json::from_str(&podman(QUICK, &["ps", "--all", "--format", "json"])?)?;
     let exists = all.as_array().ok_or("Invalid inventory")?.iter().any(|c| {
         c["Names"]
@@ -574,7 +576,7 @@ fn parse<'a>(
                     let c = v
                         .as_f64()
                         .ok_or("cpus must be a number of cores, fractions allowed")?;
-                    let cores = host_cpus() as f64;
+                    let cores = host_cpus()? as f64;
                     if !(MIN_CPUS..=cores).contains(&c) {
                         return Err(format!(
                             "cpus must be from {MIN_CPUS} to this host's {cores} cores"
@@ -1429,6 +1431,14 @@ pub fn execute(db: &Connection, request: &Value) -> Result<Value, Error> {
 /// uses only positional `?` placeholders. A pending operation and its attempt are committed
 /// before Podman is touched; the terminal journal update is committed as one transaction.
 pub fn execute_store(store: &mut dyn DurableStore, request: &Value) -> Result<Value, Error> {
+    if crate::host_adapter::configured()
+        && request["operation"] == "create"
+        && (request.get("secrets").is_some()
+            || request.get("manager_host_state").is_some()
+            || request["network_profile"] != "isolated")
+    {
+        return Err("private host capability for managed network, secrets or host-state mounts is not ported".into());
+    }
     let operation = text(request, "operation")?;
     if ![
         "create",
@@ -1495,7 +1505,9 @@ pub fn execute_store(store: &mut dyn DurableStore, request: &Value) -> Result<Va
 
     let outcome = {
         let mut db = DurableLifecycleDb { store };
-        perform_managed(&mut db, attempt, id, uuid, &params)
+        crate::host_adapter::with_intent(request, || {
+            perform_managed(&mut db, attempt, id, uuid, &params)
+        })
     };
     let finished = crate::now() as i64;
     let mut tx = store.transaction()?;
@@ -1658,7 +1670,7 @@ fn parse_store<'a>(
                     let cpus = value
                         .as_f64()
                         .ok_or("cpus must be a number of cores, fractions allowed")?;
-                    let cores = host_cpus() as f64;
+                    let cores = host_cpus()? as f64;
                     if !(MIN_CPUS..=cores).contains(&cpus) {
                         return Err(format!(
                             "cpus must be from {MIN_CPUS} to this host's {cores} cores"
@@ -2419,9 +2431,11 @@ fn create(
             return Err(format!("the container does not carry the allocated address {requested}; it was removed and the address released").into());
         }
     }
-    Ok(
-        json!({"status":"verified","state":c["State"]["Status"],"universe_uuid":uuid,"universe_profile":universe_profile,"container_id":c["Id"],"network":network,"started":false}),
-    )
+    let mut result = json!({"status":"verified","state":c["State"]["Status"],"universe_uuid":uuid,"universe_profile":universe_profile,"container_id":c["Id"],"network":network,"started":false});
+    if crate::host_adapter::configured() {
+        result["host_policy_limits"] = json!({"memory_bytes":c["HostConfig"]["Memory"],"nano_cpus":c["HostConfig"]["NanoCpus"],"note":"observed initial cgroup ceilings from the host-owned policy; these are limits, not reserved or allocated consumption"});
+    }
+    Ok(result)
 }
 fn delete(
     db: &mut dyn LifecycleDb,
@@ -2572,6 +2586,11 @@ fn start(
     Ok(result)
 }
 fn host_memory_bytes() -> Result<u64, Error> {
+    if crate::host_adapter::configured() {
+        return crate::host_adapter::fact("host_capacity", None)?["memory_bytes"]
+            .as_u64()
+            .ok_or_else(|| "host adapter memory unavailable".into());
+    }
     let info = std::fs::read_to_string("/proc/meminfo")?;
     let kib: u64 = info
         .lines()
@@ -2582,10 +2601,17 @@ fn host_memory_bytes() -> Result<u64, Error> {
     Ok(kib * 1024)
 }
 
-fn host_cpus() -> usize {
-    std::thread::available_parallelism()
+fn host_cpus() -> Result<usize, Error> {
+    if crate::host_adapter::configured() {
+        return Ok(usize::try_from(
+            crate::host_adapter::fact("host_capacity", None)?["cpus"]
+                .as_u64()
+                .ok_or("host CPU count unavailable")?,
+        )?);
+    }
+    Ok(std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(1)
+        .unwrap_or(1))
 }
 
 fn state_result(c: &Value, uuid: &str, operation: &str, action: &str, note: &str) -> Value {
@@ -2694,10 +2720,27 @@ fn resume(
 
 /// What the kernel enforces for this container right now: its cgroup's memory.max and cpu.max,
 /// read from the unified hierarchy. `None` when the container has no cgroup (not running).
-fn cgroup_limits(c: &Value) -> Option<Value> {
+fn cgroup_limits(c: &Value) -> Result<Option<Value>, Error> {
+    if crate::host_adapter::configured() {
+        let uuid = c["Config"]["Labels"][UNIVERSE]
+            .as_str()
+            .ok_or("owned universe identity missing")?;
+        let limits = crate::host_adapter::fact("cgroup_limits", Some(uuid))?;
+        return Ok((!limits.is_null()).then_some(limits));
+    }
+    Ok(cgroup_limits_local(c))
+}
+
+pub(crate) fn cgroup_limits_local(c: &Value) -> Option<Value> {
     let path = c["State"]["CgroupPath"]
         .as_str()
         .filter(|p| !p.is_empty())?;
+    if std::path::Path::new(path)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
     let dir = std::path::Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
     let read = |f: &str| {
         std::fs::read_to_string(dir.join(f))
@@ -2794,7 +2837,7 @@ fn resources(
             ));
         }
     }
-    let kernel = cgroup_limits(&c);
+    let kernel = cgroup_limits(&c)?;
     if let Some(k) = kernel.as_ref() {
         if let Some(m) = memory_bytes {
             if k["memory_max_bytes"].as_u64() != Some(m) {
@@ -3075,12 +3118,20 @@ fn clone(
             crate::network::LABEL_PROFILE,
             crate::network::PROFILE_ISOLATED
         );
-        podman(
-            QUICK,
-            &[
-                "create",
-                "--pull=never",
-                "--network=none",
+        if crate::host_adapter::configured() {
+            let snapshot = images()?
+                .into_iter()
+                .find(|i| image_id(i) == image)
+                .ok_or("clone snapshot missing")?;
+            let profile = snapshot["Labels"][crate::network::LABEL_UNIVERSE_PROFILE]
+                .as_str()
+                .unwrap_or("flat");
+            let profile_label = format!("{}={profile}", crate::network::LABEL_UNIVERSE_PROFILE);
+            let mut args = vec!["create", "--pull=never", "--network=none"];
+            if profile == "nested" {
+                args.push("--privileged");
+            }
+            args.extend([
                 "--name",
                 name,
                 "--label",
@@ -3089,9 +3140,29 @@ fn clone(
                 &provenance,
                 "--label",
                 &profile_label,
-                &image,
-            ],
-        )?;
+            ]);
+            let network_label = format!("{}=isolated", crate::network::LABEL_PROFILE);
+            args.extend(["--label", &network_label, &image]);
+            podman(QUICK, &args)?;
+        } else {
+            podman(
+                QUICK,
+                &[
+                    "create",
+                    "--pull=never",
+                    "--network=none",
+                    "--name",
+                    name,
+                    "--label",
+                    &label,
+                    "--label",
+                    &provenance,
+                    "--label",
+                    &profile_label,
+                    &image,
+                ],
+            )?;
+        }
     }
     // Verify the observed clone, whether created now or by an interrupted attempt.
     let c = inspect(name)?.ok_or("Clone not observable")?;

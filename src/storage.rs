@@ -83,6 +83,33 @@ pub struct GrowthAssessment {
 }
 
 pub fn assess_host_growth() -> Result<GrowthAssessment, Error> {
+    if crate::host_adapter::configured() {
+        let facts = crate::host_adapter::fact("storage_status", None)?;
+        let growth = match facts["growth"].as_str() {
+            Some("possible") => "possible",
+            Some("refused") => "refused",
+            _ => return Err("unknown host storage growth assessment".into()),
+        };
+        return Ok(GrowthAssessment {
+            graph_root: facts["graph_root"]
+                .as_str()
+                .ok_or("host graph root unavailable")?
+                .into(),
+            backend: facts["backend"]
+                .as_str()
+                .ok_or("host storage backend unavailable")?
+                .into(),
+            dedicated: facts["dedicated"]
+                .as_bool()
+                .ok_or("host storage boundary unavailable")?,
+            growth,
+            reason: facts["reason"]
+                .as_str()
+                .ok_or("host storage reason unavailable")?
+                .into(),
+            filesystem_size_bytes: facts["filesystem"]["size_bytes"].as_u64(),
+        });
+    }
     let info = run("podman", &["info", "--format", "json"]).ok_or("podman info failed")?;
     let info: Value = serde_json::from_str(&info)?;
     let graph_root = info["store"]["graphRoot"]
@@ -211,6 +238,7 @@ fn universe_volumes_field(db: Option<&Connection>) -> Value {
 }
 
 pub fn status(db: Option<&Connection>) -> Result<Value, Error> {
+    if crate::host_adapter::configured() { return crate::host_adapter::fact("storage_status", None); }
     let info = run("podman", &["info", "--format", "json"]).ok_or("podman info failed")?;
     let info: Value = serde_json::from_str(&info)?;
     let graph_root = info["store"]["graphRoot"]

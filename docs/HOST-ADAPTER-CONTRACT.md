@@ -74,3 +74,17 @@ retry, container replacement, stopped clone/delete and actual eight-operation
 lifecycle. Then qualify exact exported bytes in the private node pod with its own
 DB, application UID, provider and persistent recovery state. A protocol parser test
 or an adapter that refuses every real effect does not close this boundary.
+
+## Implemented transport increment, pending qualification
+
+The node source now has a separate provider and application wrapper. Host boot
+facts are read once per pass and validated. The provider's optional `allowed_nested`
+grants bind exact UUID/base image, an empty host-mount set, private PID/IPC/UTS and
+network-none, and explicit `privileged-host-device-access` for the Rule11 outer
+universe. This names the broad privileged device envelope honestly; it does not
+claim a fine-grained device allowlist. Nested cloning preserves the profile and
+requires a distinct target grant for the same base image. No inner workload or
+continuity proof is supplied by this source increment. Arbitrary mount/device or
+namespace flags remain rejected; managed network, secrets and host-state mounts,
+migration/replication effects and imported lease/epoch boot gates remain unported.
+The initial flat-only increment above is historical scope, not the product target.

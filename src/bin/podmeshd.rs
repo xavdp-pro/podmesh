@@ -21,6 +21,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // to start rather than fall back to a file it was not configured to write.
     let profile = podmesh::store_profile(&dir)?;
     eprintln!("PodMesh store: {}", profile.described());
+    if std::env::var_os(podmesh::host_adapter::SOCKET_ENV).is_some() {
+        if profile.engine != podmesh::store::Engine::Mariadb || unsafe { libc::geteuid() } <= 1000 {
+            return Err("private node application requires a non-system identity and explicit MariaDB profile".into());
+        }
+    }
     let mut store = podmesh::open_node_store(&dir, &profile)?;
     // Do not expose a lifecycle API over restored effects we cannot reconcile.
     store.validate_startup_scope()?;
