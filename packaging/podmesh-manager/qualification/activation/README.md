@@ -83,6 +83,11 @@ When deriving inspection from a temporary configuration, its `network.database_p
 must remain a direct child of the declared temporary state directory, including
 for MariaDB. A MariaDB-derived inspection reads the configured server at rest;
 it does not prove that the preserved SQL dump restores into an empty instance.
+MariaDB capture uses the configured socket when present, otherwise the configured
+TCP endpoint. Credentials travel through the client environment, never process
+arguments. A failing or empty dump leaves the prior completed artifact intact
+and removes its partial output. Restoration still requires an independent empty
+private instance and integrity/content checks.
 
 ## Four evidence stages
 
