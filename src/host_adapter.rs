@@ -1586,11 +1586,50 @@ mod real_effect_tests {
         struct Cleanup<'a> {
             policy: &'a Policy,
             ids: Vec<String>,
+            names: Vec<String>,
         }
         impl Drop for Cleanup<'_> {
             fn drop(&mut self) {
                 for id in &self.ids {
                     let _ = command(30, &["rm".into(), "--force".into(), id.clone()]);
+                }
+                let mut uncertain = false;
+                for uuid in &self.names {
+                    match self.policy.inspect(uuid) {
+                        Ok(None) => {}
+                        Ok(Some(container)) => {
+                            let record = self
+                                .policy
+                                .record_path(uuid)
+                                .ok()
+                                .and_then(|path| fs::read(path).ok())
+                                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+                            let owned = record.as_ref().is_some_and(|record| {
+                                container["Config"]["Labels"][SCOPE_LABEL] == self.policy.scope
+                                    && container["Config"]["Labels"][ACTION_LABEL]
+                                        == record["action_sha256"]
+                                    && container["Config"]["Labels"]
+                                        ["io.podmesh.creation-operation"]
+                                        == record["operation_id"]
+                                    && (record["container_id"].is_null()
+                                        || record["container_id"] == container["Id"])
+                            });
+                            if owned {
+                                if let Some(id) = container["Id"].as_str() {
+                                    if command(30, &["rm".into(), "--force".into(), id.into()])
+                                        .is_err()
+                                    {
+                                        uncertain = true;
+                                    }
+                                } else {
+                                    uncertain = true;
+                                }
+                            } else {
+                                uncertain = true;
+                            }
+                        }
+                        Err(_) => uncertain = true,
+                    }
                 }
                 if let Ok(images) = self.policy.images() {
                     for image in images {
@@ -1601,7 +1640,14 @@ mod real_effect_tests {
                         }
                     }
                 }
-                let _ = fs::remove_dir_all(&self.policy.state);
+                if uncertain {
+                    eprintln!(
+                        "fixture cleanup ownership uncertain; preserve provider records at {}",
+                        self.policy.state.display()
+                    );
+                } else {
+                    let _ = fs::remove_dir_all(&self.policy.state);
+                }
             }
         }
         let mut cleanup = Cleanup {
@@ -1712,6 +1758,7 @@ mod real_effect_tests {
             .unwrap()
             .trim()
             .to_string();
+        cleanup.names.push(invalid_uuid.clone());
         let invalid_id = format!("invalid-{invalid_uuid}");
         let mut invalid_intent = request("create", &invalid_id, &invalid_uuid);
         invalid_intent["image"] = json!(image);
