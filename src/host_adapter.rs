@@ -1616,8 +1616,8 @@ mod real_effect_tests {
                             });
                             if owned {
                                 if let Some(id) = container["Id"].as_str() {
-                                    if command(30, &["rm".into(), "--force".into(), id.into()])
-                                        .is_err()
+                                    if !command(30, &["rm".into(), "--force".into(), id.into()])
+                                        .is_ok_and(|out| out.status.success())
                                     {
                                         uncertain = true;
                                     }
@@ -1653,6 +1653,7 @@ mod real_effect_tests {
         let mut cleanup = Cleanup {
             policy: &policy,
             ids: Vec::new(),
+            names: vec![nonce.clone(), child.clone()],
         };
         let request = |operation: &str, id: &str, target: &str| json!({"operation":operation,"operation_id":id,"universe_uuid":target,"authorization_ref":"isolated named host engineering fixture"});
         let invoke = |action: Value, intent: Value| {
