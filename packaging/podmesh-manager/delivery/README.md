@@ -316,6 +316,21 @@ OCI version, owning layer/sandbox and mounts bound to the declared private root.
 Container-bound runroot health/log/network/previous-PID files and empty
 `tmp/persist` are classified explicitly. Previous PID bytes are retained as
 historical metadata; actual container PID0 establishes process quiescence.
+Capture entry explicitly uses a **running preflight**, after observing positive
+PIDs and Running state for the declared APP, DB and infra containers. Only in
+that phase, Podman 5.4.2 may expose `attach` (root-owned mode0700 socket) and
+`ctl`/`winsz` (root-owned mode0640 FIFOs) under each declared CID's userdata.
+These zero-size, single-link, xattr-free IPC objects are classified by lstat;
+they are never opened, hashed, removed or serialized by the validator. Unknown
+names, types, modes or ownership refuse. After typed APP shutdown and DB/pod
+stop, the strict stopped validator requires those objects absent before the
+complete durable tree is sealed. Only normal engine cleanup may remove them;
+remaining IPC refuses capture. This follows the tagged
+[Podman conmon lifecycle](https://github.com/containers/podman/blob/v5.4.2/libpod/container_internal.go).
+The targeted metadata test recreates the observed running IPC shape on its
+private copy, checks preflight passage and stopped refusal, then removes only
+its own test objects and proves the original tree remains exact. It does not
+claim to exercise real engine shutdown; that transition requires native VM proof.
 The native 5.4.2 `tmp/alive` file contains the kernel boot ID: exactly one
 canonical lowercase UUID followed by a newline (37 bytes). Its root-owned
 mode0644 regular file and the empty `alive.lck` are retained unchanged, with

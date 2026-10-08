@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import os
+import socket
 import sqlite3
 from pathlib import Path
 import subprocess
@@ -39,12 +40,80 @@ class RealEngineLayoutTests(unittest.TestCase):
         self.assertTrue(root.is_absolute())
         return root, obj
 
-    def check(self):
+    def check(self, phase="stopped"):
         root, obj = self.fixture()
         layout = recovery.closed_graphroot(root, set(obj["images"]), set(obj["containers"]),
-            set(obj["volumes"]), obj["version"], obj["pod"], "sqlite", obj["infra"])
-        recovery.closed_runtime(root, set(obj["containers"]), obj["version"])
+            set(obj["volumes"]), obj["version"], obj["pod"], "sqlite", obj["infra"], phase=phase)
+        if phase == "stopped":
+            recovery.closed_runtime(root, set(obj["containers"]), obj["version"])
         return layout
+
+    def test_real_running_ipc_preflight_requires_exact_shape_and_stopped_absence(self):
+        root, obj = self.fixture()
+        before = recovery.tree(root)
+        directories = [root / "graphroot/vfs-containers" / identifier / "userdata"
+                       for identifier in obj["containers"]]
+        timestamps = {path: (path.stat().st_atime_ns, path.stat().st_mtime_ns) for path in directories}
+        sockets, created = [], []
+        try:
+            for directory in directories:
+                # Bind through the directory fd: the real absolute path exceeds
+                # the UNIX socket path limit. No listener, connection or IO.
+                descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    sockets.append(channel)
+                    channel.bind("/proc/self/fd/" + str(descriptor) + "/attach")
+                finally:
+                    os.close(descriptor)
+                attach = directory / "attach"
+                created.append(attach)
+                attach.chmod(0o700)
+                for name in ("ctl", "winsz"):
+                    path = directory / name
+                    os.mkfifo(path, 0o640)
+                    created.append(path)
+                    path.chmod(0o640)
+            with patch.object(subprocess, "run", side_effect=AssertionError("provider forbidden")):
+                self.check("running-preflight")
+                with self.assertRaisesRegex(ValueError, "unmapped container userdata"):
+                    self.check()
+                path = directories[0] / "ctl"
+                path.chmod(0o666)
+                with self.assertRaisesRegex(ValueError, "running container IPC metadata"):
+                    self.check("running-preflight")
+                path.chmod(0o640)
+                path.unlink()
+                path.write_bytes(b"foreign-state")
+                path.chmod(0o640)
+                with self.assertRaisesRegex(ValueError, "running container IPC metadata"):
+                    self.check("running-preflight")
+                path.unlink()
+                path.symlink_to(root / "graphroot/db.sql")
+                with self.assertRaisesRegex(ValueError, "running container IPC metadata"):
+                    self.check("running-preflight")
+                path.unlink()
+                os.mkfifo(path, 0o640)
+                path.chmod(0o640)
+                with tempfile.TemporaryDirectory() as temporary:
+                    os.link(path, Path(temporary) / "foreign-link")
+                    with self.assertRaisesRegex(ValueError, "running container IPC metadata"):
+                        self.check("running-preflight")
+                unknown = directories[0] / "foreign-ipc"
+                os.mkfifo(unknown, 0o640)
+                created.append(unknown)
+                with self.assertRaisesRegex(ValueError, "unmapped container userdata"):
+                    self.check("running-preflight")
+        finally:
+            for channel in sockets:
+                channel.close()
+            for path in created:
+                if path.exists() or path.is_symlink():
+                    path.unlink()
+            for path, times in timestamps.items():
+                os.utime(path, ns=times, follow_symlinks=False)
+        self.assertEqual(recovery.tree(root), before)
+        self.check()
 
     def test_real_stopped_sqlite_graphroot_and_runtime_pass_without_rewriting(self):
         root, obj = self.fixture()

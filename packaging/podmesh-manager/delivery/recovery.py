@@ -667,13 +667,14 @@ def closed_sqlite_engine(root, images, containers, volumes, pod_id, infra_id):
             "row_counts": counts, "infra_container_id": infra_id, "exit_record_ids": [row[0] for row in exits]}
 
 
-def closed_graphroot(root, images, containers, volumes, version="synthetic-test-only", pod_id=None, database_backend="boltdb", infra_id=None):
+def closed_graphroot(root, images, containers, volumes, version="synthetic-test-only", pod_id=None, database_backend="boltdb", infra_id=None, phase="stopped"):
     """Bounded containers/storage VFS layout; unknown versions/layouts refuse.
 
     This classifies every path, including children. JSON metadata must refer only
     to the observed images, three containers, and their complete parent layers.
     No arbitrary file is accepted merely because it lives under graphroot.
     """
+    require(phase in ("stopped", "running-preflight"), "unclassified graphroot lifecycle phase")
     require(database_backend in ("boltdb", "sqlite"), "unclassified engine database backend")
     graph = root / "graphroot"
     require(graph.is_dir() and not graph.is_symlink(), "private VFS graphroot missing")
@@ -761,10 +762,22 @@ def closed_graphroot(root, images, containers, volumes, version="synthetic-test-
                 and {p.name for p in directory.iterdir()} == {"userdata"}, "unmapped container metadata component")
         userdata = directory / "userdata"
         files = {"config.json"} if version == "5.4.2" else set()
+        ipc = {"attach": (stat.S_IFSOCK, 0o700), "ctl": (stat.S_IFIFO, 0o640),
+               "winsz": (stat.S_IFIFO, 0o640)} if version == "5.4.2" and phase == "running-preflight" else {}
         require(userdata.is_dir() and not userdata.is_symlink()
-                and {p.name for p in userdata.iterdir()} <= {"artifacts", "secrets", "shm"} | files,
+                and {p.name for p in userdata.iterdir()} <= {"artifacts", "secrets", "shm"} | files | set(ipc),
                 "unmapped container userdata")
         for path in userdata.iterdir():
+            if path.name in ipc:
+                kind, mode = ipc[path.name]
+                item = path.lstat()
+                require(stat.S_IFMT(item.st_mode) == kind and stat.S_IMODE(item.st_mode) == mode
+                        and item.st_uid == item.st_gid == 0 and item.st_nlink == 1
+                        and item.st_size == 0 and not os.listxattr(path, follow_symlinks=False),
+                        "unclassified running container IPC metadata")
+                # Do not open, read, hash or remove a live socket/FIFO. The final
+                # stopped validator must reject any remaining IPC before sealing.
+                continue
             if path.name == "config.json":
                 closed_oci_config(path, root, row["layer"], containers, volumes)
                 continue
@@ -853,9 +866,11 @@ def capture(instance, a, api):
     pod_before = instance.owned("pod", instance.r["pod"])
     before = [instance.check_container(role) for role in ("app", "db")]
     before.append(instance.inspect("container", pod_before["InfraContainerID"]))
+    require(all(item["State"]["Running"] and item["State"]["Pid"] > 0 for item in before),
+            "capture preflight requires observed running source containers")
     closed_graphroot(instance.root, {api.image_id(item["Image"]) for item in before},
                      {item["Id"] for item in before}, {instance.prefix + "-app", instance.prefix + "-db"}, version,
-                     pod_before["Id"], backend, pod_before["InfraContainerID"])
+                     pod_before["Id"], backend, pod_before["InfraContainerID"], phase="running-preflight")
     instance.unitcheck()
     for name in instance.r["units"]:
         require(not api.run(["/usr/bin/systemctl", "show", "--property=DropInPaths", "--value", name]).stdout.strip(),
