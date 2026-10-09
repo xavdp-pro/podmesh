@@ -4,6 +4,9 @@ This repository carries what is needed to understand, build, qualify and operate
 records, reviews and decisions in a private companion repository; nothing here depends on it.
 
 ## Direction
+- [SIMPLE-PRODUCTION-PATH.md](SIMPLE-PRODUCTION-PATH.md) — **A** container life → **B** move + replicate → **C** later.
+- [ASSEMBLY-2026-10-07.md](ASSEMBLY-2026-10-07.md) — current assembly line (node MariaDB).
+- [FUNCTIONAL-UNITS.md](FUNCTIONAL-UNITS.md) — `podmesh-node` / `podmesh-manager` under SEP22.
 - [../INTENT.md](../INTENT.md) — the purpose, actors, the human-agent contract and the delivery discipline.
 - [IDEAL-SCENE.md](IDEAL-SCENE.md) — what PodMesh ought to be: goal, purposes, the invariants, the valuable final
   products, the ideal scene per area and per topology (one host to ten and more, with or without shared storage).
@@ -12,7 +15,9 @@ records, reviews and decisions in a private companion repository; nothing here d
 - [EXPERIMENTAL-SCOPE.md](EXPERIMENTAL-SCOPE.md) — the research scope and the review contract.
 
 ## Operate
+- [IMAGE-BUILD-AND-REGISTRY.md](IMAGE-BUILD-AND-REGISTRY.md) — build workers, dedicated OCI registry storage, runtime pulls and scoped cleanup.
 - [PREPARE-A-HOST.md](PREPARE-A-HOST.md) — the validated host target, installation and storage recommendations.
+- [MANAGER-DEPLOYMENT.md](MANAGER-DEPLOYMENT.md) — the `podmesh-manager` Debian package boundary and laboratory activation checklist.
 - [OPERATIONS.md](OPERATIONS.md) — the experimental tools: moving, replicating, guarding and taking over universes.
 - [LOCAL-API.md](LOCAL-API.md) — every operation of the host's local API, its fields, refusals and replay rules.
 
@@ -28,11 +33,17 @@ records, reviews and decisions in a private companion repository; nothing here d
 - [MANAGER-ADMINISTRATION.md](MANAGER-ADMINISTRATION.md), [MANAGER-PUBLISHER-CONTRACT.md](MANAGER-PUBLISHER-CONTRACT.md)
   and [PUBLISHER-FOLLOW-LAB.md](PUBLISHER-FOLLOW-LAB.md) — the manager's administration surface and the public entry
   point that follows the active manager.
+- [DECISION-FOLLOW.md](DECISION-FOLLOW.md) — the host-side tick that delivers the replicas' quorum certificates
+  to this node through its local socket.
 - [GARBAGE-COLLECTION.md](GARBAGE-COLLECTION.md) — collection on proof, never on age alone.
 - [BACKUP-SERVER.md](BACKUP-SERVER.md) — the Backup Server design (recovery points, immutable chunks, off-site copy).
 - [SHAPER-SUPERVISION.md](SHAPER-SUPERVISION.md) — integration with SHAPER's supervision loop.
 
 ## Engineering
 - [RUST-IMPLEMENTATION-PLAN.md](RUST-IMPLEMENTATION-PLAN.md) — the implementation plan.
+- [STORE-CONFIGURATION.md](STORE-CONFIGURATION.md) and
+  [STORAGE-MARIADB-MIGRATION-PLAN.md](STORAGE-MARIADB-MIGRATION-PLAN.md) — which engine carries a
+  node's journal, and the migration from the SQLite file to a MariaDB instance per functional role.
 - [ACCEPTANCE-TEST-PLAN.md](ACCEPTANCE-TEST-PLAN.md) — the acceptance gates and their required evidence.
+- [PUBLIC-CLAIMS-PATH-B-2026-10-07.md](PUBLIC-CLAIMS-PATH-B-2026-10-07.md) — sanitized move/replicate claims for site, wiki and summaries (assembly 2026-10-07).
 - [../AGENTS.md](../AGENTS.md) — what belongs in this repository, in the private companion, and in neither.

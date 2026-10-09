@@ -48,13 +48,21 @@ pub fn all() -> Value {
     put("host_status", op("read", "none", "this host's CPU count, load averages, memory, swap, uptime and storage, read now", Some(vec![])));
     put("universe_stats", op("read", "none", "every PodMesh universe on this host: CPU over a short sample, memory and its limit, CPU allowance, processes, disk written", Some(vec![])));
     put("storage_status", op("read", "none", "what carries Podman's storage on this host and whether a universe's space can grow there", Some(vec![])));
+    put("volume_declare", op("universe", "reservation", "declares how much dedicated data volume a stopped universe is entitled to on a host whose Podman storage can grow", Some(vec![
+        int("capacity_bytes", true, 1024 * 1024, None, "bytes, from 1 MiB up to the filesystem size carrying Podman's storage"),
+    ])));
+    put("volume_grow", op("universe", "reservation", "raises a declared universe volume's capacity within what the host's growable storage still reports", Some(vec![
+        int("additional_bytes", true, 1024 * 1024, None, "bytes to add, from 1 MiB"),
+    ])));
 
     put("create", op("universe", "reservation", "a stopped container for a new universe, from a local image, on the isolated or the managed network", Some(vec![
         f("image", "string", true, "a local image by digest: sha256:<64 hex>"),
         f("command", "string[]", true, "the command, as a list of strings"),
+        en("universe_profile", false, &["flat", "nested"], "flat is the default packaged scope; nested is Rule 11 outer (privileged, isolated network only)"),
         en("network_profile", true, &["isolated", "managed"], "isolated has no network; managed joins the host's declared pool"),
         f("network_address", "string", false, "an address in the host's pool, for the managed profile"),
         f("secrets", "object[]", false, "declared secrets to mount: [{name, target}]"),
+        f("manager_host_state", "string", false, "a manager replica's host state, by name: its vote directory read-write at /run/podmesh-host/votes, the operator's evidence directory and the host's machine-id read-only at /run/podmesh-host/evidence and /run/podmesh-host/machine-id, kept under this node's state directory and never removed by it"),
     ])));
     put("clone", op("universe", "lease,reservation", "a new universe from a stopped, mount-free source, through a committed snapshot image", Some(vec![
         uuid("source_uuid", "the universe to clone"),
@@ -152,8 +160,21 @@ pub fn all() -> Value {
     ])));
 
     put("manager_status", op("read", "none", "the manager resident's status through its control door, bound to the container's identity", Some(vec![])));
+    put("manager_decision", op("read", "none", "this host's manager replica's reading of the replicas' decision for one resource (decision_read), relayed through the control door: the current decision with its quorum certificate, or what is missing; the certificate is verified by the operation it is delivered to", Some(vec![
+        uuid("resource", "the resource the replicas decide"),
+    ])));
     put("manager_observe", op("universe", "none", "one observation appended in the replica's own scope through the control door", Some(vec![
         f("scope", "string", true, "the replica's granted scope"), f("subject", "string", true, "1-128 safe ASCII"), f("value", "string", true, "at most 4096 bytes"),
+    ])));
+    put("manager_vote_ledger_init", op("universe", "none", "operator-only initialization of this manager replica's signing ledger through its control door; the ledger starts unadmitted", Some(vec![])));
+    put("manager_vote_ledger_mark_unadmitted", op("universe", "none", "operator-only mark before a restored replica can vote; readmission evidence is still required", Some(vec![
+        f("reason", "string", true, "1-256 printable characters explaining the restore"),
+    ])));
+    put("manager_vote_ledger_readmit", op("universe", "none", "operator-only readmission of this replica's signing ledger against already collected and digest-bound evidence", Some(vec![
+        f("evidence_sha256", "object", true, "1-32 bounded evidence file names mapped to canonical SHA-256 digests, at most 3072 bytes"),
+    ])));
+    put("manager_decision_propose", op("universe", "none", "operator-only proposal to this manager replica; resident validates policy and records a proposal fact, while its peers decide by votes", Some(vec![
+        f("payload", "object", true, "the bounded takeover proposal document validated again by the resident"),
     ])));
 
     put("recovery_point_prepare", op("universe", "reservation", "captures a universe as a recovery point, honestly unsigned: stopped (its rootfs, class quiescent) or live (a memory checkpoint resumed in place, class memory-coherent)", Some(vec![

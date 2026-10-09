@@ -86,9 +86,22 @@ the `backend` — `zfs`, `btrfs`, `lvm-thin`, `lvm`, `plain` — and whether it 
 not the system's root filesystem), the filesystem's sizes from df, and the operator's rule applied
 (2026-09-16): a universe's space may `growth: possible` only on a dedicated LVM, ZFS or Btrfs
 volume; on a filesystem shared with the system, or a dedicated one that does not know how to grow,
-it is `refused` with the reason. Universe volumes, `volume_declare` and `volume_grow` come with the
-dedicated storage; today a universe keeps its data in its container's layer, and the result says so.
-On the laboratory hosts, whose storage sits on the ext4 root, the answer is `refused`.
+it is `refused` with the reason. On the laboratory hosts, whose storage sits on the ext4 root,
+the answer is `refused`.
+
+`volume_declare` and `volume_grow` are journaled universe mutations gated like `resources`. They
+apply the same host growth rule: refused while Podman's storage shares the system root or sits on
+a backend that cannot grow. When growth is `possible`, they record a declared `capacity_bytes`
+in the journal only — no per-universe block device is attached in this build. Both require a
+stopped universe that this host's journal owns.
+
+```json
+{"operation": "volume_declare", "operation_id": "...", "universe_uuid": "...", "authorization_ref": "...", "capacity_bytes": 1073741824}
+{"operation": "volume_grow", "operation_id": "...", "universe_uuid": "...", "authorization_ref": "...", "additional_bytes": 1073741824}
+```
+
+`storage_status` lists every declaration under `universe_volumes.declarations` when read through the
+SQLite API.
 
 ## Pause and resume
 
@@ -763,7 +776,7 @@ unsuperseded lease held here, in one journaled operation `publisher_startup_with
 
 A manager universe runs the frozen manager resident behind one Unix socket at a contract path inside the
 universe (`/run/podmesh-manager/control.sock`), reachable by nothing outside it. PodMesh offers the one door:
-two typed operations over the same root-only API, with `authorization_ref` as provenance, carried by a copy of
+named, typed operations over the same root-only API, with `authorization_ref` as provenance, carried by a copy of
 the daemon entered into the universe's PID namespace (the resident checks the peer's credentials, and a peer
 whose PID is not visible from the universe is refused whatever its UID). The PID read from Podman is bound to
 the container it was read from — the process must sit in that container's cgroup, and its start time is
@@ -782,6 +795,72 @@ resident's protocol.
   the resident's own refusal (a scope it does not own, a writer it does not accept) is returned as the refusal.
   Not an exclusive effect and not gated by the activation lease: every replica appends in its own scopes and
   replication carries them.
+- `manager_decision` (`resource`, a UUID; read-only; development tree, V3-5): relays exactly one
+  `{"operation": "decision_read", "resource"}` to the resident and returns its answer as
+  `resident_reply`. The answer is the replica's current decision of the resource, with the quorum
+  certificate its votes assemble into, or each proposal above it with its voters and what is missing.
+  Nothing in it is trusted here: a certificate is verified by the operation it is delivered to
+  (`activation_acquire`, `activation_supersede`, `publisher_start`), with this host's policy's keys. The
+  host's decision follow tick reads it (`DECISION-FOLLOW.md`). No other field of the request reaches the
+  resident.
+- `manager_vote_ledger_init` (journaled, operator): relays only `vote_ledger_init` for this replica. A
+  new ledger starts unadmitted; initializing one is not permission to vote.
+- `manager_vote_ledger_mark_unadmitted` (`reason`, 1–256 printable characters; journaled, operator):
+  relays only the restore mark while the universe is running. It does **not** by itself satisfy the
+  restore requirement: after a VM or ledger restore, the mark must precede catch-up and voting,
+  before this door can be used. A separate pre-start restore guard remains necessary.
+- `manager_vote_ledger_readmit` (`evidence_sha256`, a bounded file-to-digest map; journaled,
+  operator): relays only `vote_ledger_readmit`. The operator must first collect the required evidence
+  from the other stores, ledgers and node screens into the replica's read-only evidence mount. The
+  resident checks the digest, time bound and contents; the door does not waive any requirement.
+- `manager_decision_propose` (`payload`, a decision document object of at most 3072 bytes;
+  journaled, operator): relays only `decision_propose` to this replica. The resident checks its policy,
+  resource and shape, then records a proposal fact; voters independently check it. This is neither a
+  vote nor a certificate. The node accepts an effect only after verifying a quorum certificate.
+
+The operator requests use the PodMesh operation ID as the resident's operation ID. The door strips
+extra caller fields, refuses a malformed evidence name or digest before connecting, and refuses a
+resident error instead of recording it as success. The local root-only API is the authorization
+boundary; no public or agent network listener is added. The manager's `operator_uid` and
+`observation_writer_uid` must admit the node's root-owned relay. The voting host-state and key
+handling requirements below remain mandatory.
+
+This door is a source-side prototype, not a field-ready restore procedure. Do not enable voting in
+an installed manager universe on a restorable host until a pre-start mark or an external restore
+witness prevents a restored ledger from voting before readmission. `manager_vote_ledger_readmit`
+also requires operator-collected evidence and the resident's waiting bound; the door does not
+collect it.
+
+**A manager replica's host state (development tree, V3-5).** `create` takes an optional
+`manager_host_state` (a name, the token of this host's replica, such as its alias). The universe then gets
+three required bind mounts, derived from that name and nothing the caller gives:
+
+- `<state>/manager-host/<name>/votes`, read-write, at `/run/podmesh-host/votes`: the replica's signing key
+  and its signing ledger;
+- `<state>/manager-host/<name>/evidence`, read-only, at `/run/podmesh-host/evidence`: the operator's
+  readmission evidence, which the replica cannot write;
+- the host's `/etc/machine-id`, read-only, at `/run/podmesh-host/machine-id`: the identity the ledger is
+  bound to.
+
+On a QEMU guest exposing `/sys/firmware/qemu_fw_cfg/by_name/etc/vmgenid_guid/raw`, the node also
+mounts that live VM generation witness read-only at `/run/podmesh-host/vmgenid`. Voting configurations
+that require this witness refuse a missing or changed value; it does not make a RAM-inclusive VM
+rollback safe against an already in-flight signature.
+
+The two directories are made private, must be real directories, and are never removed by PodMesh. **One
+universe holds a name at a time**: `create` is refused, before anything is made, with
+`manager_host_state_claimed` when another container on this node carries the name's label, and with
+`manager_host_state_held` when `<state>/manager-host/<name>` exists, which it does while a universe holds
+it. `delete` renames it to `<name>.released` once the container is gone; the next `create` of the name
+renames it back, so a roll finds its key and ledger again only after the old universe is gone. A delete
+that cannot release it fails and says so (`manager_host_state_release_blocked` when a released copy is
+already there). A directory left held by a container removed outside PodMesh is renamed by the operator,
+after checking that nothing runs with it. The container is labelled
+`io.podmesh.manager-host-state=<name>`. A universe with mounts is
+refused by clones, live captures and migrations. A stopped capture exports the root filesystem without
+them, so no recovery point carries or rewinds the key or the ledger. A promotion creates the universe
+without them, so a promoted replica that votes does not start until it is created again with its host
+state.
 
 ## Facts for a watching agent
 

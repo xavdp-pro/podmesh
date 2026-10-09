@@ -1,0 +1,8 @@
+# Reviewed G2 activation fragment when store.json names engine=mariadb on 127.0.0.1 TCP.
+# Replace <peer-1> and <peer-2> with the two configured replica endpoints (private).
+[Service]
+Environment=PODMESH_MANAGER_NETWORK_MODE=authenticated-static-peers
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressAllow=<peer-1>/32
+IPAddressAllow=<peer-2>/32
+IPAddressAllow=127.0.0.1/32

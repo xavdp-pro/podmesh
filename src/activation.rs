@@ -454,12 +454,7 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
         ("activation_lease_history", "boot_id TEXT"),
     ] {
         let name = column.split(' ').next().unwrap_or_default();
-        let present: bool = db.query_row(
-            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?1"),
-            [name],
-            |r| Ok(r.get::<_, i64>(0)? > 0),
-        )?;
-        if !present {
+        if !crate::store::catalog::connection::has_column(db, table, name)? {
             db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column};"))?;
         }
     }

@@ -442,3 +442,48 @@ and resident operations are the next lots), extend a lease by majority, or run o
   late is declared at its peers' serial (`authority_serial`) so that it shares their digest.
 - **The barrier on the certificate path is kept:** a certificate's `eligible_after` holds the
   acquisition itself, whatever the method.
+
+**2026-09-19, V3-5, the manager decides: built and tested without the laboratory.** The replicas propose,
+vote and assemble certificates themselves (web tree, `experiments/manager-resident`, "The manager
+decides"). Each voter checks a proposal against its own view before it votes. The view is the current
+epoch and holder its store's votes prove, and the barrier rules above:
+
+- `same_holder` carries the barrier;
+- `lease_barrier` to another holder also covers the current certificate's expiry, the renewal bound of
+  the follow mandates, and the proposal's issue, each plus the lease and the margin;
+- `fence_receipt` is refused, because a receipt is the previous holder node's unsigned answer, which no
+  replica can verify.
+
+A host-side tick delivers the certificates through the node's local socket
+(`packaging/podmesh-decision-follow`, `DECISION-FOLLOW.md`), reading them through a new read-only door,
+`manager_decision`. The certificate names the holder's host: `activation_acquire`, then `publisher_start`
+with it as the takeover proof when a publisher is declared, eligible and idle. On every other host:
+`activation_supersede` above the screen. No listener is added anywhere.
+
+What the local end-to-end test shows, with three residents and three real nodes: an epoch and a
+same-holder re-issue decided by two replicas of three and applied by the nodes; a rotation held until its
+barrier; a minority's vote deciding nothing and its hand-made certificate refused; replayed and late
+certificates refused by the screen.
+
+**Before any V3-5 rotation to another holder (review of V3-5, findings 1 and 2).** The replicas cannot
+see a follow mandate, and the node does not re-check one against a quorum certificate. So, until the
+majority extends leases (V3-6):
+
+- the V3-1 follow mandates (`packaging/podmesh-publisher-follow`, `tools/arm-publisher-follow.py`) are
+  frozen (no new `--refresh`) or removed on every host;
+- every replica's `renewal_not_after` for the resource is set to the latest `not_after` of those
+  mandates;
+- a voter refuses a `lease_barrier` that changes holder while `renewal_not_after` is 0
+  (`renewal_unbounded`), or earlier than the current proof's expiry or the proposal's issue
+  (`renewal_bound_too_early`): a mandate may still stand past it;
+- a resource that leaves the gate carries in its baseline the gate's last proof's `expires_at`. Until a
+  certificate the replicas assembled passes the baseline, that is the current expiry, and a change of
+  holder is refused while it is absent (`baseline_expiry_unknown`).
+
+A same-holder decision needs none of this: it does not change who may run.
+
+What only the laboratory shows: the relay of `manager_decision` into a running manager universe,
+`publisher_start` under a certificate on a real connector, and the campaign with the workstation off. The
+majority does not extend leases yet (V3-6). Until it does, a rotation away from a holder that may still
+renew by itself waits for the follow mandates' `not_after`, and declaring a host lost stays the
+operator's.

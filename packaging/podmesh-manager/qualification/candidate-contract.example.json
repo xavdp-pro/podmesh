@@ -1,0 +1,44 @@
+{
+  "schema_version": "podmesh-manager-candidate-contract/v2",
+  "package": "podmesh-manager",
+  "version": "replace-with-reviewed-version",
+  "architecture": "amd64",
+  "deb_sha256": "replace-with-64-lowercase-hex",
+  "binary_sha256": "replace-with-64-lowercase-hex",
+  "signing_fingerprint": "0000000000000000000000000000000000000000",
+  "source_commit": "replace-with-reviewed-source-commit",
+  "expected_files": [
+    "/",
+    "/usr/",
+    "/usr/lib/",
+    "/usr/lib/podmesh-manager/",
+    "/usr/lib/podmesh-manager/podmesh-managerd",
+    "/usr/lib/systemd/",
+    "/usr/lib/systemd/system/podmesh-manager.service",
+    "/usr/share/",
+    "/usr/share/doc/",
+    "/usr/share/doc/podmesh-manager/",
+    "/usr/share/doc/podmesh-manager/MANAGER-DEPLOYMENT.md",
+    "/usr/share/doc/podmesh-manager/NOTICE",
+    "/usr/share/doc/podmesh-manager/binary.glibc-max",
+    "/usr/share/doc/podmesh-manager/binary.sha256",
+    "/usr/share/doc/podmesh-manager/copyright",
+    "/usr/share/podmesh-manager/",
+    "/usr/share/podmesh-manager/config.example.json"
+  ],
+  "expected_regular_payload_files": [
+    {"path": "/usr/lib/podmesh-manager/podmesh-managerd", "sha256": "replace-with-64-lowercase-hex"},
+    {"path": "/usr/lib/systemd/system/podmesh-manager.service", "sha256": "replace-with-64-lowercase-hex"},
+    {"path": "/usr/share/doc/podmesh-manager/MANAGER-DEPLOYMENT.md", "sha256": "replace-with-64-lowercase-hex"},
+    {"path": "/usr/share/doc/podmesh-manager/NOTICE", "sha256": "replace-with-64-lowercase-hex"},
+    {"path": "/usr/share/doc/podmesh-manager/binary.glibc-max", "sha256": "replace-with-64-lowercase-hex"},
+    {"path": "/usr/share/doc/podmesh-manager/binary.sha256", "sha256": "replace-with-64-lowercase-hex"},
+    {"path": "/usr/share/doc/podmesh-manager/copyright", "sha256": "replace-with-64-lowercase-hex"},
+    {"path": "/usr/share/podmesh-manager/config.example.json", "sha256": "replace-with-64-lowercase-hex"}
+  ],
+  "expected_maintainer_scripts": [
+    {"name": "postinst", "sha256": "replace-with-64-lowercase-hex"},
+    {"name": "postrm", "sha256": "replace-with-64-lowercase-hex"},
+    {"name": "prerm", "sha256": "replace-with-64-lowercase-hex"}
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "network": {
+    "replica_id": "<replica-uuid>",
+    "database_path": "/var/lib/podmesh-manager/manager.sqlite",
+    "manager": {
+      "logical_manager_id": "<logical-manager-uuid>",
+      "replicas": [
+        {
+          "replica_id": "<replica-uuid>",
+          "host_id": "<host-uuid>"
+        }
+      ],
+      "grants": [
+        {
+          "scope": "lab/manager-universe/observations",
+          "owner_replica_id": "<replica-uuid>"
+        }
+      ]
+    },
+    "bind": "127.0.0.1:9443",
+    "peers": []
+  },
+  "control_socket": "/run/podmesh-manager/control.sock",
+  "observation_writer_uid": 0,
+  "interval_ms": 1000,
+  "max_backoff_ms": 30000,
+  "incoming_workers": 1
+}

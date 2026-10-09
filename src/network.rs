@@ -22,6 +22,10 @@ pub const PROFILE_MANAGED: &str = "managed";
 pub const LABEL_PROFILE: &str = "io.podmesh.network-profile";
 pub const LABEL_IP: &str = "io.podmesh.universe-ip";
 pub const LABEL_NETWORK: &str = "io.podmesh.network-uuid";
+/// Rule 11 outer universe shape (`docs/EXPERIMENTAL-SCOPE.md`): flat is the default journal-owned container; nested is a privileged outer with isolated network only.
+pub const UNIVERSE_PROFILE_FLAT: &str = "flat";
+pub const UNIVERSE_PROFILE_NESTED: &str = "nested";
+pub const LABEL_UNIVERSE_PROFILE: &str = "io.podmesh.universe-profile";
 /// The one bridge a host carries for its pool; the name says what it is and nothing about a prefix.
 pub const BRIDGE: &str = "podmesh-managed";
 /// The nftables table that keeps Podman's source NAT off traffic inside the logical prefix.
@@ -63,12 +67,7 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
             alias_universe_uuid TEXT);",
     )?;
     for column in ["exclusive_resource", "alias_universe_uuid"] {
-        let present: bool = db.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('network_routes') WHERE name=?1",
-            [column],
-            |r| Ok(r.get::<_, i64>(0)? > 0),
-        )?;
-        if !present {
+        if !crate::store::catalog::connection::has_column(db, "network_routes", column)? {
             db.execute_batch(&format!("ALTER TABLE network_routes ADD COLUMN {column} TEXT;"))?;
         }
     }
@@ -77,9 +76,11 @@ pub fn ensure_schema(db: &Connection) -> Result<(), Error> {
     // so a universe deleted and put back (promoted from a recovery point at its own address) could
     // never be allocated again either. Only a LIVE allocation is unique, per address and per
     // universe; the released rows are history. An older table is rebuilt once, keeping its rows.
-    let sql: Option<String> = db
-        .query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='network_allocations'", [], |r| r.get(0))
-        .optional()?;
+    //
+    // The question is what the table was *declared* with, which only SQLite keeps verbatim; the
+    // escape is named and explained in `store::catalog`. A store the migration set made is never
+    // in the state this repairs, on either engine.
+    let sql = crate::store::catalog::connection::table_definition(db, "network_allocations")?;
     if sql.is_some_and(|s| s.contains("UNIQUE") || s.contains("PRIMARY KEY")) {
         db.execute_batch(
             "DROP INDEX IF EXISTS network_allocations_live_ip;
@@ -454,12 +455,7 @@ fn ensure_ledger(db: &Connection) -> Result<(), Error> {
             observed TEXT);",
     )?;
     for (table, column) in [("network_routes", "state"), ("network_declaration", "observed"), ("network_declaration", "nat_backend")] {
-        let present: bool = db.query_row(
-            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?1"),
-            [column],
-            |r| Ok(r.get::<_, i64>(0)? > 0),
-        )?;
-        if !present {
+        if !crate::store::catalog::connection::has_column(db, table, column)? {
             db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT;"))?;
         }
     }

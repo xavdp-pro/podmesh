@@ -1,0 +1,115 @@
+{
+  "schema_version": "podmesh-manager-host-evidence/v5",
+  "stage": "pre-install",
+  "host_alias": "lab-c",
+  "captured_at_utc": "2026-09-12T10:00:00Z",
+  "packages": {
+    "podmesh": {
+      "status": "installed",
+      "version": "1.0"
+    },
+    "podmesh-web-observer": {
+      "status": "installed",
+      "version": "2.0"
+    },
+    "podmesh-manager": {
+      "status": "absent",
+      "version": null
+    }
+  },
+  "services": {
+    "podmesh.service": {
+      "unit": "podmesh.service",
+      "load_state": "loaded",
+      "active_state": "active",
+      "sub_state": "running",
+      "unit_file_state": "enabled",
+      "main_pid": 121,
+      "exec_main_pid": 121,
+      "invocation_id": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "start_monotonic_usec": 1000000,
+      "n_restarts": 0
+    },
+    "podmesh-web-observer.service": {
+      "unit": "podmesh-web-observer.service",
+      "load_state": "loaded",
+      "active_state": "active",
+      "sub_state": "running",
+      "unit_file_state": "enabled",
+      "main_pid": 232,
+      "exec_main_pid": 232,
+      "invocation_id": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "start_monotonic_usec": 2000000,
+      "n_restarts": 0
+    },
+    "podmesh-manager.service": {
+      "unit": "podmesh-manager.service",
+      "load_state": "not-found",
+      "active_state": "inactive",
+      "sub_state": "dead",
+      "unit_file_state": "",
+      "main_pid": 0,
+      "exec_main_pid": 0,
+      "invocation_id": null,
+      "start_monotonic_usec": 0,
+      "n_restarts": 0
+    }
+  },
+  "sockets": {
+    "/run/podmesh/api.sock": {
+      "path": "/run/podmesh/api.sock",
+      "present": true,
+      "file_type": "socket",
+      "mode": "600",
+      "uid": 0,
+      "gid": 0,
+      "inode": 343,
+      "bytes": 0
+    },
+    "/run/podmesh-web-observer/api.sock": {
+      "path": "/run/podmesh-web-observer/api.sock",
+      "present": true,
+      "file_type": "socket",
+      "mode": "600",
+      "uid": 0,
+      "gid": 0,
+      "inode": 454,
+      "bytes": 0
+    }
+  },
+  "podman_rootful": {
+    "projection_version": "v2",
+    "commitments": {
+      "containers": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "images": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "volumes": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "networks": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "pods": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+    }
+  },
+  "manager": {
+    "process_count": 0,
+    "account": {
+      "name": "podmesh-manager",
+      "present": false,
+      "uid": null,
+      "primary_gid": null,
+      "primary_group": null,
+      "home": null,
+      "shell": null
+    },
+    "config_present": false,
+    "state_directory": {
+      "path": "/var/lib/podmesh-manager",
+      "present": false,
+      "file_type": null,
+      "owner": null,
+      "group": null,
+      "mode": null,
+      "entry_count": null
+    },
+    "runtime_present": false,
+    "candidate_binding": null
+  },
+  "boot_id_commitment": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+}

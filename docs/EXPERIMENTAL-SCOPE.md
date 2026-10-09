@@ -124,6 +124,8 @@ remaining a dev/lab fallback until deprecation. This is a durability and backup
 harmonization track, not field qualification.
 
 - Plan: [STORAGE-MARIADB-MIGRATION-PLAN.md](STORAGE-MARIADB-MIGRATION-PLAN.md)
+- Configuration surface and how to build and test the MariaDB backend:
+  [STORE-CONFIGURATION.md](STORE-CONFIGURATION.md)
 - Phase 0 decisions: private lab record
   `podmesh-lab/records/storage-mariadb-2026-09-25/README.md`
 - Implementation branch: `codex/v3-5-med-integrated` (or successor). No MED-M5 or gate

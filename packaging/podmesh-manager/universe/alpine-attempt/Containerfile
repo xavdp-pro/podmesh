@@ -1,0 +1,8 @@
+# Alpine attempt for the manager universe: the frozen candidate binary as it is, on musl.
+FROM docker.io/library/alpine:3.22
+RUN apk add --no-cache python3
+COPY podmesh-managerd /usr/lib/podmesh-manager/podmesh-managerd
+COPY config.single-replica-fixture.json /etc/podmesh-manager/config.json
+COPY entrypoint.sh /usr/local/bin/manager-universe
+RUN chmod 755 /usr/lib/podmesh-manager/podmesh-managerd /usr/local/bin/manager-universe && chmod 600 /etc/podmesh-manager/config.json && mkdir -p /run/podmesh-manager /var/lib/podmesh-manager && chmod 700 /run/podmesh-manager /var/lib/podmesh-manager
+CMD ["/usr/local/bin/manager-universe"]
