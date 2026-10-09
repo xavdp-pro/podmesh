@@ -15,6 +15,7 @@ records, reviews and decisions in a private companion repository; nothing here d
 - [EXPERIMENTAL-SCOPE.md](EXPERIMENTAL-SCOPE.md) — the research scope and the review contract.
 
 ## Operate
+- [IMAGE-BUILD-AND-REGISTRY.md](IMAGE-BUILD-AND-REGISTRY.md) — build workers, dedicated OCI registry storage, runtime pulls and scoped cleanup.
 - [PREPARE-A-HOST.md](PREPARE-A-HOST.md) — the validated host target, installation and storage recommendations.
 - [MANAGER-DEPLOYMENT.md](MANAGER-DEPLOYMENT.md) — the `podmesh-manager` Debian package boundary and laboratory activation checklist.
 - [OPERATIONS.md](OPERATIONS.md) — the experimental tools: moving, replicating, guarding and taking over universes.
