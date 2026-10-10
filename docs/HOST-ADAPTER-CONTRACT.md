@@ -75,6 +75,34 @@ lifecycle. Then qualify exact exported bytes in the private node pod with its ow
 DB, application UID, provider and persistent recovery state. A protocol parser test
 or an adapter that refuses every real effect does not close this boundary.
 
+## Containment of a nested outer universe
+
+A rootful outer container that holds `SYS_ADMIN` and a writable `/proc/sys` is equivalent to root on
+the host: it can rewrite init-namespace sysctls such as `kernel.core_pattern` or `kernel.modprobe`,
+whose helpers run with host privileges, and it can remount what was made read-only. This is true with
+`--privileged` and with a narrowed capability list alike. Making `/proc/sys` read-only is not a
+remedy: the nested network stack (netavark) must write the network sysctls of the namespaces it
+creates.
+
+The supported shape is a **user-namespaced outer**:
+
+- the outer's root maps to an unprivileged host UID/GID range (for example 65536 IDs that no other
+  container uses), so its capabilities act only on namespaces the outer owns;
+- host directories given to the outer (configuration, unit state, inner image store, test fixtures)
+  are idmapped mounts, so files keep their owners inside and stay unprivileged on the host;
+- the capability set is limited to what nested Podman needs: `SYS_ADMIN`, `NET_ADMIN`, `NET_RAW`,
+  `MKNOD`, `SYS_RESOURCE`, `SYS_PTRACE`, `SETFCAP`, `AUDIT_WRITE`, with `/dev/fuse` and `/dev/net/tun`;
+- `/proc/sys` is writable for the outer's own network namespaces and `net.ipv4.ip_forward=1` is set;
+  writes to init-namespace sysctls are refused by the kernel;
+- the inner store uses kernel overlay on a dedicated mount, and the outer's default nested network
+  uses a subnet distinct from the host's container network.
+
+Qualification must show both sides: a write to `kernel.core_pattern` from the outer is refused and
+the outer's processes run under the mapped host UIDs, **and** every functional unit inside still
+passes its real effects, failures, recovery and restore. The `privileged-host-device-access` grant
+above names the host-root-equivalent envelope; a nested grant intended for production should name the
+user-namespaced envelope instead.
+
 ## Implemented transport increment, pending qualification
 
 The node source now has a separate provider and application wrapper. Host boot
