@@ -47,4 +47,6 @@ branch) is scaffolding for A, not a C claim.
 ## Done
 
 A and B without this laptop. Site and wiki say the same thing.
-SQLite on the node is scaffolding until `podmesh-node` MariaDB; manager MariaDB follows.
+SQLite is legacy scaffolding; each declared node/manager unit needs its own private
+MariaDB and functional restore proof. Shared prerequisites proceed independently
+of the standalone or SHAPER-integrated release choice. See [FUNCTIONAL-UNITS.md](FUNCTIONAL-UNITS.md).

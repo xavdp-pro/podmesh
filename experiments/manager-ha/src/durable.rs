@@ -519,6 +519,27 @@ pub struct Store {
     integrity: Arc<StoreIntegrityEntry>,
 }
 
+fn allocate_attempt_id(replica_id: &str, wire_nonce: &str) -> DurableResult<String> {
+    validate_wire_nonce_value(wire_nonce)?;
+    let sequence = NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(error)?
+        .as_nanos();
+    Ok(format!(
+        "attempt:{}",
+        digest(&json(&(
+            "podmesh-manager-ha-attempt/1",
+            replica_id,
+            wire_nonce,
+            std::process::id(),
+            sequence,
+            timestamp,
+            random_hex_16()?,
+        ))?)
+    ))
+}
+
 impl Store {
     /// Allocates a bounded local attempt identity. The wire nonce remains a
     /// separate audit field and may be reused by an untrusted peer. Before a
@@ -528,24 +549,7 @@ impl Store {
     /// # Errors
     /// Refuses an invalid nonce and reports a local clock or serialization failure.
     pub fn new_attempt_id(&self, wire_nonce: &str) -> DurableResult<String> {
-        validate_wire_nonce_value(wire_nonce)?;
-        let sequence = NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed);
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(error)?
-            .as_nanos();
-        Ok(format!(
-            "attempt:{}",
-            digest(&json(&(
-                "podmesh-manager-ha-attempt/1",
-                &self.replica_id,
-                wire_nonce,
-                std::process::id(),
-                sequence,
-                timestamp,
-                random_hex_16()?,
-            ))?)
-        ))
+        allocate_attempt_id(&self.replica_id, wire_nonce)
     }
 
     /// Opens or initializes a schema-v3 database bound to one replica/topology.

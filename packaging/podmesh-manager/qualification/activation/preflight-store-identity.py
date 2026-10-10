@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Refuse activation when config.json identity disagrees with the canonical store.
 
-Uses the same read-only ``--inspect-store`` path as capture-host.sh. A missing store
-is a fresh host and passes. Any ``identity_mismatch`` refusal matches resident start
+Uses the same read-only ``--inspect-store`` path as capture-host.sh. A missing SQLite
+file with no store profile is a fresh host and passes. A configured store must be
+inspected even when the legacy SQLite path is absent. Any ``identity_mismatch`` refusal matches resident start
 semantics: ``replica_id`` and serde-stable ``topology_json`` in the store must equal
 ``network.replica_id`` and ``network.manager`` replicas/grants from the installed config.
 """
@@ -107,7 +108,17 @@ def main():
     except ValueError as error:
         print(f"activation preflight refused: {error}", file=sys.stderr)
         return 2
-    if not store_path.exists() and not store_path.is_symlink():
+    # The resident resolves the profile in state_dir (or PODMESH_STORE_PROFILE).
+    # MariaDB deliberately has no SQLite file: absence is not an empty-store proof.
+    # Delegate all configured profiles, including malformed ones, to the resident
+    # rather than duplicating its engine/credential validation here.
+    profile = args.state_dir / "store.json"
+    profile_named = (
+        "PODMESH_STORE_PROFILE" in os.environ
+        or profile.exists()
+        or profile.is_symlink()
+    )
+    if not profile_named and not store_path.exists() and not store_path.is_symlink():
         statedir = store_path.parent
         if not statedir.is_dir() or statedir.is_symlink():
             print("manager state directory is absent or is not a directory", file=sys.stderr)

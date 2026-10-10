@@ -1,0 +1,31 @@
+# Private application only: host capabilities cross a dedicated typed Unix socket.
+FROM docker.io/library/mariadb@sha256:93fc3fe333b6cdfb061425869c2c3a5bb2851c0c74dbebc2c940f024e7482d76
+ARG NODE_BINARY_SHA256
+ARG BINARY_SOURCE_REVISION
+ARG RECIPE_REVISION
+COPY podmeshd /usr/lib/podmesh-node/podmeshd
+RUN test "${#NODE_BINARY_SHA256}" -eq 64 \
+ && case "$NODE_BINARY_SHA256" in *[!0-9a-f]*) exit 1;; esac \
+ && test "${#BINARY_SOURCE_REVISION}" -eq 40 \
+ && case "$BINARY_SOURCE_REVISION" in *[!0-9a-f]*) exit 1;; esac \
+ && test "${#RECIPE_REVISION}" -eq 40 \
+ && case "$RECIPE_REVISION" in *[!0-9a-f]*) exit 1;; esac \
+ && printf '%s  %s\n' "$NODE_BINARY_SHA256" /usr/lib/podmesh-node/podmeshd | sha256sum --check --strict - \
+ && groupadd --gid 1102 podmesh-node \
+ && useradd --uid 1102 --gid 1102 --no-create-home --home-dir /var/lib/podmesh-node --shell /usr/sbin/nologin podmesh-node \
+ && mkdir -p /var/lib/podmesh-node /run/podmesh-node /etc/podmesh-node /run/podmesh-host \
+ && chown 1102:1102 /var/lib/podmesh-node /run/podmesh-node /etc/podmesh-node \
+ && chmod 0700 /var/lib/podmesh-node /run/podmesh-node /etc/podmesh-node \
+ && chmod 0755 /usr/lib/podmesh-node/podmeshd
+LABEL org.opencontainers.image.revision="$RECIPE_REVISION" \
+      io.podmesh.binary-source-revision="$BINARY_SOURCE_REVISION" \
+      io.podmesh.node-binary-sha256="$NODE_BINARY_SHA256" \
+      io.podmesh.functional-slug="podmesh-node" \
+      io.podmesh.application-uid="1102"
+ENV PODMESH_STATE_DIR=/var/lib/podmesh-node \
+    PODMESH_SOCKET=/run/podmesh-node/api.sock \
+    PODMESH_STORE_PROFILE=/etc/podmesh-node/store.json \
+    PODMESH_HOST_ADAPTER_SOCKET=/run/podmesh-host/capability.sock
+USER podmesh-node:podmesh-node
+RUN test "$(id -u)" = 1102 && test "$(id -g)" = 1102
+ENTRYPOINT ["/usr/lib/podmesh-node/podmeshd"]

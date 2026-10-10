@@ -9,7 +9,7 @@ Owner: Xavier de Poorter. Repository: public `podmesh` (code and product docs).
    operation, recovery-point and replication traffic. SQLite’s single-writer model
    and WAL growth become the bottleneck before host CPU is saturated.
 2. **Backup harmonization** — SHAPER universes already prove restore with
-   `mariadb-dump` per functional boundary (V1.14 Rule 26). PodMesh today copies
+   `mariadb-dump` per functional boundary (adopted V1.15 Rule 26). PodMesh today copies
    `.sqlite` files and bespoke integrity checks; operators carry two recovery
    playbooks.
 3. **Alignment with future Shaper cell** — The intended manager-inside-a-universe
@@ -55,8 +55,8 @@ qualified with isolated MariaDB, restore proof and documented boundaries.
    layer changes.
 3. **Explicit configuration** — Replace path-only `database_path` pointing at a file
    with a structured **store profile** (engine, DSN, database name, credential
-   source). SQLite remains supported as **dev/lab fallback** until cutover, then
-   deprecated behind a feature flag with a removal date.
+   source). SQLite remains an explicitly selected **legacy dev/lab engine** until cutover;
+   a MariaDB profile never falls back to SQLite. Deprecation requires a release decision.
 4. **Crash-safe ordering preserved** — Every mutation that today relies on SQLite
    transactions + fsync must map to InnoDB transactions with documented isolation
    (default `REPEATABLE READ`; justify any downgrade).
@@ -66,35 +66,19 @@ qualified with isolated MariaDB, restore proof and documented boundaries.
 
 ## 4. Target architecture
 
-```text
-Host (or manager universe)
-├── podmesh-node role
-│   ├── process: podmeshd
-│   └── MariaDB instance A (database: podmesh-node or slug-aligned name)
-│       └── schemas: lifecycle, migration, publisher, recovery_points, secrets, …
-└── podmesh-manager replica role (when installed)
-    ├── process: podmesh-managerd (resident)
-    └── MariaDB instance B
-        └── schemas: manager-ha history, receipts, audit, signing ledger tables, …
-```
+The frozen unit shape and identity/privilege split are owned by
+[FUNCTIONAL-UNITS.md](FUNCTIONAL-UNITS.md): one isolated Podman boundary containing
+application + private server per unit, owned persistent volumes, slug-aligned
+application identity, and a separate scoped privileged host adapter. A shared
+server with separate databases or an external sidecar outside that boundary does
+not satisfy the declared profile. Host-systemd spikes are engineering fixtures.
+The existing host-root daemon remains a conformity gap until that boundary is
+implemented and qualified.
 
-**Credential layout (Shaper-aligned when integrated):**
-
-- Password file e.g. `/apps/<functional-slug>/etc/mysql/localhost/passwd` (mode 0600),
-  or container-local equivalent mounted from host secret dir for manager replicas.
-- Application connects only as `<functional-slug>` to matching database; admin
-  proof uses local root CLI path for qualification scripts.
-
-**Packaging options (pick one per role in Phase 0 decision record):**
-
-| Option | Pros | Cons |
-| --- | --- | --- |
-| **Sidecar `brick-mariadb` Podman** per role | Matches SHAPER universe pattern, same backup story | More containers, port/volume wiring |
-| **Embedded MariaDB in manager universe image** (node: host-managed or nested) | Fewer moving parts on small lab | Must not merge node+manager DB |
-| **Host systemd MariaDB instances** (lab only) | Fast spike | Weaker portability story for adopters |
-
-Recommendation: **sidecar or co-located Podman MariaDB per role** for product
-story; host systemd only for early spikes.
+Credentials are private files readable by the owning application account; database
+bootstrap/admin uses a separate authorized path. Neither a DSN nor a password is
+published in evidence. Recovery retains the manifest, cfg/image lock, identity,
+private profile and all declared persistent volumes as well as the logical dump.
 
 ## 5. Phased delivery
 
@@ -124,14 +108,11 @@ Update `docs/EXPERIMENTAL-SCOPE.md` with a short pointer to this plan.
 Exit: all existing unit/integration tests green on SQLite; MariaDB backend compiles
 and passes a **minimal** schema bootstrap test.
 
-**In the tree** (2026-09-28): `src/store/` carries the contract (`DurableStore`), the
-SQLite backend wrapping the existing `rusqlite` paths, and the MariaDB backend behind the
-Cargo feature `mariadb`, off by default. The configuration surface (`store.engine`), how to
-build with the feature and how to run the bootstrap test are in
-[STORE-CONFIGURATION.md](STORE-CONFIGURATION.md). No caller is moved: `open_state` still
-opens `state.sqlite` through `rusqlite`, and nothing reads `store.engine` yet. Point 5's CI
-matrix is not set up; the two suites are run by hand, the MariaDB one against a server named
-by `PODMESH_MARIADB_DSN`.
+The engineering layer is implemented in `src/store/` with a SQLite backend and a
+MariaDB backend behind feature `mariadb`. The configured node and manager entry
+points now read the profile. Coverage remains slice-specific; see the actual
+Phase 2 call map below and [STORE-CONFIGURATION.md](STORE-CONFIGURATION.md).
+A schema bootstrap test establishes only store plumbing, not operations or restore.
 
 ### Phase 2 — Node (`state.sqlite`) migration
 
@@ -156,17 +137,25 @@ by `PODMESH_MARIADB_DSN`.
 Exit: lab record with dump size, restore time, and full `tests/` delta green on
 MariaDB node store.
 
-**In the tree** (2026-09-28), points 1 to 3: the node's schema is one ordered set of migrations in
-`src/store/migrations/node/`, a file per engine, carrying all 38 production tables; `open_state`
-reads the store profile (`store.json` under the state directory, or `PODMESH_STORE_PROFILE`) and
-applies the set to whichever engine it names, recording the version in `store_schema`. An incomplete
-MariaDB profile is refused before anything opens, and a MariaDB profile never falls back to a file.
-`src/store/catalog.rs` answers what a store carries on both engines, so no caller reads
-`sqlite_master` on the migrated path; the two SQLite-only escapes that remain are named in
-[STORE-CONFIGURATION.md](STORE-CONFIGURATION.md). What is **not** done: the node's operations still
-take a `rusqlite::Connection`, so a node configured for MariaDB opens, migrates and then refuses to
-serve, by name. Point 4 (`podmesh-storage-migrate`) and point 5 (the backup script) are separate
-work; point 6 re-runs on MariaDB once the call sites are ported.
+**Current call sites:** `podmeshd` resolves the profile and calls `open_node_store`,
+which applies migrations and binds the host identity. `NodeStore::handle` preserves
+legacy SQLite dispatch and sends MariaDB requests through `handle_durable`.
+`lifecycle::execute_store` ports create/delete/clone/start/stop/pause/resume/resources
+with pending intent committed before Podman and terminal operation/attempt updates
+in one transaction. Secret metadata and local read APIs also use `DurableStore`.
+Volume declaration/growth and storage-status declarations now use `DurableStore`,
+with capacity/result/attempt committed atomically. `boot_restore`/status share the
+pass planner across engines; MariaDB boot-return supports isolated ungated universes
+and refuses imported activation and managed-network state. Real host return and
+functional restoration remain qualification requirements for container-life slice A. Migration, recovery-point, network, publisher
+and manager control modules retain explicit unsupported refusals on MariaDB.
+Startup network/publisher reconciliation is likewise refused; opening/migrating a
+schema is not full node qualification. The compatibility `open_state` API still
+returns only a SQLite connection and cannot serve MariaDB callers.
+
+The required first slice is A's ten steps in [SIMPLE-PRODUCTION-PATH.md](SIMPLE-PRODUCTION-PATH.md),
+including bounded volumes and journal-derived boot return. B's migration/replication
+ports follow; unrelated C modules are not silently advertised as supported.
 
 ### Phase 3 — Manager (`manager.sqlite` / `manager-ha`) migration
 
@@ -181,7 +170,7 @@ work; point 6 re-runs on MariaDB once the call sites are ported.
 4. Update `capture-host.sh`, `compare-evidence.py`, campaign scripts to dump/check
    MariaDB instead of copying `.sqlite*` (WAL/SHM copy path removed for MariaDB).
 5. Re-run manager test suites: resident tests, activation qualification, vote tool
-   offline validation, integrated 16-check pair on P3 with `umask 077`.
+   offline validation, integrated checks on an explicitly named isolated test host with `umask 077`.
 
 Exit: 96+ manager / 82+ node tests green on MariaDB; lab record with restore after
 fake “store corruption” drill.
@@ -255,12 +244,14 @@ integrity + one end-to-end operation path.
 
 ## 9. Open questions for operator
 
-1. Sidecar MariaDB vs embedded in manager universe image for med-pmox?
-2. Slug names for Rule 26 alignment when manager lives inside Shaper OS later?
+1. Standalone-first or SHAPER-integrated-first release perimeter? Common unit
+   isolation, identity and restore requirements apply to both.
+2. Adapter capability envelope and installation interface for the chosen host?
+   Slugs and private-server-per-unit shape are fixed in FUNCTIONAL-UNITS.md.
 3. Accept temporary **two** backup formats in one release (file copy for old
    guests, dump for new) — yes/no and for how long?
-4. Priority: node first (less gate coupling) or manager first (V3-5 qualification
-   surface)? **Recommended: node Phase 2, then manager Phase 3.**
+4. Which bounded candidate slice is qualified next? Node and manager work may
+   proceed independently; each closes only with its own exact-artifact evidence.
 
 ## 10. Success criteria (summary)
 
@@ -274,5 +265,5 @@ integrity + one end-to-end operation path.
 
 Related: [INTENT.md](../INTENT.md) (delivery ladder), [EXPERIMENTAL-SCOPE.md](EXPERIMENTAL-SCOPE.md),
 private `podmesh-lab/status/CURRENT-STATE.md` (gates). SHAPER Rule 26 and
-[September MariaDB profile](https://github.com/xavdp-pro/SHAPER-OS-V1.15/blob/main/docs/profiles/SEPTEMBER-CONTAINER-MARIADB.md)
+[September MariaDB profile](https://github.com/xavdp-pro/SHAPER-OS-V1.15/blob/173ae591988e1f71a33f65289fc26b9de4aaf3d7/docs/profiles/SEPTEMBER-CONTAINER-MARIADB.md)
 state the ecosystem target this migration aligns with, without auto-qualifying PodMesh.

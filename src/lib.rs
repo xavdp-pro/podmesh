@@ -12,6 +12,7 @@ mod signing;
 // The journal's engine, named once (docs/STORE-CONFIGURATION.md). Public so that the tools and
 // the manager tree may open a store; `storage` below is Podman's graph, not this.
 mod health;
+pub mod host_adapter;
 mod storage;
 pub mod store;
 pub use manager::control_relay;
@@ -205,27 +206,74 @@ impl NodeStore {
         }
     }
 
+    /// Refuse a durable lifecycle candidate that needs an unported startup reconciler.
+    /// This check reads only the journal, before the daemon opens its API socket.
+    pub fn validate_startup_scope(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let NodeStore::Durable(store) = self {
+            validate_durable_startup_scope(store.as_mut())?;
+        }
+        Ok(())
+    }
+
     /// The connection the node's operations take, or a refusal naming why there is none.
     ///
-    /// This is where Phase 2 stops. The node's schema is versioned and installs on both engines,
-    /// and the profile decides which one is opened -- but `handle` and every module below it
-    /// still speak `rusqlite`, so a journal that is not a file has nothing to hand them. A node
-    /// configured for MariaDB is refused here, by name, rather than served from a file it was not
-    /// configured to use.
+    /// Compatibility escape for callers that still require a SQLite connection.
+    /// MariaDB callers retain NodeStore and use its ported operation dispatch; this
+    /// conversion cannot represent their journal and never substitutes a file.
     pub fn into_connection(self) -> Result<Connection, Box<dyn std::error::Error>> {
         match self {
             NodeStore::Sqlite(db) => Ok(db),
             NodeStore::Durable(store) => Err(format!(
                 "store.engine is {engine}: the journal opened and its schema is at version {version}, \
-                 but this build's operations still read and write the node's journal as SQLite \
+                 but this compatibility API returns only a SQLite connection \
                  (Phase 2 of docs/STORAGE-MARIADB-MIGRATION-PLAN.md ports them). \
-                 Set store.engine to sqlite to run this node.",
+                 Retain NodeStore and use NodeStore::handle for the ported MariaDB operation slice.",
                 engine = store.engine(),
                 version = migrations::node_version(),
             )
             .into()),
         }
     }
+}
+
+/// Conservative candidate precondition until publisher/network startup reconciliation is ported.
+/// Historical rows also refuse: their absence from the host cannot be inferred from a journal.
+fn validate_durable_startup_scope(
+    store: &mut dyn DurableStore,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for table in [
+        "network_declaration",
+        "network_peer_pools",
+        "network_allocations",
+        "network_routes",
+        "network_effects",
+        "publishers",
+        "publisher_events",
+        "publisher_transitions",
+        "publisher_takeover_verified",
+    ] {
+        if store
+            .query_one(&format!("SELECT 1 FROM {table} LIMIT 1"), &[])?
+            .is_some()
+        {
+            return Err(format!("store_engine_unsupported: durable startup refused because {table} contains state requiring SQLite-only publisher/network reconciliation; preserve this journal and reconcile with a compatible implementation before cutover").into());
+        }
+    }
+    for row in store.query("SELECT request FROM operations", &[])? {
+        let request: Value = serde_json::from_str(row.text(0)?).map_err(|_| {
+            "durable startup refused: cannot establish publisher/network scope from an invalid journal request"
+        })?;
+        let operation = request["operation"]
+            .as_str()
+            .ok_or("durable startup refused: journal request has no operation identity")?;
+        if operation.starts_with("network_")
+            || operation.starts_with("publisher_")
+            || request["network_profile"].as_str() == Some(network::PROFILE_MANAGED)
+        {
+            return Err("store_engine_unsupported: durable startup refused because operation history includes publisher/network effects not supported by this candidate; preserve and reconcile the original state before cutover".into());
+        }
+    }
+    Ok(())
 }
 
 /// Open the node's journal under the profile it is configured with, and bring its schema up.
@@ -268,7 +316,11 @@ pub fn open_node_store(
 /// engine's, so the row is read and then written inside a transaction, which is the same fact on
 /// both. One process opens a node's journal, so there is no second writer to race here.
 fn bind_to_this_host(store: &mut dyn DurableStore) -> Result<(), Box<dyn std::error::Error>> {
-    let machine = fs::read_to_string("/etc/machine-id")?.trim().to_string();
+    let machine = if host_adapter::configured() {
+        host_adapter::host_identity()?.machine
+    } else {
+        fs::read_to_string("/etc/machine-id")?.trim().to_string()
+    };
     let uuid = fs::read_to_string("/proc/sys/kernel/random/uuid")?
         .trim()
         .to_string();
@@ -311,6 +363,7 @@ pub fn open_state(dir: &Path) -> Result<Connection, Box<dyn std::error::Error>> 
     open_node_store(dir, &store_profile(dir)?)?.into_connection()
 }
 fn inventory() -> Result<Value, Box<dyn std::error::Error>> {
+    if host_adapter::configured() { return Ok(serde_json::from_slice(&host_adapter::run_podman(&["ps", "--all", "--format", "json"])?.stdout)?); }
     // Fixed command; no caller-controlled shell or command arguments.
     let mut child = Command::new("/usr/bin/podman")
         .args(["ps", "--all", "--format", "json"])
@@ -411,11 +464,7 @@ fn sqlite_only_operation(operation: &str) -> bool {
             | "recovery_point_stage"
             | "recovery_point_discard"
             | "recovery_point_resume"
-            | "boot_restore"
-            | "boot_restore_status"
             | "migration_status"
-            | "volume_declare"
-            | "volume_grow"
     )
 }
 
@@ -427,7 +476,7 @@ fn durable_lifecycle_operation(operation: &str) -> bool {
 }
 
 fn durable_capabilities(engine: Engine) -> Value {
-    json!({
+    let mut capabilities = json!({
         "schemas": schema::all(),
         "schema_version": "podmesh-operation-schema/1",
         "version": option_env!("PODMESH_PACKAGE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
@@ -447,14 +496,32 @@ fn durable_capabilities(engine: Engine) -> Value {
             "pause",
             "resume",
             "resources",
+            "volume_declare",
+            "volume_grow",
+            "boot_restore",
+            "boot_restore_status",
             "secret_declare",
             "secret_remove",
             "secret_status",
         ],
         "store_engine": engine.as_str(),
         "unsupported_error_code": "store_engine_unsupported",
-        "scope": "read-only local API, lifecycle create/delete/clone/start/stop/pause/resume/resources, and secret_declare/secret_remove/secret_status; other module-owned mutations remain SQLite-only",
-    })
+        "scope": "read-only local API, lifecycle create/delete/clone/start/stop/pause/resume/resources, bounded volume declarations/growth, isolated ungated boot_restore/status, and secret_declare/secret_remove/secret_status; other module-owned mutations remain SQLite-only",
+    });
+    if host_adapter::configured() {
+        capabilities["operations"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|v| {
+                !matches!(
+                    v.as_str(),
+                    Some("secret_declare" | "secret_remove" | "secret_status" | "universe_stats")
+                )
+            });
+        capabilities["host_adapter_protocol"] = json!("podmesh-host-capability/1");
+        capabilities["host_adapter_scope"] = json!("isolated lifecycle including explicit host-owned nested UUID/image grants and mount-free cloning; managed network/secrets/host-state mounts/scoped statistics and migration/replication effects unported");
+    }
+    capabilities
 }
 
 /// Local API carried by a non-SQLite journal.
@@ -466,8 +533,17 @@ fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
         .get("operation")
         .and_then(Value::as_str)
         .unwrap_or("");
-    if durable_lifecycle_operation(operation) {
-        let result = lifecycle::execute_store(store, request);
+    if host_adapter::configured() && matches!(operation, "secret_declare" | "secret_remove" | "secret_status" | "universe_stats") {
+        return json!({"ok":false,"observed_at":now(),"error_code":"host_capability_unsupported","error":"operation is not ported to the private node host adapter","operation":operation});
+    }
+    if durable_lifecycle_operation(operation) || matches!(operation, "volume_declare" | "volume_grow" | "boot_restore" | "boot_restore_status") {
+        let result = if matches!(operation, "volume_declare" | "volume_grow") {
+            storage::execute_store(store, request)
+        } else if matches!(operation, "boot_restore" | "boot_restore_status") {
+            boot_restore::execute_store(store, request)
+        } else {
+            lifecycle::execute_store(store, request)
+        };
         let response = match result {
             Ok(data) => json!({"ok":true,"observed_at":now(),"data":data}),
             Err(error) => {
@@ -551,8 +627,8 @@ fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
                     .collect::<store::Result<Vec<_>>>()?;
                 json!({"observations": observations})
             }
-            "storage_status" => storage::status(None)?,
-            "host_status" => health::host_status()?,
+            "storage_status" => storage::status_store(store)?,
+            "host_status" => if host_adapter::configured() { host_adapter::fact("host_status", None)? } else { health::host_status()? },
             "universe_stats" => health::universe_stats()?,
             _ => return Err("Unsupported operation".into()),
         })

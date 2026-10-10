@@ -11,10 +11,59 @@ state directory, as it always has. What Phase 2 added is that the journal's *sch
 ordered set of migrations applied at every open, on whichever engine the profile names, and that
 `store.engine` is read: a node configured for MariaDB opens that instance and migrates it.
 
-**What it does not yet do** is run from MariaDB. The node's operations still take a
-`rusqlite::Connection`, so a node whose profile says `mariadb` opens the instance, brings its schema
-up, and then refuses to serve, naming why. Failing closed is the point: a node that believes it
-writes to a server and writes to a file instead is the one failure this layer must not allow.
+**The daemon serves the operations ported to `DurableStore` from MariaDB.** These
+include local reads, lifecycle create/delete/clone/start/stop/pause/resume/resources,
+bounded volume declaration/growth and secret declare/remove/status. Ask `capabilities`
+for the supported set. Volume changes retain stopped-owned-universe, reservation
+and dedicated growable-storage gates; they declare capacity only, not new block
+devices. Pending intent commits first; capacity, verified result and completed
+attempt commit together, so retries repeat no growth. `storage_status` reads
+declarations from the configured journal. Other module-owned operations return
+`store_engine_unsupported`: migration and recovery points still require SQLite.
+`boot_restore` and `boot_restore_status` use the same journal-derived pass planner
+on both engines. On MariaDB the supported boot-return slice is isolated, ungated
+universes: imported lease/epoch policies and managed-network universes are blocked,
+as are quarantined copies, recovery points without policy, holding reservations,
+unresolved restore claims and unfinished captures/promotions. Child starts retain
+a stable per-boot ID and their first saved mandate, execute through existing durable
+lifecycle gates, and repeat no verified start. A pass commits intent before children
+and its terminal result afterward. A reboot or actual host-start proof is separate
+from engineering tests with controlled observations.
+Startup publisher withdrawal and network reconciliation are also SQLite-only.
+Before opening the API socket, a durable node refuses any rows in network/publisher
+tables, any network/publisher operation history, or any managed-network operation.
+Historical rows also refuse; the guard cannot infer that their host effects are gone.
+Unreadable/malformed journal requests or failed guard queries refuse startup.
+Preserve the journal and reconcile using a compatible implementation before cutover;
+deleting history to pass this guard is not an approved migration. This is a journal
+precondition, not cleanup of active host effects. Qualification additionally requires
+an isolated host scope with no residual unjournaled managed network or publisher
+services. The guard does not prove their absence or port these modules.
+This is a partial cutover, not a complete A/B production path. The legacy
+`open_state`/`into_connection` API still refuses a MariaDB journal because it returns
+a `rusqlite::Connection`. No MariaDB profile silently falls back to SQLite.
+
+## Private application boundaries
+
+When `PODMESH_HOST_ADAPTER_SOCKET` is configured, the node application requires
+MariaDB and a non-system application identity. Host effects/observations use the
+scoped typed provider in [HOST-ADAPTER-CONTRACT.md](HOST-ADAPTER-CONTRACT.md), with
+no local Podman fallback. This surface excludes secrets and scoped universe
+statistics until those capabilities are ported. Isolated nested lifecycle requires
+host-owned UUID/base-image/empty-host-mount grants; that does not qualify inner
+workload continuity, migration or replication. Each boot pass reads validated
+host machine/boot/btime/clock facts once through the provider. See the
+[node recipe](../packaging/podmesh-node/private-unit/README.md) and
+[product proof scenario](../packaging/podmesh-node/qualification/README.md).
+
+Manager resident and network resolve the same profile beside
+`network.database_path` or from explicitly named `PODMESH_STORE_PROFILE`.
+Observations, snapshot export, authenticated import, receipts and exchange audits
+use that backend. MariaDB import commits facts/receipt/import audit atomically;
+other exchange phases commit into the same private journal. A rejected profile or
+failed MariaDB connection never opens `manager.sqlite` as fallback. The `mariadb`
+feature propagates through resident/network/HA; without it a MariaDB profile
+refuses and the SQLite-only build remains usable.
 
 ## Where the profile is read from
 
@@ -154,9 +203,10 @@ own dialect, and the node's tables arrive the same way, as the migration set bel
 0008-recovery-point  the eight recovery-point tables
 0009-retention       retention, holds, retained points
 0010-collector       collection runs and effects
+0011-universe-volume per-universe data volume declarations
 ```
 
-That is the **38 production tables** the storage inventory counts. Each step is a pair of files,
+That is the **39 production tables**: the 38 the storage inventory counted, plus 1 for universe volume declarations. Each step is a pair of files,
 `<id>.sqlite.sql` and `<id>.mariadb.sql`, because every `CREATE TABLE` in this set diverges: a
 variable-length primary key needs a length on MariaDB and none on SQLite, so there is no portable
 spelling of even the first table. A future step that is portable (an index, a row) may name one file

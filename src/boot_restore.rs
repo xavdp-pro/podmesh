@@ -43,6 +43,7 @@
 //! is issued first, then observed once, so a pass stays short on a service that answers one request
 //! at a time.
 use crate::lifecycle as lc;
+use crate::store::{DurableStore, Value as Stored};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -160,11 +161,19 @@ pub(crate) fn last_intents(db: &Connection) -> Result<BTreeMap<String, LastInten
 
 /// This boot's identity, as the kernel gives it.
 fn boot_id() -> Result<String, Error> {
-    Ok(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim().to_string())
+    if crate::host_adapter::configured() {
+        return Ok(crate::host_adapter::host_identity()?.boot);
+    }
+    Ok(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+        .trim()
+        .to_string())
 }
 
 /// When this boot began, in seconds since the Unix epoch, on the wall clock as it reads now.
 pub(crate) fn boot_time() -> Option<i64> {
+    if crate::host_adapter::configured() {
+        return crate::host_adapter::host_identity().ok()?.booted;
+    }
     std::fs::read_to_string("/proc/stat")
         .ok()?
         .lines()
@@ -180,8 +189,14 @@ pub(crate) fn start_operation_id(boot_id: &str, uuid: &str) -> String {
 
 /// Whether the system clock is known to be synchronized: `Some(true)` or `Some(false)` from systemd,
 /// `None` when it cannot be read, which is treated as not known.
-fn clock_synchronized() -> Option<bool> {
-    let out = Command::new("timedatectl").args(["show", "-p", "NTPSynchronized", "--value"]).output().ok()?;
+pub(crate) fn clock_synchronized() -> Option<bool> {
+    if crate::host_adapter::configured() {
+        return crate::host_adapter::host_identity().ok()?.clock;
+    }
+    let out = Command::new("timedatectl")
+        .args(["show", "-p", "NTPSynchronized", "--value"])
+        .output()
+        .ok()?;
     match String::from_utf8_lossy(&out.stdout).trim() {
         "yes" => Some(true),
         "no" => Some(false),
@@ -201,6 +216,14 @@ fn container_names() -> Result<HashSet<String>, Error> {
         .collect())
 }
 
+fn boot_facts() -> Result<(String, Option<i64>, Option<bool>), Error> {
+    if crate::host_adapter::configured() {
+        let host = crate::host_adapter::host_identity()?;
+        return Ok((host.boot, host.booted, host.clock));
+    }
+    Ok((boot_id()?, boot_time(), clock_synchronized()))
+}
+
 /// What a pass knows for all its universes: read once.
 struct Facts {
     boot: String,
@@ -211,7 +234,14 @@ struct Facts {
 }
 
 fn facts(db: &Connection) -> Result<Facts, Error> {
-    Ok(Facts { boot: boot_id()?, booted: boot_time(), names: container_names()?, attempts: last_attempts(db)?, clock: clock_synchronized() })
+    let (boot, booted, clock) = boot_facts()?;
+    Ok(Facts {
+        boot,
+        booted,
+        names: container_names()?,
+        attempts: last_attempts(db)?,
+        clock,
+    })
 }
 
 /// The decision a pass reaches before issuing a start: a reason not to, or leave to the start.
@@ -365,10 +395,14 @@ fn start_request(db: &Connection, id: &str, uuid: &str, authorization_ref: &str)
 }
 
 fn restore(db: &Connection, request: &Value) -> Result<Value, Error> {
+    restore_managed(&mut SqliteBootJournal { db }, request)
+}
+
+fn restore_managed(db: &mut dyn BootJournal, request: &Value) -> Result<Value, Error> {
     let authorization_ref = lc::text(request, "authorization_ref")?;
     let observe = observe_seconds(request)?;
-    let intents = last_intents(db)?;
-    let f = facts(db)?;
+    let intents = db.intents()?;
+    let f = db.facts()?;
     let mut decisions: Vec<Value> = Vec::new();
     let mut absent = Vec::new();
     let mut issued = Vec::new();
@@ -380,7 +414,7 @@ fn restore(db: &Connection, request: &Value) -> Result<Value, Error> {
             "last_intent": {"operation": last.operation, "operation_id": last.operation_id},
         });
         // One universe's failure is that universe's decision, never the pass's: every other universe is still decided.
-        match before_start(db, uuid, last, &f) {
+        match db.before(uuid, last, &f) {
             Ok(Before::Absent) => {
                 absent.push(json!(uuid));
                 continue;
@@ -393,7 +427,7 @@ fn restore(db: &Connection, request: &Value) -> Result<Value, Error> {
             Ok(Before::Start) => {
                 let id = start_operation_id(&f.boot, uuid);
                 entry["start_operation_id"] = json!(id);
-                match start_request(db, &id, uuid, authorization_ref).and_then(|start| lc::execute(db, &start)) {
+                match db.start_request(&id, uuid, authorization_ref).and_then(|start| db.start(&start)) {
                     Ok(result) if result["replayed"] == json!(true) => {
                         entry["decision"] = json!("restored_earlier_this_boot");
                         entry["start"] = result;
@@ -423,7 +457,7 @@ fn restore(db: &Connection, request: &Value) -> Result<Value, Error> {
         std::thread::sleep(Duration::from_secs(observe));
         for i in issued {
             let name = format!("podmesh-{}", decisions[i]["universe_uuid"].as_str().unwrap_or_default());
-            match lc::inspect(&name) {
+            match db.observe(&name) {
                 Ok(Some(c)) => {
                     let view = lc::state_view(&c);
                     decisions[i]["decision"] = json!(if view["running"] == json!(true) { "restored" } else { "started_not_running" });
@@ -439,7 +473,7 @@ fn restore(db: &Connection, request: &Value) -> Result<Value, Error> {
         "operation": "boot_restore",
         "boot_id": f.boot,
         "booted_at": f.booted,
-        "host_uuid": host_uuid(db)?,
+        "host_uuid": db.host_uuid()?,
         "authorization_ref": authorization_ref,
         "clock_synchronized": f.clock,
         "observation_seconds": observe,
@@ -462,26 +496,18 @@ fn restore(db: &Connection, request: &Value) -> Result<Value, Error> {
 /// Read-only: this boot's passes, what a pass would decide now, and the operations a previous run of
 /// the service left pending. Nothing is started, nothing is journaled.
 fn status(db: &Connection) -> Result<Value, Error> {
-    let intents = last_intents(db)?;
-    let f = facts(db)?;
-    let mut times: HashMap<String, (Option<i64>, Option<i64>)> = HashMap::new();
-    {
-        let mut stmt = db.prepare("SELECT operation_id, MAX(started_at), MAX(finished_at) FROM operation_attempts GROUP BY operation_id")?;
-        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, Option<i64>>(2)?)))? {
-            let (id, started, finished) = row?;
-            times.insert(id, (started, finished));
-        }
-    }
+    status_managed(&mut SqliteBootJournal { db })
+}
+
+fn status_managed(db: &mut dyn BootJournal) -> Result<Value, Error> {
+    let intents = db.intents()?;
+    let f = db.facts()?;
+    let times = db.times()?;
     let mut passes = Vec::new();
     let mut pending = Vec::new();
     let mut pending_count = 0;
     {
-        let mut stmt = db.prepare("SELECT id, request, status, result FROM operations")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?))
-        })?;
-        for row in rows {
-            let (id, request, state, result) = row?;
+        for (id, request, state, result) in db.operations()? {
             if state == "pending" {
                 pending_count += 1;
                 if pending.len() < PENDING_LISTED {
@@ -520,10 +546,9 @@ fn status(db: &Connection) -> Result<Value, Error> {
             "last_intent": {"operation": last.operation, "operation_id": last.operation_id},
             "start_operation_id": id,
         });
-        let start_status: Option<String> =
-            db.query_row("SELECT status FROM operations WHERE id=?1", [&id], |r| r.get(0)).optional()?;
+        let start_status = db.start_status(&id)?;
         entry["start_status_this_boot"] = json!(start_status);
-        match before_start(db, uuid, last, &f) {
+        match db.before(uuid, last, &f) {
             Ok(Before::Absent) => {
                 entry["would"] = json!("not_restored");
                 entry["reason"] = json!("container_absent");
@@ -538,7 +563,7 @@ fn status(db: &Connection) -> Result<Value, Error> {
             Ok(Before::Start) => {
                 // The start's own lease gate, read without effect; the other gates were read above. This is a
                 // prediction: ownership and an earlier attempt of the same start are decided by the start itself.
-                match crate::activation::refuse_if_not_activated(db, uuid, "boot_restore") {
+                match db.activation(uuid) {
                     Ok(()) => entry["would"] = json!("restore"),
                     Err(e) => {
                         entry["would"] = json!("not_restored");
@@ -558,13 +583,347 @@ fn status(db: &Connection) -> Result<Value, Error> {
     Ok(json!({
         "boot_id": f.boot,
         "booted_at": f.booted,
-        "host_uuid": host_uuid(db)?,
+        "host_uuid": db.host_uuid()?,
         "clock_synchronized": f.clock,
         "passes_this_boot": passes,
         "plan": plan,
         "operations_left_pending": {"count": pending_count, "first": pending},
         "note": "read-only: nothing is started and nothing is journaled; `would` is a prediction; a pending operation is re-evaluated only when its operation ID is sent again",
     }))
+}
+type OperationRow = (String, String, String, Option<String>);
+type OperationTimes = HashMap<String, (Option<i64>, Option<i64>)>;
+
+/// Shared pass planning/observation; engine adapters only supply journal facts and start gates.
+trait BootJournal {
+    fn intents(&mut self) -> Result<BTreeMap<String, LastIntent>, Error>;
+    fn facts(&mut self) -> Result<Facts, Error>;
+    fn before(&mut self, uuid: &str, last: &LastIntent, facts: &Facts) -> Result<Before, Error>;
+    fn start_request(&mut self, id: &str, uuid: &str, authorization: &str) -> Result<Value, Error>;
+    fn start(&mut self, request: &Value) -> Result<Value, Error>;
+    fn host_uuid(&mut self) -> Result<String, Error>;
+    fn times(&mut self) -> Result<OperationTimes, Error>;
+    fn operations(&mut self) -> Result<Vec<OperationRow>, Error>;
+    fn start_status(&mut self, id: &str) -> Result<Option<String>, Error>;
+    fn activation(&mut self, uuid: &str) -> Result<(), Error>;
+    fn observe(&mut self, name: &str) -> Result<Option<Value>, Error> { lc::inspect(name) }
+}
+
+struct SqliteBootJournal<'a> {
+    db: &'a Connection,
+}
+impl BootJournal for SqliteBootJournal<'_> {
+    fn intents(&mut self) -> Result<BTreeMap<String, LastIntent>, Error> {
+        last_intents(self.db)
+    }
+    fn facts(&mut self) -> Result<Facts, Error> {
+        facts(self.db)
+    }
+    fn before(&mut self, uuid: &str, last: &LastIntent, facts: &Facts) -> Result<Before, Error> {
+        before_start(self.db, uuid, last, facts)
+    }
+    fn start_request(&mut self, id: &str, uuid: &str, authorization: &str) -> Result<Value, Error> {
+        start_request(self.db, id, uuid, authorization)
+    }
+    fn start(&mut self, request: &Value) -> Result<Value, Error> {
+        lc::execute(self.db, request)
+    }
+    fn host_uuid(&mut self) -> Result<String, Error> {
+        host_uuid(self.db)
+    }
+    fn times(&mut self) -> Result<OperationTimes, Error> {
+        let mut stmt = self.db.prepare("SELECT operation_id, MAX(started_at), MAX(finished_at) FROM operation_attempts GROUP BY operation_id")?;
+        let mut times = HashMap::new();
+        for row in stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<i64>>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+            ))
+        })? {
+            let (id, started, finished) = row?;
+            times.insert(id, (started, finished));
+        }
+        Ok(times)
+    }
+    fn operations(&mut self) -> Result<Vec<OperationRow>, Error> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT id, request, status, result FROM operations")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+    fn start_status(&mut self, id: &str) -> Result<Option<String>, Error> {
+        Ok(self
+            .db
+            .query_row("SELECT status FROM operations WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+    fn activation(&mut self, uuid: &str) -> Result<(), Error> {
+        crate::activation::refuse_if_not_activated(self.db, uuid, "boot_restore")
+    }
+}
+
+struct DurableBootJournal<'a> {
+    store: &'a mut dyn DurableStore,
+}
+impl DurableBootJournal<'_> {
+    fn attempts(&mut self) -> Result<HashMap<String, i64>, Error> {
+        self.store
+            .query(
+                "SELECT operation_id, MAX(id) FROM operation_attempts GROUP BY operation_id",
+                &[],
+            )?
+            .into_iter()
+            .map(|r| Ok((r.text(0)?.to_string(), r.integer(1)?)))
+            .collect()
+    }
+    fn exists(&mut self, sql: &str, uuid: &str) -> Result<bool, Error> {
+        Ok(self.store.query_one(sql, &[Stored::from(uuid)])?.is_some())
+    }
+    fn before_container(&mut self, uuid: &str, last: &LastIntent, f: &Facts, c: &Value) -> Result<Before, Error> {
+        if lc::status(&c) == "running" {
+            return Ok(skip(
+                "already_running",
+                "running",
+                json!({"observed":lc::state_view(&c)}),
+            ));
+        }
+        if c["Config"]["Labels"][crate::network::LABEL_PROFILE].as_str()
+            == Some(crate::network::PROFILE_MANAGED)
+        {
+            return Ok(skip(
+                "not_restored",
+                "managed_network_unported",
+                json!({"note":"managed-network reconciliation is unavailable on this durable candidate"}),
+            ));
+        }
+        // Activation acquisition/renewal is unported. Never use an imported old lease as leave
+        // to restart. Epoch and plain lease gates both fail closed on this bounded candidate.
+        if let Some(policy) = self.store.query_one(
+            "SELECT authority_id FROM activation_policy WHERE universe_uuid = ?",
+            &[Stored::from(uuid)],
+        )? {
+            let reason = if policy.text(0)?.is_empty() {
+                "activation_policy_unported"
+            } else {
+                "epoch_gated"
+            };
+            return Ok(skip(
+                "not_restored",
+                reason,
+                json!({"note":"this candidate restores isolated ungated universes only; imported activation state grants no boot entitlement"}),
+            ));
+        }
+        if self.exists(
+            "SELECT 1 FROM recovery_point_restores WHERE restored_universe_uuid = ?",
+            uuid,
+        )? {
+            return Ok(skip("not_restored", "quarantined_copy", Value::Null));
+        }
+        if self.exists(
+            "SELECT 1 FROM recovery_points WHERE universe_uuid = ?",
+            uuid,
+        )? {
+            return Ok(skip(
+                "not_restored",
+                "recovery_points_without_policy",
+                Value::Null,
+            ));
+        }
+        if let Err(error) = lc::reserved_store_gate(self.store, uuid, "boot_restore") {
+            return Ok(skip(
+                "not_restored",
+                "reservation_or_restore_claim",
+                json!({"error":error.to_string()}),
+            ));
+        }
+        for (table, state, reason) in [
+            (
+                "recovery_point_live_captures",
+                "dumping",
+                "interrupted_live_capture",
+            ),
+            (
+                "recovery_point_live_promote_attempts",
+                "launched",
+                "unfinished_live_promotion",
+            ),
+        ] {
+            for row in self.store.query(
+                &format!("SELECT operation_id FROM {table} WHERE universe_uuid = ? AND state = ?"),
+                &[Stored::from(uuid), Stored::from(state)],
+            )? {
+                let id = row.text(0)?;
+                if f.attempts
+                    .get(id)
+                    .map_or(true, |position| *position >= last.position)
+                {
+                    return Ok(skip(
+                        "not_restored",
+                        reason,
+                        json!({"operation_id":id, "settle":"retry that operation with a compatible implementation"}),
+                    ));
+                }
+            }
+        }
+        let state = lc::status(&c);
+        if !lc::STOPPED.contains(&state) {
+            return Ok(skip(
+                "not_restored",
+                format!("state_{state}"),
+                json!({"observed":lc::state_view(&c)}),
+            ));
+        }
+        Ok(Before::Start)
+    }
+
+}
+impl BootJournal for DurableBootJournal<'_> {
+    fn intents(&mut self) -> Result<BTreeMap<String, LastIntent>, Error> {
+        let attempts = self.attempts()?;
+        let mut intents: BTreeMap<String, LastIntent> = BTreeMap::new();
+        let mut record = |uuid: &str, intent: Intent, position: i64, operation: &str, id: &str| {
+            if intents
+                .get(uuid)
+                .map_or(true, |known| position > known.position)
+            {
+                intents.insert(
+                    uuid.to_string(),
+                    LastIntent {
+                        intent,
+                        position,
+                        operation: operation.to_string(),
+                        operation_id: id.to_string(),
+                    },
+                );
+            }
+        };
+        for (id, request, status, result) in self.operations()? {
+            let Some(&position) = attempts.get(&id) else {
+                continue;
+            };
+            let Ok(request) = serde_json::from_str::<Value>(&request) else {
+                continue;
+            };
+            let (Some(operation), Some(uuid)) = (
+                request["operation"].as_str(),
+                request["universe_uuid"].as_str(),
+            ) else {
+                continue;
+            };
+            let result = result.and_then(|r| serde_json::from_str::<Value>(&r).ok());
+            if let Some(intent) = classify(operation, &status, &request, result.as_ref()) {
+                record(uuid, intent, position, operation, &id);
+            }
+        }
+        for row in self.store.query("SELECT universe_uuid, operation_id FROM activation_lease_history WHERE event = 'fenced'", &[])? {
+            let (uuid, id) = (row.text(0)?, row.text(1)?);
+            if let Some(&position) = attempts.get(id) { record(uuid, Intent::NotRun, position, "activation_fence", id); }
+        }
+        Ok(intents)
+    }
+    fn facts(&mut self) -> Result<Facts, Error> {
+        let (boot, booted, clock) = boot_facts()?;
+        Ok(Facts {
+            boot,
+            booted,
+            names: container_names()?,
+            attempts: self.attempts()?,
+            clock,
+        })
+    }
+    fn before(&mut self, uuid: &str, last: &LastIntent, f: &Facts) -> Result<Before, Error> {
+        let name = format!("podmesh-{uuid}");
+        if !f.names.contains(&name) { return Ok(Before::Absent) }
+        let c = lc::inspect(&name)?.ok_or("Container disappeared during boot planning")?;
+        self.before_container(uuid, last, f, &c)
+    }
+    fn start_request(&mut self, id: &str, uuid: &str, authorization: &str) -> Result<Value, Error> {
+        Ok(
+            match self.store.query_one(
+                "SELECT request FROM operations WHERE id = ?",
+                &[Stored::from(id)],
+            )? {
+                Some(row) => serde_json::from_str(row.text(0)?)?,
+                None => {
+                    json!({"operation":"start", "operation_id":id, "universe_uuid":uuid, "authorization_ref":authorization, "observe_seconds":0})
+                }
+            },
+        )
+    }
+    fn start(&mut self, request: &Value) -> Result<Value, Error> {
+        lc::execute_store(self.store, request)
+    }
+    fn host_uuid(&mut self) -> Result<String, Error> {
+        Ok(self
+            .store
+            .query_one("SELECT value FROM metadata WHERE `key` = 'host_uuid'", &[])?
+            .ok_or("Missing host identity")?
+            .text(0)?
+            .to_string())
+    }
+    fn times(&mut self) -> Result<OperationTimes, Error> {
+        self.store.query("SELECT operation_id, MAX(started_at), MAX(finished_at) FROM operation_attempts GROUP BY operation_id", &[])?.into_iter()
+            .map(|r| Ok((r.text(0)?.to_string(), (r.value(1)?.integer(), r.value(2)?.integer())))).collect()
+    }
+    fn operations(&mut self) -> Result<Vec<OperationRow>, Error> {
+        self.store
+            .query("SELECT id, request, status, result FROM operations", &[])?
+            .into_iter()
+            .map(|r| {
+                Ok((
+                    r.text(0)?.to_string(),
+                    r.text(1)?.to_string(),
+                    r.text(2)?.to_string(),
+                    r.value(3)?.text().map(str::to_string),
+                ))
+            })
+            .collect()
+    }
+    fn start_status(&mut self, id: &str) -> Result<Option<String>, Error> {
+        Ok(self
+            .store
+            .query_one(
+                "SELECT status FROM operations WHERE id = ?",
+                &[Stored::from(id)],
+            )?
+            .map(|r| r.text(0).map(str::to_string))
+            .transpose()?)
+    }
+    fn activation(&mut self, uuid: &str) -> Result<(), Error> {
+        if self.exists(
+            "SELECT 1 FROM activation_policy WHERE universe_uuid = ?",
+            uuid,
+        )? {
+            return Err("durable boot restore refuses imported activation policies".into());
+        }
+        Ok(())
+    }
+}
+
+/// Bounded A10: isolated ungated boot return using the same pass/replay/observation semantics.
+pub fn execute_store(store: &mut dyn DurableStore, request: &Value) -> Result<Value, Error> {
+    let operation = lc::text(request, "operation")?;
+    if request.get("universe_uuid").is_some() {
+        return Err(format!(
+            "{operation} considers every universe of this host and takes no universe_uuid"
+        )
+        .into());
+    }
+    match operation {
+        "boot_restore_status" => status_managed(&mut DurableBootJournal { store }),
+        "boot_restore" => {
+            lc::text(request, "authorization_ref")?;
+            observe_seconds(request)?;
+            lc::journaled_store(store, request, |store| {
+                restore_managed(&mut DurableBootJournal { store }, request)
+            })
+        }
+        _ => Err("Unsupported boot restore operation".into()),
+    }
 }
 
 #[cfg(test)]
@@ -702,5 +1061,295 @@ mod tests {
         let intents = last_intents(&db).unwrap();
         assert_eq!((intents[U].intent, intents[U].operation.as_str()), (Intent::NotRun, "activation_fence"));
         assert_eq!(intents[V].intent, Intent::Run);
+    }
+}
+
+#[cfg(test)]
+mod durable_tests {
+    use super::*;
+    use crate::store::{migrations, SqliteStore};
+    const U: &str = "49a3baf4-0137-476e-b9c9-f471e5842c98";
+
+    fn seed(store: &mut dyn DurableStore, operation: &str, id: &str, status: &str) {
+        store.execute("INSERT INTO operations VALUES(?, ?, ?, NULL)", &[
+            Stored::from(id), Stored::from(json!({"operation":operation,"operation_id":id,"universe_uuid":U,"authorization_ref":"fixture"}).to_string()), Stored::from(status)
+        ]).unwrap();
+        store
+            .execute(
+                "INSERT INTO operation_attempts(operation_id, started_at) VALUES(?, 1)",
+                &[Stored::from(id)],
+            )
+            .unwrap();
+    }
+    fn journal() -> SqliteStore {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        migrations::apply(&mut store).unwrap();
+        store
+            .execute(
+                "INSERT INTO metadata VALUES('host_uuid', 'boot-host-fixture')",
+                &[],
+            )
+            .unwrap();
+        store
+    }
+    fn facts_for(attempts: HashMap<String, i64>) -> Facts {
+        Facts {
+            boot: "00000000-0000-4000-8000-000000000000".into(),
+            booted: Some(0),
+            names: HashSet::from([format!("podmesh-{U}")]),
+            attempts,
+            clock: Some(true),
+        }
+    }
+    fn stopped() -> Value {
+        json!({"State":{"Status":"exited","Running":false},"Config":{"Labels":{"io.podmesh.network-profile":"isolated"}}})
+    }
+    fn last() -> LastIntent {
+        LastIntent {
+            intent: Intent::Run,
+            position: 1,
+            operation: "start".into(),
+            operation_id: "initial-start".into(),
+        }
+    }
+
+    #[test]
+    fn durable_last_intents_match_sqlite_for_attempt_order_and_interruption() {
+        let mut store = journal();
+        seed(&mut store, "start", "initial-start", "verified");
+        seed(&mut store, "stop", "later-stop", "pending");
+        seed(&mut store, "start", "interrupted-start", "pending");
+        let legacy = last_intents(store.connection()).unwrap();
+        let durable = DurableBootJournal { store: &mut store }.intents().unwrap();
+        assert_eq!(legacy[U].intent, Intent::NotRun);
+        assert_eq!(legacy[U].intent, durable[U].intent);
+        assert_eq!(legacy[U].position, durable[U].position);
+        assert_eq!(durable[U].operation_id, "later-stop");
+        seed(&mut store, "resume", "later-resume", "verified");
+        assert_eq!(
+            DurableBootJournal { store: &mut store }.intents().unwrap()[U].intent,
+            Intent::Run
+        );
+        seed(&mut store, "activation_fence", "fence", "verified");
+        store.execute("INSERT INTO activation_lease_history(universe_uuid, holder_host_uuid, generation, event, `at`, operation_id) VALUES(?, 'fixture', 1, 'fenced', 2, 'fence')", &[Stored::from(U)]).unwrap();
+        let durable = DurableBootJournal { store: &mut store }.intents().unwrap();
+        assert_eq!(durable[U].intent, Intent::NotRun);
+        assert_eq!(durable[U].operation_id, "fence");
+    }
+
+    #[test]
+    fn imported_activation_policy_and_managed_network_never_grant_boot_leave() {
+        let mut store = journal();
+        let facts = facts_for(HashMap::new());
+        assert!(matches!(
+            DurableBootJournal { store: &mut store }
+                .before_container(U, &last(), &facts, &stopped())
+                .unwrap(),
+            Before::Start
+        ));
+        store.execute("INSERT INTO activation_policy(universe_uuid, lease_seconds, takeover_margin_seconds, declared_at, operation_id) VALUES(?, 60, 1, 0, 'policy')", &[Stored::from(U)]).unwrap();
+        let before = DurableBootJournal { store: &mut store }
+            .before_container(U, &last(), &facts, &stopped())
+            .unwrap();
+        assert!(matches!(
+            before,
+            Before::Skip {
+                decision: "not_restored",
+                ..
+            }
+        ));
+        store
+            .execute(
+                "DELETE FROM activation_policy WHERE universe_uuid = ?",
+                &[Stored::from(U)],
+            )
+            .unwrap();
+        let mut managed = stopped();
+        managed["Config"]["Labels"][crate::network::LABEL_PROFILE] =
+            json!(crate::network::PROFILE_MANAGED);
+        assert!(matches!(
+            DurableBootJournal { store: &mut store }
+                .before_container(U, &last(), &facts, &managed)
+                .unwrap(),
+            Before::Skip {
+                decision: "not_restored",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn durable_boot_refuses_reservations_claims_and_interrupted_captures() {
+        let mut store = journal();
+        let facts = facts_for(HashMap::new());
+        store.execute("INSERT INTO migration_reservations VALUES(?, 'move', 'container', 'image', 'source', 'destination', 'started', 'checkpointed', 0, 0, NULL)", &[Stored::from(U)]).unwrap();
+        assert!(matches!(DurableBootJournal {store:&mut store}.before_container(U, &last(), &facts, &stopped()).unwrap(), Before::Skip {decision:"not_restored", ..}));
+        store.execute("DELETE FROM migration_reservations WHERE universe_uuid = ?", &[Stored::from(U)]).unwrap();
+        store.execute("INSERT INTO migration_restore_claims(authorization_id, operation_id, universe_uuid, handoff, handoff_sha256, source_host_uuid, source_container_id, image_id, state, created_at, updated_at) VALUES('claim', 'restore', ?, '{}', 'hash', 'source', 'container', 'image', 'restore_failed', 0, 0)", &[Stored::from(U)]).unwrap();
+        assert!(matches!(DurableBootJournal {store:&mut store}.before_container(U, &last(), &facts, &stopped()).unwrap(), Before::Skip {decision:"not_restored", ..}));
+        store.execute("DELETE FROM migration_restore_claims WHERE universe_uuid = ?", &[Stored::from(U)]).unwrap();
+        store.execute("INSERT INTO recovery_point_live_captures VALUES('unresolved-capture', ?, 'container', 'point', 0, 'dumping', NULL)", &[Stored::from(U)]).unwrap();
+        assert!(matches!(DurableBootJournal {store:&mut store}.before_container(U, &last(), &facts, &stopped()).unwrap(), Before::Skip {decision:"not_restored", ..}));
+    }
+
+    // Controlled host observations exercise shared pass planning, persistence and replay without
+    // touching Podman. A real boot/start on a qualified host is a separate runtime proof.
+    struct Controlled<'a> {
+        store: &'a mut dyn DurableStore,
+    }
+    impl BootJournal for Controlled<'_> {
+        fn intents(&mut self) -> Result<BTreeMap<String, LastIntent>, Error> {
+            DurableBootJournal { store: self.store }.intents()
+        }
+        fn facts(&mut self) -> Result<Facts, Error> {
+            Ok(facts_for(
+                DurableBootJournal { store: self.store }.attempts()?,
+            ))
+        }
+        fn before(
+            &mut self,
+            uuid: &str,
+            last: &LastIntent,
+            facts: &Facts,
+        ) -> Result<Before, Error> {
+            DurableBootJournal { store: self.store }.before_container(uuid, last, facts, &stopped())
+        }
+        fn start_request(
+            &mut self,
+            id: &str,
+            uuid: &str,
+            authorization: &str,
+        ) -> Result<Value, Error> {
+            DurableBootJournal { store: self.store }.start_request(id, uuid, authorization)
+        }
+        fn start(&mut self, request: &Value) -> Result<Value, Error> {
+            lc::journaled_store_transaction(self.store, request, |_| Ok(json!({"started":true})))
+        }
+        fn host_uuid(&mut self) -> Result<String, Error> {
+            DurableBootJournal { store: self.store }.host_uuid()
+        }
+        fn times(&mut self) -> Result<OperationTimes, Error> {
+            DurableBootJournal { store: self.store }.times()
+        }
+        fn operations(&mut self) -> Result<Vec<OperationRow>, Error> {
+            DurableBootJournal { store: self.store }.operations()
+        }
+        fn start_status(&mut self, id: &str) -> Result<Option<String>, Error> {
+            DurableBootJournal { store: self.store }.start_status(id)
+        }
+        fn activation(&mut self, uuid: &str) -> Result<(), Error> {
+            DurableBootJournal { store: self.store }.activation(uuid)
+        }
+        fn observe(&mut self, _: &str) -> Result<Option<Value>, Error> {
+            Ok(Some(json!({"State":{"Status":"running","Running":true}})))
+        }
+    }
+    fn pass_round_trip(store: &mut dyn DurableStore) {
+        seed(store, "start", "initial-start", "verified");
+        let first = json!({"operation":"boot_restore","operation_id":"boot-pass-one","authorization_ref":"first-mandate","observe_seconds":0});
+        let second = json!({"operation":"boot_restore","operation_id":"boot-pass-two","authorization_ref":"second-mandate","observe_seconds":0});
+        let run = |store: &mut dyn DurableStore| restore_managed(&mut Controlled { store }, &first);
+        let result = lc::journaled_store(store, &first, run).unwrap();
+        assert_eq!(result["counts"]["restored"], 1);
+        let replay =
+            lc::journaled_store(store, &first, |_| panic!("verified pass must not execute"))
+                .unwrap();
+        assert_eq!(replay["replayed"], true);
+        let later = lc::journaled_store(store, &second, |store| {
+            restore_managed(&mut Controlled { store }, &second)
+        })
+        .unwrap();
+        assert_eq!(later["counts"]["restored_earlier_this_boot"], 1);
+        let id = start_operation_id("00000000-0000-4000-8000-000000000000", U);
+        let row = store
+            .query_one(
+                "SELECT request FROM operations WHERE id = ?",
+                &[Stored::from(&id)],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(row.text(0).unwrap()).unwrap()["authorization_ref"],
+            "first-mandate"
+        );
+        assert_eq!(
+            store
+                .query_one(
+                    "SELECT COUNT(*) FROM operation_attempts WHERE operation_id = ?",
+                    &[Stored::from(&id)]
+                )
+                .unwrap()
+                .unwrap()
+                .integer(0)
+                .unwrap(),
+            1
+        );
+        let before = store
+            .query_one("SELECT COUNT(*) FROM operation_attempts", &[])
+            .unwrap()
+            .unwrap()
+            .integer(0)
+            .unwrap();
+        let status = status_managed(&mut Controlled { store }).unwrap();
+        assert_eq!(status["plan"][0]["would"], "restored_earlier_this_boot");
+        assert_eq!(status["passes_this_boot"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            store
+                .query_one("SELECT COUNT(*) FROM operation_attempts", &[])
+                .unwrap()
+                .unwrap()
+                .integer(0)
+                .unwrap(),
+            before
+        );
+    }
+    #[test]
+    fn durable_pass_replay_and_same_boot_child_identity_survive_new_passes() {
+        pass_round_trip(&mut journal());
+    }
+    #[cfg(feature = "mariadb")]
+    #[test]
+    fn real_mariadb_boot_pass_journal_when_a_server_is_named() {
+        use crate::store::{MariadbConfig, MariadbStore};
+        let _serialized = crate::store::MARIADB_TEST_SERVER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(config) = MariadbConfig::from_environment() else {
+            eprintln!("skipped: PODMESH_MARIADB_DSN names no isolated test server");
+            return;
+        };
+        let mut store = MariadbStore::open(&config).expect("named MariaDB test server opens");
+        migrations::apply(&mut store).unwrap();
+        assert!(store.query_one("SELECT 1 FROM operations WHERE id IN ('initial-start', 'boot-pass-one', 'boot-pass-two')", &[]).unwrap().is_none(), "fresh isolated fixture required");
+        if store
+            .query_one("SELECT value FROM metadata WHERE `key`='host_uuid'", &[])
+            .unwrap()
+            .is_none()
+        {
+            store
+                .execute(
+                    "INSERT INTO metadata VALUES('host_uuid', 'boot-host-fixture')",
+                    &[],
+                )
+                .unwrap();
+        }
+        pass_round_trip(&mut store);
+        let child = start_operation_id("00000000-0000-4000-8000-000000000000", U);
+        for id in [
+            "initial-start",
+            "boot-pass-one",
+            "boot-pass-two",
+            child.as_str(),
+        ] {
+            store
+                .execute(
+                    "DELETE FROM operation_attempts WHERE operation_id = ?",
+                    &[Stored::from(id)],
+                )
+                .unwrap();
+            store
+                .execute("DELETE FROM operations WHERE id = ?", &[Stored::from(id)])
+                .unwrap();
+        }
     }
 }

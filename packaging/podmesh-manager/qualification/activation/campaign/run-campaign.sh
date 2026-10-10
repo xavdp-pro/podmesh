@@ -111,21 +111,10 @@ store_dir=\$(dirname -- "\$store")
 profile="\${PODMESH_STORE_PROFILE:-\$store_dir/store.json}"
 if [ -f "\$profile" ] && jq -e '(.store.engine // .engine) == "mariadb"' "\$profile" >/dev/null 2>&1; then
   cp -p -- "\$profile" "\$d/store.json"
-  db=\$(jq -er '.store.mariadb.database // .mariadb.database // .database' "\$profile")
-  passwd_file=\$(jq -r '.store.mariadb.password_file // .mariadb.password_file // empty' "\$profile")
-  [ -n "\$passwd_file" ] && [ -f "\$passwd_file" ] || passwd_file="\$store_dir/passwd"
-  [ -f "\$passwd_file" ] || { echo "MariaDB preserve: password file missing"; exit 1; }
-  if grep -qE '^\[(client|mysqldump)\]' "\$passwd_file"; then
-    mariadb-dump --defaults-extra-file="\$passwd_file" --single-transaction "\$db" > "\$d/manager-mariadb.sql"
-  else
-    host=\$(jq -r '.store.mariadb.host // .mariadb.host // "127.0.0.1"' "\$profile")
-    port=\$(jq -r '.store.mariadb.port // .mariadb.port // 3306' "\$profile")
-    user=\$(jq -r '.store.mariadb.user // .mariadb.user // "podmesh-manager"' "\$profile")
-    mariadb-dump -h"\$host" -P"\$port" -u"\$user" -p"\$(<"\$passwd_file")" --single-transaction "\$db" > "\$d/manager-mariadb.sql"
-  fi
+  python3 $A/dump-store.py --profile "\$profile" --output "\$d/manager-mariadb.sql"
   (cd "\$d" && sha256sum store.json manager-mariadb.sql > SHA256SUMS)
   w=\$(mktemp -d); cp -p -- "\$d/store.json" "\$w/store.json"
-  jq '.' /etc/podmesh-manager/config.json > "\$w/config.json"
+  jq --arg p "\$w/manager.sqlite" '.network.database_path=\$p' /etc/podmesh-manager/config.json > "\$w/config.json"
   chown -R podmesh-manager:podmesh-manager "\$w"; chmod 700 "\$w"; chmod 600 "\$w/config.json" "\$w/store.json"
   runuser -u podmesh-manager -- /usr/lib/podmesh-manager/podmesh-managerd --inspect-store --config "\$w/config.json" --state-dir "\$w" > $E/$a/derived-inspection.json
   rm -rf -- "\$w"
