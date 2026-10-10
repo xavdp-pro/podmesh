@@ -11,6 +11,7 @@ description = "Local Podman operations for human-agent tandems"
 mariadb = ["dep:mysql"]
 
 [dependencies]
+libc = "0.2"
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 # The MariaDB client, synchronous like the rest of this tree, without TLS or a C compression

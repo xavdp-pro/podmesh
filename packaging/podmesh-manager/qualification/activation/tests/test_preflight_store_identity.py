@@ -58,11 +58,54 @@ class PreflightStoreIdentityTests(unittest.TestCase):
                 "--managerd",
                 str(managerd),
             ]
-            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(sys, "argv", argv), mock.patch.object(
                 os, "geteuid", return_value=0
             ), mock.patch.object(self.module, "inspect_store") as inspect:
                 self.assertEqual(self.module.main(), 0)
                 inspect.assert_not_called()
+
+    def test_configured_store_is_inspected_without_a_sqlite_file(self):
+        # A MariaDB store has no SQLite sentinel. Invalid profiles and explicit
+        # overrides also must reach the resident's refusal instead of a false PASS.
+        for profile_kind in ("mariadb", "malformed", "override"):
+            with self.subTest(profile_kind=profile_kind), tempfile.TemporaryDirectory() as tmp:
+                state = Path(tmp) / "state"
+                state.mkdir()
+                config = Path(tmp) / "config.json"
+                config.write_text(json.dumps({"network": {
+                    "replica_id": "replica-a",
+                    "database_path": str(state / "manager.sqlite"),
+                    "manager": {
+                        "logical_manager_id": "logical",
+                        "replicas": [{"replica_id": "replica-a", "host_id": "host-a"}],
+                        "grants": [],
+                    },
+                }}))
+                managerd = Path(tmp) / "podmesh-managerd"
+                managerd.write_text("")
+                environment = {}
+                if profile_kind == "override":
+                    environment["PODMESH_STORE_PROFILE"] = str(Path(tmp) / "external.json")
+                else:
+                    (state / "store.json").write_text(
+                        '{"store":{"engine":"mariadb"}}' if profile_kind == "mariadb" else "{invalid"
+                    )
+                argv = ["preflight-store-identity.py", "--config", str(config),
+                        "--state-dir", str(state), "--managerd", str(managerd)]
+                responses = (
+                    (subprocess.CompletedProcess([], 1, "", "resident refused: identity_mismatch"), 1),
+                    (subprocess.CompletedProcess([], 0, json.dumps({
+                        "replica_id": "replica-a", "logical_manager_id": "logical"
+                    }), ""), 0),
+                )
+                for response, expected in responses:
+                    with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
+                        sys, "argv", argv
+                    ), mock.patch.object(os, "geteuid", return_value=0), mock.patch.object(
+                        self.module, "inspect_store", return_value=response
+                    ) as inspect, mock.patch("sys.stderr", new_callable=io.StringIO):
+                        self.assertEqual(self.module.main(), expected)
+                        inspect.assert_called_once_with(managerd, config, state)
 
     def test_identity_mismatch_refusal_message(self):
         with tempfile.TemporaryDirectory() as tmp:

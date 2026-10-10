@@ -10,8 +10,8 @@ use super::{
     receipt_digest, receipt_metadata_for_request, validate_local_configuration,
     validate_receipt_metadata, validate_receipt_operation_id, AuditDirection, AuditOutcome,
     AuditPhase, AuthenticatedImport, Configuration, DurableError, DurableResult, Executed,
-    ExchangeAuditEvent, ReceiptEvidence, ReceiptKind, ReceiptMetadata, Request, Response,
-    Snapshot, Store, StoreClosedState, StoreIntegrity, StoreIntegrityEntry, Topology,
+    ExchangeAuditEvent, ExchangeAuditEvidence, ReceiptEvidence, ReceiptKind, ReceiptMetadata, Request,
+    Response, Snapshot, Store, StoreClosedState, StoreIntegrity, StoreIntegrityEntry, Topology,
     VerifiedPositions,
 };
 #[cfg(feature = "mariadb")]
@@ -270,6 +270,7 @@ fn verify_stored_receipt(logical_manager_id: &str, receipt: &StoredReceipt) -> D
 }
 
 /// A manager journal opened from a store profile on MariaDB.
+#[cfg(feature = "mariadb")]
 pub struct MariaDbJournal {
     store: Box<dyn store::DurableStore>,
     configuration: Configuration,
@@ -278,6 +279,7 @@ pub struct MariaDbJournal {
     integrity: Arc<StoreIntegrityEntry>,
 }
 
+#[cfg(feature = "mariadb")]
 impl MariaDbJournal {
     /// Opens through [`podmesh::open_manager_store`] and binds identity for this replica.
     ///
@@ -337,6 +339,41 @@ impl MariaDbJournal {
         transaction.commit().map_err(store_error)?;
         integrity.record_full_verification(VerifiedPositions::default(), started, replace_positions)?;
         Ok(())
+    }
+
+    /// Allocates the same bounded, entropy-backed attempt identity as SQLite.
+    ///
+    /// # Errors
+    /// Refuses invalid nonces and clock/entropy faults.
+    pub fn new_attempt_id(&self, wire_nonce: &str) -> DurableResult<String> {
+        super::allocate_attempt_id(&self.replica_id, wire_nonce)
+    }
+
+    /// Persists a non-import exchange phase on this private MariaDB journal.
+    ///
+    /// # Errors
+    /// Refuses invalid audit/receipt bindings, corruption and failed commits.
+    pub fn record_exchange_audit(
+        &mut self,
+        audit: &ExchangeAuditEvent,
+    ) -> DurableResult<ExchangeAuditEvidence> {
+        self.integrity.refuse_if_failed()?;
+        if audit.phase == AuditPhase::InboundImportCommitted {
+            return Err(DurableError::InvalidAudit(
+                "inbound import audit must use the atomic authenticated-import API".into(),
+            ));
+        }
+        let mut transaction = self.store.transaction().map_err(store_error)?;
+        let evidence = journal_audit::insert_audit(
+            transaction.as_mut(),
+            &self.topology,
+            &self.replica_id,
+            audit,
+            false,
+        )
+        .map_err(|problem| self.integrity.fail_closed_if_corrupt(problem))?;
+        transaction.commit().map_err(store_error)?;
+        Ok(evidence)
     }
 
     /// Applies one laboratory request in a single durable transaction.
@@ -568,6 +605,33 @@ impl ConfiguredStore {
         let profile = podmesh::resolve_manager_store_profile(profile_dir, sqlite_database_path)
             .map_err(|problem| DurableError::Storage(problem.to_string()))?;
         Self::open(&profile, sqlite_database_path, configuration, replica_id)
+    }
+
+    /// Allocates an exchange attempt on the selected backend without opening another store.
+    ///
+    /// # Errors
+    /// Refuses invalid nonces and clock/entropy faults.
+    pub fn new_attempt_id(&self, wire_nonce: &str) -> DurableResult<String> {
+        match self {
+            Self::Sqlite(store) => store.new_attempt_id(wire_nonce),
+            #[cfg(feature = "mariadb")]
+            Self::MariaDb(store) => store.new_attempt_id(wire_nonce),
+        }
+    }
+
+    /// Records an exchange phase in the same journal as facts and receipts.
+    ///
+    /// # Errors
+    /// Refuses invalid audit evidence and store faults.
+    pub fn record_exchange_audit(
+        &mut self,
+        audit: &ExchangeAuditEvent,
+    ) -> DurableResult<ExchangeAuditEvidence> {
+        match self {
+            Self::Sqlite(store) => store.record_exchange_audit(audit),
+            #[cfg(feature = "mariadb")]
+            Self::MariaDb(store) => store.record_exchange_audit(audit),
+        }
     }
 
     /// Applies one laboratory request.

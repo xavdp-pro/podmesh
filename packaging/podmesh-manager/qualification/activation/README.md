@@ -74,6 +74,21 @@ incident analysis rather than being reclassified as a failed start.
 The durable store and protected configuration are never removed. Configuration
 transition is a separate prerequisite under config-transition/.
 
+Store identity is established by inspecting the configured backend. An absent
+legacy SQLite path proves a fresh store only when no store profile is named;
+MariaDB profiles must still be inspected and refused on identity mismatch.
+Inspection never bootstraps or upgrades a MariaDB journal: absent, older or newer
+schema versions and incomplete cutovers refuse without applying migrations.
+When deriving inspection from a temporary configuration, its `network.database_path`
+must remain a direct child of the declared temporary state directory, including
+for MariaDB. A MariaDB-derived inspection reads the configured server at rest;
+it does not prove that the preserved SQL dump restores into an empty instance.
+MariaDB capture uses the configured socket when present, otherwise the configured
+TCP endpoint. Credentials travel through the client environment, never process
+arguments. A failing or empty dump leaves the prior completed artifact intact
+and removes its partial output. Restoration still requires an independent empty
+private instance and integrity/content checks.
+
 ## Four evidence stages
 
 ### Version contract

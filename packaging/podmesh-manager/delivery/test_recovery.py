@@ -1,0 +1,1055 @@
+"""Bounded filesystem regressions; never invoke host providers.
+
+The GNU tar roundtrip is intentional. All other tests use local temporary data
+and reject any subprocess. Use an explicitly designated isolated test host.
+"""
+import copy
+import importlib.util
+import io
+import json
+import os
+import socket
+import sqlite3
+from pathlib import Path
+import subprocess
+import tarfile
+import tempfile
+import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("manager_native_recovery", HERE / "recovery.py")
+recovery = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(recovery)
+
+
+class RealEngineLayoutTests(unittest.TestCase):
+    """Require a private isolated copy of real engine metadata, never a live root.
+
+    The fixture host reconstructs only metadata and payload/volume directories
+    from a stopped capture, preserving root path bindings and original bytes.
+    No private application inputs, image layer bytes or provider calls are needed.
+    """
+    def fixture(self):
+        descriptor = Path(os.environ["PODMESH_ENGINE_LAYOUT_FIXTURE"])
+        obj = json.loads(descriptor.read_text())
+        self.assertTrue(obj["isolated_metadata_copy"])
+        self.assertEqual(obj["version"], "5.4.2")
+        root = Path(obj["root"])
+        self.assertTrue(root.is_absolute())
+        return root, obj
+
+    def check(self, phase="stopped"):
+        root, obj = self.fixture()
+        layout = recovery.closed_graphroot(root, set(obj["images"]), set(obj["containers"]),
+            set(obj["volumes"]), obj["version"], obj["pod"], "sqlite", obj["infra"], phase=phase)
+        if phase == "stopped":
+            recovery.closed_runtime(root, set(obj["containers"]), obj["version"])
+        return layout
+
+    def test_real_running_ipc_preflight_requires_exact_shape_and_stopped_absence(self):
+        root, obj = self.fixture()
+        before = recovery.tree(root)
+        directories = [root / "graphroot/vfs-containers" / identifier / "userdata"
+                       for identifier in obj["containers"]]
+        timestamps = {path: (path.stat().st_atime_ns, path.stat().st_mtime_ns) for path in directories}
+        sockets, created = [], []
+        try:
+            for directory in directories:
+                # Bind through the directory fd: the real absolute path exceeds
+                # the UNIX socket path limit. No listener, connection or IO.
+                descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    sockets.append(channel)
+                    channel.bind("/proc/self/fd/" + str(descriptor) + "/attach")
+                finally:
+                    os.close(descriptor)
+                attach = directory / "attach"
+                created.append(attach)
+                attach.chmod(0o700)
+                for name in ("ctl", "winsz"):
+                    path = directory / name
+                    os.mkfifo(path, 0o640)
+                    created.append(path)
+                    path.chmod(0o640)
+            with patch.object(subprocess, "run", side_effect=AssertionError("provider forbidden")):
+                self.check("running-preflight")
+                with self.assertRaisesRegex(ValueError, "unmapped container userdata"):
+                    self.check()
+                path = directories[0] / "ctl"
+                path.chmod(0o666)
+                with self.assertRaisesRegex(ValueError, "running container IPC metadata"):
+                    self.check("running-preflight")
+                path.chmod(0o640)
+                path.unlink()
+                path.write_bytes(b"foreign-state")
+                path.chmod(0o640)
+                with self.assertRaisesRegex(ValueError, "running container IPC metadata"):
+                    self.check("running-preflight")
+                path.unlink()
+                path.symlink_to(root / "graphroot/db.sql")
+                with self.assertRaisesRegex(ValueError, "running container IPC metadata"):
+                    self.check("running-preflight")
+                path.unlink()
+                os.mkfifo(path, 0o640)
+                path.chmod(0o640)
+                with tempfile.TemporaryDirectory(dir=root.parent) as temporary:
+                    os.link(path, Path(temporary) / "foreign-link")
+                    with self.assertRaisesRegex(ValueError, "running container IPC metadata"):
+                        self.check("running-preflight")
+                unknown = directories[0] / "foreign-ipc"
+                os.mkfifo(unknown, 0o640)
+                created.append(unknown)
+                with self.assertRaisesRegex(ValueError, "unmapped container userdata"):
+                    self.check("running-preflight")
+        finally:
+            for channel in sockets:
+                channel.close()
+            for path in created:
+                if path.exists() or path.is_symlink():
+                    path.unlink()
+            for path, times in timestamps.items():
+                os.utime(path, ns=times, follow_symlinks=False)
+        self.assertEqual(recovery.tree(root), before)
+        self.check()
+
+    def test_real_stopped_sqlite_graphroot_and_runtime_pass_without_rewriting(self):
+        root, obj = self.fixture()
+        before = recovery.tree(root)
+        with patch.object(subprocess, "run", side_effect=AssertionError("provider forbidden")):
+            result = self.check()
+        self.assertEqual(result["engine_sqlite"]["sha256"], obj["database_sha256"])
+        self.assertEqual(result["engine_secrets"], "empty-lock-only")
+        self.assertEqual(result["engine_database_backend"], "sqlite")
+        self.assertEqual(recovery.tree(root), before)
+
+    def test_real_engine_database_unknown_schema_resource_and_sidecar_refuse(self):
+        root, obj = self.fixture()
+        database = root / "graphroot/db.sql"
+        original = database.read_bytes()
+        try:
+            for statement in ("CREATE TABLE foreign_state(value TEXT)",
+                              "INSERT INTO IDNamespace VALUES ('" + "f" * 64 + "')"):
+                try:
+                    with sqlite3.connect(database) as connection:
+                        connection.execute(statement)
+                    connection.close()
+                    with self.assertRaisesRegex(ValueError, "schema|resource identity"):
+                        self.check()
+                finally:
+                    database.write_bytes(original)
+            sidecar = database.with_name("db.sql-wal")
+            sidecar.write_bytes(b"preserve-unknown-sidecar")
+            try:
+                with self.assertRaisesRegex(ValueError, "sidecar|graphroot component"):
+                    self.check()
+            finally:
+                sidecar.unlink()
+        finally:
+            database.write_bytes(original)
+        self.assertEqual(recovery.digest(database), obj["database_sha256"])
+
+    def test_real_empty_secrets_unknown_runtime_and_oci_mount_refuse(self):
+        root, obj = self.fixture()
+        secret = root / "graphroot/secrets/secrets.json"
+        secret.write_bytes(b"{}")
+        try:
+            with self.assertRaisesRegex(ValueError, "secret store"):
+                self.check()
+        finally:
+            secret.unlink()
+        unknown = root / "tmp/persist/foreign-state"
+        unknown.write_bytes(b"preserve")
+        try:
+            with self.assertRaisesRegex(ValueError, "exit records"):
+                self.check()
+        finally:
+            unknown.unlink()
+        configuration = next((root / "graphroot/vfs-containers").glob("*/userdata/config.json"))
+        original = configuration.read_bytes()
+        try:
+            config = json.loads(original)
+            config["mounts"].append({"type": "bind", "source": "/foreign/private", "destination": "/foreign"})
+            configuration.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, "OCI bookkeeping mount"):
+                self.check()
+        finally:
+            configuration.write_bytes(original)
+
+    def test_real_empty_volatile_metadata_nonempty_and_symlink_refuse(self):
+        root, obj = self.fixture()
+        for name in ("vfs-containers/volatile-containers.json", "vfs-layers/volatile-layers.json"):
+            path = root / "graphroot" / name
+            original, mode = path.read_bytes(), path.stat().st_mode & 0o777
+            self.assertEqual(original, b"[]")
+            try:
+                path.write_bytes(b'[{"id":"foreign"}]')
+                with self.assertRaisesRegex(ValueError, "volatile VFS state"):
+                    self.check()
+                path.unlink()
+                path.symlink_to(root / "graphroot/db.sql")
+                with self.assertRaisesRegex(ValueError, "volatile VFS state"):
+                    self.check()
+            finally:
+                if path.is_symlink():
+                    path.unlink()
+                path.write_bytes(original)
+                path.chmod(mode)
+        self.check()
+
+    def test_real_unsigned_image_unknown_metadata_and_signature_state_refuse(self):
+        root, obj = self.fixture()
+        path = root / "graphroot/vfs-images/images.json"
+        original = path.read_bytes()
+        try:
+            for state in ({"unknown-state": True}, {"signatures-sizes": {"foreign": [1]}}):
+                rows = json.loads(original)
+                rows[0]["metadata"] = json.dumps(state)
+                path.write_text(json.dumps(rows))
+                with self.assertRaisesRegex(ValueError, "image metadata/signature state"):
+                    self.check()
+            rows = json.loads(original)
+            self.assertEqual(json.loads(rows[0]["metadata"]), {})
+            rows[0]["big-data-names"].append("signature-" + rows[0]["digest"].removeprefix("sha256:"))
+            path.write_text(json.dumps(rows))
+            with self.assertRaisesRegex(ValueError, "image metadata/signature state"):
+                self.check()
+        finally:
+            path.write_bytes(original)
+        self.check()
+
+    def test_real_boot_identity_and_empty_lock_refuse_unclassified_state(self):
+        root, obj = self.fixture()
+        before = recovery.tree(root)
+        alive, lock = root / "tmp/alive", root / "tmp/alive.lck"
+        timestamps = {path: (path.stat().st_atime_ns, path.stat().st_mtime_ns)
+                      for path in (alive, lock, alive.parent)}
+        original = alive.read_bytes()
+        self.assertEqual(len(original), 37)
+        self.assertEqual(lock.read_bytes(), b"")
+        self.check()
+        try:
+            for value in (b"", original[:-1], original.upper(), b"x" * 36 + b"\n",
+                          original + b"foreign-state"):
+                alive.write_bytes(value)
+                with self.assertRaisesRegex(ValueError, "boot identity metadata"):
+                    self.check()
+            alive.write_bytes(original)
+            alive.chmod(0o666)
+            with self.assertRaisesRegex(ValueError, "liveness metadata"):
+                self.check()
+            alive.chmod(0o644)
+            alive.unlink()
+            alive.symlink_to(root / "graphroot/db.sql")
+            with self.assertRaisesRegex(ValueError, "liveness metadata"):
+                self.check()
+            alive.unlink()
+            alive.write_bytes(original)
+            alive.chmod(0o644)
+            with tempfile.TemporaryDirectory() as temporary:
+                os.link(alive, Path(temporary) / "boot-marker-link")
+                with self.assertRaisesRegex(ValueError, "liveness metadata"):
+                    self.check()
+            lock.write_bytes(b"foreign-state")
+            with self.assertRaisesRegex(ValueError, "liveness metadata"):
+                self.check()
+        finally:
+            if alive.is_symlink():
+                alive.unlink()
+            alive.write_bytes(original)
+            alive.chmod(0o644)
+            lock.write_bytes(b"")
+            # Replacing the symlink also changes its parent's directory mtime.
+            # Restore all metadata changed by this test before exact comparison.
+            for path, times in timestamps.items():
+                os.utime(path, ns=times, follow_symlinks=False)
+        self.assertEqual(recovery.tree(root), before)
+        self.check()
+
+    def test_real_nullable_sql_infra_requires_exact_json_observed_identity_and_role(self):
+        root, obj = self.fixture()
+        database = root / "graphroot/db.sql"
+        original = database.read_bytes()
+        connection = sqlite3.connect(database)
+        try:
+            column, encoded = connection.execute("SELECT InfraContainerID,JSON FROM PodState").fetchone()
+        finally:
+            connection.close()
+        self.assertIsNone(column)
+        state = json.loads(encoded)
+        self.assertEqual(state["InfraContainerID"], obj["infra"])
+        self.check()
+        noninfra = next(identifier for identifier in obj["containers"] if identifier != obj["infra"])
+        try:
+            for value in (None, "f" * 64, noninfra):
+                changed = dict(state, InfraContainerID=value)
+                connection = sqlite3.connect(database)
+                try:
+                    connection.execute("UPDATE PodState SET JSON=?", (json.dumps(changed),))
+                    connection.commit()
+                finally:
+                    connection.close()
+                try:
+                    with self.assertRaisesRegex(ValueError, "infra container identity"):
+                        self.check()
+                finally:
+                    database.write_bytes(original)
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute("UPDATE PodState SET InfraContainerID=?", (noninfra,))
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(ValueError, "infra container identity"):
+                self.check()
+            database.write_bytes(original)
+            connection = sqlite3.connect(database)
+            try:
+                encoded = connection.execute("SELECT JSON FROM ContainerConfig WHERE ID=?", (obj["infra"],)).fetchone()[0]
+                config = dict(json.loads(encoded), pause=False)
+                connection.execute("UPDATE ContainerConfig SET JSON=? WHERE ID=?", (json.dumps(config), obj["infra"]))
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(ValueError, "infra container role"):
+                self.check()
+        finally:
+            database.write_bytes(original)
+        self.assertEqual(recovery.digest(database), obj["database_sha256"])
+        self.check()
+
+
+class RealPreparedTargetTests(unittest.TestCase):
+    """Require an isolated copy of a native never-started target's metadata."""
+    def fixture(self):
+        obj = json.loads(Path(os.environ["PODMESH_PREPARED_TARGET_FIXTURE"]).read_text())
+        self.assertTrue(obj["isolated_metadata_copy"])
+        self.assertEqual(obj["version"], "5.4.2")
+        root = Path(obj["root"])
+        self.assertTrue(root.is_absolute())
+        self.assertFalse((root / "graphroot/secrets").exists())
+        return root, obj
+
+    def check(self, root, obj, phase="prepared-target", observations=None, backend="sqlite", version="5.4.2"):
+        return recovery.closed_graphroot(root, set(obj["images"]), set(obj["containers"]),
+            set(obj["volumes"]), version, obj["pod"], backend, obj["infra"], phase=phase,
+            prepared_observations=obj["observations"] if observations is None else observations)
+
+    def test_native_never_started_target_allows_absent_lazy_secret_store_only_in_prepared_phase(self):
+        root, obj = self.fixture()
+        before = recovery.tree(root)
+        with patch.object(subprocess, "run", side_effect=AssertionError("provider forbidden")):
+            result = self.check(root, obj)
+            self.assertEqual(result["engine_secrets"], "absent")
+            self.assertEqual(result["engine_sqlite"]["sha256"], obj["database_sha256"])
+            for phase in ("stopped", "running-preflight"):
+                with self.assertRaisesRegex(ValueError, "secret-lock store missing"):
+                    self.check(root, obj, phase)
+            for backend, version in (("boltdb", "5.4.2"), ("sqlite", "5.4.3")):
+                with self.assertRaisesRegex(ValueError, "prepared target engine"):
+                    self.check(root, obj, backend=backend, version=version)
+            with self.assertRaisesRegex(ValueError, "observed container identities"):
+                self.check(root, obj, observations=[])
+            for field, value in (("Status", "exited"), ("Pid", 7), ("Running", True),
+                                 ("StartedAt", "2026-01-01T00:00:00Z"), ("FinishedAt", None),
+                                 ("RestoredAt", "2026-01-01T00:00:00Z")):
+                observations = copy.deepcopy(obj["observations"])
+                observations[0]["State"][field] = value
+                with self.assertRaisesRegex(ValueError, "observed container has lifecycle history"):
+                    self.check(root, obj, observations=observations)
+        self.assertEqual(recovery.tree(root), before)
+
+    def test_native_prepared_target_sql_history_secret_dependency_and_unclassified_store_refuse(self):
+        root, obj = self.fixture()
+        before = recovery.tree(root)
+        graph = root / "graphroot"
+        graph_times = (graph.stat().st_atime_ns, graph.stat().st_mtime_ns)
+        database = root / "graphroot/db.sql"
+        original = database.read_bytes()
+        times = (database.stat().st_atime_ns, database.stat().st_mtime_ns)
+        identifier = obj["containers"][0]
+        try:
+            for field, value in (("state", 5), ("pid", 7), ("conmonPid", 8),
+                                 ("startedTime", "2026-01-01T00:00:00Z"), ("finishedTime", None)):
+                with sqlite3.connect(database) as connection:
+                    encoded = connection.execute("SELECT JSON FROM ContainerState WHERE ID=?", (identifier,)).fetchone()[0]
+                    state = dict(json.loads(encoded), **{field: value})
+                    connection.execute("UPDATE ContainerState SET JSON=? WHERE ID=?", (json.dumps(state), identifier))
+                connection.close()
+                with self.assertRaisesRegex(ValueError, "SQLite container has lifecycle history"):
+                    self.check(root, obj)
+                database.write_bytes(original)
+            for field in ("State", "ExitCode"):
+                with sqlite3.connect(database) as connection:
+                    connection.execute("UPDATE ContainerState SET " + field + "=? WHERE ID=?", (9, identifier))
+                connection.close()
+                with self.assertRaisesRegex(ValueError, "SQLite container has lifecycle history"):
+                    self.check(root, obj)
+                database.write_bytes(original)
+            with sqlite3.connect(database) as connection:
+                encoded = connection.execute("SELECT JSON FROM ContainerConfig WHERE ID=?", (identifier,)).fetchone()[0]
+                config = dict(json.loads(encoded), secrets=[{"Name": "unclassified"}])
+                connection.execute("UPDATE ContainerConfig SET JSON=? WHERE ID=?", (json.dumps(config), identifier))
+            connection.close()
+            with self.assertRaisesRegex(ValueError, "secret dependency"):
+                self.check(root, obj)
+        finally:
+            database.write_bytes(original)
+            os.utime(database, ns=times)
+        secrets = graph / "secrets"
+        try:
+            secrets.symlink_to(database)
+            with self.assertRaisesRegex(ValueError, "secret store"):
+                self.check(root, obj)
+            secrets.unlink()
+            secrets.mkdir(mode=0o700)
+            (secrets / "secrets.json").write_bytes(b"{}")
+            with self.assertRaisesRegex(ValueError, "secret store"):
+                self.check(root, obj)
+        finally:
+            if secrets.is_symlink():
+                secrets.unlink()
+            elif secrets.exists():
+                (secrets / "secrets.json").unlink()
+                secrets.rmdir()
+            os.utime(graph, ns=graph_times)
+        self.assertEqual(recovery.tree(root), before)
+        self.check(root, obj)
+
+
+class RealWritableScaffoldingTests(unittest.TestCase):
+    """Use a private copy of actual stopped /etc trees and engine JSON only."""
+    def fixture(self):
+        obj = json.loads(Path(os.environ["PODMESH_WRITABLE_SCAFFOLD_FIXTURE"]).read_text())
+        self.assertTrue(obj["isolated_metadata_copy"])
+        self.assertEqual(obj["version"], "5.4.2")
+        root = Path(obj["root"])
+        self.assertTrue(root.is_absolute())
+        diffs = {role: recovery.cli_diff_rows(value, obj["version"]) for role, value in obj["diffs"].items()}
+        return root, obj, diffs
+
+    def proof(self, rows=None, replacements=None):
+        root, obj, diffs = self.fixture()
+        rows = recovery.tree(root) if rows is None else rows
+        replacements = replacements or {}
+        return recovery.writable_scaffolding(rows,
+            lambda name: replacements[name] if name in replacements else (root / name).read_bytes(),
+            root, obj["bindings"], diffs, obj["version"])
+
+    def test_actual_etc_scaffolding_preserves_all_rows_and_refuses_mutations(self):
+        root, obj, diffs = self.fixture()
+        rows = recovery.tree(root)
+        with patch.object(subprocess, "run", side_effect=AssertionError("provider forbidden")):
+            proof = self.proof(rows)
+            self.assertEqual(set(proof), {"app", "db", "infra"})
+            self.assertEqual((rows["app-config"]["uid"], rows["app-config"]["gid"], rows["app-config"]["mode"]),
+                             (1103, 1103, 0o700))
+            changed = copy.deepcopy(rows)
+            changed["app-config"].update(uid=0, gid=0)
+            with self.assertRaisesRegex(ValueError, "etc mount source unavailable"):
+                self.proof(changed)
+            self.assertEqual(proof["infra"]["image_etc_entries"], 0)
+            self.assertEqual(proof["infra"]["container_etc_entries"], 5)
+            for role, changes in diffs.items():
+                self.assertEqual(len(changes), sum(len(group) for group in obj["diffs"][role].values()))
+                self.assertEqual(recovery.safe_diff(changes, role, proof[role]), changes)
+                with self.assertRaises(ValueError):
+                    recovery.safe_diff(changes, role)
+            for role in ("app", "db"):
+                prefix = "graphroot/vfs/dir/" + proof[role]["writable_layer"] + "/etc"
+                ordinary = next(name for name, row in rows.items()
+                                if name.startswith(prefix + "/") and row["kind"] == "file")
+                changed = copy.deepcopy(rows)
+                changed[ordinary]["sha256"] = "0" * 64
+                with self.assertRaisesRegex(ValueError, "durable etc"):
+                    self.proof(changed)
+                changed = copy.deepcopy(rows)
+                changed[prefix]["xattrs"] = {"user.foreign": "eA=="}
+                with self.assertRaisesRegex(ValueError, "durable etc"):
+                    self.proof(changed)
+                changed = copy.deepcopy(rows)
+                changed[prefix + "/mtab"]["link"] = "/foreign/mounts"
+                with self.assertRaisesRegex(ValueError, "mount table"):
+                    self.proof(changed)
+            prefix = "graphroot/vfs/dir/" + proof["infra"]["writable_layer"] + "/etc"
+            changed = copy.deepcopy(rows)
+            changed[prefix + "/hosts"]["size"] = 1
+            with self.assertRaisesRegex(ValueError, "mount placeholder"):
+                self.proof(changed)
+            changed = copy.deepcopy(rows)
+            changed[prefix + "/foreign"] = dict(changed[prefix + "/mtab"])
+            with self.assertRaisesRegex(ValueError, "added etc directory"):
+                self.proof(changed)
+            name = "graphroot/vfs-containers/" + proof["app"]["container_id"] + "/userdata/config.json"
+            config = json.loads((root / name).read_bytes())
+            next(m for m in config["mounts"] if m["destination"] == "/etc/hosts")["source"] = "/foreign/hosts"
+            raw = json.dumps(config).encode()
+            changed = copy.deepcopy(rows)
+            changed[name].update(size=len(raw), sha256=recovery.hashlib.sha256(raw).hexdigest())
+            with self.assertRaisesRegex(ValueError, "etc mount binding"):
+                self.proof(changed, {name: raw})
+        self.assertEqual(recovery.tree(root), rows)
+
+    def test_sealed_v3_regenerates_scaffolding_and_refuses_proof_or_json_tampering(self):
+        root, obj, diffs = self.fixture()
+        before = recovery.tree(root)
+        proof = self.proof(before)
+        receipt = {"scope": root.name, "bundle": "isolated-fixture", "machine_id": "fixture",
+                   "replica_id": "fixture", "app": obj["bindings"]["app"]["Id"],
+                   "db": obj["bindings"]["db"]["Id"], "pod": obj["pod"]["Id"]}
+        components = {"containers": obj["bindings"], "pod": obj["pod"],
+                      "storage_layout": {"engine_version": obj["version"]}}
+        generated = {"instance.json": json.dumps(receipt).encode(),
+                     "recovery-components.json": json.dumps(components).encode()}
+        rows = copy.deepcopy(before)
+        for name, raw in generated.items():
+            rows[name] = {"kind": "file", "mode": 0o600, "uid": 0, "gid": 0, "mtime_ns": 0,
+                          "xattrs": {}, "size": len(raw), "sha256": recovery.hashlib.sha256(raw).hexdigest(),
+                          "extents": [[0, len(raw)]], "hardlink": name}
+        api = SimpleNamespace(BASE=root.parent, protected=lambda path, mode: self.assertEqual(path.stat().st_mode & 0o777, mode))
+        with tempfile.TemporaryDirectory(dir=root.parent) as temporary:
+            capture = Path(temporary)
+            with tarfile.open(capture / "source-full.tar", "w", format=tarfile.PAX_FORMAT) as archive:
+                for name in sorted(before):
+                    if name not in generated:
+                        archive.add(root / name, arcname=root.name if name == "." else root.name + "/" + name,
+                                    recursive=False)
+                for name, raw in generated.items():
+                    member = tarfile.TarInfo(root.name + "/" + name)
+                    member.size, member.mode = len(raw), 0o600
+                    archive.addfile(member, io.BytesIO(raw))
+            (capture / "store.sql").write_bytes(b"isolated data-only load test")
+            for name in ("source-full.tar", "store.sql"):
+                (capture / name).chmod(0o600)
+            manifest = {"type": "manager-full-capture/v3", "capture_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                        **{key: receipt[key] for key in ("scope", "bundle", "machine_id", "replica_id")},
+                        "receipt": receipt, "receipt_sha256": rows["instance.json"]["sha256"],
+                        "archive_sha256": recovery.digest(capture / "source-full.tar"),
+                        "sql_sha256": recovery.digest(capture / "store.sql"), "tree": rows,
+                        "volume_paths": {}, "image_files": {}, "writable_layers": diffs,
+                        "writable_scaffolding": proof, "sql_identity": {"historical_uncertainty":
+                            {"type": "manager-historical-uncertainty/v1", "attempts": [], "audit_events": []}}}
+            path = capture / "capture.json"
+            def save(value):
+                path.write_text(json.dumps(value))
+                path.chmod(0o600)
+            save(manifest)
+            self.assertEqual(recovery.load_capture(capture, api), manifest)
+            changed = copy.deepcopy(manifest)
+            changed["writable_scaffolding"]["app"]["image_etc_sha256"] = "0" * 64
+            save(changed)
+            with self.assertRaisesRegex(ValueError, "scaffolding proof differs"):
+                recovery.load_capture(capture, api)
+            changed = copy.deepcopy(manifest)
+            name = "graphroot/vfs-containers/" + proof["app"]["container_id"] + "/userdata/config.json"
+            changed["tree"][name]["sha256"] = "0" * 64
+            save(changed)
+            with self.assertRaisesRegex(ValueError, "hash differs"):
+                recovery.load_capture(capture, api)
+        self.assertEqual(recovery.tree(root), before)
+
+
+class RecoveryTests(unittest.TestCase):
+    def test_unprepared_version_probe_is_neutral_only_and_configured_probe_remains_private(self):
+        instance = SimpleNamespace(podman=lambda *args: SimpleNamespace(stdout=b"podman version 5.4.2\n"))
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "absent-target"
+            calls = []
+            def recorder(args, **kwargs):
+                calls.append((args, kwargs))
+                self.assertEqual(args, ["/usr/bin/podman", "--version"])
+                self.assertEqual(kwargs["env"], {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+                                                "HOME": "/root", "LANG": "C.UTF-8"})
+                self.assertFalse(target.exists())
+                return SimpleNamespace(returncode=0, stdout=b"podman version 5.4.2\n")
+            with patch.object(subprocess, "run", side_effect=recorder):
+                self.assertEqual(recovery.engine_version(instance, bootstrap=True), "5.4.2")
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(target.exists())
+            with patch.object(subprocess, "run", side_effect=AssertionError("unconfigured command forbidden")):
+                self.assertEqual(recovery.engine_version(instance), "5.4.2")
+            for result in (SimpleNamespace(returncode=1, stdout=b""),
+                           SimpleNamespace(returncode=0, stdout=b"unknown engine\n")):
+                with patch.object(subprocess, "run", return_value=result):
+                    with self.assertRaises(ValueError):
+                        recovery.engine_version(instance, bootstrap=True)
+
+    def test_extraction_only_resume_requires_exact_tree_absent_target_and_no_later_members(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            stage, target, capture = base / "stage", base / "target", base / "capture"
+            stage.mkdir(mode=0o700)
+            original = stage / "source"
+            original.mkdir(mode=0o700)
+            payload = original / "preserved"
+            payload.write_bytes(b"immutable source copy")
+            payload.chmod(0o600)
+            capture.mkdir(mode=0o700)
+            (capture / "capture.json").write_bytes(b"sealed test manifest")
+            rows = recovery.tree(original)
+            manifest = {"tree": rows, "scope": "source"}
+            api = SimpleNamespace(protected=lambda path, mode: self.assertEqual(path.stat().st_mode & 0o777, mode))
+            enough = SimpleNamespace(free=2 * recovery.validate_tree(rows) + 256 * 1024 ** 2)
+            with patch.object(recovery, "restore_archive", side_effect=AssertionError("must not reextract")), \
+                 patch.object(recovery.shutil, "disk_usage", return_value=enough):
+                path, proof = recovery.extracted_source_stage(stage, target, manifest, capture, api)
+                self.assertEqual(path, original)
+                self.assertEqual(proof["source_tree_sha256"], recovery.row_hash(rows))
+                self.assertEqual(recovery.tree(original), rows)
+                target.mkdir()
+                with self.assertRaisesRegex(ValueError, "target must remain absent"):
+                    recovery.extracted_source_stage(stage, target, manifest, capture, api)
+                target.rmdir()
+                later = stage / "configuration"
+                later.write_bytes(b"later checkpoint")
+                with self.assertRaisesRegex(ValueError, "extraction-only"):
+                    recovery.extracted_source_stage(stage, target, manifest, capture, api)
+                later.unlink()
+                payload.write_bytes(b"changed source copy")
+                with self.assertRaisesRegex(ValueError, "checkpoint differs"):
+                    recovery.extracted_source_stage(stage, target, manifest, capture, api)
+
+    def test_exact_original_ff_capsule_corrective_binding_and_payload_drift_refusal(self):
+        directory = Path(os.environ["PODMESH_CORRECTIVE_SOURCE_CAPSULE"])
+        source = json.loads((directory / "bundle.json").read_text())
+        target = copy.deepcopy(source)
+        target["bundle"] = "6ba91890a8ff-corrective-fixture"
+        target["payload_sha256"]["recovery.py"] = recovery.digest(HERE / "recovery.py")
+        target["payload_sha256"]["README.md"] = recovery.digest(HERE / "README.md")
+        manifest = {"type": "manager-full-capture/v3", "bundle": source["bundle"],
+                    "capture_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+        def protect(path, mode=None):
+            item = path.lstat()
+            self.assertFalse(path.is_symlink())
+            self.assertEqual(item.st_uid, 0)
+            self.assertFalse(item.st_mode & 0o022)
+        original, lineage = recovery.corrective_capture_binding(manifest, target,
+            directory.parent / target["bundle"], protect)
+        self.assertEqual(original, source)
+        self.assertEqual(lineage["mode"], "verified-ff236c-corrective-rebind")
+        self.assertFalse(lineage["source_receipt_mutated"])
+        for name in ("instance.py", "podmesh-managerd", "application.oci.tar", "database.oci.tar"):
+            changed = copy.deepcopy(target)
+            changed["payload_sha256"][name] = "0" * 64
+            with self.assertRaisesRegex(ValueError, "executable payload differs"):
+                recovery.corrective_capsule_fields(source, changed)
+        changed = copy.deepcopy(source)
+        changed["recipe_revision"] = "0" * 40
+        with self.assertRaisesRegex(ValueError, "unsupported corrective source"):
+            recovery.corrective_capsule_fields(changed, target)
+        changed = copy.deepcopy(source)
+        changed["payload_sha256"]["recovery.py"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "unsupported corrective source"):
+            recovery.corrective_capsule_fields(changed, target)
+        changed = copy.deepcopy(target)
+        changed["application_image"] = "sha256:" + "0" * 64
+        with self.assertRaisesRegex(ValueError, "runtime payload identity differs"):
+            recovery.corrective_capsule_fields(source, changed)
+        changed = dict(manifest, type="manager-full-capture/v2")
+        with self.assertRaisesRegex(ValueError, "unsupported corrective capture"):
+            recovery.corrective_capture_binding(changed, target, directory.parent / target["bundle"], protect)
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            capsule = parent / source["bundle"]
+            capsule.mkdir(mode=0o700)
+            (capsule / "bundle.json").write_text(json.dumps(source))
+            (capsule / "bundle.json").chmod(0o600)
+            first = next(iter(source["payload_sha256"]))
+            (capsule / first).write_bytes(b"tampered original payload")
+            (capsule / first).chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "original corrective capsule payload changed"):
+                recovery.corrective_capture_binding(manifest, target, parent / target["bundle"], protect)
+
+    def test_oracle_uses_durable_migration_marker_not_legacy_history_version(self):
+        instance = SimpleNamespace(prefix="owned", r={"replica_id": "original"})
+        def results(candidate, statement):
+            self.assertIs(candidate, instance)
+            if statement.startswith("SELECT CURRENT_USER()"):
+                return "podmesh-manager@%\tpodmesh-manager\towned-db\n"
+            if statement == "SHOW TABLES;":
+                return "\n".join(recovery.TABLES) + "\n"
+            if "information_schema.TRIGGERS" in statement:
+                return "8\n"
+            if "information_schema.ROUTINES" in statement:
+                return "0\n0\n"
+            if statement.startswith("SELECT version FROM store_schema"):
+                return marker + "\n"
+            if statement.startswith("SELECT replica_id FROM identity"):
+                return "original\n"
+            if statement == "SHOW GRANTS FOR CURRENT_USER;":
+                return "GRANT ALL PRIVILEGES ON `podmesh-manager`.* TO `podmesh-manager`@`%`\n"
+            self.fail("unexpected oracle SQL")
+        marker = "1"
+        with patch.object(recovery, "query", side_effect=results), patch.object(
+                recovery, "inspect_quiescent_store", return_value={"incomplete_attempts": [], "ordered_audit_events": []}):
+            self.assertEqual(recovery.oracle(instance)["tables"], recovery.TABLES)
+            marker = "3"
+            with self.assertRaisesRegex(ValueError, "DurableStore migration version"):
+                recovery.oracle(instance)
+
+    def uncertainty(self):
+        # Shape returned by the product's canonical validator, not a replacement
+        # validation machine. Include all inbound prefix classes, not just replies.
+        attempts, rows = [], []
+        for direction, phase in (("outbound", "outbound_request_prepared"),
+                                 ("inbound", "inbound_request_observed"),
+                                 ("inbound", "inbound_import_committed"),
+                                 ("inbound", "inbound_refusal_recorded"),
+                                 ("inbound", "inbound_reply_prepared")):
+            identifier = "attempt:" + phase
+            attempts.append({"direction": direction, "attempt_id": identifier,
+                             "wire_nonce": "nonce-" + phase, "wire_operation_id": None, "last_phase": phase})
+            rows.append({"event": {"audit_event_id": "audit-" + phase, "direction": direction,
+                                   "attempt_id": identifier, "phase": phase}, "sha256": "a" * 64})
+        return {"incomplete_attempts": attempts, "ordered_audit_events": rows}
+
+    def test_uncertainty_retains_exact_canonical_attempts_and_all_prefix_evidence(self):
+        inspection = self.uncertainty()
+        # A multi-row prefix must retain every predecessor, not just its last row.
+        predecessor = copy.deepcopy(inspection["ordered_audit_events"][-1])
+        predecessor["event"]["audit_event_id"] = "predecessor"
+        predecessor["event"]["phase"] = "inbound_request_observed"
+        inspection["ordered_audit_events"].append(predecessor)
+        inventory = recovery.uncertainty_inventory(inspection)
+        self.assertEqual(len(inventory["attempts"]), 5)
+        self.assertEqual(len(inventory["audit_events"]), 6)
+        self.assertEqual(set(row["sha256"] for row in inventory["audit_events"]), {"a" * 64})
+        recovery.same_uncertainty(inventory, copy.deepcopy(inventory))
+
+    def test_uncertainty_refuses_loss_alteration_addition_and_synthetic_completion(self):
+        original = recovery.uncertainty_inventory(self.uncertainty())
+        lost = copy.deepcopy(original)
+        lost["attempts"].pop()
+        altered = copy.deepcopy(original)
+        altered["audit_events"][0]["sha256"] = "b" * 64
+        added = copy.deepcopy(original)
+        added["attempts"].append({"attempt_id": "new"})
+        completed = {"type": original["type"], "attempts": [], "audit_events": []}
+        for candidate in (lost, altered, added, completed):
+            with self.subTest(candidate=candidate), self.assertRaisesRegex(ValueError, "uncertainty lost, altered or added"):
+                recovery.same_uncertainty(original, candidate)
+
+    def test_uncertainty_refuses_duplicate_or_missing_canonical_evidence(self):
+        inspection = self.uncertainty()
+        inspection["incomplete_attempts"].append(inspection["incomplete_attempts"][0])
+        with self.assertRaisesRegex(ValueError, "duplicate canonical"):
+            recovery.uncertainty_inventory(inspection)
+        inspection = self.uncertainty()
+        inspection["ordered_audit_events"].pop()
+        with self.assertRaisesRegex(ValueError, "lacks audit evidence"):
+            recovery.uncertainty_inventory(inspection)
+
+    def test_canonical_recovery_inspection_refuses_live_app_before_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            instance = SimpleNamespace(root=Path(directory), check_container=lambda role:
+                {"State": {"Running": True, "Pid": 42, "ExitCode": 0}},
+                podman=lambda *args, **kwargs: self.fail("live APP must prevent provider call"))
+            with self.assertRaisesRegex(ValueError, "quiescent clean APP"):
+                recovery.inspect_quiescent_store(instance)
+
+    def test_canonical_recovery_inspection_reuses_exact_image_read_only_and_propagates_invalid_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            calls = []
+            inspection = dict(self.uncertainty(), replica_id="original")
+            def provider(*args, **kwargs):
+                calls.append(args)
+                return SimpleNamespace(stdout=json.dumps(inspection).encode())
+            instance = SimpleNamespace(root=Path(directory), prefix="owned", scope="scope",
+                r={"bundle": "immutable", "pod": "own-pod", "replica_id": "original"},
+                manifest={"application_image": "sha256:" + "a" * 64},
+                check_container=lambda role: {"State": {"Running": False, "Pid": 0, "ExitCode": 0}},
+                inspect=lambda *args: None, podman=provider)
+            self.assertEqual(recovery.inspect_quiescent_store(instance), inspection)
+            command = calls[0]
+            for argument in ("--rm", "--user=1103:1103", "--read-only", "--inspect-store",
+                             "owned-app:/var/lib/podmesh-manager:ro", "own-pod", instance.manifest["application_image"]):
+                self.assertIn(argument, command)
+            def invalid(*args, **kwargs):
+                raise ValueError("canonical store corrupt: invalid audit prefix")
+            instance.podman = invalid
+            with self.assertRaisesRegex(ValueError, "invalid audit prefix"):
+                recovery.inspect_quiescent_store(instance)
+
+    def test_engine_version_provenance_does_not_substitute_for_schema_validation(self):
+        calls = []
+        def provider(*args):
+            calls.append(args)
+            self.assertEqual(args, ("--version",))
+            return SimpleNamespace(stdout=b"podman version 5.4.2\n")
+        self.assertEqual(recovery.engine_version(SimpleNamespace(podman=provider)), "5.4.2")
+        self.assertEqual(calls, [("--version",)])
+
+    def inputs(self, root):
+        for directory, files in (("app-config", ("config.json", "store.json", "passwd")),
+                                 ("db-admin", ("passwd",)), ("api", ()), ("r", ()), ("tmp", ())):
+            (root / directory).mkdir()
+            for name in files:
+                (root / directory / name).write_bytes(b"owned-input")
+
+    def graph(self, root):
+        graph = root / "graphroot"
+        graph.mkdir()
+        ids = {"images": "a" * 64, "containers": "b" * 64, "layers": "c" * 64}
+        for kind in ids:
+            directory = graph / ("vfs-" + kind)
+            directory.mkdir()
+            row = {"id": ids[kind]}
+            if kind != "layers":
+                row["layer"] = "d" * 64 if kind == "containers" else ids["layers"]
+            if kind == "containers":
+                row["image"] = ids["images"]
+            rows = [row]
+            if kind == "layers":
+                rows.append({"id": "d" * 64, "parent": ids["layers"]})
+            (directory / (kind + ".json")).write_text(json.dumps(rows))
+            if kind == "images":
+                (directory / ids[kind]).mkdir()
+            if kind == "containers":
+                (directory / ids[kind] / "userdata").mkdir(parents=True)
+        (graph / "vfs" / "dir" / ids["layers"]).mkdir(parents=True)
+        (graph / "vfs" / "dir" / ("d" * 64)).mkdir()
+        (graph / "volumes" / "own-app" / "_data").mkdir(parents=True)
+        (graph / "libpod").mkdir()
+        return graph, ids
+
+    def test_extra_configuration_rejected_without_process(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(subprocess, "run", side_effect=AssertionError("process")):
+            root = Path(directory)
+            self.inputs(root)
+            recovery.closed_inputs(root, stopped=True)
+            (root / "app-config" / "extra-state.json").write_text("durable")
+            with self.assertRaisesRegex(ValueError, "unmapped"):
+                recovery.closed_inputs(root)
+
+    def test_unknown_root_and_stopped_transient_file_refuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.inputs(root)
+            unknown = root / "unknown-durable-state"
+            unknown.write_text("preserve")
+            with self.assertRaises(ValueError):
+                recovery.closed_inputs(root)
+            unknown.unlink()
+            (root / "tmp" / "unknown-state").write_text("preserve")
+            with self.assertRaises(ValueError):
+                recovery.closed_runtime(root, set())
+
+    def test_foreign_graphroot_and_unknown_layer_refuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            graph, ids = self.graph(root)
+            check = lambda: recovery.closed_graphroot(root, {ids["images"]}, {ids["containers"]}, {"own-app"})
+            check()
+            (graph / "unmapped-durable-file").write_text("durable")
+            with self.assertRaisesRegex(ValueError, "unmapped"):
+                check()
+            (graph / "unmapped-durable-file").unlink()
+            path = graph / "vfs-layers/layers.json"
+            rows = json.loads(path.read_text())
+            rows.append({"id": "e" * 64})
+            path.write_text(json.dumps(rows))
+            with self.assertRaisesRegex(ValueError, "unmapped durable VFS layer"):
+                check()
+
+    def test_external_metadata_symlink_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            graph, ids = self.graph(root)
+            path = graph / "vfs-images/images.json"
+            path.unlink()
+            path.symlink_to("/etc/passwd")
+            with self.assertRaises(ValueError):
+                recovery.closed_graphroot(root, {ids["images"]}, {ids["containers"]}, {"own-app"})
+
+    def test_durable_writable_layer_has_no_sql_only_fallback(self):
+        recovery.safe_diff([{"Path": "/run/mysqld", "Kind": 1}], "db")
+        for role, path in (("db", "/etc/extra-state"), ("app", "/tmp/state"), ("infra", "/run/state")):
+            with self.assertRaises(ValueError):
+                recovery.safe_diff([{"Path": path, "Kind": 1}], role)
+
+    def test_native_cli_diff_groups_preserve_every_path_kind_and_durable_refusal(self):
+        for role in ("app", "db", "infra"):
+            self.assertEqual(recovery.cli_writable_diff(json.loads('{}\n'), role, "5.4.2"), [])
+        native = {"changed": ["/run", "/tmp/repeated"],
+                  "added": ["/run/mysqld", "/tmp/repeated"], "deleted": ["/var/tmp/old"]}
+        expected = [{"Path": "/run", "Kind": 0}, {"Path": "/tmp/repeated", "Kind": 0},
+                    {"Path": "/run/mysqld", "Kind": 1}, {"Path": "/tmp/repeated", "Kind": 1},
+                    {"Path": "/var/tmp/old", "Kind": 2}]
+        original = copy.deepcopy(native)
+        self.assertEqual(recovery.cli_writable_diff(native, "db", "5.4.2"), expected)
+        self.assertEqual(native, original)
+        self.assertEqual(recovery.safe_diff(expected, "db"), expected)
+        # The sealed manifest still requires canonical lists, never CLI objects.
+        with self.assertRaisesRegex(ValueError, "inventory unavailable"):
+            recovery.safe_diff(native, "db")
+        for group in ("changed", "added", "deleted"):
+            for role, path in (("app", "/tmp/state"), ("infra", "/run/state"),
+                               ("db", "/etc/extra-state"), ("db", "/var/lib/mysql/state")):
+                with self.assertRaisesRegex(ValueError, "unmapped"):
+                    recovery.cli_writable_diff({group: [path]}, role, "5.4.2")
+            for path in ("relative", "/run/../etc/state"):
+                with self.assertRaisesRegex(ValueError, "invalid writable layer path"):
+                    recovery.cli_writable_diff({group: [path]}, "db", "5.4.2")
+        for malformed in (None, [], "", {"foreign": []}, {"added": None},
+                          {"changed": "/run"}, {"deleted": [None]}, {"added": [{}]}):
+            with self.assertRaisesRegex(ValueError, "unclassified engine writable layer JSON"):
+                recovery.cli_writable_diff(malformed, "db", "5.4.2")
+        with self.assertRaisesRegex(ValueError, "inventory unavailable"):
+            recovery.cli_writable_diff({}, "db", "4.3.1")
+
+    def test_original_scope_owner_required(self):
+        config = {"network": {"manager": {"grants": [{"scope": "custom/source", "owner_replica_id": "original"}]}}}
+        previous = {"request": {"scope": "custom/source"}}
+        self.assertEqual(recovery.observation_scope(config, "original", previous), "custom/source")
+        with self.assertRaises(ValueError):
+            recovery.observation_scope(config, "different", previous)
+
+    def test_all_five_histories_preserved(self):
+        original = {table: ["original-" + table] for table in recovery.TABLES}
+        extended = copy.deepcopy(original)
+        for table in ("facts", "receipts", "exchange_audit_events"):
+            extended[table].append("new-" + table)
+        recovery.preserved_rows(original, extended)
+        for table in recovery.TABLES:
+            damaged = copy.deepcopy(extended)
+            damaged[table].remove("original-" + table)
+            with self.assertRaises(ValueError):
+                recovery.preserved_rows(original, damaged)
+
+    def test_captured_operation_cannot_be_used_as_fresh_nominal(self):
+        original = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        fresh = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        snapshot = {"receipts": [json.dumps([original, "observe", None, None, "request", "response", "hash"]).encode().hex()]}
+        recovery.absent_operation(snapshot, fresh)
+        with self.assertRaises(ValueError):
+            recovery.absent_operation(snapshot, original)
+
+    def test_every_peer_and_fresh_ack_required(self):
+        peers = {"p1", "p2"}
+        status = {"catch_up": {"caught_up": True, "caught_up_by": "every_peer", "peers_matched": list(peers)},
+                  "peers": {peer: {"authenticated_successes": 2, "last_success_age_ms": 1,
+                            "acknowledged_unchanged": True, "outcome": "authenticated_import_receipt",
+                            "acknowledged_history_len": 4, "local_history_len_at_attempt": 4,
+                            "history_count_delta": 0} for peer in peers}}
+        recovery.peer_complete(status, peers, 4, {peer: 1 for peer in peers})
+        status["catch_up"]["caught_up_by"] = "window"
+        with self.assertRaises(ValueError):
+            recovery.peer_complete(status, peers)
+        status["catch_up"]["caught_up_by"] = "every_peer"
+        status["peers"]["p2"]["authenticated_successes"] = 1
+        with self.assertRaises(ValueError):
+            recovery.peer_complete(status, peers, 4, {peer: 1 for peer in peers})
+
+    def test_gnu_tar_first_link_differs_from_manifest_anchor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = parent / "source"
+            root.mkdir()
+            (root / "z/deep").mkdir(parents=True)
+            # Explicit tar ordering emits z/deep/data before its lexical anchor a.
+            data = root / "z/deep/data"
+            with data.open("wb") as stream:
+                stream.seek(1024 * 1024)
+                stream.write(b"sparse-durable")
+            os.link(data, root / "a")
+            os.setxattr(data, "user.recovery", b"metadata")
+            (root / "alias").symlink_to("a")
+            rows = recovery.tree(root)
+            archive = parent / "source.tar"
+            subprocess.run(["/usr/bin/tar", "--format=pax", "--xattrs", "--acls", "--sparse", "--numeric-owner",
+                            "--no-recursion", "-cpf", str(archive), "-C", str(parent), "source", "source/z",
+                            "source/z/deep", "source/z/deep/data", "source/a", "source/alias"], check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            with tarfile.open(archive) as handle:
+                self.assertTrue(handle.getmember("source/a").islnk())
+                self.assertEqual(handle.getmember("source/a").linkname, "source/z/deep/data")
+            target = parent / "target"
+            target.mkdir()
+            recovery.restore_archive(archive, rows, "source", target)
+            self.assertEqual(recovery.tree(target), rows)
+            self.assertEqual((target / "a").stat().st_ino, (target / "z/deep/data").stat().st_ino)
+
+    def test_external_hardlink_and_manifest_traversal_refuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = parent / "root"
+            root.mkdir()
+            outside = parent / "outside"
+            outside.write_text("external")
+            os.link(outside, root / "alias")
+            with self.assertRaises(ValueError):
+                recovery.tree(root)
+            (root / "alias").unlink()
+            rows = recovery.tree(root)
+            rows["../outside"] = copy.deepcopy(rows["."])
+            with self.assertRaises(ValueError):
+                recovery.validate_tree(rows)
+
+    def test_manifest_missing_parent_and_inconsistent_hardlink_metadata_refuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "a").write_bytes(b"owned")
+            os.link(root / "a", root / "z")
+            rows = recovery.tree(root)
+            recovery.validate_tree(rows)
+            inconsistent = copy.deepcopy(rows)
+            inconsistent["z"]["mode"] ^= 0o100
+            with self.assertRaises(ValueError):
+                recovery.validate_tree(inconsistent)
+            missing = copy.deepcopy(rows)
+            missing["absent/child"] = copy.deepcopy(rows["."])
+            with self.assertRaises(ValueError):
+                recovery.validate_tree(missing)
+
+    def test_duplicate_and_outside_archive_members_refuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = parent / "source"
+            root.mkdir()
+            (root / "data").write_bytes(b"owned")
+            rows = recovery.tree(root)
+            for kind in ("duplicate", "outside", "foreign-hardlink"):
+                archive = parent / (kind + ".tar")
+                with tarfile.open(archive, "w") as handle:
+                    handle.add(root, arcname="source")
+                    member = tarfile.TarInfo("../escape" if kind == "outside" else "source/data")
+                    if kind == "foreign-hardlink":
+                        # Replace data with an outside link in an otherwise complete archive.
+                        member.name = "source/extra"
+                        rows_extra = copy.deepcopy(rows)
+                        rows_extra["extra"] = copy.deepcopy(rows["data"])
+                        member.type = tarfile.LNKTYPE
+                        member.linkname = "outside/data"
+                        handle.addfile(member)
+                    else:
+                        member.size = 5
+                        handle.addfile(member, io.BytesIO(b"owned"))
+                target = parent / kind
+                target.mkdir()
+                with self.assertRaises(ValueError):
+                    recovery.restore_archive(archive, rows_extra if kind == "foreign-hardlink" else rows, "source", target)
+                self.assertEqual(list(target.iterdir()), [])
+
+    def test_both_new_receipts_must_link_to_prepared_requests(self):
+        events = []
+        for peer in ("p1", "p2"):
+            prepared = {"audit_event_id": "prepared-" + peer, "attempt_id": peer,
+                        "phase": "outbound_request_prepared", "direction": "outbound",
+                        "wire_nonce": peer, "request_sha256": "a" * 64}
+            completed = {**prepared, "audit_event_id": "completed-" + peer,
+                         "phase": "outbound_exchange_completed", "outcome": "accepted",
+                         "authenticated_peer_id": peer, "remote_receipt_operation_id": "remote-" + peer,
+                         "remote_receipt_sha256": "b" * 64}
+            events.extend((prepared, completed))
+        self.assertEqual(set(recovery.linked_peer_receipts(events, set(), {"p1", "p2"})), {"p1", "p2"})
+        with self.assertRaises(ValueError):
+            recovery.linked_peer_receipts(events, {"completed-p2"}, {"p1", "p2"})
+        events[-1]["request_sha256"] = "c" * 64
+        with self.assertRaises(ValueError):
+            recovery.linked_peer_receipts(events, set(), {"p1", "p2"})
+
+
+if __name__ == "__main__":
+    unittest.main()

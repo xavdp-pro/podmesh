@@ -2070,13 +2070,19 @@ fn a_witness_the_hypervisor_does_not_answer_for_is_refused() {
         .unwrap_err();
     assert_eq!(absent.code, ledger::GENERATION_WITNESS_UNTRUSTED);
 
-    // A file the kernel answers for is accepted. Any sysfs path proves the filesystem test; the
-    // deployed witness is QEMU's `fw_cfg` item, which lives on the same filesystem.
+    // The pathname alone grants no trust: LXC may expose it through FUSE/LXCFS.
+    // Assert the actual filesystem gate, including the refusal on that terrain.
     let sysfs = std::path::Path::new("/sys/devices/system/cpu/online");
-    if sysfs.exists() {
-        signer
-            .watch_generation(sysfs.to_path_buf(), &guarded)
-            .expect("sysfs is a filesystem the hypervisor answers for");
+    match rustix::fs::statfs(sysfs) {
+        Ok(filesystem) if filesystem.f_type == 0x6265_6572 => {
+            signer.watch_generation(sysfs.to_path_buf(), &guarded)
+                .expect("a native sysfs path passes filesystem trust");
+        }
+        terrain => {
+            assert_eq!(signer.watch_generation(sysfs.to_path_buf(), &guarded).unwrap_err().code,
+                ledger::GENERATION_WITNESS_UNTRUSTED);
+            eprintln!("generation witness terrain {terrain:?}: refusal verified; native sysfs positive proof requires a native/VM fixture");
+        }
     }
 }
 
@@ -2165,16 +2171,19 @@ fn a_witness_is_one_of_two_forms_and_nothing_else() {
         "generation_identity_unreadable"
     );
 
-    // Sysfs is the filesystem, not the item. A sysfs file that is not a generation item passes the
-    // filesystem test and is refused when it is read, which is where the two checks divide.
+    // A native sysfs file passes filesystem trust but is not necessarily a generation item.
+    // A FUSE/LXCFS overlay must refuse at trust, before considering its contents.
     let sysfs = std::path::Path::new("/sys/devices/system/cpu/online");
-    if sysfs.exists() {
-        ledger::trust_generation_witness(sysfs).expect("sysfs is a filesystem worth reading again");
-        assert_eq!(
-            code(crate::votes::generation_id_from(sysfs)),
-            "generation_identity_unreadable",
-            "and it is still not a generation item"
-        );
+    match rustix::fs::statfs(sysfs) {
+        Ok(filesystem) if filesystem.f_type == 0x6265_6572 => {
+            ledger::trust_generation_witness(sysfs).expect("native sysfs is worth reading again");
+            assert_eq!(code(crate::votes::generation_id_from(sysfs)), "generation_identity_unreadable",
+                "a CPU list still is not a generation item");
+        }
+        terrain => {
+            assert_eq!(code(ledger::trust_generation_witness(sysfs)), ledger::GENERATION_WITNESS_UNTRUSTED);
+            eprintln!("generation witness terrain {terrain:?}: refusal verified; native sysfs positive proof requires a native/VM fixture");
+        }
     }
 }
 

@@ -358,6 +358,35 @@ fn load_audits_transaction(
 }
 
 #[cfg(feature = "mariadb")]
+fn open_mariadb_for_inspection(
+    profile: &StoreConfig,
+) -> DurableResult<Box<dyn store::DurableStore>> {
+    profile.validate().map_err(store_error)?;
+    // Inspection must never bootstrap or upgrade the store. In particular, opening
+    // an empty instance must leave it empty even when inspection is refused.
+    let mut opened = store::open(profile).map_err(store_error)?;
+    if !opened
+        .tables()
+        .map_err(store_error)?
+        .iter()
+        .any(|table| table == store::SCHEMA_TABLE)
+    {
+        return Err(DurableError::Refused(
+            super::RefusalReason::UnsupportedSchema,
+        ));
+    }
+    if schema_version(opened.as_mut(), migrations::MANAGER).map_err(store_error)?
+        != Some(migrations::manager_version())
+    {
+        return Err(DurableError::Refused(
+            super::RefusalReason::UnsupportedSchema,
+        ));
+    }
+    migrations::refuse_incomplete_manager_cutover(opened.as_mut()).map_err(store_error)?;
+    Ok(opened)
+}
+
+#[cfg(feature = "mariadb")]
 fn inspect_mariadb_read_only(
     profile: &StoreConfig,
     configuration: &Configuration,
@@ -367,21 +396,7 @@ fn inspect_mariadb_read_only(
         .validate()
         .map_err(|problem| DurableError::Storage(problem.to_string()))?;
     let topology = validate_local_configuration(configuration, replica_id)?;
-    let opened = podmesh::open_manager_store(profile)
-        .map_err(|problem| DurableError::Storage(problem.to_string()))?;
-    let mut store = match opened.into_journal() {
-        podmesh::ManagerJournal::Durable(store) => store,
-        podmesh::ManagerJournal::Sqlite(_) => {
-            return Err(DurableError::Storage(
-                "manager store profile named sqlite; use a file path instead".into(),
-            ));
-        }
-    };
-    let version = schema_version(store.as_mut(), migrations::MANAGER)
-        .map_err(|problem| DurableError::Storage(problem.to_string()))?;
-    if version != Some(migrations::manager_version()) {
-        return Err(DurableError::Refused(super::RefusalReason::UnsupportedSchema));
-    }
+    let mut store = open_mariadb_for_inspection(profile)?;
     let integrity = store
         .integrity_check()
         .map_err(|problem| DurableError::Storage(problem.to_string()))?;
@@ -419,21 +434,7 @@ fn inspect_mariadb_facts_read_only(
         .validate()
         .map_err(|problem| DurableError::Storage(problem.to_string()))?;
     let topology = validate_local_configuration(configuration, replica_id)?;
-    let opened = podmesh::open_manager_store(profile)
-        .map_err(|problem| DurableError::Storage(problem.to_string()))?;
-    let mut store = match opened.into_journal() {
-        podmesh::ManagerJournal::Durable(store) => store,
-        podmesh::ManagerJournal::Sqlite(_) => {
-            return Err(DurableError::Storage(
-                "manager store profile named sqlite; use a file path instead".into(),
-            ));
-        }
-    };
-    let version = schema_version(store.as_mut(), migrations::MANAGER)
-        .map_err(|problem| DurableError::Storage(problem.to_string()))?;
-    if version != Some(migrations::manager_version()) {
-        return Err(DurableError::Refused(super::RefusalReason::UnsupportedSchema));
-    }
+    let mut store = open_mariadb_for_inspection(profile)?;
     let mut transaction = store.transaction().map_err(store_error)?;
     begin_mariadb_inspection(transaction.as_mut(), &topology, replica_id)?;
     let replica = load_replica_transaction(transaction.as_mut(), &topology, replica_id)?;

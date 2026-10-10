@@ -21,9 +21,8 @@ use hmac::{Hmac, Mac};
 use podmesh_manager_ha_lab::durable::{
     authenticated_import_receipt_id, AuditDirection, AuditErrorCategory, AuditOutcome, AuditPhase,
     Configuration, DurableError, ExchangeAuditEvent, RefusalReason, Request, Response, Snapshot,
-    Store,
 };
-use podmesh_manager_ha_lab::Fact;
+use podmesh_manager_ha_lab::{ConfiguredStore, Fact};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -36,7 +35,7 @@ pub const MAX_FRAME_BYTES: usize = 512 * 1024;
 pub const IO_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum connections admitted while seeking one authenticated request.
 pub const MAX_CONNECTIONS_PER_PROCESS: usize = 8;
-/// Maximum local configuration JSON size, read before parsing or opening SQLite.
+/// Maximum local configuration JSON size, read before parsing or opening the configured journal.
 pub const MAX_CONFIGURATION_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,8 +120,16 @@ impl ConfigurationFile {
     /// Returns a refusal on invalid static configuration or durable-store failure.
     pub fn open(&self) -> Result<Node, Error> {
         self.validate()?;
-        let store = Store::open(&self.database_path, self.manager.clone(), &self.replica_id)
-            .map_err(Error::durable)?;
+        let profile_dir = self.database_path.parent().ok_or_else(|| {
+            Error::refused("database path has no parent directory for store profile")
+        })?;
+        let store = ConfiguredStore::open_resolved(
+            profile_dir,
+            &self.database_path,
+            self.manager.clone(),
+            &self.replica_id,
+        )
+        .map_err(Error::durable)?;
         Ok(Node {
             replica_id: self.replica_id.clone(),
             configuration: self.manager.clone(),
@@ -142,7 +149,7 @@ pub struct Node {
     configuration: Configuration,
     bind: SocketAddr,
     peers: Vec<Peer>,
-    store: Store,
+    store: ConfiguredStore,
     audit_failure_phase: Option<AuditPhase>,
     #[cfg(test)]
     post_auth_failure: Option<PostAuthFailure>,
@@ -3701,6 +3708,16 @@ mod tests {
         assert_eq!(error.category(), ErrorCategory::Unavailable);
         assert_eq!(error.source(), ErrorSource::Local);
         assert!(error.connection_attempted());
+        let audit = inspection(&r1);
+        assert_eq!(audit.audit_event_count, 2, "connect refusal must persist its terminal: {error}");
+        assert!(audit.incomplete_attempts.is_empty());
+        let terminal = audit.ordered_audit_events.iter().find(|evidence| {
+            evidence.event.phase == AuditPhase::OutboundExchangeCompleted
+        }).unwrap();
+        assert_eq!(terminal.event.outcome, AuditOutcome::Unavailable);
+        assert_eq!(terminal.event.reason_code, Some(RefusalReason::TransportUnavailable));
+        assert_eq!(terminal.event.request_frame_bytes, 0);
+        assert_eq!(terminal.event.reply_frame_bytes, 0);
     }
 
     #[test]

@@ -18,8 +18,10 @@ within its declared loss when a host is lost for good, with the guarantees state
 - **V1** A node restarts its universes from its own journal after a reboot or a service restart, without any peer.
 - **V2** The manager is healthy: its replicas boot, exchange, and keep a majority when one host is lost (resident audit
   table, boot fact).
-- **V3** Nothing indispensable on a workstation: the guardian's duties (renewal, schedules, transport, decisions) move
-  into the manager; the workstation guardians and the laboratory gate are retired.
+- **V3** Nothing indispensable on a workstation: delegated renewal, schedules, transport and execution coordination
+  run in the deployed manager within the human or parent mandate. The authority issuing that mandate and the
+  externally granted lease/epoch remain separate; moving a technical duty never transfers Governor or Maker
+  authority. Retire workstation guardians only after the replacement path is qualified.
 - **V4** Universe classes (`stateless`, `stay`, `failover`, `mergeable`) are declared per universe and enforced by the
   node and the manager.
 - **V5** A coverage view: per host "if lost now: restored where, lost what"; per universe its copies, ages, image
@@ -46,9 +48,10 @@ within its declared loss when a host is lost for good, with the guarantees state
 2. **O2 — Healthy manager.** V2 with Codex; campaign: lose any one host, the manager keeps a majority and its facts.
 3. **O3 — Coverage.** V5, C3; copies of every protected universe by policy, images available by the chosen method,
    restore tests scheduled; campaign: the coverage view says every host is losable.
-4. **O4 — Authority in the manager.** V3, V4, C1, C2; epochs by majority, the guardian's duties in the manager,
-   the entry point following the epoch; campaigns: network cut, service down, power off, heal — with the
-   workstation switched off.
+4. **O4 — Delegated coordination in the manager.** V3, V4, C1, C2; majority-backed technical epoch coordination
+   within an externally issued activation mandate, bounded renewal/schedules/transport in the manager, and the
+   entry point following the authorized epoch. A majority grants no human, parent, Governor or Maker authority.
+   Campaigns: network cut, service down, power off, heal — with the workstation switched off.
 5. **O5 — Losing a host for good.** Declaration, plan, spread execution, protection against return, readmission;
    campaign: a host destroyed (disk wiped), everything restored elsewhere, the host rebuilt and readmitted.
 6. **O6 — Topologies.** One host with a Backup Server, two hosts without and with a witness (C5), ten hosts enrolled at

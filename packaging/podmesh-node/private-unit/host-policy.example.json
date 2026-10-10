@@ -1,0 +1,21 @@
+{
+  "scope": "replace-with-explicit-node-scope",
+  "application_uid": 1102,
+  "application_gid": 1102,
+  "allowed_operations": [
+    "create",
+    "delete",
+    "clone",
+    "start",
+    "stop",
+    "pause",
+    "resume",
+    "resources"
+  ],
+  "allowed_images": [],
+  "max_memory_bytes": 536870912,
+  "max_cpus": 1.0,
+  "max_universes": 16,
+  "state_dir": "/var/lib/podmesh-host/replace-with-explicit-node-scope",
+  "allowed_nested": []
+}
