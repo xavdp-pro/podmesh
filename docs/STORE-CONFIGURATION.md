@@ -203,9 +203,10 @@ own dialect, and the node's tables arrive the same way, as the migration set bel
 0008-recovery-point  the eight recovery-point tables
 0009-retention       retention, holds, retained points
 0010-collector       collection runs and effects
+0011-universe-volume per-universe data volume declarations
 ```
 
-That is the **38 production tables** the storage inventory counts. Each step is a pair of files,
+That is the **39 production tables**: the 38 the storage inventory counted, plus 1 for universe volume declarations. Each step is a pair of files,
 `<id>.sqlite.sql` and `<id>.mariadb.sql`, because every `CREATE TABLE` in this set diverges: a
 variable-length primary key needs a length on MariaDB and none on SQLite, so there is no portable
 spelling of even the first table. A future step that is portable (an index, a row) may name one file
