@@ -84,7 +84,7 @@ whose helpers run with host privileges, and it can remount what was made read-on
 remedy: the nested network stack (netavark) must write the network sysctls of the namespaces it
 creates.
 
-The supported shape is a **user-namespaced outer**:
+The target shape is a **user-namespaced outer**. It is not implemented by the host adapter yet: `src/host_adapter.rs` still launches a nested outer with `--privileged` under the `privileged-host-device-access` grant, which this section classifies as host-root equivalent and acceptable only for a bounded laboratory increment. The shape below was qualified with a standalone nested universe, not through the adapter's provider path:
 
 - the outer's root maps to an unprivileged host UID/GID range (for example 65536 IDs that no other
   container uses), so its capabilities act only on namespaces the outer owns;
@@ -100,8 +100,9 @@ The supported shape is a **user-namespaced outer**:
 Qualification must show both sides: a write to `kernel.core_pattern` from the outer is refused and
 the outer's processes run under the mapped host UIDs, **and** every functional unit inside still
 passes its real effects, failures, recovery and restore. The `privileged-host-device-access` grant
-above names the host-root-equivalent envelope; a nested grant intended for production should name the
-user-namespaced envelope instead.
+above names the host-root-equivalent envelope. Production containment needs a distinct grant naming the
+user-namespaced envelope, implemented in the adapter (UID/GID mapping, idmapped mounts, bounded
+capabilities, observed effective namespace) and qualified on that provider path.
 
 ## Implemented transport increment, pending qualification
 
