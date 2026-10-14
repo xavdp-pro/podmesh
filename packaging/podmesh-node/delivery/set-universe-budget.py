@@ -88,16 +88,23 @@ def receipt_after(before,old_policy_sha256,new_policy_sha256):
     return result
 
 
+def provider_identity_stem(stem):
+    # f761 lifecycle::is_uuid: ASCII hexadecimal, exact separators; no version/variant normalization.
+    return re.fullmatch(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}',stem) is not None
+
+
 def provider_records(enroller,root):
     enroller.protected(root,directory=True,mode=0o700);count=0;manifest={}
     for path in sorted(root.rglob('*')):
         item=path.lstat();require(not stat.S_ISLNK(item.st_mode) and item.st_uid==0 and not item.st_mode & 0o022,
             'provider history custody differs')
         require(stat.S_ISREG(item.st_mode) or stat.S_ISDIR(item.st_mode),'provider history special file refused')
+        # Match host_adapter read_dir/file_stem counting, independent of extension/type.
+        # Intent, unknown and malformed file bytes remain preserved in the manifest.
+        if path.parent==root and provider_identity_stem(path.stem):count+=1
         if stat.S_ISREG(item.st_mode):
             enroller.protected(path);manifest[str(path.relative_to(root))]={'sha256':enroller.sha(path),
                 'uid':item.st_uid,'gid':item.st_gid,'mode':stat.S_IMODE(item.st_mode),'device':item.st_dev,'inode':item.st_ino}
-            if path.parent==root and path.suffix=='.json':count+=1
     return count,manifest
 
 

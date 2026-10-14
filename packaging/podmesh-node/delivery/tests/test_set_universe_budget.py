@@ -90,15 +90,54 @@ class UniverseBudget(unittest.TestCase):
         instance=Instance();instance.r={'phase':'started','units':{}}
         with self.assertRaises(enroller.Refusal):tool.preflight_original(enroller,instance,'a'*64,'b'*64)
 
+    def test_two_universe_records_and_nine_intents_keep_every_file_but_count_two(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);root.chmod(0o700)
+            names=['d8304d1a-fdd4-49fc-9af2-1926f1d03af7.json','e029d6fa-35c8-4e23-a87d-e530f1a1492b.json']
+            names += ['intent-'+str(index)+'.json' for index in range(9)]
+            for name in names:(root/name).write_bytes(('retained-'+name).encode())
+            if root.stat().st_uid!=0:self.skipTest('root build-host metadata fixture required')
+            original={name:((root/name).read_bytes(),(root/name).stat().st_ino) for name in names}
+            with patch.object(enroller,'protected',side_effect=lambda path,**kw:Path(path)):
+                count,history=tool.provider_records(enroller,root)
+            self.assertEqual(count,2);self.assertEqual(set(history),set(names))
+            old,new=fixture();tool.budget_only(encoded(old),encoded(new),2,3,count,1)
+            for name,(data,inode) in original.items():
+                self.assertEqual(history[name]['sha256'],hashlib.sha256(data).hexdigest())
+                self.assertEqual(history[name]['inode'],inode);self.assertEqual((root/name).read_bytes(),data)
+
+    def test_exact_provider_uuid_syntax_not_uuid_normalization(self):
+        self.assertTrue(tool.provider_identity_stem('D8304D1A-FDD4-49FC-9AF2-1926F1D03AF7'))
+        self.assertTrue(tool.provider_identity_stem('00000000-0000-0000-0000-000000000000'))
+        for name in ('intent-d8304d1a-fdd4-49fc-9af2-1926f1d03af7',
+            'd8304d1afdd449fc9af21926f1d03af7','d8304d1a-fdd4-49fc-9af2-1926f1d03afg',
+            'd8304d1a-fdd4-49fc-9af2-1926f1d03af7.json','d8304d1a-fdd4-49fc-9af2-1926f1d03af７'):
+            with self.subTest(name=name):self.assertFalse(tool.provider_identity_stem(name))
+
+    def test_provider_counts_uuid_stems_any_extension_or_directory_preserves_unknown_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);root.chmod(0o700)
+            first=root/'D8304D1A-FDD4-49FC-9AF2-1926F1D03AF7.bin';first.write_bytes(b'malformed-json-kept')
+            second=root/'e029d6fa-35c8-4e23-a87d-e530f1a1492b';second.mkdir()
+            nested=second/'e6ed3f27-2b3e-426a-8863-c79d706ae9db.json';nested.write_bytes(b'unique-nested')
+            unknown=root/'unknown.json';unknown.write_bytes(b'{not-valid-json')
+            if root.stat().st_uid!=0:self.skipTest('root build-host metadata fixture required')
+            with patch.object(enroller,'protected',side_effect=lambda path,**kw:Path(path)):
+                count,history=tool.provider_records(enroller,root)
+            self.assertEqual(count,2)
+            self.assertEqual(history[first.name]['sha256'],hashlib.sha256(first.read_bytes()).hexdigest())
+            self.assertEqual(history[unknown.name]['sha256'],hashlib.sha256(unknown.read_bytes()).hexdigest())
+            self.assertIn(str(nested.relative_to(root)),history)
+
     def test_provider_history_hash_and_inode_are_retained_and_symlink_refused(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root=Path(temporary);root.chmod(0o700);record=root/'retained.json';record.write_bytes(b'{"unique":"never drop"}')
+            root=Path(temporary);root.chmod(0o700);record=root/'d8304d1a-fdd4-49fc-9af2-1926f1d03af7.json';record.write_bytes(b'{"unique":"never drop"}')
             # Pure temporary fixture: do not require root-owned ancestor custody here.
             with patch.object(enroller,'protected',side_effect=lambda path,**kw:Path(path)):
                 if record.stat().st_uid!=0:self.skipTest('root build-host fixture needed for actual metadata guard')
                 count,history=tool.provider_records(enroller,root)
-                self.assertEqual(count,1);self.assertEqual(history['retained.json']['sha256'],hashlib.sha256(record.read_bytes()).hexdigest())
-                self.assertEqual(history['retained.json']['inode'],record.stat().st_ino)
+                self.assertEqual(count,1);self.assertEqual(history[record.name]['sha256'],hashlib.sha256(record.read_bytes()).hexdigest())
+                self.assertEqual(history[record.name]['inode'],record.stat().st_ino)
                 (root/'linked.json').symlink_to(record)
                 with self.assertRaises(tool.Refusal):tool.provider_records(enroller,root)
 
