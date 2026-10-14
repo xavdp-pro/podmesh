@@ -857,6 +857,36 @@ fn verify_created_envelope(container: &Value, nested: bool) -> Result<(), Error>
     }
     Ok(())
 }
+fn bound_stop_signal<'a>(
+    action: &Value,
+    container: &'a Value,
+    intent: &Value,
+) -> Result<&'a str, Error> {
+    let signal = container["Config"]["StopSignal"]
+        .as_str()
+        .unwrap_or("SIGTERM");
+    let realtime_offset = ["SIGRTMIN+", "SIGRTMAX-", "RTMIN+", "RTMAX-"]
+        .iter()
+        .find_map(|prefix| signal.strip_prefix(prefix))
+        .is_some_and(|offset| {
+            !offset.is_empty()
+                && offset.bytes().all(|b| b.is_ascii_digit())
+                && offset
+                    .parse::<u32>()
+                    .is_ok_and(|n| n <= (libc::SIGRTMAX() - libc::SIGRTMIN()) as u32)
+        });
+    let syntax = !signal.is_empty()
+        && signal.len() <= 32
+        && (signal.bytes().all(|b| b.is_ascii_alphanumeric()) || realtime_offset);
+    if text(action, "signal")? != signal
+        || !syntax
+        || intent["operation"] != "stop"
+        || intent["on_timeout"] != "leave_running"
+    {
+        return Err("stop signal differs from owned container or operation".into());
+    }
+    Ok(signal)
+}
 fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
     fields(request, &["protocol", "action", "intent"])?;
     if request["protocol"] != PROTOCOL {
@@ -1291,14 +1321,7 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
                     limit = seconds + 30;
                 }
                 "signal" => {
-                    let signal = c["Config"]["StopSignal"].as_str().unwrap_or("SIGTERM");
-                    if text(a, "signal")? != signal
-                        || signal.len() > 32
-                        || !signal.bytes().all(|b| b.is_ascii_alphanumeric())
-                        || intent["on_timeout"] != "leave_running"
-                    {
-                        return Err("stop signal differs from owned container or operation".into());
-                    }
+                    let signal = bound_stop_signal(a, &c, intent)?;
                     args = vec!["kill".into(), "--signal".into(), signal.into(), name];
                 }
                 "resources" => {
@@ -1444,6 +1467,60 @@ mod tests {
         json!({"operation":operation,"operation_id":"typed-fixture","universe_uuid":U,"authorization_ref":"bounded engineering mandate"})
     }
     #[test]
+    fn real_time_stop_signal_requires_exact_owned_signal_and_committed_stop() {
+        let intent = json!({"operation":"stop","on_timeout":"leave_running"});
+        for signal in [
+            "SIGTERM",
+            "37",
+            "SIGRTMIN+3",
+            "SIGRTMAX-3",
+            "RTMIN+3",
+            "RTMAX-3",
+        ] {
+            let container = json!({"Config":{"StopSignal":signal}});
+            assert_eq!(
+                bound_stop_signal(&json!({"signal":signal}), &container, &intent).unwrap(),
+                signal
+            );
+            assert!(bound_stop_signal(&json!({"signal":"SIGKILL"}), &container, &intent).is_err());
+            assert!(bound_stop_signal(
+                &json!({"signal":signal}),
+                &container,
+                &json!({"operation":"stop","on_timeout":"kill"})
+            )
+            .is_err());
+            assert!(bound_stop_signal(
+                &json!({"signal":signal}),
+                &container,
+                &json!({"operation":"start","on_timeout":"leave_running"})
+            )
+            .is_err());
+        }
+        for signal in [
+            "",
+            "SIGRTMIN+",
+            "SIGRTMIN+-3",
+            "SIGRTMAX+3",
+            "SIGRTMIN+9999999999999999999999",
+            "SIGRTMIN+3;id",
+            "SIGRTMIN+3\n",
+            "--signal=SIGKILL",
+            "SIGRTMIN+3 $(id)",
+        ] {
+            let container = json!({"Config":{"StopSignal":signal}});
+            assert!(
+                bound_stop_signal(&json!({"signal":signal}), &container, &intent).is_err(),
+                "{signal:?}"
+            );
+        }
+        assert!(bound_stop_signal(
+            &json!({}),
+            &json!({"Config":{"StopSignal":"SIGRTMIN+3"}}),
+            &intent
+        )
+        .is_err());
+    }
+    #[test]
     fn observed_mounts_privilege_and_namespace_must_match_fixed_envelope() {
         let valid = json!({"HostConfig":{"Privileged":false,"NetworkMode":"none","PidMode":"private","IpcMode":"private","UTSMode":"private"},"Mounts":[]});
         assert!(verify_created_envelope(&valid, false).is_ok());
@@ -1525,9 +1602,24 @@ mod tests {
     fn create_conversion_rejects_unknown_or_flat_host_policy_network_labels() {
         let name = format!("podmesh-{U}");
         let image = format!("sha256:{}", "a".repeat(64));
-        for profile in ["io.podmesh.network-profile=unknown", "io.podmesh.network-profile=", "io.podmesh.network-profile=host-policy"] {
-            assert!(typed(&["create", "--pull=never", "--network=none", "--name", &name,
-                "--label", profile, &image, "sleep", "60"]).is_err());
+        for profile in [
+            "io.podmesh.network-profile=unknown",
+            "io.podmesh.network-profile=",
+            "io.podmesh.network-profile=host-policy",
+        ] {
+            assert!(typed(&[
+                "create",
+                "--pull=never",
+                "--network=none",
+                "--name",
+                &name,
+                "--label",
+                profile,
+                &image,
+                "sleep",
+                "60"
+            ])
+            .is_err());
         }
     }
     #[test]
