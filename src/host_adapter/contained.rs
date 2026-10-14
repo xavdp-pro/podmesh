@@ -144,6 +144,47 @@ mod tests {
         assert!(!normalized("/var/lib/owned:path"));
         assert!(!normalized("/var/lib/owned/"));
     }
+    #[test]
+    fn podman_consumed_idmap_requires_exact_oci_process_and_mount_maps() {
+        let mut grant = fixture();
+        grant.value["mounts"] = json!([
+            {"source":"/declared/owned/core/config","destination":"/etc/shaper","read_only":true},
+            {"source":"/declared/owned/core/state","destination":"/var/lib/shaper","read_only":false}
+        ]);
+        // Actual post-generation representation: idmap is absent from mount options,
+        // but each OCI mount carries the explicit process-matching UID/GID arrays.
+        let uid = json!([{"containerID":0,"hostID":200000,"size":65536}]);
+        let gid = json!([{"containerID":0,"hostID":300000,"size":65536}]);
+        let spec = json!({"linux":{"uidMappings":uid,"gidMappings":gid},"mounts":[
+            {"type":"bind","source":"/declared/owned/core/config","destination":"/etc/shaper",
+                "options":["rprivate","ro","rbind"],"uidMappings":uid,"gidMappings":gid},
+            {"type":"bind","source":"/declared/owned/core/state","destination":"/var/lib/shaper",
+                "options":["rprivate","rw","rbind"],"uidMappings":uid,"gidMappings":gid}
+        ]});
+        assert!(grant.verify_oci_mounts(&spec).is_ok());
+        for (pointer, value) in [
+            ("/linux/uidMappings/0/hostID", json!(0)),
+            ("/mounts/0/uidMappings", json!([])),
+            ("/mounts/1/gidMappings/0/hostID", json!(0)),
+            ("/mounts/1/gidMappings/0/size", json!(1)),
+            ("/mounts/0/source", json!("/foreign/config")),
+            ("/mounts/0/options", json!(["rprivate", "rw", "rbind"])),
+            (
+                "/mounts/1/options",
+                json!(["rprivate", "ro", "rw", "rbind"]),
+            ),
+        ] {
+            let mut changed = spec.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert!(grant.verify_oci_mounts(&changed).is_err(), "{pointer}");
+        }
+        let mut duplicated = spec.clone();
+        duplicated["mounts"]
+            .as_array_mut()
+            .unwrap()
+            .push(spec["mounts"][0].clone());
+        assert!(grant.verify_oci_mounts(&duplicated).is_err());
+    }
 }
 fn directory(path: &str) -> Result<(), Error> {
     if !normalized(path) {
@@ -162,6 +203,69 @@ fn directory(path: &str) -> Result<(), Error> {
         return Err("contained source directory may not traverse links".into());
     }
     Ok(())
+}
+
+fn observed_oci_spec(container: &Value) -> Result<(Value, Value), Error> {
+    use sha2::{Digest, Sha256};
+    let id = digest(text(container, "Id")?)?;
+    let info = super::command(30, &["info".into(), "--format=json".into()])?;
+    if !info.status.success() {
+        return Err("owned OCI storage identity unavailable".into());
+    }
+    let info: Value = serde_json::from_slice(&info.stdout)?;
+    let graph = Path::new(text(&info["store"], "graphRoot")?);
+    let driver = text(&info["store"], "graphDriverName")?;
+    if driver.is_empty()
+        || !driver
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err("unknown owned OCI storage driver".into());
+    }
+    let expected = graph
+        .join(format!("{driver}-containers"))
+        .join(id)
+        .join("userdata/config.json");
+    let path = Path::new(text(container, "OCIConfigPath")?);
+    // The inspect path belongs to the same immutable container in the actual provider store,
+    // not a caller-selected file, neighbouring container, copied fixture or command line.
+    if path != expected || fs::canonicalize(path)? != expected {
+        return Err("OCI spec does not belong to this owned container/store".into());
+    }
+    super::protected_ancestors(path)?;
+    let before = fs::symlink_metadata(path)?;
+    if !before.is_file()
+        || before.uid() != 0
+        || before.permissions().mode() & 0o022 != 0
+        || before.len() > super::MAX_OUTPUT as u64
+    {
+        return Err("owned OCI spec must be a bounded protected root-owned regular file".into());
+    }
+    let bytes = fs::read(path)?;
+    let after = fs::symlink_metadata(path)?;
+    if (
+        before.dev(),
+        before.ino(),
+        before.len(),
+        before.mtime(),
+        before.mtime_nsec(),
+        before.ctime(),
+        before.ctime_nsec(),
+    ) != (
+        after.dev(),
+        after.ino(),
+        after.len(),
+        after.mtime(),
+        after.mtime_nsec(),
+        after.ctime(),
+        after.ctime_nsec(),
+    ) {
+        return Err("owned OCI spec changed during observation".into());
+    }
+    let custody = json!({"type":"podmesh-owned-oci-spec-observation/1", "path":path,
+        "container_id":id,"device":before.dev(),"inode":before.ino(),"bytes":bytes.len(),
+        "sha256":format!("{:x}",Sha256::digest(&bytes))});
+    Ok((serde_json::from_slice(&bytes)?, custody))
 }
 impl Grant {
     pub fn parse(value: &Value) -> Result<Self, Error> {
@@ -487,6 +591,7 @@ impl Grant {
         if mounts.len() != expected_mounts.len() {
             return Err("undeclared contained mount".into());
         }
+        let mut needs_oci_maps = false;
         for expected in expected_mounts {
             if !mounts.iter().any(|m| {
                 m["Type"] == "bind"
@@ -494,16 +599,32 @@ impl Grant {
                     && m["Destination"] == expected["destination"]
                     && m["RW"] == !expected["read_only"].as_bool().unwrap()
                     && matches!(m["Propagation"].as_str(), Some("private" | "rprivate"))
-                    && m["Options"]
-                        .as_array()
-                        .is_some_and(|options| options.iter().any(|o| o == "idmap"))
             }) {
-                return Err("observed bind/access/idmap differs from contained grant".into());
+                return Err("observed bind/access/propagation differs from contained grant".into());
             }
+            let mount = mounts
+                .iter()
+                .find(|m| m["Destination"] == expected["destination"])
+                .ok_or("declared contained mount absent")?;
+            needs_oci_maps |= !mount["Options"]
+                .as_array()
+                .is_some_and(|options| options.iter().any(|o| o == "idmap"));
         }
         let mut proof = json!({"profile":PROFILE, "configuration_verified":true, "runtime_verified":false, "network":network,
             "uid_start":self.value["uid_start"], "gid_start":self.value["gid_start"], "id_count":self.value["id_count"],
             "volume_recovery":"full-declared-volumes-required; rootfs-only-clone-refused"});
+        // Podman 5.4 consumes each idmap option into OCI uidMappings/gidMappings
+        // when generating the runtime spec; its post-start inspect omits those maps.
+        // Missing literal options require exact protected OCI mapping evidence, never
+        // acceptance of an ordinary bind or of the saved create-command text.
+        if needs_oci_maps {
+            let (spec, custody) = observed_oci_spec(c)?;
+            self.verify_oci_mounts(&spec)?;
+            proof["idmap_evidence"] = json!("owned-oci-per-mount-mappings");
+            proof["oci_spec_observation"] = custody;
+        } else {
+            proof["idmap_evidence"] = json!("podman-inspect-idmap-options");
+        }
         if c["State"]["Running"] == true || c["State"]["Paused"] == true {
             let pid = c["State"]["Pid"]
                 .as_u64()
@@ -514,6 +635,52 @@ impl Grant {
             proof["host_pid"] = json!(pid);
         }
         Ok(proof)
+    }
+    fn verify_oci_mounts(&self, spec: &Value) -> Result<(), Error> {
+        for (field, key) in [("uidMappings", "uid_start"), ("gidMappings", "gid_start")] {
+            let expected = json!([{"containerID":0, "hostID":number(&self.value,key)?, "size":number(&self.value,"id_count")?}]);
+            if spec["linux"][field] != expected {
+                return Err("OCI process mappings differ from contained grant".into());
+            }
+        }
+        let mounts = spec["mounts"]
+            .as_array()
+            .ok_or("OCI mount evidence unavailable")?;
+        for expected in self.value["mounts"].as_array().unwrap() {
+            let selected: Vec<&Value> = mounts
+                .iter()
+                .filter(|m| m["destination"] == expected["destination"])
+                .collect();
+            if selected.len() != 1 {
+                return Err("OCI contained mount absent or duplicated".into());
+            }
+            let mount = selected[0];
+            if mount["source"] != expected["source"] || mount["type"] != "bind" {
+                return Err("OCI contained bind source/type differs".into());
+            }
+            let options = mount["options"]
+                .as_array()
+                .ok_or("OCI contained mount options unavailable")?;
+            let (access, forbidden_access) = if expected["read_only"] == true {
+                ("ro", "rw")
+            } else {
+                ("rw", "ro")
+            };
+            if !options.iter().any(|o| o == access)
+                || options.iter().any(|o| o == forbidden_access)
+                || !options.iter().any(|o| o == "rprivate")
+                || !options.iter().any(|o| o == "rbind")
+            {
+                return Err("OCI contained access/propagation differs".into());
+            }
+            for (field, key) in [("uidMappings", "uid_start"), ("gidMappings", "gid_start")] {
+                let maps = json!([{"containerID":0,"hostID":number(&self.value,key)?,"size":number(&self.value,"id_count")?}]);
+                if mount[field] != maps {
+                    return Err("OCI per-mount idmapping absent or differs from grant".into());
+                }
+            }
+        }
+        Ok(())
     }
     fn verify_process(&self, pid: u64) -> Result<(), Error> {
         let root = format!("/proc/{pid}");
