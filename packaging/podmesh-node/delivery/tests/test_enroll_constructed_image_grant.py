@@ -102,7 +102,11 @@ class ConstructionGuards(unittest.TestCase):
 
     def test_empty_functional_context_may_have_bounded_nonroot_identity(self):
         context=self.saved/'maestro/context';os.chown(context,2104,2104);context.chmod(0o700)
-        self.verify();os.chown(context,2**30,2104)
+        self.verify()
+        # CT root can chown only mapped IDs. Keep the actual UID2104 fixture
+        # and shrink the tested declared boundary instead of chowning outside
+        # the CT map; the constructor must reject this real directory owner.
+        self.grant['id_count']=2104
         with self.assertRaises(tool.Refusal):self.verify()
 
     def test_saved_sql_cache_and_undeclared_credential_files_refuse_even_reviewed(self):
