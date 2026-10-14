@@ -170,8 +170,12 @@ def check_stopped(instance):
         result = subprocess.run(['/usr/bin/systemctl', 'show', unit, '--property=ActiveState,MainPID,ControlPID'],
                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=True)
         values = dict(line.split('=', 1) for line in result.stdout.decode().splitlines() if '=' in line)
-        require(values.get('ActiveState') in ('inactive', 'failed') and values.get('MainPID') == '0'
-                and values.get('ControlPID') == '0', 'native service/target remains live')
+        require(values.get('ActiveState') in ('inactive', 'failed'), 'native service/target remains live')
+        # systemd targets have no service process properties. Only the exact
+        # recorded immutable target may omit them; services must report explicit 0.
+        target = unit == instance.prefix + '.target'
+        require(all(values.get(field, '0' if target else None) == '0'
+                    for field in ('MainPID', 'ControlPID')), 'native service/target process remains live')
     for role in ('app', 'db'):
         container = instance.check_container(role)
         require(container['State']['Running'] is False and not container['State']['Paused']

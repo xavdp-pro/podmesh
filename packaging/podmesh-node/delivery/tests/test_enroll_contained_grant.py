@@ -115,6 +115,7 @@ class AppendGuards(unittest.TestCase):
 
     def test_native_phase_service_pid_and_container_process_require_stopped(self):
         class Instance:
+            prefix='podmesh-node-private-operator-owned'
             r={'phase':'stopped','units':{'owned.service':'hash'}}
             def unitcheck(self): pass
             def check_container(self,role):return {'State':{'Running':False,'Paused':False,'Pid':0}}
@@ -125,6 +126,27 @@ class AppendGuards(unittest.TestCase):
         with patch.object(tool.subprocess,'run',return_value=live),self.assertRaises(tool.Refusal):tool.check_stopped(instance)
         instance.r={'phase':'started','units':{}}
         with self.assertRaises(tool.Refusal):tool.check_stopped(instance)
+
+    def test_only_exact_recorded_target_may_omit_service_pid_properties(self):
+        class Instance:
+            prefix='podmesh-node-private-operator-owned'
+            r={'phase':'stopped','units':{'podmesh-node-private-operator-owned.target':'hash'}}
+            def unitcheck(self): pass
+            def check_container(self,role):return {'State':{'Running':False,'Paused':False,'Pid':0}}
+        instance=Instance()
+        def observed(data):return subprocess.CompletedProcess([],0,data,b'')
+        with patch.object(tool.subprocess,'run',return_value=observed(b'ActiveState=inactive\n')):
+            tool.check_stopped(instance)
+        with patch.object(tool.subprocess,'run',return_value=observed(b'ActiveState=inactive\nMainPID=0\nControlPID=0\n')):
+            tool.check_stopped(instance)
+        for data in (b'ActiveState=active\n',b'ActiveState=inactive\nMainPID=7\n',
+                     b'ActiveState=inactive\nControlPID=7\n',b'ActiveState=inactive\nMainPID=\n'):
+            with self.subTest(data=data),patch.object(tool.subprocess,'run',return_value=observed(data)),self.assertRaises(tool.Refusal):
+                tool.check_stopped(instance)
+        for unit in ('owned.service','another.target'):
+            instance.r={'phase':'stopped','units':{unit:'hash'}}
+            with self.subTest(unit=unit),patch.object(tool.subprocess,'run',return_value=observed(b'ActiveState=inactive\n')),self.assertRaises(tool.Refusal):
+                tool.check_stopped(instance)
 
 
 if __name__ == '__main__':unittest.main()

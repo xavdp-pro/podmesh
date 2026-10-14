@@ -54,7 +54,9 @@ API and executable evidence; the tool does not query a stopped MariaDB or infer
 SQL state from provider intent filenames. This is prerequisite evidence,
 never a synthetic zero written by this tool. Keep the controller quiescent between
 that observation and stop. Use the original native stop first: the receipt must
-say `stopped`, every recorded service/target must have no main/control process,
+say `stopped`, every recorded service/target must be inactive or failed. Services
+must explicitly report zero main/control PIDs; only the exact immutable native
+target may omit these systemd service properties (present nonzero PIDs refuse),
 and both owned app/DB containers must be stopped. The owned pod's networkless
 infra process is not a serving app or database.
 
