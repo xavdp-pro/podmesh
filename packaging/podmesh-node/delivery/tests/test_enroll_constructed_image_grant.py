@@ -59,6 +59,44 @@ class AppendGuards(unittest.TestCase):
         old,new=policies();old['allowed_images']=['sha256:'+IMAGE];new['allowed_images']=['sha256:'+IMAGE,IMAGE]
         with self.assertRaises(tool.Refusal):tool.append_only(enc(old),enc(new),fixtures.A,IMAGE)
 
+    def test_existing_approved_image_appends_only_grant_and_preserves_exact_list(self):
+        for approved in (IMAGE,'sha256:'+IMAGE):
+            old,new=policies();old['allowed_images'].append(approved)
+            new['allowed_images']=copy.deepcopy(old['allowed_images'])
+            a,b,grant=tool.append_only(enc(old),enc(new),fixtures.A,IMAGE)
+            self.assertEqual(a,old);self.assertEqual(b,new)
+            self.assertEqual(b['allowed_images'],a['allowed_images'])
+            self.assertEqual(grant['image'],IMAGE)
+            self.assertEqual(len(b['allowed_contained_nested']),len(a['allowed_contained_nested'])+1)
+
+    def test_existing_image_cannot_add_duplicate_change_list_or_substitute_grant(self):
+        old,new=policies();old['allowed_images'].append(IMAGE)
+        new['allowed_images']=copy.deepcopy(old['allowed_images'])
+        old['max_universes']=new['max_universes']=3
+        changes=[lambda p:p['allowed_images'].append(IMAGE),
+            lambda p:p['allowed_images'].append('sha256:'+IMAGE),
+            lambda p:p['allowed_images'].__setitem__(0,'e'*64),
+            lambda p:p['allowed_images'].reverse(),
+            lambda p:p['allowed_images'].__setitem__(1,'sha256:'+IMAGE),
+            lambda p:p['allowed_contained_nested'][-1].update(image='e'*64),
+            lambda p:p['allowed_contained_nested'].append(copy.deepcopy(p['allowed_contained_nested'][-1])),
+            lambda p:p['allowed_contained_nested'][0].update(network='changed'),
+            lambda p:p.update(max_universes=p['max_universes']+1)]
+        for change in changes:
+            proposed=copy.deepcopy(new);change(proposed)
+            with self.subTest(change=change),self.assertRaises(tool.Refusal):
+                tool.append_only(enc(old),enc(proposed),fixtures.A,IMAGE)
+
+    def test_existing_image_requires_byte_identical_array_and_unique_approval(self):
+        old,new=policies();old['allowed_images'].append(IMAGE)
+        new['allowed_images']=copy.deepcopy(old['allowed_images'])
+        before,after=enc(old),enc(new)
+        old_array=tool.spans(before)[0][tool.spans(before)[1]['allowed_images'][0]:tool.spans(before)[1]['allowed_images'][1]]
+        changed=after.replace(old_array.encode(),old_array.replace('\n','\n ',1).encode(),1)
+        with self.assertRaises(tool.Refusal):tool.append_only(before,changed,fixtures.A,IMAGE)
+        old['allowed_images'].append('sha256:'+IMAGE);new['allowed_images']=copy.deepcopy(old['allowed_images'])
+        with self.assertRaises(tool.Refusal):tool.append_only(enc(old),enc(new),fixtures.A,IMAGE)
+
 
 class ConstructionGuards(unittest.TestCase):
     def setUp(self):

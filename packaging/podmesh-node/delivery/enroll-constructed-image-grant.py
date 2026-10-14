@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Root-only stopped-instance append of one reviewed image and constructed grant.
+"""Root-only stopped-instance append of one constructed grant and optional image.
 
 The frozen empty-target enroller remains unchanged. This separate administrator
 admits only exact preconstructed configuration bytes from root-reviewed custody;
@@ -76,9 +76,10 @@ def append_only(before,after,template_uuid,image):
     old_text,old_spans,new_text,new_spans=unchanged_arrays(before,after)
     require(re.fullmatch('[0-9a-f]{64}',image),'one canonical approved image digest required')
     original=old['allowed_images'];proposed=new['allowed_images']
-    require(isinstance(original,list)and isinstance(proposed,list)and len(proposed)==len(original)+1
-        and proposed[:-1]==original and proposed[-1]==image and image not in [value.removeprefix('sha256:') for value in original],
-        'exactly one new approved image must be appended')
+    require(isinstance(original,list)and isinstance(proposed,list)
+        and all(isinstance(value,str)and re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}',value)for value in original),
+        'canonical existing approved image identities required')
+    matches=[value for value in original if value.removeprefix('sha256:')==image]
     # Raw items and punctuation/whitespace surrounding old values stay intact.
     old_array=old_text[old_spans['allowed_images'][0]:old_spans['allowed_images'][1]]
     new_array=new_text[new_spans['allowed_images'][0]:new_spans['allowed_images'][1]]
@@ -86,10 +87,16 @@ def append_only(before,after,template_uuid,image):
         # Treat this array as the frozen guard's existing grant-array reader.
         text,(_,_,items)=base.array_span(('{"allowed_contained_nested":'+array+'}').encode())
         return items
-    require(item_bytes(new_array)[:-1]==item_bytes(old_array),'old allowed image item bytes changed')
+    if matches:
+        require(len(matches)==1 and proposed==original and new_array==old_array,
+                'already approved image requires the exact unchanged image list, without duplicate approval')
+    else:
+        require(len(proposed)==len(original)+1 and proposed[:-1]==original and proposed[-1]==image,
+                'exactly one new approved image must be appended')
+        require(item_bytes(new_array)[:-1]==item_bytes(old_array),'old allowed image item bytes changed')
     _,(_,_,raw_grants)=base.array_span(after)
     grant=new['allowed_contained_nested'][-1]
-    require(grant['image']==image,'new grant must use only explicitly approved new image')
+    require(grant['image']==image,'new grant must use only the explicitly approved image')
     templates=[g for g in old['allowed_contained_nested']if g['universe_uuid']==template_uuid]
     require(len(templates)==1,'one existing explicit template grant required')
     template=templates[0]
@@ -285,7 +292,9 @@ def main():
             'before_policy_sha256':args.expected_policy_sha256,'before_receipt_sha256':args.expected_receipt_sha256,
             'new_policy_sha256':args.expected_new_policy_sha256,'freshness_sha256':args.freshness_sha256,
             'added_uuid':grant['universe_uuid'],'old_directory_identities':old_inodes,'new_directory_identities':new_inodes,
-            'provider_state_sha256':provider_before,'policy_change':'append-one-approved-image-and-one-constructed-contained-grant',
+            'provider_state_sha256':provider_before,'policy_change':
+                'append-one-constructed-contained-grant-with-existing-approved-image'if new['allowed_images']==old['allowed_images']else
+                'append-one-approved-image-and-one-constructed-contained-grant',
             'image_proof':approved_image,'construction_manifest_sha256':args.expected_construction_manifest_sha256,
             'base_guard_sha256':BASE_GUARD_SHA}
         write_new(transaction / 'intent.json', (json.dumps(intent,indent=2,sort_keys=True)+'\n').encode())

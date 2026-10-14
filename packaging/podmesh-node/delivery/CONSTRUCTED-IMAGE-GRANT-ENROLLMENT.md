@@ -1,8 +1,13 @@
-# Append one reviewed image and constructed receiving grant
+# Append one constructed receiving grant with an approved image
 
 `enroll-constructed-image-grant.py` is a separate root administrator for a
-stopped installed Node. It adds one explicitly approved, already loaded image
-and one fresh contained receiving grant. It does not replace or weaken the
+stopped installed Node. It adds one fresh contained receiving grant. If its exact
+image is already approved once, the complete `allowed_images` value must remain
+byte-identical, including order, prefix spelling and whitespace. Otherwise, it
+appends that one explicitly approved, already loaded image. Duplicate approval
+of the same image, including a `sha256:` alias, is refused. Both paths require
+the same actual loaded-image, matrix/OCI and constructed-tree proofs. This is
+not an empty-target enrollment shortcut. It does not replace or weaken the
 frozen empty-target administrator `enroll-contained-grant.py` (SHA-256
 `6381411f3ffdd335fc25e2e384251bd7c1df4f8c6a7d2d36c83c895a1dde8702`).
 The original installed bundle, provider, operation history and old grants remain
@@ -17,8 +22,9 @@ containing the exact frozen administrator beside it. All inputs are explicit:
   `--expected-bundle-manifest-sha256`, `--expected-policy-sha256` and
   `--expected-receipt-sha256`.
 - Reviewed `--new-policy`, `--expected-new-policy-sha256`, `--template-uuid`
-  and dedicated `--enrollment-root`. Only the two append-array values may
-  differ. Existing array items retain their exact descriptor bytes. The new
+  and dedicated `--enrollment-root`. Only the contained-grant append and, for
+  a previously unapproved image, the single image append may differ. Existing
+  array items retain their exact descriptor bytes. The new
   grant retains the template's containment, network, capabilities, relative
   mount layout and ID-count, with disjoint bounded UID/GID ranges and root.
 - `--expected-image-id` is the bare 64-character image ID;
