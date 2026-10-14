@@ -132,7 +132,7 @@ def construction(grant,manifest,image,matrix_hash,source_pin):
             and not meta.st_mode&0o022,'constructed path custody/type/write access differs')
         relative=str(path.relative_to(root));entry={'path':relative,'uid':meta.st_uid,'gid':meta.st_gid,'mode':stat.S_IMODE(meta.st_mode)}
         if stat.S_ISDIR(meta.st_mode):
-            require(meta.st_uid==0 and meta.st_gid==0 or path!=saved and path.is_relative_to(saved)and bounded_identity(meta),
+            require(meta.st_uid==0 and bounded_identity(meta)or path!=saved and path.is_relative_to(saved)and bounded_identity(meta),
                 'nonroot directory permitted only inside empty saved subtree with bounded identity')
             entry['type']='directory'
         else:

@@ -109,6 +109,20 @@ class ConstructionGuards(unittest.TestCase):
         self.grant['id_count']=2104
         with self.assertRaises(tool.Refusal):self.verify()
 
+    def test_root_configuration_directory_allows_bounded_functional_group_only(self):
+        directory=self.etc/'units/vault';directory.mkdir(parents=True)
+        os.chown(directory,0,2101);directory.chmod(0o710)
+        self.verify()
+        os.chown(directory,2101,2101)
+        with self.assertRaises(tool.Refusal):self.verify()
+        os.chown(directory,0,2101);directory.chmod(0o730)
+        with self.assertRaises(tool.Refusal):self.verify()
+        directory.chmod(0o710)
+        # Retain the real mapped group and put it exactly at the tested bound;
+        # no chown outside the build container's permitted mapping is needed.
+        self.grant['id_count']=2101
+        with self.assertRaises(tool.Refusal):self.verify()
+
     def test_saved_sql_cache_and_undeclared_credential_files_refuse_even_reviewed(self):
         for p in (self.saved/'sql',self.cache/'blob',self.root/'other.tokens.json',self.ssh/'private-key'):
             p.write_bytes(b'not-allowed')

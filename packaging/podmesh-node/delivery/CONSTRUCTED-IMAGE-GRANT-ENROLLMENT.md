@@ -67,7 +67,8 @@ single-link, nonempty JSON object of at most 1 MiB; its bytes are checked withou
 printing their content. No other host-only credential files are accepted.
 Saved and inner-store paths remain directory-only: no copied SQL, cache blobs
 or even empty regular placeholders. Mount roots and configuration directories
-remain root-protected. Empty functional subdirectories below saved may have
+remain root-owned and may use bounded functional group IDs without group-write
+permission. Empty functional subdirectories below saved may have
 bounded declared UID/GID ownership, with exact modes and ownership in the
 reviewed manifest.
 
