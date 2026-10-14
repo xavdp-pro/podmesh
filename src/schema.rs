@@ -47,6 +47,7 @@ pub fn all() -> Value {
     put("observations", op("read", "none", "the last twenty journaled operations", Some(vec![])));
     put("host_status", op("read", "none", "this host's CPU count, load averages, memory, swap, uptime and storage, read now", Some(vec![])));
     put("universe_stats", op("read", "none", "every PodMesh universe on this host: CPU over a short sample, memory and its limit, CPU allowance, processes, disk written", Some(vec![])));
+    put("universe_recovery_bindings", op("read", "none", "contained private-provider recovery bindings and all declared volume paths; requires the scoped host adapter, not a backup or restore proof", Some(vec![uuid("universe_uuid", "the exact contained universe owned by this provider")])));
     put("storage_status", op("read", "none", "what carries Podman's storage on this host and whether a universe's space can grow there", Some(vec![])));
     put("volume_declare", op("universe", "reservation", "declares how much dedicated data volume a stopped universe is entitled to on a host whose Podman storage can grow", Some(vec![
         int("capacity_bytes", true, 1024 * 1024, None, "bytes, from 1 MiB up to the filesystem size carrying Podman's storage"),
@@ -58,8 +59,8 @@ pub fn all() -> Value {
     put("create", op("universe", "reservation", "a stopped container for a new universe, from a local image, on the isolated or the managed network", Some(vec![
         f("image", "string", true, "a local image by digest: sha256:<64 hex>"),
         f("command", "string[]", true, "the command, as a list of strings"),
-        en("universe_profile", false, &["flat", "nested"], "flat is the default packaged scope; nested is Rule 11 outer (privileged, isolated network only)"),
-        en("network_profile", true, &["isolated", "managed"], "isolated has no network; managed joins the host's declared pool"),
+        en("universe_profile", false, &["flat", "nested"], "flat is the default packaged scope; nested is Rule 11 outer; a private provider selects an explicit legacy or contained userns envelope"),
+        en("network_profile", true, &["isolated", "managed", "host-policy"], "isolated has no network; managed joins the declared pool; host-policy requires a contained private-provider nested grant and its exact network"),
         f("network_address", "string", false, "an address in the host's pool, for the managed profile"),
         f("secrets", "object[]", false, "declared secrets to mount: [{name, target}]"),
         f("manager_host_state", "string", false, "a manager replica's host state, by name: its vote directory read-write at /run/podmesh-host/votes, the operator's evidence directory and the host's machine-id read-only at /run/podmesh-host/evidence and /run/podmesh-host/machine-id, kept under this node's state directory and never removed by it"),

@@ -18,6 +18,7 @@ use std::net::Ipv4Addr;
 type Error = Box<dyn std::error::Error>;
 
 pub const PROFILE_ISOLATED: &str = "isolated";
+pub const PROFILE_HOST_POLICY: &str = "host-policy";
 pub const PROFILE_MANAGED: &str = "managed";
 pub const LABEL_PROFILE: &str = "io.podmesh.network-profile";
 pub const LABEL_IP: &str = "io.podmesh.universe-ip";
@@ -421,11 +422,17 @@ pub(crate) fn of_container(c: &Value) -> Value {
         .as_object()
         .map(|m| m.iter().map(|(name, n)| json!({"network": name, "ip": n["IPAddress"].as_str().filter(|s| !s.is_empty())})).collect())
         .unwrap_or_default();
-    json!({
+    let mut result = json!({
         "profile": profile.unwrap_or("unknown"),
         "requested": {"ip": requested_ip, "network_uuid": labels[LABEL_NETWORK].as_str()},
         "effective": effective,
-    })
+    });
+    if c["PodMeshContainment"]["profile"] == "userns-v1" {
+        result["profile"] = json!(PROFILE_HOST_POLICY);
+        result["host_network"] = c["PodMeshContainment"]["network"].clone();
+        result["note"] = json!("private universe namespace on the exact scope-owned network selected by the contained host grant");
+    }
+    result
 }
 
 // ---------------------------------------------------------------- the effects ledger

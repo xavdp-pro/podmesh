@@ -192,7 +192,7 @@ pub(crate) fn token(value: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// `universe_profile` on `create`: flat (default) or nested Rule 11 outer (privileged, isolated network only).
+/// `universe_profile` on `create`: flat or nested; containment and scoped networking use explicit host-policy grants.
 pub(crate) fn parse_universe_profile(
     request: &Value,
     network_profile: &str,
@@ -206,9 +206,10 @@ pub(crate) fn parse_universe_profile(
     match profile {
         crate::network::UNIVERSE_PROFILE_FLAT => Ok(crate::network::UNIVERSE_PROFILE_FLAT),
         crate::network::UNIVERSE_PROFILE_NESTED => {
-            if network_profile != crate::network::PROFILE_ISOLATED {
+            if network_profile != crate::network::PROFILE_ISOLATED
+                && !(network_profile == crate::network::PROFILE_HOST_POLICY && crate::host_adapter::configured()) {
                 return Err(
-                    "universe_profile nested requires network_profile isolated (Rule 11 outer universe)"
+                    "universe_profile nested requires isolated or private-provider host-policy network"
                         .into(),
                 );
             }
@@ -1435,7 +1436,7 @@ pub fn execute_store(store: &mut dyn DurableStore, request: &Value) -> Result<Va
         && request["operation"] == "create"
         && (request.get("secrets").is_some()
             || request.get("manager_host_state").is_some()
-            || request["network_profile"] != "isolated")
+            || !matches!(request["network_profile"].as_str(), Some("isolated" | "host-policy")))
     {
         return Err("private host capability for managed network, secrets or host-state mounts is not ported".into());
     }
@@ -1577,6 +1578,7 @@ fn parse_store<'a>(
                 .map_err(|_| "network_profile is required: isolated or managed (docs/UNIVERSE-NETWORK-CONTRACT.md)")?;
             if profile != crate::network::PROFILE_ISOLATED
                 && profile != crate::network::PROFILE_MANAGED
+                && !(profile == crate::network::PROFILE_HOST_POLICY && crate::host_adapter::configured())
             {
                 return Err("network_profile must be isolated or managed".into());
             }
@@ -2434,6 +2436,7 @@ fn create(
     let mut result = json!({"status":"verified","state":c["State"]["Status"],"universe_uuid":uuid,"universe_profile":universe_profile,"container_id":c["Id"],"network":network,"started":false});
     if crate::host_adapter::configured() {
         result["host_policy_limits"] = json!({"memory_bytes":c["HostConfig"]["Memory"],"nano_cpus":c["HostConfig"]["NanoCpus"],"note":"observed initial cgroup ceilings from the host-owned policy; these are limits, not reserved or allocated consumption"});
+        result["containment"] = c["PodMeshContainment"].clone();
     }
     Ok(result)
 }

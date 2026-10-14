@@ -17,5 +17,6 @@
   "max_cpus": 1.0,
   "max_universes": 16,
   "state_dir": "/var/lib/podmesh-host/replace-with-explicit-node-scope",
-  "allowed_nested": []
+  "allowed_nested": [],
+  "allowed_contained_nested": []
 }

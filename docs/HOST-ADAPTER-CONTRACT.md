@@ -84,7 +84,12 @@ whose helpers run with host privileges, and it can remount what was made read-on
 remedy: the nested network stack (netavark) must write the network sysctls of the namespaces it
 creates.
 
-The target shape is a **user-namespaced outer**. It is not implemented by the host adapter yet: `src/host_adapter.rs` still launches a nested outer with `--privileged` under the `privileged-host-device-access` grant, which this section classifies as host-root equivalent and acceptable only for a bounded laboratory increment. The shape below was qualified with a standalone nested universe, not through the adapter's provider path:
+The contained source shape is a **user-namespaced outer**, selected by the distinct
+`allowed_contained_nested` grant and `network_profile: host-policy` create request.
+Its profile is `userns-v1`; it never falls back to a legacy privileged outer.
+The legacy `allowed_nested` / `privileged-host-device-access` path remains a separately
+labelled host-root-equivalent laboratory increment. Historical standalone qualification
+does not qualify this new provider source or a package built from it.
 
 - the outer's root maps to an unprivileged host UID/GID range (for example 65536 IDs that no other
   container uses), so its capabilities act only on namespaces the outer owns;
@@ -101,8 +106,67 @@ Qualification must show both sides: a write to `kernel.core_pattern` from the ou
 the outer's processes run under the mapped host UIDs, **and** every functional unit inside still
 passes its real effects, failures, recovery and restore. The `privileged-host-device-access` grant
 above names the host-root-equivalent envelope. Production containment needs a distinct grant naming the
-user-namespaced envelope, implemented in the adapter (UID/GID mapping, idmapped mounts, bounded
-capabilities, observed effective namespace) and qualified on that provider path.
+user-namespaced envelope (UID/GID mapping, idmapped mounts, bounded capabilities,
+observed effective namespace) and qualification on that provider path.
+
+### Contained grant and recovery handoff
+
+The host policy's `allowed_contained_nested` array defaults to empty. Each entry has
+exact fields: `universe_uuid`, immutable local `image`, `containment: userns-v1`,
+`uid_start`, `gid_start`, `id_count`, `volume_root`, `mounts`, and `network`.
+The mapping is a single range from container ID zero, excludes host IDs below 65536,
+and covers 65536 through 1048576 identities. Declared UID and GID ranges and volume
+roots cannot overlap other contained grants; a UUID cannot also have a legacy grant.
+Before create, existing private container mappings in the provider's configured Podman store are inspected for conflicts. The host constructor allocates unused ranges across any other independently managed stores; store-local inventory is not a host-wide allocator.
+
+Each mount has `source`, `destination`, and boolean `read_only`. Sources are existing
+protected root-owned directories beneath the grant's dedicated `volume_root`; no
+symlink, overlapping source/destination or host-control destination is accepted.
+The provider supplies `idmap,rprivate` and the declared access. It never recursively
+changes ownership. Typical generic destinations are `/etc/shaper`, `/var/lib/shaper`
+and `/var/lib/containers`; source paths and mapping ranges are deployment inputs.
+No application request supplies a host path, namespace mapping, capability or device.
+
+`network` is `none` or one existing bridge network whose name matches exactly and
+whose `io.podmesh.adapter-scope` label matches the host policy scope. It is not a
+host namespace or an implicit default network. The constructor provides its DNS,
+route and outbound connectivity when required; a successful provider start alone
+does not prove that connectivity. The create operation explicitly selects
+`network_profile: host-policy`, so a routed bridge is never reported as the
+legacy `isolated` / no-network profile.
+
+The provider fixes the capability/device envelope, UID/GID mappings, private
+PID/IPC/UTS/network/cgroup namespaces and idmapped mounts. Its ownership record
+binds the complete grant and each source directory's device/inode. Replacing a
+directory or changing the policy does not adopt existing runtime; an explicit new
+construction/recovery binding is required. Configuration is checked from actual
+Podman inspect, not the create-command text. Running or paused instances additionally
+prove kernel UID/GID maps, mapped process identities, separate namespaces and
+idmapped source/view ownership through `/proc`. `PodMeshContainment` reports
+`configuration_verified` and `runtime_verified` separately, including the selected
+network. Unsupported Podman, kernel or filesystem behavior refuses; no privileged
+fallback, volume-copy imitation or silent privilege widening is available.
+
+The node read operation `universe_recovery_bindings` requires the exact owned
+`universe_uuid`. It returns `podmesh-contained-recovery-bindings/1`, the current
+container/image identity, retained grant/source binding, every declared mount and
+the actual stopped/running state. This is the full-volume recovery handoff to the
+authorized SHAPER constructor: cleanly stop the source, capture consistent private
+SQL dumps and all declared non-reproducible volumes, retain keys separately, restore
+into an empty target under a distinct contained grant and prove useful operation.
+The provider does not manufacture a backup or parent Logger receipt. Rootfs-only
+snapshot/clone is explicitly refused for contained instances: such an image omits
+the declared persistent volumes. Existing mount-free legacy clone semantics remain.
+
+Engineering checks use the native Rust suite. The explicitly armed real effect
+test `real_contained_nested_provider_when_explicitly_named` reads
+`PODMESH_HOST_CONTAINED_FIXTURE`, a JSON object with `scope`, existing empty root0700
+`state_dir`, the exact `grant`, and an explicit `command`. It exercises real create,
+start, original-create retry while running, pause/resume, stop, delete and recovery
+binding observation. The fixture owner supplies an already-local image, unused
+mapping ranges, protected directories and optional scope-owned network. Unarmed
+tests are not runtime evidence; even an armed engineering fixture is not the full
+private-node/MariaDB/SHAPER nested service and restoration qualification.
 
 ## Implemented transport increment, pending qualification
 

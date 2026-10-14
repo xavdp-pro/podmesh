@@ -518,8 +518,9 @@ fn durable_capabilities(engine: Engine) -> Value {
                     Some("secret_declare" | "secret_remove" | "secret_status" | "universe_stats")
                 )
             });
+        capabilities["operations"].as_array_mut().unwrap().push(json!("universe_recovery_bindings"));
         capabilities["host_adapter_protocol"] = json!("podmesh-host-capability/1");
-        capabilities["host_adapter_scope"] = json!("isolated lifecycle including explicit host-owned nested UUID/image grants and mount-free cloning; managed network/secrets/host-state mounts/scoped statistics and migration/replication effects unported");
+        capabilities["host_adapter_scope"] = json!("flat/legacy isolated lifecycle and explicitly granted userns-v1 nested lifecycle on its scope-owned host-policy network with idmapped volumes; full-volume recovery binding handoff; contained rootfs-only clone refused; managed network/secrets/host-state mounts/scoped statistics and migration/replication effects unported");
     }
     capabilities
 }
@@ -626,6 +627,10 @@ fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
                     })
                     .collect::<store::Result<Vec<_>>>()?;
                 json!({"observations": observations})
+            }
+            "universe_recovery_bindings" if host_adapter::configured() => {
+                let target = lifecycle::text(request,"universe_uuid")?;
+                host_adapter::fact("recovery_bindings",Some(target))?
             }
             "storage_status" => storage::status_store(store)?,
             "host_status" => if host_adapter::configured() { host_adapter::fact("host_status", None)? } else { health::host_status()? },

@@ -18,6 +18,7 @@ use std::{
     thread,
     time::Duration,
 };
+mod contained;
 type Error = Box<dyn std::error::Error>;
 pub const SOCKET_ENV: &str = "PODMESH_HOST_ADAPTER_SOCKET";
 const PROTOCOL: &str = "podmesh-host-capability/1";
@@ -139,7 +140,7 @@ fn typed(args: &[&str]) -> Result<Value, Error> {
                 return Err("nested privilege must carry its typed universe profile".into());
             }
             let image = digest(rest[i])?;
-            json!({"kind":"create","uuid":name.ok_or("missing container name")?,"image":image,"command":&rest[i+1..],"labels":labels,"nested":privileged})
+            json!({"kind":"create","uuid":name.ok_or("missing container name")?,"image":image,"command":&rest[i+1..],"labels":labels,"nested":privileged,"containment":if privileged { if labels["io.podmesh.network-profile"] == "host-policy" { contained::PROFILE } else { "legacy-host-root" } } else { "flat" }})
         }
         ["update", rest @ ..] if !rest.is_empty() => {
             let id = named(rest[rest.len() - 1])?;
@@ -342,6 +343,7 @@ struct Policy {
     gid: u32,
     images: Vec<String>,
     nested: Vec<(String, String)>,
+    contained: Vec<contained::Grant>,
     operations: Vec<String>,
     max_memory: u64,
     max_cpus: f64,
@@ -371,6 +373,7 @@ impl Policy {
                 "allowed_images",
                 "allowed_operations",
                 "allowed_nested",
+                "allowed_contained_nested",
                 "max_memory_bytes",
                 "max_cpus",
                 "max_universes",
@@ -429,6 +432,33 @@ impl Policy {
                     return Err("nested grant image must be explicitly allowed locally".into());
                 }
                 nested.push((target.to_string(), image.to_string()));
+            }
+        }
+        let mut contained = Vec::<contained::Grant>::new();
+        if let Some(grants) = value.get("allowed_contained_nested") {
+            let grants = grants
+                .as_array()
+                .ok_or("contained grants must be an array")?;
+            if grants.len() > 1024 {
+                return Err("contained grant budget exceeded".into());
+            }
+            for raw in grants {
+                let grant = contained::Grant::parse(raw)?;
+                if nested.iter().any(|(id, _)| id == &grant.uuid)
+                    || contained
+                        .iter()
+                        .any(|previous| previous.uuid == grant.uuid || previous.overlaps(&grant))
+                {
+                    return Err("contained UUID/ranges/volume-root overlap another grant".into());
+                }
+                if !images
+                    .iter()
+                    .any(|image| digest(image).ok() == Some(grant.image.as_str()))
+                {
+                    return Err("contained grant image must be explicitly allowed locally".into());
+                }
+                grant.verify_network(&scope)?;
+                contained.push(grant);
             }
         }
         let operations = tokens(&value["allowed_operations"])?;
@@ -491,6 +521,7 @@ impl Policy {
             gid,
             images,
             nested,
+            contained,
             operations,
             max_memory,
             max_cpus,
@@ -508,6 +539,31 @@ impl Policy {
         } else {
             Err("nested image/UUID/mount envelope is not granted by host policy".into())
         }
+    }
+    fn contained_grant(&self, target: &str) -> Option<&contained::Grant> {
+        self.contained.iter().find(|grant| grant.uuid == target)
+    }
+    fn observe_containment(
+        &self,
+        target: &str,
+        container: &mut Value,
+        record: &Value,
+    ) -> Result<(), Error> {
+        if record["containment"]["profile"] == contained::PROFILE {
+            let grant = self
+                .contained_grant(target)
+                .ok_or("contained grant removed; explicit recovery required")?;
+            let proof = grant.verify(container, &record["containment"])?;
+            container["PodMeshContainment"] = proof;
+        } else {
+            if self.contained_grant(target).is_some()
+                || container["Config"]["Labels"][contained::LABEL] == contained::PROFILE
+            {
+                return Err("legacy identity cannot be silently adopted as contained".into());
+            }
+            container["PodMeshContainment"] = json!({"profile":if container["HostConfig"]["Privileged"] == true {"legacy-host-root"} else {"flat"}, "runtime_verified":false});
+        }
+        Ok(())
     }
     fn bind_intent(&self, intent: &Value) -> Result<(), Error> {
         use sha2::{Digest, Sha256};
@@ -620,7 +676,7 @@ impl Policy {
             .cloned())
     }
     fn owned(&self, id: &str) -> Result<Value, Error> {
-        let c = self.inspect(id)?.ok_or("owned universe absent")?;
+        let mut c = self.inspect(id)?.ok_or("owned universe absent")?;
         let mut record: Value = serde_json::from_slice(&fs::read(self.record_path(id)?)?)?;
         let labels = &c["Config"]["Labels"];
         if labels[SCOPE_LABEL] != self.scope
@@ -638,6 +694,7 @@ impl Policy {
             record["container_id"] = json!(actual);
             self.write_record(id, &record)?;
         }
+        self.observe_containment(id, &mut c, &record)?;
         Ok(c)
     }
     fn images(&self) -> Result<Vec<Value>, Error> {
@@ -804,8 +861,17 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
     let allowed: &[&str] = match kind {
         "inventory" | "images" | "host_capacity" | "host_identity" | "storage_status"
         | "host_status" | "universe_stats" => &["kind"],
-        "inspect" | "start" | "pause" | "unpause" | "rm" | "cgroup_limits" => &["kind", "uuid"],
-        "create" => &["kind", "uuid", "image", "command", "labels", "nested"],
+        "inspect" | "start" | "pause" | "unpause" | "rm" | "cgroup_limits"
+        | "recovery_bindings" => &["kind", "uuid"],
+        "create" => &[
+            "kind",
+            "uuid",
+            "image",
+            "command",
+            "labels",
+            "nested",
+            "containment",
+        ],
         "stop" => &["kind", "uuid", "timeout_seconds"],
         "signal" => &["kind", "uuid", "signal"],
         "resources" => &["kind", "uuid", "memory_bytes", "cpus"],
@@ -868,6 +934,21 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
                 json!({"exit_code":0,"stdout":serde_json::to_string(&containers)?,"stderr":""}),
             );
         }
+        "recovery_bindings" => {
+            let target = text(a, "uuid")?;
+            let c = policy.owned(target)?;
+            let record: Value = serde_json::from_slice(&fs::read(policy.record_path(target)?)?)?;
+            let grant = policy
+                .contained_grant(target)
+                .ok_or("full-volume bindings require a contained grant")?;
+            return Ok(
+                json!({"type":"podmesh-contained-recovery-bindings/1", "scope":policy.scope,
+                "universe_uuid":target, "container_id":c["Id"], "image":c["Image"], "base_image":record["base_image"],
+                "containment":c["PodMeshContainment"], "binding":record["containment"], "mounts":grant.value["mounts"],
+                "state":c["State"], "rootfs_clone_supported":false,
+                "recovery_contract":"stop-source; logical-dumps-and-full-declared-volume-copy; separately-custodied-keys; new-empty-target-under-a-distinct-grant; useful-post-restore-proof"}),
+            );
+        }
         "cgroup_limits" => {
             let c = policy.owned(text(a, "uuid")?)?;
             return Ok(crate::lifecycle::cgroup_limits_local(&c).unwrap_or(Value::Null));
@@ -900,7 +981,10 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
             )?;
             if labels["io.podmesh.universe"] != target
                 || labels["io.podmesh.creation-operation"] != id
-                || labels["io.podmesh.network-profile"] != "isolated"
+                || !matches!(
+                    labels["io.podmesh.network-profile"].as_str(),
+                    Some("isolated" | "host-policy")
+                )
             {
                 return Err("create labels are outside isolated operation binding".into());
             }
@@ -909,7 +993,11 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
             if intent["operation"] == "create" {
                 if digest(text(intent, "image")?)? != image
                     || intent["command"] != a["command"]
-                    || intent["network_profile"] != "isolated"
+                    || !matches!(
+                        intent["network_profile"].as_str(),
+                        Some("isolated" | "host-policy")
+                    )
+                    || intent["network_profile"] != labels["io.podmesh.network-profile"]
                     || intent.get("secrets").is_some()
                     || intent.get("manager_host_state").is_some()
                 {
@@ -943,14 +1031,44 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
             if !matches!(profile, "flat" | "nested") || nested != (profile == "nested") {
                 return Err("nested capability differs from typed universe profile".into());
             }
+            if labels["io.podmesh.network-profile"] == "host-policy"
+                && policy.contained_grant(target).is_none()
+            {
+                return Err("host-policy profile requires an exact contained nested grant".into());
+            }
+            if policy.contained_grant(target).is_some() && !nested {
+                return Err("contained nested grant cannot be used as a flat universe".into());
+            }
             if intent["operation"] == "create" {
                 if intent["universe_profile"].as_str().unwrap_or("flat") != profile {
                     return Err("universe profile differs from committed operation".into());
                 }
                 if nested {
-                    policy.require_nested(target, image)?;
+                    if let Some(grant) = policy.contained_grant(target) {
+                        if grant.image != image
+                            || a["containment"] != contained::PROFILE
+                            || intent["network_profile"] != "host-policy"
+                        {
+                            return Err("contained create requires exact image and explicit host-policy selection".into());
+                        }
+                        grant.verify_network(&policy.scope)?;
+                        grant.verify_unused_ranges()?;
+                    } else {
+                        policy.require_nested(target, image)?;
+                        if intent["network_profile"] != "isolated"
+                            || (a.get("containment").is_some()
+                                && a["containment"] != "legacy-host-root")
+                        {
+                            return Err(
+                                "legacy nested cannot satisfy requested containment profile".into(),
+                            );
+                        }
+                    }
                 }
             } else {
+                if policy.contained_grant(target).is_some() {
+                    return Err("contained cloning requires full declared-volume recovery; rootfs-only clone refused".into());
+                }
                 let source = policy.owned(text(intent, "source_uuid")?)?;
                 let source_nested =
                     source["Config"]["Labels"]["io.podmesh.universe-profile"] == "nested";
@@ -966,7 +1084,20 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
                 }
             }
             use sha2::{Digest, Sha256};
-            let action_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(a)?));
+            let envelope = policy
+                .contained_grant(target)
+                .map(contained::Grant::binding);
+            let mut legacy_action = a.clone();
+            legacy_action
+                .as_object_mut()
+                .ok_or("typed action required")?
+                .remove("containment");
+            let binding = if envelope.is_some() {
+                json!({"action":a,"containment":envelope})
+            } else {
+                legacy_action
+            };
+            let action_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&binding)?));
             let record_path = policy.record_path(target)?;
             if record_path.exists() {
                 let previous: Value = serde_json::from_slice(&fs::read(&record_path)?)?;
@@ -991,12 +1122,14 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
                 }
                 policy.write_record(
                     target,
-                    &json!({"operation_id":id,"action_sha256":action_hash,"container_id":null,"base_image":if intent["operation"] == "create" { json!(image) } else { let source_record: Value = serde_json::from_slice(&fs::read(policy.record_path(text(intent,"source_uuid")?)?)?)?; source_record["base_image"].clone() }}),
+                    &json!({"operation_id":id,"action_sha256":action_hash,"container_id":null,"containment":envelope.clone().unwrap_or(json!({"profile":if nested {"legacy-host-root"} else {"flat"}})),"base_image":if intent["operation"] == "create" { json!(image) } else { let source_record: Value = serde_json::from_slice(&fs::read(policy.record_path(text(intent,"source_uuid")?)?)?)?; source_record["base_image"].clone() }}),
                 )?;
             }
             if policy.inspect(target)?.is_some() {
                 let c = policy.owned(target)?;
-                verify_created_envelope(&c, nested)?;
+                if envelope.is_none() {
+                    verify_created_envelope(&c, nested)?;
+                }
                 return Ok(json!({"exit_code":0,"stdout":text(&c,"Id")?,"stderr":""}));
             }
             let record: Value = serde_json::from_slice(&fs::read(policy.record_path(target)?)?)?;
@@ -1009,7 +1142,13 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
             args = vec![
                 "create".into(),
                 "--pull=never".into(),
-                "--network=none".into(),
+                format!(
+                    "--network={}",
+                    policy
+                        .contained_grant(target)
+                        .map(|grant| grant.value["network"].as_str().unwrap())
+                        .unwrap_or("none")
+                ),
                 "--image-volume=ignore".into(),
                 "--pid=private".into(),
                 "--ipc=private".into(),
@@ -1023,7 +1162,13 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
                 "--name".into(),
                 format!("podmesh-{target}"),
             ];
-            if nested {
+            if let Some(grant) = policy.contained_grant(target) {
+                args.extend(grant.arguments());
+                args.extend([
+                    "--label".into(),
+                    format!("{}={}", contained::LABEL, contained::PROFILE),
+                ]);
+            } else if nested {
                 args.push("--privileged".into());
             } else {
                 args.extend([
@@ -1049,6 +1194,9 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
         "snapshot" => {
             let source = text(a, "source_uuid")?;
             let c = policy.owned(source)?;
+            if c["PodMeshContainment"]["profile"] == contained::PROFILE {
+                return Err("contained cloning requires full declared-volume recovery; rootfs-only snapshot refused".into());
+            }
             if !crate::lifecycle::STOPPED.contains(&crate::lifecycle::status(&c))
                 || !c["Mounts"].as_array().is_some_and(Vec::is_empty)
             {
@@ -1183,9 +1331,47 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
     let out = command(limit, &args)?;
     if kind == "create" && out.status.success() {
         let observed = policy.owned(target)?;
-        verify_created_envelope(&observed, a["nested"].as_bool().unwrap_or(false))?;
+        if policy.contained_grant(target).is_none() {
+            verify_created_envelope(&observed, a["nested"].as_bool().unwrap_or(false))?;
+        }
     }
-    Ok(output(out))
+    let mut response = output(out);
+    if out_success(&response)
+        && matches!(
+            kind,
+            "create" | "start" | "pause" | "unpause" | "stop" | "resources"
+        )
+    {
+        let observed = match policy.owned(target) {
+            Ok(observed) => observed,
+            Err(error)
+                if policy.contained_grant(target).is_some()
+                    && matches!(kind, "start" | "unpause") =>
+            {
+                // A launch/resume whose kernel boundary cannot be proven must not stay available.
+                // The saved immutable ID was checked before the command; never stop a foreign name.
+                let record: Value =
+                    serde_json::from_slice(&fs::read(policy.record_path(target)?)?)?;
+                let container_id = text(&record, "container_id")?;
+                let stopped = command(
+                    40,
+                    &[
+                        "stop".into(),
+                        "--time".into(),
+                        "10".into(),
+                        container_id.into(),
+                    ],
+                )?;
+                return Err(format!("contained runtime verification failed: {error}; owned stop exit {:?}; state and volumes retained", stopped.status.code()).into());
+            }
+            Err(error) => return Err(error),
+        };
+        response["containment"] = observed["PodMeshContainment"].clone();
+    }
+    Ok(response)
+}
+fn out_success(value: &Value) -> bool {
+    value["exit_code"] == 0
 }
 
 /// Host-only server. Policy/state must be prepared explicitly; socket endpoint is never replaced.
@@ -1475,6 +1661,7 @@ mod tests {
             gid: 1102,
             images: vec![],
             nested: vec![(U.into(), "a".repeat(64))],
+            contained: vec![],
             operations: vec![],
             max_memory: 33554432,
             max_cpus: 1.0,
@@ -1495,6 +1682,7 @@ mod tests {
             gid: 1102,
             images: vec![],
             nested: vec![],
+            contained: vec![],
             operations: vec!["start".into()],
             max_memory: 33554432,
             max_cpus: 1.0,
@@ -1515,6 +1703,99 @@ mod tests {
 #[cfg(test)]
 mod real_effect_tests {
     use super::*;
+    /// Explicit host fixture only: real provider effects and kernel observations, never a stub.
+    /// The fixture owns a fresh grant UUID, image, protected volumes and empty state directory.
+    #[test]
+    fn real_contained_nested_provider_when_explicitly_named() {
+        let Some(path) = std::env::var_os("PODMESH_HOST_CONTAINED_FIXTURE") else {
+            eprintln!("not armed: PODMESH_HOST_CONTAINED_FIXTURE names no owned host fixture");
+            return;
+        };
+        let fixture: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        fields(&fixture, &["scope", "state_dir", "grant", "command"]).unwrap();
+        let grant = contained::Grant::parse(&fixture["grant"]).unwrap();
+        let target = grant.uuid.clone();
+        let state = PathBuf::from(text(&fixture, "state_dir").unwrap());
+        protected_ancestors(&state).unwrap();
+        let metadata = fs::symlink_metadata(&state).unwrap();
+        assert!(
+            metadata.is_dir()
+                && metadata.uid() == 0
+                && metadata.permissions().mode() & 0o777 == 0o700
+        );
+        assert_eq!(
+            fs::read_dir(&state).unwrap().count(),
+            0,
+            "fixture state must be fresh"
+        );
+        let policy = Policy {
+            scope: text(&fixture, "scope").unwrap().into(),
+            uid: 1102,
+            gid: 1102,
+            images: vec![grant.image.clone()],
+            nested: vec![],
+            contained: vec![grant],
+            operations: vec![
+                "create".into(),
+                "start".into(),
+                "stop".into(),
+                "pause".into(),
+                "resume".into(),
+                "delete".into(),
+            ],
+            max_memory: 256 * 1024 * 1024,
+            max_cpus: 1.0,
+            max_universes: 4,
+            state,
+        };
+        let id = format!("contained-{target}");
+        let create = json!({"operation":"create","operation_id":id,"universe_uuid":target,
+            "authorization_ref":"explicit isolated contained engineering fixture", "universe_profile":"nested",
+            "image":policy.images[0], "command":fixture["command"], "network_profile":"host-policy"});
+        let action = json!({"kind":"create","uuid":target,"image":policy.images[0],"command":fixture["command"],
+            "nested":true,"containment":contained::PROFILE, "labels":{"io.podmesh.universe":target,
+                "io.podmesh.creation-operation":id,"io.podmesh.network-profile":"host-policy","io.podmesh.universe-profile":"nested"}});
+        let request = json!({"protocol":PROTOCOL,"action":action,"intent":create});
+        let created = execute(&policy, &request).unwrap();
+        assert_eq!(created["exit_code"], 0);
+        assert_eq!(created["containment"]["profile"], contained::PROFILE);
+        for (operation, kind) in [
+            ("start", "start"),
+            ("pause", "pause"),
+            ("resume", "unpause"),
+            ("stop", "stop"),
+        ] {
+            let mut intent = json!({"operation":operation,"operation_id":format!("{id}-{operation}"),"universe_uuid":target,
+                "authorization_ref":"explicit isolated contained engineering fixture"});
+            let mut action = json!({"kind":kind,"uuid":target});
+            if operation == "stop" {
+                intent["timeout_seconds"] = json!(10);
+                intent["on_timeout"] = json!("kill");
+                action["timeout_seconds"] = json!(10);
+            }
+            let outcome = execute(
+                &policy,
+                &json!({"protocol":PROTOCOL,"action":action,"intent":intent}),
+            )
+            .unwrap();
+            assert_eq!(outcome["exit_code"], 0, "{operation}: {outcome}");
+            if operation != "stop" {
+                assert_eq!(outcome["containment"]["runtime_verified"], true);
+            }
+            if operation == "start" {
+                // Retry original create while running: own mappings must not conflict with themselves.
+                assert_eq!(execute(&policy, &request).unwrap()["exit_code"], 0);
+                let recovery = execute(&policy,&json!({"protocol":PROTOCOL,"action":{"kind":"recovery_bindings","uuid":target},"intent":null})).unwrap();
+                assert_eq!(recovery["binding"]["profile"], contained::PROFILE);
+                assert_eq!(recovery["rootfs_clone_supported"], false);
+            }
+        }
+        let deleted = execute(&policy,&json!({"protocol":PROTOCOL,"action":{"kind":"rm","uuid":target},
+            "intent":{"operation":"delete","operation_id":format!("{id}-delete"),"universe_uuid":target,
+                "authorization_ref":"explicit isolated contained engineering fixture"}})).unwrap();
+        assert_eq!(deleted["exit_code"], 0);
+        // Declared volumes, provider records and evidence remain for the fixture owner.
+    }
     /// Real host-effect engineering test, explicitly armed with an already-local immutable image.
     /// It does not replace private-app+MariaDB+peer/restore qualification on the runtime hosts.
     #[test]
@@ -1565,6 +1846,7 @@ mod real_effect_tests {
             } else {
                 vec![]
             },
+            contained: vec![],
             operations: vec![
                 "create",
                 "start",

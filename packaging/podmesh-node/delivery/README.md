@@ -181,3 +181,30 @@ retained-workload rollback refusal, interrupted preparation preservation and exa
 owned cleanup. Record actual start failure and socket-restart behavior. Full node
 host-storage restoration, physical growth, nested inner workload continuity and
 unported A/B capabilities remain separate required product work and proofs.
+
+
+## New contained source candidates
+
+The historical `build-deb.py` and its fixed binary/image hashes remain the old
+qualified capsule recipe. They never acquire the `userns-v1` behavior by a label
+or documentation change. Use `build-candidate.py` to package newly built immutable
+bytes for a new source candidate, then qualify that package independently.
+
+The additional required `--candidate-lock` input has exactly `source_revision`,
+`provider_source_revision`, `database_image`, `database_archive_sha256`,
+`database_manifest_digest` and `base_registry_digest`. Revisions are full Git
+commits; image/manifest/base values are full `sha256:` digests, and the archive
+checksum is 64 hexadecimal characters. The build kit manifest also supplies
+`provider_source_revision`, `source.revision`, `source.sourceDateEpoch`,
+`oci.imageId`, `oci.manifestDigest`, and `artifacts` checksums for `podmeshd`,
+`podmesh-host-adapter`, and `application.oci.tar`. All payload and OCI descriptor,
+config and layer bytes are checked before packaging. The candidate lock is copied
+into the immutable package and included in its payload hashes. Packaging performs
+no compile, pull, installation or activation and grants no reuse of an older
+candidate's runtime evidence.
+
+For a contained nested universe, use the host policy and exact node operation
+packet documented in [HOST-ADAPTER-CONTRACT.md](../../../docs/HOST-ADAPTER-CONTRACT.md#contained-grant-and-recovery-handoff).
+The provider stores its source-directory identity/grant binding and supplies the
+read-only `universe_recovery_bindings` handoff for full declared-volume recovery;
+a successful rootfs-only clone never qualifies that path.
