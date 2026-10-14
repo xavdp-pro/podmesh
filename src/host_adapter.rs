@@ -139,8 +139,14 @@ fn typed(args: &[&str]) -> Result<Value, Error> {
             if privileged && labels.get("io.podmesh.universe-profile") != Some(&json!("nested")) {
                 return Err("nested privilege must carry its typed universe profile".into());
             }
+            let containment = match (privileged, labels.get("io.podmesh.network-profile").and_then(Value::as_str)) {
+                (true, Some("host-policy")) => contained::PROFILE,
+                (true, None | Some("isolated")) => "legacy-host-root",
+                (false, None | Some("isolated")) => "flat",
+                _ => return Err("host adapter create requires an isolated or contained host-policy network profile".into()),
+            };
             let image = digest(rest[i])?;
-            json!({"kind":"create","uuid":name.ok_or("missing container name")?,"image":image,"command":&rest[i+1..],"labels":labels,"nested":privileged,"containment":if privileged { if labels["io.podmesh.network-profile"] == "host-policy" { contained::PROFILE } else { "legacy-host-root" } } else { "flat" }})
+            json!({"kind":"create","uuid":name.ok_or("missing container name")?,"image":image,"command":&rest[i+1..],"labels":labels,"nested":privileged,"containment":containment})
         }
         ["update", rest @ ..] if !rest.is_empty() => {
             let id = named(rest[rest.len() - 1])?;
@@ -1489,6 +1495,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(action["nested"], true);
+        assert_eq!(action["containment"], "legacy-host-root");
         assert!(typed(&[
             "create",
             "--pull=never",
@@ -1513,6 +1520,15 @@ mod tests {
             &image
         ])
         .is_err());
+    }
+    #[test]
+    fn create_conversion_rejects_unknown_or_flat_host_policy_network_labels() {
+        let name = format!("podmesh-{U}");
+        let image = format!("sha256:{}", "a".repeat(64));
+        for profile in ["io.podmesh.network-profile=unknown", "io.podmesh.network-profile=", "io.podmesh.network-profile=host-policy"] {
+            assert!(typed(&["create", "--pull=never", "--network=none", "--name", &name,
+                "--label", profile, &image, "sleep", "60"]).is_err());
+        }
     }
     #[test]
     fn lifecycle_arguments_cross_as_typed_fields_without_flags() {
@@ -1706,6 +1722,7 @@ mod real_effect_tests {
     /// Explicit host fixture only: real provider effects and kernel observations, never a stub.
     /// The fixture owns a fresh grant UUID, image, protected volumes and empty state directory.
     #[test]
+    #[ignore = "requires an explicitly owned contained runtime fixture"]
     fn real_contained_nested_provider_when_explicitly_named() {
         let Some(path) = std::env::var_os("PODMESH_HOST_CONTAINED_FIXTURE") else {
             eprintln!("not armed: PODMESH_HOST_CONTAINED_FIXTURE names no owned host fixture");
