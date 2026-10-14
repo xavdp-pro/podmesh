@@ -131,6 +131,32 @@ mod tests {
         assert!(grant.verify(&c, &changed).is_err());
     }
     #[test]
+    fn owned_shutdown_observation_never_claims_live_runtime_proof() {
+        let grant = fixture();
+        let mut c = observed();
+        c["State"]["Running"] = json!(true);
+        // The full verifier must reject an active instance with no valid live PID.
+        assert!(grant.verify(&c, &grant.binding()).is_err());
+        let proof = grant
+            .verify_during_owned_stop(&c, &grant.binding())
+            .unwrap();
+        assert_eq!(proof["configuration_verified"], true);
+        assert_eq!(proof["runtime_verified"], false);
+        assert_eq!(
+            proof["runtime_observation"],
+            "owned-stop-in-progress; live-mount-proof-not-claimed"
+        );
+        c["HostConfig"]["Privileged"] = json!(true);
+        assert!(grant
+            .verify_during_owned_stop(&c, &grant.binding())
+            .is_err());
+        c = observed();
+        c["HostConfig"]["IDMappings"]["UidMap"] = json!(["0:0:65536"]);
+        assert!(grant
+            .verify_during_owned_stop(&c, &grant.binding())
+            .is_err());
+    }
+    #[test]
     fn invalid_ranges_and_unrecognized_policy_inputs_refuse_before_paths() {
         let mut raw = fixture().value;
         raw["uid_start"] = json!(0);
@@ -517,6 +543,26 @@ impl Grant {
         Ok(())
     }
     pub fn verify(&self, c: &Value, binding: &Value) -> Result<Value, Error> {
+        self.verify_observation(c, binding, true)
+    }
+    // Caller must prove successful stop dispatch for this exact process generation.
+    // Configuration remains mandatory; shutdown may already have unmounted volumes.
+    pub(super) fn verify_during_owned_stop(
+        &self,
+        c: &Value,
+        binding: &Value,
+    ) -> Result<Value, Error> {
+        let mut proof = self.verify_observation(c, binding, false)?;
+        proof["runtime_observation"] =
+            json!("owned-stop-in-progress; live-mount-proof-not-claimed");
+        Ok(proof)
+    }
+    fn verify_observation(
+        &self,
+        c: &Value,
+        binding: &Value,
+        verify_live: bool,
+    ) -> Result<Value, Error> {
         if &self.binding() != binding {
             return Err(
                 "contained grant/source identity changed; explicit recovery rebind required".into(),
@@ -625,7 +671,7 @@ impl Grant {
         } else {
             proof["idmap_evidence"] = json!("podman-inspect-idmap-options");
         }
-        if c["State"]["Running"] == true || c["State"]["Paused"] == true {
+        if verify_live && (c["State"]["Running"] == true || c["State"]["Paused"] == true) {
             let pid = c["State"]["Pid"]
                 .as_u64()
                 .filter(|v| *v > 0)

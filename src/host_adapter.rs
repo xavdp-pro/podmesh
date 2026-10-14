@@ -554,12 +554,17 @@ impl Policy {
         target: &str,
         container: &mut Value,
         record: &Value,
+        stopping: bool,
     ) -> Result<(), Error> {
         if record["containment"]["profile"] == contained::PROFILE {
             let grant = self
                 .contained_grant(target)
                 .ok_or("contained grant removed; explicit recovery required")?;
-            let proof = grant.verify(container, &record["containment"])?;
+            let proof = if stopping {
+                grant.verify_during_owned_stop(container, &record["containment"])?
+            } else {
+                grant.verify(container, &record["containment"])?
+            };
             container["PodMeshContainment"] = proof;
         } else {
             if self.contained_grant(target).is_some()
@@ -682,6 +687,9 @@ impl Policy {
             .cloned())
     }
     fn owned(&self, id: &str) -> Result<Value, Error> {
+        self.owned_observation(id, None)
+    }
+    fn owned_observation(&self, id: &str, stop_intent: Option<&Value>) -> Result<Value, Error> {
         let mut c = self.inspect(id)?.ok_or("owned universe absent")?;
         let mut record: Value = serde_json::from_slice(&fs::read(self.record_path(id)?)?)?;
         let labels = &c["Config"]["Labels"];
@@ -700,7 +708,9 @@ impl Policy {
             record["container_id"] = json!(actual);
             self.write_record(id, &record)?;
         }
-        self.observe_containment(id, &mut c, &record)?;
+        let stopping = stop_intent
+            .is_some_and(|intent| confirmed_stop_observation(&record, &c, intent, epoch_seconds()));
+        self.observe_containment(id, &mut c, &record, stopping)?;
         Ok(c)
     }
     fn images(&self) -> Result<Vec<Value>, Error> {
@@ -964,7 +974,17 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
             let containers = if policy.inspect(id)?.is_none() {
                 vec![]
             } else {
-                vec![policy.owned(id)?]
+                let intent = &request["intent"];
+                if intent["operation"] == "stop" {
+                    validate_intent(&json!({"kind":"stop", "uuid":id}), intent)?;
+                    if !policy.operations.iter().any(|v| v == "stop") {
+                        return Err("operation outside host-owned policy".into());
+                    }
+                    policy.bind_intent(intent)?;
+                    vec![policy.owned_observation(id, Some(intent))?]
+                } else {
+                    vec![policy.owned(id)?]
+                }
             };
             return Ok(
                 json!({"exit_code":0,"stdout":serde_json::to_string(&containers)?,"stderr":""}),
@@ -1003,6 +1023,7 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
     policy.bind_intent(intent)?;
     let mut args: Vec<String> = Vec::new();
     let mut limit = 30;
+    let mut stop_receipt = None;
     match kind {
         "create" => {
             let labels = &a["labels"];
@@ -1355,9 +1376,38 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
                 }
                 _ => return Err("unsupported owned effect".into()),
             }
+            if matches!(kind, "stop" | "signal") && policy.contained_grant(target).is_some() {
+                // owned() above proved the live boundary BEFORE dispatch. Bind the
+                // subsequent state-only observation to that exact run, never a restart.
+                if c["State"]["Running"] == true
+                    && c["PodMeshContainment"]["runtime_verified"] != true
+                {
+                    return Err("stop needs prior verified contained runtime".into());
+                }
+                stop_receipt = Some(json!({"operation_id":id,"universe_uuid":target,
+                    "container_id":c["Id"],"started_at":c["State"]["StartedAt"],
+                    "host_pid":c["State"]["Pid"],"command":kind,
+                    "issued_at":epoch_seconds(),"timeout_seconds":intent["timeout_seconds"],
+                    "prior_containment":c["PodMeshContainment"],"dispatch_succeeded":true}));
+                // Use the immutable owned ID for the effect, avoiding a name replacement.
+                if let Some(last) = args.last_mut() {
+                    *last = text(&c, "Id")?.into();
+                }
+            }
         }
     }
     let out = command(limit, &args)?;
+    if out.status.success() {
+        if let Some(receipt) = stop_receipt {
+            let mut record: Value =
+                serde_json::from_slice(&fs::read(policy.record_path(target)?)?)?;
+            if record["container_id"] != receipt["container_id"] {
+                return Err("owned stop receipt container changed".into());
+            }
+            record["stop_observation"] = receipt;
+            policy.write_record(target, &record)?;
+        }
+    }
     if kind == "create" && out.status.success() {
         let observed = policy.owned(target)?;
         if policy.contained_grant(target).is_none() {
@@ -1371,7 +1421,12 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
             "create" | "start" | "pause" | "unpause" | "stop" | "resources"
         )
     {
-        let observed = match policy.owned(target) {
+        let observation = if kind == "stop" {
+            policy.owned_observation(target, Some(intent))
+        } else {
+            policy.owned(target)
+        };
+        let observed = match observation {
             Ok(observed) => observed,
             Err(error)
                 if policy.contained_grant(target).is_some()
@@ -1399,6 +1454,54 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
     }
     Ok(response)
 }
+fn epoch_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+// A successful dispatch is a shutdown observation authority, not current runtime
+// qualification. Never extend it to another operation, container or process run.
+fn confirmed_stop_observation(record: &Value, container: &Value, intent: &Value, now: u64) -> bool {
+    let saved = &record["stop_observation"];
+    let active = container["State"]["Running"] == true || container["State"]["Paused"] == true;
+    let Some(issued) = saved["issued_at"].as_u64().filter(|t| *t > 0) else {
+        return false;
+    };
+    let Some(timeout) = intent["timeout_seconds"].as_u64().filter(|t| *t <= 300) else {
+        return false;
+    };
+    intent["operation"] == "stop"
+        && matches!(
+            intent["on_timeout"].as_str(),
+            Some("kill" | "leave_running")
+        )
+        && saved["dispatch_succeeded"] == true
+        && ((saved["command"] == "signal" && intent["on_timeout"] == "leave_running")
+            || (saved["command"] == "stop" && intent["on_timeout"] == "kill"))
+        && saved["operation_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+        && saved["operation_id"] == intent["operation_id"]
+        && saved["universe_uuid"] == intent["universe_uuid"]
+        && saved["timeout_seconds"] == intent["timeout_seconds"]
+        && saved["container_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+        && saved["container_id"] == record["container_id"]
+        && saved["container_id"] == container["Id"]
+        && saved["started_at"].as_str().is_some_and(|s| !s.is_empty())
+        && saved["started_at"] == container["State"]["StartedAt"]
+        && (!active
+            || (saved["host_pid"].as_u64().is_some_and(|pid| pid > 0)
+                && saved["host_pid"] == container["State"]["Pid"]
+                && saved["prior_containment"]["runtime_verified"] == true))
+        && saved["prior_containment"]["configuration_verified"] == true
+        && saved["prior_containment"]["profile"] == contained::PROFILE
+        && now >= issued
+        && now - issued <= timeout + 30
+}
+
 fn out_success(value: &Value) -> bool {
     value["exit_code"] == 0
 }
@@ -1461,6 +1564,85 @@ pub fn serve(policy_path: &Path, socket: &Path) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stop_observation_is_bound_to_successful_dispatch_and_exact_run() {
+        let intent = json!({"operation":"stop", "operation_id":"stop-current", "universe_uuid":"owned",
+            "timeout_seconds":90,"on_timeout":"leave_running"});
+        let container = json!({"Id":"immutable-container", "State":{"Running":true,"Paused":false,
+            "Pid":123,"StartedAt":"same-generation"}});
+        let record = json!({"container_id":"immutable-container", "stop_observation":{
+            "operation_id":"stop-current","universe_uuid":"owned","container_id":"immutable-container",
+            "started_at":"same-generation","host_pid":123,"issued_at":1000,
+            "timeout_seconds":90,"command":"signal","dispatch_succeeded":true,
+            "prior_containment":{"profile":contained::PROFILE,"configuration_verified":true,"runtime_verified":true}}});
+        assert!(confirmed_stop_observation(
+            &record, &container, &intent, 1001
+        ));
+        assert!(!confirmed_stop_observation(
+            &json!({}),
+            &container,
+            &intent,
+            1001
+        ));
+        for (pointer, value) in [
+            ("/stop_observation/operation_id", json!("foreign")),
+            ("/stop_observation/universe_uuid", json!("foreign")),
+            ("/stop_observation/container_id", json!("replacement")),
+            ("/container_id", json!("replacement")),
+            ("/stop_observation/started_at", json!("previous-generation")),
+            ("/stop_observation/host_pid", json!(124)),
+            ("/stop_observation/dispatch_succeeded", json!(false)),
+            ("/stop_observation/command", json!("stop")),
+            ("/stop_observation/timeout_seconds", json!(91)),
+            (
+                "/stop_observation/prior_containment/runtime_verified",
+                json!(false),
+            ),
+            (
+                "/stop_observation/prior_containment/configuration_verified",
+                json!(false),
+            ),
+            (
+                "/stop_observation/prior_containment/profile",
+                json!("legacy-host-root"),
+            ),
+        ] {
+            let mut changed = record.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                !confirmed_stop_observation(&changed, &container, &intent, 1001),
+                "{pointer}"
+            );
+        }
+        for (pointer, value) in [
+            ("/Id", json!("replacement")),
+            ("/State/StartedAt", json!("new-generation")),
+            ("/State/Pid", json!(456)),
+        ] {
+            let mut changed = container.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                !confirmed_stop_observation(&record, &changed, &intent, 1001),
+                "{pointer}"
+            );
+        }
+        let mut changed = intent.clone();
+        changed["operation"] = json!("start");
+        assert!(!confirmed_stop_observation(
+            &record, &container, &changed, 1001
+        ));
+        assert!(!confirmed_stop_observation(
+            &record, &container, &intent, 999
+        ));
+        assert!(!confirmed_stop_observation(
+            &record, &container, &intent, 1121
+        ));
+        let mut stopped = container.clone();
+        stopped["State"]["Running"] = json!(false);
+        stopped["State"]["Pid"] = json!(0);
+        assert!(confirmed_stop_observation(&record, &stopped, &intent, 1005));
+    }
+
     use super::*;
     const U: &str = "24e5b403-0fbf-43bf-b657-fd54277a2bda";
     fn intent(operation: &str) -> Value {

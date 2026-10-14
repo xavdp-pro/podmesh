@@ -181,3 +181,19 @@ continuity proof is supplied by this source increment. Arbitrary mount/device or
 namespace flags remain rejected; managed network, secrets and host-state mounts,
 migration/replication effects and imported lease/epoch boot gates remain unported.
 The initial flat-only increment above is historical scope, not the product target.
+
+### Observation while an owned stop is completing
+
+The provider verifies the complete contained runtime before sending a stop signal.
+A successful dispatch then records an atomic root-owned receipt bound to the
+immutable stop intent, container ID, start timestamp and observed host PID.
+Inspection inside that same committed stop may observe shutdown without requiring
+live volume mount ownership: systemd can unmount those volumes before PID 1 exits.
+This exception lasts only the declared timeout plus the 30-second command margin;
+a missing, failed, foreign, expired or restarted-generation receipt retains the
+complete verifier. Static grant, source identity, container ownership, configuration
+and actual OCI idmaps remain mandatory. The shutdown view explicitly reports
+`runtime_verified=false`, with `runtime_observation=owned-stop-in-progress; live-mount-proof-not-claimed`.
+Ordinary inspection, inventory and recovery queries always require the full live
+proof. The application still waits for process exit and rejects a changed start
+timestamp; a successful signal receipt alone never proves a completed stop.
