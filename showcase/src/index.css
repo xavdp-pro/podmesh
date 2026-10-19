@@ -1,0 +1,111 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens strictly aligned with xavdp.pro on gbs-l0 ("Atelier Vivant").
+ * Warm organic base, living green anchor, terracotta craft, electric cyan signal.
+ */
+@theme {
+  --color-canvas: #faf7f2;
+  --color-canvas-alt: #f2ece2;
+  --color-surface: #fffdfa;
+  --color-surface-2: #f2ece2;
+  --color-line: #e3dacb;
+  --color-fg: #10231b;
+  --color-fg-muted: #4a5a51;
+  --color-fg-faint: #68756d;
+  --color-accent: #0f6b46;
+  --color-accent-hover: #064e3b;
+  --color-accent-soft: #e6f2ea;
+  --color-accent-fg: #ffffff;
+  --color-warm: #b4562c;
+  --color-warm-soft: #f8ece5;
+  --color-signal: #0f7c8c;
+  --color-danger: #dc2626;
+  --color-danger-soft: #fef2f2;
+  --color-success: #0f6b46;
+  --color-success-soft: #e6f2ea;
+  --color-warning: #b4562c;
+  --color-warning-soft: #f8ece5;
+}
+
+html.theme-dark,
+[data-theme='dark'] {
+  color-scheme: dark;
+  --color-canvas: #0c1512;
+  --color-canvas-alt: #121e19;
+  --color-surface: #142019;
+  --color-surface-2: #121e19;
+  --color-line: #33463b;
+  --color-fg: #eef4ef;
+  --color-fg-muted: #b3c4b9;
+  --color-fg-faint: #82948a;
+  --color-accent: #128255;
+  --color-accent-hover: #1fa968;
+  --color-accent-soft: #142a1e;
+  --color-accent-fg: #ffffff;
+  --color-warm: #e08b60;
+  --color-warm-soft: #2b1d15;
+  --color-signal: #4fc7d8;
+  --color-danger: #f87171;
+  --color-danger-soft: #3b1a1f;
+  --color-success: #1fa968;
+  --color-success-soft: #142a1e;
+  --color-warning: #e08b60;
+  --color-warning-soft: #2b1d15;
+}
+
+@custom-variant dark (&:where(.theme-dark, .theme-dark *));
+
+html {
+  -webkit-tap-highlight-color: transparent;
+  overflow-x: hidden;
+  overflow-y: auto;
+  min-height: 100%;
+}
+
+body {
+  font-family: Outfit, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background-color: var(--color-canvas);
+  color: var(--color-fg);
+  min-height: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  transition: background-color 220ms ease, color 220ms ease;
+}
+
+#root {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Serif titles carrying the human weight (xavdp.pro) */
+.site-display {
+  font-family: 'Iowan Old Style', 'Palatino Linotype', Palatino, Georgia, serif;
+  letter-spacing: -0.018em;
+}
+
+.site-mono {
+  font-family: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Monaco, Consolas, monospace;
+}
+
+/* Children shrinking */
+* {
+  min-width: 0;
+}
+
+:where(a[href], button:not(:disabled), [role="button"], [role="option"], summary, label[for]) {
+  cursor: pointer;
+}
+
+:where(button:disabled, [aria-disabled="true"], input:disabled, textarea:disabled) {
+  cursor: not-allowed;
+}
+
+.thin-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line) transparent;
+}

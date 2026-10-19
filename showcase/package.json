@@ -1,0 +1,44 @@
+{
+  "name": "podmesh-manager",
+  "version": "2.0.0",
+  "description": "PodMesh Phase 2 — Super Fractal Universe Manager (AI-First, Proxmox-Grade, MeshFS, PMBS, SHAPER OS v1.15).",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev:api": "node --watch server/index.js",
+    "dev:vite": "vite",
+    "build": "vite build",
+    "start": "node server/index.js",
+    "migrate": "node server/migrations/run.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^18.0.0",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.5.2",
+    "framer-motion": "^13.4.0",
+    "helmet": "^8.2.0",
+    "jsonwebtoken": "^9.0.3",
+    "lucide-react": "^1.8.0",
+    "mysql2": "^3.22.0",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "react-router-dom": "^7.14.1",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.2.2",
+    "@vitejs/plugin-react": "^6.0.1",
+    "supertest": "^7.2.2",
+    "tailwindcss": "^4.2.2",
+    "vite": "^8.0.8",
+    "vitest": "^5.0.1"
+  },
+  "license": "CC-BY-SA-4.0"
+}
