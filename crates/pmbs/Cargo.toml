@@ -1,0 +1,30 @@
+[package]
+name = "pmbs"
+version = "2.1.0"
+edition = "2021"
+authors = ["Xavier DP <xavier@xavdp.pro>", "PodMesh Team"]
+description = "PodMesh Backup Server (PMBS) — High-Performance Deduplicated Backup Server in Pure Rust"
+license = "Apache-2.0"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["multipart"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+hex = "0.4"
+clap = { version = "4.4", features = ["derive"] }
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1.5"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
