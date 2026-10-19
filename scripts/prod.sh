@@ -25,11 +25,15 @@ if [ -d "${ROOT_DIR}/showcase" ]; then
 fi
 
 # 3. Génération de tous les paquets Debian
-echo "--> [3/4] Génération de la suite complète de paquets Debian..."
+echo "--> [3/5] Génération de la suite complète de paquets Debian..."
 bash "${ROOT_DIR}/packaging/build-all-debs.sh"
 
-# 4. Synthèse et vérification des empreintes cryptographiques
-echo "--> [4/4] Validation des paquets générés..."
+# 4. Génération des 2 canaux de repositories APT Debian
+echo "--> [4/5] Indexation des 2 canaux de repositories APT Debian (DEV & PROD)..."
+bash "${ROOT_DIR}/packaging/generate-apt-repos.sh" all
+
+# 5. Synthèse et vérification des empreintes cryptographiques
+echo "--> [5/5] Validation des paquets générés..."
 echo ""
 echo "=========================================================="
 echo "  SUCCÈS : TOUS LES COMPOSANTS SONT PRÊTS POUR LA PRODUCTION"

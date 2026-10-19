@@ -1,0 +1,5 @@
+Types: deb
+URIs: https://deb.xavdp.pro/prod
+Suites: trixie-stable
+Components: main
+Signed-By: /etc/apt/keyrings/xavdp.gpg

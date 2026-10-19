@@ -1,0 +1,2 @@
+# Dépôt Debian APT PodMesh — Canal PRODUCTION (trixie-stable)
+deb [signed-by=/etc/apt/keyrings/xavdp.gpg] https://deb.xavdp.pro/prod trixie-stable main

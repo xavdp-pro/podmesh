@@ -90,6 +90,34 @@ make prod
 
 ---
 
+### 🌐 3. Deux Canaux de Repositories Debian APT (DEV & PROD)
+
+Le système intègre un générateur complet d'arborescences de dépôts Debian APT standards (`pool/main`, `dists/.../Packages.gz`, `Release`) scindé en deux canaux distincts :
+
+#### 🟡 Canal DÉVELOPPEMENT (`trixie-dev`)
+Dédié aux versions expérimentales, aux tests d'intégration continue et aux pré-versions :
+```bash
+# Générer le canal APT Dev
+make apt-dev
+
+# Fichier client sur les nœuds de test (/etc/apt/sources.list.d/podmesh-dev.list) :
+deb [signed-by=/etc/apt/keyrings/xavdp.gpg] https://deb.xavdp.pro/dev trixie-dev main
+```
+
+#### 🟢 Canal PRODUCTION (`trixie-stable`)
+Dédié aux déploiements stables sur les hyperviseurs Proxmox VE et serveurs de production :
+```bash
+# Générer le canal APT Prod
+make apt-prod
+
+# Fichier client sur les nœuds de production (/etc/apt/sources.list.d/podmesh-prod.list) :
+deb [signed-by=/etc/apt/keyrings/xavdp.gpg] https://deb.xavdp.pro/prod trixie-stable main
+```
+
+> **Note :** La commande `make apt-all` indexe et génère simultanément les deux canaux dans `dist/apt-repos/`.
+
+---
+
 ## 📦 Commandes du Makefile
 
 | Commande | Action |

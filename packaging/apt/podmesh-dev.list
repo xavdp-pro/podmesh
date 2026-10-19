@@ -1,0 +1,2 @@
+# Dépôt Debian APT PodMesh — Canal DÉVELOPPEMENT (trixie-dev)
+deb [signed-by=/etc/apt/keyrings/xavdp.gpg] https://deb.xavdp.pro/dev trixie-dev main

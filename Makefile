@@ -18,6 +18,16 @@ prod:
 packages:
 	@bash packaging/build-all-debs.sh
 
+# Génère les 2 repositories Debian APT (Canal DEV et Canal PROD)
+apt-all:
+	@bash packaging/generate-apt-repos.sh all
+
+apt-dev:
+	@bash packaging/generate-apt-repos.sh dev
+
+apt-prod:
+	@bash packaging/generate-apt-repos.sh prod
+
 # Exécute l'ensemble des tests unitaires du workspace Rust
 test:
 	@cargo test --workspace
