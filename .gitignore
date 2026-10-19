@@ -1,5 +1,5 @@
 /target/
-/dist/
+dist/
 /evidence/
 .env
 .env.*
@@ -9,3 +9,6 @@ __pycache__/
 *.pyc
 /operator-snapshots/
 node_modules/
+/data/
+!.env.*.example
+!.env.example

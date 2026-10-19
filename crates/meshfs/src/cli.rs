@@ -19,7 +19,7 @@ pub const DEFAULT_SOCKET: &str = "/var/lib/meshfs/meshfs.sock";
 )]
 pub struct Cli {
     /// Enable verbose debug logging (or set RUST_LOG=debug)
-    #[arg(short, long, global = true)]
+    #[arg(long, global = true)]
     pub debug: bool,
 
     #[command(subcommand)]

@@ -23,10 +23,3 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
-
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true

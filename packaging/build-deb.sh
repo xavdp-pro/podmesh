@@ -5,12 +5,12 @@ umask 022
 cd "$(dirname "$0")/.."
 version=0.1.0~experimental7
 # Reported by the capabilities operation, so an installed binary identifies its package.
-PODMESH_PACKAGE_VERSION=$version cargo build --release --locked -j2
+PODMESH_PACKAGE_VERSION=$version cargo build --release --locked -j2 --workspace
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 chmod 755 "$work"
 mkdir -p "$work/DEBIAN" "$work/usr/bin" "$work/usr/lib/systemd/system"
-install -m755 target/release/podmesh target/release/podmeshd "$work/usr/bin/"
+install -m755 target/release/podmesh target/release/podmeshd target/release/podmesh-ctl "$work/usr/bin/"
 install -m644 packaging/podmesh.service packaging/podmesh-fence.service packaging/podmesh-fence.timer packaging/podmesh-restore.service \
   packaging/podmesh-decision-follow.service packaging/podmesh-decision-follow.timer "$work/usr/lib/systemd/system/"
 install -m755 packaging/podmesh-fence packaging/podmesh-restore packaging/podmesh-decision-follow "$work/usr/bin/"

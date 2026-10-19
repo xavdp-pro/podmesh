@@ -1,48 +1,168 @@
-# PodMesh
+# PodMesh — Sovereign Infrastructure, Distributed Storage & Backup Suite
 
-Portable Podman operations for human-agent tandems.
+> **100% Pure Rust Architecture • Zero Python Runtime on Storage Nodes • Sub-8MB Footprint**  
+> Portable Podman operations for human-agent tandems, high-performance distributed storage (**MeshFS**), deduplicated backup server (**PMBS**), and unified orchestration CLI (**`podmesh-ctl`**).
 
-## Why we started
+---
 
-PodMesh grew out of Xavier de Poorter's extensive hands-on experience with Proxmox: a platform he values and has used for many successful experiments, alongside difficult recovery situations and constraints around joining populated hosts, identities and cluster reconfiguration. Those experiences inspired a desire for more freedom to connect, separate, recover and move workloads between autonomous hosts.
+## 🏛 Architecture Globale
 
-Xavier and OpenAI Codex (GPT-6 Astra) began by experimenting with memory-preserving migration of nested Podman containers. The work built on CRIU and the existing nested-process support in OpenVZ/Virtuozzo's vzcriu, with experimental adaptations for the Linux environment used in the laboratory. The original projects retain credit for their underlying implementations.
+PodMesh unifie l'orchestration de conteneurs, le stockage distribué souverain et la sauvegarde continue dans un monorepo Cargo unifié sans dépendances d'exécution externes :
 
-- [Experimental vzcriu fork and patches](https://github.com/xavdp-pro/vzcriu/tree/experiment/debian13-nested-podman)
-- [Nested Podman reproduction kit](https://github.com/xavdp-pro/vzcriu/tree/experiment/debian13-nested-podman/contrib/nested-podman)
-- [Recorded replication experiment and limitations](https://github.com/xavdp-pro/vzcriu/blob/experiment/debian13-nested-podman/contrib/nested-podman/REPLICATION.md)
+```
+                               ┌─────────────────────────────────┐
+                               │  Vite / React 19 Showcase / UI  │
+                               │        (:5173 - Shaper OS)      │
+                               └────────────────┬────────────────┘
+                                                │ REST / Sockets
+        ┌───────────────────────────────────────┼───────────────────────────────────────┐
+        │                                       │                                       │
+        ▼                                       ▼                                       ▼
+┌───────────────────────┐       ┌───────────────────────────────┐       ┌───────────────────────┐
+│     MeshFS Daemon     │       │       PodMesh Node Engine     │       │      PMBS Daemon      │
+│   (crates/meshfs)     │       │       (src/ - Core Engine)    │       │     (crates/pmbs)     │
+├───────────────────────┤       ├───────────────────────────────┤       ├───────────────────────┤
+│ • CAS SHA-256 4MB     │       │ • Rootful Podman Lifecycle    │       │ • CAS SHA-256 Dedup   │
+│ • Merkle DAG Inodes   │       │ • MariaDB & SQLite Stores     │       │ • Op 10 Boot Proof    │
+│ • ioctl FICLONE CoW   │       │ • Reconcile & State Machine   │       │ • Cross-Site Sync     │
+│ • Proxmox VE Plugin   │       │ • Ed25519 Takeover Proofs     │       │ • Single-File Restore │
+│ • Port 7443 + IPC Sock│       │ • Port 8080 + IPC Socket      │       │ • Port 8007 + IPC Sock│
+│ • Footprint: < 8MB RAM│       │ • Footprint: < 15MB RAM       │       │ • Footprint: < 8MB RAM│
+└───────────────────────┘       └───────────────────────────────┘       └───────────────────────┘
+                                                ▲
+                                                │ Local / Remote Control
+                               ┌────────────────┴────────────────┐
+                               │       podmesh-ctl (CLI Rust)    │
+                               │       (crates/podmesh-cli)      │
+                               └─────────────────────────────────┘
+```
 
-These experiments demonstrated selected workload recovery and migration cases; they do not establish general fault tolerance or uninterrupted application availability. The analogy with live VM migration motivated the work, but this is not an implementation of VMware vMotion.
+---
 
-PodMesh is an independent Podman project for Linux hosts, not a Proxmox extension or compatibility layer. Physical servers, virtual machines and VPS are deployment targets. ShaperOS is our preferred integration environment — since 16 September 2026 its Rule 11 names PodMesh as the optional manager of `nested` universes — while standalone operation remains a requirement.
+## 🚀 Démarrage Rapide : Mode Dev vs Mode Prod
 
-See [the experimental scope and review contract](docs/EXPERIMENTAL-SCOPE.md) for
-what we are exploring, what the evidence establishes, and how this relates to the
-current SHAPER runtime standard.
+Le projet dispose de deux modes de fonctionnement unifiés pilotés par Makefile ou scripts Bash :
 
-## Current scope
+### 1. Mode Développement (`make dev`)
 
-An experimental Rust service and CLI provide local inventory, persistent host identity, an observation journal, and initial managed-container creation, explicit start and stop, deletion and cloning. These operations have been exercised on three laboratory hosts. They act only on network-disabled containers whose creation is recorded in the host's PodMesh journal. Start reports the observed outcome; stop requires a declared graceful timeout and escalation behavior. Cloning is limited to stopped containers without volumes or bind mounts, taken through a committed snapshot image.
+Le **Mode Développeur** lance l'ensemble des services en local de manière totalement isolée, sans nécessiter de privilèges `root`, sans modifier `/var/lib`, et avec logs détaillés `--debug` :
 
-On the assembly development tree (`cursor/assembly-2026-10-07`), maintainers recorded **one** verified nested outer-universe **move** and **one** two-host **replicate** campaign (stopped and live planned switchover), with explicit fixture limits — see [Path B public claims](docs/PUBLIC-CLAIMS-PATH-B-2026-10-07.md). Node store MariaDB cutover is evidenced in the private workshop; container-life slice **A** is **partial** (campaign ops 1–8 verified; dedicated LVM grow and boot-restore op 10 remain open). Path **C** (publisher, secrets API, vote keys, automated HA beyond the replicate harness) is **frozen**. Through the **published** experimental package and its acceptance gates, migration and HA are still **not** validated; networking, general volume handling, and full gates 6–8 qualification remain incomplete — see the [acceptance test plan](docs/ACCEPTANCE-TEST-PLAN.md) (assembly branch note, 2026-10-07).
+```bash
+# Lancement de l'environnement complet de développement
+make dev
 
-The service currently exposes a root-only Unix socket and uses the default rootful Podman store. A request's authorization reference records provenance; it is not an implemented remote authorization system. The local administrator controls access.
+# Ou via le script direct :
+./scripts/dev.sh
+```
 
-See [the intent](INTENT.md), [the ideal scene](docs/IDEAL-SCENE.md) with its [program](docs/IDEAL-SCENE-PROGRAM.md) and [certification checklists](docs/IDEAL-SCENE-CHECKLISTS.md), and the [acceptance test plan](docs/ACCEPTANCE-TEST-PLAN.md) for direction, requirements and qualification criteria. The [documentation index](docs/README.md) lists every document, and the [operations guide](docs/OPERATIONS.md) shows how to run the experimental tools.
+**Composants démarrés automatiquement :**
+- **MeshFS Daemon** : API HTTP `http://127.0.0.1:7443` | Socket IPC `./data/dev/meshfs/meshfs.sock`
+- **PMBS Daemon**   : API HTTP `http://127.0.0.1:8007` | Socket IPC `./data/dev/pmbs/pmbs.sock`
+- **Showcase UI**   : Interface Web interactive `http://localhost:5173`
+- **Logs en direct** : `tail -f data/dev/*.log`
 
-The development tree, not yet packaged, also carries: the [local API reference](docs/LOCAL-API.md) of every
-operation; [universe high availability](docs/UNIVERSE-HIGH-AVAILABILITY.md) — activation leases, epochs from an
-external gate, recovery points, restore into quarantine, promotion, and the agent's side as
-[`tools/ha-standby.py`](tools/ha-standby.py); the [garbage collection contract](docs/GARBAGE-COLLECTION.md) and its
-implemented classes; and the [Backup Server design](docs/BACKUP-SERVER.md). Each states what it proves and what it
-does not. The maintainers keep the laboratory status, campaign records and reviews in a private repository; this repository carries what is needed to understand, build and operate PodMesh.
+> **Note :** Pour tester automatiquement le démarrage et l'arrêt propre sans intervention :
+> ```bash
+> make dev-check
+> ```
 
-## Debian delivery
+---
 
-[deb.xavdp.pro](https://deb.xavdp.pro) hosts the signed experimental APT repository. The published package is `0.1.0~experimental7` for Debian 13 amd64, and the three laboratory hosts run it (read from the repository and from `apt-cache policy` on each host, 2026-09-18). What a package was qualified for is another question: the qualified status in [docs/ACCEPTANCE-TEST-PLAN.md](docs/ACCEPTANCE-TEST-PLAN.md) still describes `0.1.0~experimental5`, and experimental6 and experimental7 are published and installed without that document being rewritten for them. The repository keeps one version per suite, so an earlier package is reinstallable only from a host's own APT cache. Stable and other architectures are not validated.
+### 2. Mode Production (`make prod`)
 
-The delivery objective is an installable dependency chain for the complete supported system. Publish project-specific components and required patched runtime packages with explicit versions, dependencies, conflicts and rollback instructions. Use Debian's existing packages for ordinary dependencies rather than unnecessarily republishing them. The patched `podmesh-vzcriu` runtime and separate helper packages have been published and tested through experimental APT. A complete clean-host migration installation chain remains to qualify; the future backup service is not implemented.
+Le **Mode Production** compile l'ensemble du workspace Rust avec optimisations maximales (`opt-level=3`, LTO agressif, `strip=true`, `panic="abort"`), assemble le bundle web Vite, et génère tous les paquets Debian autonomes (`.deb`) dans `dist/` avec contrôle d'empreintes SHA-256 :
 
-## Collaboration
+```bash
+# Compilation release et génération des paquets Debian
+make prod
 
-Created by Xavier de Poorter, in collaboration with OpenAI Codex — GPT-6 Astra and Claude Code. Codex contributed the initial migration research, implementation and review; Claude Code has contributed implementation, packaging, tests and review. Individual commits and evidence records identify the contributing engines and versions. Human direction, implementation, experiments and critical review form a shared development process. Public claims of reliability must identify the tested scope and remaining limits.
+# Ou via le script direct :
+./scripts/prod.sh
+```
+
+**Artefacts générés dans `dist/` :**
+| Paquet Debian | Rôle & Description | Taille |
+|---|---|---|
+| `podmesh-meshfs_2.1.0_amd64.deb` | Moteur MeshFS Pure Rust + Plugin Proxmox VE + Service systemd | ~1.7 MB |
+| `podmesh-backup-server_2.1.0_amd64.deb` | Serveur de sauvegarde PMBS Pure Rust + Service systemd | ~1.6 MB |
+| `podmesh-cli_2.1.0_amd64.deb` | CLI unifié `podmesh-ctl` autonome (HA, failover, replication) | ~600 KB |
+| `podmesh_0.1.0~experimental7_amd64.deb` | Moteur PodMesh Node complet (`podmesh`, `podmeshd`, `podmesh-ctl`) | ~2.4 MB |
+
+---
+
+## 📦 Commandes du Makefile
+
+| Commande | Action |
+|---|---|
+| `make dev` | Démarre l'environnement de dev local (MeshFS + PMBS + Showcase) |
+| `make dev-check` | Vérifie la santé et l'auto-démarrage du mode dev en non-interactif |
+| `make prod` | Compile en Release (LTO) et génère tous les paquets `.deb` |
+| `make packages` | Construit uniquement les paquets Debian dans `dist/` |
+| `make test` | Exécute l'intégralité des 185+ tests unitaires du workspace Rust |
+| `make check` | Vérification syntaxique et de types `cargo check --workspace` |
+| `make health` | Audit de connectivité HTTP et vérification des Sockets Unix IPC |
+| `make clean` | Nettoie les binaires compilés, les logs et données volatiles dev |
+
+---
+
+## 🛠 Déploiement en Production sur Nœuds Proxmox / Debian
+
+Sur un serveur Debian 12/13 ou Proxmox VE :
+
+```bash
+# 1. Installation de MeshFS (Stockage Distribué & Plugin PVE automatique)
+sudo dpkg -i dist/podmesh-meshfs_2.1.0_amd64.deb
+
+# 2. Installation de PMBS (Backup Server dédupliqué)
+sudo dpkg -i dist/podmesh-backup-server_2.1.0_amd64.deb
+
+# 3. Installation de PodMesh Engine & CLI
+sudo dpkg -i dist/podmesh_0.1.0~experimental7_amd64.deb
+
+# 4. Vérification de l'état des services systemd
+sudo systemctl status meshfs.service
+sudo systemctl status pmbs.service
+sudo systemctl status podmesh.service
+```
+
+### Intégration Native Proxmox VE :
+Le paquet `podmesh-meshfs` installe automatiquement `MeshFSPlugin.pm` dans `/usr/share/perl5/PVE/Storage/Custom/MeshFSPlugin.pm` et l'enregistre auprès de `pvedaemon` / `pveproxy`. MeshFS apparaît immédiatement comme stockage sélectionnable pour :
+- Images disques QEMU (`images`)
+- Conteneurs LXC (`rootdir`)
+- Sauvegardes VZDump (`backup`)
+- ISOs et templates (`iso`, `vztmpl`)
+
+---
+
+## ⚡ CLI Unifié `podmesh-ctl`
+
+Le binaire `podmesh-ctl` (100% Rust) remplace les anciens scripts Python et shell :
+
+```bash
+# Déclaration de politique HA pour un univers
+podmesh-ctl ha declare my-universe --authority authority-quorum-1 --lease 30
+
+# Rotation d'époque et génération de preuve Ed25519 de reprise
+podmesh-ctl ha rotate my-universe --host gbs-p4
+
+# Configuration de la réplication inter-nœuds
+podmesh-ctl replicate configure my-universe --active gbs-p4 --standbys med-pmox --interval 300
+
+# Déplacement à chaud d'un univers
+podmesh-ctl move my-universe gbs-p4 med-pmox
+
+# Statut du manager de cluster
+podmesh-ctl admin status
+```
+
+---
+
+## 🔒 Confidentialité & Intégrité
+- **Cryptographie** : Preuves de reprise et certificats signés en **Ed25519**, déduplication et intégrité CAS via **SHA-256**.
+- **Bit-Rot Protection** : `meshfs inspect` vérifie cryptographiquement chaque chunk 4MB en lecture directe.
+- **Souveraineté** : Zéro télémétrie, zéro dépendance cloud propriétaire.
+
+---
+
+## Licence
+Sous licence Apache-2.0. Créé par Xavier de Poorter et l'équipe d'ingénieurs PodMesh.

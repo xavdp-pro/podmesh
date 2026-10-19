@@ -19,7 +19,7 @@ use tracing_subscriber::EnvFilter;
     long_about = "Replaces legacy Python tools (ha-standby, replicate-universe, move-universe) with native, ultra-fast Rust binaries."
 )]
 pub struct Cli {
-    #[arg(short, long, global = true)]
+    #[arg(long, global = true)]
     pub debug: bool,
 
     #[command(subcommand)]

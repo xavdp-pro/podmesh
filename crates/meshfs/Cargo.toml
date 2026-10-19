@@ -21,10 +21,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true

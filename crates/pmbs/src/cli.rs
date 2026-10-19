@@ -17,7 +17,7 @@ pub const DEFAULT_SOCKET: &str = "/var/lib/pmbs/pmbs.sock";
 )]
 pub struct Cli {
     /// Enable verbose debug logging
-    #[arg(short, long, global = true)]
+    #[arg(long, global = true)]
     pub debug: bool,
 
     #[command(subcommand)]
