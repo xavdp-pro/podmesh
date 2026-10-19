@@ -1,0 +1,63 @@
+{
+  "timestamp_utc": "2026-10-19T18:40:00Z",
+  "campaign": "pure-rust-qualification-and-proxmox-meshfs",
+  "hypervisor": "gbs-p4",
+  "verdict": "PASS",
+  "components": {
+    "podmesh_ctl": {
+      "language": "Rust 2021",
+      "architecture": "amd64",
+      "multi_call": true,
+      "replaced_scripts": [
+        "podmesh-decision-follow",
+        "podmesh-publisher-follow",
+        "podmesh-fence",
+        "podmesh-restore"
+      ],
+      "mandate_enforcement": {
+        "missing_mandate_exit_code": 3,
+        "status": "PASS"
+      }
+    },
+    "meshfs": {
+      "version": "2.1.0",
+      "language": "Rust 2021",
+      "memory_peak_kb": 1700,
+      "memory_active_kb": 664,
+      "cas_chunk_size_bytes": 4194304,
+      "merkle_snapshots": true,
+      "test_8mb_upload_sha256": "8feacf566259a8dc4a01f3f83f6491ac08441a06e9d3723552819de9fb01a6ba",
+      "test_8mb_restore_sha256": "8feacf566259a8dc4a01f3f83f6491ac08441a06e9d3723552819de9fb01a6ba",
+      "bit_rot_audit_result": "PASS",
+      "cluster_interconnect": {
+        "node_a": "10.10.10.156:7443",
+        "node_b": "10.10.10.157:7443",
+        "node_c": "10.10.10.154:7443",
+        "status": "CONNECTED"
+      }
+    },
+    "pmbs": {
+      "version": "2.1.0",
+      "language": "Rust 2021",
+      "memory_active_kb": 596,
+      "remote_sync_enabled": true,
+      "status": "PASS"
+    },
+    "proxmox_ve_storage_plugin": {
+      "target_node": "infra-a0-pve (VM 9400)",
+      "pve_version": "9.2.2",
+      "driver_path": "/usr/share/perl5/PVE/Storage/Custom/MeshFSPlugin.pm",
+      "storage_id": "meshfs",
+      "storage_type": "meshfs",
+      "pvesm_status": "active",
+      "alloc_raw_image": "PASS",
+      "free_raw_image": "PASS"
+    },
+    "flat_container_support": {
+      "tested_image": "docker.io/library/alpine:3.22",
+      "profile": "flat",
+      "nested_podman_required": false,
+      "status": "PASS"
+    }
+  }
+}
