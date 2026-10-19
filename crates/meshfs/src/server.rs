@@ -5,7 +5,7 @@
 use crate::engine::MeshFSEngine;
 use axum::{
     body::Body,
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -111,6 +111,7 @@ pub fn create_router(engine: MeshFSEngine) -> Router {
         // Diagnostics & Integrity audit routes
         .route("/diagnostics", get(diagnostics_handler))
         .route("/api/v1/meshfs/diagnostics", get(diagnostics_handler))
+        .layer(DefaultBodyLimit::disable())
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(cors)
         .with_state(engine)
