@@ -6,6 +6,7 @@ use podmesh_cli::ha::HALedger;
 use podmesh_cli::move_cmd::execute_move;
 use podmesh_cli::replication::ReplicationManager;
 use podmesh_cli::system::{run_boot_restore, run_self_fence};
+use podmesh_cli::{run_decision_follow, run_publisher_follow};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
@@ -146,10 +147,64 @@ pub enum SystemSubcommand {
         #[arg(short, long, default_value = "/etc/podmesh/restore-mandate")]
         mandate: PathBuf,
     },
+    /// Execute decision follow under /etc/podmesh/decision-follow-mandate
+    FollowDecision {
+        #[arg(short, long)]
+        mandate: Option<PathBuf>,
+    },
+    /// Execute publisher follow under /etc/podmesh/publisher-follow-mandate
+    FollowPublisher {
+        #[arg(short, long)]
+        mandate: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Multi-call binary inspection (drop-in compatibility with symlinks)
+    if let Some(arg0) = std::env::args().next() {
+        let file_name = std::path::Path::new(&arg0)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        if file_name == "podmesh-decision-follow" {
+            let code = run_decision_follow(None).await;
+            return ExitCode::from(code as u8);
+        } else if file_name == "podmesh-publisher-follow" {
+            let code = run_publisher_follow(None).await;
+            return ExitCode::from(code as u8);
+        } else if file_name == "podmesh-fence" {
+            let mandate = PathBuf::from(
+                std::env::var("PODMESH_FENCE_MANDATE").unwrap_or_else(|_| "/etc/podmesh/fence-mandate".to_string()),
+            );
+            return match run_self_fence(&mandate) {
+                Ok(outcome) => {
+                    println!("{}", serde_json::to_string_pretty(&outcome).unwrap());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("podmesh-fence: {}", e);
+                    ExitCode::from(3)
+                }
+            };
+        } else if file_name == "podmesh-restore" {
+            let mandate = PathBuf::from(
+                std::env::var("PODMESH_RESTORE_MANDATE").unwrap_or_else(|_| "/etc/podmesh/restore-mandate".to_string()),
+            );
+            return match run_boot_restore(&mandate) {
+                Ok(outcome) => {
+                    println!("{}", serde_json::to_string_pretty(&outcome).unwrap());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("podmesh-restore: {}", e);
+                    ExitCode::from(3)
+                }
+            };
+        }
+    }
+
     let args = Cli::parse();
 
     let default_level = if args.debug { "debug" } else { "info" };
@@ -291,6 +346,14 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
+            SystemSubcommand::FollowDecision { mandate } => {
+                let code = run_decision_follow(mandate.as_deref()).await;
+                return ExitCode::from(code as u8);
+            }
+            SystemSubcommand::FollowPublisher { mandate } => {
+                let code = run_publisher_follow(mandate.as_deref()).await;
+                return ExitCode::from(code as u8);
+            }
         },
     }
 

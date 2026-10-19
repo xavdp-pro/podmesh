@@ -13,7 +13,10 @@ mkdir -p "$work/DEBIAN" "$work/usr/bin" "$work/usr/lib/systemd/system"
 install -m755 target/release/podmesh target/release/podmeshd target/release/podmesh-ctl "$work/usr/bin/"
 install -m644 packaging/podmesh.service packaging/podmesh-fence.service packaging/podmesh-fence.timer packaging/podmesh-restore.service \
   packaging/podmesh-decision-follow.service packaging/podmesh-decision-follow.timer "$work/usr/lib/systemd/system/"
-install -m755 packaging/podmesh-fence packaging/podmesh-restore packaging/podmesh-decision-follow "$work/usr/bin/"
+ln -s podmesh-ctl "$work/usr/bin/podmesh-fence"
+ln -s podmesh-ctl "$work/usr/bin/podmesh-restore"
+ln -s podmesh-ctl "$work/usr/bin/podmesh-decision-follow"
+ln -s podmesh-ctl "$work/usr/bin/podmesh-publisher-follow"
 install -d "$work/usr/share/doc/podmesh"
 install -m644 docs/DECISION-FOLLOW.md "$work/usr/share/doc/podmesh/"
 cat > "$work/DEBIAN/control" <<CONTROL
