@@ -185,6 +185,13 @@ podmesh-ctl admin status
 
 ---
 
+## 📖 Documentation & Specifications (English / AI & Humans)
+
+- **[Architecture & Machine-Readable Spec](docs/ARCHITECTURE-PURE-RUST-AND-STORAGE.md)**: Exhaustive architectural breakdown for AI agents and human operators detailing component roles, fail-closed mandate contracts, IPC protocols, and Proxmox storage hooks.
+- **[Laboratory Qualification Record (2026-10-19)](https://github.com/xavdp-pro/podmesh-lab/tree/main/records/pure-rust-qualification-2026-10-19)**: Complete test matrix evidence on hypervisor `gbs-p4`, lab nodes, and nested Proxmox VE.
+
+---
+
 ## 🔒 Confidentialité & Intégrité
 - **Cryptographie** : Preuves de reprise et certificats signés en **Ed25519**, déduplication et intégrité CAS via **SHA-256**.
 - **Bit-Rot Protection** : `meshfs inspect` vérifie cryptographiquement chaque chunk 4MB en lecture directe.
