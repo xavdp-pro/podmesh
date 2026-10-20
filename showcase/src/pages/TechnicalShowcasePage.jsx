@@ -29,6 +29,20 @@ export default function TechnicalShowcasePage() {
   const index = copy.sections.findIndex((section) => section.id === activeId)
   const section = copy.sections[index]
   const [mobileOpen, setMobileOpen] = useState(false)
+  const [isDesktop, setIsDesktop] = useState(() => window.matchMedia('(min-width: 1024px)').matches)
+  const [desktopExpanded, setDesktopExpanded] = useState(() => {
+    try { return localStorage.getItem('showcase:desktop-expanded') !== 'false' } catch { return true }
+  })
+  function setDesktopMenu(expanded) {
+    setDesktopExpanded(expanded)
+    try { localStorage.setItem('showcase:desktop-expanded', String(expanded)) } catch {}
+  }
+  useEffect(() => {
+    const media = window.matchMedia('(min-width: 1024px)')
+    const changed = () => { setIsDesktop(media.matches); setMobileOpen(false) }
+    media.addEventListener('change', changed)
+    return () => media.removeEventListener('change', changed)
+  }, [])
   const menuRef = useRef(null)
   const text = (value) => <GlossaryText lang={locale}>{value}</GlossaryText>
 
@@ -83,7 +97,7 @@ export default function TechnicalShowcasePage() {
       <header className="sticky top-0 z-40 border-b border-line bg-surface/95 backdrop-blur-md">
         <div className="mx-auto flex min-h-16 max-w-7xl flex-wrap items-center justify-between gap-2 px-4 py-2 sm:px-6 lg:px-8">
           <div className="flex items-center gap-3">
-            <button ref={menuRef} type="button" onClick={() => setMobileOpen(true)} aria-label={copy.menu} aria-expanded={mobileOpen} aria-controls="guide-navigation" className="rounded-lg border border-line p-2"><Menu size={18} /></button>
+            <button ref={menuRef} type="button" onClick={() => isDesktop ? setDesktopMenu(!desktopExpanded) : setMobileOpen(true)} aria-label={isDesktop && desktopExpanded ? copy.close : copy.menu} aria-expanded={isDesktop ? desktopExpanded : mobileOpen} aria-controls={isDesktop ? "guide-navigation-desktop" : "guide-navigation"} className="rounded-lg border border-line p-2"><Menu size={18} /></button>
 
             <Link to="/#podmesh" className="site-display text-2xl font-bold">PodMesh</Link>
             <a href="https://xavdp.pro" className="hidden border-l border-line pl-3 text-sm text-fg-muted sm:block">xavdp.pro</a>
@@ -93,7 +107,7 @@ export default function TechnicalShowcasePage() {
       </header>
 
       <div className="mx-auto flex max-w-7xl items-start gap-6 px-4 py-6 sm:px-6 lg:gap-10 lg:px-8">
-        <ShowcaseSidebar activeTab={activeId} onSelectTab={selectSection} mobileOpen={mobileOpen} onCloseMobile={() => { setMobileOpen(false); menuRef.current?.focus() }} locale={locale} />
+        <ShowcaseSidebar activeTab={activeId} onSelectTab={selectSection} desktopExpanded={desktopExpanded} onCollapseDesktop={() => { setDesktopMenu(false); menuRef.current?.focus() }} mobileOpen={mobileOpen} onCloseMobile={() => { setMobileOpen(false); menuRef.current?.focus() }} locale={locale} />
         <main className="min-w-0 flex-1 pb-12">
           <section className="mb-10 border-b border-line pb-8">
             <p className="mb-4 text-sm font-semibold text-accent">PodMesh · MeshFS · PMBS</p>

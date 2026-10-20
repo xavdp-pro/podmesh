@@ -50,6 +50,8 @@ const UI_TEXT = {
 export default function ShowcaseSidebar({
   activeTab,
   onSelectTab,
+  desktopExpanded,
+  onCollapseDesktop,
   mobileOpen,
   onCloseMobile,
   locale = 'fr',
@@ -159,7 +161,7 @@ export default function ShowcaseSidebar({
     <>
       {/* Mobile Backdrop & Drawer */}
       {mobileOpen && (
-        <div className="fixed inset-0 z-50">
+        <div className="fixed inset-0 z-50 lg:hidden">
           <div
             className="fixed inset-0 bg-black/60 backdrop-blur-xs transition-opacity"
             onClick={onCloseMobile}
@@ -195,6 +197,25 @@ export default function ShowcaseSidebar({
             </div>
           </aside>
         </div>
+      )}
+
+      {desktopExpanded && (
+        <aside id="guide-navigation-desktop" aria-label={lang.summary}
+          className="sticky top-20 hidden w-72 shrink-0 self-start lg:block">
+          <div className="max-h-[calc(100dvh-96px)] overflow-y-auto rounded-2xl border border-line bg-surface p-3 shadow-xs thin-scrollbar">
+            <div className="flex items-center justify-between border-b border-line px-2 pb-3 pt-1">
+              <div className="flex items-center gap-2">
+                <Bookmark size={16} className="text-accent" />
+                <span className="text-xs font-black uppercase tracking-wider">{lang.summary}</span>
+              </div>
+              <button type="button" onClick={onCollapseDesktop} aria-label={lang.collapse}
+                className="rounded-lg p-1.5 text-fg-muted hover:bg-surface-2 hover:text-fg">
+                <X size={18} />
+              </button>
+            </div>
+            <div className="pt-2">{renderNavItems(false)}</div>
+          </div>
+        </aside>
       )}
 
 
