@@ -49,11 +49,20 @@ async fn main() -> ExitCode {
 
             if let Some(path) = &d.cluster_config {
                 let config = match meshfs::cluster::ClusterConfig::load(path) {
-                    Ok(c) => c, Err(e) => { error!("Cluster configuration: {}", e); return ExitCode::FAILURE; }
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Cluster configuration: {}", e);
+                        return ExitCode::FAILURE;
+                    }
                 };
                 match meshfs::cluster::Cluster::start(engine.clone(), config, d.bootstrap).await {
-                    Ok(c) => { let _ = engine.cluster.set(c); },
-                    Err(e) => { error!("Cluster startup: {}", e); return ExitCode::FAILURE; }
+                    Ok(c) => {
+                        let _ = engine.cluster.set(c);
+                    }
+                    Err(e) => {
+                        error!("Cluster startup: {}", e);
+                        return ExitCode::FAILURE;
+                    }
                 }
             } else if d.data_dir.join("raft").exists() {
                 error!("Existing clustered data requires --cluster-config; refusing standalone startup");
@@ -193,7 +202,10 @@ async fn main() -> ExitCode {
 
         Commands::Join(j) => {
             let client = reqwest::Client::new();
-            let url = format!("{}/api/v1/meshfs/nodes/join", j.remote.trim_end_matches('/'));
+            let url = format!(
+                "{}/api/v1/meshfs/nodes/join",
+                j.remote.trim_end_matches('/')
+            );
             let payload = serde_json::json!({
                 "targetAddress": j.target,
                 "token": j.token
@@ -216,7 +228,10 @@ async fn main() -> ExitCode {
 
         Commands::Snapshot(sn) => {
             let client = reqwest::Client::new();
-            let url = format!("{}/api/v1/meshfs/snapshots", sn.remote.trim_end_matches('/'));
+            let url = format!(
+                "{}/api/v1/meshfs/snapshots",
+                sn.remote.trim_end_matches('/')
+            );
             let payload = serde_json::json!({
                 "volume": sn.volume,
                 "name": sn.name
@@ -279,19 +294,32 @@ async fn main() -> ExitCode {
             let content = match fs::read(&p.file) {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    eprintln!("Impossible de lire le fichier source '{}': {}", p.file.display(), e);
+                    eprintln!(
+                        "Impossible de lire le fichier source '{}': {}",
+                        p.file.display(),
+                        e
+                    );
                     return ExitCode::FAILURE;
                 }
             };
 
             // Encode content in base64
-            const B64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            const B64_CHARS: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
             let mut b64 = String::with_capacity(content.len() * 4 / 3 + 4);
             let mut i = 0;
             while i < content.len() {
                 let b0 = content[i] as usize;
-                let b1 = if i + 1 < content.len() { content[i + 1] as usize } else { 0 };
-                let b2 = if i + 2 < content.len() { content[i + 2] as usize } else { 0 };
+                let b1 = if i + 1 < content.len() {
+                    content[i + 1] as usize
+                } else {
+                    0
+                };
+                let b2 = if i + 2 < content.len() {
+                    content[i + 2] as usize
+                } else {
+                    0
+                };
 
                 let trip = (b0 << 16) | (b1 << 8) | b2;
 
@@ -311,7 +339,10 @@ async fn main() -> ExitCode {
             }
 
             let client = reqwest::Client::new();
-            let url = format!("{}/api/v1/meshfs/files/upload", p.remote.trim_end_matches('/'));
+            let url = format!(
+                "{}/api/v1/meshfs/files/upload",
+                p.remote.trim_end_matches('/')
+            );
             let payload = serde_json::json!({
                 "volume": p.volume,
                 "path": p.path,
@@ -352,10 +383,18 @@ async fn main() -> ExitCode {
                         Ok(bytes) => {
                             if let Some(out_path) = g.output {
                                 if let Err(e) = fs::write(&out_path, &bytes) {
-                                    eprintln!("Erreur écriture dans '{}': {}", out_path.display(), e);
+                                    eprintln!(
+                                        "Erreur écriture dans '{}': {}",
+                                        out_path.display(),
+                                        e
+                                    );
                                     return ExitCode::FAILURE;
                                 }
-                                println!("Fichier téléchargé avec succès ({} octets) -> {}", bytes.len(), out_path.display());
+                                println!(
+                                    "Fichier téléchargé avec succès ({} octets) -> {}",
+                                    bytes.len(),
+                                    out_path.display()
+                                );
                             } else {
                                 let _ = io::stdout().write_all(&bytes);
                             }

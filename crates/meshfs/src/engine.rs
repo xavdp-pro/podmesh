@@ -3,6 +3,7 @@
 //! volume isolation, and peer node synchronization.
 
 use crate::chunk::{sha256_digest, ChunkRef, ChunkStore, CHUNK_SIZE};
+use crate::cluster::{Action, Cluster, MAX_FILE_BYTES};
 use crate::merkle::Inode;
 use crate::storage::{StorageDriver, StorageMetrics};
 use crate::volume::{Snapshot, Volume};
@@ -13,7 +14,6 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use crate::cluster::{Cluster, Action, MAX_FILE_BYTES};
 use tokio::sync::RwLock;
 
 /// Cluster node descriptor.
@@ -186,7 +186,6 @@ impl MeshFSEngine {
         let serialized = serde_json::to_string_pretty(&*state_guard)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-
         use std::sync::atomic::{AtomicU64, Ordering};
         static STATE_TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
         let seq = STATE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -213,14 +212,21 @@ impl MeshFSEngine {
     /// Retrieves comprehensive operational status.
     pub async fn get_status(&self) -> StatusReport {
         let cluster = self.cluster.get();
-        let ready = if let Some(c) = cluster { c.namespace().await.is_ok() } else { true };
+        let ready = if let Some(c) = cluster {
+            c.namespace().await.is_ok()
+        } else {
+            true
+        };
         let state = self.state.read().await;
-        let metrics = self.driver.get_metrics(&self.data_dir).unwrap_or(StorageMetrics {
-            total_bytes: 0,
-            used_bytes: 0,
-            free_bytes: 0,
-            used_percent: 0.0,
-        });
+        let metrics = self
+            .driver
+            .get_metrics(&self.data_dir)
+            .unwrap_or(StorageMetrics {
+                total_bytes: 0,
+                used_bytes: 0,
+                free_bytes: 0,
+                used_percent: 0.0,
+            });
 
         let total_files: usize = state.volumes.values().map(|v| v.files.len()).sum();
         let total_logical_bytes: u64 = state.volumes.values().map(|v| v.total_bytes()).sum();
@@ -247,15 +253,39 @@ impl MeshFSEngine {
             supports_scale_out: cluster.is_some(),
             compatible_without_podmesh: true,
             replication: cluster.map(|c| c.metrics()),
-            namespace_consistency: if cluster.is_some() { "diagnostic local counters; data reads require quorum" } else { "standalone" }.to_string(),
+            namespace_consistency: if cluster.is_some() {
+                "diagnostic local counters; data reads require quorum"
+            } else {
+                "standalone"
+            }
+            .to_string(),
         }
     }
 
     /// Stores a file into a volume, splitting it into 4MB CAS chunks.
-    pub async fn put_file(&self, volume_name: &str, file_path: &str, content: &[u8]) -> io::Result<Inode> {
+    pub async fn put_file(
+        &self,
+        volume_name: &str,
+        file_path: &str,
+        content: &[u8],
+    ) -> io::Result<Inode> {
         if let Some(c) = self.cluster.get() {
-            if content.len() > MAX_FILE_BYTES { return Err(io::Error::new(io::ErrorKind::InvalidInput, "clustered file limit is 16 MiB")); }
-            return serde_json::from_value(c.write(Action::Put { volume: volume_name.into(), path: file_path.into(), hex: hex::encode(content), at: Utc::now().to_rfc3339() }).await?).map_err(io::Error::other);
+            if content.len() > MAX_FILE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "clustered file limit is 16 MiB",
+                ));
+            }
+            return serde_json::from_value(
+                c.write(Action::Put {
+                    volume: volume_name.into(),
+                    path: file_path.into(),
+                    hex: hex::encode(content),
+                    at: Utc::now().to_rfc3339(),
+                })
+                .await?,
+            )
+            .map_err(io::Error::other);
         }
         let size = content.len() as u64;
         let file_digest = format!("sha256:{}", sha256_digest(content));
@@ -287,7 +317,10 @@ impl MeshFSEngine {
 
         {
             let mut state = self.state.write().await;
-            let vol = state.volumes.entry(volume_name.to_string()).or_insert_with(|| Volume::new(volume_name));
+            let vol = state
+                .volumes
+                .entry(volume_name.to_string())
+                .or_insert_with(|| Volume::new(volume_name));
             vol.insert_file(inode.clone());
         }
 
@@ -297,14 +330,23 @@ impl MeshFSEngine {
 
     /// Reassembles a file from its CAS chunks.
     pub async fn get_file(&self, volume_name: &str, file_path: &str) -> io::Result<Vec<u8>> {
-        if let Some(c) = self.cluster.get() { return c.read(volume_name, file_path).await; }
+        if let Some(c) = self.cluster.get() {
+            return c.read(volume_name, file_path).await;
+        }
         self.local_get_file(volume_name, file_path).await
     }
 
-    pub(crate) async fn local_get_file(&self, volume_name: &str, file_path: &str) -> io::Result<Vec<u8>> {
+    pub(crate) async fn local_get_file(
+        &self,
+        volume_name: &str,
+        file_path: &str,
+    ) -> io::Result<Vec<u8>> {
         let state = self.state.read().await;
         let vol = state.volumes.get(volume_name).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("Volume '{}' introuvable", volume_name))
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Volume '{}' introuvable", volume_name),
+            )
         })?;
 
         let inode = vol.get_file(file_path).ok_or_else(|| {
@@ -320,15 +362,29 @@ impl MeshFSEngine {
             buffer.extend_from_slice(&data);
         }
 
-        if buffer.len() as u64 != inode.size || format!("sha256:{}", sha256_digest(&buffer)) != inode.digest {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "file size or digest mismatch"));
+        if buffer.len() as u64 != inode.size
+            || format!("sha256:{}", sha256_digest(&buffer)) != inode.digest
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file size or digest mismatch",
+            ));
         }
         Ok(buffer)
     }
 
     /// Creates a new logical volume.
     pub async fn create_volume(&self, name: &str) -> io::Result<Volume> {
-        if let Some(c) = self.cluster.get() { return serde_json::from_value(c.write(Action::CreateVolume { name: name.into(), at: Utc::now().to_rfc3339() }).await?).map_err(io::Error::other); }
+        if let Some(c) = self.cluster.get() {
+            return serde_json::from_value(
+                c.write(Action::CreateVolume {
+                    name: name.into(),
+                    at: Utc::now().to_rfc3339(),
+                })
+                .await?,
+            )
+            .map_err(io::Error::other);
+        }
         let vol = {
             let mut state = self.state.write().await;
             if let Some(existing) = state.volumes.get(name) {
@@ -345,7 +401,12 @@ impl MeshFSEngine {
 
     /// Deletes a logical volume.
     pub async fn delete_volume(&self, name: &str) -> io::Result<bool> {
-        if let Some(c) = self.cluster.get() { return serde_json::from_value(c.write(Action::DeleteVolume { name: name.into() }).await?).map_err(io::Error::other); }
+        if let Some(c) = self.cluster.get() {
+            return serde_json::from_value(
+                c.write(Action::DeleteVolume { name: name.into() }).await?,
+            )
+            .map_err(io::Error::other);
+        }
         let removed = {
             let mut state = self.state.write().await;
             state.volumes.remove(name).is_some()
@@ -359,20 +420,42 @@ impl MeshFSEngine {
 
     /// Lists all volumes.
     pub async fn list_volumes(&self) -> io::Result<HashMap<String, Volume>> {
-        if let Some(c) = self.cluster.get() { return serde_json::from_value(c.namespace().await?["volumes"].clone()).map_err(io::Error::other); }
+        if let Some(c) = self.cluster.get() {
+            return serde_json::from_value(c.namespace().await?["volumes"].clone())
+                .map_err(io::Error::other);
+        }
         Ok(self.state.read().await.volumes.clone())
     }
 
     /// Creates an instant O(1) Copy-on-Write Merkle snapshot.
-    pub async fn create_snapshot(&self, volume_name: &str, custom_name: Option<&str>) -> io::Result<Snapshot> {
+    pub async fn create_snapshot(
+        &self,
+        volume_name: &str,
+        custom_name: Option<&str>,
+    ) -> io::Result<Snapshot> {
         if let Some(c) = self.cluster.get() {
-            let id = format!("snapshot-{}", Utc::now().timestamp_nanos_opt().unwrap_or_default());
-            return serde_json::from_value(c.write(Action::Snapshot { volume: volume_name.into(), name: custom_name.unwrap_or(&id).into(), id: id.clone(), at: Utc::now().to_rfc3339() }).await?).map_err(io::Error::other);
+            let id = format!(
+                "snapshot-{}",
+                Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            );
+            return serde_json::from_value(
+                c.write(Action::Snapshot {
+                    volume: volume_name.into(),
+                    name: custom_name.unwrap_or(&id).into(),
+                    id: id.clone(),
+                    at: Utc::now().to_rfc3339(),
+                })
+                .await?,
+            )
+            .map_err(io::Error::other);
         }
         let snap = {
             let mut state = self.state.write().await;
             let vol = state.volumes.get_mut(volume_name).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, format!("Volume '{}' introuvable", volume_name))
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Volume '{}' introuvable", volume_name),
+                )
             })?;
 
             // Ensure Merkle root is strictly fresh
@@ -387,8 +470,21 @@ impl MeshFSEngine {
     }
 
     /// Deletes a snapshot by name or ID.
-    pub async fn delete_snapshot(&self, volume_name: &str, snapshot_name: &str) -> io::Result<bool> {
-        if let Some(c) = self.cluster.get() { return serde_json::from_value(c.write(Action::DeleteSnapshot { volume: volume_name.into(), name: snapshot_name.into() }).await?).map_err(io::Error::other); }
+    pub async fn delete_snapshot(
+        &self,
+        volume_name: &str,
+        snapshot_name: &str,
+    ) -> io::Result<bool> {
+        if let Some(c) = self.cluster.get() {
+            return serde_json::from_value(
+                c.write(Action::DeleteSnapshot {
+                    volume: volume_name.into(),
+                    name: snapshot_name.into(),
+                })
+                .await?,
+            )
+            .map_err(io::Error::other);
+        }
         let removed = {
             let mut state = self.state.write().await;
             let initial_len = state.snapshots.len();
@@ -407,18 +503,36 @@ impl MeshFSEngine {
     /// Lists snapshots, optionally filtered by volume.
     pub async fn list_snapshots(&self, volume_filter: Option<&str>) -> io::Result<Vec<Snapshot>> {
         let snapshots: Vec<Snapshot> = if let Some(c) = self.cluster.get() {
-            serde_json::from_value(c.namespace().await?["snapshots"].clone()).map_err(io::Error::other)?
-        } else { self.state.read().await.snapshots.clone() };
-        Ok(snapshots.into_iter().filter(|s| volume_filter.is_none_or(|v| s.volume == v)).collect())
+            serde_json::from_value(c.namespace().await?["snapshots"].clone())
+                .map_err(io::Error::other)?
+        } else {
+            self.state.read().await.snapshots.clone()
+        };
+        Ok(snapshots
+            .into_iter()
+            .filter(|s| volume_filter.is_none_or(|v| s.volume == v))
+            .collect())
     }
 
     /// Joins an existing MeshFS cluster node and exchanges node peer records.
-    pub async fn join_cluster(&self, target_address: &str, _token: &str) -> Result<Vec<NodeInfo>, String> {
-        let c = self.cluster.get().ok_or("peer discovery alone does not replicate data; configure a fixed cluster explicitly")?;
+    pub async fn join_cluster(
+        &self,
+        target_address: &str,
+        _token: &str,
+    ) -> Result<Vec<NodeInfo>, String> {
+        let c = self.cluster.get().ok_or(
+            "peer discovery alone does not replicate data; configure a fixed cluster explicitly",
+        )?;
         let target = target_address.trim_end_matches('/');
-        if !c.config.peers.values().any(|p| p.trim_end_matches('/') == target) { return Err("target is not in the configured membership".into()); }
+        if !c
+            .config
+            .peers
+            .values()
+            .any(|p| p.trim_end_matches('/') == target)
+        {
+            return Err("target is not in the configured membership".into());
+        }
         c.namespace().await.map_err(|e| e.to_string())?;
         Ok(c.nodes().await)
-
     }
 }

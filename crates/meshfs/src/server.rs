@@ -6,7 +6,7 @@ use crate::engine::MeshFSEngine;
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Query, State},
-    http::{header, StatusCode, HeaderMap},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -109,7 +109,10 @@ pub fn create_router(engine: MeshFSEngine) -> Router {
             get(snapshots_handler).post(create_snapshot_handler),
         )
         .route("/snapshots/delete", post(delete_snapshot_handler))
-        .route("/api/v1/meshfs/snapshots/delete", post(delete_snapshot_handler))
+        .route(
+            "/api/v1/meshfs/snapshots/delete",
+            post(delete_snapshot_handler),
+        )
         // Files download / upload routes
         .route("/files/download", get(download_file_handler))
         .route("/api/v1/meshfs/files/download", get(download_file_handler))
@@ -132,16 +135,17 @@ async fn status_handler(State(engine): State<MeshFSEngine>) -> impl IntoResponse
 }
 
 async fn nodes_handler(State(engine): State<MeshFSEngine>) -> impl IntoResponse {
-    let nodes = if let Some(c) = engine.cluster.get() { c.nodes().await } else { engine.state.read().await.nodes.clone() };
+    let nodes = if let Some(c) = engine.cluster.get() {
+        c.nodes().await
+    } else {
+        engine.state.read().await.nodes.clone()
+    };
     #[derive(Serialize)]
     struct NodesResp {
         ok: bool,
         nodes: Vec<crate::engine::NodeInfo>,
     }
-    Json(NodesResp {
-        ok: true,
-        nodes,
-    })
+    Json(NodesResp { ok: true, nodes })
 }
 
 async fn join_handler(
@@ -229,10 +233,7 @@ async fn create_snapshot_handler(
         req.volume.trim()
     };
 
-    match engine
-        .create_snapshot(vol_name, req.name.as_deref())
-        .await
-    {
+    match engine.create_snapshot(vol_name, req.name.as_deref()).await {
         Ok(snap) => (
             StatusCode::CREATED,
             Json(serde_json::json!({ "ok": true, "snapshot": snap })),
@@ -301,7 +302,11 @@ async fn download_file_handler(
         )
             .into_response(),
         Err(e) => (
-            if e.kind()==std::io::ErrorKind::NotFound { StatusCode::NOT_FOUND } else { StatusCode::SERVICE_UNAVAILABLE },
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            },
             Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
         )
             .into_response(),
@@ -320,19 +325,24 @@ async fn upload_file_handler(
             .into_response();
     }
 
-    let decoded = match hex_or_base64_decode(&req.content_base64) {
-        Ok(data) => data,
-        Err(e) => {
-            return (
+    let decoded =
+        match hex_or_base64_decode(&req.content_base64) {
+            Ok(data) => data,
+            Err(e) => return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": format!("Base64 invalide: {}", e) })),
+                Json(
+                    serde_json::json!({ "ok": false, "error": format!("Base64 invalide: {}", e) }),
+                ),
             )
-                .into_response()
-        }
-    };
+                .into_response(),
+        };
 
     if engine.cluster.get().is_some() && decoded.len() > crate::cluster::MAX_FILE_BYTES {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "clustered file limit is 16 MiB").into_response();
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "clustered file limit is 16 MiB",
+        )
+            .into_response();
     }
     match engine.put_file(&req.volume, &req.path, &decoded).await {
         Ok(meta) => (
@@ -353,50 +363,107 @@ async fn diagnostics_handler(
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let vol_filter = params.get("volume").map(|s| s.as_str());
-    let deep = params.get("deep").map(|s| s == "true" || s == "1").unwrap_or(true);
+    let deep = params
+        .get("deep")
+        .map(|s| s == "true" || s == "1")
+        .unwrap_or(true);
     let report = engine.audit_integrity(vol_filter, deep).await;
     Json(report)
 }
 
 fn hex_or_base64_decode(input: &str) -> Result<Vec<u8>, String> {
     use base64::Engine;
-    base64::engine::general_purpose::STANDARD.decode(input).map_err(|e| e.to_string())
+    base64::engine::general_purpose::STANDARD
+        .decode(input)
+        .map_err(|e| e.to_string())
 }
 
 fn unavailable(e: impl std::fmt::Display) -> Response {
-    (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"ok":false,"error":e.to_string()}))).into_response()
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"ok":false,"error":e.to_string()})),
+    )
+        .into_response()
 }
-fn internal_cluster(engine: &MeshFSEngine, headers: &HeaderMap) -> Result<std::sync::Arc<crate::cluster::Cluster>, Response> {
+fn internal_cluster(
+    engine: &MeshFSEngine,
+    headers: &HeaderMap,
+) -> Result<std::sync::Arc<crate::cluster::Cluster>, Response> {
     match engine.cluster.get() {
         Some(c) if c.authorized(headers) => Ok(c.clone()),
         _ => Err(StatusCode::UNAUTHORIZED.into_response()),
     }
 }
-async fn raft_append(State(e): State<MeshFSEngine>, h: HeaderMap, Json(r): Json<openraft::raft::AppendEntriesRequest<crate::cluster::Types>>) -> Response {
-    let c=match internal_cluster(&e,&h){Ok(c)=>c,Err(r)=>return r};
+async fn raft_append(
+    State(e): State<MeshFSEngine>,
+    h: HeaderMap,
+    Json(r): Json<openraft::raft::AppendEntriesRequest<crate::cluster::Types>>,
+) -> Response {
+    let c = match internal_cluster(&e, &h) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
     Json(c.raft.append_entries(r).await).into_response()
 }
-async fn raft_vote(State(e): State<MeshFSEngine>, h: HeaderMap, Json(r): Json<openraft::raft::VoteRequest<u64>>) -> Response {
-    let c=match internal_cluster(&e,&h){Ok(c)=>c,Err(r)=>return r};
+async fn raft_vote(
+    State(e): State<MeshFSEngine>,
+    h: HeaderMap,
+    Json(r): Json<openraft::raft::VoteRequest<u64>>,
+) -> Response {
+    let c = match internal_cluster(&e, &h) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
     Json(c.raft.vote(r).await).into_response()
 }
-async fn raft_snapshot(State(e): State<MeshFSEngine>, h: HeaderMap, Json(r): Json<openraft::raft::InstallSnapshotRequest<crate::cluster::Types>>) -> Response {
-    let c=match internal_cluster(&e,&h){Ok(c)=>c,Err(r)=>return r};
+async fn raft_snapshot(
+    State(e): State<MeshFSEngine>,
+    h: HeaderMap,
+    Json(r): Json<openraft::raft::InstallSnapshotRequest<crate::cluster::Types>>,
+) -> Response {
+    let c = match internal_cluster(&e, &h) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
     Json(c.raft.install_snapshot(r).await).into_response()
 }
-async fn raft_write(State(e): State<MeshFSEngine>, h: HeaderMap, Json(r): Json<crate::cluster::Command>) -> Response {
-    let c=match internal_cluster(&e,&h){Ok(c)=>c,Err(r)=>return r};
+async fn raft_write(
+    State(e): State<MeshFSEngine>,
+    h: HeaderMap,
+    Json(r): Json<crate::cluster::Command>,
+) -> Response {
+    let c = match internal_cluster(&e, &h) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
     Json(c.local_write(r).await).into_response()
 }
-async fn raft_read(State(e): State<MeshFSEngine>, h: HeaderMap, Json(r): Json<crate::cluster::ReadRequest>) -> Response {
-    let c=match internal_cluster(&e,&h){Ok(c)=>c,Err(r)=>return r};
+async fn raft_read(
+    State(e): State<MeshFSEngine>,
+    h: HeaderMap,
+    Json(r): Json<crate::cluster::ReadRequest>,
+) -> Response {
+    let c = match internal_cluster(&e, &h) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
     Json(c.local_read(r).await).into_response()
 }
-async fn raft_namespace(State(e): State<MeshFSEngine>, h: HeaderMap, Json(_): Json<()>) -> Response {
-    let c=match internal_cluster(&e,&h){Ok(c)=>c,Err(r)=>return r};
+async fn raft_namespace(
+    State(e): State<MeshFSEngine>,
+    h: HeaderMap,
+    Json(_): Json<()>,
+) -> Response {
+    let c = match internal_cluster(&e, &h) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
     Json(c.local_namespace().await).into_response()
 }
 async fn raft_health(State(e): State<MeshFSEngine>, h: HeaderMap, Json(_): Json<()>) -> Response {
-    let c=match internal_cluster(&e,&h){Ok(c)=>c,Err(r)=>return r};
-    Json(Ok::<_,String>(c.metrics())).into_response()
+    let c = match internal_cluster(&e, &h) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    Json(Ok::<_, String>(c.metrics())).into_response()
 }

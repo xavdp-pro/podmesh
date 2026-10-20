@@ -7,9 +7,9 @@
 //! - Instant Copy-on-Write snapshots capturing DAG states
 //! - REST API compatible with Proxmox VE Storage Plugin (`MeshFSPlugin.pm`)
 
-pub mod cluster;
 pub mod chunk;
 pub mod cli;
+pub mod cluster;
 pub mod control;
 pub mod engine;
 pub mod merkle;

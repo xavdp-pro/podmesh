@@ -73,7 +73,8 @@ impl ChunkStore {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let tmp_file = target_file.with_extension(format!("tmp.{}.{}.{}", std::process::id(), seq, nanos));
+        let tmp_file =
+            target_file.with_extension(format!("tmp.{}.{}.{}", std::process::id(), seq, nanos));
         {
             let mut file = File::create(&tmp_file)?;
             file.write_all(data)?;
@@ -89,8 +90,15 @@ impl ChunkStore {
     /// Reads chunk content from disk and verifies integrity.
     pub fn read_chunk(&self, chunk_id: &str) -> io::Result<Vec<u8>> {
         let id = Self::normalize_id(chunk_id);
-        if id.len()!=64 || !id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid chunk digest"));
+        if id.len() != 64
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid chunk digest",
+            ));
         }
         let target_file = self.chunk_path(chunk_id);
         if !target_file.exists() {
