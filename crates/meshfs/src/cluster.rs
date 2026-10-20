@@ -251,7 +251,9 @@ impl Cluster {
         if let Action::Put { hex, .. } = &c.action {
             if hex.len()>MAX_FILE_BYTES*2 || hex::decode(hex).is_err() { return Err("invalid or oversized file payload".into()); }
         }
-        self.raft.client_write(c).await.map(|r|r.data).map_err(|e|e.to_string())
+        tokio::time::timeout(std::time::Duration::from_secs(3), self.raft.client_write(c))
+            .await.map_err(|_|"write deadline exceeded; outcome may be committed, reconcile before retry".to_string())?
+            .map(|r|r.data).map_err(|e|e.to_string())
     }
     pub async fn write(&self,action:Action)->io::Result<Value> {
         let id=format!("{}-{}",self.config.node_id,std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(err)?.as_nanos());
@@ -260,7 +262,8 @@ impl Cluster {
         if let Some(e)=value.get("error"){return Err(err(e))}Ok(value)
     }
     pub async fn local_read(&self,r:ReadRequest)->Result<String,String> {
-        self.raft.ensure_linearizable().await.map_err(|e|e.to_string())?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), self.raft.ensure_linearizable())
+            .await.map_err(|_|"quorum read deadline exceeded".to_string())?.map_err(|e|e.to_string())?;
         self.machine.engine.local_get_file(&r.volume,&r.path).await.map(hex::encode).map_err(|e|e.to_string())
     }
     pub async fn read(&self,volume:&str,path:&str)->io::Result<Vec<u8>> {
@@ -268,7 +271,8 @@ impl Cluster {
         let data=if leader==self.config.node_id{self.local_read(req).await.map_err(err)?}else{self.network.rpc::<_,String,StringError>(leader,&node,"read",req).await.map_err(err)?};hex::decode(data).map_err(err)
     }
     pub async fn local_namespace(&self)->Result<Value,String> {
-        self.raft.ensure_linearizable().await.map_err(|e|e.to_string())?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), self.raft.ensure_linearizable())
+            .await.map_err(|_|"quorum read deadline exceeded".to_string())?.map_err(|e|e.to_string())?;
         let s=self.machine.data.lock().await;
         Ok(json!({"volumes":s.volumes,"snapshots":s.snapshots}))
     }
@@ -295,3 +299,48 @@ impl Cluster {
 pub struct StringError(pub String);
 impl std::fmt::Display for StringError {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.write_str(&self.0)}}
 impl std::error::Error for StringError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openraft::testing::StoreBuilder;
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+    struct Builder;
+    impl openraft::testing::StoreBuilder<Types, Db, Arc<Machine>, Cleanup> for Builder {
+        async fn build(&self) -> SResult<(Cleanup, Db, Arc<Machine>)> {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let dir=std::env::temp_dir().join(format!("meshfs-raft-test-{}-{}",std::process::id(),NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed)));
+            std::fs::create_dir(&dir).map_err(se)?;
+            let db=Db::open(&dir.join("raft.sqlite")).map_err(se)?;
+            let engine=MeshFSEngine::new(&dir,"test",0).await.map_err(se)?;
+            let sm=Arc::new(Machine{db:db.clone(),engine,data:AsyncMutex::new(MachineData::default())});
+            Ok((Cleanup(dir),db,sm))
+        }
+    }
+    #[test]
+    fn raft_storage_contract() {
+        openraft::testing::Suite::test_all(Builder).unwrap();
+    }
+    #[tokio::test]
+    async fn committed_files_survive_reopen_and_snapshot_transfer() {
+        let (_guard,db,mut sm)=Builder.build().await.unwrap();
+        let command=Command{id:"write-1".into(),action:Action::Put{volume:"default".into(),path:"test.txt".into(),hex:hex::encode(b"durable replicated bytes"),at:"2026-01-01T00:00:00Z".into()}};
+        let entry=Entry{log_id:LogId::new(openraft::CommittedLeaderId::new(1,1),1),payload:EntryPayload::Normal(command.clone())};
+        sm.apply([entry]).await.unwrap();
+        let persisted=db.get::<MachineData>("machine").unwrap().unwrap();
+        let reopened=Db::open(&_guard.0.join("raft.sqlite")).unwrap();
+        assert_eq!(reopened.get::<MachineData>("machine").unwrap().unwrap().applied,persisted.applied);
+        let (_target_guard,_,mut target)=Builder.build().await.unwrap();
+        let image=sm.build_snapshot().await.unwrap();
+        target.install_snapshot(&image.meta,image.snapshot).await.unwrap();
+        assert_eq!(target.engine.local_get_file("default","test.txt").await.unwrap(),b"durable replicated bytes");
+        let mut state=target.data.lock().await;
+        let before=state.volumes["default"].merkle_root.clone();
+        target.execute(&mut state,&command).unwrap();
+        assert_eq!(before,state.volumes["default"].merkle_root);
+        let reused=Command{id:command.id,action:Action::DeleteVolume{name:"default".into()}};
+        assert!(target.execute(&mut state,&reused).unwrap().get("error").is_some());
+        assert!(state.volumes.contains_key("default"));
+    }
+}
