@@ -268,7 +268,7 @@ struct MachineData {
     #[serde(default)]
     blobs: BTreeMap<String, usize>,
     #[serde(default)]
-    live_ops: BTreeMap<String,(String,Value)>,
+    live_ops: BTreeMap<String, (String, Value)>,
 }
 pub struct Machine {
     db: Db,
@@ -292,21 +292,45 @@ impl Machine {
         }
         let result = match &c.action {
             Action::Live(change) => {
-                if let Some((hash,result))=s.live_ops.get(&change.id) {
-                    return Ok(if hash==&change.hash {result.clone()}else{json!({"error":"live operation ID reused"})});
+                if let Some((hash, result)) = s.live_ops.get(&change.id) {
+                    return Ok(if hash == &change.hash {
+                        result.clone()
+                    } else {
+                        json!({"error":"live operation ID reused"})
+                    });
                 }
-                let current=s.volumes.get(&change.volume).and_then(|v|v.files.get(&change.path));
-                if current.map(crate::live::version)!=change.expected {return Ok(json!({"error":"live compare conflict"}));}
-                if let Some(inode)=&change.inode {crate::live::validate(inode,&s.blobs).map_err(se)?;}
-                let v=s.volumes.entry(change.volume.clone()).or_insert_with(||Volume::new(&change.volume));
-                if let Some(to)=&change.rename {
-                    let mut inode=v.files.remove(&change.path).ok_or_else(||se("rename source missing"))?;
-                    inode.path=to.clone();v.files.insert(to.clone(),inode);
-                }else if let Some(inode)=&change.inode {v.files.insert(change.path.clone(),inode.clone());}
-                else {v.files.remove(&change.path);}
-                v.recompute_merkle();let result=json!({"ok":true});
-                s.live_ops.insert(change.id.clone(),(change.hash.clone(),result.clone()));result
-            },
+                let current = s
+                    .volumes
+                    .get(&change.volume)
+                    .and_then(|v| v.files.get(&change.path));
+                if current.map(crate::live::version) != change.expected {
+                    return Ok(json!({"error":"live compare conflict"}));
+                }
+                if let Some(inode) = &change.inode {
+                    crate::live::validate(inode, &s.blobs).map_err(se)?;
+                }
+                let v = s
+                    .volumes
+                    .entry(change.volume.clone())
+                    .or_insert_with(|| Volume::new(&change.volume));
+                if let Some(to) = &change.rename {
+                    let mut inode = v
+                        .files
+                        .remove(&change.path)
+                        .ok_or_else(|| se("rename source missing"))?;
+                    inode.path = to.clone();
+                    v.files.insert(to.clone(), inode);
+                } else if let Some(inode) = &change.inode {
+                    v.files.insert(change.path.clone(), inode.clone());
+                } else {
+                    v.files.remove(&change.path);
+                }
+                v.recompute_merkle();
+                let result = json!({"ok":true});
+                s.live_ops
+                    .insert(change.id.clone(), (change.hash.clone(), result.clone()));
+                result
+            }
             Action::StageChunk { hex } => {
                 let bytes = hex::decode(hex).map_err(se)?;
                 if bytes.len() > CHUNK_SIZE {
@@ -1179,7 +1203,9 @@ fn validate_layout(inode: &Inode, sizes: &BTreeMap<String, usize>) -> SResult<()
     if inode.chunks_count != inode.chunks.len() {
         return Err(se("chunk count mismatch"));
     }
-    if inode.digest.starts_with("merkle-sha256:") {return crate::live::validate(inode,sizes).map_err(se);}
+    if inode.digest.starts_with("merkle-sha256:") {
+        return crate::live::validate(inode, sizes).map_err(se);
+    }
     let digest = inode
         .digest
         .strip_prefix("sha256:")

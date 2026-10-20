@@ -210,11 +210,11 @@ pub struct GetArgs {
     pub remote: String,
 }
 
-#[derive(Args,Debug)]
+#[derive(Args, Debug)]
 pub struct MountArgs {
-    #[arg(long,required=true)]
-    pub peer:Vec<String>,
+    #[arg(long, required = true)]
+    pub peer: Vec<String>,
     #[arg(long)]
-    pub volume:String,
-    pub mountpoint:PathBuf,
+    pub volume: String,
+    pub mountpoint: PathBuf,
 }
