@@ -84,8 +84,8 @@ pub fn create_router(engine: MeshFSEngine) -> Router {
         .route("/internal/read", post(raft_read))
         .route("/internal/namespace", post(raft_namespace))
         .route("/internal/health", post(raft_health))
-        .route("/internal/inode",post(raft_inode))
-        .route("/internal/chunk",post(raft_chunk))
+        .route("/internal/inode", post(raft_inode))
+        .route("/internal/chunk", post(raft_chunk))
         // Status routes
         .route("/", get(status_handler))
         .route("/status", get(status_handler))
@@ -118,8 +118,14 @@ pub fn create_router(engine: MeshFSEngine) -> Router {
         // Files download / upload routes
         .route("/files/download", get(download_file_handler))
         .route("/api/v1/meshfs/files/download", get(download_file_handler))
-        .route("/files/stream",post(stream_upload_handler).layer(DefaultBodyLimit::disable()))
-        .route("/api/v1/meshfs/files/stream",post(stream_upload_handler).layer(DefaultBodyLimit::disable()))
+        .route(
+            "/files/stream",
+            post(stream_upload_handler).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/api/v1/meshfs/files/stream",
+            post(stream_upload_handler).layer(DefaultBodyLimit::disable()),
+        )
         .route("/files/upload", post(upload_file_handler))
         .route("/api/v1/meshfs/files/upload", post(upload_file_handler))
         // Diagnostics & Integrity audit routes
@@ -292,32 +298,82 @@ async fn download_file_handler(
     State(engine): State<MeshFSEngine>,
     Query(query): Query<DownloadQuery>,
 ) -> Response {
-    let inode=match engine.file_inode(&query.volume,&query.path).await {
-        Ok(i)=>i,Err(e)=>return (if e.kind()==std::io::ErrorKind::NotFound {StatusCode::NOT_FOUND}else{StatusCode::SERVICE_UNAVAILABLE},Json(serde_json::json!({"error":e.to_string()}))).into_response()
-    };
-    let size=inode.size;let digest=inode.digest.clone();
-    use sha2::{Digest,Sha256};
-    let stream=futures_util::stream::try_unfold((engine,inode,0usize,0u64,Sha256::new()),|(engine,inode,index,offset,mut hash)|async move {
-        if index==inode.chunks.len() {
-            if offset!=inode.size || format!("sha256:{}",hex::encode(hash.finalize()))!=inode.digest {return Err(std::io::Error::other("file digest mismatch"));}
-            return Ok(None);
+    let inode = match engine.file_inode(&query.volume, &query.path).await {
+        Ok(i) => i,
+        Err(e) => {
+            return (
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                },
+                Json(serde_json::json!({"error":e.to_string()})),
+            )
+                .into_response()
         }
-        let c=&inode.chunks[index];let bytes=engine.file_chunk(&c.id).await?;
-        if c.offset!=offset || bytes.len()!=c.size {return Err(std::io::Error::other("chunk layout mismatch"));}
-        hash.update(&bytes);let offset=offset+bytes.len() as u64;
-        if index+1==inode.chunks.len() && (offset!=inode.size || format!("sha256:{}",hex::encode(hash.clone().finalize()))!=inode.digest) {return Err(std::io::Error::other("file digest mismatch"));}
-        Ok(Some((bytes::Bytes::from(bytes),(engine,inode,index+1,offset,hash))))
-    });
-    (StatusCode::OK,[(header::CONTENT_TYPE,"application/octet-stream".to_string()),(header::CONTENT_LENGTH,size.to_string()),(header::ETAG,format!("\"{}\"",digest))],Body::from_stream(stream)).into_response()
+    };
+    let size = inode.size;
+    let digest = inode.digest.clone();
+    use sha2::{Digest, Sha256};
+    let stream = futures_util::stream::try_unfold(
+        (engine, inode, 0usize, 0u64, Sha256::new()),
+        |(engine, inode, index, offset, mut hash)| async move {
+            if index == inode.chunks.len() {
+                if offset != inode.size
+                    || format!("sha256:{}", hex::encode(hash.finalize())) != inode.digest
+                {
+                    return Err(std::io::Error::other("file digest mismatch"));
+                }
+                return Ok(None);
+            }
+            let c = &inode.chunks[index];
+            let bytes = engine.file_chunk(&c.id).await?;
+            if c.offset != offset || bytes.len() != c.size {
+                return Err(std::io::Error::other("chunk layout mismatch"));
+            }
+            hash.update(&bytes);
+            let offset = offset + bytes.len() as u64;
+            if index + 1 == inode.chunks.len()
+                && (offset != inode.size
+                    || format!("sha256:{}", hex::encode(hash.clone().finalize())) != inode.digest)
+            {
+                return Err(std::io::Error::other("file digest mismatch"));
+            }
+            Ok(Some((
+                bytes::Bytes::from(bytes),
+                (engine, inode, index + 1, offset, hash),
+            )))
+        },
+    );
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_LENGTH, size.to_string()),
+            (header::ETAG, format!("\"{}\"", digest)),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response()
 }
-async fn stream_upload_handler(State(engine):State<MeshFSEngine>,Query(query):Query<DownloadQuery>,body:Body)->Response {
+async fn stream_upload_handler(
+    State(engine): State<MeshFSEngine>,
+    Query(query): Query<DownloadQuery>,
+    body: Body,
+) -> Response {
     use futures_util::TryStreamExt;
-    if query.path.trim().is_empty(){return StatusCode::BAD_REQUEST.into_response();}
-    let stream=body.into_data_stream().map_err(std::io::Error::other);
-    let reader=tokio_util::io::StreamReader::new(stream);
-    match engine.put_stream(&query.volume,&query.path,reader).await {
-        Ok(inode)=>(StatusCode::CREATED,Json(serde_json::json!({"ok":true,"file":inode}))).into_response(),
-        Err(e)=>unavailable(e),
+    if query.path.trim().is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let stream = body.into_data_stream().map_err(std::io::Error::other);
+    let reader = tokio_util::io::StreamReader::new(stream);
+    match engine.put_stream(&query.volume, &query.path, reader).await {
+        Ok(inode) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"ok":true,"file":inode})),
+        )
+            .into_response(),
+        Err(e) => unavailable(e),
     }
 }
 
@@ -476,9 +532,25 @@ async fn raft_health(State(e): State<MeshFSEngine>, h: HeaderMap, Json(_): Json<
     Json(Ok::<_, String>(c.metrics())).into_response()
 }
 
-async fn raft_inode(State(e):State<MeshFSEngine>,h:HeaderMap,Json(r):Json<crate::cluster::ReadRequest>)->Response {
-    let c=match internal_cluster(&e,&h){Ok(c)=>c,Err(r)=>return r};Json(c.local_inode(r).await).into_response()
+async fn raft_inode(
+    State(e): State<MeshFSEngine>,
+    h: HeaderMap,
+    Json(r): Json<crate::cluster::ReadRequest>,
+) -> Response {
+    let c = match internal_cluster(&e, &h) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    Json(c.local_inode(r).await).into_response()
 }
-async fn raft_chunk(State(e):State<MeshFSEngine>,h:HeaderMap,Json(id):Json<String>)->Response {
-    let c=match internal_cluster(&e,&h){Ok(c)=>c,Err(r)=>return r};Json(c.local_chunk(&id)).into_response()
+async fn raft_chunk(
+    State(e): State<MeshFSEngine>,
+    h: HeaderMap,
+    Json(id): Json<String>,
+) -> Response {
+    let c = match internal_cluster(&e, &h) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    Json(c.local_chunk(&id)).into_response()
 }

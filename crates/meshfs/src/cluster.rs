@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Debug,
-    io::{self, Read, Write, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     ops::RangeBounds,
     path::Path,
     sync::{Arc, Mutex},
@@ -32,8 +32,13 @@ pub const MAX_INLINE_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Action {
     /// Replicate one durable immutable block before publishing file metadata.
-    StageChunk { hex: String },
-    CommitFile { volume: String, inode: Inode },
+    StageChunk {
+        hex: String,
+    },
+    CommitFile {
+        volume: String,
+        inode: Inode,
+    },
     Put {
         volume: String,
         path: String,
@@ -109,7 +114,8 @@ impl ClusterConfig {
     }
     fn fingerprint(&self) -> String {
         sha256_digest(
-            &serde_json::to_vec(&("meshfs-stream-v1", &self.cluster, &self.peers)).expect("serializable topology"),
+            &serde_json::to_vec(&("meshfs-stream-v1", &self.cluster, &self.peers))
+                .expect("serializable topology"),
         )
     }
     fn nodes(&self) -> BTreeMap<u64, BasicNode> {
@@ -259,7 +265,7 @@ struct MachineData {
     seen: BTreeMap<String, (String, Value)>,
     // Staged blocks remain referenced even if an upload is interrupted. No GC.
     #[serde(default)]
-    blobs: BTreeMap<String,usize>,
+    blobs: BTreeMap<String, usize>,
 }
 pub struct Machine {
     db: Db,
@@ -283,18 +289,24 @@ impl Machine {
         }
         let result = match &c.action {
             Action::StageChunk { hex } => {
-                let bytes=hex::decode(hex).map_err(se)?;
-                if bytes.len()>CHUNK_SIZE {return Err(se("oversized staged chunk"));}
-                let id=self.engine.chunk_store.write_chunk(&bytes).map_err(se)?;
-                s.blobs.insert(id.clone(),bytes.len()); json!(id)
-            },
-            Action::CommitFile {volume,inode} => {
-                validate_layout(inode,&s.blobs)?;
-                let v=s.volumes.entry(volume.clone()).or_insert_with(|| {
-                    let mut v=Volume::new(volume);v.created_at=inode.updated_at.clone();v
+                let bytes = hex::decode(hex).map_err(se)?;
+                if bytes.len() > CHUNK_SIZE {
+                    return Err(se("oversized staged chunk"));
+                }
+                let id = self.engine.chunk_store.write_chunk(&bytes).map_err(se)?;
+                s.blobs.insert(id.clone(), bytes.len());
+                json!(id)
+            }
+            Action::CommitFile { volume, inode } => {
+                validate_layout(inode, &s.blobs)?;
+                let v = s.volumes.entry(volume.clone()).or_insert_with(|| {
+                    let mut v = Volume::new(volume);
+                    v.created_at = inode.updated_at.clone();
+                    v
                 });
-                v.insert_file(inode.clone());json!(inode)
-            },
+                v.insert_file(inode.clone());
+                json!(inode)
+            }
             Action::Put {
                 volume,
                 path,
@@ -306,7 +318,7 @@ impl Machine {
                 let mut offset = 0;
                 for part in bytes.chunks(CHUNK_SIZE) {
                     let id = self.engine.chunk_store.write_chunk(part).map_err(se)?;
-                    s.blobs.insert(id.clone(),part.len());
+                    s.blobs.insert(id.clone(), part.len());
                     chunks.push(ChunkRef {
                         id,
                         size: part.len(),
@@ -371,23 +383,40 @@ impl Machine {
         s.seen.insert(c.id.clone(), (digest, result.clone()));
         Ok(result)
     }
-    fn snapshot_file(&self)->SResult<std::fs::File> {
-        let dir=self.engine.data_dir.join("raft/snapshots");std::fs::create_dir_all(&dir).map_err(se)?;
-        static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
-        let path=dir.join(format!("transfer-{}-{}",std::process::id(),NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed)));
-        let file=std::fs::OpenOptions::new().create_new(true).read(true).write(true).open(&path).map_err(se)?;
+    fn snapshot_file(&self) -> SResult<std::fs::File> {
+        let dir = self.engine.data_dir.join("raft/snapshots");
+        std::fs::create_dir_all(&dir).map_err(se)?;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = dir.join(format!(
+            "transfer-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(se)?;
         // OpenRaft owns the descriptor until transfer completion. Unlinking the
         // temporary name also removes abandoned transfers on process termination.
-        std::fs::remove_file(path).map_err(se)?;Ok(file)
+        std::fs::remove_file(path).map_err(se)?;
+        Ok(file)
     }
-    fn chunk_ids(s:&MachineData)->BTreeSet<String> {
-        let mut ids:BTreeSet<String>=s.blobs.keys().cloned().collect();
-        for inode in s.volumes.values().flat_map(|v|v.files.values()).chain(s.snapshots.iter().flat_map(|v|v.files_tree.values())) {
-            for chunk in &inode.chunks {ids.insert(chunk.id.clone());}
+    fn chunk_ids(s: &MachineData) -> BTreeSet<String> {
+        let mut ids: BTreeSet<String> = s.blobs.keys().cloned().collect();
+        for inode in s
+            .volumes
+            .values()
+            .flat_map(|v| v.files.values())
+            .chain(s.snapshots.iter().flat_map(|v| v.files_tree.values()))
+        {
+            for chunk in &inode.chunks {
+                ids.insert(chunk.id.clone());
+            }
         }
         ids
     }
-
 }
 impl RaftStateMachine<Types> for Arc<Machine> {
     type SnapshotBuilder = Self;
@@ -434,24 +463,45 @@ impl RaftStateMachine<Types> for Arc<Machine> {
         meta: &SnapshotMeta<u64, BasicNode>,
         snapshot: Box<<Types as RaftTypeConfig>::SnapshotData>,
     ) -> SResult<()> {
-        let mut file=(*snapshot).into_std().await;
-        file.sync_all().map_err(se)?;file.seek(SeekFrom::Start(0)).map_err(se)?;
-        let mut reader=std::io::BufReader::new(file);
-        let mut checksum=[0u8;32];reader.read_exact(&mut checksum).map_err(se)?;
-        let metadata=read_frame(&mut reader,128*1024*1024)?;
-        if hex::encode(checksum)!=sha256_digest(&metadata){return Err(se("snapshot metadata checksum mismatch"));}
-        let state:MachineData=serde_json::from_slice(&metadata).map_err(se)?;
-        if state.applied!=meta.last_log_id || state.membership!=meta.last_membership {return Err(se("snapshot metadata mismatch"));}
-        let expected=Machine::chunk_ids(&state);
-        let mut sizes=BTreeMap::new();
-        for id in &expected {
-            let bytes=read_frame(&mut reader,CHUNK_SIZE)?;
-            sizes.insert(id.clone(),bytes.len());
-            if self.engine.chunk_store.write_chunk(&bytes).map_err(se)?!=*id {return Err(se("snapshot chunk hash mismatch"));}
+        let mut file = (*snapshot).into_std().await;
+        file.sync_all().map_err(se)?;
+        file.seek(SeekFrom::Start(0)).map_err(se)?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut checksum = [0u8; 32];
+        reader.read_exact(&mut checksum).map_err(se)?;
+        let metadata = read_frame(&mut reader, 128 * 1024 * 1024)?;
+        if hex::encode(checksum) != sha256_digest(&metadata) {
+            return Err(se("snapshot metadata checksum mismatch"));
         }
-        let mut extra=[0u8;1];if reader.read(&mut extra).map_err(se)?!=0{return Err(se("snapshot trailing bytes"));}
-        for inode in state.volumes.values().flat_map(|v|v.files.values()).chain(state.snapshots.iter().flat_map(|v|v.files_tree.values())) {validate_layout(inode,&sizes)?;}
-        let mut s=self.data.lock().await;self.db.set("machine",&state)?;*s=state;self.mirror(&s).await;
+        let state: MachineData = serde_json::from_slice(&metadata).map_err(se)?;
+        if state.applied != meta.last_log_id || state.membership != meta.last_membership {
+            return Err(se("snapshot metadata mismatch"));
+        }
+        let expected = Machine::chunk_ids(&state);
+        let mut sizes = BTreeMap::new();
+        for id in &expected {
+            let bytes = read_frame(&mut reader, CHUNK_SIZE)?;
+            sizes.insert(id.clone(), bytes.len());
+            if self.engine.chunk_store.write_chunk(&bytes).map_err(se)? != *id {
+                return Err(se("snapshot chunk hash mismatch"));
+            }
+        }
+        let mut extra = [0u8; 1];
+        if reader.read(&mut extra).map_err(se)? != 0 {
+            return Err(se("snapshot trailing bytes"));
+        }
+        for inode in state
+            .volumes
+            .values()
+            .flat_map(|v| v.files.values())
+            .chain(state.snapshots.iter().flat_map(|v| v.files_tree.values()))
+        {
+            validate_layout(inode, &sizes)?;
+        }
+        let mut s = self.data.lock().await;
+        self.db.set("machine", &state)?;
+        *s = state;
+        self.mirror(&s).await;
         Ok(())
     }
     async fn get_current_snapshot(&mut self) -> SResult<Option<Snapshot<Types>>> {
@@ -463,17 +513,34 @@ impl RaftStateMachine<Types> for Arc<Machine> {
 }
 impl RaftSnapshotBuilder<Types> for Arc<Machine> {
     async fn build_snapshot(&mut self) -> SResult<Snapshot<Types>> {
-        let state=self.data.lock().await.clone();let machine=self.clone();
-        tokio::task::spawn_blocking(move|| {
-            let meta=SnapshotMeta{last_log_id:state.applied,last_membership:state.membership.clone(),snapshot_id:format!("{:?}",state.applied)};
-            let mut file=machine.snapshot_file()?;
-            let metadata=serde_json::to_vec(&state).map_err(se)?;
-            file.write_all(&hex::decode(sha256_digest(&metadata)).map_err(se)?).map_err(se)?;
-            write_frame(&mut file,&metadata)?;
-            for id in Machine::chunk_ids(&state){write_frame(&mut file,&machine.engine.chunk_store.read_chunk(&id).map_err(se)?)?;}
-            file.sync_all().map_err(se)?;file.seek(SeekFrom::Start(0)).map_err(se)?;
-            Ok(Snapshot{meta,snapshot:Box::new(tokio::fs::File::from_std(file))})
-        }).await.map_err(se)?
+        let state = self.data.lock().await.clone();
+        let machine = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let meta = SnapshotMeta {
+                last_log_id: state.applied,
+                last_membership: state.membership.clone(),
+                snapshot_id: format!("{:?}", state.applied),
+            };
+            let mut file = machine.snapshot_file()?;
+            let metadata = serde_json::to_vec(&state).map_err(se)?;
+            file.write_all(&hex::decode(sha256_digest(&metadata)).map_err(se)?)
+                .map_err(se)?;
+            write_frame(&mut file, &metadata)?;
+            for id in Machine::chunk_ids(&state) {
+                write_frame(
+                    &mut file,
+                    &machine.engine.chunk_store.read_chunk(&id).map_err(se)?,
+                )?;
+            }
+            file.sync_all().map_err(se)?;
+            file.seek(SeekFrom::Start(0)).map_err(se)?;
+            Ok(Snapshot {
+                meta,
+                snapshot: Box::new(tokio::fs::File::from_std(file)),
+            })
+        })
+        .await
+        .map_err(se)?
     }
 }
 
@@ -506,7 +573,11 @@ impl Network {
             .bearer_auth(&*self.token)
             .header("x-meshfs-topology", &self.fingerprint)
             .json(&req)
-            .timeout(std::time::Duration::from_secs(if path=="snapshot" {120}else{4}))
+            .timeout(std::time::Duration::from_secs(if path == "snapshot" {
+                120
+            } else {
+                4
+            }))
             .send()
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
@@ -702,15 +773,24 @@ impl Cluster {
         if c.id.is_empty() || c.id.len() > 256 {
             return Err("invalid operation ID".into());
         }
-        if let Action::StageChunk {hex} = &c.action {
-            if hex.len()>CHUNK_SIZE*2 {return Err("oversized chunk payload".into());}
-            let bytes=hex::decode(hex).map_err(|e|e.to_string())?;
-            if bytes.is_empty(){return Err("empty staged chunk".into());}
-            let id=format!("sha256:{}",sha256_digest(&bytes));
-            let already_committed=self.machine.data.lock().await.blobs.contains_key(&id);
+        if let Action::StageChunk { hex } = &c.action {
+            if hex.len() > CHUNK_SIZE * 2 {
+                return Err("oversized chunk payload".into());
+            }
+            let bytes = hex::decode(hex).map_err(|e| e.to_string())?;
+            if bytes.is_empty() {
+                return Err("empty staged chunk".into());
+            }
+            let id = format!("sha256:{}", sha256_digest(&bytes));
+            let already_committed = self.machine.data.lock().await.blobs.contains_key(&id);
             if already_committed {
-                tokio::time::timeout(std::time::Duration::from_secs(3),self.raft.ensure_linearizable()).await
-                    .map_err(|_|"quorum deadline exceeded".to_string())?.map_err(|e|e.to_string())?;
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    self.raft.ensure_linearizable(),
+                )
+                .await
+                .map_err(|_| "quorum deadline exceeded".to_string())?
+                .map_err(|e| e.to_string())?;
                 return Ok(json!(id));
             }
         }
@@ -753,22 +833,48 @@ impl Cluster {
         Ok(value)
     }
     pub async fn local_read(&self, r: ReadRequest) -> Result<String, ReadError> {
-        tokio::time::timeout(std::time::Duration::from_secs(3), self.raft.ensure_linearizable())
-            .await.map_err(|_| ReadError::unavailable("quorum read deadline exceeded"))?
-            .map_err(ReadError::unavailable)?;
-        if self.machine.engine.local_inode(&r.volume,&r.path).await.map_err(ReadError::unavailable)?.size>MAX_INLINE_BYTES as u64 {
-            return Err(ReadError::unavailable("use the streaming download endpoint for large files"));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.raft.ensure_linearizable(),
+        )
+        .await
+        .map_err(|_| ReadError::unavailable("quorum read deadline exceeded"))?
+        .map_err(ReadError::unavailable)?;
+        if self
+            .machine
+            .engine
+            .local_inode(&r.volume, &r.path)
+            .await
+            .map_err(ReadError::unavailable)?
+            .size
+            > MAX_INLINE_BYTES as u64
+        {
+            return Err(ReadError::unavailable(
+                "use the streaming download endpoint for large files",
+            ));
         }
-        self.machine.engine.local_get_file(&r.volume, &r.path).await.map(hex::encode)
-            .map_err(|e| ReadError { missing: e.kind()==io::ErrorKind::NotFound, message: e.to_string() })
+        self.machine
+            .engine
+            .local_get_file(&r.volume, &r.path)
+            .await
+            .map(hex::encode)
+            .map_err(|e| ReadError {
+                missing: e.kind() == io::ErrorKind::NotFound,
+                message: e.to_string(),
+            })
     }
     pub async fn read(&self, volume: &str, path: &str) -> io::Result<Vec<u8>> {
         let (leader, node) = self.leader()?;
-        let req = ReadRequest { volume: volume.into(), path: path.into() };
+        let req = ReadRequest {
+            volume: volume.into(),
+            path: path.into(),
+        };
         let data = if leader == self.config.node_id {
             self.local_read(req).await.map_err(ReadError::into_io)?
         } else {
-            self.network.rpc::<_, String, ReadError>(leader, &node, "read", req).await
+            self.network
+                .rpc::<_, String, ReadError>(leader, &node, "read", req)
+                .await
                 .map_err(|e| match e {
                     RPCError::RemoteError(remote) => remote.source.into_io(),
                     other => err(other),
@@ -777,29 +883,72 @@ impl Cluster {
         hex::decode(data).map_err(err)
     }
 
-    pub async fn local_inode(&self,r:ReadRequest)->Result<Inode,ReadError> {
-        tokio::time::timeout(std::time::Duration::from_secs(3),self.raft.ensure_linearizable()).await
-            .map_err(|_|ReadError::unavailable("quorum read deadline exceeded"))?.map_err(ReadError::unavailable)?;
-        self.machine.engine.local_inode(&r.volume,&r.path).await.map_err(|e|ReadError{missing:e.kind()==io::ErrorKind::NotFound,message:e.to_string()})
+    pub async fn local_inode(&self, r: ReadRequest) -> Result<Inode, ReadError> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.raft.ensure_linearizable(),
+        )
+        .await
+        .map_err(|_| ReadError::unavailable("quorum read deadline exceeded"))?
+        .map_err(ReadError::unavailable)?;
+        self.machine
+            .engine
+            .local_inode(&r.volume, &r.path)
+            .await
+            .map_err(|e| ReadError {
+                missing: e.kind() == io::ErrorKind::NotFound,
+                message: e.to_string(),
+            })
     }
-    pub async fn inode(&self,volume:&str,path:&str)->io::Result<Inode> {
-        let (leader,node)=self.leader()?;let req=ReadRequest{volume:volume.into(),path:path.into()};
-        if leader==self.config.node_id {self.local_inode(req).await.map_err(ReadError::into_io)} else {
-            self.network.rpc::<_,Inode,ReadError>(leader,&node,"inode",req).await.map_err(|e|match e{RPCError::RemoteError(r)=>r.source.into_io(),other=>err(other)})
+    pub async fn inode(&self, volume: &str, path: &str) -> io::Result<Inode> {
+        let (leader, node) = self.leader()?;
+        let req = ReadRequest {
+            volume: volume.into(),
+            path: path.into(),
+        };
+        if leader == self.config.node_id {
+            self.local_inode(req).await.map_err(ReadError::into_io)
+        } else {
+            self.network
+                .rpc::<_, Inode, ReadError>(leader, &node, "inode", req)
+                .await
+                .map_err(|e| match e {
+                    RPCError::RemoteError(r) => r.source.into_io(),
+                    other => err(other),
+                })
         }
     }
-    pub fn local_chunk(&self,id:&str)->Result<String,String> {self.machine.engine.chunk_store.read_chunk(id).map(hex::encode).map_err(|e|e.to_string())}
-    pub async fn chunk(&self,id:&str)->io::Result<Vec<u8>> {
-        if let Ok(data)=self.machine.engine.chunk_store.read_chunk(id){return Ok(data);}
-        for (node,url) in &self.config.peers {
-            if *node==self.config.node_id{continue;}
-            if let Ok(data)=self.network.rpc::<_,String,StringError>(*node,&BasicNode::new(url.clone()),"chunk",id).await {
-                let bytes=hex::decode(data).map_err(err)?;
-                if self.machine.engine.chunk_store.write_chunk(&bytes)?!=id {return Err(err("peer chunk hash mismatch"));}
+    pub fn local_chunk(&self, id: &str) -> Result<String, String> {
+        self.machine
+            .engine
+            .chunk_store
+            .read_chunk(id)
+            .map(hex::encode)
+            .map_err(|e| e.to_string())
+    }
+    pub async fn chunk(&self, id: &str) -> io::Result<Vec<u8>> {
+        if let Ok(data) = self.machine.engine.chunk_store.read_chunk(id) {
+            return Ok(data);
+        }
+        for (node, url) in &self.config.peers {
+            if *node == self.config.node_id {
+                continue;
+            }
+            if let Ok(data) = self
+                .network
+                .rpc::<_, String, StringError>(*node, &BasicNode::new(url.clone()), "chunk", id)
+                .await
+            {
+                let bytes = hex::decode(data).map_err(err)?;
+                if self.machine.engine.chunk_store.write_chunk(&bytes)? != id {
+                    return Err(err("peer chunk hash mismatch"));
+                }
                 return Ok(bytes);
             }
         }
-        Err(err("referenced chunk is unavailable from configured replicas"))
+        Err(err(
+            "referenced chunk is unavailable from configured replicas",
+        ))
     }
     pub async fn local_namespace(&self) -> Result<Value, String> {
         tokio::time::timeout(
@@ -957,35 +1106,82 @@ mod tests {
     }
 }
 
-#[derive(Debug,Clone,Serialize,Deserialize)]
-pub struct ReadError { pub missing:bool, pub message:String }
-impl ReadError {
-    fn unavailable(e:impl std::fmt::Display)->Self {Self{missing:false,message:e.to_string()}}
-    fn into_io(self)->io::Error {io::Error::new(if self.missing {io::ErrorKind::NotFound}else{io::ErrorKind::Other},self.message)}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadError {
+    pub missing: bool,
+    pub message: String,
 }
-impl std::fmt::Display for ReadError {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.write_str(&self.message)}}
+impl ReadError {
+    fn unavailable(e: impl std::fmt::Display) -> Self {
+        Self {
+            missing: false,
+            message: e.to_string(),
+        }
+    }
+    fn into_io(self) -> io::Error {
+        io::Error::new(
+            if self.missing {
+                io::ErrorKind::NotFound
+            } else {
+                io::ErrorKind::Other
+            },
+            self.message,
+        )
+    }
+}
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
 impl std::error::Error for ReadError {}
 
-fn write_frame(w:&mut impl Write,bytes:&[u8])->SResult<()> {
-    w.write_all(&(bytes.len() as u64).to_be_bytes()).map_err(se)?;w.write_all(bytes).map_err(se)
+fn write_frame(w: &mut impl Write, bytes: &[u8]) -> SResult<()> {
+    w.write_all(&(bytes.len() as u64).to_be_bytes())
+        .map_err(se)?;
+    w.write_all(bytes).map_err(se)
 }
-fn read_frame(r:&mut impl Read,max:usize)->SResult<Vec<u8>> {
-    let mut len=[0;8];r.read_exact(&mut len).map_err(se)?;let len=u64::from_be_bytes(len);
-    if len>max as u64{return Err(se("snapshot frame exceeds its bound"));}
-    let mut bytes=vec![0;len as usize];r.read_exact(&mut bytes).map_err(se)?;Ok(bytes)
+fn read_frame(r: &mut impl Read, max: usize) -> SResult<Vec<u8>> {
+    let mut len = [0; 8];
+    r.read_exact(&mut len).map_err(se)?;
+    let len = u64::from_be_bytes(len);
+    if len > max as u64 {
+        return Err(se("snapshot frame exceeds its bound"));
+    }
+    let mut bytes = vec![0; len as usize];
+    r.read_exact(&mut bytes).map_err(se)?;
+    Ok(bytes)
 }
 
 /// Payload hashes are calculated while ingesting and verified while reading.
 /// Committing an inode checks references to already committed immutable blocks;
 /// it never rescans an entire VM disk while holding the state-machine lock.
-fn validate_layout(inode:&Inode,sizes:&BTreeMap<String,usize>)->SResult<()> {
-    if inode.chunks_count!=inode.chunks.len(){return Err(se("chunk count mismatch"));}
-    let digest=inode.digest.strip_prefix("sha256:").ok_or_else(||se("invalid file digest"))?;
-    if digest.len()!=64 || !digest.bytes().all(|b|b.is_ascii_hexdigit()){return Err(se("invalid file digest"));}
-    let mut offset=0u64;
-    for c in &inode.chunks {
-        if c.offset!=offset || c.size==0 || c.size>CHUNK_SIZE || sizes.get(&c.id)!=Some(&c.size){return Err(se("uncommitted or invalid chunk reference"));}
-        offset=offset.checked_add(c.size as u64).ok_or_else(||se("file size overflow"))?;
+fn validate_layout(inode: &Inode, sizes: &BTreeMap<String, usize>) -> SResult<()> {
+    if inode.chunks_count != inode.chunks.len() {
+        return Err(se("chunk count mismatch"));
     }
-    if offset!=inode.size{return Err(se("file size mismatch"));}Ok(())
+    let digest = inode
+        .digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| se("invalid file digest"))?;
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(se("invalid file digest"));
+    }
+    let mut offset = 0u64;
+    for c in &inode.chunks {
+        if c.offset != offset
+            || c.size == 0
+            || c.size > CHUNK_SIZE
+            || sizes.get(&c.id) != Some(&c.size)
+        {
+            return Err(se("uncommitted or invalid chunk reference"));
+        }
+        offset = offset
+            .checked_add(c.size as u64)
+            .ok_or_else(|| se("file size overflow"))?;
+    }
+    if offset != inode.size {
+        return Err(se("file size mismatch"));
+    }
+    Ok(())
 }

@@ -108,10 +108,15 @@ impl ChunkStore {
             ));
         }
 
-        let mut file = File::open(&target_file)?;
+        let file = File::open(&target_file)?;
         let mut buffer = Vec::new();
         file.take(CHUNK_SIZE as u64 + 1).read_to_end(&mut buffer)?;
-        if buffer.len()>CHUNK_SIZE {return Err(io::Error::new(io::ErrorKind::InvalidData,"oversized CAS chunk"));}
+        if buffer.len() > CHUNK_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "oversized CAS chunk",
+            ));
+        }
 
         // Verify cryptographic hash on read (protection against bit-rot)
         let expected = Self::normalize_id(chunk_id);

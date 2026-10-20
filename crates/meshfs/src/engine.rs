@@ -330,31 +330,101 @@ impl MeshFSEngine {
 
     /// Stream bytes into bounded replicated blocks; publish the inode only after
     /// every block has committed. Interrupted uploads leave the old path intact.
-    pub async fn put_stream<R: tokio::io::AsyncRead + Unpin + Send>(&self,volume:&str,path:&str,mut reader:R)->io::Result<Inode> {
+    pub async fn put_stream<R: tokio::io::AsyncRead + Unpin + Send>(
+        &self,
+        volume: &str,
+        path: &str,
+        mut reader: R,
+    ) -> io::Result<Inode> {
+        use sha2::{Digest, Sha256};
         use tokio::io::AsyncReadExt;
-        use sha2::{Digest,Sha256};
-        let mut buffer=vec![0;CHUNK_SIZE];let mut size=0u64;let mut hash=Sha256::new();let mut chunks=Vec::new();
+        let mut buffer = vec![0; CHUNK_SIZE];
+        let mut size = 0u64;
+        let mut hash = Sha256::new();
+        let mut chunks = Vec::new();
+        let mut staged = std::collections::HashSet::new();
         loop {
-            let mut used=0;
-            while used<buffer.len() {let n=reader.read(&mut buffer[used..]).await?;if n==0{break;}used+=n;}
-            if used==0{break;}
-            let bytes=&buffer[..used];hash.update(bytes);
-            let id=if let Some(c)=self.cluster.get(){serde_json::from_value::<String>(c.write(Action::StageChunk{hex:hex::encode(bytes)}).await?).map_err(io::Error::other)?}else{self.chunk_store.write_chunk(bytes)?};
-            chunks.push(ChunkRef{id,size:used,offset:size});size=size.checked_add(used as u64).ok_or_else(||io::Error::other("file size overflow"))?;
+            let mut used = 0;
+            while used < buffer.len() {
+                let n = reader.read(&mut buffer[used..]).await?;
+                if n == 0 {
+                    break;
+                }
+                used += n;
+            }
+            if used == 0 {
+                break;
+            }
+            let bytes = &buffer[..used];
+            hash.update(bytes);
+            let digest=format!("sha256:{}",sha256_digest(bytes));
+            let id = if let Some(c) = self.cluster.get() {
+                if staged.contains(&digest) {digest.clone()} else {
+                    let id=serde_json::from_value::<String>(c.write(Action::StageChunk {hex:hex::encode(bytes)}).await?).map_err(io::Error::other)?;
+                    if id!=digest{return Err(io::Error::other("committed chunk digest mismatch"));}
+                    staged.insert(id.clone());id
+                }
+            } else {self.chunk_store.write_chunk(bytes)?};
+            chunks.push(ChunkRef {
+                id,
+                size: used,
+                offset: size,
+            });
+            size = size
+                .checked_add(used as u64)
+                .ok_or_else(|| io::Error::other("file size overflow"))?;
         }
-        let inode=Inode{path:path.into(),size,digest:format!("sha256:{}",hex::encode(hash.finalize())),chunks_count:chunks.len(),chunks,updated_at:Utc::now().to_rfc3339()};
-        if let Some(c)=self.cluster.get(){return serde_json::from_value(c.write(Action::CommitFile{volume:volume.into(),inode}).await?).map_err(io::Error::other);}
-        {let mut s=self.state.write().await;s.volumes.entry(volume.into()).or_insert_with(||Volume::new(volume)).insert_file(inode.clone());}
-        self.persist_state().await?;Ok(inode)
+        let inode = Inode {
+            path: path.into(),
+            size,
+            digest: format!("sha256:{}", hex::encode(hash.finalize())),
+            chunks_count: chunks.len(),
+            chunks,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        if let Some(c) = self.cluster.get() {
+            return serde_json::from_value(
+                c.write(Action::CommitFile {
+                    volume: volume.into(),
+                    inode,
+                })
+                .await?,
+            )
+            .map_err(io::Error::other);
+        }
+        {
+            let mut s = self.state.write().await;
+            s.volumes
+                .entry(volume.into())
+                .or_insert_with(|| Volume::new(volume))
+                .insert_file(inode.clone());
+        }
+        self.persist_state().await?;
+        Ok(inode)
     }
-    pub async fn local_inode(&self,volume:&str,path:&str)->io::Result<Inode> {
-        self.state.read().await.volumes.get(volume).and_then(|v|v.files.get(path)).cloned().ok_or_else(||io::Error::new(io::ErrorKind::NotFound,"file not found"))
+    pub async fn local_inode(&self, volume: &str, path: &str) -> io::Result<Inode> {
+        self.state
+            .read()
+            .await
+            .volumes
+            .get(volume)
+            .and_then(|v| v.files.get(path))
+            .cloned()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))
     }
-    pub async fn file_inode(&self,volume:&str,path:&str)->io::Result<Inode> {
-        if let Some(c)=self.cluster.get(){c.inode(volume,path).await}else{self.local_inode(volume,path).await}
+    pub async fn file_inode(&self, volume: &str, path: &str) -> io::Result<Inode> {
+        if let Some(c) = self.cluster.get() {
+            c.inode(volume, path).await
+        } else {
+            self.local_inode(volume, path).await
+        }
     }
-    pub async fn file_chunk(&self,id:&str)->io::Result<Vec<u8>> {
-        if let Some(c)=self.cluster.get(){c.chunk(id).await}else{self.chunk_store.read_chunk(id)}
+    pub async fn file_chunk(&self, id: &str) -> io::Result<Vec<u8>> {
+        if let Some(c) = self.cluster.get() {
+            c.chunk(id).await
+        } else {
+            self.chunk_store.read_chunk(id)
+        }
     }
     /// Reassembles a file from its CAS chunks.
     pub async fn get_file(&self, volume_name: &str, file_path: &str) -> io::Result<Vec<u8>> {
@@ -571,17 +641,35 @@ mod streaming_tests {
     use tokio::io::AsyncReadExt;
     #[tokio::test]
     async fn large_stream_and_interrupted_replacement() {
-        let dir=std::env::temp_dir().join(format!("meshfs-stream-test-{}",std::process::id()));
+        let dir = std::env::temp_dir().join(format!("meshfs-stream-test-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
-        let engine=MeshFSEngine::new(&dir,"test",0).await.unwrap();
-        let length=20*1024*1024+31;
-        let inode=engine.put_stream("default","disk.raw",tokio::io::repeat(0x5a).take(length)).await.unwrap();
-        assert_eq!(inode.size,length);assert_eq!(inode.chunks.len(),6);
-        let partial=futures_util::stream::iter(vec![Ok(bytes::Bytes::from(vec![7u8;CHUNK_SIZE])),Err(std::io::Error::other("source disconnected"))]);
-        assert!(engine.put_stream("default","disk.raw",tokio_util::io::StreamReader::new(partial)).await.is_err());
-        assert_eq!(engine.local_inode("default","disk.raw").await.unwrap(),inode);
-        let restored=engine.local_get_file("default","disk.raw").await.unwrap();
-        assert_eq!(restored.len(),length as usize);assert!(restored.iter().all(|b|*b==0x5a));
+        let engine = MeshFSEngine::new(&dir, "test", 0).await.unwrap();
+        let length = 20 * 1024 * 1024 + 31;
+        let inode = engine
+            .put_stream("default", "disk.raw", tokio::io::repeat(0x5a).take(length))
+            .await
+            .unwrap();
+        assert_eq!(inode.size, length);
+        assert_eq!(inode.chunks.len(), 6);
+        let partial = futures_util::stream::iter(vec![
+            Ok(bytes::Bytes::from(vec![7u8; CHUNK_SIZE])),
+            Err(std::io::Error::other("source disconnected")),
+        ]);
+        assert!(engine
+            .put_stream(
+                "default",
+                "disk.raw",
+                tokio_util::io::StreamReader::new(partial)
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            engine.local_inode("default", "disk.raw").await.unwrap(),
+            inode
+        );
+        let restored = engine.local_get_file("default", "disk.raw").await.unwrap();
+        assert_eq!(restored.len(), length as usize);
+        assert!(restored.iter().all(|b| *b == 0x5a));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

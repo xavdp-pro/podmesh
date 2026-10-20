@@ -291,14 +291,37 @@ async fn main() -> ExitCode {
         },
 
         Commands::Put(p) => {
-            let file=match tokio::fs::File::open(&p.file).await {Ok(f)=>f,Err(e)=>{eprintln!("Cannot read source: {}",e);return ExitCode::FAILURE;}};
-            let client=reqwest::Client::new();
-            let response=client.post(format!("{}/api/v1/meshfs/files/stream",p.remote.trim_end_matches('/')))
-                .query(&[("volume",&p.volume),("path",&p.path)])
-                .body(reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file))).send().await;
+            let file = match tokio::fs::File::open(&p.file).await {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("Cannot read source: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let client = reqwest::Client::new();
+            let response = client
+                .post(format!(
+                    "{}/api/v1/meshfs/files/stream",
+                    p.remote.trim_end_matches('/')
+                ))
+                .query(&[("volume", &p.volume), ("path", &p.path)])
+                .body(reqwest::Body::wrap_stream(
+                    tokio_util::io::ReaderStream::new(file),
+                ))
+                .send()
+                .await;
             match response {
-                Ok(r)=>{let status=r.status();println!("{}",r.text().await.unwrap_or_default());if !status.is_success(){return ExitCode::FAILURE;}},
-                Err(e)=>{eprintln!("Upload failed: {}",e);return ExitCode::FAILURE;}
+                Ok(r) => {
+                    let status = r.status();
+                    println!("{}", r.text().await.unwrap_or_default());
+                    if !status.is_success() {
+                        return ExitCode::FAILURE;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Upload failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
             }
         }
 
@@ -311,32 +334,80 @@ async fn main() -> ExitCode {
                 urlencoding(&g.path)
             );
 
-            let mut response=match client.get(&url).send().await {
-                Ok(r) if r.status().is_success()=>r,
-                Ok(r)=>{eprintln!("Download failed: {}",r.status());return ExitCode::FAILURE;},
-                Err(e)=>{eprintln!("Download failed: {}",e);return ExitCode::FAILURE;}
+            let mut response = match client.get(&url).send().await {
+                Ok(r) if r.status().is_success() => r,
+                Ok(r) => {
+                    eprintln!("Download failed: {}", r.status());
+                    return ExitCode::FAILURE;
+                }
+                Err(e) => {
+                    eprintln!("Download failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
             };
-            let expected=response.headers().get(reqwest::header::ETAG).and_then(|v|v.to_str().ok()).map(|s|s.trim_matches('"').to_string());
-            let temporary=g.output.as_ref().map(|p|p.with_extension(format!("meshfs-download-{}",std::process::id())));
-            let mut output:Box<dyn Write>=if let Some(path)=&temporary {
-                match fs::OpenOptions::new().write(true).create_new(true).open(path){Ok(f)=>Box::new(f),Err(e)=>{eprintln!("Output: {}",e);return ExitCode::FAILURE;}}
-            }else{Box::new(io::stdout())};
-            use sha2::{Digest,Sha256};let mut hash=Sha256::new();
+            let expected = response
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim_matches('"').to_string());
+            let temporary = g
+                .output
+                .as_ref()
+                .map(|p| p.with_extension(format!("meshfs-download-{}", std::process::id())));
+            let mut output: Box<dyn Write> = if let Some(path) = &temporary {
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                {
+                    Ok(f) => Box::new(f),
+                    Err(e) => {
+                        eprintln!("Output: {}", e);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                Box::new(io::stdout())
+            };
+            use sha2::{Digest, Sha256};
+            let mut hash = Sha256::new();
             loop {
                 match response.chunk().await {
-                    Ok(Some(bytes))=>{hash.update(&bytes);if let Err(e)=output.write_all(&bytes){eprintln!("Output: {}",e);return ExitCode::FAILURE;}},
-                    Ok(None)=>break,
-                    Err(e)=>{eprintln!("Incomplete download: {}",e);return ExitCode::FAILURE;}
+                    Ok(Some(bytes)) => {
+                        hash.update(&bytes);
+                        if let Err(e) = output.write_all(&bytes) {
+                            eprintln!("Output: {}", e);
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("Incomplete download: {}", e);
+                        return ExitCode::FAILURE;
+                    }
                 }
             }
-            if expected.as_ref().is_some_and(|e|e!=&format!("sha256:{}",hex::encode(hash.finalize()))) {
-                eprintln!("Download digest mismatch");return ExitCode::FAILURE;
+            if expected
+                .as_ref()
+                .is_some_and(|e| e != &format!("sha256:{}", hex::encode(hash.finalize())))
+            {
+                eprintln!("Download digest mismatch");
+                return ExitCode::FAILURE;
             }
-            if let Err(e)=output.flush(){eprintln!("Output: {}",e);return ExitCode::FAILURE;}drop(output);
-            if let (Some(tmp),Some(path))=(temporary,g.output) {
-                if let Err(e)=fs::File::open(&tmp).and_then(|f|f.sync_all()).and_then(|_|fs::rename(&tmp,&path)){eprintln!("Output commit: {}",e);return ExitCode::FAILURE;}
+            if let Err(e) = output.flush() {
+                eprintln!("Output: {}", e);
+                return ExitCode::FAILURE;
             }
-
+            drop(output);
+            if let (Some(tmp), Some(path)) = (temporary, g.output) {
+                if let Err(e) = fs::File::open(&tmp)
+                    .and_then(|f| f.sync_all())
+                    .and_then(|_| fs::rename(&tmp, &path))
+                {
+                    eprintln!("Output commit: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
         }
     }
 
