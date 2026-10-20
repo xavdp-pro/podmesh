@@ -291,76 +291,14 @@ async fn main() -> ExitCode {
         },
 
         Commands::Put(p) => {
-            let content = match fs::read(&p.file) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    eprintln!(
-                        "Impossible de lire le fichier source '{}': {}",
-                        p.file.display(),
-                        e
-                    );
-                    return ExitCode::FAILURE;
-                }
-            };
-
-            // Encode content in base64
-            const B64_CHARS: &[u8] =
-                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-            let mut b64 = String::with_capacity(content.len() * 4 / 3 + 4);
-            let mut i = 0;
-            while i < content.len() {
-                let b0 = content[i] as usize;
-                let b1 = if i + 1 < content.len() {
-                    content[i + 1] as usize
-                } else {
-                    0
-                };
-                let b2 = if i + 2 < content.len() {
-                    content[i + 2] as usize
-                } else {
-                    0
-                };
-
-                let trip = (b0 << 16) | (b1 << 8) | b2;
-
-                b64.push(B64_CHARS[(trip >> 18) & 0x3F] as char);
-                b64.push(B64_CHARS[(trip >> 12) & 0x3F] as char);
-                if i + 1 < content.len() {
-                    b64.push(B64_CHARS[(trip >> 6) & 0x3F] as char);
-                } else {
-                    b64.push('=');
-                }
-                if i + 2 < content.len() {
-                    b64.push(B64_CHARS[trip & 0x3F] as char);
-                } else {
-                    b64.push('=');
-                }
-                i += 3;
-            }
-
-            let client = reqwest::Client::new();
-            let url = format!(
-                "{}/api/v1/meshfs/files/upload",
-                p.remote.trim_end_matches('/')
-            );
-            let payload = serde_json::json!({
-                "volume": p.volume,
-                "path": p.path,
-                "contentBase64": b64
-            });
-
-            match client.post(&url).json(&payload).send().await {
-                Ok(resp) => match resp.text().await {
-                    Ok(body) => println!("{}", body),
-                    Err(e) => {
-                        eprintln!("Erreur réponse upload: {}", e);
-                        return ExitCode::FAILURE;
-                    }
-                },
-                Err(e) => {
-                    eprintln!("Erreur upload fichier: {}", e);
-                    return ExitCode::FAILURE;
-                }
+            let file=match tokio::fs::File::open(&p.file).await {Ok(f)=>f,Err(e)=>{eprintln!("Cannot read source: {}",e);return ExitCode::FAILURE;}};
+            let client=reqwest::Client::new();
+            let response=client.post(format!("{}/api/v1/meshfs/files/stream",p.remote.trim_end_matches('/')))
+                .query(&[("volume",&p.volume),("path",&p.path)])
+                .body(reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file))).send().await;
+            match response {
+                Ok(r)=>{let status=r.status();println!("{}",r.text().await.unwrap_or_default());if !status.is_success(){return ExitCode::FAILURE;}},
+                Err(e)=>{eprintln!("Upload failed: {}",e);return ExitCode::FAILURE;}
             }
         }
 
@@ -373,43 +311,32 @@ async fn main() -> ExitCode {
                 urlencoding(&g.path)
             );
 
-            match client.get(&url).send().await {
-                Ok(resp) => {
-                    if !resp.status().is_success() {
-                        eprintln!("Erreur téléchargement HTTP: {}", resp.status());
-                        return ExitCode::FAILURE;
-                    }
-                    match resp.bytes().await {
-                        Ok(bytes) => {
-                            if let Some(out_path) = g.output {
-                                if let Err(e) = fs::write(&out_path, &bytes) {
-                                    eprintln!(
-                                        "Erreur écriture dans '{}': {}",
-                                        out_path.display(),
-                                        e
-                                    );
-                                    return ExitCode::FAILURE;
-                                }
-                                println!(
-                                    "Fichier téléchargé avec succès ({} octets) -> {}",
-                                    bytes.len(),
-                                    out_path.display()
-                                );
-                            } else {
-                                let _ = io::stdout().write_all(&bytes);
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Erreur lecture flux: {}", e);
-                            return ExitCode::FAILURE;
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Erreur requête GET: {}", e);
-                    return ExitCode::FAILURE;
+            let mut response=match client.get(&url).send().await {
+                Ok(r) if r.status().is_success()=>r,
+                Ok(r)=>{eprintln!("Download failed: {}",r.status());return ExitCode::FAILURE;},
+                Err(e)=>{eprintln!("Download failed: {}",e);return ExitCode::FAILURE;}
+            };
+            let expected=response.headers().get(reqwest::header::ETAG).and_then(|v|v.to_str().ok()).map(|s|s.trim_matches('"').to_string());
+            let temporary=g.output.as_ref().map(|p|p.with_extension(format!("meshfs-download-{}",std::process::id())));
+            let mut output:Box<dyn Write>=if let Some(path)=&temporary {
+                match fs::OpenOptions::new().write(true).create_new(true).open(path){Ok(f)=>Box::new(f),Err(e)=>{eprintln!("Output: {}",e);return ExitCode::FAILURE;}}
+            }else{Box::new(io::stdout())};
+            use sha2::{Digest,Sha256};let mut hash=Sha256::new();
+            loop {
+                match response.chunk().await {
+                    Ok(Some(bytes))=>{hash.update(&bytes);if let Err(e)=output.write_all(&bytes){eprintln!("Output: {}",e);return ExitCode::FAILURE;}},
+                    Ok(None)=>break,
+                    Err(e)=>{eprintln!("Incomplete download: {}",e);return ExitCode::FAILURE;}
                 }
             }
+            if expected.as_ref().is_some_and(|e|e!=&format!("sha256:{}",hex::encode(hash.finalize()))) {
+                eprintln!("Download digest mismatch");return ExitCode::FAILURE;
+            }
+            if let Err(e)=output.flush(){eprintln!("Output: {}",e);return ExitCode::FAILURE;}drop(output);
+            if let (Some(tmp),Some(path))=(temporary,g.output) {
+                if let Err(e)=fs::File::open(&tmp).and_then(|f|f.sync_all()).and_then(|_|fs::rename(&tmp,&path)){eprintln!("Output commit: {}",e);return ExitCode::FAILURE;}
+            }
+
         }
     }
 
