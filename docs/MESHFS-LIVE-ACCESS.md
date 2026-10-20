@@ -32,3 +32,12 @@ Do not attach the same VM disk to multiple writers. Test QEMU workloads require
 an explicit single-writer configuration; these tests do not qualify the
 Proxmox storage plugin or VM orchestration. PodMesh manages Podman applications;
 QEMU/Proxmox remains responsible for VMs.
+
+## Uncertain write outcomes
+
+A transport timeout or EIO does not establish cancellation of server work. The
+request ID protects retries of the same operation; it is not an expired-writer
+session fence. Before recovering a writer after an uncertain outcome, reconcile
+its data and pending operations. The current adapter does not provide automatic
+fencing between an old delayed session and a new mount. Qualification of that
+recovery boundary is required before production VM storage use.
