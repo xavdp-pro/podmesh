@@ -76,7 +76,6 @@ impl RaftLogReader<Types> for Db {
         let rows=q.query_map([],|r|Ok((r.get::<_,u64>(0)?,r.get::<_,String>(1)?))).map_err(se)?;
         let mut out=Vec::new();for row in rows { let (i,s)=row.map_err(se)?;if range.contains(&i){out.push(serde_json::from_str(&s).map_err(se)?);} }Ok(out)
     }
-    async fn read_vote(&mut self)->SResult<Option<Vote<u64>>> {self.get("vote")}
 }
 impl RaftLogStorage<Types> for Db {
     type LogReader=Self;
