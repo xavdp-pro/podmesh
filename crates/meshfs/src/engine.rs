@@ -237,7 +237,7 @@ impl MeshFSEngine {
             cluster: state.cluster_name.clone(),
             node_id: state.node_id.clone(),
             hostname: state.hostname.clone(),
-            nodes_count: state.nodes.len(),
+            nodes_count: cluster.map_or(state.nodes.len(), |c| c.config.peers.len()),
             volumes_count: state.volumes.len(),
             snapshots_count: state.snapshots.len(),
             total_files,
