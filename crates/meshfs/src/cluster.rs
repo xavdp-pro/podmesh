@@ -109,7 +109,7 @@ impl ClusterConfig {
     }
     fn fingerprint(&self) -> String {
         sha256_digest(
-            &serde_json::to_vec(&(&self.cluster, &self.peers)).expect("serializable topology"),
+            &serde_json::to_vec(&("meshfs-stream-v1", &self.cluster, &self.peers)).expect("serializable topology"),
         )
     }
     fn nodes(&self) -> BTreeMap<u64, BasicNode> {
@@ -259,7 +259,7 @@ struct MachineData {
     seen: BTreeMap<String, (String, Value)>,
     // Staged blocks remain referenced even if an upload is interrupted. No GC.
     #[serde(default)]
-    blobs: BTreeSet<String>,
+    blobs: BTreeMap<String,usize>,
 }
 pub struct Machine {
     db: Db,
@@ -286,11 +286,10 @@ impl Machine {
                 let bytes=hex::decode(hex).map_err(se)?;
                 if bytes.len()>CHUNK_SIZE {return Err(se("oversized staged chunk"));}
                 let id=self.engine.chunk_store.write_chunk(&bytes).map_err(se)?;
-                s.blobs.insert(id.clone()); json!(id)
+                s.blobs.insert(id.clone(),bytes.len()); json!(id)
             },
             Action::CommitFile {volume,inode} => {
-                self.validate_inode(inode)?;
-                for chunk in &inode.chunks {s.blobs.insert(chunk.id.clone());}
+                validate_layout(inode,&s.blobs)?;
                 let v=s.volumes.entry(volume.clone()).or_insert_with(|| {
                     let mut v=Volume::new(volume);v.created_at=inode.updated_at.clone();v
                 });
@@ -307,7 +306,7 @@ impl Machine {
                 let mut offset = 0;
                 for part in bytes.chunks(CHUNK_SIZE) {
                     let id = self.engine.chunk_store.write_chunk(part).map_err(se)?;
-                    s.blobs.insert(id.clone());
+                    s.blobs.insert(id.clone(),part.len());
                     chunks.push(ChunkRef {
                         id,
                         size: part.len(),
@@ -372,18 +371,6 @@ impl Machine {
         s.seen.insert(c.id.clone(), (digest, result.clone()));
         Ok(result)
     }
-    fn validate_inode(&self,inode:&Inode)->SResult<()> {
-        use sha2::{Digest,Sha256};
-        if inode.chunks_count!=inode.chunks.len(){return Err(se("chunk count mismatch"));}
-        let mut offset=0u64;let mut hash=Sha256::new();
-        for c in &inode.chunks {
-            let bytes=self.engine.chunk_store.read_chunk(&c.id).map_err(se)?;
-            if c.offset!=offset || c.size!=bytes.len() || c.size>CHUNK_SIZE {return Err(se("chunk layout mismatch"));}
-            hash.update(&bytes);offset=offset.checked_add(bytes.len() as u64).ok_or_else(||se("file size overflow"))?;
-        }
-        if offset!=inode.size || format!("sha256:{}",hex::encode(hash.finalize()))!=inode.digest {return Err(se("file digest mismatch"));}
-        Ok(())
-    }
     fn snapshot_file(&self)->SResult<std::fs::File> {
         let dir=self.engine.data_dir.join("raft/snapshots");std::fs::create_dir_all(&dir).map_err(se)?;
         static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
@@ -394,7 +381,7 @@ impl Machine {
         std::fs::remove_file(path).map_err(se)?;Ok(file)
     }
     fn chunk_ids(s:&MachineData)->BTreeSet<String> {
-        let mut ids=s.blobs.clone();
+        let mut ids:BTreeSet<String>=s.blobs.keys().cloned().collect();
         for inode in s.volumes.values().flat_map(|v|v.files.values()).chain(s.snapshots.iter().flat_map(|v|v.files_tree.values())) {
             for chunk in &inode.chunks {ids.insert(chunk.id.clone());}
         }
@@ -450,15 +437,20 @@ impl RaftStateMachine<Types> for Arc<Machine> {
         let mut file=(*snapshot).into_std().await;
         file.sync_all().map_err(se)?;file.seek(SeekFrom::Start(0)).map_err(se)?;
         let mut reader=std::io::BufReader::new(file);
-        let state:MachineData=serde_json::from_reader(read_frame(&mut reader,128*1024*1024)?.as_slice()).map_err(se)?;
+        let mut checksum=[0u8;32];reader.read_exact(&mut checksum).map_err(se)?;
+        let metadata=read_frame(&mut reader,128*1024*1024)?;
+        if hex::encode(checksum)!=sha256_digest(&metadata){return Err(se("snapshot metadata checksum mismatch"));}
+        let state:MachineData=serde_json::from_slice(&metadata).map_err(se)?;
         if state.applied!=meta.last_log_id || state.membership!=meta.last_membership {return Err(se("snapshot metadata mismatch"));}
         let expected=Machine::chunk_ids(&state);
+        let mut sizes=BTreeMap::new();
         for id in &expected {
             let bytes=read_frame(&mut reader,CHUNK_SIZE)?;
+            sizes.insert(id.clone(),bytes.len());
             if self.engine.chunk_store.write_chunk(&bytes).map_err(se)?!=*id {return Err(se("snapshot chunk hash mismatch"));}
         }
         let mut extra=[0u8;1];if reader.read(&mut extra).map_err(se)?!=0{return Err(se("snapshot trailing bytes"));}
-        for inode in state.volumes.values().flat_map(|v|v.files.values()).chain(state.snapshots.iter().flat_map(|v|v.files_tree.values())) {self.validate_inode(inode)?;}
+        for inode in state.volumes.values().flat_map(|v|v.files.values()).chain(state.snapshots.iter().flat_map(|v|v.files_tree.values())) {validate_layout(inode,&sizes)?;}
         let mut s=self.data.lock().await;self.db.set("machine",&state)?;*s=state;self.mirror(&s).await;
         Ok(())
     }
@@ -471,18 +463,17 @@ impl RaftStateMachine<Types> for Arc<Machine> {
 }
 impl RaftSnapshotBuilder<Types> for Arc<Machine> {
     async fn build_snapshot(&mut self) -> SResult<Snapshot<Types>> {
-        let s = self.data.lock().await;
-
-        let meta = SnapshotMeta {
-            last_log_id: s.applied,
-            last_membership: s.membership.clone(),
-            snapshot_id: format!("{:?}", s.applied),
-        };
-        let mut file=self.snapshot_file()?;
-        write_frame(&mut file,&serde_json::to_vec(&*s).map_err(se)?)?;
-        for id in Machine::chunk_ids(&s) {write_frame(&mut file,&self.engine.chunk_store.read_chunk(&id).map_err(se)?)?;}
-        file.sync_all().map_err(se)?;file.seek(SeekFrom::Start(0)).map_err(se)?;
-        Ok(Snapshot {meta,snapshot:Box::new(tokio::fs::File::from_std(file))})
+        let state=self.data.lock().await.clone();let machine=self.clone();
+        tokio::task::spawn_blocking(move|| {
+            let meta=SnapshotMeta{last_log_id:state.applied,last_membership:state.membership.clone(),snapshot_id:format!("{:?}",state.applied)};
+            let mut file=machine.snapshot_file()?;
+            let metadata=serde_json::to_vec(&state).map_err(se)?;
+            file.write_all(&hex::decode(sha256_digest(&metadata)).map_err(se)?).map_err(se)?;
+            write_frame(&mut file,&metadata)?;
+            for id in Machine::chunk_ids(&state){write_frame(&mut file,&machine.engine.chunk_store.read_chunk(&id).map_err(se)?)?;}
+            file.sync_all().map_err(se)?;file.seek(SeekFrom::Start(0)).map_err(se)?;
+            Ok(Snapshot{meta,snapshot:Box::new(tokio::fs::File::from_std(file))})
+        }).await.map_err(se)?
     }
 }
 
@@ -515,6 +506,7 @@ impl Network {
             .bearer_auth(&*self.token)
             .header("x-meshfs-topology", &self.fingerprint)
             .json(&req)
+            .timeout(std::time::Duration::from_secs(if path=="snapshot" {120}else{4}))
             .send()
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
@@ -640,6 +632,8 @@ impl Cluster {
             cluster_name: config.cluster.clone(),
             heartbeat_interval: 250,
             max_payload_entries: 1,
+            install_snapshot_timeout: 120_000,
+            snapshot_max_chunk_size: 256 * 1024,
             election_timeout_min: 800,
             election_timeout_max: 1600,
             snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(64),
@@ -709,7 +703,16 @@ impl Cluster {
             return Err("invalid operation ID".into());
         }
         if let Action::StageChunk {hex} = &c.action {
-            if hex.len()>CHUNK_SIZE*2 || hex::decode(hex).is_err(){return Err("invalid chunk payload".into());}
+            if hex.len()>CHUNK_SIZE*2 {return Err("oversized chunk payload".into());}
+            let bytes=hex::decode(hex).map_err(|e|e.to_string())?;
+            if bytes.is_empty(){return Err("empty staged chunk".into());}
+            let id=format!("sha256:{}",sha256_digest(&bytes));
+            let already_committed=self.machine.data.lock().await.blobs.contains_key(&id);
+            if already_committed {
+                tokio::time::timeout(std::time::Duration::from_secs(3),self.raft.ensure_linearizable()).await
+                    .map_err(|_|"quorum deadline exceeded".to_string())?.map_err(|e|e.to_string())?;
+                return Ok(json!(id));
+            }
         }
         if let Action::Put { hex, .. } = &c.action {
             if hex.len() > MAX_INLINE_BYTES * 2 || hex::decode(hex).is_err() {
@@ -753,6 +756,9 @@ impl Cluster {
         tokio::time::timeout(std::time::Duration::from_secs(3), self.raft.ensure_linearizable())
             .await.map_err(|_| ReadError::unavailable("quorum read deadline exceeded"))?
             .map_err(ReadError::unavailable)?;
+        if self.machine.engine.local_inode(&r.volume,&r.path).await.map_err(ReadError::unavailable)?.size>MAX_INLINE_BYTES as u64 {
+            return Err(ReadError::unavailable("use the streaming download endpoint for large files"));
+        }
         self.machine.engine.local_get_file(&r.volume, &r.path).await.map(hex::encode)
             .map_err(|e| ReadError { missing: e.kind()==io::ErrorKind::NotFound, message: e.to_string() })
     }
@@ -967,4 +973,19 @@ fn read_frame(r:&mut impl Read,max:usize)->SResult<Vec<u8>> {
     let mut len=[0;8];r.read_exact(&mut len).map_err(se)?;let len=u64::from_be_bytes(len);
     if len>max as u64{return Err(se("snapshot frame exceeds its bound"));}
     let mut bytes=vec![0;len as usize];r.read_exact(&mut bytes).map_err(se)?;Ok(bytes)
+}
+
+/// Payload hashes are calculated while ingesting and verified while reading.
+/// Committing an inode checks references to already committed immutable blocks;
+/// it never rescans an entire VM disk while holding the state-machine lock.
+fn validate_layout(inode:&Inode,sizes:&BTreeMap<String,usize>)->SResult<()> {
+    if inode.chunks_count!=inode.chunks.len(){return Err(se("chunk count mismatch"));}
+    let digest=inode.digest.strip_prefix("sha256:").ok_or_else(||se("invalid file digest"))?;
+    if digest.len()!=64 || !digest.bytes().all(|b|b.is_ascii_hexdigit()){return Err(se("invalid file digest"));}
+    let mut offset=0u64;
+    for c in &inode.chunks {
+        if c.offset!=offset || c.size==0 || c.size>CHUNK_SIZE || sizes.get(&c.id)!=Some(&c.size){return Err(se("uncommitted or invalid chunk reference"));}
+        offset=offset.checked_add(c.size as u64).ok_or_else(||se("file size overflow"))?;
+    }
+    if offset!=inode.size{return Err(se("file size mismatch"));}Ok(())
 }
