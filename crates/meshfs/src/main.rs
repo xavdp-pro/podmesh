@@ -31,7 +31,7 @@ async fn main() -> ExitCode {
 
     match args.command {
         Commands::Mount(m) => {
-            match std::thread::spawn(move || meshfs::fuse::mount(m.peer, m.volume, &m.mountpoint))
+            return match std::thread::spawn(move || meshfs::fuse::mount(m.peer, m.volume, &m.mountpoint))
                 .join()
             {
                 Ok(Ok(())) => ExitCode::SUCCESS,
