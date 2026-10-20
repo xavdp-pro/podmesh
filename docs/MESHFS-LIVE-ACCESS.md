@@ -11,7 +11,9 @@ Writes stage immutable 64 KiB blocks through the quorum log, then atomically
 compare and replace the inode. Acknowledgement follows durable replication.
 A stable semantic request ID makes transport retries idempotent. Reads obtain a
 quorum-checked inode and verify each immutable block. The client tries all
-configured peers on transport/quorum failures. Kernel data caching is disabled;
+configured peers on transport/quorum failures within a bounded 20-second
+failover deadline, retaining the semantic request ID even when a response body
+is interrupted. Kernel data caching is disabled;
 flush/fsync requires a successful quorum barrier. Loss of majority fails I/O.
 
 Live manifests use a `merkle-sha256:` digest over file size and ordered block
