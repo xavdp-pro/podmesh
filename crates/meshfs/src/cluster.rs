@@ -754,37 +754,28 @@ impl Cluster {
         }
         Ok(value)
     }
-    pub async fn local_read(&self, r: ReadRequest) -> Result<String, String> {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            self.raft.ensure_linearizable(),
-        )
-        .await
-        .map_err(|_| "quorum read deadline exceeded".to_string())?
-        .map_err(|e| e.to_string())?;
-        self.machine
-            .engine
-            .local_get_file(&r.volume, &r.path)
-            .await
-            .map(hex::encode)
-            .map_err(|e| e.to_string())
+    pub async fn local_read(&self, r: ReadRequest) -> Result<String, ReadError> {
+        tokio::time::timeout(std::time::Duration::from_secs(3), self.raft.ensure_linearizable())
+            .await.map_err(|_| ReadError::unavailable("quorum read deadline exceeded"))?
+            .map_err(ReadError::unavailable)?;
+        self.machine.engine.local_get_file(&r.volume, &r.path).await.map(hex::encode)
+            .map_err(|e| ReadError { missing: e.kind()==io::ErrorKind::NotFound, message: e.to_string() })
     }
     pub async fn read(&self, volume: &str, path: &str) -> io::Result<Vec<u8>> {
         let (leader, node) = self.leader()?;
-        let req = ReadRequest {
-            volume: volume.to_string(),
-            path: path.to_string(),
-        };
+        let req = ReadRequest { volume: volume.into(), path: path.into() };
         let data = if leader == self.config.node_id {
-            self.local_read(req).await.map_err(err)?
+            self.local_read(req).await.map_err(ReadError::into_io)?
         } else {
-            self.network
-                .rpc::<_, String, StringError>(leader, &node, "read", req)
-                .await
-                .map_err(err)?
+            self.network.rpc::<_, String, ReadError>(leader, &node, "read", req).await
+                .map_err(|e| match e {
+                    RPCError::RemoteError(remote) => remote.source.into_io(),
+                    other => err(other),
+                })?
         };
         hex::decode(data).map_err(err)
     }
+
     pub async fn local_namespace(&self) -> Result<Value, String> {
         tokio::time::timeout(
             std::time::Duration::from_secs(3),
@@ -940,3 +931,12 @@ mod tests {
         assert!(state.volumes.contains_key("default"));
     }
 }
+
+#[derive(Debug,Clone,Serialize,Deserialize)]
+pub struct ReadError { pub missing:bool, pub message:String }
+impl ReadError {
+    fn unavailable(e:impl std::fmt::Display)->Self {Self{missing:false,message:e.to_string()}}
+    fn into_io(self)->io::Error {io::Error::new(if self.missing {io::ErrorKind::NotFound}else{io::ErrorKind::Other},self.message)}
+}
+impl std::fmt::Display for ReadError {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.write_str(&self.message)}}
+impl std::error::Error for ReadError {}
