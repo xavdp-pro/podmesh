@@ -39,5 +39,7 @@ A transport timeout or EIO does not establish cancellation of server work. The
 request ID protects retries of the same operation; it is not an expired-writer
 session fence. Before recovering a writer after an uncertain outcome, reconcile
 its data and pending operations. The current adapter does not provide automatic
-fencing between an old delayed session and a new mount. Qualification of that
-recovery boundary is required before production VM storage use.
+fencing between an old delayed session and a new mount. If an intermediary
+delivers an old request after a newer write has been acknowledged, the old
+request can replace the newer bytes. This storage-ordering defect must be fixed
+and its regression test passed before production VM storage use.
