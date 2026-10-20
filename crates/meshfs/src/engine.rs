@@ -564,3 +564,24 @@ impl MeshFSEngine {
         Ok(c.nodes().await)
     }
 }
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+    #[tokio::test]
+    async fn large_stream_and_interrupted_replacement() {
+        let dir=std::env::temp_dir().join(format!("meshfs-stream-test-{}",std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let engine=MeshFSEngine::new(&dir,"test",0).await.unwrap();
+        let length=20*1024*1024+31;
+        let inode=engine.put_stream("default","disk.raw",tokio::io::repeat(0x5a).take(length)).await.unwrap();
+        assert_eq!(inode.size,length);assert_eq!(inode.chunks.len(),6);
+        let partial=futures_util::stream::iter(vec![Ok(bytes::Bytes::from(vec![7u8;CHUNK_SIZE])),Err(std::io::Error::other("source disconnected"))]);
+        assert!(engine.put_stream("default","disk.raw",tokio_util::io::StreamReader::new(partial)).await.is_err());
+        assert_eq!(engine.local_inode("default","disk.raw").await.unwrap(),inode);
+        let restored=engine.local_get_file("default","disk.raw").await.unwrap();
+        assert_eq!(restored.len(),length as usize);assert!(restored.iter().all(|b|*b==0x5a));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

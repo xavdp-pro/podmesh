@@ -35,15 +35,41 @@ same path are serialized, and the last committed write becomes current. An
 unacknowledged request has an uncertain outcome and must be reconciled by
 reading the namespace before retrying. This is not an application merge policy.
 
-A returning replica replays missing journal entries or receives a snapshot
-containing namespace metadata and referenced immutable chunks. File snapshots
-also retain their referenced chunks. No automatic chunk garbage collection is
-performed. Snapshots and journal payloads are buffered in memory; clustered
-uploads are currently limited to 16 MiB per file and internal HTTP bodies to
-128 MiB. These bounds are not a design for large VM disk storage. Large namespace
-snapshots, streaming, safe membership replacement, client retry semantics and
-production operational qualification remain work to complete before deploying
-this mode for VM images.
+A returning replica replays missing journal entries or receives a file-backed
+snapshot containing namespace metadata and immutable chunks. Snapshot transfer
+and chunk integrity checks use bounded buffers. Metadata is checksummed; each
+chunk is verified against its content address. The new snapshot format is
+versioned in the topology fingerprint: it does not support mixing old and new
+replicas or an implicit upgrade of old cluster state.
+
+For VM images and other large files, use `meshfs put` / `meshfs get`, or stream
+raw bytes with `POST /api/v1/meshfs/files/stream?volume=default&path=disk.qcow2`
+and `GET /api/v1/meshfs/files/download?volume=default&path=disk.qcow2`.
+There is no 16 MiB file ceiling on this path. The compatibility Base64 JSON
+upload remains bounded to 16 MiB; it is not the large-image interface. The CLI
+streams files, validates the download's SHA-256 ETag and replaces an output file
+only after the transfer has completed successfully.
+
+The ingest path replicates immutable blocks of at most 4 MiB, then atomically
+commits the complete file's metadata. Its full-file digest is calculated during
+ingestion and checked during download; committed references are validated
+without rescanning an entire disk while holding the Raft state-machine lock.
+Interrupted ingest does not publish a truncated replacement. Already committed
+immutable blocks can be reused after a quorum check. A failed final response
+still has an uncertain outcome; reconcile the path before retrying.
+
+File snapshots retain referenced chunks. Interrupted uploads also retain staged
+blocks; no automatic garbage collection is implemented. Plan disk space for CAS,
+journal, snapshot transfer and retained versions. Snapshot metadata has a 128 MiB
+frame limit; data is transferred in bounded frames independently of file length.
+Disk capacity and namespace metadata size remain real limits.
+
+These APIs transfer complete offline images. They do **not** implement a FUSE
+mount, NBD device or random-write block interface for a running VM. Validate a
+restored image with its native tools and filesystem before use. Live VM storage,
+safe membership replacement, disk replacement and production operations require
+separate implementations and qualification. Existing services are not migrated
+by enabling this mode.
 
 `status` contains local diagnostic counters and replication metrics. A successful
 quorum probe is point-in-time readiness, not a permanent availability guarantee.
