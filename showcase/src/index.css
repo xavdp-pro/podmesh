@@ -58,7 +58,7 @@ html.theme-dark,
 
 html {
   -webkit-tap-highlight-color: transparent;
-  overflow-x: hidden;
+  overflow-x: clip;
   overflow-y: auto;
   min-height: 100%;
 }
@@ -68,8 +68,9 @@ body {
   background-color: var(--color-canvas);
   color: var(--color-fg);
   min-height: 100%;
-  overflow-x: hidden;
-  overflow-y: auto;
+  /* Keep the document as the scroll container for the sticky navigation. */
+  overflow-x: clip;
+  overflow-y: visible;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
@@ -109,3 +110,86 @@ body {
   scrollbar-width: thin;
   scrollbar-color: var(--color-line) transparent;
 }
+
+/* Glossary, discreet trigger, calm panel centred on the word */
+.site-glossary-inline {
+  display: inline;
+}
+
+.site-glossary-term {
+  border-bottom: 1px dotted color-mix(in srgb, var(--color-accent) 55%, transparent);
+  border-radius: 2px;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+  -webkit-tap-highlight-color: transparent;
+  color: inherit;
+  cursor: help;
+  font-weight: inherit;
+  touch-action: manipulation;
+  transition:
+    background-color 160ms ease,
+    border-color 160ms ease;
+}
+
+.site-glossary-term:hover,
+.site-glossary-term[data-open='true'] {
+  background: var(--color-accent-soft);
+  border-bottom-color: var(--color-accent);
+}
+
+.site-glossary-panel {
+  --glossary-arrow: 7px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: 14px;
+  box-shadow: 0 12px 36px rgb(0 0 0 / 15%);
+  isolation: isolate;
+  max-width: min(18rem, calc(100vw - 1.5rem));
+  padding: 0.95rem 1.05rem 1rem;
+  position: fixed;
+  text-align: left;
+  z-index: 80;
+}
+
+.site-glossary-panel::before {
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  content: '';
+  height: var(--glossary-arrow);
+  left: var(--glossary-arrow-left, 1.5rem);
+  position: absolute;
+  transform: translateX(-50%) rotate(45deg);
+  width: var(--glossary-arrow);
+}
+
+.site-glossary-panel[data-placement='below']::before {
+  border-bottom: none;
+  border-right: none;
+  top: calc(var(--glossary-arrow) * -0.42);
+}
+
+.site-glossary-panel[data-placement='above']::before {
+  border-left: none;
+  border-top: none;
+  bottom: calc(var(--glossary-arrow) * -0.42);
+}
+
+.site-glossary-panel__label {
+  color: var(--color-accent);
+  font-family: 'Iowan Old Style', 'Palatino Linotype', Palatino, Georgia, serif;
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+  margin: 0 0 0.45rem;
+}
+
+.site-glossary-panel__body {
+  color: var(--color-fg-muted);
+  font-size: 0.875rem;
+  line-height: 1.55;
+  margin: 0;
+}
+
+
+.site-glossary-term:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 3px; }

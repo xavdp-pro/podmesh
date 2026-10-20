@@ -1,110 +1,46 @@
 import React, { useEffect, useRef } from 'react'
+import { guideContent } from '../../data/publicGuideContent'
 import {
   Layers,
   HardDrive,
   ShieldCheck,
   Server,
   Terminal,
-  PanelLeftClose,
-  PanelLeftOpen,
   X,
   ChevronRight,
   Bookmark,
 } from 'lucide-react'
 
-const SIDEBAR_ITEMS = [
-  {
-    key: 'podmesh',
-    icon: Layers,
-    title: { fr: 'PodMesh Engine', en: 'PodMesh Engine', es: 'PodMesh Engine' },
-    desc: {
-      fr: 'Architecture multi-fractales & 4 strates',
-      en: 'Multi-fractal architecture & 4 strata',
-      es: 'Arquitectura multifractal y 4 estratos',
-    },
-    anchors: [
-      { id: 'strata-law', label: { fr: 'Loi des 4 Strates', en: '4 Strata Law', es: 'Ley de 4 Estratos' } },
-      { id: 'strata-diagram', label: { fr: 'Schéma Haute Définition', en: 'High-Def Diagram', es: 'Diagrama Alta Definición' } },
-      { id: 'strata-isolation', label: { fr: 'Isolation userns & cgroups v2', en: 'userns & cgroups v2', es: 'Aislamiento userns y cgroups' } },
-    ],
-  },
-  {
-    key: 'meshfs',
-    icon: HardDrive,
-    title: { fr: 'MeshFS Distribué', en: 'Distributed MeshFS', es: 'MeshFS Distribuido' },
-    desc: {
-      fr: 'Stockage CAS 4MB & multi-moteurs',
-      en: '4MB CAS storage & multi-engines',
-      es: 'Almacenamiento CAS 4MB y multimotores',
-    },
-    anchors: [
-      { id: 'meshfs-merkle', label: { fr: 'Arbre de Merkle & Chunks', en: 'Merkle Tree & Chunks', es: 'Árbol Merkle y Chunks' } },
-      { id: 'meshfs-engines', label: { fr: 'Moteurs ZFS / Btrfs / LVM', en: 'ZFS / Btrfs / LVM Engines', es: 'Motores ZFS / Btrfs / LVM' } },
-      { id: 'meshfs-ceph-comparison', label: { fr: 'Comparatif vs CephFS', en: 'CephFS Comparison', es: 'Comparativa vs CephFS' } },
-    ],
-  },
-  {
-    key: 'pmbs',
-    icon: ShieldCheck,
-    title: { fr: 'PMBS Backup Server', en: 'PMBS Backup Server', es: 'PMBS Backup Server' },
-    desc: {
-      fr: 'Datastore dédupliqué & Op 10',
-      en: 'Deduplicated datastore & Op 10',
-      es: 'Datastore deduplicado y Op 10',
-    },
-    anchors: [
-      { id: 'pmbs-cas', label: { fr: 'Datastore SHA-256 CAS', en: 'SHA-256 CAS Datastore', es: 'Datastore SHA-256 CAS' } },
-      { id: 'pmbs-op10', label: { fr: 'Preuve de Survie Op 10', en: 'Op 10 Survival Seal', es: 'Prueba Supervivencia Op 10' } },
-      { id: 'pmbs-remotesync', label: { fr: 'Réplication WAN Multi-Sites', en: 'Cross-Site WAN Sync', es: 'Sincronización WAN' } },
-    ],
-  },
-  {
-    key: 'proxmox',
-    icon: Server,
-    title: { fr: 'Plugin Proxmox VE', en: 'Proxmox VE Plugin', es: 'Plugin Proxmox VE' },
-    desc: {
-      fr: 'Intégration stockage PVE native',
-      en: 'Native PVE storage integration',
-      es: 'Integración almacenamiento PVE',
-    },
-    anchors: [
-      { id: 'pve-driver', label: { fr: 'Driver Perl PVE::Storage', en: 'Perl Storage Driver', es: 'Driver Perl PVE::Storage' } },
-      { id: 'pve-config', label: { fr: 'Configuration storage.cfg', en: 'storage.cfg Configuration', es: 'Configuración storage.cfg' } },
-      { id: 'pve-workloads', label: { fr: 'Volumes QEMU, LXC & VZDump', en: 'QEMU, LXC & VZDump', es: 'Volúmenes QEMU, LXC y VZDump' } },
-    ],
-  },
-  {
-    key: 'downloads',
-    icon: Terminal,
-    title: { fr: 'Téléchargements & CLI', en: 'Downloads & CLI', es: 'Descargas y CLI' },
-    desc: {
-      fr: 'Paquets Debian .deb & Cheatsheet',
-      en: 'Debian .deb packages & Cheatsheet',
-      es: 'Paquetes Debian .deb y Guía',
-    },
-    anchors: [
-      { id: 'cli-deb', label: { fr: 'Paquets Debian .deb', en: 'Debian .deb Packages', es: 'Paquetes Debian .deb' } },
-      { id: 'cli-oci', label: { fr: 'Matrices OCI Déconnectées', en: 'Offline OCI Matrices', es: 'Matrices OCI Desconectadas' } },
-      { id: 'cli-terminal', label: { fr: 'Cheatsheet Interactive', en: 'Interactive Cheatsheet', es: 'Terminal Interactivo' } },
-    ],
-  },
-]
+const NAV_ICONS = { podmesh: Layers, meshfs: HardDrive, pmbs: ShieldCheck, proxmox: Server, downloads: Terminal }
+const LOCALES = ['fr', 'en', 'es']
+const translated = (read) => Object.fromEntries(LOCALES.map((locale) => [locale, read(guideContent[locale])]))
+
+export const SIDEBAR_ITEMS = guideContent.fr.sections.map(({ id }, index) => ({
+  key: id,
+  icon: NAV_ICONS[id],
+  title: translated((copy) => copy.sections[index].name),
+  desc: translated((copy) => copy.sections[index].short),
+  anchors: ['usage', 'agent', 'details'].map((part) => ({
+    id: `${id}-${part}`,
+    label: translated((copy) => copy[part]),
+  })),
+}))
 
 const UI_TEXT = {
   fr: {
-    summary: 'Sommaire Technique',
+    summary: 'Explorer les outils',
     collapse: 'Replier le sommaire',
     expand: 'Déplier le sommaire',
     close: 'Fermer le menu',
   },
   en: {
-    summary: 'Technical Contents',
+    summary: 'Explore the tools',
     collapse: 'Collapse sidebar',
     expand: 'Expand sidebar',
     close: 'Close menu',
   },
   es: {
-    summary: 'Índice Técnico',
+    summary: 'Explorar las herramientas',
     collapse: 'Plegar índice',
     expand: 'Desplegar índice',
     close: 'Cerrar menú',
@@ -114,13 +50,12 @@ const UI_TEXT = {
 export default function ShowcaseSidebar({
   activeTab,
   onSelectTab,
-  collapsed,
-  onToggleCollapsed,
   mobileOpen,
   onCloseMobile,
   locale = 'fr',
 }) {
   const drawerRef = useRef(null)
+  const collapsed = false
   const lang = UI_TEXT[locale] || UI_TEXT.fr
 
   // Close mobile drawer on Escape key
@@ -144,9 +79,11 @@ export default function ShowcaseSidebar({
 
         return (
           <div key={item.key} className="flex flex-col">
-            <button
-              type="button"
-              onClick={() => {
+            <a
+              href={`#${item.key}`}
+              aria-current={isActive ? 'page' : undefined}
+              onClick={(event) => {
+                event.preventDefault()
                 onSelectTab(item.key)
                 if (isDrawer) onCloseMobile()
               }}
@@ -177,8 +114,8 @@ export default function ShowcaseSidebar({
 
               {(!collapsed || isDrawer) && (
                 <div className="min-w-0 flex-1">
-                  <p className="truncate text-xs font-bold leading-tight">{title}</p>
-                  <p className="truncate text-[10px] text-fg-faint mt-0.5">{desc}</p>
+                  <p className="text-sm font-bold leading-tight">{title}</p>
+                  <p className="text-xs text-fg-faint mt-0.5">{desc}</p>
                 </div>
               )}
 
@@ -190,27 +127,25 @@ export default function ShowcaseSidebar({
                   }`}
                 />
               )}
-            </button>
+            </a>
 
             {/* Sub-anchors when active */}
             {isActive && (!collapsed || isDrawer) && item.anchors && (
               <div className="ml-8 mt-1 mb-2 flex flex-col gap-1 border-l-2 border-accent/25 pl-3">
                 {item.anchors.map((anchor) => (
-                  <button
+                  <a
                     key={anchor.id}
-                    type="button"
-                    onClick={() => {
-                      const el = document.getElementById(anchor.id)
-                      if (el) {
-                        el.scrollIntoView({ behavior: 'smooth', block: 'start' })
-                      }
+                    href={`#${anchor.id}`}
+                    onClick={(event) => {
+                      event.preventDefault()
+                      onSelectTab(item.key, anchor.id)
                       if (isDrawer) onCloseMobile()
                     }}
-                    className="flex items-center gap-1.5 py-1 text-[11px] font-medium text-fg-muted hover:text-accent transition-colors text-left"
+                    className="flex items-center gap-1.5 py-1.5 text-xs font-medium text-fg-muted hover:text-accent transition-colors text-left"
                   >
                     <span className="h-1 w-1 rounded-full bg-accent/60" />
                     <span>{anchor.label[locale] || anchor.label.fr}</span>
-                  </button>
+                  </a>
                 ))}
               </div>
             )}
@@ -224,7 +159,7 @@ export default function ShowcaseSidebar({
     <>
       {/* Mobile Backdrop & Drawer */}
       {mobileOpen && (
-        <div className="fixed inset-0 z-50 lg:hidden">
+        <div className="fixed inset-0 z-50">
           <div
             className="fixed inset-0 bg-black/60 backdrop-blur-xs transition-opacity"
             onClick={onCloseMobile}
@@ -232,6 +167,10 @@ export default function ShowcaseSidebar({
           />
           <aside
             ref={drawerRef}
+            id="guide-navigation"
+            data-mobile-guide
+            role="dialog"
+            aria-modal="true"
             className="fixed inset-y-0 left-0 z-50 flex w-72 max-w-[85vw] flex-col border-r border-line bg-surface p-3 shadow-2xl"
             aria-label={lang.summary}
           >
@@ -258,70 +197,7 @@ export default function ShowcaseSidebar({
         </div>
       )}
 
-      {/* Desktop Sticky Retractable Sidebar */}
-      <aside
-        className={`hidden shrink-0 transition-[width] duration-200 lg:block ${
-          collapsed ? 'w-16' : 'w-72'
-        }`}
-        aria-label={lang.summary}
-      >
-        <div className="sticky top-[80px] max-h-[calc(100vh-96px)] overflow-y-auto thin-scrollbar rounded-2xl border border-line bg-surface/80 p-2 shadow-xs backdrop-blur-md">
-          {/* Header with collapse/expand toggle */}
-          <div
-            className={`mb-2 flex items-center border-b border-line pb-2 px-2 pt-1 ${
-              collapsed ? 'justify-center' : 'justify-between'
-            }`}
-          >
-            {!collapsed && (
-              <div className="flex items-center gap-2">
-                <Bookmark size={14} className="text-accent" />
-                <span className="text-[11px] font-black uppercase tracking-wider text-fg">
-                  {lang.summary}
-                </span>
-              </div>
-            )}
-            <button
-              type="button"
-              onClick={onToggleCollapsed}
-              className="rounded-lg p-1 text-fg-faint hover:bg-surface-2 hover:text-fg transition-colors"
-              title={collapsed ? lang.expand : lang.collapse}
-              aria-label={collapsed ? lang.expand : lang.collapse}
-            >
-              {collapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
-            </button>
-          </div>
 
-          {/* Navigation Items */}
-          {renderNavItems(false)}
-
-          {/* GitHub Repositories Link in Sidebar */}
-          {!collapsed && (
-            <div className="mt-4 border-t border-line pt-3 px-2">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-fg-faint block mb-2">
-                Code Source &amp; Architecture
-              </span>
-              <a
-                href="https://github.com/xavdp-pro/podmesh"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-fg-muted hover:text-fg hover:bg-surface-2 transition-colors"
-              >
-                <span className="font-mono text-accent">🐙</span>
-                <span>GitHub : podmesh</span>
-              </a>
-              <a
-                href="https://github.com/xavdp-pro/SHAPER-OS-V1.13"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-fg-muted hover:text-fg hover:bg-surface-2 transition-colors mt-0.5"
-              >
-                <span className="font-mono text-accent">🌿</span>
-                <span>GitHub : SHAPER-OS</span>
-              </a>
-            </div>
-          )}
-        </div>
-      </aside>
     </>
   )
 }
