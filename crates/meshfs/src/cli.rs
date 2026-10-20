@@ -54,6 +54,8 @@ pub enum Commands {
 
     /// Retrieve a file from MeshFS
     Get(GetArgs),
+    /// Mount an experimental flat-file volume (one writer per file).
+    Mount(MountArgs),
 }
 
 #[derive(Args, Debug)]
@@ -206,4 +208,13 @@ pub struct GetArgs {
     /// MeshFS HTTP daemon address
     #[arg(short, long, default_value = "http://127.0.0.1:7443")]
     pub remote: String,
+}
+
+#[derive(Args,Debug)]
+pub struct MountArgs {
+    #[arg(long,required=true)]
+    pub peer:Vec<String>,
+    #[arg(long)]
+    pub volume:String,
+    pub mountpoint:PathBuf,
 }

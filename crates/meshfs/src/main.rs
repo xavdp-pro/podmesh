@@ -30,6 +30,12 @@ async fn main() -> ExitCode {
         .init();
 
     match args.command {
+        Commands::Mount(m) => {
+            match std::thread::spawn(move || meshfs::fuse::mount(m.peer,m.volume,&m.mountpoint)).join() {
+                Ok(Ok(()))=>ExitCode::SUCCESS,
+                other=>{error!("mount failed: {:?}",other);ExitCode::FAILURE}
+            }
+        }
         Commands::Daemon(d) => {
             info!(
                 cluster = %d.cluster,

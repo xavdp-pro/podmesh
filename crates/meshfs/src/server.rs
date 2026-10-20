@@ -115,6 +115,10 @@ pub fn create_router(engine: MeshFSEngine) -> Router {
             "/api/v1/meshfs/snapshots/delete",
             post(delete_snapshot_handler),
         )
+        // Bounded experimental live file access.
+        .route("/api/v1/meshfs/files/inode", get(live_inode_handler))
+        .route("/api/v1/meshfs/files/range", get(live_range_handler))
+        .route("/api/v1/meshfs/files/live", post(live_mutation_handler))
         // Files download / upload routes
         .route("/files/download", get(download_file_handler))
         .route("/api/v1/meshfs/files/download", get(download_file_handler))
@@ -312,6 +316,9 @@ async fn download_file_handler(
                 .into_response()
         }
     };
+    if inode.digest.starts_with("merkle-sha256:") {
+        return (StatusCode::CONFLICT,"live files require the range interface or mount; digest is a manifest hash").into_response();
+    }
     let size = inode.size;
     let digest = inode.digest.clone();
     use sha2::{Digest, Sha256};
@@ -553,4 +560,17 @@ async fn raft_chunk(
         Err(r) => return r,
     };
     Json(c.local_chunk(&id)).into_response()
+}
+
+async fn live_inode_handler(State(e):State<MeshFSEngine>,Query(q):Query<DownloadQuery>)->Response {
+ match e.file_inode(&q.volume,&q.path).await {Ok(i)=>Json(i).into_response(),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>StatusCode::NOT_FOUND.into_response(),Err(e)=>unavailable(e)}
+}
+#[derive(Deserialize)]
+struct RangeQuery {volume:String,path:String,offset:u64,length:usize}
+async fn live_range_handler(State(e):State<MeshFSEngine>,Query(q):Query<RangeQuery>)->Response {
+ if q.length>crate::live::MAX_IO{return StatusCode::BAD_REQUEST.into_response();}
+ match e.live_read(&q.volume,&q.path,q.offset,q.length).await {Ok(b)=>b.into_response(),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>StatusCode::NOT_FOUND.into_response(),Err(e)=>unavailable(e)}
+}
+async fn live_mutation_handler(State(e):State<MeshFSEngine>,Json(r):Json<crate::live::Request>)->Response {
+ match e.live_apply(r).await {Ok(v)=>Json(v).into_response(),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>StatusCode::NOT_FOUND.into_response(),Err(e)=>unavailable(e)}
 }

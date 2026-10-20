@@ -23,3 +23,6 @@ pub use engine::{MeshFSEngine, NodeInfo, StatusReport};
 pub use merkle::{compute_merkle_root, diff_trees, Inode, MerkleDiff};
 pub use storage::{BackendFeatures, BackendInfo, StorageDriver, StorageMetrics};
 pub use volume::{Snapshot, Volume};
+
+pub mod live;
+pub mod fuse;
