@@ -1,4 +1,4 @@
-// Public guide follows IDEAL-SCENE.md: direction and uses, not a live qualification report.
+// Public guide: clear component roles, following the ideal scene.
 export const guideContent = {
   "fr": {
     "title": "Le plaisir d’explorer. Le souci de bien faire.",
@@ -22,153 +22,154 @@ export const guideContent = {
       {
         "id": "podmesh",
         "name": "PodMesh",
-        "short": "Déplacer et répliquer les applications",
-        "title": "Une application, au-delà de son premier serveur.",
-        "lead": "Une application vit sur une machine, mais elle ne se résume pas à son emplacement. Elle a des services, des fichiers et un état d’exécution : ce qu’elle est en train de faire. Avec PodMesh et Podman, nous explorons comment gérer cet ensemble, le déplacer à chaud et en préparer une réplique, avec le souci de retrouver ce qui le fait fonctionner.",
+        "short": "Orchestrer les conteneurs",
+        "title": "Créer, déplacer et répliquer des applications.",
+        "lead": "PodMesh est un orchestrateur d’applications conteneurisées avec Podman. Il rassemble les commandes pour créer une application, la démarrer, l’arrêter, la déplacer vers un autre serveur et préparer sa réplique. Il prend en compte ses services et ses données, ainsi que son état d’exécution pour les déplacements à chaud compatibles.",
         "points": [
           [
-            "Voir ce que l’on prend en charge",
-            "Retrouver les conteneurs, les services et les données qui font vivre l’application. Dans SHAPER OS, cet ensemble s’appelle un univers."
+            "Piloter les applications",
+            "Créer, démarrer et arrêter les conteneurs qui composent une application, puis consulter leur état depuis une console ou des outils de commande."
           ],
           [
-            "Explorer le déplacement à chaud",
-            "Capturer un état d’exécution et le reprendre sur une autre machine : on s’intéresse à ce que l’application faisait, en plus de ses fichiers. Le déroulement dépend de la configuration."
+            "Déplacer une application",
+            "Transférer l’application et les données qu’elle doit retrouver sur un autre hôte. Lorsque la configuration le permet, un déplacement à chaud reprend aussi son état d’exécution."
           ],
           [
-            "Préparer une copie pour la reprise",
-            "La réplication maintient une copie sur un autre serveur. Déplacer une application et la répliquer répondent à deux besoins différents, que nous travaillons dans le même projet."
+            "Préparer la reprise ailleurs",
+            "Maintenir une réplique sur un autre serveur et organiser sa reprise selon les règles de continuité choisies pour l’application."
           ]
         ],
-        "example": "Un serveur a besoin d’entretien. Vous voulez pouvoir préparer le passage de votre application sur une autre machine, retrouver ses données et vérifier qu’elle fonctionne avant de poursuivre. C’est un besoin quotidien, et une bonne raison de travailler le déplacement et la reprise avec soin.",
+        "example": "Vous devez entretenir un serveur : PodMesh organise le déplacement de l’application vers un autre hôte avec ses services et ses données. La réplication prépare une autre situation : disposer d’une copie pour reprendre après une panne.",
         "workflow": [
-          "Observer l’état réel des applications et les ressources disponibles.",
-          "Préparer l’opération avec les interfaces de la version installée et les autorisations reçues.",
-          "Contrôler l’application et ses données après l’opération, puis expliquer ce qui a réussi ou reste à faire."
+          "Recenser les conteneurs et les données de l’application, puis choisir un hôte de destination.",
+          "Demander le déplacement ou la réplication avec les outils PodMesh, et suivre l’opération.",
+          "Vérifier que l’application répond sur le bon hôte et retrouve ses données."
         ],
-        "technical": "La scène idéale donne au tandem humain-agent un même contrat pour créer, démarrer, déplacer, protéger et restaurer un univers, depuis la console comme depuis les outils d’un agent. Les hôtes portent le fonctionnement : un poste de travail sert à observer et à commander. Chaque univers déclare ses règles de continuité et les données à préserver. Les décisions exclusives doivent éviter deux instances qui écrivent des histoires différentes ; une opération interrompue doit pouvoir reprendre sans répéter ses effets. Les possibilités de reprise suivent l’infrastructure disponible.",
+        "technical": "Podman exécute les conteneurs ; PodMesh coordonne leur cycle de vie et les opérations entre hôtes. Un univers SHAPER OS regroupe une application, ses services et ses données. Déplacement, réplication et restauration ont des rôles différents. La scène idéale vise une même opération depuis la console, la CLI ou un agent IA, avec une seule instance autorisée à écrire lorsque l’application l’exige.",
         "doc": "docs/IDEAL-SCENE.md"
       },
       {
         "id": "meshfs",
         "name": "MeshFS",
-        "short": "Garder la trace des fichiers",
-        "title": "Garder la trace, sans tout recopier.",
-        "lead": "Les fichiers changent, et l’on aimerait pouvoir retrouver leur histoire sans conserver une copie complète à chaque étape. MeshFS part de cette idée : organiser le contenu en blocs reconnus par leur empreinte numérique, puis réutiliser ceux qui sont déjà présents. Une piste passionnante à explorer, à partir de fichiers tout simples.",
+        "short": "Système de fichiers distribué",
+        "title": "Stocker et répliquer des fichiers sur plusieurs serveurs.",
+        "lead": "MeshFS est un système de fichiers distribué : il organise les fichiers en volumes et réplique leur contenu entre plusieurs serveurs, appelés nœuds. Son rôle est de rendre les mêmes fichiers accessibles dans le cluster, de garder des copies cohérentes et de rattraper les changements manqués lorsqu’un nœud revient.",
         "points": [
           [
-            "Réutiliser ce qui existe déjà",
-            "Deux versions contiennent les mêmes blocs ? MeshFS peut les conserver une seule fois et les réutiliser. C’est la déduplication. La place gagnée dépend du contenu commun."
+            "Répliquer les fichiers entre les nœuds",
+            "Un fichier envoyé au cluster est découpé en blocs et répliqué. Quand un nœud manque des écritures pendant son absence, il récupère les changements à son retour."
           ],
           [
-            "Conserver des points de repère",
-            "Un instantané, ou snapshot, décrit les fichiers à un moment donné. Il permet de comparer des versions et de retrouver un état avec une référence pour s’y repérer."
+            "Éviter des versions contradictoires",
+            "Les écritures suivent un ordre commun validé par une majorité de nœuds. Une machine isolée refuse une opération qu’elle ne peut pas confirmer, plutôt que de présenter une ancienne version comme actuelle."
           ],
           [
-            "Comprendre en essayant",
-            "Un dossier de test permet de découvrir le fonctionnement. MeshFS peut être utilisé sans PodMesh ; le travail entre plusieurs serveurs ajoute le partage et la synchronisation."
+            "Réutiliser les blocs et garder des instantanés",
+            "Les blocs identiques peuvent être partagés entre fichiers et versions : c’est la déduplication. Les snapshots conservent un état des fichiers sans recopier tous leurs blocs."
           ]
         ],
-        "example": "Vous faites évoluer un dossier au fil des jours. Certaines parties changent, d’autres restent identiques. MeshFS peut réutiliser les blocs communs entre les versions : vous pouvez alors examiner ce qui a changé et retrouver vos points de repère.",
+        "example": "Vous envoyez une image de disque au cluster pendant qu’un nœud est arrêté. Les nœuds restants conservent le fichier. Au retour du nœud absent, MeshFS lui transmet ce qu’il a manqué pour qu’il retrouve le même contenu.",
         "workflow": [
-          "Identifier les fichiers, le stockage utilisé et la place disponible.",
-          "Créer ou examiner un instantané en conservant sa référence.",
-          "Comparer les empreintes et vérifier les fichiers retrouvés. Pour une copie sur un autre serveur, contrôler aussi sa présence et sa lecture."
+          "Choisir le volume et envoyer le fichier au cluster, par exemple une image RAW ou QCOW2.",
+          "Consulter l’état des nœuds et la progression de la réplication.",
+          "Lire le fichier depuis un autre nœud et vérifier son empreinte après récupération."
         ],
-        "technical": "L’approche de MeshFS repose sur le stockage adressé par le contenu, ou CAS : des blocs identifiés par leur empreinte SHA-256 peuvent être réutilisés. Une structure de Merkle relie les fichiers à leurs blocs et aide à repérer les changements. Ce travail sur les fichiers complète celui de PodMesh sur les applications et celui de PMBS sur les sauvegardes. Le partage du stockage, les copies pour la continuité et les sauvegardes répondent à des besoins différents : nous voulons que chacun reste compréhensible.",
+        "technical": "MeshFS découpe les fichiers en blocs de 4 Mio, identifiés par leur empreinte SHA-256 : c’est le stockage adressé par le contenu, ou CAS. Un arbre de Merkle décrit les fichiers et leurs changements. Le mode distribué utilise un journal répliqué et une majorité pour ordonner les écritures ; le rattrapage passe par ce journal ou un snapshot. Les transferts de grandes images passent par la CLI ou l’API en flux. L’accès en direct aux disques d’une VM en exécution nécessite aussi une couche de montage ou de stockage bloc.",
         "doc": "crates/meshfs",
         "docLabel": "Voir le code source de MeshFS"
       },
       {
         "id": "pmbs",
         "name": "PMBS",
-        "short": "Sauvegarder pour pouvoir repartir",
-        "title": "Une sauvegarde dont on sait se servir.",
-        "lead": "Ce que l’on attend d’une sauvegarde, c’est de pouvoir retrouver ses données au moment où l’on en a besoin. Avec PMBS — PodMesh Backup Server — nous travaillons sur tout ce chemin : conserver les fichiers, contrôler leur intégrité et préparer leur restauration. Le but est simple : savoir comment repartir.",
+        "short": "Serveur de sauvegarde",
+        "title": "Sauvegarder les données et retrouver un état antérieur.",
+        "lead": "PMBS, PodMesh Backup Server, est le serveur de sauvegarde du projet. Il conserve des points de sauvegarde, les fichiers qu’ils contiennent et les blocs nécessaires pour les reconstruire. Il permet de contrôler leur intégrité et de préparer une restauration vers un emplacement choisi.",
         "points": [
           [
-            "Retrouver une sauvegarde",
-            "Identifier le contenu conservé et le point de sauvegarde auquel il correspond."
+            "Conserver des points de sauvegarde",
+            "Retrouver les fichiers associés à une sauvegarde identifiée, pour choisir l’état que l’on veut récupérer."
           ],
           [
-            "Réutiliser les blocs identiques",
-            "Les sauvegardes peuvent partager les blocs qu’elles ont en commun. La place nécessaire dépend des données et de leurs changements."
+            "Limiter les copies inutiles",
+            "Les sauvegardes partagent leurs blocs identiques. Les transferts entre sites peuvent porter sur les blocs manquants, plutôt que sur toutes les données."
           ],
           [
-            "Essayer la récupération",
-            "Contrôler les blocs, restaurer dans une cible de test et vérifier que les fichiers puis l’application sont utilisables. Chaque étape apporte sa propre preuve, et c’est leur réunion qui donne confiance."
+            "Restaurer et vérifier le résultat",
+            "Récupérer les fichiers d’un point de sauvegarde, puis contrôler les données et le fonctionnement de l’application restaurée."
           ]
         ],
-        "example": "Avant une mise à jour, vous gardez une sauvegarde et vous essayez sa restauration dans un espace de test. Retrouver les fichiers, puis faire fonctionner l’application, donne des repères concrets pour le jour où vous en aurez besoin.",
+        "example": "Une mise à jour pose problème. Vous choisissez une sauvegarde antérieure, restaurez ses données dans une cible distincte et vérifiez l’application avant de décider de la suite.",
         "workflow": [
-          "Repérer le contenu sauvegardé, sa référence et les éléments nécessaires à sa récupération.",
-          "Contrôler la présence des blocs et leur intégrité.",
-          "Restaurer dans une cible autorisée, puis vérifier les données et le fonctionnement de l’application."
+          "Lister les points de sauvegarde et choisir celui à restaurer.",
+          "Vérifier ses blocs et préparer une cible de restauration.",
+          "Restaurer les fichiers, puis vérifier les données et le service qui les utilise."
         ],
-        "technical": "Dans la scène idéale, un serveur de sauvegarde extérieur au groupe de machines conserve des points de reprise versionnés, protégés contre la modification, avec une copie sur un autre site. Le chemin de retour couvre les fichiers, les bases de données et les éléments nécessaires au fonctionnement de l’application. Contrôler des empreintes sert à vérifier l’intégrité ; le cap est aussi de restaurer pour de vrai et de vérifier que l’application fonctionne. C’est cette chaîne complète qui doit permettre de compter sur la sauvegarde.",
+        "technical": "PMBS conserve des manifestes de sauvegarde : ils décrivent quels fichiers et quels blocs appartiennent à chaque point de reprise. Les blocs sont adressés par leur contenu pour la déduplication et la vérification d’intégrité. La scène idéale prévoit une conservation extérieure aux hôtes applicatifs et une copie sur un autre site. MeshFS sert au stockage distribué des fichiers ; PMBS sert à retrouver un état sauvegardé après une erreur, une perte ou un incident.",
         "doc": "crates/pmbs",
         "docLabel": "Voir le code source de PMBS"
       },
       {
         "id": "proxmox",
         "name": "Proxmox VE",
-        "short": "Relier les outils de stockage",
-        "title": "Explorer MeshFS dans un environnement familier.",
-        "lead": "Proxmox fait partie des outils que nous aimons utiliser. Le plugin du projet relie ses outils de stockage à MeshFS : une façon de prolonger l’exploration depuis une interface familière, puis de voir comment cette approche répond à vos usages.",
+        "short": "Connecter MeshFS à Proxmox",
+        "title": "Gérer le stockage MeshFS depuis Proxmox VE.",
+        "lead": "Le plugin Proxmox VE est l’adaptateur entre MeshFS et les outils de stockage de Proxmox. Il décrit un stockage, expose son état et relie les opérations sur les volumes et les images de disques aux interfaces de Proxmox, afin de les retrouver dans cet environnement.",
         "points": [
           [
-            "Retrouver vos repères",
-            "Passer par les interfaces de stockage de Proxmox pour les opérations prises en charge par le plugin."
+            "Déclarer le stockage",
+            "Renseigner le serveur, le volume, le chemin et les types de contenus concernés : images de disques, ISO ou sauvegardes."
           ],
           [
-            "Préparer un espace de stockage",
-            "Définir son emplacement, les serveurs concernés et les types de contenus autorisés."
+            "Gérer les images et les instantanés",
+            "Relier les opérations de création, de liste et de snapshot des images aux commandes de stockage prises en charge par le plugin."
           ],
           [
-            "Essayer sur un volume de test",
-            "Vérifier la création, l’écriture, la lecture et la récupération avant d’y placer une machine importante."
+            "Consulter l’état et la capacité",
+            "Retrouver l’espace disponible et l’état du stockage depuis les interfaces de Proxmox."
           ]
         ],
-        "example": "Vous connaissez déjà Proxmox et vous voulez découvrir MeshFS. Vous commencez par un volume de test, vous y écrivez des données, vous les relisez et vous essayez de les retrouver après restauration. L’exploration prend ainsi appui sur des gestes connus.",
+        "example": "Vous administrez vos VM avec Proxmox. Le plugin permet de déclarer un stockage MeshFS et de retrouver ses opérations de stockage parmi vos outils habituels.",
         "workflow": [
-          "Vérifier les versions de Proxmox, de MeshFS et du plugin.",
-          "Préparer la configuration de stockage dans le périmètre autorisé.",
-          "Tester les opérations nécessaires avec de vraies données et conserver le résultat des vérifications."
+          "Lire la configuration du stockage Proxmox et identifier le volume MeshFS associé.",
+          "Préparer la déclaration du stockage et les types de contenus nécessaires.",
+          "Exécuter les opérations prises en charge et vérifier les images et les données correspondantes."
         ],
-        "technical": "Le plugin fait le lien entre l’interface de stockage de Proxmox VE et MeshFS, grâce au mécanisme PVE::Storage::Plugin. L’intention est de retrouver les opérations de stockage dans des outils familiers, avec des responsabilités lisibles. Le plugin est développé dans le projet PodMesh. Le stockage et les règles de continuité de l’application restent deux sujets distincts.",
+        "technical": "Le plugin utilise PVE::Storage::Plugin, le mécanisme d’extension du stockage de Proxmox VE. Il adapte les commandes de Proxmox aux opérations de MeshFS et aux outils d’images comme qemu-img. Déclarer un stockage partagé ne réplique pas ses données : la réplication relève de MeshFS. L’accès réel d’une VM en exécution dépend aussi de la couche de montage ou de stockage bloc utilisée.",
         "doc": "packaging/proxmox/README-PROXMOX-PLUGIN.md"
       },
       {
         "id": "downloads",
         "name": "Premiers pas",
-        "short": "Choisir quoi installer",
-        "title": "Commencer petit, apprendre en faisant.",
-        "lead": "Un dossier, un conteneur ou une sauvegarde de test : il suffit d’un usage précis pour commencer à comprendre. Nous vous invitons à explorer un composant, observer ce qu’il fait et prendre vos repères avant d’aller plus loin.",
+        "short": "Installation et premier usage",
+        "title": "Choisir les composants, les installer et les utiliser.",
+        "lead": "PodMesh, MeshFS et PMBS répondent à trois besoins : piloter les applications, répartir leurs fichiers et conserver leurs sauvegardes. Les guides d’installation donnent les composants et les prérequis nécessaires selon l’usage choisi. Vous pouvez commencer par un outil sans déployer tout l’ensemble.",
         "points": [
           [
-            "Choisir un point de départ",
-            "Comprendre les conteneurs avec PodMesh, explorer les fichiers avec MeshFS ou préparer une sauvegarde avec PMBS."
+            "Choisir l’outil adapté",
+            "PodMesh pour gérer les applications Podman ; MeshFS pour le système de fichiers distribué ; PMBS pour les sauvegardes et leur récupération."
           ],
           [
-            "Lire la procédure correspondante",
-            "Repérer les prérequis, la version et les composants nécessaires dans la documentation."
+            "Préparer l’installation",
+            "Repérer la version, les prérequis et la procédure du composant, puis identifier les machines et les espaces de données qui l’accueilleront."
           ],
           [
-            "Faire un premier essai",
-            "Utiliser des données de test, noter ce qui a été installé et vérifier le résultat avant d’élargir l’usage."
+            "Réaliser une première opération",
+            "Démarrer une application, transférer un fichier entre nœuds ou restaurer une sauvegarde : choisir une action concrète et vérifier son résultat."
           ]
         ],
-        "example": "Pour découvrir MeshFS, vous commencez avec un dossier dont vous connaissez les fichiers. Vous créez un instantané, modifiez quelques éléments et regardez ce qui a changé. Ce premier essai aide à comprendre ce que l’outil peut vous apporter.",
+        "example": "Pour découvrir MeshFS, vous préparez un volume de test sur plusieurs nœuds, envoyez un fichier depuis l’un d’eux et le relisez depuis un autre. Pour PMBS, vous partez d’un point de sauvegarde et récupérez un fichier.",
         "workflow": [
-          "Clarifier le résultat attendu et vérifier les prérequis de la machine.",
-          "Préparer une installation à partir d’une source identifiée, avec ses versions et ses empreintes.",
-          "Rendre compte de ce qui est installé, de ce qui fonctionne et des étapes encore nécessaires."
+          "Choisir le composant en fonction du résultat attendu.",
+          "Suivre son guide d’installation et vérifier que le service répond.",
+          "Effectuer une première opération avec des données de test, puis en contrôler le résultat."
         ],
-        "technical": "Le projet sépare la gestion des applications, les outils de commande, le stockage MeshFS et le serveur de sauvegarde PMBS. Les guides d’installation accompagnent le choix des composants, des versions et des prérequis. Notre direction reste la même : pouvoir comprendre ce qui a été installé, observer ses opérations et disposer d’un chemin de récupération.",
+        "technical": "Le projet sépare l’orchestration des applications, le stockage distribué et les sauvegardes. Les commandes et les API sont les points d’entrée des utilisateurs comme des agents IA. Les procédures d’installation précisent les versions et les composants nécessaires pour chaque rôle.",
         "doc": "docs/README.md"
       }
     ],
     "direction": "Cette vitrine présente la direction du projet : ce que nous construisons et les usages qui nous guident.",
-    "directionLink": "Lire la scène idéale"
+    "directionLink": "Lire la scène idéale",
+    "overview": "PodMesh pilote les applications. MeshFS distribue leurs fichiers entre serveurs. PMBS conserve leurs sauvegardes."
   },
   "en": {
     "title": "The joy of exploring. The care to do things well.",
@@ -192,153 +193,154 @@ export const guideContent = {
       {
         "id": "podmesh",
         "name": "PodMesh",
-        "short": "Move and replicate applications",
-        "title": "An application, beyond its first server.",
-        "lead": "An application lives on a machine, but its location is only part of the story. It has services, files and a running state: what it is doing right now. With PodMesh and Podman, we explore how to manage that whole, move it live and prepare a replica, taking care to recover what keeps it working.",
+        "short": "Container orchestration",
+        "title": "Create, move and replicate applications.",
+        "lead": "PodMesh is an orchestrator for applications running in Podman containers. It brings together commands to create, start and stop an application, move it to another server and prepare a replica. It handles its services and data, and its running state for compatible live moves.",
         "points": [
           [
-            "See what you are looking after",
-            "Identify the containers, services and data that keep the application alive. In SHAPER OS, this whole is called a universe."
+            "Manage applications",
+            "Create, start and stop the containers that make up an application, and inspect their state from a console or command tools."
           ],
           [
-            "Explore live movement",
-            "Capture a running state and resume it on another machine: the application’s activity matters alongside its files. The process depends on the configuration."
+            "Move an application",
+            "Transfer the application and its required data to another host. Compatible live moves also resume its running state."
           ],
           [
-            "Prepare a copy for recovery",
-            "Replication maintains a copy on another server. Moving and replicating an application meet different needs that we work on within the same project."
+            "Prepare recovery elsewhere",
+            "Maintain a replica on another server and organise recovery according to the application’s continuity rules."
           ]
         ],
-        "example": "A server needs maintenance. You want to prepare your application’s move to another machine, find its data and check that it works before continuing. It is an everyday need, and a good reason to work carefully on movement and recovery.",
+        "example": "A server needs maintenance: PodMesh organises the application’s move with its services and data. Replication prepares for a different situation: having a copy available for recovery after a failure.",
         "workflow": [
-          "Observe the actual application state and available resources.",
-          "Prepare the operation using the installed version’s interfaces and the permissions received.",
-          "Check the application and data afterwards, then explain what worked and what remains."
+          "Identify the application’s containers and data, then choose a destination host.",
+          "Request a move or replication through PodMesh and follow the operation.",
+          "Check that the application responds on the right host and finds its data."
         ],
-        "technical": "The ideal scene gives the human-agent tandem one contract to create, run, move, protect and restore a universe, from a console or an agent’s tools. Hosts carry the operation; a workstation observes and commands. Each universe declares continuity rules and the data to preserve. Exclusive decisions must avoid two instances writing divergent histories; interrupted operations must resume without repeating their effects. Recovery possibilities follow the available infrastructure.",
+        "technical": "Podman runs containers; PodMesh coordinates their lifecycle and operations between hosts. A SHAPER OS universe groups an application, its services and data. Movement, replication and restoration serve different purposes. The ideal scene provides the same operation through a console, CLI or AI agent, with a single authorised writer where required.",
         "doc": "docs/IDEAL-SCENE.md"
       },
       {
         "id": "meshfs",
         "name": "MeshFS",
-        "short": "Keep track of files",
-        "title": "Keep a history, without copying everything again.",
-        "lead": "Files change, and we would like to find their history without keeping a full copy at every step. MeshFS starts from that idea: organise content into blocks recognised by their digital fingerprints, then reuse those already present. An exciting direction to explore, starting with simple files.",
+        "short": "Distributed filesystem",
+        "title": "Store and replicate files across servers.",
+        "lead": "MeshFS is a distributed filesystem: it organises files into volumes and replicates their content across servers called nodes. Its role is to make the same files available across the cluster, keep copies consistent and catch up on missed changes when a node returns.",
         "points": [
           [
-            "Reuse what already exists",
-            "Two versions contain identical blocks? MeshFS can store them once and reuse them. This is deduplication. The space saved depends on the common content."
+            "Replicate files between nodes",
+            "Files sent to the cluster are split into blocks and replicated. A node that misses writes during an absence retrieves those changes when it returns."
           ],
           [
-            "Keep reference points",
-            "A snapshot describes files at a particular time. It helps compare versions and find a state again with a reference to guide you."
+            "Avoid conflicting versions",
+            "Writes follow a shared order validated by a majority of nodes. An isolated machine refuses an operation it cannot confirm instead of presenting an old version as current."
           ],
           [
-            "Understand by trying",
-            "A test folder helps you discover the approach. MeshFS can be used without PodMesh; working across servers adds sharing and synchronisation."
+            "Reuse blocks and retain snapshots",
+            "Identical blocks can be shared across files and versions: this is deduplication. Snapshots retain file states without copying every block."
           ]
         ],
-        "example": "You develop a folder over several days. Some parts change; others stay identical. MeshFS can reuse the blocks shared across versions, so you can examine changes and find your reference points again.",
+        "example": "You send a disk image to the cluster while one node is stopped. The remaining nodes retain the file. When the absent node returns, MeshFS sends what it missed so it can recover the same content.",
         "workflow": [
-          "Identify the files, storage in use and available capacity.",
-          "Create or inspect a snapshot and keep its reference.",
-          "Compare fingerprints and check recovered files. For a copy on another server, also check its presence and readability."
+          "Choose a volume and send a file to the cluster, such as a RAW or QCOW2 image.",
+          "Inspect node state and replication progress.",
+          "Read the file through another node and check its fingerprint after recovery."
         ],
-        "technical": "MeshFS builds on content-addressed storage, or CAS: blocks identified by SHA-256 fingerprints can be reused. A Merkle structure connects files to their blocks and helps identify changes. This work on files complements PodMesh’s work on applications and PMBS’s work on backups. Shared storage, continuity copies and backups answer different needs; we want each to remain understandable.",
+        "technical": "MeshFS splits files into 4 MiB blocks identified by SHA-256 fingerprints: content-addressed storage, or CAS. A Merkle tree describes files and changes. Distributed mode uses a replicated log and a majority to order writes; returning nodes catch up through that log or a snapshot. Large images transfer through the streaming CLI or API. Direct disk access for a running VM also requires a filesystem mount or block-storage layer.",
         "doc": "crates/meshfs",
         "docLabel": "Read the MeshFS source code"
       },
       {
         "id": "pmbs",
         "name": "PMBS",
-        "short": "Back up so you can recover",
-        "title": "A backup you know how to use.",
-        "lead": "What we want from a backup is to recover our data when we need it. With PMBS — PodMesh Backup Server — we work on that whole path: keeping files, checking their integrity and preparing restoration. The aim is simple: know how to get going again.",
+        "short": "Backup server",
+        "title": "Back up data and recover an earlier state.",
+        "lead": "PMBS, PodMesh Backup Server, is the project’s backup server. It retains backup points, their files and the blocks needed to reconstruct them. It checks their integrity and prepares restoration to a chosen destination.",
         "points": [
           [
-            "Find a backup",
-            "Identify the contents kept and the backup point they belong to."
+            "Keep backup points",
+            "Find the files associated with an identified backup and choose the state to recover."
           ],
           [
-            "Reuse identical blocks",
-            "Backups can share the blocks they have in common. Capacity needs depend on the data and how it changes."
+            "Avoid unnecessary copies",
+            "Backups share identical blocks. Transfers between sites can send missing blocks instead of all the data."
           ],
           [
-            "Try recovery",
-            "Check the blocks, restore to a test destination and verify that the files and application can be used. Each step brings its own evidence; together, they build confidence."
+            "Restore and check the result",
+            "Recover a backup’s files, then check the data and the restored application."
           ]
         ],
-        "example": "Before an update, you keep a backup and try restoring it in a test space. Finding the files, then running the application, provides practical reference points for the day you need them.",
+        "example": "An update causes a problem. Choose an earlier backup, restore its data to a separate destination and check the application before deciding what to do next.",
         "workflow": [
-          "Identify the backed-up contents, their reference and the items needed for recovery.",
-          "Check block presence and integrity.",
-          "Restore to an authorised destination, then check data and application operation."
+          "List backup points and choose one to restore.",
+          "Verify its blocks and prepare a restoration destination.",
+          "Restore files, then check the data and the service that uses it."
         ],
-        "technical": "In the ideal scene, a backup server outside the group of hosts keeps versioned recovery points protected against modification, with a copy at another site. The path back covers files, databases and the elements required for the application to work. Checking fingerprints verifies integrity; the goal also includes actual restoration and checking that the application works. That whole chain is what should make a backup dependable.",
+        "technical": "PMBS stores backup manifests describing the files and blocks belonging to each recovery point. Content-addressed blocks enable deduplication and integrity checks. The ideal scene places backups outside application hosts, with a copy at another site. MeshFS provides distributed file storage; PMBS recovers a saved state after an error, loss or incident.",
         "doc": "crates/pmbs",
         "docLabel": "Read the PMBS source code"
       },
       {
         "id": "proxmox",
         "name": "Proxmox VE",
-        "short": "Connect storage tools",
-        "title": "Explore MeshFS in a familiar environment.",
-        "lead": "Proxmox is one of the tools we enjoy using. The project plugin connects its storage tools to MeshFS: a way to continue exploring from a familiar interface and see how this approach meets your needs.",
+        "short": "Connect MeshFS to Proxmox",
+        "title": "Manage MeshFS storage from Proxmox VE.",
+        "lead": "The Proxmox VE plugin is the adapter between MeshFS and Proxmox storage tools. It describes storage, exposes its state and connects volume and disk-image operations to Proxmox interfaces.",
         "points": [
           [
-            "Use familiar tools",
-            "Use Proxmox storage interfaces for operations supported by the plugin."
+            "Declare storage",
+            "Set the server, volume, path and content types: disk images, ISO files or backups."
           ],
           [
-            "Prepare storage",
-            "Define its location, participating servers and permitted content types."
+            "Manage images and snapshots",
+            "Connect image creation, listing and snapshot operations to storage commands supported by the plugin."
           ],
           [
-            "Try a test volume",
-            "Check creation, writes, reads and recovery before placing an important machine on it."
+            "Inspect state and capacity",
+            "Find available space and storage state through Proxmox interfaces."
           ]
         ],
-        "example": "You already know Proxmox and want to discover MeshFS. Start with a test volume, write data, read it back and try retrieving it after restoration. The exploration builds on familiar actions.",
+        "example": "You administer VMs with Proxmox. The plugin lets you declare MeshFS storage and find its storage operations among your familiar tools.",
         "workflow": [
-          "Check the Proxmox, MeshFS and plugin versions.",
-          "Prepare storage configuration within the authorised scope.",
-          "Test the required operations with actual data and keep the results."
+          "Read the Proxmox storage configuration and identify its MeshFS volume.",
+          "Prepare the storage declaration and required content types.",
+          "Run supported operations and check the corresponding images and data."
         ],
-        "technical": "The plugin connects Proxmox VE’s storage interface to MeshFS through PVE::Storage::Plugin. The intention is to bring storage operations into familiar tools with clear responsibilities. It is developed within the PodMesh project. Storage and application continuity rules remain distinct subjects.",
+        "technical": "The plugin uses PVE::Storage::Plugin, Proxmox VE’s storage extension mechanism. It adapts Proxmox commands to MeshFS operations and image tools such as qemu-img. Declaring shared storage does not replicate data: replication belongs to MeshFS. Actual access by a running VM also depends on the filesystem mount or block-storage layer.",
         "doc": "packaging/proxmox/README-PROXMOX-PLUGIN.md"
       },
       {
         "id": "downloads",
         "name": "Getting started",
-        "short": "Choose what to install",
-        "title": "Start small, learn by doing.",
-        "lead": "A folder, a container or a test backup: one specific use is enough to begin understanding. We invite you to explore a component, observe what it does and get your bearings before going further.",
+        "short": "Installation and first use",
+        "title": "Choose components, install them and use them.",
+        "lead": "PodMesh, MeshFS and PMBS meet three needs: managing applications, distributing files and retaining backups. Installation guides describe the components and prerequisites for each use. You can begin with one tool without deploying everything.",
         "points": [
           [
-            "Choose a starting point",
-            "Understand containers with PodMesh, explore files with MeshFS or prepare a backup with PMBS."
+            "Choose the appropriate tool",
+            "PodMesh manages Podman applications; MeshFS provides the distributed filesystem; PMBS handles backups and recovery."
           ],
           [
-            "Read the relevant procedure",
-            "Find prerequisites, versions and required components in the documentation."
+            "Prepare installation",
+            "Find the component version, prerequisites and procedure, then identify its hosts and data storage."
           ],
           [
-            "Run a first trial",
-            "Use test data, record what was installed and check the result before extending the use."
+            "Perform a first operation",
+            "Start an application, transfer a file between nodes or restore a backup: choose a concrete action and check the result."
           ]
         ],
-        "example": "To discover MeshFS, start with a folder whose files you know. Create a snapshot, change a few items and look at what changed. This first trial helps you understand what the tool could bring you.",
+        "example": "To discover MeshFS, prepare a test volume across nodes, send a file through one and read it through another. With PMBS, start from a backup point and recover a file.",
         "workflow": [
-          "Clarify the desired result and check machine prerequisites.",
-          "Prepare installation from an identified source, with its versions and fingerprints.",
-          "Report what is installed, what works and which steps remain."
+          "Choose a component for the desired result.",
+          "Follow its installation guide and check that the service responds.",
+          "Perform a first operation with test data and verify the result."
         ],
-        "technical": "The project separates application management, command tools, MeshFS storage and the PMBS backup server. Installation guides help choose components, versions and prerequisites. Our direction stays the same: understand what is installed, observe its operations and have a recovery path.",
+        "technical": "The project separates application orchestration, distributed storage and backups. Commands and APIs are entry points for users and AI agents alike. Installation procedures specify the versions and components needed for each role.",
         "doc": "docs/README.md"
       }
     ],
     "direction": "This guide presents the direction of the project: what we are building and the uses that guide us.",
-    "directionLink": "Read the ideal scene"
+    "directionLink": "Read the ideal scene",
+    "overview": "PodMesh manages applications. MeshFS distributes their files across servers. PMBS keeps their backups."
   },
   "es": {
     "title": "El placer de explorar. El cuidado de hacer las cosas bien.",
@@ -362,152 +364,153 @@ export const guideContent = {
       {
         "id": "podmesh",
         "name": "PodMesh",
-        "short": "Mover y replicar aplicaciones",
-        "title": "Una aplicación, más allá de su primer servidor.",
-        "lead": "Una aplicación vive en una máquina, pero su ubicación solo es una parte. Tiene servicios, archivos y un estado de ejecución: lo que está haciendo ahora. Con PodMesh y Podman exploramos cómo gestionar ese conjunto, trasladarlo en caliente y preparar una réplica, cuidando lo que le permite funcionar.",
+        "short": "Orquestar contenedores",
+        "title": "Crear, trasladar y replicar aplicaciones.",
+        "lead": "PodMesh es un orquestador de aplicaciones en contenedores Podman. Reúne las operaciones para crear, iniciar y detener una aplicación, trasladarla a otro servidor y preparar una réplica. Gestiona sus servicios y datos, y su estado de ejecución en traslados en caliente compatibles.",
         "points": [
           [
-            "Ver qué estás cuidando",
-            "Identificar los contenedores, servicios y datos que dan vida a la aplicación. En SHAPER OS, este conjunto se llama universo."
+            "Gestionar aplicaciones",
+            "Crear, iniciar y detener los contenedores de una aplicación y consultar su estado desde una consola o herramientas de comandos."
           ],
           [
-            "Explorar el traslado en caliente",
-            "Capturar un estado de ejecución y reanudarlo en otra máquina: nos interesa lo que hacía la aplicación además de sus archivos. El proceso depende de la configuración."
+            "Trasladar una aplicación",
+            "Transferir la aplicación y sus datos a otro host. Los traslados en caliente compatibles también reanudan su estado de ejecución."
           ],
           [
-            "Preparar una copia para recuperar",
-            "La replicación mantiene una copia en otro servidor. Trasladar y replicar una aplicación responden a necesidades distintas que trabajamos en el mismo proyecto."
+            "Preparar la recuperación",
+            "Mantener una réplica en otro servidor y organizar su recuperación según las reglas de continuidad de la aplicación."
           ]
         ],
-        "example": "Un servidor necesita mantenimiento. Quieres preparar el traslado de tu aplicación a otra máquina, encontrar sus datos y comprobar que funciona antes de continuar. Es una necesidad cotidiana y una buena razón para trabajar con cuidado en el traslado y la recuperación.",
+        "example": "Un servidor necesita mantenimiento: PodMesh organiza el traslado de la aplicación con sus servicios y datos. La replicación prepara otra situación: disponer de una copia para recuperarse tras una avería.",
         "workflow": [
-          "Observar el estado real de las aplicaciones y los recursos disponibles.",
-          "Preparar la operación con las interfaces de la versión instalada y los permisos recibidos.",
-          "Comprobar la aplicación y sus datos después, e indicar qué ha funcionado y qué queda pendiente."
+          "Identificar los contenedores y datos de la aplicación y elegir un host de destino.",
+          "Solicitar el traslado o la replicación con PodMesh y seguir la operación.",
+          "Comprobar que la aplicación responde en el host correcto y encuentra sus datos."
         ],
-        "technical": "La escena ideal ofrece al tándem persona-agente un mismo contrato para crear, ejecutar, trasladar, proteger y restaurar un universo, desde una consola o las herramientas de un agente. Los hosts llevan el funcionamiento; una estación de trabajo observa y manda. Cada universo declara sus reglas de continuidad y los datos que preservar. Las decisiones exclusivas deben evitar dos instancias que escriban historias distintas; las operaciones interrumpidas deben reanudarse sin repetir efectos. La recuperación sigue la infraestructura disponible.",
+        "technical": "Podman ejecuta los contenedores; PodMesh coordina su ciclo de vida y las operaciones entre hosts. Un universo SHAPER OS agrupa una aplicación, sus servicios y datos. Traslado, replicación y restauración cumplen funciones distintas. La escena ideal ofrece la misma operación desde consola, CLI o un agente de IA, con una única instancia autorizada a escribir cuando sea necesario.",
         "doc": "docs/IDEAL-SCENE.md"
       },
       {
         "id": "meshfs",
         "name": "MeshFS",
-        "short": "Seguir la historia de los archivos",
-        "title": "Guardar la historia, sin volver a copiarlo todo.",
-        "lead": "Los archivos cambian y nos gustaría encontrar su historia sin guardar una copia completa en cada etapa. MeshFS parte de esta idea: organizar el contenido en bloques reconocidos por sus huellas digitales y reutilizar los que ya existen. Una dirección apasionante para explorar con archivos sencillos.",
+        "short": "Sistema de archivos distribuido",
+        "title": "Almacenar y replicar archivos entre servidores.",
+        "lead": "MeshFS es un sistema de archivos distribuido: organiza archivos en volúmenes y replica su contenido entre servidores llamados nodos. Su función es ofrecer los mismos archivos en el clúster, mantener copias coherentes y recuperar los cambios pendientes cuando un nodo regresa.",
         "points": [
           [
-            "Reutilizar lo que ya existe",
-            "¿Dos versiones contienen bloques idénticos? MeshFS puede guardarlos una sola vez y reutilizarlos. Es la deduplicación. El ahorro depende del contenido común."
+            "Replicar archivos entre nodos",
+            "Los archivos enviados al clúster se dividen en bloques y se replican. Un nodo que pierde escrituras durante su ausencia recupera los cambios al regresar."
           ],
           [
-            "Conservar referencias",
-            "Una instantánea, o snapshot, describe los archivos en un momento concreto. Ayuda a comparar versiones y encontrar un estado con una referencia que te orienta."
+            "Evitar versiones contradictorias",
+            "Las escrituras siguen un orden común validado por una mayoría de nodos. Una máquina aislada rechaza una operación que no puede confirmar, en lugar de presentar una versión antigua como actual."
           ],
           [
-            "Comprender probando",
-            "Una carpeta de prueba ayuda a descubrir la idea. MeshFS puede utilizarse sin PodMesh; trabajar entre servidores añade intercambio y sincronización."
+            "Reutilizar bloques y conservar instantáneas",
+            "Los bloques idénticos pueden compartirse entre archivos y versiones: es la deduplicación. Las instantáneas conservan estados de archivos sin copiar todos los bloques."
           ]
         ],
-        "example": "Una carpeta evoluciona con los días. Algunas partes cambian y otras siguen idénticas. MeshFS puede reutilizar los bloques comunes entre versiones para examinar los cambios y encontrar tus referencias.",
+        "example": "Envías una imagen de disco al clúster mientras un nodo está detenido. Los demás conservan el archivo. Cuando vuelve el nodo ausente, MeshFS le envía lo que le falta para recuperar el mismo contenido.",
         "workflow": [
-          "Identificar los archivos, el almacenamiento y el espacio disponible.",
-          "Crear o examinar una instantánea y conservar su referencia.",
-          "Comparar las huellas y comprobar los archivos recuperados. Para una copia en otro servidor, comprobar también su presencia y lectura."
+          "Elegir un volumen y enviar un archivo al clúster, por ejemplo una imagen RAW o QCOW2.",
+          "Consultar el estado de los nodos y el progreso de replicación.",
+          "Leer el archivo desde otro nodo y comprobar su huella después de recuperarlo."
         ],
-        "technical": "MeshFS parte del almacenamiento direccionado por contenido, o CAS: los bloques identificados por huellas SHA-256 pueden reutilizarse. Una estructura de Merkle relaciona los archivos con sus bloques y ayuda a detectar cambios. Este trabajo sobre los archivos complementa el de PodMesh sobre aplicaciones y el de PMBS sobre copias de seguridad. El almacenamiento compartido, las copias para continuidad y las copias de seguridad responden a necesidades distintas; queremos que cada una siga siendo comprensible.",
+        "technical": "MeshFS divide los archivos en bloques de 4 MiB identificados por huellas SHA-256: almacenamiento direccionado por contenido, o CAS. Un árbol de Merkle describe los archivos y sus cambios. El modo distribuido usa un registro replicado y una mayoría para ordenar escrituras; el nodo recupera cambios mediante ese registro o una instantánea. Las imágenes grandes se transfieren mediante la CLI o API en flujo. El acceso directo al disco de una VM en ejecución también necesita una capa de montaje o almacenamiento de bloques.",
         "doc": "crates/meshfs",
         "docLabel": "Ver el código fuente de MeshFS"
       },
       {
         "id": "pmbs",
         "name": "PMBS",
-        "short": "Guardar para poder recuperar",
-        "title": "Una copia que sabes cómo utilizar.",
-        "lead": "Lo que esperamos de una copia de seguridad es recuperar nuestros datos cuando los necesitamos. Con PMBS — PodMesh Backup Server — trabajamos en todo ese camino: conservar archivos, comprobar su integridad y preparar la restauración. El objetivo es sencillo: saber cómo volver a empezar.",
+        "short": "Servidor de copias de seguridad",
+        "title": "Guardar datos y recuperar un estado anterior.",
+        "lead": "PMBS, PodMesh Backup Server, es el servidor de copias de seguridad del proyecto. Conserva puntos de copia, sus archivos y los bloques necesarios para reconstruirlos. Permite comprobar su integridad y preparar la restauración en un destino elegido.",
         "points": [
           [
-            "Encontrar una copia",
-            "Identificar el contenido conservado y el punto de copia al que corresponde."
+            "Conservar puntos de copia",
+            "Encontrar los archivos asociados a una copia identificada y elegir el estado que recuperar."
           ],
           [
-            "Reutilizar bloques idénticos",
-            "Las copias pueden compartir sus bloques comunes. El espacio necesario depende de los datos y sus cambios."
+            "Evitar copias innecesarias",
+            "Las copias comparten bloques idénticos. Los traslados entre sitios pueden enviar solo los bloques que faltan."
           ],
           [
-            "Probar la recuperación",
-            "Comprobar los bloques, restaurar en un destino de prueba y verificar que los archivos y la aplicación son utilizables. Cada etapa aporta su propia prueba y, juntas, ayudan a confiar en el resultado."
+            "Restaurar y comprobar",
+            "Recuperar los archivos de una copia y comprobar los datos y la aplicación restaurada."
           ]
         ],
-        "example": "Antes de actualizar, guardas una copia y pruebas su restauración en un espacio de prueba. Recuperar los archivos y después hacer funcionar la aplicación da referencias concretas para cuando las necesites.",
+        "example": "Una actualización causa un problema. Eliges una copia anterior, restauras sus datos en otro destino y compruebas la aplicación antes de decidir cómo continuar.",
         "workflow": [
-          "Identificar el contenido guardado, su referencia y los elementos necesarios para recuperarlo.",
-          "Comprobar la presencia e integridad de los bloques.",
-          "Restaurar en un destino autorizado y comprobar los datos y el funcionamiento de la aplicación."
+          "Listar los puntos de copia y elegir uno para restaurar.",
+          "Verificar los bloques y preparar el destino de restauración.",
+          "Restaurar los archivos y comprobar los datos y el servicio que los utiliza."
         ],
-        "technical": "En la escena ideal, un servidor de copias fuera del grupo de máquinas guarda puntos de recuperación versionados, protegidos contra modificaciones, con una copia en otra ubicación. El camino de vuelta cubre archivos, bases de datos y elementos necesarios para que funcione la aplicación. Comprobar huellas verifica la integridad; el objetivo incluye restaurar de verdad y comprobar el funcionamiento. Toda esa cadena debe permitir confiar en la copia.",
+        "technical": "PMBS guarda manifiestos que describen los archivos y bloques de cada punto de recuperación. Los bloques direccionados por contenido permiten deduplicación y comprobación de integridad. La escena ideal sitúa las copias fuera de los hosts de aplicaciones, con otra copia en un segundo sitio. MeshFS ofrece almacenamiento distribuido; PMBS permite recuperar un estado guardado tras un error, una pérdida o un incidente.",
         "doc": "crates/pmbs",
         "docLabel": "Ver el código fuente de PMBS"
       },
       {
         "id": "proxmox",
         "name": "Proxmox VE",
-        "short": "Conectar el almacenamiento",
-        "title": "Explorar MeshFS en un entorno familiar.",
-        "lead": "Proxmox es una de las herramientas que disfrutamos usando. El plugin del proyecto conecta su almacenamiento con MeshFS: una forma de seguir explorando desde una interfaz conocida y ver cómo responde a tus necesidades.",
+        "short": "Conectar MeshFS con Proxmox",
+        "title": "Gestionar MeshFS desde Proxmox VE.",
+        "lead": "El plugin Proxmox VE es el adaptador entre MeshFS y las herramientas de almacenamiento de Proxmox. Describe el almacenamiento, muestra su estado y conecta las operaciones de volúmenes e imágenes de disco con las interfaces de Proxmox.",
         "points": [
           [
-            "Usar herramientas conocidas",
-            "Pasar por las interfaces de almacenamiento de Proxmox para las operaciones compatibles con el plugin."
+            "Declarar el almacenamiento",
+            "Configurar servidor, volumen, ruta y tipos de contenido: imágenes de disco, ISO o copias."
           ],
           [
-            "Preparar el almacenamiento",
-            "Definir su ubicación, los servidores participantes y los tipos de contenido permitidos."
+            "Gestionar imágenes e instantáneas",
+            "Conectar creación, listado e instantáneas de imágenes con las operaciones compatibles con el plugin."
           ],
           [
-            "Probar con un volumen de prueba",
-            "Comprobar creación, escritura, lectura y recuperación antes de alojar una máquina importante."
+            "Consultar estado y capacidad",
+            "Encontrar el espacio disponible y el estado desde las interfaces de Proxmox."
           ]
         ],
-        "example": "Ya conoces Proxmox y quieres descubrir MeshFS. Empiezas con un volumen de prueba, escribes datos, los lees e intentas recuperarlos después de restaurar. La exploración se apoya en acciones conocidas.",
+        "example": "Administras tus VM con Proxmox. El plugin permite declarar almacenamiento MeshFS y encontrar sus operaciones entre las herramientas habituales.",
         "workflow": [
-          "Comprobar las versiones de Proxmox, MeshFS y el plugin.",
-          "Preparar la configuración de almacenamiento dentro del alcance autorizado.",
-          "Probar las operaciones necesarias con datos reales y conservar los resultados."
+          "Leer la configuración de Proxmox e identificar su volumen MeshFS.",
+          "Preparar la declaración de almacenamiento y los tipos de contenido necesarios.",
+          "Ejecutar las operaciones compatibles y comprobar sus imágenes y datos."
         ],
-        "technical": "El plugin conecta la interfaz de almacenamiento de Proxmox VE con MeshFS mediante PVE::Storage::Plugin. La intención es llevar las operaciones de almacenamiento a herramientas familiares con responsabilidades claras. Se desarrolla dentro del proyecto PodMesh. El almacenamiento y las reglas de continuidad de la aplicación siguen siendo temas distintos.",
+        "technical": "El plugin usa PVE::Storage::Plugin, el mecanismo de extensión de almacenamiento de Proxmox VE. Adapta comandos de Proxmox a MeshFS y herramientas como qemu-img. Declarar almacenamiento compartido no replica los datos: esa tarea corresponde a MeshFS. El acceso de una VM en ejecución también depende de la capa de montaje o almacenamiento de bloques.",
         "doc": "packaging/proxmox/README-PROXMOX-PLUGIN.md"
       },
       {
         "id": "downloads",
         "name": "Primeros pasos",
-        "short": "Elegir qué instalar",
-        "title": "Empezar poco a poco, aprender haciendo.",
-        "lead": "Una carpeta, un contenedor o una copia de prueba: un uso concreto basta para empezar a comprender. Te invitamos a explorar un componente, observar qué hace y orientarte antes de avanzar.",
+        "short": "Instalación y primer uso",
+        "title": "Elegir componentes, instalarlos y utilizarlos.",
+        "lead": "PodMesh, MeshFS y PMBS cubren tres necesidades: gestionar aplicaciones, distribuir archivos y conservar copias. Las guías de instalación describen los componentes y requisitos de cada uso. Puedes empezar con una herramienta sin desplegar todo el conjunto.",
         "points": [
           [
-            "Elegir un punto de partida",
-            "Comprender los contenedores con PodMesh, explorar archivos con MeshFS o preparar una copia con PMBS."
+            "Elegir la herramienta",
+            "PodMesh para aplicaciones Podman; MeshFS para el sistema de archivos distribuido; PMBS para copias y recuperación."
           ],
           [
-            "Leer el procedimiento",
-            "Consultar los requisitos, las versiones y los componentes necesarios en la documentación."
+            "Preparar la instalación",
+            "Consultar versión, requisitos y procedimiento e identificar las máquinas y espacios de datos."
           ],
           [
-            "Hacer una primera prueba",
-            "Usar datos de prueba, anotar lo instalado y comprobar el resultado antes de ampliar el uso."
+            "Realizar una primera operación",
+            "Iniciar una aplicación, transferir un archivo entre nodos o restaurar una copia y comprobar el resultado."
           ]
         ],
-        "example": "Para descubrir MeshFS, empieza con una carpeta cuyos archivos conoces. Crea una instantánea, cambia algunos elementos y observa qué ha cambiado. Esta primera prueba ayuda a comprender qué te puede aportar la herramienta.",
+        "example": "Para descubrir MeshFS, preparas un volumen de prueba entre nodos, envías un archivo desde uno y lo lees desde otro. Con PMBS, eliges un punto de copia y recuperas un archivo.",
         "workflow": [
-          "Aclarar el resultado esperado y comprobar los requisitos de la máquina.",
-          "Preparar la instalación desde una fuente identificada, con sus versiones y huellas.",
-          "Indicar qué está instalado, qué funciona y qué pasos faltan."
+          "Elegir el componente según el resultado esperado.",
+          "Seguir su guía de instalación y comprobar que el servicio responde.",
+          "Realizar una operación con datos de prueba y verificar el resultado."
         ],
-        "technical": "El proyecto separa la gestión de aplicaciones, las herramientas de comandos, el almacenamiento MeshFS y el servidor de copias PMBS. Las guías de instalación ayudan a elegir componentes, versiones y requisitos. Nuestro rumbo es el mismo: comprender lo instalado, observar sus operaciones y disponer de un camino de recuperación.",
+        "technical": "El proyecto separa orquestación, almacenamiento distribuido y copias de seguridad. Los comandos y las API son puntos de entrada para personas y agentes de IA. Las guías indican versiones y componentes para cada función.",
         "doc": "docs/README.md"
       }
     ],
     "direction": "Esta presentación muestra el rumbo del proyecto: lo que construimos y los usos que nos guían.",
-    "directionLink": "Leer la escena ideal"
+    "directionLink": "Leer la escena ideal",
+    "overview": "PodMesh gestiona las aplicaciones. MeshFS distribuye sus archivos entre servidores. PMBS conserva sus copias de seguridad."
   }
 }

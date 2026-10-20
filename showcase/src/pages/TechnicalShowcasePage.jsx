@@ -6,6 +6,7 @@ import LanguageSwitcher from '../components/LanguageSwitcher'
 import ThemeToggle from '../components/ui/ThemeToggle'
 import ShowcaseSidebar, { SIDEBAR_ITEMS } from '../components/showcase/ShowcaseSidebar'
 import GlossaryText from '../components/GlossaryText'
+import ComponentDiagram from '../components/showcase/ComponentDiagram'
 import { guideContent } from '../data/publicGuideContent'
 
 const REPOSITORY = 'https://github.com/xavdp-pro/podmesh'
@@ -113,6 +114,7 @@ export default function TechnicalShowcasePage() {
             <p className="mb-4 text-sm font-semibold text-accent">PodMesh · MeshFS · PMBS</p>
             <h1 className="site-display max-w-3xl text-4xl font-semibold leading-tight sm:text-5xl">{text(copy.title)}</h1>
             <p className="mt-5 max-w-3xl text-lg leading-8 text-fg-muted">{text(copy.intro)}</p>
+            <p className="mt-4 max-w-3xl text-base font-semibold leading-7">{text(copy.overview)}</p>
             <p className="mt-4 max-w-3xl text-base leading-7">{text(copy.tandem)}</p>
             <p className="mt-4 text-sm leading-6 text-fg-muted">{copy.direction}{' '}<a href={`${DOC_BASE}docs/IDEAL-SCENE.md`} target="_blank" rel="noreferrer" className="text-accent underline underline-offset-4">{copy.directionLink}</a></p>
             <p className="mt-5 border-l-2 border-warm pl-4 text-sm leading-6 text-fg-muted">{text(copy.vocabulary)}</p>
@@ -125,6 +127,8 @@ export default function TechnicalShowcasePage() {
               <h2 className="site-display text-3xl font-semibold leading-tight sm:text-4xl">{section.title}</h2>
               <p className="mt-4 text-lg leading-8 text-fg-muted">{text(section.lead)}</p>
             </div>
+
+            <ComponentDiagram section={activeId} locale={locale} />
 
             <section id={`${activeId}-usage`} tabIndex={-1} className="scroll-mt-24 rounded-2xl border border-line bg-surface px-5 py-6 sm:p-7">
               <h3 className="mb-5 text-lg font-semibold">{copy.usage}</h3>
