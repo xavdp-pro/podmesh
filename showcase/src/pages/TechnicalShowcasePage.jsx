@@ -103,7 +103,7 @@ export default function TechnicalShowcasePage() {
             <Link to="/#podmesh" className="site-display text-2xl font-bold">PodMesh</Link>
             <a href="https://xavdp.pro" className="hidden border-l border-line pl-3 text-sm text-fg-muted sm:block">xavdp.pro</a>
           </div>
-          <div className="flex items-center gap-2"><LanguageSwitcher /><ThemeToggle /></div>
+          <div className="flex items-center gap-2"><ThemeToggle /><LanguageSwitcher /></div>
         </div>
       </header>
 

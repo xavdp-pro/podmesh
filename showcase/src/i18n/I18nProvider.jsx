@@ -1,10 +1,12 @@
-import { createContext, useCallback, useContext, useMemo, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import { detectLocale, LOCALE_STORAGE_KEY, SUPPORTED_LOCALES, translate, isKey } from './index.js'
 
 const I18nContext = createContext(null)
 
 export function I18nProvider({ children }) {
   const [locale, setLocaleState] = useState(detectLocale)
+
+  useEffect(() => { document.documentElement.lang = locale }, [locale])
 
   const setLocale = useCallback((next) => {
     if (!SUPPORTED_LOCALES.includes(next)) return

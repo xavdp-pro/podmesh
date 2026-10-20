@@ -12,7 +12,9 @@
       // Apply the saved theme before first paint so dark mode never flashes white.
       try {
         var t = localStorage.getItem('theme')
-        if (!t && window.matchMedia('(prefers-color-scheme: dark)').matches) t = 'dark'
+        if (t !== 'light' && t !== 'dark') t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+        document.documentElement.setAttribute('data-theme', t)
+        document.documentElement.style.colorScheme = t
         document.documentElement.classList.add(t === 'dark' ? 'theme-dark' : 'theme-light')
       } catch (e) {}
     </script>
