@@ -307,6 +307,7 @@ impl MeshFSEngine {
         }
 
         let inode = Inode {
+                revision: 0,
             path: file_path.to_string(),
             size,
             digest: file_digest,
@@ -375,6 +376,7 @@ impl MeshFSEngine {
                 .ok_or_else(|| io::Error::other("file size overflow"))?;
         }
         let inode = Inode {
+                revision: 0,
             path: path.into(),
             size,
             digest: format!("sha256:{}", hex::encode(hash.finalize())),

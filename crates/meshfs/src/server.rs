@@ -219,7 +219,7 @@ async fn create_volume_handler(
         )
             .into_response(),
         Err(e) => (
-            StatusCode::SERVICE_UNAVAILABLE,
+            if e.to_string().contains("live file requires precondition"){StatusCode::CONFLICT}else{StatusCode::SERVICE_UNAVAILABLE},
             Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
         )
             .into_response(),
@@ -291,7 +291,7 @@ async fn delete_snapshot_handler(
         )
             .into_response(),
         Err(e) => (
-            StatusCode::SERVICE_UNAVAILABLE,
+            if e.to_string().contains("live file requires precondition"){StatusCode::CONFLICT}else{StatusCode::SERVICE_UNAVAILABLE},
             Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
         )
             .into_response(),
@@ -426,7 +426,7 @@ async fn upload_file_handler(
         )
             .into_response(),
         Err(e) => (
-            StatusCode::SERVICE_UNAVAILABLE,
+            if e.to_string().contains("live file requires precondition"){StatusCode::CONFLICT}else{StatusCode::SERVICE_UNAVAILABLE},
             Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
         )
             .into_response(),
@@ -455,7 +455,7 @@ fn hex_or_base64_decode(input: &str) -> Result<Vec<u8>, String> {
 
 fn unavailable(e: impl std::fmt::Display) -> Response {
     (
-        StatusCode::SERVICE_UNAVAILABLE,
+        if e.to_string().contains("live compare conflict")||e.to_string().contains("live file requires precondition"){StatusCode::CONFLICT}else{StatusCode::SERVICE_UNAVAILABLE},
         Json(serde_json::json!({"ok":false,"error":e.to_string()})),
     )
         .into_response()
@@ -600,6 +600,9 @@ async fn live_mutation_handler(
     State(e): State<MeshFSEngine>,
     Json(r): Json<crate::live::Request>,
 ) -> Response {
+    if r.base.is_none() || (matches!(r.operation,crate::live::Operation::Rename{..}) && r.destination.is_none()) {
+        return (StatusCode::PRECONDITION_REQUIRED,"explicit live preconditions required").into_response();
+    }
     match e.live_apply(r).await {
         Ok(v) => Json(v).into_response(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND.into_response(),

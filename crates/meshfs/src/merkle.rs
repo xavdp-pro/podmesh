@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, HashMap};
 /// Represents an immutable or mutable file Inode on MeshFS.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Inode {
+    #[serde(default)]
+    pub revision: u64,
     pub path: String,
     pub size: u64,
     pub digest: String,
@@ -117,6 +119,7 @@ mod tests {
         files.insert(
             "etc/hostname".to_string(),
             Inode {
+                revision: 0,
                 path: "etc/hostname".to_string(),
                 size: 12,
                 digest: "sha256:1111".to_string(),
@@ -128,6 +131,7 @@ mod tests {
         files.insert(
             "var/log/syslog".to_string(),
             Inode {
+                revision: 0,
                 path: "var/log/syslog".to_string(),
                 size: 2048,
                 digest: "sha256:2222".to_string(),
@@ -149,6 +153,7 @@ mod tests {
         base.insert(
             "file1.txt".to_string(),
             Inode {
+                revision: 0,
                 path: "file1.txt".to_string(),
                 size: 10,
                 digest: "sha256:aaaa".to_string(),
@@ -163,6 +168,7 @@ mod tests {
         target.insert(
             "file1.txt".to_string(),
             Inode {
+                revision: 0,
                 path: "file1.txt".to_string(),
                 size: 15,
                 digest: "sha256:bbbb".to_string(),
@@ -175,6 +181,7 @@ mod tests {
         target.insert(
             "file2.txt".to_string(),
             Inode {
+                revision: 0,
                 path: "file2.txt".to_string(),
                 size: 20,
                 digest: "sha256:cccc".to_string(),

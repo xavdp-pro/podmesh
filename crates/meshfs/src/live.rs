@@ -23,11 +23,17 @@ pub enum Operation {
     Rename { to: String },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Precondition { pub version: Option<String> }
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
     pub id: String,
     pub volume: String,
     pub path: String,
     pub operation: Operation,
+    #[serde(default)]
+    pub base: Option<Precondition>,
+    #[serde(default)]
+    pub destination: Option<Precondition>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Commit {
@@ -38,9 +44,13 @@ pub struct Commit {
     pub expected: Option<String>,
     pub inode: Option<Inode>,
     pub rename: Option<String>,
+    #[serde(default)]
+    pub destination: Option<Precondition>,
+    #[serde(default)]
+    pub probe: bool,
 }
 pub fn version(i: &Inode) -> String {
-    format!("{}@{}", i.digest, i.updated_at)
+    format!("{}:{}@{}", i.revision, i.digest, i.updated_at)
 }
 pub fn digest(size: u64, chunks: &[ChunkRef]) -> String {
     let mut h = Sha256::new();
@@ -123,34 +133,25 @@ impl MeshFSEngine {
             .get()
             .ok_or_else(|| io::Error::other("live access requires an explicit cluster"))?;
         let hash = sha256_digest(&serde_json::to_vec(&r).map_err(io::Error::other)?);
-        for _ in 0..4 {
+        let expected = r.base.as_ref().ok_or_else(||io::Error::other("live precondition required"))?.version.clone();
+        if matches!(r.operation,Operation::Rename{..}) && r.destination.is_none() {return Err(io::Error::other("rename destination precondition required"));}
+        {
             let old = match self.file_inode(&r.volume, &r.path).await {
                 Ok(v) => Some(v),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => None,
                 Err(e) => return Err(e),
             };
-            if matches!(r.operation, Operation::Create) && old.is_some() {
-                return Ok(json!({"ok":true}));
+            if old.as_ref().map(version)!=expected || (old.is_none() && !matches!(r.operation,Operation::Create)) {
+                // Consult durable semantic dedup before rejecting a retry whose
+                // original precondition is no longer current. Probe cannot mutate.
+                return cluster.write(Action::Live(Commit {
+                    id:r.id.clone(),hash:hash.clone(),volume:r.volume.clone(),path:r.path.clone(),
+                    expected:expected.clone(),inode:None,rename:None,destination:None,probe:true,
+                })).await;
             }
-            if old.is_none() && !matches!(r.operation, Operation::Create) {
-                // A remove/rename may already have committed before its response was lost.
-                // The impossible precondition probes semantic dedup without changing data.
-                let probe = Commit {
-                    id: r.id.clone(),
-                    hash: hash.clone(),
-                    volume: r.volume.clone(),
-                    path: r.path.clone(),
-                    expected: Some("missing-preflight".into()),
-                    inode: None,
-                    rename: None,
-                };
-                return match cluster.write(Action::Live(probe)).await {
-                    Ok(v) => Ok(v),
-                    Err(_) => Err(io::Error::new(io::ErrorKind::NotFound, "file not found")),
-                };
-            }
-            let expected = old.as_ref().map(version);
+            if matches!(r.operation,Operation::Create) && old.is_some() {return Err(io::Error::new(io::ErrorKind::AlreadyExists,"file exists"));}
             let mut inode = old.clone().unwrap_or(Inode {
+                revision: 0,
                 path: r.path.clone(),
                 size: 0,
                 digest: digest(0, &[]),
@@ -208,16 +209,11 @@ impl MeshFSEngine {
                     Some(inode)
                 },
                 rename,
+                destination:r.destination.clone(),
+                probe:false,
             };
-            match cluster.write(Action::Live(commit)).await {
-                Ok(v) => return Ok(v),
-                Err(e) if e.to_string().contains("live compare conflict") => continue,
-                Err(e) => return Err(e),
-            }
+            return cluster.write(Action::Live(commit)).await;
         }
-        Err(io::Error::other(
-            "live compare conflict; request can be retried with the same ID",
-        ))
     }
     async fn live_stage(&self, bytes: &[u8]) -> io::Result<String> {
         let c = self
@@ -298,6 +294,7 @@ mod tests {
         ];
         let sizes = BTreeMap::from([(id, BLOCK)]);
         let mut i = Inode {
+                revision: 0,
             path: "disk.raw".into(),
             size: (BLOCK * 2) as u64,
             digest: digest((BLOCK * 2) as u64, &chunks),

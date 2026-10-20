@@ -59,6 +59,7 @@ impl LiveFs {
                         if let Ok(bytes) = r.bytes() { return Ok(bytes.to_vec()); }
                     }
                     Ok(r) if r.status().as_u16() == 404 => return Err(libc::ENOENT),
+                    Ok(r) if matches!(r.status().as_u16(),409|428)=>return Err(libc::ESTALE),
                     _ => {}
                 }
             }
@@ -114,13 +115,20 @@ impl LiveFs {
         let name = self.names.get(&ino).ok_or(libc::ENOENT)?;
         Ok(self.attr(ino, self.inode(name)?.size))
     }
+    fn base(&self,name:&str)->Result<live::Precondition,i32>{
+        match self.inode(name){Ok(i)=>Ok(live::Precondition{version:Some(live::version(&i))}),Err(libc::ENOENT)=>Ok(live::Precondition{version:None}),Err(e)=>Err(e)}
+    }
     fn mutate(&mut self, name: &str, operation: live::Operation) -> Result<(), i32> {
         self.sequence += 1;
+        let base=Some(self.base(name)?);
+        let destination=if let live::Operation::Rename{to}=&operation {Some(self.base(to)?)}else{None};
         let body = serde_json::to_value(live::Request {
             id: format!("{}-{}", self.session, self.sequence),
             volume: self.volume.clone(),
             path: name.into(),
             operation,
+            base,
+            destination,
         })
         .map_err(|_| libc::EIO)?;
         let raw = self.call("POST", "files/live", &[], Some(&body))?;
