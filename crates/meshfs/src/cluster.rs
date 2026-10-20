@@ -169,7 +169,14 @@ impl RaftStateMachine<Types> for Arc<Machine> {
         if image.state.applied!=meta.last_log_id||image.state.membership!=meta.last_membership{return Err(se("snapshot metadata mismatch"));}
         // Only immutable chunks are installed before the namespace transaction.
         for (id,value) in &image.chunks {let bytes=hex::decode(value).map_err(se)?;if self.engine.chunk_store.write_chunk(&bytes).map_err(se)?!=*id{return Err(se("snapshot chunk hash mismatch"));}}
-        for inode in image.state.volumes.values().flat_map(|v|v.files.values()).chain(image.state.snapshots.iter().flat_map(|s|s.files_tree.values())) {for c in &inode.chunks {self.engine.chunk_store.read_chunk(&c.id).map_err(se)?;}}
+        for inode in image.state.volumes.values().flat_map(|v|v.files.values()).chain(image.state.snapshots.iter().flat_map(|s|s.files_tree.values())) {let mut bytes=Vec::new();
+            if inode.chunks_count!=inode.chunks.len(){return Err(se("snapshot chunk count mismatch"));}
+            for c in &inode.chunks {
+                let chunk=self.engine.chunk_store.read_chunk(&c.id).map_err(se)?;
+                if c.offset!=bytes.len() as u64 || c.size!=chunk.len() {return Err(se("snapshot chunk layout mismatch"));}
+                bytes.extend_from_slice(&chunk);
+            }
+            if bytes.len() as u64!=inode.size || format!("sha256:{}",sha256_digest(&bytes))!=inode.digest {return Err(se("snapshot file digest mismatch"));}}
         let mut s=self.data.lock().await;self.db.set("machine",&image.state)?;*s=image.state;self.mirror(&s).await;Ok(())
     }
     async fn get_current_snapshot(&mut self)->SResult<Option<Snapshot<Types>>> {
@@ -223,6 +230,11 @@ impl Cluster {
             db.set("topology",&fingerprint).map_err(err)?;db.set("node_id",&config.node_id).map_err(err)?;
         }
         if db.get::<u64>("node_id").map_err(err)?!=Some(config.node_id){return Err(err("persisted node identity differs from configuration"))}
+        {
+            let mut state=engine.state.write().await;
+            state.node_id=config.node_id.to_string();
+            state.cluster_name=config.cluster.clone();
+        }
         let data=db.get::<MachineData>("machine").map_err(err)?.unwrap_or_default();
         let mut local_engine = engine.clone();
         local_engine.cluster = Arc::new(std::sync::OnceLock::new());
