@@ -33,13 +33,38 @@ an explicit single-writer configuration; these tests do not qualify the
 Proxmox storage plugin or VM orchestration. PodMesh manages Podman applications;
 QEMU/Proxmox remains responsible for VMs.
 
-## Uncertain write outcomes
+## Versioned mutations and uncertain outcomes
 
-A transport timeout or EIO does not establish cancellation of server work. The
-request ID protects retries of the same operation; it is not an expired-writer
-session fence. Before recovering a writer after an uncertain outcome, reconcile
-its data and pending operations. The current adapter does not provide automatic
-fencing between an old delayed session and a new mount. If an intermediary
-delivers an old request after a newer write has been acknowledged, the old
-request can replace the newer bytes. This storage-ordering defect must be fixed
-and its regression test passed before production VM storage use.
+Each live mutation carries an explicit immutable source precondition in `base`:
+`{"version":"<inode-version>"}`, or `{"version":null}` for an absent file.
+The inode version combines a durable, cluster-wide monotonic revision with its
+digest and timestamp. Rename also requires `destination` with the captured
+version (or explicit absence) of its target. Both comparisons happen atomically
+when applying the mutation. Delete/recreate consumes new revisions, preventing
+reuse of a pathname's old version.
+
+The FUSE client captures these versions once before its first send and retains
+the same body and semantic request ID through transport retries. It never
+refreshes a failed write's precondition to force it through. Missing required
+preconditions return HTTP 428; an obsolete version returns HTTP 409. The FUSE
+adapter reports these conflicts as `ESTALE`. Legacy inline and streaming upload
+paths reject replacement of an existing live inode with HTTP 409; they cannot
+bypass the versioned live interface.
+
+A byte-identical retry of an already committed semantic request returns its
+original success without applying it again, even after a newer mutation. A
+never-committed delayed request with an obsolete version is rejected, including
+after a new client mount. A zero-length write currently returns without storing
+a deduplication record; a subsequent retry can report conflict after intervening
+changes. It cannot overwrite bytes.
+
+A transport timeout or EIO still does not establish cancellation of server work.
+If its precondition remains current, a delayed request may succeed after the
+caller timed out. Reconcile uncertain outcomes before recovering a writer.
+Version comparison protects newer acknowledged mutations; it does not provide
+exclusive writer leases, session expiry or distributed locking.
+
+The topology fingerprint uses `meshfs-live-v2-preconditions`. All peers and live
+clients must use the corresponding protocol. Mixed-version operation and an
+in-place upgrade of an older cluster are not qualified. This change does not
+establish production VM storage readiness or a complete backup/restore contract.
