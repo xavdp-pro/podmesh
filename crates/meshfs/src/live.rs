@@ -23,7 +23,9 @@ pub enum Operation {
     Rename { to: String },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Precondition { pub version: Option<String> }
+pub struct Precondition {
+    pub version: Option<String>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
     pub id: String,
@@ -133,23 +135,43 @@ impl MeshFSEngine {
             .get()
             .ok_or_else(|| io::Error::other("live access requires an explicit cluster"))?;
         let hash = sha256_digest(&serde_json::to_vec(&r).map_err(io::Error::other)?);
-        let expected = r.base.as_ref().ok_or_else(||io::Error::other("live precondition required"))?.version.clone();
-        if matches!(r.operation,Operation::Rename{..}) && r.destination.is_none() {return Err(io::Error::other("rename destination precondition required"));}
+        let expected = r
+            .base
+            .as_ref()
+            .ok_or_else(|| io::Error::other("live precondition required"))?
+            .version
+            .clone();
+        if matches!(r.operation, Operation::Rename { .. }) && r.destination.is_none() {
+            return Err(io::Error::other("rename destination precondition required"));
+        }
         {
             let old = match self.file_inode(&r.volume, &r.path).await {
                 Ok(v) => Some(v),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => None,
                 Err(e) => return Err(e),
             };
-            if old.as_ref().map(version)!=expected || (old.is_none() && !matches!(r.operation,Operation::Create)) {
+            if old.as_ref().map(version) != expected
+                || (old.is_none() && !matches!(r.operation, Operation::Create))
+            {
                 // Consult durable semantic dedup before rejecting a retry whose
                 // original precondition is no longer current. Probe cannot mutate.
-                return cluster.write(Action::Live(Commit {
-                    id:r.id.clone(),hash:hash.clone(),volume:r.volume.clone(),path:r.path.clone(),
-                    expected:expected.clone(),inode:None,rename:None,destination:None,probe:true,
-                })).await;
+                return cluster
+                    .write(Action::Live(Commit {
+                        id: r.id.clone(),
+                        hash: hash.clone(),
+                        volume: r.volume.clone(),
+                        path: r.path.clone(),
+                        expected: expected.clone(),
+                        inode: None,
+                        rename: None,
+                        destination: None,
+                        probe: true,
+                    }))
+                    .await;
             }
-            if matches!(r.operation,Operation::Create) && old.is_some() {return Err(io::Error::new(io::ErrorKind::AlreadyExists,"file exists"));}
+            if matches!(r.operation, Operation::Create) && old.is_some() {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "file exists"));
+            }
             let mut inode = old.clone().unwrap_or(Inode {
                 revision: 0,
                 path: r.path.clone(),
@@ -209,8 +231,8 @@ impl MeshFSEngine {
                     Some(inode)
                 },
                 rename,
-                destination:r.destination.clone(),
-                probe:false,
+                destination: r.destination.clone(),
+                probe: false,
             };
             return cluster.write(Action::Live(commit)).await;
         }
@@ -294,7 +316,7 @@ mod tests {
         ];
         let sizes = BTreeMap::from([(id, BLOCK)]);
         let mut i = Inode {
-                revision: 0,
+            revision: 0,
             path: "disk.raw".into(),
             size: (BLOCK * 2) as u64,
             digest: digest((BLOCK * 2) as u64, &chunks),

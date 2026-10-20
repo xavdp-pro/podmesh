@@ -36,7 +36,9 @@ impl LiveFs {
         while Instant::now() < deadline {
             for peer in &self.peers {
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() { break; }
+                if remaining.is_zero() {
+                    break;
+                }
                 let mut request = self
                     .client
                     .request(
@@ -56,10 +58,12 @@ impl LiveFs {
                     Ok(r) if r.status().is_success() => {
                         // A peer may die after sending headers. Retry the same
                         // operation if its response body is incomplete as well.
-                        if let Ok(bytes) = r.bytes() { return Ok(bytes.to_vec()); }
+                        if let Ok(bytes) = r.bytes() {
+                            return Ok(bytes.to_vec());
+                        }
                     }
                     Ok(r) if r.status().as_u16() == 404 => return Err(libc::ENOENT),
-                    Ok(r) if matches!(r.status().as_u16(),409|428)=>return Err(libc::ESTALE),
+                    Ok(r) if matches!(r.status().as_u16(), 409 | 428) => return Err(libc::ESTALE),
                     _ => {}
                 }
             }
@@ -115,13 +119,23 @@ impl LiveFs {
         let name = self.names.get(&ino).ok_or(libc::ENOENT)?;
         Ok(self.attr(ino, self.inode(name)?.size))
     }
-    fn base(&self,name:&str)->Result<live::Precondition,i32>{
-        match self.inode(name){Ok(i)=>Ok(live::Precondition{version:Some(live::version(&i))}),Err(libc::ENOENT)=>Ok(live::Precondition{version:None}),Err(e)=>Err(e)}
+    fn base(&self, name: &str) -> Result<live::Precondition, i32> {
+        match self.inode(name) {
+            Ok(i) => Ok(live::Precondition {
+                version: Some(live::version(&i)),
+            }),
+            Err(libc::ENOENT) => Ok(live::Precondition { version: None }),
+            Err(e) => Err(e),
+        }
     }
     fn mutate(&mut self, name: &str, operation: live::Operation) -> Result<(), i32> {
         self.sequence += 1;
-        let base=Some(self.base(name)?);
-        let destination=if let live::Operation::Rename{to}=&operation {Some(self.base(to)?)}else{None};
+        let base = Some(self.base(name)?);
+        let destination = if let live::Operation::Rename { to } = &operation {
+            Some(self.base(to)?)
+        } else {
+            None
+        };
         let body = serde_json::to_value(live::Request {
             id: format!("{}-{}", self.session, self.sequence),
             volume: self.volume.clone(),
@@ -499,28 +513,73 @@ pub fn mount(peers: Vec<String>, volume: String, path: &Path) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{io::{Read,Write},net::TcpListener};
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+    };
     #[test]
     fn retries_election_and_lost_response_with_same_semantic_id() {
-        let listener=TcpListener::bind("127.0.0.1:0").unwrap();
-        let peer=format!("http://{}",listener.local_addr().unwrap());
-        let server=std::thread::spawn(move || {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
             for attempt in 0..6 {
-                let (mut stream,_)=listener.accept().unwrap();
-                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                let mut raw=Vec::new();let mut byte=[0];
-                while !raw.ends_with(b"\r\n\r\n") {stream.read_exact(&mut byte).unwrap();raw.push(byte[0]);}
-                let header=String::from_utf8(raw).unwrap();
-                let length:usize=header.lines().find_map(|l|l.to_lowercase().strip_prefix("content-length:").map(|v|v.trim().parse().unwrap())).unwrap();
-                let mut body=vec![0;length];stream.read_exact(&mut body).unwrap();
-                assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["id"],"stable-request");
-                if attempt==0 {stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\nConnection: close\r\n\r\n{").unwrap();}
-                else if attempt<5 {stream.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();}
-                else {stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}").unwrap();}
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut raw = Vec::new();
+                let mut byte = [0];
+                while !raw.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).unwrap();
+                    raw.push(byte[0]);
+                }
+                let header = String::from_utf8(raw).unwrap();
+                let length: usize = header
+                    .lines()
+                    .find_map(|l| {
+                        l.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&body).unwrap()["id"],
+                    "stable-request"
+                );
+                if attempt == 0 {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\nConnection: close\r\n\r\n{",
+                        )
+                        .unwrap();
+                } else if attempt < 5 {
+                    stream.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                } else {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}").unwrap();
+                }
             }
         });
-        let fs=LiveFs{client:Client::new(),peers:vec![peer],volume:"test".into(),names:BTreeMap::new(),next:2,sequence:0,session:"test".into()};
-        assert_eq!(fs.call("POST","files/live",&[],Some(&serde_json::json!({"id":"stable-request"}))).unwrap(),br#"{"ok":true}"#);
+        let fs = LiveFs {
+            client: Client::new(),
+            peers: vec![peer],
+            volume: "test".into(),
+            names: BTreeMap::new(),
+            next: 2,
+            sequence: 0,
+            session: "test".into(),
+        };
+        assert_eq!(
+            fs.call(
+                "POST",
+                "files/live",
+                &[],
+                Some(&serde_json::json!({"id":"stable-request"}))
+            )
+            .unwrap(),
+            br#"{"ok":true}"#
+        );
         server.join().unwrap();
     }
 }

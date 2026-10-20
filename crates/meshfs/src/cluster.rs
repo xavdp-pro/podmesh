@@ -301,7 +301,9 @@ impl Machine {
                         json!({"error":"live operation ID reused"})
                     });
                 }
-                if change.probe {return Ok(json!({"error":"live compare conflict"}));}
+                if change.probe {
+                    return Ok(json!({"error":"live compare conflict"}));
+                }
                 let current = s
                     .volumes
                     .get(&change.volume)
@@ -309,28 +311,37 @@ impl Machine {
                 if current.map(crate::live::version) != change.expected {
                     return Ok(json!({"error":"live compare conflict"}));
                 }
-                if let Some(to)=&change.rename {
-                    let target=s.volumes.get(&change.volume).and_then(|v|v.files.get(to));
-                    if change.destination.as_ref().map(|p|p.version.clone()) != Some(target.map(crate::live::version)) {
+                if let Some(to) = &change.rename {
+                    let target = s.volumes.get(&change.volume).and_then(|v| v.files.get(to));
+                    if change.destination.as_ref().map(|p| p.version.clone())
+                        != Some(target.map(crate::live::version))
+                    {
                         return Ok(json!({"error":"live compare conflict at rename destination"}));
                     }
                 }
                 if let Some(inode) = &change.inode {
-                    if let Err(e)=crate::live::validate(inode, &s.blobs){return Ok(json!({"error":e.to_string()}));}
+                    if let Err(e) = crate::live::validate(inode, &s.blobs) {
+                        return Ok(json!({"error":e.to_string()}));
+                    }
                 }
-                let Some(revision)=s.live_revision.checked_add(1) else {return Ok(json!({"error":"live revision exhausted"}));};
-                s.live_revision=revision;
+                let Some(revision) = s.live_revision.checked_add(1) else {
+                    return Ok(json!({"error":"live revision exhausted"}));
+                };
+                s.live_revision = revision;
                 let v = s
                     .volumes
                     .entry(change.volume.clone())
                     .or_insert_with(|| Volume::new(&change.volume));
                 if let Some(to) = &change.rename {
-                    let Some(mut inode)=v.files.remove(&change.path) else {return Ok(json!({"error":"rename source missing"}));};
-                    inode.revision=revision;
+                    let Some(mut inode) = v.files.remove(&change.path) else {
+                        return Ok(json!({"error":"rename source missing"}));
+                    };
+                    inode.revision = revision;
                     inode.path = to.clone();
                     v.files.insert(to.clone(), inode);
                 } else if let Some(inode) = &change.inode {
-                    let mut inode=inode.clone();inode.revision=revision;
+                    let mut inode = inode.clone();
+                    inode.revision = revision;
                     v.files.insert(change.path.clone(), inode);
                 } else {
                     v.files.remove(&change.path);
@@ -351,7 +362,13 @@ impl Machine {
                 json!(id)
             }
             Action::CommitFile { volume, inode } => {
-                if s.volumes.get(volume).and_then(|v|v.files.get(&inode.path)).is_some_and(|i|i.revision>0 || i.digest.starts_with("merkle-sha256:")) {return Ok(json!({"error":"live file requires precondition"}));}
+                if s.volumes
+                    .get(volume)
+                    .and_then(|v| v.files.get(&inode.path))
+                    .is_some_and(|i| i.revision > 0 || i.digest.starts_with("merkle-sha256:"))
+                {
+                    return Ok(json!({"error":"live file requires precondition"}));
+                }
                 validate_layout(inode, &s.blobs)?;
                 let v = s.volumes.entry(volume.clone()).or_insert_with(|| {
                     let mut v = Volume::new(volume);
@@ -367,7 +384,13 @@ impl Machine {
                 hex,
                 at,
             } => {
-                if s.volumes.get(volume).and_then(|v|v.files.get(path)).is_some_and(|i|i.revision>0 || i.digest.starts_with("merkle-sha256:")) {return Ok(json!({"error":"live file requires precondition"}));}
+                if s.volumes
+                    .get(volume)
+                    .and_then(|v| v.files.get(path))
+                    .is_some_and(|i| i.revision > 0 || i.digest.starts_with("merkle-sha256:"))
+                {
+                    return Ok(json!({"error":"live file requires precondition"}));
+                }
                 let bytes = hex::decode(hex).map_err(se)?;
                 let mut chunks = Vec::new();
                 let mut offset = 0;
@@ -382,7 +405,7 @@ impl Machine {
                     offset += part.len() as u64;
                 }
                 let inode = Inode {
-                revision: 0,
+                    revision: 0,
                     path: path.clone(),
                     size: bytes.len() as u64,
                     digest: format!("sha256:{}", sha256_digest(&bytes)),

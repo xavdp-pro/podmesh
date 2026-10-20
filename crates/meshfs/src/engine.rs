@@ -307,7 +307,7 @@ impl MeshFSEngine {
         }
 
         let inode = Inode {
-                revision: 0,
+            revision: 0,
             path: file_path.to_string(),
             size,
             digest: file_digest,
@@ -358,14 +358,27 @@ impl MeshFSEngine {
             }
             let bytes = &buffer[..used];
             hash.update(bytes);
-            let digest=format!("sha256:{}",sha256_digest(bytes));
+            let digest = format!("sha256:{}", sha256_digest(bytes));
             let id = if let Some(c) = self.cluster.get() {
-                if staged.contains(&digest) {digest.clone()} else {
-                    let id=serde_json::from_value::<String>(c.write(Action::StageChunk {hex:hex::encode(bytes)}).await?).map_err(io::Error::other)?;
-                    if id!=digest{return Err(io::Error::other("committed chunk digest mismatch"));}
-                    staged.insert(id.clone());id
+                if staged.contains(&digest) {
+                    digest.clone()
+                } else {
+                    let id = serde_json::from_value::<String>(
+                        c.write(Action::StageChunk {
+                            hex: hex::encode(bytes),
+                        })
+                        .await?,
+                    )
+                    .map_err(io::Error::other)?;
+                    if id != digest {
+                        return Err(io::Error::other("committed chunk digest mismatch"));
+                    }
+                    staged.insert(id.clone());
+                    id
                 }
-            } else {self.chunk_store.write_chunk(bytes)?};
+            } else {
+                self.chunk_store.write_chunk(bytes)?
+            };
             chunks.push(ChunkRef {
                 id,
                 size: used,
@@ -376,7 +389,7 @@ impl MeshFSEngine {
                 .ok_or_else(|| io::Error::other("file size overflow"))?;
         }
         let inode = Inode {
-                revision: 0,
+            revision: 0,
             path: path.into(),
             size,
             digest: format!("sha256:{}", hex::encode(hash.finalize())),

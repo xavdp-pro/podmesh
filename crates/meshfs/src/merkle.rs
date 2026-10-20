@@ -32,7 +32,8 @@ pub struct MerkleDiff {
 /// Computes the canonical Merkle root hash for a set of file Inodes.
 pub fn compute_merkle_root(files: &HashMap<String, Inode>) -> String {
     if files.is_empty() {
-        return "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(); // Empty string sha256
+        return "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            .to_string(); // Empty string sha256
     }
 
     // Sort files deterministically in a BTreeMap
@@ -49,17 +50,15 @@ pub fn compute_merkle_root(files: &HashMap<String, Inode>) -> String {
 }
 
 /// Calculates diff between two file trees (e.g. for differential snapshot sync or backup).
-pub fn diff_trees(
-    base: &HashMap<String, Inode>,
-    target: &HashMap<String, Inode>,
-) -> MerkleDiff {
+pub fn diff_trees(base: &HashMap<String, Inode>, target: &HashMap<String, Inode>) -> MerkleDiff {
     let mut added = Vec::new();
     let mut modified = Vec::new();
     let mut deleted = Vec::new();
     let mut unchanged = Vec::new();
     let mut new_chunks_needed = Vec::new();
 
-    let mut existing_chunk_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut existing_chunk_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for inode in base.values() {
         for c in &inode.chunks {
             existing_chunk_ids.insert(c.id.clone());
@@ -77,7 +76,8 @@ pub fn diff_trees(
                 }
             }
             Some(base_inode) => {
-                if base_inode.digest != target_inode.digest || base_inode.size != target_inode.size {
+                if base_inode.digest != target_inode.digest || base_inode.size != target_inode.size
+                {
                     modified.push(path.clone());
                     for c in &target_inode.chunks {
                         if !existing_chunk_ids.contains(&c.id) {
@@ -158,7 +158,11 @@ mod tests {
                 size: 10,
                 digest: "sha256:aaaa".to_string(),
                 chunks_count: 1,
-                chunks: vec![ChunkRef { id: "sha256:aaaa".to_string(), size: 10, offset: 0 }],
+                chunks: vec![ChunkRef {
+                    id: "sha256:aaaa".to_string(),
+                    size: 10,
+                    offset: 0,
+                }],
                 updated_at: "2026-10-19T00:00:00Z".to_string(),
             },
         );
@@ -173,7 +177,11 @@ mod tests {
                 size: 15,
                 digest: "sha256:bbbb".to_string(),
                 chunks_count: 1,
-                chunks: vec![ChunkRef { id: "sha256:bbbb".to_string(), size: 15, offset: 0 }],
+                chunks: vec![ChunkRef {
+                    id: "sha256:bbbb".to_string(),
+                    size: 15,
+                    offset: 0,
+                }],
                 updated_at: "2026-10-19T01:00:00Z".to_string(),
             },
         );
@@ -186,7 +194,11 @@ mod tests {
                 size: 20,
                 digest: "sha256:cccc".to_string(),
                 chunks_count: 1,
-                chunks: vec![ChunkRef { id: "sha256:cccc".to_string(), size: 20, offset: 0 }],
+                chunks: vec![ChunkRef {
+                    id: "sha256:cccc".to_string(),
+                    size: 20,
+                    offset: 0,
+                }],
                 updated_at: "2026-10-19T01:00:00Z".to_string(),
             },
         );

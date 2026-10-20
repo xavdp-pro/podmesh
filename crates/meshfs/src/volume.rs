@@ -104,7 +104,7 @@ mod tests {
         assert!(vol.merkle_root.starts_with("sha256:"));
 
         vol.insert_file(Inode {
-                revision: 0,
+            revision: 0,
             path: "images/100/vm-100-disk-0.raw".to_string(),
             size: 1048576,
             digest: "sha256:abcd".to_string(),
@@ -124,7 +124,7 @@ mod tests {
 
         // Modify volume: add another disk
         vol.insert_file(Inode {
-                revision: 0,
+            revision: 0,
             path: "images/100/vm-100-disk-1.raw".to_string(),
             size: 2097152,
             digest: "sha256:ef01".to_string(),
@@ -139,4 +139,3 @@ mod tests {
         assert_ne!(vol.merkle_root, snap.merkle_root);
     }
 }
-
