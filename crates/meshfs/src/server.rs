@@ -6,7 +6,7 @@ use crate::engine::MeshFSEngine;
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Query, State},
-    http::{header, StatusCode},
+    http::{header, StatusCode, HeaderMap},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -77,6 +77,13 @@ pub fn create_router(engine: MeshFSEngine) -> Router {
         .allow_headers(Any);
 
     Router::new()
+        .route("/internal/append", post(raft_append))
+        .route("/internal/vote", post(raft_vote))
+        .route("/internal/snapshot", post(raft_snapshot))
+        .route("/internal/write", post(raft_write))
+        .route("/internal/read", post(raft_read))
+        .route("/internal/namespace", post(raft_namespace))
+        .route("/internal/health", post(raft_health))
         // Status routes
         .route("/", get(status_handler))
         .route("/status", get(status_handler))
@@ -111,7 +118,7 @@ pub fn create_router(engine: MeshFSEngine) -> Router {
         // Diagnostics & Integrity audit routes
         .route("/diagnostics", get(diagnostics_handler))
         .route("/api/v1/meshfs/diagnostics", get(diagnostics_handler))
-        .layer(DefaultBodyLimit::disable())
+        .layer(DefaultBodyLimit::max(128 * 1024 * 1024))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(cors)
         .with_state(engine)
@@ -125,7 +132,7 @@ async fn status_handler(State(engine): State<MeshFSEngine>) -> impl IntoResponse
 }
 
 async fn nodes_handler(State(engine): State<MeshFSEngine>) -> impl IntoResponse {
-    let state = engine.state.read().await;
+    let nodes = if let Some(c) = engine.cluster.get() { c.nodes().await } else { engine.state.read().await.nodes.clone() };
     #[derive(Serialize)]
     struct NodesResp {
         ok: bool,
@@ -133,7 +140,7 @@ async fn nodes_handler(State(engine): State<MeshFSEngine>) -> impl IntoResponse 
     }
     Json(NodesResp {
         ok: true,
-        nodes: state.nodes.clone(),
+        nodes,
     })
 }
 
@@ -160,19 +167,18 @@ async fn join_handler(
         )
             .into_response(),
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "ok": false, "error": e })),
         )
             .into_response(),
     }
 }
 
-async fn volumes_handler(State(engine): State<MeshFSEngine>) -> impl IntoResponse {
-    let volumes = engine.list_volumes().await;
-    Json(serde_json::json!({
-        "ok": true,
-        "volumes": volumes
-    }))
+async fn volumes_handler(State(engine): State<MeshFSEngine>) -> Response {
+    match engine.list_volumes().await {
+        Ok(volumes) => Json(serde_json::json!({"ok":true,"volumes":volumes})).into_response(),
+        Err(e) => unavailable(e),
+    }
 }
 
 async fn create_volume_handler(
@@ -195,7 +201,7 @@ async fn create_volume_handler(
         )
             .into_response(),
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
         )
             .into_response(),
@@ -205,13 +211,12 @@ async fn create_volume_handler(
 async fn snapshots_handler(
     State(engine): State<MeshFSEngine>,
     Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> Response {
     let vol_filter = params.get("volume").map(|s| s.as_str());
-    let snapshots = engine.list_snapshots(vol_filter).await;
-    Json(serde_json::json!({
-        "ok": true,
-        "snapshots": snapshots
-    }))
+    match engine.list_snapshots(vol_filter).await {
+        Ok(snapshots) => Json(serde_json::json!({"ok":true,"snapshots":snapshots})).into_response(),
+        Err(e) => unavailable(e),
+    }
 }
 
 async fn create_snapshot_handler(
@@ -271,7 +276,7 @@ async fn delete_snapshot_handler(
         )
             .into_response(),
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
         )
             .into_response(),
@@ -296,7 +301,7 @@ async fn download_file_handler(
         )
             .into_response(),
         Err(e) => (
-            StatusCode::NOT_FOUND,
+            if e.kind()==std::io::ErrorKind::NotFound { StatusCode::NOT_FOUND } else { StatusCode::SERVICE_UNAVAILABLE },
             Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
         )
             .into_response(),
@@ -326,6 +331,9 @@ async fn upload_file_handler(
         }
     };
 
+    if engine.cluster.get().is_some() && decoded.len() > crate::cluster::MAX_FILE_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "clustered file limit is 16 MiB").into_response();
+    }
     match engine.put_file(&req.volume, &req.path, &decoded).await {
         Ok(meta) => (
             StatusCode::CREATED,
@@ -333,7 +341,7 @@ async fn upload_file_handler(
         )
             .into_response(),
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
         )
             .into_response(),
@@ -350,47 +358,45 @@ async fn diagnostics_handler(
     Json(report)
 }
 
-/// Fallback base64 decoder using simple standard translation table.
 fn hex_or_base64_decode(input: &str) -> Result<Vec<u8>, String> {
-    // Simple fast base64 decoder without extra external dependencies
-    let clean: String = input.chars().filter(|c| !c.is_whitespace()).collect();
-    let chars: Vec<char> = clean.chars().collect();
-    let mut out = Vec::new();
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(input).map_err(|e| e.to_string())
+}
 
-    let b64_val = |c: char| -> Result<u8, String> {
-        match c {
-            'A'..='Z' => Ok(c as u8 - b'A'),
-            'a'..='z' => Ok(c as u8 - b'a' + 26),
-            '0'..='9' => Ok(c as u8 - b'0' + 52),
-            '+' => Ok(62),
-            '/' => Ok(63),
-            '=' => Ok(0),
-            _ => Err(format!("Caractère base64 invalide: {}", c)),
-        }
-    };
-
-    let mut i = 0;
-    while i < chars.len() {
-        if i + 4 > chars.len() {
-            break;
-        }
-        let b0 = b64_val(chars[i])?;
-        let b1 = b64_val(chars[i + 1])?;
-        let b2 = b64_val(chars[i + 2])?;
-        let b3 = b64_val(chars[i + 3])?;
-
-        let trip = ((b0 as u32) << 18) | ((b1 as u32) << 12) | ((b2 as u32) << 6) | (b3 as u32);
-
-        out.push(((trip >> 16) & 0xFF) as u8);
-        if chars[i + 2] != '=' {
-            out.push(((trip >> 8) & 0xFF) as u8);
-        }
-        if chars[i + 3] != '=' {
-            out.push((trip & 0xFF) as u8);
-        }
-
-        i += 4;
+fn unavailable(e: impl std::fmt::Display) -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"ok":false,"error":e.to_string()}))).into_response()
+}
+fn internal_cluster(engine: &MeshFSEngine, headers: &HeaderMap) -> Result<std::sync::Arc<crate::cluster::Cluster>, Response> {
+    match engine.cluster.get() {
+        Some(c) if c.authorized(headers) => Ok(c.clone()),
+        _ => Err(StatusCode::UNAUTHORIZED.into_response()),
     }
-
-    Ok(out)
+}
+async fn raft_append(State(e): State<MeshFSEngine>, h: HeaderMap, Json(r): Json<openraft::raft::AppendEntriesRequest<crate::cluster::Types>>) -> Response {
+    let c=match internal_cluster(&e,&h){Ok(c)=>c,Err(r)=>return r};
+    Json(c.raft.append_entries(r).await).into_response()
+}
+async fn raft_vote(State(e): State<MeshFSEngine>, h: HeaderMap, Json(r): Json<openraft::raft::VoteRequest<u64>>) -> Response {
+    let c=match internal_cluster(&e,&h){Ok(c)=>c,Err(r)=>return r};
+    Json(c.raft.vote(r).await).into_response()
+}
+async fn raft_snapshot(State(e): State<MeshFSEngine>, h: HeaderMap, Json(r): Json<openraft::raft::InstallSnapshotRequest<crate::cluster::Types>>) -> Response {
+    let c=match internal_cluster(&e,&h){Ok(c)=>c,Err(r)=>return r};
+    Json(c.raft.install_snapshot(r).await).into_response()
+}
+async fn raft_write(State(e): State<MeshFSEngine>, h: HeaderMap, Json(r): Json<crate::cluster::Command>) -> Response {
+    let c=match internal_cluster(&e,&h){Ok(c)=>c,Err(r)=>return r};
+    Json(c.local_write(r).await).into_response()
+}
+async fn raft_read(State(e): State<MeshFSEngine>, h: HeaderMap, Json(r): Json<crate::cluster::ReadRequest>) -> Response {
+    let c=match internal_cluster(&e,&h){Ok(c)=>c,Err(r)=>return r};
+    Json(c.local_read(r).await).into_response()
+}
+async fn raft_namespace(State(e): State<MeshFSEngine>, h: HeaderMap, Json(_): Json<()>) -> Response {
+    let c=match internal_cluster(&e,&h){Ok(c)=>c,Err(r)=>return r};
+    Json(c.local_namespace().await).into_response()
+}
+async fn raft_health(State(e): State<MeshFSEngine>, h: HeaderMap, Json(_): Json<()>) -> Response {
+    let c=match internal_cluster(&e,&h){Ok(c)=>c,Err(r)=>return r};
+    Json(Ok::<_,String>(c.metrics())).into_response()
 }

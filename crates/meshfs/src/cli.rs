@@ -58,6 +58,12 @@ pub enum Commands {
 
 #[derive(Args, Debug)]
 pub struct DaemonArgs {
+    /// Explicit fixed membership JSON; omission keeps standalone operation.
+    #[arg(long)]
+    pub cluster_config: Option<PathBuf>,
+    /// Initialize a new cluster on this node only. Never use for disk replacement.
+    #[arg(long, requires = "cluster_config")]
+    pub bootstrap: bool,
     /// Port to listen on for HTTP REST API
     #[arg(short, long, default_value_t = DEFAULT_PORT)]
     pub port: u16,

@@ -47,6 +47,19 @@ async fn main() -> ExitCode {
                 }
             };
 
+            if let Some(path) = &d.cluster_config {
+                let config = match meshfs::cluster::ClusterConfig::load(path) {
+                    Ok(c) => c, Err(e) => { error!("Cluster configuration: {}", e); return ExitCode::FAILURE; }
+                };
+                match meshfs::cluster::Cluster::start(engine.clone(), config, d.bootstrap).await {
+                    Ok(c) => { let _ = engine.cluster.set(c); },
+                    Err(e) => { error!("Cluster startup: {}", e); return ExitCode::FAILURE; }
+                }
+            } else if d.data_dir.join("raft").exists() {
+                error!("Existing clustered data requires --cluster-config; refusing standalone startup");
+                return ExitCode::FAILURE;
+            }
+
             // Start local Unix Domain Socket listener for zero-latency control
             if let Err(e) = start_control_socket(engine.clone(), d.socket.clone()).await {
                 error!(path = %d.socket.display(), "Impossible d'initialiser le socket Unix de contrôle: {}", e);

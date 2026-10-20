@@ -12,7 +12,8 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use crate::cluster::{Cluster, Action, MAX_FILE_BYTES};
 use tokio::sync::RwLock;
 
 /// Cluster node descriptor.
@@ -82,6 +83,8 @@ pub struct StatusReport {
     pub supports_scale_out: bool,
     #[serde(rename = "compatibleWithoutPodmesh")]
     pub compatible_without_podmesh: bool,
+    pub replication: Option<serde_json::Value>,
+    pub namespace_consistency: String,
 }
 
 /// Main Thread-safe MeshFS Engine.
@@ -93,6 +96,7 @@ pub struct MeshFSEngine {
     pub chunk_store: ChunkStore,
     pub driver: StorageDriver,
     pub state: Arc<RwLock<EngineState>>,
+    pub cluster: Arc<OnceLock<Arc<Cluster>>>,
 }
 
 impl MeshFSEngine {
@@ -107,11 +111,8 @@ impl MeshFSEngine {
         let driver = StorageDriver::detect(&chunk_store.chunks_dir);
 
         let initial_state = if state_file.exists() {
-            match fs::read_to_string(&state_file) {
-                Ok(content) => serde_json::from_str::<EngineState>(&content)
-                    .unwrap_or_else(|_| Self::default_state(cluster_name, listen_port)),
-                Err(_) => Self::default_state(cluster_name, listen_port),
-            }
+            serde_json::from_str::<EngineState>(&fs::read_to_string(&state_file)?)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
         } else {
             Self::default_state(cluster_name, listen_port)
         };
@@ -123,6 +124,7 @@ impl MeshFSEngine {
             chunk_store,
             driver,
             state: Arc::new(RwLock::new(initial_state)),
+            cluster: Arc::new(OnceLock::new()),
         };
 
         // Ensure state is persisted
@@ -153,7 +155,7 @@ impl MeshFSEngine {
         let node_id = format!("node-{}-{}", hostname, timestamp);
 
         let primary_node = NodeInfo {
-            node_id: format!("node-{}", hostname),
+            node_id: node_id.clone(),
             hostname: hostname.clone(),
             address: format!("127.0.0.1:{}", port),
             role: "primary".to_string(),
@@ -183,7 +185,7 @@ impl MeshFSEngine {
         let state_guard = self.state.read().await;
         let serialized = serde_json::to_string_pretty(&*state_guard)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        drop(state_guard);
+
 
         use std::sync::atomic::{AtomicU64, Ordering};
         static STATE_TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -204,11 +206,14 @@ impl MeshFSEngine {
             file.sync_all()?;
         }
         fs::rename(tmp_file, &self.state_file)?;
+        File::open(&self.meta_dir)?.sync_all()?;
         Ok(())
     }
 
     /// Retrieves comprehensive operational status.
     pub async fn get_status(&self) -> StatusReport {
+        let cluster = self.cluster.get();
+        let ready = if let Some(c) = cluster { c.namespace().await.is_ok() } else { true };
         let state = self.state.read().await;
         let metrics = self.driver.get_metrics(&self.data_dir).unwrap_or(StorageMetrics {
             total_bytes: 0,
@@ -221,7 +226,7 @@ impl MeshFSEngine {
         let total_logical_bytes: u64 = state.volumes.values().map(|v| v.total_bytes()).sum();
 
         StatusReport {
-            ok: true,
+            ok: ready,
             service: "meshfs-distributed".to_string(),
             cluster: state.cluster_name.clone(),
             node_id: state.node_id.clone(),
@@ -238,14 +243,20 @@ impl MeshFSEngine {
             storage_backend: self.driver.info.backend_type.clone(),
             reflink_supported: self.driver.info.features.reflink_support,
             chunk_store_path: self.chunk_store.chunks_dir.to_string_lossy().to_string(),
-            single_node_autonomous: true,
-            supports_scale_out: true,
+            single_node_autonomous: cluster.is_none(),
+            supports_scale_out: cluster.is_some(),
             compatible_without_podmesh: true,
+            replication: cluster.map(|c| c.metrics()),
+            namespace_consistency: if cluster.is_some() { "diagnostic local counters; data reads require quorum" } else { "standalone" }.to_string(),
         }
     }
 
     /// Stores a file into a volume, splitting it into 4MB CAS chunks.
     pub async fn put_file(&self, volume_name: &str, file_path: &str, content: &[u8]) -> io::Result<Inode> {
+        if let Some(c) = self.cluster.get() {
+            if content.len() > MAX_FILE_BYTES { return Err(io::Error::new(io::ErrorKind::InvalidInput, "clustered file limit is 16 MiB")); }
+            return serde_json::from_value(c.write(Action::Put { volume: volume_name.into(), path: file_path.into(), hex: hex::encode(content), at: Utc::now().to_rfc3339() }).await?).map_err(io::Error::other);
+        }
         let size = content.len() as u64;
         let file_digest = format!("sha256:{}", sha256_digest(content));
         let mut chunks = Vec::new();
@@ -286,6 +297,11 @@ impl MeshFSEngine {
 
     /// Reassembles a file from its CAS chunks.
     pub async fn get_file(&self, volume_name: &str, file_path: &str) -> io::Result<Vec<u8>> {
+        if let Some(c) = self.cluster.get() { return c.read(volume_name, file_path).await; }
+        self.local_get_file(volume_name, file_path).await
+    }
+
+    pub(crate) async fn local_get_file(&self, volume_name: &str, file_path: &str) -> io::Result<Vec<u8>> {
         let state = self.state.read().await;
         let vol = state.volumes.get(volume_name).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("Volume '{}' introuvable", volume_name))
@@ -304,11 +320,15 @@ impl MeshFSEngine {
             buffer.extend_from_slice(&data);
         }
 
+        if buffer.len() as u64 != inode.size || format!("sha256:{}", sha256_digest(&buffer)) != inode.digest {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "file size or digest mismatch"));
+        }
         Ok(buffer)
     }
 
     /// Creates a new logical volume.
     pub async fn create_volume(&self, name: &str) -> io::Result<Volume> {
+        if let Some(c) = self.cluster.get() { return serde_json::from_value(c.write(Action::CreateVolume { name: name.into(), at: Utc::now().to_rfc3339() }).await?).map_err(io::Error::other); }
         let vol = {
             let mut state = self.state.write().await;
             if let Some(existing) = state.volumes.get(name) {
@@ -325,6 +345,7 @@ impl MeshFSEngine {
 
     /// Deletes a logical volume.
     pub async fn delete_volume(&self, name: &str) -> io::Result<bool> {
+        if let Some(c) = self.cluster.get() { return serde_json::from_value(c.write(Action::DeleteVolume { name: name.into() }).await?).map_err(io::Error::other); }
         let removed = {
             let mut state = self.state.write().await;
             state.volumes.remove(name).is_some()
@@ -337,12 +358,17 @@ impl MeshFSEngine {
     }
 
     /// Lists all volumes.
-    pub async fn list_volumes(&self) -> HashMap<String, Volume> {
-        self.state.read().await.volumes.clone()
+    pub async fn list_volumes(&self) -> io::Result<HashMap<String, Volume>> {
+        if let Some(c) = self.cluster.get() { return serde_json::from_value(c.namespace().await?["volumes"].clone()).map_err(io::Error::other); }
+        Ok(self.state.read().await.volumes.clone())
     }
 
     /// Creates an instant O(1) Copy-on-Write Merkle snapshot.
     pub async fn create_snapshot(&self, volume_name: &str, custom_name: Option<&str>) -> io::Result<Snapshot> {
+        if let Some(c) = self.cluster.get() {
+            let id = format!("snapshot-{}", Utc::now().timestamp_nanos_opt().unwrap_or_default());
+            return serde_json::from_value(c.write(Action::Snapshot { volume: volume_name.into(), name: custom_name.unwrap_or(&id).into(), id: id.clone(), at: Utc::now().to_rfc3339() }).await?).map_err(io::Error::other);
+        }
         let snap = {
             let mut state = self.state.write().await;
             let vol = state.volumes.get_mut(volume_name).ok_or_else(|| {
@@ -362,6 +388,7 @@ impl MeshFSEngine {
 
     /// Deletes a snapshot by name or ID.
     pub async fn delete_snapshot(&self, volume_name: &str, snapshot_name: &str) -> io::Result<bool> {
+        if let Some(c) = self.cluster.get() { return serde_json::from_value(c.write(Action::DeleteSnapshot { volume: volume_name.into(), name: snapshot_name.into() }).await?).map_err(io::Error::other); }
         let removed = {
             let mut state = self.state.write().await;
             let initial_len = state.snapshots.len();
@@ -378,56 +405,20 @@ impl MeshFSEngine {
     }
 
     /// Lists snapshots, optionally filtered by volume.
-    pub async fn list_snapshots(&self, volume_filter: Option<&str>) -> Vec<Snapshot> {
-        let state = self.state.read().await;
-        match volume_filter {
-            Some(v) => state.snapshots.iter().filter(|s| s.volume == v).cloned().collect(),
-            None => state.snapshots.clone(),
-        }
+    pub async fn list_snapshots(&self, volume_filter: Option<&str>) -> io::Result<Vec<Snapshot>> {
+        let snapshots: Vec<Snapshot> = if let Some(c) = self.cluster.get() {
+            serde_json::from_value(c.namespace().await?["snapshots"].clone()).map_err(io::Error::other)?
+        } else { self.state.read().await.snapshots.clone() };
+        Ok(snapshots.into_iter().filter(|s| volume_filter.is_none_or(|v| s.volume == v)).collect())
     }
 
     /// Joins an existing MeshFS cluster node and exchanges node peer records.
     pub async fn join_cluster(&self, target_address: &str, _token: &str) -> Result<Vec<NodeInfo>, String> {
-        let url = if target_address.starts_with("http://") || target_address.starts_with("https://") {
-            format!("{}/api/v1/meshfs/nodes", target_address)
-        } else {
-            format!("http://{}/api/v1/meshfs/nodes", target_address)
-        };
+        let c = self.cluster.get().ok_or("peer discovery alone does not replicate data; configure a fixed cluster explicitly")?;
+        let target = target_address.trim_end_matches('/');
+        if !c.config.peers.values().any(|p| p.trim_end_matches('/') == target) { return Err("target is not in the configured membership".into()); }
+        c.namespace().await.map_err(|e| e.to_string())?;
+        Ok(c.nodes().await)
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .map_err(|e| e.to_string())?;
-
-        let response = client.get(&url).send().await.map_err(|e| format!("Connexion échouée: {}", e))?;
-        if !response.status().is_success() {
-            return Err(format!("Statut distant non-OK: {}", response.status()));
-        }
-
-        #[derive(Deserialize)]
-        struct RemoteNodesResponse {
-            nodes: Vec<NodeInfo>,
-        }
-
-        let data = response
-            .json::<RemoteNodesResponse>()
-            .await
-            .map_err(|e| format!("Payload distant invalide: {}", e))?;
-
-        {
-            let mut state = self.state.write().await;
-            let mut known_ids: std::collections::HashSet<String> =
-                state.nodes.iter().map(|n| n.node_id.clone()).collect();
-
-            for remote_node in data.nodes {
-                if !known_ids.contains(&remote_node.node_id) {
-                    known_ids.insert(remote_node.node_id.clone());
-                    state.nodes.push(remote_node);
-                }
-            }
-        }
-
-        let _ = self.persist_state().await;
-        Ok(self.state.read().await.nodes.clone())
     }
 }

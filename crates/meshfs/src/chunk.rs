@@ -58,7 +58,7 @@ impl ChunkStore {
         let digest = sha256_digest(data);
         let target_file = self.chunk_path(&digest);
 
-        if target_file.exists() {
+        if target_file.exists() && self.read_chunk(&digest).is_ok() {
             return Ok(format!("sha256:{}", digest));
         }
 
@@ -81,11 +81,17 @@ impl ChunkStore {
         }
 
         fs::rename(tmp_file, &target_file)?;
+        File::open(target_file.parent().expect("chunk parent"))?.sync_all()?;
+        File::open(&self.chunks_dir)?.sync_all()?;
         Ok(format!("sha256:{}", digest))
     }
 
     /// Reads chunk content from disk and verifies integrity.
     pub fn read_chunk(&self, chunk_id: &str) -> io::Result<Vec<u8>> {
+        let id = Self::normalize_id(chunk_id);
+        if id.len()!=64 || !id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid chunk digest"));
+        }
         let target_file = self.chunk_path(chunk_id);
         if !target_file.exists() {
             return Err(io::Error::new(
