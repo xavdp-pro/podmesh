@@ -107,7 +107,7 @@ export default function TechnicalShowcasePage() {
       </header>
 
       <div className="mx-auto flex max-w-7xl items-start gap-6 px-4 py-6 sm:px-6 lg:gap-10 lg:px-8">
-        <ShowcaseSidebar activeTab={activeId} onSelectTab={selectSection} desktopExpanded={desktopExpanded} onCollapseDesktop={() => { setDesktopMenu(false); menuRef.current?.focus() }} mobileOpen={mobileOpen} onCloseMobile={() => { setMobileOpen(false); menuRef.current?.focus() }} locale={locale} />
+        <ShowcaseSidebar activeTab={activeId} activeAnchor={targetId} onSelectTab={selectSection} desktopExpanded={desktopExpanded} onCollapseDesktop={() => { setDesktopMenu(false); menuRef.current?.focus() }} mobileOpen={mobileOpen} onCloseMobile={() => { setMobileOpen(false); menuRef.current?.focus() }} locale={locale} />
         <main className="min-w-0 flex-1 pb-12">
           <section className="mb-10 border-b border-line pb-8">
             <p className="mb-4 text-sm font-semibold text-accent">PodMesh · MeshFS · PMBS</p>

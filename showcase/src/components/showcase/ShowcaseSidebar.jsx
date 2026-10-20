@@ -49,6 +49,7 @@ const UI_TEXT = {
 
 export default function ShowcaseSidebar({
   activeTab,
+  activeAnchor,
   onSelectTab,
   desktopExpanded,
   onCollapseDesktop,
@@ -92,7 +93,7 @@ export default function ShowcaseSidebar({
               title={collapsed && !isDrawer ? title : undefined}
               className={`group relative flex items-center gap-3 rounded-xl px-3 py-2.5 text-left transition-all ${
                 isActive
-                  ? 'bg-accent/15 text-accent shadow-xs'
+                  ? 'bg-accent/15 text-accent ring-1 ring-accent/30 shadow-xs'
                   : 'text-fg-muted hover:bg-surface-2 hover:text-fg'
               }`}
             >
@@ -138,14 +139,15 @@ export default function ShowcaseSidebar({
                   <a
                     key={anchor.id}
                     href={`#${anchor.id}`}
+                    aria-current={activeAnchor === anchor.id ? 'location' : undefined}
                     onClick={(event) => {
                       event.preventDefault()
                       onSelectTab(item.key, anchor.id)
                       if (isDrawer) onCloseMobile()
                     }}
-                    className="flex items-center gap-1.5 py-1.5 text-xs font-medium text-fg-muted hover:text-accent transition-colors text-left"
+                    className={`flex items-center gap-2 rounded-lg px-2 py-2 text-xs text-left transition-colors ${activeAnchor === anchor.id ? 'bg-accent text-accent-fg font-bold shadow-xs' : 'font-medium text-fg-muted hover:bg-accent/10 hover:text-accent'}`}
                   >
-                    <span className="h-1 w-1 rounded-full bg-accent/60" />
+                    <span aria-hidden="true" className={`h-1.5 w-1.5 shrink-0 rounded-full ${activeAnchor === anchor.id ? 'bg-current' : 'bg-accent/60'}`} />
                     <span>{anchor.label[locale] || anchor.label.fr}</span>
                   </a>
                 ))}
