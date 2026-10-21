@@ -190,24 +190,37 @@ impl Db {
         let marker = serde_json::to_string(&state.applied).map_err(se)?;
         let mut c = self.conn.lock().map_err(se)?;
         let tx = c.transaction().map_err(se)?;
-        let previous: Option<String> = tx
-            .query_row("SELECT v FROM meta WHERE k='machine'", [], |r| r.get(0))
+        let base: Option<String> = tx
+            .query_row("SELECT v FROM meta WHERE k='machine_base'", [], |r| {
+                r.get(0)
+            })
             .optional()
             .map_err(se)?;
-        let old = previous
-            .map(|v| serde_json::from_str::<MachineData>(&v).map_err(se))
-            .transpose()?;
-        if !install
-            && old.as_ref().and_then(|v| v.applied).map(|v| v.index)
-                > state.applied.map(|v| v.index)
-        {
-            return Ok(()); // A newer installed/checkpointed state wins.
+        let base_index = match base {
+            Some(v) => serde_json::from_str::<Option<LogId<u64>>>(&v)
+                .map_err(se)?
+                .map(|v| v.index),
+            None => {
+                // One-time legacy fallback; subsequent checkpoints compare only a small marker.
+                let raw: Option<String> = tx
+                    .query_row("SELECT v FROM meta WHERE k='machine'", [], |r| r.get(0))
+                    .optional()
+                    .map_err(se)?;
+                raw.map(|v| serde_json::from_str::<MachineData>(&v).map_err(se))
+                    .transpose()?
+                    .and_then(|v| v.applied)
+                    .map(|v| v.index)
+            }
+        };
+        if !install && base_index > state.applied.map(|v| v.index) {
+            return Ok(());
         }
         tx.execute(
             "INSERT INTO meta(k,v) VALUES('machine',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
             [raw],
         )
         .map_err(se)?;
+        tx.execute("INSERT INTO meta(k,v) VALUES('machine_base',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", [&marker]).map_err(se)?;
         let latest: Option<String> = tx
             .query_row("SELECT v FROM meta WHERE k='machine_applied'", [], |r| {
                 r.get(0)
@@ -1811,6 +1824,12 @@ mod tests {
         let restored = machine.restored_state().unwrap();
         assert_eq!(restored.applied.unwrap().index, 2);
         assert_eq!(restored.blobs.len(), 2);
+        assert_eq!(
+            db.get::<Option<LogId<u64>>>("machine_base")
+                .unwrap()
+                .flatten(),
+            first.applied
+        );
         assert_eq!(
             db.conn
                 .lock()
