@@ -47,6 +47,9 @@ pub enum Commands {
 
 #[derive(Args, Debug)]
 pub struct DaemonArgs {
+    /// Listen address; remote access requires an authenticated TLS boundary.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub bind: std::net::IpAddr,
     /// Port to listen on for REST API
     #[arg(short, long, default_value_t = DEFAULT_PORT)]
     pub port: u16,

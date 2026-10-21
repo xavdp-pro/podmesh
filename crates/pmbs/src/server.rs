@@ -1,11 +1,12 @@
 //! PMBS REST API Server (Axum)
 //! Exposes backup endpoints on standard port 8007.
 
-use crate::datastore::{BackupManifest, Datastore, CHUNK_SIZE};
-use crate::sync::sync_from_remote;
+use crate::datastore::{BackupManifest, Datastore, CHUNK_SIZE, validate_name, validate_chunk_id};
 use crate::verify::verify_snapshot;
 use axum::{
     body::Body,
+    middleware::{self, Next},
+    extract::Request,
     extract::{DefaultBodyLimit, Path as AxPath, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
@@ -17,7 +18,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tower_http::cors::{Any, CorsLayer};
+
 
 #[derive(Clone)]
 pub struct AppState {
@@ -59,10 +60,6 @@ pub struct VerifyRequest {
 }
 
 pub fn create_router(state: AppState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
 
     Router::new()
         .route("/", get(status_handler))
@@ -93,8 +90,32 @@ pub fn create_router(state: AppState) -> Router {
             post(sync_datastore_handler),
         )
         .layer(tower_http::trace::TraceLayer::new_for_http())
-        .layer(cors)
+        .layer(middleware::from_fn(authorize))
         .with_state(state)
+}
+
+/// Required for HTTP on every route; local IPC uses owner-only filesystem permissions.
+pub fn configured_token() -> Result<String, String> {
+    let token = std::env::var("PMBS_API_TOKEN").map_err(|_| "PMBS_API_TOKEN is required")?;
+    if token.len() < 32 || token.len() > 256 || !token.bytes().all(|b| (33..=126).contains(&b)) {
+        return Err("PMBS_API_TOKEN must be 32..256 printable non-space bytes".into());
+    }
+    Ok(token)
+}
+async fn authorize(request: Request, next: Next) -> Response {
+    let expected = match configured_token() { Ok(v) => v, Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response() };
+    let supplied = request.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
+    if supplied.len() != expected.len() || supplied.bytes().zip(expected.bytes()).fold(0u8, |diff, (a,b)| diff | (a ^ b)) != 0 {
+        return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Bearer")], "authentication required").into_response();
+    }
+    next.run(request).await
+}
+pub fn api_client() -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Ok(token) = configured_token() {
+        if let Ok(mut v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) { v.set_sensitive(true); headers.insert(reqwest::header::AUTHORIZATION, v); }
+    }
+    reqwest::Client::builder().default_headers(headers).redirect(reqwest::redirect::Policy::none()).build().expect("HTTP client construction")
 }
 
 // Handlers
@@ -123,11 +144,11 @@ async fn create_datastore_handler(
     State(state): State<AppState>,
     Json(req): Json<CreateDatastoreRequest>,
 ) -> Response {
-    let name = req.name.trim();
-    if name.is_empty() {
+    let name = req.name.as_str();
+    if validate_name(name).is_err() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "error": "name requis" })),
+            Json(serde_json::json!({ "ok": false, "error": "invalid datastore name" })),
         )
             .into_response();
     }
@@ -202,7 +223,7 @@ async fn save_snapshot_handler(
         )
             .into_response(),
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            match e.kind() { std::io::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST, std::io::ErrorKind::AlreadyExists => StatusCode::CONFLICT, _ => StatusCode::INTERNAL_SERVER_ERROR },
             Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
         )
             .into_response(),
@@ -213,6 +234,7 @@ async fn get_chunk_handler(
     State(state): State<AppState>,
     AxPath((datastore, chunk_id)): AxPath<(String, String)>,
 ) -> Response {
+    if validate_chunk_id(&chunk_id).is_err() { return (StatusCode::BAD_REQUEST, "invalid chunk id").into_response(); }
     let stores = state.datastores.read().await;
     let ds = match stores.get(&datastore) {
         Some(d) => d,
@@ -310,29 +332,7 @@ async fn verify_datastore_handler(
 }
 
 async fn sync_datastore_handler(
-    State(state): State<AppState>,
-    AxPath(datastore): AxPath<String>,
-    Json(req): Json<SyncRequest>,
+    State(_state): State<AppState>, AxPath(_datastore): AxPath<String>, Json(_req): Json<SyncRequest>,
 ) -> Response {
-    let stores = state.datastores.read().await;
-    let ds = match stores.get(&datastore) {
-        Some(d) => d.clone(),
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "Datastore introuvable" })),
-            )
-                .into_response()
-        }
-    };
-    drop(stores);
-
-    match sync_from_remote(&req.remote_url, &req.remote_datastore, &ds).await {
-        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": e })),
-        )
-            .into_response(),
-    }
+    (StatusCode::FORBIDDEN, "remote sync disabled: configure an outbound destination policy before enabling").into_response()
 }

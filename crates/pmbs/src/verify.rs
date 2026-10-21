@@ -41,7 +41,7 @@ pub fn verify_snapshot(datastore: &Datastore, manifest: &BackupManifest) -> Veri
             chunks_audited += 1;
             let chunk_path = datastore.chunk_path(&chunk_ref.id);
 
-            if !chunk_path.exists() {
+            if !chunk_path.map(|p| p.is_file()).unwrap_or(false) {
                 chunks_missing.push(chunk_ref.id.clone());
                 continue;
             }
@@ -60,6 +60,7 @@ pub fn verify_snapshot(datastore: &Datastore, manifest: &BackupManifest) -> Veri
         }
     }
 
+    if let Err(e) = datastore.validate_manifest(manifest) { chunks_corrupted.push(format!("manifest: {}", e)); }
     let is_crypto_sound = chunks_missing.is_empty() && chunks_corrupted.is_empty();
     let integrity_verified = is_crypto_sound && chunks_audited > 0;
     let message = if integrity_verified {
@@ -132,7 +133,7 @@ mod tests {
         assert_eq!(report.boot_readiness, "NOT_TESTED");
         assert_eq!(report.chunks_audited, 1);
 
-        std::fs::remove_file(ds.chunk_path(&chunk_id)).unwrap();
+        std::fs::remove_file(ds.chunk_path(&chunk_id).unwrap()).unwrap();
         let missing = verify_snapshot(&ds, &manifest);
         assert!(!missing.ok && !missing.integrity_verified && !missing.op10_sandbox_boot_proof);
         assert_eq!(missing.boot_readiness, "NOT_TESTED");

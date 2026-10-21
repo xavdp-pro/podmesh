@@ -28,10 +28,8 @@ pub async fn sync_from_remote(
     remote_datastore: &str,
     target_datastore: &Datastore,
 ) -> Result<SyncReport, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| e.to_string())?;
+    crate::datastore::validate_name(remote_datastore).map_err(|e| e.to_string())?;
+    let client = crate::server::api_client();
 
     // 1. Fetch remote snapshots list
     let list_url = format!(

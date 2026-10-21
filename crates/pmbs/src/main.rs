@@ -4,7 +4,7 @@ use clap::Parser;
 use pmbs::cli::{Cli, Commands, DatastoreSubcommand};
 use pmbs::control::{query_control_socket, start_control_socket, ControlRequest};
 use pmbs::datastore::Datastore;
-use pmbs::server::{create_router, AppState};
+use pmbs::server::{create_router, AppState, configured_token, api_client};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -30,6 +30,7 @@ async fn main() -> ExitCode {
 
     match args.command {
         Commands::Daemon(d) => {
+            if let Err(e) = configured_token() { eprintln!("{}", e); return ExitCode::FAILURE; }
             info!(
                 port = d.port,
                 data_dir = %d.data_dir.display(),
@@ -72,7 +73,7 @@ async fn main() -> ExitCode {
             }
 
             let app = create_router(app_state);
-            let addr = format!("0.0.0.0:{}", d.port);
+            let addr = std::net::SocketAddr::new(d.bind, d.port);
             let listener = match tokio::net::TcpListener::bind(&addr).await {
                 Ok(l) => l,
                 Err(e) => {
@@ -102,9 +103,9 @@ async fn main() -> ExitCode {
                 }
             }
 
-            let client = reqwest::Client::new();
+            let client = api_client();
             let url = format!("{}/api/v1/status", p.remote.trim_end_matches('/'));
-            match client.get(&url).send().await {
+            match client.get(&url).send().await.and_then(|r| r.error_for_status()) {
                 Ok(resp) => {
                     if resp.status().is_success() {
                         println!("{{\"status\":\"pong\",\"remote\":\"{}\"}}", url);
@@ -133,9 +134,9 @@ async fn main() -> ExitCode {
                 }
             }
 
-            let client = reqwest::Client::new();
+            let client = api_client();
             let url = format!("{}/api/v1/status", s.remote.trim_end_matches('/'));
-            match client.get(&url).send().await {
+            match client.get(&url).send().await.and_then(|r| r.error_for_status()) {
                 Ok(resp) => match resp.text().await {
                     Ok(body) => println!("{}", body),
                     Err(e) => {
@@ -152,9 +153,9 @@ async fn main() -> ExitCode {
 
         Commands::Datastore(dc) => match dc.action {
             DatastoreSubcommand::List { remote } => {
-                let client = reqwest::Client::new();
+                let client = api_client();
                 let url = format!("{}/api/v1/datastores", remote.trim_end_matches('/'));
-                match client.get(&url).send().await {
+                match client.get(&url).send().await.and_then(|r| r.error_for_status()) {
                     Ok(resp) => match resp.text().await {
                         Ok(body) => println!("{}", body),
                         Err(e) => {
@@ -169,10 +170,10 @@ async fn main() -> ExitCode {
                 }
             }
             DatastoreSubcommand::Create { name, remote } => {
-                let client = reqwest::Client::new();
+                let client = api_client();
                 let url = format!("{}/api/v1/datastores", remote.trim_end_matches('/'));
                 let payload = serde_json::json!({ "name": name });
-                match client.post(&url).json(&payload).send().await {
+                match client.post(&url).json(&payload).send().await.and_then(|r| r.error_for_status()) {
                     Ok(resp) => match resp.text().await {
                         Ok(body) => println!("{}", body),
                         Err(e) => {
@@ -205,14 +206,14 @@ async fn main() -> ExitCode {
                 }
             }
 
-            let client = reqwest::Client::new();
+            let client = api_client();
             let url = format!(
                 "{}/api/v1/datastores/{}/verify",
                 v.remote.trim_end_matches('/'),
                 v.datastore
             );
             let payload = serde_json::json!({ "snapshotId": v.snapshot });
-            match client.post(&url).json(&payload).send().await {
+            match client.post(&url).json(&payload).send().await.and_then(|r| r.error_for_status()) {
                 Ok(resp) => match resp.text().await {
                     Ok(body) => println!("{}", body),
                     Err(e) => {
@@ -228,7 +229,7 @@ async fn main() -> ExitCode {
         }
 
         Commands::Sync(sc) => {
-            let client = reqwest::Client::new();
+            let client = api_client();
             let url = format!(
                 "{}/api/v1/datastores/{}/sync",
                 sc.remote.trim_end_matches('/'),
@@ -239,7 +240,7 @@ async fn main() -> ExitCode {
                 "remoteDatastore": sc.remote_datastore
             });
 
-            match client.post(&url).json(&payload).send().await {
+            match client.post(&url).json(&payload).send().await.and_then(|r| r.error_for_status()) {
                 Ok(resp) => match resp.text().await {
                     Ok(body) => println!("{}", body),
                     Err(e) => {

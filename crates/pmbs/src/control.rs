@@ -35,6 +35,8 @@ pub async fn start_control_socket(state: AppState, socket_path: PathBuf) -> std:
     }
 
     let listener = UnixListener::bind(&socket_path)?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
     info!(path = %socket_path.display(), "PMBS Control Unix Socket actif");
 
     let state = Arc::new(state);
