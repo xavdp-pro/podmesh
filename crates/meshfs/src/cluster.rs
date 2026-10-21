@@ -7,7 +7,9 @@ use crate::{
     merkle::Inode,
     volume::{Snapshot as FileSnapshot, Volume},
 };
-use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError};
+use openraft::error::{
+    InstallSnapshotError, NetworkError, PayloadTooLarge, RPCError, RaftError, RemoteError,
+};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::*;
 use openraft::storage::{LogFlushed, RaftLogStorage, RaftStateMachine};
@@ -22,7 +24,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt::Debug,
     io::{self, Read, Seek, SeekFrom, Write},
-    ops::RangeBounds,
+    ops::{Bound, RangeBounds},
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -141,7 +143,7 @@ pub struct Db {
 impl Db {
     fn open(path: &Path) -> io::Result<Self> {
         let c = Connection::open(path).map_err(err)?;
-        c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY,v TEXT NOT NULL); CREATE TABLE IF NOT EXISTS logs(idx INTEGER PRIMARY KEY,entry TEXT NOT NULL);").map_err(err)?;
+        c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY,v TEXT NOT NULL); CREATE TABLE IF NOT EXISTS logs(idx INTEGER PRIMARY KEY,entry TEXT NOT NULL); CREATE TABLE IF NOT EXISTS machine_deltas(last_idx INTEGER PRIMARY KEY,entries TEXT NOT NULL);").map_err(err)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(c)),
         })
@@ -165,25 +167,105 @@ impl Db {
             .map_err(se)?;
         Ok(())
     }
+    fn persist_apply(&self, entries: &[Entry<Types>], applied: Option<LogId<u64>>) -> SResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let raw = serde_json::to_string(entries).map_err(se)?;
+        let marker = serde_json::to_string(&applied).map_err(se)?;
+        let last = entries.last().expect("nonempty batch").log_id.index;
+        let mut c = self.conn.lock().map_err(se)?;
+        let tx = c.transaction().map_err(se)?;
+        tx.execute(
+            "INSERT INTO machine_deltas(last_idx,entries) VALUES(?,?)",
+            params![last, raw],
+        )
+        .map_err(se)?;
+        tx.execute("INSERT INTO meta(k,v) VALUES('machine_applied',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", [marker]).map_err(se)?;
+        tx.commit().map_err(se)?;
+        Ok(())
+    }
+    fn checkpoint(&self, state: &MachineData, install: bool) -> SResult<()> {
+        let raw = serde_json::to_string(state).map_err(se)?;
+        let marker = serde_json::to_string(&state.applied).map_err(se)?;
+        let mut c = self.conn.lock().map_err(se)?;
+        let tx = c.transaction().map_err(se)?;
+        let previous: Option<String> = tx
+            .query_row("SELECT v FROM meta WHERE k='machine'", [], |r| r.get(0))
+            .optional()
+            .map_err(se)?;
+        let old = previous
+            .map(|v| serde_json::from_str::<MachineData>(&v).map_err(se))
+            .transpose()?;
+        if !install
+            && old.as_ref().and_then(|v| v.applied).map(|v| v.index)
+                > state.applied.map(|v| v.index)
+        {
+            return Ok(()); // A newer installed/checkpointed state wins.
+        }
+        tx.execute(
+            "INSERT INTO meta(k,v) VALUES('machine',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            [raw],
+        )
+        .map_err(se)?;
+        let latest: Option<String> = tx
+            .query_row("SELECT v FROM meta WHERE k='machine_applied'", [], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(se)?;
+        let latest = latest
+            .map(|v| serde_json::from_str::<Option<LogId<u64>>>(&v).map_err(se))
+            .transpose()?
+            .flatten();
+        if install || latest.map(|v| v.index) <= state.applied.map(|v| v.index) {
+            tx.execute("INSERT INTO meta(k,v) VALUES('machine_applied',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", [marker]).map_err(se)?;
+        }
+        if install {
+            tx.execute("DELETE FROM machine_deltas", []).map_err(se)?;
+        } else if let Some(id) = state.applied {
+            tx.execute("DELETE FROM machine_deltas WHERE last_idx<=?", [id.index])
+                .map_err(se)?;
+        }
+        tx.commit().map_err(se)?;
+        Ok(())
+    }
 }
 impl RaftLogReader<Types> for Db {
     async fn try_get_log_entries<R: RangeBounds<u64> + Clone + Debug + Send>(
         &mut self,
         range: R,
     ) -> SResult<Vec<Entry<Types>>> {
+        let start = match range.start_bound() {
+            Bound::Included(v) => *v,
+            Bound::Excluded(v) => match v.checked_add(1) {
+                Some(v) => v,
+                None => return Ok(vec![]),
+            },
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(v) => *v,
+            Bound::Excluded(v) => match v.checked_sub(1) {
+                Some(v) => v,
+                None => return Ok(vec![]),
+            },
+            Bound::Unbounded => i64::MAX as u64,
+        }
+        .min(i64::MAX as u64);
+        if start > end {
+            return Ok(vec![]);
+        }
         let c = self.conn.lock().map_err(se)?;
         let mut q = c
-            .prepare("SELECT idx,entry FROM logs ORDER BY idx")
+            .prepare("SELECT entry FROM logs WHERE idx>=? AND idx<=? ORDER BY idx")
             .map_err(se)?;
         let rows = q
-            .query_map([], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?)))
+            .query_map(params![start, end], |r| r.get::<_, String>(0))
             .map_err(se)?;
         let mut out = Vec::new();
         for row in rows {
-            let (i, s) = row.map_err(se)?;
-            if range.contains(&i) {
-                out.push(serde_json::from_str(&s).map_err(se)?);
-            }
+            out.push(serde_json::from_str(&row.map_err(se)?).map_err(se)?);
         }
         Ok(out)
     }
@@ -298,6 +380,70 @@ pub struct Machine {
     data: AsyncMutex<MachineData>,
 }
 impl Machine {
+    fn restored_state(&self) -> SResult<MachineData> {
+        // One consistent SQLite view of the legacy/full checkpoint and tail.
+        let (mut state, batches, marker) = {
+            let c = self.db.conn.lock().map_err(se)?;
+            let raw: Option<String> = c
+                .query_row("SELECT v FROM meta WHERE k='machine'", [], |r| r.get(0))
+                .optional()
+                .map_err(se)?;
+            let state = raw
+                .map(|v| serde_json::from_str::<MachineData>(&v).map_err(se))
+                .transpose()?
+                .unwrap_or_default();
+            let mut q = c
+                .prepare("SELECT last_idx,entries FROM machine_deltas ORDER BY last_idx")
+                .map_err(se)?;
+            let rows = q
+                .query_map([], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?)))
+                .map_err(se)?;
+            let batches = rows.collect::<Result<Vec<_>, _>>().map_err(se)?;
+            let marker: Option<String> = c
+                .query_row("SELECT v FROM meta WHERE k='machine_applied'", [], |r| {
+                    r.get(0)
+                })
+                .optional()
+                .map_err(se)?;
+            (state, batches, marker)
+        };
+        for (last, raw) in batches {
+            let entries: Vec<Entry<Types>> = serde_json::from_str(&raw).map_err(se)?;
+            if entries.is_empty() || entries.last().map(|v| v.log_id.index) != Some(last) {
+                return Err(se("invalid durable apply batch"));
+            }
+            for e in entries {
+                if state.applied.is_some_and(|id| e.log_id.index <= id.index) {
+                    return Err(se(
+                        "durable apply journal overlaps checkpoint or is unordered",
+                    ));
+                }
+                if state
+                    .applied
+                    .is_some_and(|id| id.index.checked_add(1) != Some(e.log_id.index))
+                {
+                    return Err(se("durable apply journal has a gap"));
+                }
+                match e.payload {
+                    EntryPayload::Blank => {}
+                    EntryPayload::Membership(m) => {
+                        state.membership = StoredMembership::new(Some(e.log_id), m)
+                    }
+                    EntryPayload::Normal(c) => {
+                        self.execute(&mut state, &c)?;
+                    }
+                }
+                state.applied = Some(e.log_id);
+            }
+        }
+        if let Some(marker) = marker {
+            let expected: Option<LogId<u64>> = serde_json::from_str(&marker).map_err(se)?;
+            if state.applied != expected {
+                return Err(se("durable apply marker differs from reconstructed state"));
+            }
+        }
+        Ok(state)
+    }
     async fn mirror(&self, data: &MachineData) {
         let mut s = self.engine.state.write().await;
         s.volumes = data.volumes.clone();
@@ -618,11 +764,11 @@ impl RaftStateMachine<Types> for Arc<Machine> {
         let out = tokio::task::spawn_blocking(move || {
             let mut s = machine.data.blocking_lock();
             let mut out = Vec::with_capacity(entries.len());
-            for e in entries {
-                let value = match e.payload {
+            for e in &entries {
+                let value = match &e.payload {
                     EntryPayload::Blank => Value::Null,
                     EntryPayload::Membership(m) => {
-                        s.membership = StoredMembership::new(Some(e.log_id), m);
+                        s.membership = StoredMembership::new(Some(e.log_id), m.clone());
                         Value::Null
                     }
                     EntryPayload::Normal(c) => machine.execute(&mut s, &c)?,
@@ -630,7 +776,7 @@ impl RaftStateMachine<Types> for Arc<Machine> {
                 s.applied = Some(e.log_id);
                 out.push(value);
             }
-            machine.db.set("machine", &*s)?;
+            machine.db.persist_apply(&entries, s.applied)?;
             Ok::<_, StorageError<u64>>(out)
         })
         .await
@@ -688,7 +834,7 @@ impl RaftStateMachine<Types> for Arc<Machine> {
             validate_layout(inode, &sizes)?;
         }
         let mut s = self.data.lock().await;
-        self.db.set("machine", &state)?;
+        self.db.checkpoint(&state, true)?;
         *s = state;
         self.mirror(&s).await;
         Ok(())
@@ -711,6 +857,7 @@ impl RaftSnapshotBuilder<Types> for Arc<Machine> {
                 snapshot_id: format!("{:?}", state.applied),
             };
             let mut file = machine.snapshot_file()?;
+            machine.db.checkpoint(&state, false)?;
             let metadata = serde_json::to_vec(&state).map_err(se)?;
             file.write_all(&hex::decode(sha256_digest(&metadata)).map_err(se)?)
                 .map_err(se)?;
@@ -789,12 +936,58 @@ impl RaftNetworkFactory<Types> for Network {
         }
     }
 }
+const APPEND_ENTRY_BYTES: usize = 10 * 1024 * 1024;
+fn append_prefix(entries: &[Entry<Types>]) -> io::Result<usize> {
+    struct Budget {
+        left: usize,
+        exceeded: bool,
+    }
+    impl Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > self.left {
+                self.exceeded = true;
+                return Err(io::Error::other("append byte budget"));
+            }
+            self.left -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut budget = Budget {
+        left: APPEND_ENTRY_BYTES - 2,
+        exceeded: false,
+    };
+    for (i, e) in entries.iter().enumerate() {
+        if i > 0 {
+            if budget.left == 0 {
+                return Ok(i);
+            }
+            budget.left -= 1;
+        }
+        if let Err(error) = serde_json::to_writer(&mut budget, e) {
+            if budget.exceeded {
+                return Ok(i.max(1));
+            } // A valid single entry remains indivisible.
+            return Err(err(error));
+        }
+    }
+    Ok(entries.len())
+}
 impl RaftNetwork<Types> for Peer {
     async fn append_entries(
         &mut self,
         req: AppendEntriesRequest<Types>,
         _: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RpcErr> {
+        let prefix =
+            append_prefix(&req.entries).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        if prefix < req.entries.len() {
+            return Err(RPCError::PayloadTooLarge(
+                PayloadTooLarge::new_entries_hint(prefix as u64),
+            ));
+        }
         self.network
             .rpc(self.target, &self.node, "append", req)
             .await
@@ -877,7 +1070,9 @@ impl Cluster {
             data: AsyncMutex::new(data),
         });
         {
-            let s = machine.data.lock().await;
+            let recovered = machine.restored_state().map_err(err)?;
+            let mut s = machine.data.lock().await;
+            *s = recovered;
             machine.mirror(&s).await;
         }
         let network = Network {
@@ -1380,7 +1575,7 @@ mod tests {
             });
         }
         machine.apply(commands).await.unwrap();
-        let persisted = db.get::<MachineData>("machine").unwrap().unwrap();
+        let persisted = machine.restored_state().unwrap();
         assert_eq!(persisted.replay_epoch, 1);
         assert_eq!(persisted.replay_admissions, 44);
         let (_other, _, mut target) = Builder.build().await.unwrap();
@@ -1557,7 +1752,12 @@ mod tests {
         // A fresh SQLite connection must observe the full final applied batch,
         // including replay rotation and the chunks referenced by the snapshot.
         let reopened = Db::open(&_guard.0.join("raft.sqlite")).unwrap();
-        let persisted = reopened.get::<MachineData>("machine").unwrap().unwrap();
+        let reader = Machine {
+            db: reopened,
+            engine: machine.engine.clone(),
+            data: AsyncMutex::new(MachineData::default()),
+        };
+        let persisted = reader.restored_state().unwrap();
         assert_eq!(persisted.applied.unwrap().index, 256);
         assert_eq!(persisted.replay_epoch, 1);
         assert_eq!(persisted.replay_admissions, 0);
@@ -1589,6 +1789,122 @@ mod tests {
         );
         assert_eq!(restored.replay_epoch, persisted.replay_epoch);
     }
+    #[tokio::test]
+    async fn incremental_journal_migrates_checkpoint_and_preserves_newer_tail() {
+        let (_guard, db, mut machine) = Builder.build().await.unwrap();
+        let stage = |index, bytes: &[u8]| Entry {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+            payload: EntryPayload::Normal(Command {
+                id: format!("stage-{index}"),
+                epoch: 0,
+                action: Action::StageChunk {
+                    hex: hex::encode(bytes),
+                },
+            }),
+        };
+        // An existing full-machine record remains a valid migration base.
+        db.set("machine", &MachineData::default()).unwrap();
+        machine.apply([stage(1, b"first")]).await.unwrap();
+        let first = machine.data.lock().await.clone();
+        machine.apply([stage(2, b"second")]).await.unwrap();
+        db.checkpoint(&first, false).unwrap();
+        let restored = machine.restored_state().unwrap();
+        assert_eq!(restored.applied.unwrap().index, 2);
+        assert_eq!(restored.blobs.len(), 2);
+        assert_eq!(
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM machine_deltas", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+        db.checkpoint(&restored, false).unwrap();
+        db.checkpoint(&first, false).unwrap(); // Late older snapshot cannot regress base.
+        assert_eq!(machine.restored_state().unwrap().applied.unwrap().index, 2);
+        assert_eq!(
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM machine_deltas", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        let image = machine.build_snapshot().await.unwrap();
+        let (_other, target_db, mut target) = Builder.build().await.unwrap();
+        target.apply([stage(1, b"unrelated")]).await.unwrap();
+        target
+            .install_snapshot(&image.meta, image.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(target.restored_state().unwrap().blobs.len(), 2);
+        assert_eq!(
+            target_db
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM machine_deltas", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    #[tokio::test]
+    async fn sqlite_log_reader_filters_bounds_before_deserializing() {
+        let (_guard, mut db, _) = Builder.build().await.unwrap();
+        {
+            let c = db.conn.lock().unwrap();
+            c.execute("INSERT INTO logs(idx,entry) VALUES(0,'not JSON')", [])
+                .unwrap();
+            for i in 1..=5u64 {
+                let entry = Entry::<Types> {
+                    log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), i),
+                    payload: EntryPayload::Blank,
+                };
+                c.execute(
+                    "INSERT INTO logs(idx,entry) VALUES(?,?)",
+                    params![i, serde_json::to_string(&entry).unwrap()],
+                )
+                .unwrap();
+            }
+        }
+        let found = db.try_get_log_entries(2..5).await.unwrap();
+        assert_eq!(
+            found.iter().map(|v| v.log_id.index).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert_eq!(db.try_get_log_entries(5..=5).await.unwrap().len(), 1);
+        assert!(db.try_get_log_entries(3..3).await.unwrap().is_empty());
+        assert!(db
+            .try_get_log_entries((Bound::Excluded(u64::MAX), Bound::Unbounded))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+    #[test]
+    fn append_byte_budget_keeps_one_valid_large_entry() {
+        let large = Entry::<Types> {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
+            payload: EntryPayload::Normal(Command {
+                id: "large".into(),
+                epoch: 0,
+                action: Action::Put {
+                    volume: "v".into(),
+                    path: "f".into(),
+                    hex: "00".repeat(MAX_INLINE_BYTES),
+                    at: "t".into(),
+                },
+            }),
+        };
+        assert_eq!(append_prefix(std::slice::from_ref(&large)).unwrap(), 1);
+        let blank = Entry::<Types> {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 2),
+            payload: EntryPayload::Blank,
+        };
+        assert_eq!(append_prefix(&[large, blank]).unwrap(), 1);
+    }
     #[test]
     fn raft_storage_contract() {
         openraft::testing::Suite::test_all(Builder).unwrap();
@@ -1611,14 +1927,17 @@ mod tests {
             payload: EntryPayload::Normal(command.clone()),
         };
         sm.apply([entry]).await.unwrap();
-        let persisted = db.get::<MachineData>("machine").unwrap().unwrap();
+        let persisted = sm.restored_state().unwrap();
         let reopened = Db::open(&_guard.0.join("raft.sqlite")).unwrap();
         assert_eq!(
-            reopened
-                .get::<MachineData>("machine")
-                .unwrap()
-                .unwrap()
-                .applied,
+            Machine {
+                db: reopened,
+                engine: sm.engine.clone(),
+                data: AsyncMutex::new(MachineData::default())
+            }
+            .restored_state()
+            .unwrap()
+            .applied,
             persisted.applied
         );
         let (_target_guard, _, mut target) = Builder.build().await.unwrap();
