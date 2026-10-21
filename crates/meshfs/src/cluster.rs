@@ -19,7 +19,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt::Debug,
     io::{self, Read, Seek, SeekFrom, Write},
     ops::RangeBounds,
@@ -29,8 +29,13 @@ use std::{
 use tokio::sync::Mutex as AsyncMutex;
 
 pub const MAX_INLINE_BYTES: usize = 16 * 1024 * 1024;
+const REPLAY_EPOCH_ADMISSIONS: u64 = 256;
+// Up to 1 TiB of distinct canonical chunks may await a file manifest.
+const RECENT_STAGED_BLOBS: usize = 262_144;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Action {
+    /// A replicated read, outside replay admission and deduplication.
+    ReplayEpoch,
     Live(crate::live::Commit),
     /// Replicate one durable immutable block before publishing file metadata.
     StageChunk {
@@ -67,6 +72,8 @@ pub enum Action {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Command {
     pub id: String,
+    #[serde(default)]
+    pub epoch: u64,
     pub action: Action,
 }
 openraft::declare_raft_types!(pub Types: D = Command, R = Value, SnapshotData = tokio::fs::File);
@@ -115,7 +122,7 @@ impl ClusterConfig {
     }
     fn fingerprint(&self) -> String {
         sha256_digest(
-            &serde_json::to_vec(&("meshfs-live-v2-preconditions", &self.cluster, &self.peers))
+            &serde_json::to_vec(&("meshfs-live-v3-epochs", &self.cluster, &self.peers))
                 .expect("serializable topology"),
         )
     }
@@ -264,13 +271,24 @@ struct MachineData {
     volumes: HashMap<String, Volume>,
     snapshots: Vec<FileSnapshot>,
     seen: BTreeMap<String, (String, Value)>,
-    // Staged blocks remain referenced even if an upload is interrupted. No GC.
+    // Metadata retains active/snapshot references and bounded recent staging.
+    // Physical CAS deletion is deliberately separate from replay admission.
     #[serde(default)]
     blobs: BTreeMap<String, usize>,
     #[serde(default)]
     live_ops: BTreeMap<String, (String, Value)>,
     #[serde(default)]
     live_revision: u64,
+    #[serde(default)]
+    replay_epoch: u64,
+    #[serde(default)]
+    replay_admissions: u64,
+    #[serde(default)]
+    recent_staging: VecDeque<String>,
+    #[serde(default)]
+    seen_epochs: BTreeMap<String, u64>,
+    #[serde(default)]
+    live_op_epochs: BTreeMap<String, u64>,
 }
 pub struct Machine {
     db: Db,
@@ -284,6 +302,60 @@ impl Machine {
         s.snapshots = data.snapshots.clone();
     }
     fn execute(&self, s: &mut MachineData, c: &Command) -> SResult<Value> {
+        if matches!(&c.action, Action::ReplayEpoch) {
+            return Ok(json!({"epoch":s.replay_epoch}));
+        }
+        // Fence before either command-ID or live-operation deduplication. A
+        // forgotten operation can never acquire authority in a newer epoch.
+        if (c.epoch != s.replay_epoch && c.epoch.checked_add(1) != Some(s.replay_epoch))
+            || matches!(&c.action, Action::Live(change) if change.epoch != c.epoch)
+        {
+            return Ok(json!({"error":"live replay epoch expired"}));
+        }
+        let digest = sha256_digest(&serde_json::to_vec(&c.action).map_err(se)?);
+        if let Some((previous, result)) = s.seen.get(&c.id) {
+            return Ok(if previous == &digest {
+                result.clone()
+            } else {
+                json!({"error":"operation ID reused for different content"})
+            });
+        }
+        // Refuse before applying anything if the final epoch cannot rotate.
+        if s.replay_admissions >= REPLAY_EPOCH_ADMISSIONS - 1 && s.replay_epoch == u64::MAX {
+            return Ok(json!({"error":"live replay epoch exhausted"}));
+        }
+        let result = self.execute_action(s, c)?;
+        s.replay_admissions += 1;
+        if s.replay_admissions >= REPLAY_EPOCH_ADMISSIONS {
+            s.replay_epoch = s
+                .replay_epoch
+                .checked_add(1)
+                .expect("epoch checked before admission");
+            s.replay_admissions = 0;
+            let oldest = s.replay_epoch - 1;
+            s.seen
+                .retain(|id, _| s.seen_epochs.get(id).copied().unwrap_or(0) >= oldest);
+            s.seen_epochs.retain(|id, _| s.seen.contains_key(id));
+            s.live_ops
+                .retain(|id, _| s.live_op_epochs.get(id).copied().unwrap_or(0) >= oldest);
+            s.live_op_epochs.retain(|id, _| s.live_ops.contains_key(id));
+            Self::prune_blob_metadata(s);
+        }
+        Ok(result)
+    }
+    fn prune_blob_metadata(s: &mut MachineData) {
+        let mut retained: BTreeSet<String> = s.recent_staging.iter().cloned().collect();
+        for inode in s
+            .volumes
+            .values()
+            .flat_map(|v| v.files.values())
+            .chain(s.snapshots.iter().flat_map(|v| v.files_tree.values()))
+        {
+            retained.extend(inode.chunks.iter().map(|c| c.id.clone()));
+        }
+        s.blobs.retain(|id, _| retained.contains(id));
+    }
+    fn execute_action(&self, s: &mut MachineData, c: &Command) -> SResult<Value> {
         let digest = sha256_digest(&serde_json::to_vec(&c.action).map_err(se)?);
         if let Some((previous, result)) = s.seen.get(&c.id) {
             return Ok(if previous == &digest {
@@ -293,6 +365,7 @@ impl Machine {
             });
         }
         let result = match &c.action {
+            Action::ReplayEpoch => unreachable!("epoch reads bypass admission"),
             Action::Live(change) => {
                 if let Some((hash, result)) = s.live_ops.get(&change.id) {
                     return Ok(if hash == &change.hash {
@@ -350,6 +423,7 @@ impl Machine {
                 let result = json!({"ok":true});
                 s.live_ops
                     .insert(change.id.clone(), (change.hash.clone(), result.clone()));
+                s.live_op_epochs.insert(change.id.clone(), c.epoch);
                 result
             }
             Action::StageChunk { hex } => {
@@ -358,7 +432,14 @@ impl Machine {
                     return Err(se("oversized staged chunk"));
                 }
                 let id = self.engine.chunk_store.write_chunk(&bytes).map_err(se)?;
-                s.blobs.insert(id.clone(), bytes.len());
+                let existed = s.blobs.insert(id.clone(), bytes.len()).is_some();
+                if existed {
+                    s.recent_staging.retain(|previous| previous != &id);
+                }
+                s.recent_staging.push_back(id.clone());
+                while s.recent_staging.len() > RECENT_STAGED_BLOBS {
+                    s.recent_staging.pop_front();
+                }
                 json!(id)
             }
             Action::CommitFile { volume, inode } => {
@@ -369,7 +450,9 @@ impl Machine {
                 {
                     return Ok(json!({"error":"live file requires precondition"}));
                 }
-                validate_layout(inode, &s.blobs)?;
+                if let Err(e) = validate_layout(inode, &s.blobs) {
+                    return Ok(json!({"error":e.to_string()}));
+                }
                 let v = s.volumes.entry(volume.clone()).or_insert_with(|| {
                     let mut v = Volume::new(volume);
                     v.created_at = inode.updated_at.clone();
@@ -460,6 +543,7 @@ impl Machine {
             }
         };
         s.seen.insert(c.id.clone(), (digest, result.clone()));
+        s.seen_epochs.insert(c.id.clone(), c.epoch);
         Ok(result)
     }
     fn snapshot_file(&self) -> SResult<std::fs::File> {
@@ -860,18 +944,6 @@ impl Cluster {
             if bytes.is_empty() {
                 return Err("empty staged chunk".into());
             }
-            let id = format!("sha256:{}", sha256_digest(&bytes));
-            let already_committed = self.machine.data.lock().await.blobs.contains_key(&id);
-            if already_committed {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    self.raft.ensure_linearizable(),
-                )
-                .await
-                .map_err(|_| "quorum deadline exceeded".to_string())?
-                .map_err(|e| e.to_string())?;
-                return Ok(json!(id));
-            }
         }
         if let Action::Put { hex, .. } = &c.action {
             if hex.len() > MAX_INLINE_BYTES * 2 || hex::decode(hex).is_err() {
@@ -896,7 +968,25 @@ impl Cluster {
                 .map_err(err)?
                 .as_nanos()
         );
-        let command = Command { id, action };
+        let epoch = match &action {
+            Action::ReplayEpoch => 0,
+            Action::Live(change) => change.epoch,
+            _ => self
+                .dispatch(Command {
+                    id: format!("{id}-epoch"),
+                    epoch: 0,
+                    action: Action::ReplayEpoch,
+                })
+                .await?
+                .get("epoch")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| err("invalid replay epoch response"))?,
+        };
+        // The prepared command remains immutable across transport uncertainty.
+        // A rollover is an explicit conflict, never an automatic fresh retry.
+        self.dispatch(Command { id, epoch, action }).await
+    }
+    async fn dispatch(&self, command: Command) -> io::Result<Value> {
         let (leader, node) = self.leader()?;
         let value = if leader == self.config.node_id {
             self.local_write(command).await.map_err(err)?
@@ -1121,6 +1211,239 @@ mod tests {
             Ok((Cleanup(dir), db, sm))
         }
     }
+    fn epoch_command(s: &MachineData, id: impl Into<String>, action: Action) -> Command {
+        Command {
+            id: id.into(),
+            epoch: s.replay_epoch,
+            action,
+        }
+    }
+    fn empty_live(s: &MachineData, id: &str, remove: bool) -> Command {
+        let expected = s
+            .volumes
+            .get("v")
+            .and_then(|v| v.files.get("f"))
+            .map(crate::live::version);
+        let inode = (!remove).then(|| Inode {
+            revision: 0,
+            path: "f".into(),
+            size: 0,
+            digest: crate::live::digest(0, &[]),
+            chunks_count: 0,
+            chunks: vec![],
+            updated_at: id.into(),
+        });
+        epoch_command(
+            s,
+            id,
+            Action::Live(crate::live::Commit {
+                id: id.into(),
+                epoch: s.replay_epoch,
+                hash: id.into(),
+                volume: "v".into(),
+                path: "f".into(),
+                expected,
+                inode,
+                rename: None,
+                destination: None,
+                probe: false,
+            }),
+        )
+    }
+    #[tokio::test]
+    async fn expired_create_cannot_resurrect_and_recent_retry_is_stable() {
+        let (_guard, _, machine) = Builder.build().await.unwrap();
+        let mut s = MachineData::default();
+        let create = empty_live(&s, "original-create", false);
+        machine.execute(&mut s, &create).unwrap();
+        let remove = empty_live(&s, "original-delete", true);
+        machine.execute(&mut s, &remove).unwrap();
+        for i in 0..600 {
+            let command = empty_live(&s, &format!("cycle-{i}"), i % 2 == 1);
+            machine.execute(&mut s, &command).unwrap();
+            assert!(s.seen.len() <= 512);
+            assert!(s.live_ops.len() <= 512);
+            assert_eq!(s.seen.len(), s.seen_epochs.len());
+            assert_eq!(s.live_ops.len(), s.live_op_epochs.len());
+        }
+        assert_eq!(s.replay_epoch, 2);
+        assert!(!s.volumes["v"].files.contains_key("f"));
+        assert_eq!(
+            machine.execute(&mut s, &create).unwrap()["error"],
+            "live replay epoch expired"
+        );
+        assert!(!s.volumes["v"].files.contains_key("f"));
+        let recent = empty_live(&s, "recent-create", false);
+        machine.execute(&mut s, &recent).unwrap();
+        let revision = s.live_revision;
+        let admissions = s.replay_admissions;
+        machine.execute(&mut s, &recent).unwrap();
+        assert_eq!(s.live_revision, revision);
+        assert_eq!(s.replay_admissions, admissions);
+        let query = Command {
+            id: recent.id.clone(),
+            epoch: u64::MAX,
+            action: Action::ReplayEpoch,
+        };
+        assert_eq!(machine.execute(&mut s, &query).unwrap()["epoch"], 2);
+        assert_eq!(s.replay_admissions, admissions);
+        let mut mismatched = recent;
+        mismatched.id = "different-command".into();
+        if let Action::Live(change) = &mut mismatched.action {
+            change.epoch = 1;
+        }
+        assert_eq!(
+            machine.execute(&mut s, &mismatched).unwrap()["error"],
+            "live replay epoch expired"
+        );
+    }
+    #[tokio::test]
+    async fn replay_epoch_and_previous_generation_survive_durable_snapshot() {
+        let (_guard, db, mut machine) = Builder.build().await.unwrap();
+        let mut commands = Vec::new();
+        for i in 0..300u64 {
+            commands.push(Entry {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), i + 1),
+                payload: EntryPayload::Normal(Command {
+                    id: format!("admission-{i}"),
+                    epoch: i / 256,
+                    action: Action::DeleteVolume {
+                        name: "absent".into(),
+                    },
+                }),
+            });
+        }
+        machine.apply(commands).await.unwrap();
+        let persisted = db.get::<MachineData>("machine").unwrap().unwrap();
+        assert_eq!(persisted.replay_epoch, 1);
+        assert_eq!(persisted.replay_admissions, 44);
+        let (_other, _, mut target) = Builder.build().await.unwrap();
+        let image = machine.build_snapshot().await.unwrap();
+        target
+            .install_snapshot(&image.meta, image.snapshot)
+            .await
+            .unwrap();
+        let mut s = target.data.lock().await;
+        assert_eq!(s.replay_epoch, 1);
+        let before = s.replay_admissions;
+        let previous = Command {
+            id: "admission-255".into(),
+            epoch: 0,
+            action: Action::DeleteVolume {
+                name: "absent".into(),
+            },
+        };
+        assert_eq!(target.execute(&mut s, &previous).unwrap(), json!(false));
+        assert_eq!(s.replay_admissions, before);
+        // The global file revision never resets when history rotates.
+        s.live_revision = 1000;
+        let command = empty_live(&s, "post-restore", false);
+        target.execute(&mut s, &command).unwrap();
+        assert_eq!(s.live_revision, 1001);
+    }
+    #[tokio::test]
+    async fn blob_pruning_keeps_current_snapshot_and_pending_references() {
+        let (_guard, _, machine) = Builder.build().await.unwrap();
+        let mut s = MachineData::default();
+        for (id, action) in [
+            (
+                "first",
+                Action::Put {
+                    volume: "snap".into(),
+                    path: "f".into(),
+                    hex: hex::encode(b"snapshot"),
+                    at: "t".into(),
+                },
+            ),
+            (
+                "snapshot",
+                Action::Snapshot {
+                    volume: "snap".into(),
+                    name: "kept".into(),
+                    id: "snapshot-id".into(),
+                    at: "t".into(),
+                },
+            ),
+            (
+                "remove",
+                Action::DeleteVolume {
+                    name: "snap".into(),
+                },
+            ),
+            (
+                "current",
+                Action::Put {
+                    volume: "current".into(),
+                    path: "f".into(),
+                    hex: hex::encode(b"current"),
+                    at: "t".into(),
+                },
+            ),
+            (
+                "pending",
+                Action::StageChunk {
+                    hex: hex::encode(b"pending"),
+                },
+            ),
+        ] {
+            let command = epoch_command(&s, id, action);
+            machine.execute(&mut s, &command).unwrap();
+        }
+        let pending = s.recent_staging.back().unwrap().clone();
+        // Simulate an aged unreferenced block without writing 1 TiB of payload.
+        let aged = machine.engine.chunk_store.write_chunk(b"aged").unwrap();
+        s.blobs.insert(aged.clone(), 4);
+        for i in 0..256 {
+            let command = epoch_command(
+                &s,
+                format!("advance-{i}"),
+                Action::DeleteVolume {
+                    name: "absent".into(),
+                },
+            );
+            machine.execute(&mut s, &command).unwrap();
+        }
+        assert!(!s.blobs.contains_key(&aged));
+        assert!(s.blobs.contains_key(&pending));
+        for inode in s
+            .volumes
+            .values()
+            .flat_map(|v| v.files.values())
+            .chain(s.snapshots.iter().flat_map(|v| v.files_tree.values()))
+        {
+            assert!(validate_layout(inode, &s.blobs).is_ok());
+            for c in &inode.chunks {
+                machine.engine.chunk_store.read_chunk(&c.id).unwrap();
+            }
+        }
+        let invalid = Inode {
+            revision: 0,
+            path: "aged".into(),
+            size: 4,
+            digest: format!("sha256:{}", sha256_digest(b"aged")),
+            chunks_count: 1,
+            chunks: vec![ChunkRef {
+                id: aged,
+                size: 4,
+                offset: 0,
+            }],
+            updated_at: "t".into(),
+        };
+        let command = epoch_command(
+            &s,
+            "expired-staging",
+            Action::CommitFile {
+                volume: "current".into(),
+                inode: invalid,
+            },
+        );
+        assert!(machine
+            .execute(&mut s, &command)
+            .unwrap()
+            .get("error")
+            .is_some());
+        assert!(!s.volumes["current"].files.contains_key("aged"));
+    }
     #[test]
     fn raft_storage_contract() {
         openraft::testing::Suite::test_all(Builder).unwrap();
@@ -1130,6 +1453,7 @@ mod tests {
         let (_guard, db, mut sm) = Builder.build().await.unwrap();
         let command = Command {
             id: "write-1".into(),
+            epoch: 0,
             action: Action::Put {
                 volume: "default".into(),
                 path: "test.txt".into(),
@@ -1172,6 +1496,7 @@ mod tests {
         assert_eq!(before, state.volumes["default"].merkle_root);
         let reused = Command {
             id: command.id,
+            epoch: command.epoch,
             action: Action::DeleteVolume {
                 name: "default".into(),
             },

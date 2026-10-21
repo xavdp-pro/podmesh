@@ -28,6 +28,9 @@ pub struct Precondition {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
+    /// Immutable replay generation captured before reading preconditions.
+    #[serde(default)]
+    pub epoch: Option<u64>,
     pub id: String,
     pub volume: String,
     pub path: String,
@@ -39,6 +42,7 @@ pub struct Request {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Commit {
+    pub epoch: u64,
     pub id: String,
     pub hash: String,
     pub volume: String,
@@ -115,6 +119,10 @@ impl MeshFSEngine {
         }
         Ok(out)
     }
+    pub async fn live_replay_epoch(&self) -> io::Result<Value> {
+        self.cluster.get().ok_or_else(|| io::Error::other("cluster required"))?
+            .write(Action::ReplayEpoch).await
+    }
     pub async fn live_apply(&self, r: Request) -> io::Result<Value> {
         if r.id.is_empty()
             || r.id.len() > 160
@@ -134,6 +142,12 @@ impl MeshFSEngine {
             .cluster
             .get()
             .ok_or_else(|| io::Error::other("live access requires an explicit cluster"))?;
+        let epoch = r.epoch.ok_or_else(|| io::Error::other("live replay epoch required"))?;
+        let current = self.live_replay_epoch().await?["epoch"].as_u64()
+            .ok_or_else(|| io::Error::other("invalid replay epoch response"))?;
+        if epoch > current || current - epoch > 1 {
+            return Err(io::Error::other("live replay epoch expired"));
+        }
         let hash = sha256_digest(&serde_json::to_vec(&r).map_err(io::Error::other)?);
         let expected = r
             .base
@@ -157,6 +171,7 @@ impl MeshFSEngine {
                 // original precondition is no longer current. Probe cannot mutate.
                 return cluster
                     .write(Action::Live(Commit {
+                        epoch,
                         id: r.id.clone(),
                         hash: hash.clone(),
                         volume: r.volume.clone(),
@@ -220,6 +235,7 @@ impl MeshFSEngine {
             inode.digest = digest(inode.size, &inode.chunks);
             inode.updated_at = chrono::Utc::now().to_rfc3339();
             let commit = Commit {
+                epoch,
                 id: r.id.clone(),
                 hash: hash.clone(),
                 volume: r.volume.clone(),

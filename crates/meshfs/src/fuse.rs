@@ -130,6 +130,11 @@ impl LiveFs {
     }
     fn mutate(&mut self, name: &str, operation: live::Operation) -> Result<(), i32> {
         self.sequence += 1;
+        // Capture once, before preconditions. Never rebind a timed-out mutation
+        // to a newer generation; an expired request must surface ESTALE.
+        let raw = self.call("GET", "files/replay-epoch", &[], None)?;
+        let epoch = serde_json::from_slice::<Value>(&raw).map_err(|_| libc::EIO)?
+            .get("epoch").and_then(Value::as_u64).ok_or(libc::EIO)?;
         let base = Some(self.base(name)?);
         let destination = if let live::Operation::Rename { to } = &operation {
             Some(self.base(to)?)
@@ -137,6 +142,7 @@ impl LiveFs {
             None
         };
         let body = serde_json::to_value(live::Request {
+            epoch: Some(epoch),
             id: format!("{}-{}", self.session, self.sequence),
             volume: self.volume.clone(),
             path: name.into(),

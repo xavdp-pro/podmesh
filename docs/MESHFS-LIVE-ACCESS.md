@@ -9,7 +9,7 @@ adapter, not production VM storage or a complete POSIX filesystem.
 
 Writes stage immutable 64 KiB blocks through the quorum log, then atomically
 compare and replace the inode. Acknowledgement follows durable replication.
-A stable semantic request ID makes transport retries idempotent. Reads obtain a
+A stable semantic request ID makes transport retries idempotent within the retained replay generations. Reads obtain a
 quorum-checked inode and verify each immutable block. The client tries all
 configured peers on transport/quorum failures within a bounded 20-second
 failover deadline, retaining the semantic request ID even when a response body
@@ -35,7 +35,9 @@ QEMU/Proxmox remains responsible for VMs.
 
 ## Versioned mutations and uncertain outcomes
 
-Each live mutation carries an explicit immutable source precondition in `base`:
+Each live mutation carries an immutable `epoch` obtained from
+`GET /api/v1/meshfs/files/replay-epoch` **before** reading its source precondition,
+and an explicit immutable source precondition in `base`:
 `{"version":"<inode-version>"}`, or `{"version":null}` for an absent file.
 The inode version combines a durable, cluster-wide monotonic revision with its
 digest and timestamp. Rename also requires `destination` with the captured
@@ -45,14 +47,16 @@ reuse of a pathname's old version.
 
 The FUSE client captures these versions once before its first send and retains
 the same body and semantic request ID through transport retries. It never
-refreshes a failed write's precondition to force it through. Missing required
-preconditions return HTTP 428; an obsolete version returns HTTP 409. The FUSE
+refreshes a failed write's precondition to force it through. Missing an epoch or required
+preconditions returns HTTP 428; an obsolete version returns HTTP 409. The FUSE
 adapter reports these conflicts as `ESTALE`. Legacy inline and streaming upload
 paths reject replacement of an existing live inode with HTTP 409; they cannot
 bypass the versioned live interface.
 
-A byte-identical retry of an already committed semantic request returns its
-original success without applying it again, even after a newer mutation. A
+Within a retained epoch, a byte-identical retry of an already committed semantic
+request returns its original success without applying it again, even after a
+newer mutation. Once its epoch expires, the retry returns HTTP 409 instead of
+reapplying it; reconcile uncertain outcomes. A
 never-committed delayed request with an obsolete version is rejected, including
 after a new client mount. A zero-length write currently returns without storing
 a deduplication record; a subsequent retry can report conflict after intervening
@@ -64,7 +68,29 @@ caller timed out. Reconcile uncertain outcomes before recovering a writer.
 Version comparison protects newer acknowledged mutations; it does not provide
 exclusive writer leases, session expiry or distributed locking.
 
-The topology fingerprint uses `meshfs-live-v2-preconditions`. All peers and live
+## Bounded historical metadata
+
+Every 256 mutating command admissions, a durable monotonic replay epoch advances.
+The current and immediately previous epoch remain admissible; this grace permits
+an operation staged across one rollover to complete. Older or future epochs are
+rejected before either deduplication lookup. Epochs, admission counters and entry
+generations are part of the replicated state and snapshots. Request epochs and
+preconditions are never refreshed during transport retries. The generic Raft
+command envelope is fenced too. A delayed create cannot reacquire authority just
+because its pathname was deleted and its old dedup record was purged.
+
+Each command-result and live-operation cache retains at most 512 entries.
+Staged-block metadata retains all current and named-snapshot references, plus a
+recent window of 262144 distinct staged block IDs; pruning occurs on rollover,
+so up to 256 further admissions can be present between prunes. This is a bound
+on historical overhead, not a fixed bound on useful live data or snapshots.
+Staging more unique unreferenced blocks than that window before publishing an
+inode can expire its staging references and makes commit fail explicitly. For
+canonical 4 MiB chunks the window represents 1 TiB of distinct pending data;
+concurrent uploads share it. Physical CAS blocks are not deleted by this change:
+CAS disk-space reclamation is separate work.
+
+The topology fingerprint uses `meshfs-live-v3-epochs`. All peers and live
 clients must use the corresponding protocol. Mixed-version operation and an
 in-place upgrade of an older cluster are not qualified. This change does not
 establish production VM storage readiness or a complete backup/restore contract.

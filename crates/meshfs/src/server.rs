@@ -118,6 +118,7 @@ pub fn create_router(engine: MeshFSEngine) -> Router {
         // Bounded experimental live file access.
         .route("/api/v1/meshfs/files/inode", get(live_inode_handler))
         .route("/api/v1/meshfs/files/range", get(live_range_handler))
+        .route("/api/v1/meshfs/files/replay-epoch", get(live_replay_epoch_handler))
         .route("/api/v1/meshfs/files/live", post(live_mutation_handler))
         // Files download / upload routes
         .route("/files/download", get(download_file_handler))
@@ -469,6 +470,7 @@ fn unavailable(e: impl std::fmt::Display) -> Response {
     (
         if e.to_string().contains("live compare conflict")
             || e.to_string().contains("live file requires precondition")
+            || e.to_string().contains("live replay epoch expired")
         {
             StatusCode::CONFLICT
         } else {
@@ -614,11 +616,17 @@ async fn live_range_handler(
         Err(e) => unavailable(e),
     }
 }
+async fn live_replay_epoch_handler(State(e): State<MeshFSEngine>) -> Response {
+    match e.live_replay_epoch().await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => unavailable(e),
+    }
+}
 async fn live_mutation_handler(
     State(e): State<MeshFSEngine>,
     Json(r): Json<crate::live::Request>,
 ) -> Response {
-    if r.base.is_none()
+    if r.epoch.is_none() || r.base.is_none()
         || (matches!(r.operation, crate::live::Operation::Rename { .. }) && r.destination.is_none())
     {
         return (
