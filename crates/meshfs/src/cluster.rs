@@ -106,6 +106,7 @@ struct SlowEvent {
     thread: std::thread::ThreadId,
     sequence: u64,
     dropped: u64,
+    count: u64,
 }
 fn slow_diagnostics() -> Option<&'static SlowDiagnostics> {
     static DIAG: std::sync::OnceLock<Option<SlowDiagnostics>> = std::sync::OnceLock::new();
@@ -119,9 +120,9 @@ fn slow_diagnostics() -> Option<&'static SlowDiagnostics> {
             let mut output = std::io::stderr();
             for event in receiver {
                 if writeln!(output,
-                    "meshfs_slow_phase seq={} op={} phase={} start_us={} elapsed_us={} thread={:?} dropped={}",
+                    "meshfs_slow_phase seq={} op={} phase={} start_us={} elapsed_us={} thread={:?} dropped={} count={}",
                     event.sequence, event.operation, event.phase, event.start_us,
-                    event.elapsed_us, event.thread, event.dropped).is_err() {
+                    event.elapsed_us, event.thread, event.dropped, event.count).is_err() {
                     break;
                 }
             }
@@ -140,19 +141,30 @@ struct SlowPhase {
     operation: &'static str,
     phase: &'static str,
     start: Option<std::time::Instant>,
+    minimum: std::time::Duration,
+    count: u64,
 }
 impl SlowPhase {
     fn new(operation: &'static str, phase: &'static str) -> Self {
         let diagnostic = slow_diagnostics();
-        Self { diagnostic, operation, phase, start: diagnostic.map(|_| std::time::Instant::now()) }
+        Self { diagnostic, operation, phase, start: diagnostic.map(|_| std::time::Instant::now()), minimum: std::time::Duration::ZERO, count: 0 }
     }
+    fn with_count(mut self, count: usize) -> Self {
+        self.count = count as u64;
+        self
+    }
+    fn with_minimum(mut self, minimum: std::time::Duration) -> Self {
+        self.minimum = minimum;
+        self
+    }
+
 }
 impl Drop for SlowPhase {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         if let (Some(diagnostic), Some(start)) = (self.diagnostic, self.start) {
             let elapsed = start.elapsed();
-            if elapsed < diagnostic.threshold {
+            if elapsed < diagnostic.threshold.max(self.minimum) {
                 return;
             }
             let sequence = match diagnostic.attempted.fetch_update(Relaxed, Relaxed, |value| {
@@ -166,7 +178,7 @@ impl Drop for SlowPhase {
                 start_us: start.duration_since(diagnostic.start).as_micros().min(u64::MAX as u128) as u64,
                 elapsed_us: elapsed.as_micros().min(u64::MAX as u128) as u64,
                 thread: std::thread::current().id(), sequence,
-                dropped: diagnostic.dropped.load(Relaxed),
+                dropped: diagnostic.dropped.load(Relaxed), count: self.count,
             };
             if diagnostic.sender.try_send(event).is_err() {
                 diagnostic.dropped.fetch_add(1, Relaxed);
@@ -615,7 +627,10 @@ impl Machine {
         Ok(state)
     }
     async fn mirror(&self, data: &MachineData) {
+        let wait = SlowPhase::new("mirror", "engine_state_wait");
         let mut s = self.engine.state.write().await;
+        drop(wait);
+        let _clone = SlowPhase::new("mirror", "clone_metadata");
         s.volumes = data.volumes.clone();
         s.snapshots = data.snapshots.clone();
     }
@@ -674,6 +689,7 @@ impl Machine {
         Ok(result)
     }
     fn prune_blob_metadata(s: &mut MachineData) {
+        let _prune = SlowPhase::new("stage_metadata", "prune").with_count(s.blobs.len());
         let mut retained: BTreeSet<String> = s.recent_staging.iter().cloned().collect();
         for inode in s
             .volumes
@@ -763,7 +779,10 @@ impl Machine {
                 if bytes.len() > CHUNK_SIZE {
                     return Err(se("oversized staged chunk"));
                 }
+                let write = SlowPhase::new("stage_chunk", "cas_write").with_count(1);
                 let id = self.engine.chunk_store.write_chunk(&bytes).map_err(se)?;
+                drop(write);
+                let _metadata = SlowPhase::new("stage_chunk", "metadata").with_count(1);
                 let existed = s.blobs.insert(id.clone(), bytes.len()).is_some();
                 if existed {
                     s.recent_staging.retain(|previous| previous != &id);
@@ -932,12 +951,13 @@ impl RaftStateMachine<Types> for Arc<Machine> {
         // SQLite commit must finish before acknowledgement, but must not block
         // Tokio's RPC/election/timer workers while doing so.
         let out = tokio::task::spawn_blocking(move || {
-            let state_wait = SlowPhase::new("apply", "state_mutex_wait");
+            let state_wait = SlowPhase::new("apply", "state_mutex_wait").with_count(entries.len());
             let mut s = machine.data.blocking_lock();
             drop(state_wait);
-            let execute = SlowPhase::new("apply", "execute_batch");
+            let execute = SlowPhase::new("apply", "execute_batch").with_count(entries.len());
             let mut out = Vec::with_capacity(entries.len());
             for e in &entries {
+                let _entry = SlowPhase::new("apply", "execute_entry").with_count(1);
                 let value = match &e.payload {
                     EntryPayload::Blank => Value::Null,
                     EntryPayload::Membership(m) => {
@@ -950,13 +970,16 @@ impl RaftStateMachine<Types> for Arc<Machine> {
                 out.push(value);
             }
             drop(execute);
-            let _persist = SlowPhase::new("apply", "persist_total");
+            let _persist = SlowPhase::new("apply", "persist_total").with_count(entries.len());
             machine.db.persist_apply(&entries, s.applied)?;
             Ok::<_, StorageError<u64>>(out)
         })
         .await
         .map_err(se)??;
+        let state_wait = SlowPhase::new("apply", "mirror_state_wait").with_count(out.len());
         let s = self.data.lock().await;
+        drop(state_wait);
+        let _mirror = SlowPhase::new("apply", "mirror_total").with_count(out.len());
         self.mirror(&s).await;
         Ok(out)
     }
@@ -1362,6 +1385,14 @@ impl Cluster {
                 return Err("invalid or oversized file payload".into());
             }
         }
+        let operation = if matches!(&c.action, Action::StageChunk { .. }) {
+            "client_stage"
+        } else {
+            "client_other"
+        };
+        let _wait = SlowPhase::new(operation, "raft_client_write_wait")
+            .with_minimum(std::time::Duration::from_secs(1))
+            .with_count(1);
         tokio::time::timeout(std::time::Duration::from_secs(3), self.raft.client_write(c))
             .await
             .map_err(|_| {
@@ -2099,6 +2130,34 @@ mod tests {
         assert_eq!(append_prefix(&[large, blank]).unwrap(), 1);
     }
     #[test]
+    fn slow_client_minimum_preserves_budget_and_emits_count() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        use std::time::{Duration, Instant};
+        let (sender, receiver) = std::sync::mpsc::sync_channel(256);
+        let now = Instant::now();
+        let diagnostic = Box::leak(Box::new(SlowDiagnostics {
+            sender, start: now - Duration::from_secs(10),
+            threshold: Duration::from_millis(50),
+            attempted: AtomicU64::new(0), dropped: AtomicU64::new(0),
+        }));
+        let mut normal = SlowPhase::new("client_stage", "raft_client_write_wait")
+            .with_minimum(Duration::from_secs(1)).with_count(1);
+        normal.diagnostic = Some(diagnostic);
+        normal.start = Some(Instant::now());
+        drop(normal);
+        assert_eq!(diagnostic.attempted.load(Relaxed), 0);
+        assert!(receiver.try_recv().is_err());
+        let mut slow = SlowPhase::new("client_stage", "raft_client_write_wait")
+            .with_minimum(Duration::from_secs(1)).with_count(7);
+        slow.diagnostic = Some(diagnostic);
+        slow.start = Some(now - Duration::from_secs(2));
+        drop(slow);
+        let event = receiver.try_recv().unwrap();
+        assert_eq!(event.count, 7);
+        assert!(event.elapsed_us >= 2_000_000);
+        assert_eq!(diagnostic.attempted.load(Relaxed), 1);
+    }
+    #[test]
     fn slow_phase_queue_and_total_emission_are_bounded() {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         let (sender, receiver) = std::sync::mpsc::sync_channel(256);
@@ -2113,6 +2172,7 @@ mod tests {
             drop(SlowPhase {
                 diagnostic: Some(diagnostic), operation: "test", phase: "bounded",
                 start: Some(std::time::Instant::now()),
+                minimum: std::time::Duration::ZERO, count: 0,
             });
         }
         assert_eq!(diagnostic.attempted.load(Relaxed), 10_000);
@@ -2122,6 +2182,7 @@ mod tests {
         drop(SlowPhase {
             diagnostic: Some(diagnostic), operation: "test", phase: "bounded",
             start: Some(std::time::Instant::now()),
+            minimum: std::time::Duration::ZERO, count: 0,
         });
         assert!(receiver.try_recv().is_err());
     }
