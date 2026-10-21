@@ -28,7 +28,7 @@ use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
 pub const MAX_INLINE_BYTES: usize = 16 * 1024 * 1024;
 const REPLAY_EPOCH_ADMISSIONS: u64 = 256;
@@ -139,6 +139,7 @@ impl ClusterConfig {
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
+    log_io: Arc<Semaphore>,
 }
 impl Db {
     fn open(path: &Path) -> io::Result<Self> {
@@ -146,7 +147,25 @@ impl Db {
         c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY,v TEXT NOT NULL); CREATE TABLE IF NOT EXISTS logs(idx INTEGER PRIMARY KEY,entry TEXT NOT NULL); CREATE TABLE IF NOT EXISTS machine_deltas(last_idx INTEGER PRIMARY KEY,entries TEXT NOT NULL);").map_err(err)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(c)),
+            log_io: Arc::new(Semaphore::new(1)),
         })
+    }
+    // One shared admission lane across storage/read clones. The permit lives
+    // inside the blocking task, so caller cancellation cannot release the lane
+    // while its SQLite work (or durable-completion callback) is still running.
+    async fn log_io<T, F>(&self, work: F) -> SResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Db) -> SResult<T> + Send + 'static,
+    {
+        let permit = self.log_io.clone().acquire_owned().await.map_err(se)?;
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work(db)
+        })
+        .await
+        .map_err(se)?
     }
     fn get<T: DeserializeOwned>(&self, k: &str) -> SResult<Option<T>> {
         let c = self.conn.lock().map_err(se)?;
@@ -269,93 +288,117 @@ impl RaftLogReader<Types> for Db {
         if start > end {
             return Ok(vec![]);
         }
-        let c = self.conn.lock().map_err(se)?;
-        let mut q = c
-            .prepare("SELECT entry FROM logs WHERE idx>=? AND idx<=? ORDER BY idx")
-            .map_err(se)?;
-        let rows = q
-            .query_map(params![start, end], |r| r.get::<_, String>(0))
-            .map_err(se)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(serde_json::from_str(&row.map_err(se)?).map_err(se)?);
-        }
-        Ok(out)
+        self.log_io(move |db| {
+            let c = db.conn.lock().map_err(se)?;
+            let mut q = c
+                .prepare("SELECT entry FROM logs WHERE idx>=? AND idx<=? ORDER BY idx")
+                .map_err(se)?;
+            let rows = q
+                .query_map(params![start, end], |r| r.get::<_, String>(0))
+                .map_err(se)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(serde_json::from_str(&row.map_err(se)?).map_err(se)?);
+            }
+            Ok(out)
+        })
+        .await
     }
 }
 impl RaftLogStorage<Types> for Db {
     type LogReader = Self;
     async fn get_log_state(&mut self) -> SResult<LogState<Types>> {
-        let purged: Option<LogId<u64>> = self.get("purged")?;
-        let c = self.conn.lock().map_err(se)?;
-        let row: Option<String> = c
-            .query_row(
-                "SELECT entry FROM logs ORDER BY idx DESC LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(se)?;
-        let last = match row {
-            Some(s) => Some(serde_json::from_str::<Entry<Types>>(&s).map_err(se)?.log_id),
-            None => purged,
-        };
-        Ok(LogState {
-            last_purged_log_id: purged,
-            last_log_id: last,
+        self.log_io(move |db| {
+            let purged: Option<LogId<u64>> = db.get("purged")?;
+            let c = db.conn.lock().map_err(se)?;
+            let row: Option<String> = c
+                .query_row(
+                    "SELECT entry FROM logs ORDER BY idx DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(se)?;
+            let last = match row {
+                Some(s) => Some(serde_json::from_str::<Entry<Types>>(&s).map_err(se)?.log_id),
+                None => purged,
+            };
+            Ok(LogState {
+                last_purged_log_id: purged,
+                last_log_id: last,
+            })
         })
+        .await
     }
     async fn get_log_reader(&mut self) -> Self {
+        // No connection access; the reader clone shares the admission lane.
         self.clone()
     }
     async fn save_vote(&mut self, v: &Vote<u64>) -> SResult<()> {
-        self.set("vote", v)
+        let v = v.clone();
+        self.log_io(move |db| db.set("vote", &v)).await
     }
     async fn read_vote(&mut self) -> SResult<Option<Vote<u64>>> {
-        self.get("vote")
+        self.log_io(move |db| db.get("vote")).await
     }
     async fn save_committed(&mut self, v: Option<LogId<u64>>) -> SResult<()> {
-        self.set("committed", &v)
+        self.log_io(move |db| db.set("committed", &v)).await
     }
     async fn read_committed(&mut self) -> SResult<Option<LogId<u64>>> {
-        Ok(self.get::<Option<LogId<u64>>>("committed")?.flatten())
+        self.log_io(move |db| {
+            Ok(db.get::<Option<LogId<u64>>>("committed")?.flatten())
+        })
+        .await
     }
     async fn append<I>(&mut self, entries: I, callback: LogFlushed<Types>) -> SResult<()>
     where
         I: IntoIterator<Item = Entry<Types>> + Send,
         I::IntoIter: Send,
     {
-        {
-            let mut c = self.conn.lock().map_err(se)?;
-            let tx = c.transaction().map_err(se)?;
-            for e in entries {
-                tx.execute("INSERT INTO logs(idx,entry) VALUES(?,?) ON CONFLICT(idx) DO UPDATE SET entry=excluded.entry",params![e.log_id.index,serde_json::to_string(&e).map_err(se)?]).map_err(se)?;
+        // Trait iterators need not be 'static; move owned entries into the task.
+        let entries: Vec<_> = entries.into_iter().collect();
+        self.log_io(move |db| {
+            {
+                let mut c = db.conn.lock().map_err(se)?;
+                let tx = c.transaction().map_err(se)?;
+                for e in entries {
+                    tx.execute("INSERT INTO logs(idx,entry) VALUES(?,?) ON CONFLICT(idx) DO UPDATE SET entry=excluded.entry",params![e.log_id.index,serde_json::to_string(&e).map_err(se)?]).map_err(se)?;
+                }
+                tx.commit().map_err(se)?;
             }
-            tx.commit().map_err(se)?;
-        }
-        callback.log_io_completed(Ok(()));
-        Ok(())
+            // Keep this with the commit: dropping the awaiting future must not
+            // discard the notification after a successful durable append.
+            callback.log_io_completed(Ok(()));
+            Ok(())
+        })
+        .await
     }
     async fn truncate(&mut self, id: LogId<u64>) -> SResult<()> {
-        self.conn
-            .lock()
-            .map_err(se)?
-            .execute("DELETE FROM logs WHERE idx>=?", [id.index])
-            .map_err(se)?;
-        Ok(())
+        self.log_io(move |db| {
+            db.conn
+                .lock()
+                .map_err(se)?
+                .execute("DELETE FROM logs WHERE idx>=?", [id.index])
+                .map_err(se)?;
+            Ok(())
+        })
+        .await
     }
     async fn purge(&mut self, id: LogId<u64>) -> SResult<()> {
-        let mut c = self.conn.lock().map_err(se)?;
-        let tx = c.transaction().map_err(se)?;
-        tx.execute("DELETE FROM logs WHERE idx<=?", [id.index])
+        self.log_io(move |db| {
+            let mut c = db.conn.lock().map_err(se)?;
+            let tx = c.transaction().map_err(se)?;
+            tx.execute("DELETE FROM logs WHERE idx<=?", [id.index])
+                .map_err(se)?;
+            tx.execute(
+                "INSERT INTO meta(k,v) VALUES('purged',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                [serde_json::to_string(&id).map_err(se)?],
+            )
             .map_err(se)?;
-        tx.execute(
-            "INSERT INTO meta(k,v) VALUES('purged',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-            [serde_json::to_string(&id).map_err(se)?],
-        )
-        .map_err(se)?;
-        tx.commit().map_err(se)?;
-        Ok(())
+            tx.commit().map_err(se)?;
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -861,9 +904,11 @@ impl RaftStateMachine<Types> for Arc<Machine> {
 }
 impl RaftSnapshotBuilder<Types> for Arc<Machine> {
     async fn build_snapshot(&mut self) -> SResult<Snapshot<Types>> {
-        let state = self.data.lock().await.clone();
         let machine = self.clone();
         tokio::task::spawn_blocking(move || {
+            // Clone one consistent applied state off Tokio; release its lock
+            // before taking the SQLite connection or streaming CAS content.
+            let state = machine.data.blocking_lock().clone();
             let meta = SnapshotMeta {
                 last_log_id: state.applied,
                 last_membership: state.membership.clone(),
@@ -1923,6 +1968,36 @@ mod tests {
             payload: EntryPayload::Blank,
         };
         assert_eq!(append_prefix(&[large, blank]).unwrap(), 1);
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn raft_storage_mutex_wait_keeps_single_thread_timer_responsive() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let (_guard, mut db, _) = Builder.build().await.unwrap();
+        let held = db.clone();
+        let released = Arc::new(AtomicBool::new(false));
+        let released_by_holder = released.clone();
+        let (ready, locked) = tokio::sync::oneshot::channel();
+        let holder = std::thread::spawn(move || {
+            let connection = held.conn.lock().unwrap();
+            ready.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+            released_by_holder.store(true, Ordering::SeqCst);
+            drop(connection);
+        });
+        locked.await.unwrap();
+        // Poll storage first: the old synchronous lock blocks this sole runtime
+        // thread until release, so the timer's assertion would fail.
+        let (vote, ()) = tokio::join!(biased; db.read_vote(), async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                !released.load(Ordering::SeqCst),
+                "unrelated timer did not progress while storage waited for SQLite"
+            );
+        });
+        assert!(vote.unwrap().is_none());
+        holder.join().unwrap();
     }
     #[test]
     fn raft_storage_contract() {
