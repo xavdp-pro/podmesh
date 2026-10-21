@@ -7,6 +7,24 @@
 > **Perimeter**: P1 (Rule 0A — it holds encryption keys, signing authority and every
 > universe's data, so it is classified before design, not after)
 
+## Rust implementation boundary
+
+The later `crates/pmbs` implementation provides chunk upload/retrieval and
+snapshot manifest storage/listing. It does not establish this design's complete
+backup and restore contract. Its canonical chunk size is 4 MiB, but the current
+HTTP upload route retains Axum's smaller default request-body limit: a canonical
+4 MiB upload is rejected with HTTP 413 before storage. Do not qualify a canonical
+backup by silently splitting it into smaller chunks. End-to-end PMBS restoration
+remains unqualified until the upload path and actual recovery are demonstrated.
+
+`verify_snapshot` currently audits referenced chunk hashes and sizes. Its
+`op10SandboxBootProof` and `QUALIFIED_OP10_BOOT_READY` labels do not represent
+an actual sandbox boot; no VM is launched by that verifier. Actual restored
+application operation needs independent runtime evidence.
+
+The historical design status below applies to the full design, not the mere
+existence of a Rust crate.
+
 Status: design direction, revised four times after independent counter-review; not
 implemented, not validated. Nothing here is qualified.
 
