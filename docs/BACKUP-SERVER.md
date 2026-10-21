@@ -14,18 +14,47 @@ snapshot manifest storage/listing. Its upload route accepts at most the canonica
 4 MiB chunk size, including exactly 4 MiB; larger payloads are rejected with
 HTTP 413. This route-specific limit leaves JSON routes at their default limit.
 
-`verify_snapshot` audits referenced chunk hashes and sizes. Its `ok` and
-`integrityVerified` fields describe that audit only; they do not validate every
-manifest invariant, run a restoration, or establish application consistency.
-`op10SandboxBootProof` is false, `bootReadiness` is `NOT_TESTED`, and both HTTP
-and Unix-socket status report `op10VerifierReady: false`. Actual restored
-application operation needs independent runtime evidence.
+HTTP requires `Authorization: Bearer <token>` on all registered routes. Set
+`PMBS_API_TOKEN` to a private random token of 32..256 printable non-space ASCII
+bytes before starting the daemon or native HTTP CLI. Startup fails closed if
+it is missing or malformed. The default bind is `127.0.0.1`; `--bind` permits
+an explicit address, with a trusted authenticated TLS boundary required for
+remote access. HTTP client redirects are disabled to avoid forwarding credentials.
+This is one administrative bearer, not per-user RBAC or built-in TLS. The local
+control socket is mode0600 and relies on its owner's filesystem boundary.
 
-A caller can store chunks and a snapshot through PMBS APIs, reload the snapshot,
-and retrieve its chunks for restoration. An explicit client must reconstruct
-and hash-check the complete files and restore them into its target. This does
-not add a native automated MeshFS capture/restore command or qualify online
-backups, arbitrary applications, upgrades or the full design below.
+Datastore and snapshot id/type names are single ASCII components, start with an
+alphanumeric character, and contain only letters, digits, `.`, `_`, `-` (at most
+128bytes). Chunk IDs are exactly64lowercasehex digits with an optional `sha256:`
+prefix. Logical file paths must be relative, at most4096bytes, with no empty,
+`.` or `..` components, backslashes, colons or control characters. Storage
+components reject symlinks; read operations use no-follow regular-file opens.
+The data directory and its local owner are trusted administrative configuration.
+
+A snapshot is validated before publication: matching map key/file path, RFC3339
+timestamp, SHA256 identifiers, canonical contiguous chunk layout, chunk/file
+sizes and counts, complete file hashes, and aggregate counters. Referenced
+chunks must already exist and be sound. Callers cannot assert `verified:true`
+or `verifiedAt`. Committed snapshot identities are immutable: an exact retry
+succeeds without replacement, different valid contents return409. Invalid
+manifests return400. Atomic publication cannot overwrite an existing manifest.
+
+`verify_snapshot` now also checks that manifest/content contract. Its `ok` and
+`integrityVerified` describe data/manifest integrity, without executing restore
+or boot or establishing application consistency. `op10SandboxBootProof` remains
+false, `bootReadiness` remains `NOT_TESTED`, and status reports
+`op10VerifierReady:false`. Actual restored application operation requires
+independent runtime evidence.
+
+The HTTP sync endpoint returns403 without connecting to a caller-supplied URL.
+It remains disabled until an outbound destination and credential policy exists.
+This is an intentional compatibility change; no anonymous or arbitrary-URL
+compatibility mode is enabled. Old orchestrators must supply the bearer header.
+
+A client can store chunks and a validated snapshot through PMBS APIs, reload it,
+and retrieve chunks for restoration. This does not add a native automated
+MeshFS capture/restore command or qualify online backups, arbitrary applications,
+upgrades or the full design below.
 
 The historical design status below applies to the full design, not the mere
 existence of a Rust crate.
