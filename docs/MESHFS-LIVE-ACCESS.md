@@ -124,3 +124,12 @@ An existing valid indivisible command may travel alone above that budget. Its
 existing size limits and the 250 ms AppendEntries timeout still apply; this is
 not a guarantee of full-size payload latency. The mutation deadline remains three
 seconds, and a timeout still requires reconciliation before any retry.
+
+
+Raft log readers and storage operations run in awaited blocking jobs admitted
+through one shared FIFO lane across connection clones. SQLite mutex waiting and
+FULL commits therefore do not occupy Tokio workers. The admission permit and
+append completion callback stay with the blocking job through durable commit,
+even if its awaiting future is dropped. Snapshot state cloning also runs off
+Tokio. This preserves the persisted format; it does not guarantee that storage
+contention or snapshot installation cannot exceed an operation deadline.
