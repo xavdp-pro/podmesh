@@ -10,17 +10,22 @@
 ## Rust implementation boundary
 
 The later `crates/pmbs` implementation provides chunk upload/retrieval and
-snapshot manifest storage/listing. It does not establish this design's complete
-backup and restore contract. Its canonical chunk size is 4 MiB, but the current
-HTTP upload route retains Axum's smaller default request-body limit: a canonical
-4 MiB upload is rejected with HTTP 413 before storage. Do not qualify a canonical
-backup by silently splitting it into smaller chunks. End-to-end PMBS restoration
-remains unqualified until the upload path and actual recovery are demonstrated.
+snapshot manifest storage/listing. Its upload route accepts at most the canonical
+4 MiB chunk size, including exactly 4 MiB; larger payloads are rejected with
+HTTP 413. This route-specific limit leaves JSON routes at their default limit.
 
-`verify_snapshot` currently audits referenced chunk hashes and sizes. Its
-`op10SandboxBootProof` and `QUALIFIED_OP10_BOOT_READY` labels do not represent
-an actual sandbox boot; no VM is launched by that verifier. Actual restored
+`verify_snapshot` audits referenced chunk hashes and sizes. Its `ok` and
+`integrityVerified` fields describe that audit only; they do not validate every
+manifest invariant, run a restoration, or establish application consistency.
+`op10SandboxBootProof` is false, `bootReadiness` is `NOT_TESTED`, and both HTTP
+and Unix-socket status report `op10VerifierReady: false`. Actual restored
 application operation needs independent runtime evidence.
+
+A caller can store chunks and a snapshot through PMBS APIs, reload the snapshot,
+and retrieve its chunks for restoration. An explicit client must reconstruct
+and hash-check the complete files and restore them into its target. This does
+not add a native automated MeshFS capture/restore command or qualify online
+backups, arbitrary applications, upgrades or the full design below.
 
 The historical design status below applies to the full design, not the mere
 existence of a Rust crate.
