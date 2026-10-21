@@ -2,7 +2,7 @@
 //!
 //! Provides:
 //! - Content-Addressable Storage (CAS 4MB SHA-256) Datastores
-//! - Op 10 Sandbox Boot Proof verification engine
+//! - Referenced-chunk integrity audit (no sandbox boot proof)
 //! - Inter-site differential replication
 //! - Axum REST API on port 8007
 //! - Unix Domain Socket IPC control

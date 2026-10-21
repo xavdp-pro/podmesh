@@ -1,12 +1,12 @@
 //! PMBS REST API Server (Axum)
 //! Exposes backup endpoints on standard port 8007.
 
-use crate::datastore::{BackupManifest, Datastore};
+use crate::datastore::{BackupManifest, Datastore, CHUNK_SIZE};
 use crate::sync::sync_from_remote;
 use crate::verify::verify_snapshot;
 use axum::{
     body::Body,
-    extract::{Path as AxPath, State},
+    extract::{DefaultBodyLimit, Path as AxPath, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -82,7 +82,7 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/datastores/:datastore/chunks",
-            post(upload_chunk_handler),
+            post(upload_chunk_handler).layer(DefaultBodyLimit::max(CHUNK_SIZE)),
         )
         .route(
             "/api/v1/datastores/:datastore/verify",
@@ -108,7 +108,7 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
         version: "2.1.0".to_string(),
         datastores: names,
         dedup_engine: "SHA-256 CAS 4MB (Pure Rust)".to_string(),
-        op10_verifier_ready: true,
+        op10_verifier_ready: false,
         remote_sync_enabled: true,
     })
 }

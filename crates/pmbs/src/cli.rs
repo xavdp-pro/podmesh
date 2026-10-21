@@ -13,7 +13,7 @@ pub const DEFAULT_SOCKET: &str = "/var/lib/pmbs/pmbs.sock";
     author = "Xavier DP <xavier@xavdp.pro>",
     version = "2.1.0",
     about = "PodMesh Backup Server (PMBS) — Enterprise Deduplicated Backup Server in Pure Rust",
-    long_about = "High-performance PBS-alternative backup server for PodMesh and sovereign servers.\nFeatures 4MB SHA-256 CAS chunk deduplication, Op 10 Sandbox Boot Proof verification, and inter-site sync."
+    long_about = "High-performance PBS-alternative backup server for PodMesh and sovereign servers.\nFeatures 4MB SHA-256 CAS chunk deduplication, referenced-chunk integrity verification (no boot proof), and inter-site sync."
 )]
 pub struct Cli {
     /// Enable verbose debug logging
@@ -38,7 +38,7 @@ pub enum Commands {
     /// Datastore management commands
     Datastore(DatastoreCommand),
 
-    /// Verify backup snapshots and Op 10 Sandbox Boot Proof
+    /// Audit referenced backup chunks (does not restore or boot workloads)
     Verify(VerifyArgs),
 
     /// Trigger inter-site differential replication

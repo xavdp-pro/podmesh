@@ -83,7 +83,7 @@ pub async fn start_control_socket(state: AppState, socket_path: PathBuf) -> std:
                                         "version": "2.1.0",
                                         "datastores": names,
                                         "dedupEngine": "SHA-256 CAS 4MB (Pure Rust)",
-                                        "op10VerifierReady": true,
+                                        "op10VerifierReady": false,
                                         "remoteSyncEnabled": true
                                     })
                                 }

@@ -1,15 +1,16 @@
-//! PMBS Backup Verification & Op 10 Sandbox Boot Proof Engine
-//! Audits backup snapshots for complete cryptographic integrity and validates
-//! operational boot readiness in an isolated sandbox.
+//! PMBS referenced-chunk integrity audit.
+//! This verifier does not boot workloads or establish restoration readiness.
 
 use crate::datastore::{Datastore, BackupManifest};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-/// Result of an Op 10 Sandbox Boot Verification.
+/// Result of a referenced-chunk integrity audit; boot remains untested.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationReport {
     pub ok: bool,
+    #[serde(rename = "integrityVerified")]
+    pub integrity_verified: bool,
     #[serde(rename = "backupId")]
     pub backup_id: String,
     #[serde(rename = "datastore")]
@@ -29,7 +30,7 @@ pub struct VerificationReport {
     pub message: String,
 }
 
-/// Executes thorough integrity audit and Op 10 boot readiness check on a snapshot.
+/// Checks referenced chunk hashes and sizes, without executing a restore or boot.
 pub fn verify_snapshot(datastore: &Datastore, manifest: &BackupManifest) -> VerificationReport {
     let mut chunks_audited = 0;
     let mut chunks_corrupted = Vec::new();
@@ -60,38 +61,24 @@ pub fn verify_snapshot(datastore: &Datastore, manifest: &BackupManifest) -> Veri
     }
 
     let is_crypto_sound = chunks_missing.is_empty() && chunks_corrupted.is_empty();
-    let op10_passed = is_crypto_sound && chunks_audited > 0;
-    let readiness = if op10_passed {
-        "QUALIFIED_OP10_BOOT_READY".to_string()
-    } else if is_crypto_sound && chunks_audited == 0 {
-        "EMPTY_SNAPSHOT".to_string()
+    let integrity_verified = is_crypto_sound && chunks_audited > 0;
+    let message = if integrity_verified {
+        format!("Referenced chunk integrity verified ({} chunks); restore and boot not tested.", chunks_audited)
     } else {
-        "CORRUPTED_FAILOVER_BLOCKED".to_string()
-    };
-
-    let message = if op10_passed {
-        format!(
-            "Preuve Op 10 Sandbox Boot Restore VALIDÉE avec succès ({} chunks CAS audités sans corruption).",
-            chunks_audited
-        )
-    } else {
-        format!(
-            "Échec de validation : {} chunks manquants, {} chunks corrompus.",
-            chunks_missing.len(),
-            chunks_corrupted.len()
-        )
+        format!("Chunk integrity not verified: {} missing, {} corrupted, {} audited; boot not tested.", chunks_missing.len(), chunks_corrupted.len(), chunks_audited)
     };
 
     VerificationReport {
-        ok: op10_passed,
+        ok: integrity_verified,
+        integrity_verified,
         backup_id: manifest.id.clone(),
         datastore: datastore.name.clone(),
         verified_at: Utc::now().to_rfc3339(),
         chunks_audited,
         chunks_corrupted,
         chunks_missing,
-        op10_sandbox_boot_proof: op10_passed,
-        boot_readiness: readiness,
+        op10_sandbox_boot_proof: false,
+        boot_readiness: "NOT_TESTED".to_string(),
         message,
     }
 }
@@ -102,7 +89,7 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn test_verification_engine_op10_proof() {
+    fn test_chunk_integrity_never_claims_boot_proof() {
         let tmp_dir = std::env::temp_dir().join(format!("pmbs-verify-test-{}", std::process::id()));
         let ds = Datastore::new(&tmp_dir, "backup-tank").unwrap();
 
@@ -118,7 +105,7 @@ mod tests {
                 digest: format!("sha256:{}", crate::datastore::sha256_digest(raw)),
                 chunks_count: 1,
                 chunks: vec![crate::datastore::ChunkRef {
-                    id: chunk_id,
+                    id: chunk_id.clone(),
                     size: raw.len(),
                     offset: 0,
                 }],
@@ -140,10 +127,21 @@ mod tests {
 
         let report = verify_snapshot(&ds, &manifest);
         assert!(report.ok);
-        assert!(report.op10_sandbox_boot_proof);
-        assert_eq!(report.boot_readiness, "QUALIFIED_OP10_BOOT_READY");
+        assert!(report.integrity_verified);
+        assert!(!report.op10_sandbox_boot_proof);
+        assert_eq!(report.boot_readiness, "NOT_TESTED");
         assert_eq!(report.chunks_audited, 1);
 
+        std::fs::remove_file(ds.chunk_path(&chunk_id)).unwrap();
+        let missing = verify_snapshot(&ds, &manifest);
+        assert!(!missing.ok && !missing.integrity_verified && !missing.op10_sandbox_boot_proof);
+        assert_eq!(missing.boot_readiness, "NOT_TESTED");
+        assert_eq!(missing.chunks_missing.len(), 1);
+        let mut empty = manifest.clone();
+        empty.files.clear();
+        let empty_report = verify_snapshot(&ds, &empty);
+        assert!(!empty_report.integrity_verified && !empty_report.op10_sandbox_boot_proof);
+        assert_eq!(empty_report.boot_readiness, "NOT_TESTED");
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
