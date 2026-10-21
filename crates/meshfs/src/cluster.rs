@@ -611,21 +611,31 @@ impl RaftStateMachine<Types> for Arc<Machine> {
         I::IntoIter: Send,
     {
         let entries: Vec<_> = entries.into_iter().collect();
-        let mut s = self.data.lock().await;
-        let mut out = Vec::new();
-        for e in entries {
-            let value = match e.payload {
-                EntryPayload::Blank => Value::Null,
-                EntryPayload::Membership(m) => {
-                    s.membership = StoredMembership::new(Some(e.log_id), m);
-                    Value::Null
-                }
-                EntryPayload::Normal(c) => self.execute(&mut s, &c)?,
-            };
-            s.applied = Some(e.log_id);
-            out.push(value);
-        }
-        self.db.set("machine", &*s)?;
+        let machine = self.clone();
+        // Raft awaits this ordered batch. CAS I/O, serialization and the FULL
+        // SQLite commit must finish before acknowledgement, but must not block
+        // Tokio's RPC/election/timer workers while doing so.
+        let out = tokio::task::spawn_blocking(move || {
+            let mut s = machine.data.blocking_lock();
+            let mut out = Vec::with_capacity(entries.len());
+            for e in entries {
+                let value = match e.payload {
+                    EntryPayload::Blank => Value::Null,
+                    EntryPayload::Membership(m) => {
+                        s.membership = StoredMembership::new(Some(e.log_id), m);
+                        Value::Null
+                    }
+                    EntryPayload::Normal(c) => machine.execute(&mut s, &c)?,
+                };
+                s.applied = Some(e.log_id);
+                out.push(value);
+            }
+            machine.db.set("machine", &*s)?;
+            Ok::<_, StorageError<u64>>(out)
+        })
+        .await
+        .map_err(se)??;
+        let s = self.data.lock().await;
         self.mirror(&s).await;
         Ok(out)
     }
@@ -881,12 +891,16 @@ impl Cluster {
         let raft_config = openraft::Config {
             cluster_name: config.cluster.clone(),
             heartbeat_interval: 250,
-            max_payload_entries: 1,
+            // Batch committed traffic instead of forcing one RPC per entry.
+            max_payload_entries: 32,
             install_snapshot_timeout: 120_000,
             snapshot_max_chunk_size: 256 * 1024,
             election_timeout_min: 800,
             election_timeout_max: 1600,
-            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(64),
+            // Each snapshot streams all retained CAS references. Do not rebuild
+            // it every 64 staged blocks; keep the lag threshold above cadence.
+            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(16_384),
+            replication_lag_threshold: 32_768,
             max_in_snapshot_log_to_keep: 32,
             ..Default::default()
         }
@@ -1495,6 +1509,85 @@ mod tests {
             .get("error")
             .is_some());
         assert!(!s.volumes["current"].files.contains_key("aged"));
+    }
+    #[tokio::test]
+    async fn batched_apply_is_durable_before_return_and_retains_snapshot_chunks() {
+        let (_guard, _, mut machine) = Builder.build().await.unwrap();
+        let mut actions = vec![
+            Action::Put {
+                volume: "v".into(),
+                path: "f".into(),
+                hex: hex::encode(b"before"),
+                at: "t".into(),
+            },
+            Action::Snapshot {
+                volume: "v".into(),
+                name: "kept".into(),
+                id: "kept-id".into(),
+                at: "t".into(),
+            },
+        ];
+        for i in 0..254 {
+            actions.push(Action::Put {
+                volume: "v".into(),
+                path: "f".into(),
+                hex: hex::encode(format!("after-{i}")),
+                at: "t".into(),
+            });
+        }
+        let entries = actions
+            .into_iter()
+            .enumerate()
+            .map(|(i, action)| Entry {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), i as u64 + 1),
+                payload: EntryPayload::Normal(Command {
+                    id: format!("batch-{i}"),
+                    epoch: 0,
+                    action,
+                }),
+            })
+            .collect::<Vec<_>>();
+        let results = machine.apply(entries).await.unwrap();
+        assert_eq!(results.len(), 256);
+        assert_eq!(results[1]["name"], "kept");
+        assert_eq!(
+            results[255]["digest"],
+            format!("sha256:{}", sha256_digest(b"after-253"))
+        );
+        // A fresh SQLite connection must observe the full final applied batch,
+        // including replay rotation and the chunks referenced by the snapshot.
+        let reopened = Db::open(&_guard.0.join("raft.sqlite")).unwrap();
+        let persisted = reopened.get::<MachineData>("machine").unwrap().unwrap();
+        assert_eq!(persisted.applied.unwrap().index, 256);
+        assert_eq!(persisted.replay_epoch, 1);
+        assert_eq!(persisted.replay_admissions, 0);
+        assert_eq!(persisted.blobs.len(), 2);
+        assert_eq!(persisted.snapshots.len(), 1);
+        assert_eq!(
+            machine.engine.local_get_file("v", "f").await.unwrap(),
+            b"after-253"
+        );
+        let (_other, _, mut target) = Builder.build().await.unwrap();
+        let image = machine.build_snapshot().await.unwrap();
+        target
+            .install_snapshot(&image.meta, image.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            target.engine.local_get_file("v", "f").await.unwrap(),
+            b"after-253"
+        );
+        let restored = target.data.lock().await;
+        let inode = &restored.snapshots[0].files_tree["f"];
+        assert_eq!(
+            target
+                .engine
+                .chunk_store
+                .read_chunk(&inode.chunks[0].id)
+                .unwrap(),
+            b"before"
+        );
+        assert_eq!(restored.replay_epoch, persisted.replay_epoch);
     }
     #[test]
     fn raft_storage_contract() {
