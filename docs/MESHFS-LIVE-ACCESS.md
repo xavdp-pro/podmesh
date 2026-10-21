@@ -100,3 +100,27 @@ The topology fingerprint uses `meshfs-live-v3-epochs`. All peers and live
 clients must use the corresponding protocol. Mixed-version operation and an
 in-place upgrade of an older cluster are not qualified. This change does not
 establish production VM storage readiness or a complete backup/restore contract.
+
+
+## Durable apply journal and replication batches
+
+Applied Raft batches are persisted in a separate SQLite journal with their applied
+marker in one FULL transaction before acknowledgement. Recovery reconstructs the
+full machine from its checkpoint and ordered journal tail. Snapshot checkpoints
+consolidate only covered batches; snapshot installation atomically replaces the
+base and clears the previous tail. Legacy full-machine checkpoints remain valid
+recovery bases. Do not interpret the checkpoint alone as current applied state.
+The delta journal stores the applied command entries, including staged payload
+bytes, until a checkpoint consolidates them. Size disk reserves for this journal
+as well as CAS and retained Raft logs; small-object tests do not qualify
+full-size payload storage or throughput.
+Downgrading an active journal-backed store to a binary that ignores that journal
+is unsupported; retain a consistent backup rather than replacing the binary.
+
+Log reads select the requested index range in SQL. Replication splits multi-entry
+batches above a 10 MiB serialized-entry budget using OpenRaft's size hint, without
+changing the requested log-reader range. The request envelope adds a small amount.
+An existing valid indivisible command may travel alone above that budget. Its
+existing size limits and the 250 ms AppendEntries timeout still apply; this is
+not a guarantee of full-size payload latency. The mutation deadline remains three
+seconds, and a timeout still requires reconciliation before any retry.
