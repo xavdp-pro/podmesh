@@ -86,7 +86,7 @@ pub async fn start_control_socket(state: AppState, socket_path: PathBuf) -> std:
                                         "datastores": names,
                                         "dedupEngine": "SHA-256 CAS 4MB (Pure Rust)",
                                         "op10VerifierReady": false,
-                                        "remoteSyncEnabled": true
+                                        "remoteSyncEnabled": false
                                     })
                                 }
                                 Ok(ControlRequest::Verify { datastore, snapshot_id }) => {

@@ -130,7 +130,7 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
         datastores: names,
         dedup_engine: "SHA-256 CAS 4MB (Pure Rust)".to_string(),
         op10_verifier_ready: false,
-        remote_sync_enabled: true,
+        remote_sync_enabled: false,
     })
 }
 
