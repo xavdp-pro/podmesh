@@ -101,9 +101,9 @@ export default function TechnicalShowcasePage() {
             <button ref={menuRef} type="button" onClick={() => isDesktop ? setDesktopMenu(!desktopExpanded) : setMobileOpen(true)} aria-label={isDesktop && desktopExpanded ? copy.close : copy.menu} aria-expanded={isDesktop ? desktopExpanded : mobileOpen} aria-controls={isDesktop ? "guide-navigation-desktop" : "guide-navigation"} className="rounded-lg border border-line p-2"><Menu size={18} /></button>
 
             <Link to="/#podmesh" className="site-display text-2xl font-bold">PodMesh</Link>
-            <a href="https://xavdp.pro" className="hidden border-l border-line pl-3 text-sm text-fg-muted sm:block">xavdp.pro</a>
+            <a href="https://xavdp.pro" target="_blank" rel="noopener noreferrer" className="hidden border-l border-line pl-3 text-sm text-fg-muted sm:block">xavdp.pro</a>
           </div>
-          <div className="flex items-center gap-2"><ThemeToggle /><LanguageSwitcher /></div>
+          <div className="flex items-center gap-2"><LanguageSwitcher /><ThemeToggle /></div>
         </div>
       </header>
 
