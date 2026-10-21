@@ -89,6 +89,92 @@ fn se(e: impl std::fmt::Display) -> StorageError<u64> {
     StorageIOError::write_state_machine(&err(e)).into()
 }
 
+// Opt-in diagnostics never write on Raft/Tokio threads. Both queue capacity
+// and total attempted emissions are fixed, including queue-full drops.
+struct SlowDiagnostics {
+    sender: std::sync::mpsc::SyncSender<SlowEvent>,
+    start: std::time::Instant,
+    threshold: std::time::Duration,
+    attempted: std::sync::atomic::AtomicU64,
+    dropped: std::sync::atomic::AtomicU64,
+}
+struct SlowEvent {
+    operation: &'static str,
+    phase: &'static str,
+    start_us: u64,
+    elapsed_us: u64,
+    thread: std::thread::ThreadId,
+    sequence: u64,
+    dropped: u64,
+}
+fn slow_diagnostics() -> Option<&'static SlowDiagnostics> {
+    static DIAG: std::sync::OnceLock<Option<SlowDiagnostics>> = std::sync::OnceLock::new();
+    DIAG.get_or_init(|| {
+        let millis = std::env::var("MESHFS_SLOW_PHASE_MS").ok()?.parse::<u64>().ok()?;
+        if !(1..=60_000).contains(&millis) {
+            return None;
+        }
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<SlowEvent>(256);
+        std::thread::Builder::new().name("meshfs-slow-phases".into()).spawn(move || {
+            let mut output = std::io::stderr();
+            for event in receiver {
+                if writeln!(output,
+                    "meshfs_slow_phase seq={} op={} phase={} start_us={} elapsed_us={} thread={:?} dropped={}",
+                    event.sequence, event.operation, event.phase, event.start_us,
+                    event.elapsed_us, event.thread, event.dropped).is_err() {
+                    break;
+                }
+            }
+        }).ok()?;
+        Some(SlowDiagnostics {
+            sender,
+            start: std::time::Instant::now(),
+            threshold: std::time::Duration::from_millis(millis),
+            attempted: std::sync::atomic::AtomicU64::new(0),
+            dropped: std::sync::atomic::AtomicU64::new(0),
+        })
+    }).as_ref()
+}
+struct SlowPhase {
+    diagnostic: Option<&'static SlowDiagnostics>,
+    operation: &'static str,
+    phase: &'static str,
+    start: Option<std::time::Instant>,
+}
+impl SlowPhase {
+    fn new(operation: &'static str, phase: &'static str) -> Self {
+        let diagnostic = slow_diagnostics();
+        Self { diagnostic, operation, phase, start: diagnostic.map(|_| std::time::Instant::now()) }
+    }
+}
+impl Drop for SlowPhase {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if let (Some(diagnostic), Some(start)) = (self.diagnostic, self.start) {
+            let elapsed = start.elapsed();
+            if elapsed < diagnostic.threshold {
+                return;
+            }
+            let sequence = match diagnostic.attempted.fetch_update(Relaxed, Relaxed, |value| {
+                (value < 10_000).then_some(value + 1)
+            }) {
+                Ok(sequence) => sequence,
+                Err(_) => return,
+            };
+            let event = SlowEvent {
+                operation: self.operation, phase: self.phase,
+                start_us: start.duration_since(diagnostic.start).as_micros().min(u64::MAX as u128) as u64,
+                elapsed_us: elapsed.as_micros().min(u64::MAX as u128) as u64,
+                thread: std::thread::current().id(), sequence,
+                dropped: diagnostic.dropped.load(Relaxed),
+            };
+            if diagnostic.sender.try_send(event).is_err() {
+                diagnostic.dropped.fetch_add(1, Relaxed);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ClusterConfig {
     pub cluster: String,
@@ -143,6 +229,8 @@ pub struct Db {
 }
 impl Db {
     fn open(path: &Path) -> io::Result<Self> {
+        // Initialize the optional writer before Raft starts polling storage.
+        let _ = slow_diagnostics();
         let c = Connection::open(path).map_err(err)?;
         c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY,v TEXT NOT NULL); CREATE TABLE IF NOT EXISTS logs(idx INTEGER PRIMARY KEY,entry TEXT NOT NULL); CREATE TABLE IF NOT EXISTS machine_deltas(last_idx INTEGER PRIMARY KEY,entries TEXT NOT NULL);").map_err(err)?;
         Ok(Self {
@@ -153,22 +241,32 @@ impl Db {
     // One shared admission lane across storage/read clones. The permit lives
     // inside the blocking task, so caller cancellation cannot release the lane
     // while its SQLite work (or durable-completion callback) is still running.
-    async fn log_io<T, F>(&self, work: F) -> SResult<T>
+    async fn log_io<T, F>(&self, operation: &'static str, work: F) -> SResult<T>
     where
         T: Send + 'static,
         F: FnOnce(Db) -> SResult<T> + Send + 'static,
     {
+        let admission = SlowPhase::new(operation, "admission_wait");
         let permit = self.log_io.clone().acquire_owned().await.map_err(se)?;
+        drop(admission);
+        let queued = SlowPhase::new(operation, "blocking_pool_wait");
         let db = self.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            drop(queued);
+            let _work = SlowPhase::new(operation, "blocking_work");
             work(db)
         })
         .await
         .map_err(se)?
     }
+    fn lock_conn(&self, operation: &'static str) -> SResult<std::sync::MutexGuard<'_, Connection>> {
+        let _wait = SlowPhase::new(operation, "db_mutex_wait");
+        self.conn.lock().map_err(se)
+    }
     fn get<T: DeserializeOwned>(&self, k: &str) -> SResult<Option<T>> {
-        let c = self.conn.lock().map_err(se)?;
+        let c = self.lock_conn("get")?;
+        let _sql = SlowPhase::new("meta_get", "sql");
         let s: Option<String> = c
             .query_row("SELECT v FROM meta WHERE k=?", [k], |r| r.get(0))
             .optional()
@@ -176,24 +274,26 @@ impl Db {
         s.map(|s| serde_json::from_str(&s).map_err(se)).transpose()
     }
     fn set<T: Serialize>(&self, k: &str, v: &T) -> SResult<()> {
-        self.conn
-            .lock()
-            .map_err(se)?
-            .execute(
-                "INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-                params![k, serde_json::to_string(v).map_err(se)?],
-            )
-            .map_err(se)?;
+        let c = self.lock_conn("meta_set")?;
+        let _sql = SlowPhase::new("meta_set", "sql");
+        c.execute(
+            "INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            params![k, serde_json::to_string(v).map_err(se)?],
+        )
+        .map_err(se)?;
         Ok(())
     }
     fn persist_apply(&self, entries: &[Entry<Types>], applied: Option<LogId<u64>>) -> SResult<()> {
         if entries.is_empty() {
             return Ok(());
         }
+        let serialize = SlowPhase::new("persist_apply", "serialize");
         let raw = serde_json::to_string(entries).map_err(se)?;
         let marker = serde_json::to_string(&applied).map_err(se)?;
         let last = entries.last().expect("nonempty batch").log_id.index;
-        let mut c = self.conn.lock().map_err(se)?;
+        drop(serialize);
+        let mut c = self.lock_conn("persist_apply")?;
+        let sql = SlowPhase::new("persist_apply", "sql");
         let tx = c.transaction().map_err(se)?;
         tx.execute(
             "INSERT INTO machine_deltas(last_idx,entries) VALUES(?,?)",
@@ -201,13 +301,18 @@ impl Db {
         )
         .map_err(se)?;
         tx.execute("INSERT INTO meta(k,v) VALUES('machine_applied',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", [marker]).map_err(se)?;
+        drop(sql);
+        let _commit = SlowPhase::new("persist_apply", "commit");
         tx.commit().map_err(se)?;
         Ok(())
     }
     fn checkpoint(&self, state: &MachineData, install: bool) -> SResult<()> {
+        let serialize = SlowPhase::new("checkpoint", "serialize");
         let raw = serde_json::to_string(state).map_err(se)?;
         let marker = serde_json::to_string(&state.applied).map_err(se)?;
-        let mut c = self.conn.lock().map_err(se)?;
+        drop(serialize);
+        let mut c = self.lock_conn("checkpoint")?;
+        let sql = SlowPhase::new("checkpoint", "sql");
         let tx = c.transaction().map_err(se)?;
         let base: Option<String> = tx
             .query_row("SELECT v FROM meta WHERE k='machine_base'", [], |r| {
@@ -259,6 +364,8 @@ impl Db {
             tx.execute("DELETE FROM machine_deltas WHERE last_idx<=?", [id.index])
                 .map_err(se)?;
         }
+        drop(sql);
+        let _commit = SlowPhase::new("checkpoint", "commit");
         tx.commit().map_err(se)?;
         Ok(())
     }
@@ -288,8 +395,9 @@ impl RaftLogReader<Types> for Db {
         if start > end {
             return Ok(vec![]);
         }
-        self.log_io(move |db| {
-            let c = db.conn.lock().map_err(se)?;
+        self.log_io("try_get_log_entries", move |db| {
+            let c = db.lock_conn("try_get_log_entries")?;
+            let _sql = SlowPhase::new("try_get_log_entries", "sql");
             let mut q = c
                 .prepare("SELECT entry FROM logs WHERE idx>=? AND idx<=? ORDER BY idx")
                 .map_err(se)?;
@@ -308,9 +416,10 @@ impl RaftLogReader<Types> for Db {
 impl RaftLogStorage<Types> for Db {
     type LogReader = Self;
     async fn get_log_state(&mut self) -> SResult<LogState<Types>> {
-        self.log_io(move |db| {
+        self.log_io("get_log_state", move |db| {
             let purged: Option<LogId<u64>> = db.get("purged")?;
-            let c = db.conn.lock().map_err(se)?;
+            let c = db.lock_conn("get_log_state")?;
+            let _sql = SlowPhase::new("get_log_state", "sql");
             let row: Option<String> = c
                 .query_row(
                     "SELECT entry FROM logs ORDER BY idx DESC LIMIT 1",
@@ -336,16 +445,16 @@ impl RaftLogStorage<Types> for Db {
     }
     async fn save_vote(&mut self, v: &Vote<u64>) -> SResult<()> {
         let v = v.clone();
-        self.log_io(move |db| db.set("vote", &v)).await
+        self.log_io("save_vote", move |db| db.set("vote", &v)).await
     }
     async fn read_vote(&mut self) -> SResult<Option<Vote<u64>>> {
-        self.log_io(move |db| db.get("vote")).await
+        self.log_io("read_vote", move |db| db.get("vote")).await
     }
     async fn save_committed(&mut self, v: Option<LogId<u64>>) -> SResult<()> {
-        self.log_io(move |db| db.set("committed", &v)).await
+        self.log_io("save_committed", move |db| db.set("committed", &v)).await
     }
     async fn read_committed(&mut self) -> SResult<Option<LogId<u64>>> {
-        self.log_io(move |db| {
+        self.log_io("read_committed", move |db| {
             Ok(db.get::<Option<LogId<u64>>>("committed")?.flatten())
         })
         .await
@@ -357,13 +466,16 @@ impl RaftLogStorage<Types> for Db {
     {
         // Trait iterators need not be 'static; move owned entries into the task.
         let entries: Vec<_> = entries.into_iter().collect();
-        self.log_io(move |db| {
+        self.log_io("append", move |db| {
             {
-                let mut c = db.conn.lock().map_err(se)?;
+                let mut c = db.lock_conn("append")?;
+                let sql = SlowPhase::new("append", "sql");
                 let tx = c.transaction().map_err(se)?;
                 for e in entries {
                     tx.execute("INSERT INTO logs(idx,entry) VALUES(?,?) ON CONFLICT(idx) DO UPDATE SET entry=excluded.entry",params![e.log_id.index,serde_json::to_string(&e).map_err(se)?]).map_err(se)?;
                 }
+                drop(sql);
+                let _commit = SlowPhase::new("append", "commit");
                 tx.commit().map_err(se)?;
             }
             // Keep this with the commit: dropping the awaiting future must not
@@ -374,19 +486,19 @@ impl RaftLogStorage<Types> for Db {
         .await
     }
     async fn truncate(&mut self, id: LogId<u64>) -> SResult<()> {
-        self.log_io(move |db| {
-            db.conn
-                .lock()
-                .map_err(se)?
-                .execute("DELETE FROM logs WHERE idx>=?", [id.index])
+        self.log_io("truncate", move |db| {
+            let c = db.lock_conn("truncate")?;
+            let _sql = SlowPhase::new("truncate", "sql");
+            c.execute("DELETE FROM logs WHERE idx>=?", [id.index])
                 .map_err(se)?;
             Ok(())
         })
         .await
     }
     async fn purge(&mut self, id: LogId<u64>) -> SResult<()> {
-        self.log_io(move |db| {
-            let mut c = db.conn.lock().map_err(se)?;
+        self.log_io("purge", move |db| {
+            let mut c = db.lock_conn("purge")?;
+            let sql = SlowPhase::new("purge", "sql");
             let tx = c.transaction().map_err(se)?;
             tx.execute("DELETE FROM logs WHERE idx<=?", [id.index])
                 .map_err(se)?;
@@ -395,6 +507,8 @@ impl RaftLogStorage<Types> for Db {
                 [serde_json::to_string(&id).map_err(se)?],
             )
             .map_err(se)?;
+            drop(sql);
+            let _commit = SlowPhase::new("purge", "commit");
             tx.commit().map_err(se)?;
             Ok(())
         })
@@ -818,7 +932,10 @@ impl RaftStateMachine<Types> for Arc<Machine> {
         // SQLite commit must finish before acknowledgement, but must not block
         // Tokio's RPC/election/timer workers while doing so.
         let out = tokio::task::spawn_blocking(move || {
+            let state_wait = SlowPhase::new("apply", "state_mutex_wait");
             let mut s = machine.data.blocking_lock();
+            drop(state_wait);
+            let execute = SlowPhase::new("apply", "execute_batch");
             let mut out = Vec::with_capacity(entries.len());
             for e in &entries {
                 let value = match &e.payload {
@@ -832,6 +949,8 @@ impl RaftStateMachine<Types> for Arc<Machine> {
                 s.applied = Some(e.log_id);
                 out.push(value);
             }
+            drop(execute);
+            let _persist = SlowPhase::new("apply", "persist_total");
             machine.db.persist_apply(&entries, s.applied)?;
             Ok::<_, StorageError<u64>>(out)
         })
@@ -908,14 +1027,23 @@ impl RaftSnapshotBuilder<Types> for Arc<Machine> {
         tokio::task::spawn_blocking(move || {
             // Clone one consistent applied state off Tokio; release its lock
             // before taking the SQLite connection or streaming CAS content.
-            let state = machine.data.blocking_lock().clone();
+            let state_wait = SlowPhase::new("snapshot", "state_mutex_wait");
+            let guard = machine.data.blocking_lock();
+            drop(state_wait);
+            let clone = SlowPhase::new("snapshot", "clone");
+            let state = guard.clone();
+            drop(guard);
+            drop(clone);
             let meta = SnapshotMeta {
                 last_log_id: state.applied,
                 last_membership: state.membership.clone(),
                 snapshot_id: format!("{:?}", state.applied),
             };
             let mut file = machine.snapshot_file()?;
+            let checkpoint = SlowPhase::new("snapshot", "checkpoint_total");
             machine.db.checkpoint(&state, false)?;
+            drop(checkpoint);
+            let _stream = SlowPhase::new("snapshot", "stream_and_sync");
             let metadata = serde_json::to_vec(&state).map_err(se)?;
             file.write_all(&hex::decode(sha256_digest(&metadata)).map_err(se)?)
                 .map_err(se)?;
@@ -957,6 +1085,7 @@ impl Network {
         path: &str,
         req: Q,
     ) -> Result<R, RPCError<u64, BasicNode, E>> {
+        let _rpc = SlowPhase::new(if path == "snapshot" { "rpc_snapshot" } else { "rpc_other" }, "request_total");
         let response = self
             .client
             .post(format!(
@@ -1968,6 +2097,33 @@ mod tests {
             payload: EntryPayload::Blank,
         };
         assert_eq!(append_prefix(&[large, blank]).unwrap(), 1);
+    }
+    #[test]
+    fn slow_phase_queue_and_total_emission_are_bounded() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let (sender, receiver) = std::sync::mpsc::sync_channel(256);
+        let diagnostic = Box::leak(Box::new(SlowDiagnostics {
+            sender,
+            start: std::time::Instant::now(),
+            threshold: std::time::Duration::ZERO,
+            attempted: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+        }));
+        for _ in 0..10_010 {
+            drop(SlowPhase {
+                diagnostic: Some(diagnostic), operation: "test", phase: "bounded",
+                start: Some(std::time::Instant::now()),
+            });
+        }
+        assert_eq!(diagnostic.attempted.load(Relaxed), 10_000);
+        assert_eq!(diagnostic.dropped.load(Relaxed), 10_000 - 256);
+        assert_eq!(receiver.try_iter().count(), 256);
+        // A drained queue still cannot emit after the process-wide budget.
+        drop(SlowPhase {
+            diagnostic: Some(diagnostic), operation: "test", phase: "bounded",
+            start: Some(std::time::Instant::now()),
+        });
+        assert!(receiver.try_recv().is_err());
     }
     #[tokio::test(flavor = "current_thread")]
     async fn raft_storage_mutex_wait_keeps_single_thread_timer_responsive() {
