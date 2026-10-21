@@ -70,24 +70,30 @@ exclusive writer leases, session expiry or distributed locking.
 
 ## Bounded historical metadata
 
-Every 256 mutating command admissions, a durable monotonic replay epoch advances.
+Every 256 mutable command admissions, a durable monotonic replay epoch advances.
 The current and immediately previous epoch remain admissible; this grace permits
 an operation staged across one rollover to complete. Older or future epochs are
 rejected before either deduplication lookup. Epochs, admission counters and entry
 generations are part of the replicated state and snapshots. Request epochs and
 preconditions are never refreshed during transport retries. The generic Raft
-command envelope is fenced too. A delayed create cannot reacquire authority just
+command envelope is fenced too. Immutable CAS staging uses its own cleanup
+counter and does not advance mutable replay epochs or occupy result caches:
+preparing a large inode cannot expire its own mutation. Its idempotence follows
+from the verified block content address. A delayed create cannot reacquire authority just
 because its pathname was deleted and its old dedup record was purged.
 
 Each command-result and live-operation cache retains at most 512 entries.
 Staged-block metadata retains all current and named-snapshot references, plus a
 recent window of 262144 distinct staged block IDs; pruning occurs on rollover,
-so up to 256 further admissions can be present between prunes. This is a bound
+so up to 1280 additional historical block IDs can occur between prunes
+(the inline legacy path can stage four blocks per admission, alongside up to
+255 independent staging admissions). This is a bound
 on historical overhead, not a fixed bound on useful live data or snapshots.
 Staging more unique unreferenced blocks than that window before publishing an
 inode can expire its staging references and makes commit fail explicitly. For
 canonical 4 MiB chunks the window represents 1 TiB of distinct pending data;
-concurrent uploads share it. Physical CAS blocks are not deleted by this change:
+for 64 KiB live blocks, the window covers the existing 16 GiB live manifest
+limit. Concurrent uploads share it. Physical CAS blocks are not deleted by this change:
 CAS disk-space reclamation is separate work.
 
 The topology fingerprint uses `meshfs-live-v3-epochs`. All peers and live

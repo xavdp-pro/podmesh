@@ -284,6 +284,8 @@ struct MachineData {
     #[serde(default)]
     replay_admissions: u64,
     #[serde(default)]
+    staging_admissions: u64,
+    #[serde(default)]
     recent_staging: VecDeque<String>,
     #[serde(default)]
     seen_epochs: BTreeMap<String, u64>,
@@ -311,6 +313,18 @@ impl Machine {
             || matches!(&c.action, Action::Live(change) if change.epoch != c.epoch)
         {
             return Ok(json!({"error":"live replay epoch expired"}));
+        }
+        // Immutable CAS staging must not age the mutable operation whose
+        // potentially large inode is still being assembled. Its metadata has
+        // its own bounded cleanup cadence, without mutable replay authority.
+        if matches!(&c.action, Action::StageChunk { .. }) {
+            let result = self.execute_action(s, c)?;
+            s.staging_admissions += 1;
+            if s.staging_admissions >= REPLAY_EPOCH_ADMISSIONS {
+                s.staging_admissions = 0;
+                Self::prune_blob_metadata(s);
+            }
+            return Ok(result);
         }
         let digest = sha256_digest(&serde_json::to_vec(&c.action).map_err(se)?);
         if let Some((previous, result)) = s.seen.get(&c.id) {
@@ -357,12 +371,14 @@ impl Machine {
     }
     fn execute_action(&self, s: &mut MachineData, c: &Command) -> SResult<Value> {
         let digest = sha256_digest(&serde_json::to_vec(&c.action).map_err(se)?);
-        if let Some((previous, result)) = s.seen.get(&c.id) {
-            return Ok(if previous == &digest {
-                result.clone()
-            } else {
-                json!({"error":"operation ID reused for different content"})
-            });
+        if !matches!(&c.action, Action::StageChunk { .. }) {
+            if let Some((previous, result)) = s.seen.get(&c.id) {
+                return Ok(if previous == &digest {
+                    result.clone()
+                } else {
+                    json!({"error":"operation ID reused for different content"})
+                });
+            }
         }
         let result = match &c.action {
             Action::ReplayEpoch => unreachable!("epoch reads bypass admission"),
@@ -440,7 +456,7 @@ impl Machine {
                 while s.recent_staging.len() > RECENT_STAGED_BLOBS {
                     s.recent_staging.pop_front();
                 }
-                json!(id)
+                return Ok(json!(id));
             }
             Action::CommitFile { volume, inode } => {
                 if s.volumes
@@ -1249,6 +1265,42 @@ mod tests {
                 probe: false,
             }),
         )
+    }
+    #[tokio::test]
+    async fn immutable_staging_does_not_expire_its_pending_live_commit() {
+        let (_guard, _, machine) = Builder.build().await.unwrap();
+        let mut s = MachineData::default();
+        let commit = empty_live(&s, "pending-live", false);
+        let aged = machine
+            .engine
+            .chunk_store
+            .write_chunk(b"aged-staging")
+            .unwrap();
+        s.blobs.insert(aged.clone(), 12);
+        for i in 0..600 {
+            let command = Command {
+                id: format!("stage-{i}"),
+                epoch: 0,
+                action: Action::StageChunk {
+                    hex: hex::encode(b"z"),
+                },
+            };
+            assert!(machine.execute(&mut s, &command).unwrap().is_string());
+        }
+        assert_eq!(s.replay_epoch, 0);
+        assert_eq!(s.replay_admissions, 0);
+        assert_eq!(s.staging_admissions, 88);
+        assert!(s.seen.is_empty());
+        assert!(s.seen_epochs.is_empty());
+        assert!(s.live_ops.is_empty());
+        assert_eq!(s.recent_staging.len(), 1);
+        assert!(!s.blobs.contains_key(&aged));
+        assert_eq!(
+            machine.execute(&mut s, &commit).unwrap(),
+            json!({"ok":true})
+        );
+        assert!(s.volumes["v"].files.contains_key("f"));
+        assert_eq!(s.replay_admissions, 1);
     }
     #[tokio::test]
     async fn expired_create_cannot_resurrect_and_recent_retry_is_stable() {
