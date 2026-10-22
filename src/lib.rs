@@ -164,7 +164,7 @@ pub fn open_manager_store(config: &StoreConfig) -> Result<ManagerStore, Box<dyn 
         }
         Engine::Mariadb => {
             let mut store = store::open(config)?;
-            migrations::apply_manager(store.as_mut())?;
+            migrations::verify_current_manager(store.as_mut())?;
             migrations::refuse_incomplete_manager_cutover(store.as_mut())?;
             Ok(ManagerStore::Durable(store))
         }
@@ -297,7 +297,7 @@ pub fn open_node_store(
         }
         Engine::Mariadb => {
             let mut store = store::open(config)?;
-            migrations::apply(store.as_mut())?;
+            migrations::verify_current_node(store.as_mut())?;
             migrations::refuse_incomplete_cutover(store.as_mut())?;
             bind_to_this_host(store.as_mut())?;
             NodeStore::Durable(store)

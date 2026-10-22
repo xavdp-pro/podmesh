@@ -147,6 +147,59 @@ impl Applied {
     }
 }
 
+/// Functional MariaDB startup only verifies an already administratively prepared
+/// schema. This path never executes DDL, writes store_schema, or opens a transaction.
+pub fn verify_current_node(store: &mut dyn DurableStore) -> Result<()> {
+    verify_current_set(store,NODE,node_version(),node_tables())
+}
+pub fn verify_current_manager(store: &mut dyn DurableStore) -> Result<()> {
+    verify_current_set(store,MANAGER,manager_version(),manager_tables())
+}
+fn verify_current_set(store:&mut dyn DurableStore,role:&str,latest:i64,required:Vec<&str>)->Result<()> {
+    let tables=store.tables()?;
+    if !tables.iter().any(|t|t==super::SCHEMA_TABLE) {
+        return Err(Fault::Schema.error("store_schema is absent; private root schema preparation is required"));
+    }
+    let before=verified_registry(store,role,latest)?;
+    let mut expected=required;expected.push(super::SCHEMA_TABLE);
+    for table in &expected {
+        if !tables.iter().any(|t|t==table) {
+            return Err(Fault::Schema.error(format!("{role} schema is incomplete: required table {table} is absent; functional startup cannot repair it")));
+        }
+    }
+    if tables.iter().any(|t|!expected.contains(&t.as_str())) {
+        return Err(Fault::Schema.error("private schema contains undeclared or wrong-role tables; no automatic repair is permitted"));
+    }
+    if before!=verified_registry(store,role,latest)? {
+        return Err(Fault::Schema.error("schema registry changed during functional verification"));
+    }
+    let mut after_tables=store.tables()?;let mut before_tables=tables;
+    after_tables.sort();before_tables.sort();
+    if after_tables!=before_tables {
+        return Err(Fault::Schema.error("table inventory changed during functional verification"));
+    }
+    Ok(())
+}
+fn verified_registry(store:&mut dyn DurableStore,role:&str,latest:i64)->Result<Vec<(String,i64)>> {
+    let rows=store.query("SELECT name, version FROM store_schema ORDER BY name",&[])?;
+    let mut found=None;let mut registry=Vec::new();
+    for row in rows {
+        let name=row.text(0)?;let version=row.integer(1)?;
+        if name==CUTOVER || name==MANAGER_CUTOVER {
+            return Err(Fault::Schema.error("offline cutover marker is present/incomplete/unknown; functional startup never clears it"));
+        }
+        if name!=role {
+            return Err(Fault::Schema.error("schema registry names an unknown or different functional role"));
+        }
+        if found.replace(version).is_some() {return Err(Fault::Schema.error("duplicate schema role marker"));}
+        registry.push((name.to_string(),version));
+    }
+    if found!=Some(latest) {
+        return Err(Fault::Schema.error(format!("{role} schema must be exactly version {latest}; missing, old or future schema is refused, never initialized by the application")));
+    }
+    Ok(registry)
+}
+
 /// Bring a store up to the node's current schema, and record which version it now carries.
 pub fn apply(store: &mut dyn DurableStore) -> Result<Applied> {
     apply_set(store, NODE, NODE_MIGRATIONS)
@@ -720,6 +773,79 @@ mod tests {
         assert!(apply_manager(&mut store).unwrap().ran.is_empty());
         for table in MANAGER_INVENTORY.iter().chain([super::super::SCHEMA_TABLE].iter()) {
             store.execute_batch(&format!("DROP TABLE IF EXISTS `{table}`;")).unwrap();
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod private_schema_authority_tests {
+    use super::*;
+    use crate::store::{self,Engine,Integrity,Row,Transaction,Value};
+    use std::sync::Arc;
+    struct ReadOnly {tables:Vec<String>,rows:Vec<(String,Value)>,calls:Vec<String>,change:bool,table_error:bool,table_change:bool}
+    impl DurableStore for ReadOnly {
+        fn engine(&self)->Engine {Engine::Mariadb}
+        fn execute(&mut self,_:&str,_:&[Value])->store::Result<u64>{panic!("functional verifier attempted DML/DDL")}
+        fn execute_batch(&mut self,_:&str)->store::Result<()>{panic!("functional verifier attempted batch/DDL")}
+        fn transaction(&mut self)->store::Result<Box<dyn Transaction+'_>>{panic!("functional verifier opened a transaction")}
+        fn query(&mut self,sql:&str,_:&[Value])->store::Result<Vec<Row>>{
+            assert_eq!(sql,"SELECT name, version FROM store_schema ORDER BY name");
+            let second=self.calls.iter().any(|c|c==sql);self.calls.push(sql.into());
+            let mut rows=self.rows.clone();if self.change&&second{rows[0].1=Value::Integer(9999);}
+            Ok(rows.into_iter().map(|(name,v)|Row::new(Arc::new(vec!["name".into(),"version".into()]),vec![Value::from(name),v])).collect())
+        }
+        fn integrity_check(&mut self)->store::Result<Integrity>{panic!("unexpected integrity operation")}
+        fn tables(&mut self)->store::Result<Vec<String>>{let second=self.calls.iter().any(|c|c=="tables:read");self.calls.push("tables:read".into());if self.table_error{return Err(Fault::Unavailable.error("inventory unavailable"));}let mut tables=self.tables.clone();if second&&self.table_change{tables.pop();}Ok(tables)}
+    }
+    fn fixture(role:&str)->ReadOnly{
+        let (version,tables)=if role==NODE{(node_version(),node_tables())}else{(manager_version(),manager_tables())};
+        ReadOnly{tables:tables.into_iter().chain([store::SCHEMA_TABLE]).map(str::to_string).collect(),
+            rows:vec![(role.into(),Value::Integer(version))],calls:vec![],change:false,table_error:false,table_change:false}
+    }
+    fn verify(role:&str,s:&mut ReadOnly)->store::Result<()>{if role==NODE{verify_current_node(s)}else{verify_current_manager(s)}}
+    #[test]
+    fn private_schema_authority_immutable_migrations_match_required_table_inventory(){
+        let mut node=crate::store::sqlite::SqliteStore::open_in_memory().unwrap();
+        apply(&mut node).unwrap();verify_current_node(&mut node).unwrap();
+        let mut manager=crate::store::sqlite::SqliteStore::open_in_memory().unwrap();
+        apply_manager(&mut manager).unwrap();verify_current_manager(&mut manager).unwrap();
+    }
+    #[test]
+    fn private_schema_authority_current_roles_only_read_inventory_and_versions(){
+        for role in [NODE,MANAGER]{let mut s=fixture(role);verify(role,&mut s).unwrap();
+            assert_eq!(s.calls.len(),4);assert_eq!(s.calls[0],"tables:read");}
+    }
+    #[test]
+    fn private_schema_authority_missing_old_future_or_noninteger_versions_never_initialize(){
+        for role in [NODE,MANAGER]{
+            for version in [Value::Integer(0),Value::Integer(-1),Value::Integer(9999),Value::Text("1".into()),Value::Null]{
+                let mut s=fixture(role);s.rows[0].1=version;assert!(verify(role,&mut s).is_err());
+            }
+            let mut s=fixture(role);s.rows.clear();assert!(verify(role,&mut s).is_err());
+            let mut s=fixture(role);s.tables.retain(|t|t!=store::SCHEMA_TABLE);assert!(verify(role,&mut s).is_err());assert_eq!(s.calls.len(),1);
+            let mut s=fixture(role);s.table_error=true;assert!(verify(role,&mut s).is_err());
+        }
+    }
+    #[test]
+    fn private_schema_authority_wrong_role_cutover_and_unknown_registry_fail_closed(){
+        for role in [NODE,MANAGER]{
+            for name in [if role==NODE{MANAGER}else{NODE},CUTOVER,MANAGER_CUTOVER,"unknown-schema"]{
+                for v in [0,1]{let mut s=fixture(role);s.rows.push((name.into(),Value::Integer(v)));assert!(verify(role,&mut s).is_err());}
+            }
+            let mut s=fixture(role);s.rows.push(s.rows[0].clone());assert!(verify(role,&mut s).is_err());
+        }
+    }
+    #[test]
+    fn private_schema_authority_required_tables_and_stable_registry_are_mandatory(){
+        for role in [NODE,MANAGER]{
+            let initial=fixture(role);
+            for table in initial.tables.iter().filter(|t|t.as_str()!=store::SCHEMA_TABLE){
+                let mut s=fixture(role);s.tables.retain(|t|t!=table);assert!(verify(role,&mut s).is_err(),"{role}/{table}");
+            }
+            let mut s=fixture(role);s.tables.push("foreign-role-data".into());assert!(verify(role,&mut s).is_err());
+            let mut s=fixture(role);s.change=true;assert!(verify(role,&mut s).is_err());
+            let mut s=fixture(role);s.table_change=true;assert!(verify(role,&mut s).is_err());
         }
     }
 }
