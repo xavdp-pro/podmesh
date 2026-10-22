@@ -19,6 +19,7 @@ use std::{
     time::Duration,
 };
 mod contained;
+mod migration_readonly;
 type Error = Box<dyn std::error::Error>;
 pub const SOCKET_ENV: &str = "PODMESH_HOST_ADAPTER_SOCKET";
 const PROTOCOL: &str = "podmesh-host-capability/1";
@@ -909,6 +910,9 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
         | "host_status" | "universe_stats" => &["kind"],
         "inspect" | "start" | "pause" | "unpause" | "rm" | "cgroup_limits"
         | "recovery_bindings" => &["kind", "uuid"],
+        "migration_observe" => &[
+            "kind", "scope", "uuid", "container_id", "image", "creation_operation",
+        ],
         "create" => &[
             "kind",
             "uuid",
@@ -927,6 +931,14 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
     };
     fields(a, allowed)?;
     match kind {
+        // Observation only: no operation intent is bound and no ownership record
+        // is repaired. This does not enable any migration or recovery-point API.
+        "migration_observe" => {
+            if !request["intent"].is_null() {
+                return Err("read-only migration observation refuses an effect intent".into());
+            }
+            return migration_readonly::observe(policy, a);
+        }
         "host_identity" => return host_identity_local(),
         "host_capacity" => return host_capacity(),
         "storage_status" => return crate::storage::status(None),
