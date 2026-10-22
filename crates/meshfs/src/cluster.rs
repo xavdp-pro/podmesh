@@ -89,14 +89,58 @@ fn se(e: impl std::fmt::Display) -> StorageError<u64> {
     StorageIOError::write_state_machine(&err(e)).into()
 }
 
-// Opt-in diagnostics never write on Raft/Tokio threads. Both queue capacity
-// and total attempted emissions are fixed, including queue-full drops.
+// Opt-in diagnostics never write on Raft/Tokio threads. Correlation is an
+// additional opt-in; it shares the same 256-slot queue and 10,000-event budget.
+#[derive(Clone, Copy, Debug, Default)]
+struct Correlation {
+    command: Option<[u8; 32]>,
+    batch: u64,
+    first: [u64; 3], // term, leader node, index (inclusive)
+    last: [u64; 3],
+    entry: Option<[u64; 3]>,
+}
+#[derive(Clone, Copy, Debug, Default)]
+struct DiagnosticStamp {
+    monotonic_ns: u64, // Linux CLOCK_MONOTONIC, common to this guest's processes
+    tid: u64,          // OS TID, never Rust ThreadId
+}
+fn diagnostic_stamp() -> DiagnosticStamp {
+    #[cfg(target_os = "linux")]
+    {
+        // No I/O or heap allocation. Errors are explicitly unavailable (zero).
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let ns = if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
+            (ts.tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(ts.tv_nsec as u64)
+        } else { 0 };
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        DiagnosticStamp { monotonic_ns: ns, tid: if tid > 0 { tid as u64 } else { 0 } }
+    }
+    #[cfg(not(target_os = "linux"))]
+    { DiagnosticStamp::default() }
+}
+fn opaque_command(key: &[u8; 32], command: &Command) -> Option<[u8; 32]> {
+    if command.id.is_empty() || command.id.len() > 256 { return None; }
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"meshfs-diagnostic-command-v1\0");
+    h.update(key);
+    h.update(command.epoch.to_be_bytes());
+    h.update((command.id.len() as u64).to_be_bytes());
+    h.update(command.id.as_bytes());
+    Some(h.finalize().into())
+}
+fn diagnostic_log_id(id: LogId<u64>) -> [u64; 3] {
+    [id.leader_id.term, id.leader_id.node_id, id.index]
+}
 struct SlowDiagnostics {
     sender: std::sync::mpsc::SyncSender<SlowEvent>,
     start: std::time::Instant,
     threshold: std::time::Duration,
-    attempted: std::sync::atomic::AtomicU64,
-    dropped: std::sync::atomic::AtomicU64,
+    attempted: Arc<std::sync::atomic::AtomicU64>,
+    dropped: Arc<std::sync::atomic::AtomicU64>,
+    capped: Arc<std::sync::atomic::AtomicU64>,
+    next_span: std::sync::atomic::AtomicU64,
+    correlation_key: Option<[u8; 32]>,
 }
 struct SlowEvent {
     operation: &'static str,
@@ -107,33 +151,102 @@ struct SlowEvent {
     sequence: u64,
     dropped: u64,
     count: u64,
+    correlation: Option<Correlation>,
+    span: u64,
+    start_stamp: DiagnosticStamp,
+    end_stamp: DiagnosticStamp,
+    outcome: u8, // 0=unspecified/cancelled/error, 1=client OK, 2=Raft error, 3=timeout
+}
+fn write_slow_event(output: &mut impl Write, event: &SlowEvent, totals: [u64; 3]) -> io::Result<()> {
+    let c = event.correlation.unwrap_or_default();
+    let cmd = c.command.map(hex::encode).unwrap_or_else(|| "none".into());
+    let entry = c.entry.unwrap_or([0; 3]);
+    writeln!(output,
+        "meshfs_slow_phase seq={} op={} phase={} start_us={} elapsed_us={} thread={:?} dropped={} count={} correlated={} cmd={} batch={} first_term={} first_node={} first_index={} last_term={} last_node={} last_index={} entry_present={} entry_term={} entry_node={} entry_index={} span={} pid={} clock=linux_monotonic start_ns={} end_ns={} start_tid={} end_tid={} outcome={} attempted={} dropped_now={} capped={}",
+        event.sequence, event.operation, event.phase, event.start_us, event.elapsed_us, event.thread,
+        event.dropped, event.count, u8::from(event.correlation.is_some()), cmd, c.batch,
+        c.first[0], c.first[1], c.first[2], c.last[0], c.last[1], c.last[2],
+        u8::from(c.entry.is_some()), entry[0], entry[1], entry[2], event.span, std::process::id(),
+        event.start_stamp.monotonic_ns, event.end_stamp.monotonic_ns, event.start_stamp.tid,
+        event.end_stamp.tid, event.outcome, totals[0], totals[1], totals[2])
+}
+impl SlowDiagnostics {
+    fn emit(&self, mut event: SlowEvent) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let sequence = match self.attempted.fetch_update(Relaxed, Relaxed, |v| (v < 10_000).then_some(v + 1)) {
+            Ok(v) => v,
+            Err(_) => { self.capped.fetch_add(1, Relaxed); return; }
+        };
+        event.sequence = sequence;
+        event.dropped = self.dropped.load(Relaxed);
+        if self.sender.try_send(event).is_err() { self.dropped.fetch_add(1, Relaxed); }
+    }
+    fn command(&self, command: &Command) -> Option<Correlation> {
+        let key = self.correlation_key.as_ref()?;
+        Some(Correlation { command: Some(opaque_command(key, command)?), ..Correlation::default() })
+    }
+    fn entry(&self, mut batch: Correlation, entry: &Entry<Types>) -> Correlation {
+        batch.entry = Some(diagnostic_log_id(entry.log_id));
+        batch.command = match &entry.payload {
+            EntryPayload::Normal(c) => self.command(c).and_then(|v| v.command),
+            _ => None,
+        };
+        batch
+    }
+    fn batch(&self, entries: &[Entry<Types>]) -> Option<Correlation> {
+        self.correlation_key?;
+        Some(Correlation {
+            batch: self.next_span.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            first: diagnostic_log_id(entries.first()?.log_id),
+            last: diagnostic_log_id(entries.last()?.log_id),
+            ..Correlation::default()
+        })
+    }
 }
 fn slow_diagnostics() -> Option<&'static SlowDiagnostics> {
     static DIAG: std::sync::OnceLock<Option<SlowDiagnostics>> = std::sync::OnceLock::new();
     DIAG.get_or_init(|| {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        use sha2::{Digest, Sha256};
         let millis = std::env::var("MESHFS_SLOW_PHASE_MS").ok()?.parse::<u64>().ok()?;
-        if !(1..=60_000).contains(&millis) {
-            return None;
-        }
+        if !(1..=60_000).contains(&millis) { return None; }
+        // Same cluster token yields the same opaque command key on each peer.
+        // Token/key bytes, command IDs, actions and payloads never enter events.
+        let correlation_requested = std::env::var("MESHFS_CORRELATION").as_deref() == Ok("1");
+        let correlation_key = if correlation_requested {
+            std::env::var("MESHFS_CLUSTER_TOKEN").ok().filter(|v| !v.is_empty())
+                .map(|v| Sha256::digest([b"meshfs-diagnostic-key-v1\0".as_slice(), v.as_bytes()].concat()).into())
+        } else { None };
         let (sender, receiver) = std::sync::mpsc::sync_channel::<SlowEvent>(256);
+        let attempted = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let capped = Arc::new(AtomicU64::new(0));
+        let counters = (attempted.clone(), dropped.clone(), capped.clone());
+        let correlation_status = if correlation_key.is_some() { "enabled" }
+            else if correlation_requested { "disabled_no_token" } else { "disabled_not_requested" };
         std::thread::Builder::new().name("meshfs-slow-phases".into()).spawn(move || {
             let mut output = std::io::stderr();
-            for event in receiver {
-                if writeln!(output,
-                    "meshfs_slow_phase seq={} op={} phase={} start_us={} elapsed_us={} thread={:?} dropped={} count={}",
-                    event.sequence, event.operation, event.phase, event.start_us,
-                    event.elapsed_us, event.thread, event.dropped, event.count).is_err() {
-                    break;
+            // One key-free configuration line, from the writer only.
+            if writeln!(output, "meshfs_diagnostic_config correlation={} clock=linux_monotonic queue=256 max_events=10000", correlation_status).is_err() { return; }
+            let mut cap_reported = false;
+            loop {
+                match receiver.recv_timeout(std::time::Duration::from_millis(250)) {
+                    Ok(event) => {
+                        if write_slow_event(&mut output, &event, [counters.0.load(Relaxed), counters.1.load(Relaxed), counters.2.load(Relaxed)]).is_err() { break; }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                // One extra bounded summary makes exhaustion visible even if the
+                // final attempt was dropped. Counters are snapshots/lower bounds.
+                if !cap_reported && counters.0.load(Relaxed) >= 10_000 {
+                    if writeln!(output, "meshfs_diagnostic_cap exhausted=1 attempted={} dropped={} capped_at_least={}", counters.0.load(Relaxed), counters.1.load(Relaxed), counters.2.load(Relaxed)).is_err() { break; }
+                    cap_reported = true;
                 }
             }
         }).ok()?;
-        Some(SlowDiagnostics {
-            sender,
-            start: std::time::Instant::now(),
-            threshold: std::time::Duration::from_millis(millis),
-            attempted: std::sync::atomic::AtomicU64::new(0),
-            dropped: std::sync::atomic::AtomicU64::new(0),
-        })
+        Some(SlowDiagnostics { sender, start: std::time::Instant::now(), threshold: std::time::Duration::from_millis(millis),
+            attempted, dropped, capped, next_span: AtomicU64::new(1), correlation_key })
     }).as_ref()
 }
 struct SlowPhase {
@@ -143,46 +256,43 @@ struct SlowPhase {
     start: Option<std::time::Instant>,
     minimum: std::time::Duration,
     count: u64,
+    correlation: Option<Correlation>,
+    span: u64,
+    start_stamp: DiagnosticStamp,
+    outcome: u8,
 }
 impl SlowPhase {
     fn new(operation: &'static str, phase: &'static str) -> Self {
         let diagnostic = slow_diagnostics();
-        Self { diagnostic, operation, phase, start: diagnostic.map(|_| std::time::Instant::now()), minimum: std::time::Duration::ZERO, count: 0 }
+        Self { diagnostic, operation, phase, start: diagnostic.map(|_| std::time::Instant::now()), minimum: std::time::Duration::ZERO, count: 0,
+            correlation: None, span: 0, start_stamp: DiagnosticStamp::default(), outcome: 0 }
     }
-    fn with_count(mut self, count: usize) -> Self {
-        self.count = count as u64;
+    fn with_count(mut self, count: usize) -> Self { self.count = count as u64; self }
+    fn with_minimum(mut self, minimum: std::time::Duration) -> Self { self.minimum = minimum; self }
+    fn with_correlation(mut self, correlation: Option<Correlation>) -> Self {
+        self.correlation = correlation;
+        if correlation.is_some() {
+            self.start_stamp = diagnostic_stamp();
+            if let Some(d) = self.diagnostic { self.span = d.next_span.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        }
         self
     }
-    fn with_minimum(mut self, minimum: std::time::Duration) -> Self {
-        self.minimum = minimum;
-        self
-    }
-
 }
 impl Drop for SlowPhase {
     fn drop(&mut self) {
-        use std::sync::atomic::Ordering::Relaxed;
         if let (Some(diagnostic), Some(start)) = (self.diagnostic, self.start) {
             let elapsed = start.elapsed();
-            if elapsed < diagnostic.threshold.max(self.minimum) {
-                return;
-            }
-            let sequence = match diagnostic.attempted.fetch_update(Relaxed, Relaxed, |value| {
-                (value < 10_000).then_some(value + 1)
-            }) {
-                Ok(sequence) => sequence,
-                Err(_) => return,
-            };
-            let event = SlowEvent {
+            // Correlated join spans must survive even when faster than the slow
+            // threshold. Budget/drop/cancellation still preclude completeness.
+            if self.correlation.is_none() && elapsed < diagnostic.threshold.max(self.minimum) { return; }
+            diagnostic.emit(SlowEvent {
                 operation: self.operation, phase: self.phase,
                 start_us: start.duration_since(diagnostic.start).as_micros().min(u64::MAX as u128) as u64,
                 elapsed_us: elapsed.as_micros().min(u64::MAX as u128) as u64,
-                thread: std::thread::current().id(), sequence,
-                dropped: diagnostic.dropped.load(Relaxed), count: self.count,
-            };
-            if diagnostic.sender.try_send(event).is_err() {
-                diagnostic.dropped.fetch_add(1, Relaxed);
-            }
+                thread: std::thread::current().id(), sequence: 0, dropped: 0, count: self.count,
+                correlation: self.correlation, span: self.span, start_stamp: self.start_stamp,
+                end_stamp: if self.correlation.is_some() { diagnostic_stamp() } else { DiagnosticStamp::default() }, outcome: self.outcome,
+            });
         }
     }
 }
@@ -295,17 +405,19 @@ impl Db {
         .map_err(se)?;
         Ok(())
     }
-    fn persist_apply(&self, entries: &[Entry<Types>], applied: Option<LogId<u64>>) -> SResult<()> {
+    fn persist_apply(&self, entries: &[Entry<Types>], applied: Option<LogId<u64>>, correlation: Option<Correlation>) -> SResult<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        let serialize = SlowPhase::new("persist_apply", "serialize");
+        let serialize = SlowPhase::new("persist_apply", "serialize").with_correlation(correlation);
         let raw = serde_json::to_string(entries).map_err(se)?;
         let marker = serde_json::to_string(&applied).map_err(se)?;
         let last = entries.last().expect("nonempty batch").log_id.index;
         drop(serialize);
+        let lock_wait = correlation.map(|ctx| SlowPhase::new("persist_apply", "db_mutex_wait").with_correlation(Some(ctx)));
         let mut c = self.lock_conn("persist_apply")?;
-        let sql = SlowPhase::new("persist_apply", "sql");
+        drop(lock_wait);
+        let sql = SlowPhase::new("persist_apply", "sql").with_correlation(correlation);
         let tx = c.transaction().map_err(se)?;
         tx.execute(
             "INSERT INTO machine_deltas(last_idx,entries) VALUES(?,?)",
@@ -314,7 +426,7 @@ impl Db {
         .map_err(se)?;
         tx.execute("INSERT INTO meta(k,v) VALUES('machine_applied',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", [marker]).map_err(se)?;
         drop(sql);
-        let _commit = SlowPhase::new("persist_apply", "commit");
+        let _commit = SlowPhase::new("persist_apply", "commit").with_correlation(correlation);
         tx.commit().map_err(se)?;
         Ok(())
     }
@@ -947,17 +1059,21 @@ impl RaftStateMachine<Types> for Arc<Machine> {
     {
         let entries: Vec<_> = entries.into_iter().collect();
         let machine = self.clone();
+        let correlation = slow_diagnostics().and_then(|d| d.batch(&entries));
+        let queued = SlowPhase::new("apply", "blocking_pool_wait").with_count(entries.len()).with_correlation(correlation);
         // Raft awaits this ordered batch. CAS I/O, serialization and the FULL
         // SQLite commit must finish before acknowledgement, but must not block
         // Tokio's RPC/election/timer workers while doing so.
         let out = tokio::task::spawn_blocking(move || {
-            let state_wait = SlowPhase::new("apply", "state_mutex_wait").with_count(entries.len());
+            drop(queued);
+            let state_wait = SlowPhase::new("apply", "state_mutex_wait").with_count(entries.len()).with_correlation(correlation);
             let mut s = machine.data.blocking_lock();
             drop(state_wait);
-            let execute = SlowPhase::new("apply", "execute_batch").with_count(entries.len());
+            let execute = SlowPhase::new("apply", "execute_batch").with_count(entries.len()).with_correlation(correlation);
             let mut out = Vec::with_capacity(entries.len());
             for e in &entries {
-                let _entry = SlowPhase::new("apply", "execute_entry").with_count(1);
+                let entry_correlation = correlation.and_then(|ctx| slow_diagnostics().map(|d| d.entry(ctx, e)));
+                let _entry = SlowPhase::new("apply", "execute_entry").with_count(1).with_correlation(entry_correlation);
                 let value = match &e.payload {
                     EntryPayload::Blank => Value::Null,
                     EntryPayload::Membership(m) => {
@@ -970,16 +1086,16 @@ impl RaftStateMachine<Types> for Arc<Machine> {
                 out.push(value);
             }
             drop(execute);
-            let _persist = SlowPhase::new("apply", "persist_total").with_count(entries.len());
-            machine.db.persist_apply(&entries, s.applied)?;
+            let _persist = SlowPhase::new("apply", "persist_total").with_count(entries.len()).with_correlation(correlation);
+            machine.db.persist_apply(&entries, s.applied, correlation)?;
             Ok::<_, StorageError<u64>>(out)
         })
         .await
         .map_err(se)??;
-        let state_wait = SlowPhase::new("apply", "mirror_state_wait").with_count(out.len());
+        let state_wait = SlowPhase::new("apply", "mirror_state_wait").with_count(out.len()).with_correlation(correlation);
         let s = self.data.lock().await;
         drop(state_wait);
-        let _mirror = SlowPhase::new("apply", "mirror_total").with_count(out.len());
+        let _mirror = SlowPhase::new("apply", "mirror_total").with_count(out.len()).with_correlation(correlation);
         self.mirror(&s).await;
         Ok(out)
     }
@@ -1390,11 +1506,13 @@ impl Cluster {
         } else {
             "client_other"
         };
-        let _wait = SlowPhase::new(operation, "raft_client_write_wait")
+        let correlation = slow_diagnostics().and_then(|d| d.command(&c));
+        let mut wait = SlowPhase::new(operation, "raft_client_write_wait")
             .with_minimum(std::time::Duration::from_secs(1))
-            .with_count(1);
-        tokio::time::timeout(std::time::Duration::from_secs(3), self.raft.client_write(c))
-            .await
+            .with_count(1).with_correlation(correlation);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), self.raft.client_write(c)).await;
+        wait.outcome = match &result { Ok(Ok(_)) => 1, Ok(Err(_)) => 2, Err(_) => 3 };
+        result
             .map_err(|_| {
                 "write deadline exceeded; outcome may be committed, reconcile before retry"
                     .to_string()
@@ -2129,6 +2247,128 @@ mod tests {
         };
         assert_eq!(append_prefix(&[large, blank]).unwrap(), 1);
     }
+    fn correlation_test_sink(key: Option<[u8; 32]>, capacity: usize)
+        -> (&'static SlowDiagnostics, std::sync::mpsc::Receiver<SlowEvent>)
+    {
+        use std::sync::atomic::AtomicU64;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(capacity);
+        (Box::leak(Box::new(SlowDiagnostics {
+            sender, start: std::time::Instant::now(),
+            threshold: std::time::Duration::from_secs(60),
+            attempted: Arc::new(AtomicU64::new(0)), dropped: Arc::new(AtomicU64::new(0)),
+            capped: Arc::new(AtomicU64::new(0)), next_span: AtomicU64::new(1), correlation_key: key,
+        })), receiver)
+    }
+    fn correlation_test_phase(d: &'static SlowDiagnostics, ctx: Option<Correlation>) -> SlowPhase {
+        SlowPhase {
+            diagnostic: Some(d), operation: "test", phase: "join",
+            start: Some(std::time::Instant::now()), minimum: std::time::Duration::from_secs(60),
+            count: 0, correlation: None, span: 0,
+            start_stamp: DiagnosticStamp::default(), outcome: 0,
+        }.with_correlation(ctx)
+    }
+    #[test]
+    fn correlation_opaque_identity_joins_client_entry_and_batch_without_wire_changes() {
+        let command = Command { id: "private-client-id".into(), epoch: 7,
+            action: Action::StageChunk { hex: "736563726574".into() } };
+        let before = serde_json::to_value(&command).unwrap();
+        let (d, rx) = correlation_test_sink(Some([41; 32]), 256);
+        let entries = vec![
+            Entry::<Types> { log_id: LogId::new(openraft::CommittedLeaderId::new(2, 3), 11), payload: EntryPayload::Normal(command.clone()) },
+            Entry::<Types> { log_id: LogId::new(openraft::CommittedLeaderId::new(4, 5), 12), payload: EntryPayload::Blank },
+        ];
+        let batch = d.batch(&entries).unwrap();
+        let entry = d.entry(batch, &entries[0]);
+        assert_eq!(d.command(&command).unwrap().command, entry.command);
+        assert_eq!(entry.batch, batch.batch);
+        assert_eq!(entry.first, [2, 3, 11]);
+        assert_eq!(entry.last, [4, 5, 12]);
+        assert_eq!(entry.entry, Some([2, 3, 11]));
+        assert!(d.entry(batch, &entries[1]).command.is_none());
+        let mut other = command.clone(); other.epoch += 1;
+        assert_ne!(entry.command, d.command(&other).unwrap().command);
+        assert_ne!(opaque_command(&[42; 32], &command), entry.command);
+        other.id = "x".repeat(257);
+        assert!(d.command(&other).is_none());
+        drop(correlation_test_phase(d, Some(entry)));
+        let event = rx.try_recv().unwrap();
+        let mut bytes = Vec::new();
+        write_slow_event(&mut bytes, &event, [1, 0, 0]).unwrap();
+        let line = String::from_utf8(bytes).unwrap();
+        assert!(line.len() < 1600);
+        assert!(!line.contains("private-client-id") && !line.contains("736563726574"));
+        assert!(line.contains("first_index=11") && line.contains("last_index=12") && line.contains("entry_index=11"));
+        assert_eq!(serde_json::to_value(&command).unwrap(), before);
+        assert_eq!(before, json!({"id":"private-client-id","epoch":7,"action":{"StageChunk":{"hex":"736563726574"}}}));
+        let (off, off_rx) = correlation_test_sink(None, 256);
+        assert!(off.command(&command).is_none() && off.batch(&entries).is_none());
+        drop(correlation_test_phase(off, None));
+        assert!(off_rx.try_recv().is_err());
+    }
+    #[test]
+    fn correlation_fast_join_events_obey_shared_queue_drop_and_cap() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (d, rx) = correlation_test_sink(Some([1; 32]), 256);
+        for _ in 0..10_010 {
+            // No sleep: even subthreshold joins must be observable or counted.
+            drop(correlation_test_phase(d, Some(Correlation::default())));
+        }
+        assert_eq!(d.attempted.load(Relaxed), 10_000);
+        assert_eq!(d.dropped.load(Relaxed), 10_000 - 256);
+        assert_eq!(d.capped.load(Relaxed), 10);
+        assert_eq!(rx.try_iter().count(), 256);
+        drop(correlation_test_phase(d, Some(Correlation::default())));
+        assert_eq!(d.capped.load(Relaxed), 11);
+        assert!(rx.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn correlation_context_does_not_change_persisted_entries_or_marker() {
+        let (_g1, db1, _) = Builder.build().await.unwrap();
+        let (_g2, db2, _) = Builder.build().await.unwrap();
+        let entry = Entry::<Types> {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(2, 3), 11),
+            payload: EntryPayload::Normal(Command { id: "persist-wire".into(), epoch: 7,
+                action: Action::StageChunk { hex: "00".into() } }),
+        };
+        let entries = [entry];
+        let (d, _rx) = correlation_test_sink(Some([9; 32]), 256);
+        db1.persist_apply(&entries, Some(entries[0].log_id), None).unwrap();
+        db2.persist_apply(&entries, Some(entries[0].log_id), d.batch(&entries)).unwrap();
+        for db in [&db1, &db2] {
+            let c = db.conn.lock().unwrap();
+            let raw: String = c.query_row("SELECT entries FROM machine_deltas WHERE last_idx=11", [], |r| r.get(0)).unwrap();
+            assert_eq!(raw, serde_json::to_string(&entries).unwrap());
+            let marker: String = c.query_row("SELECT v FROM meta WHERE k='machine_applied'", [], |r| r.get(0)).unwrap();
+            assert_eq!(marker, serde_json::to_string(&Some(entries[0].log_id)).unwrap());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn correlation_blocking_worker_clock_and_tid_are_real_endpoint_observations() {
+        let caller = diagnostic_stamp();
+        let (d, rx) = correlation_test_sink(Some([2; 32]), 256);
+        // Creation before handoff and destruction on the worker must retain BOTH
+        // TIDs; no span claims one async task ran on a single OS thread.
+        let queued = correlation_test_phase(d, Some(Correlation::default()));
+        let worker = std::thread::spawn(move || {
+            let here = diagnostic_stamp();
+            drop(queued);
+            let phase = correlation_test_phase(d, Some(Correlation::default()));
+            drop(phase);
+            here
+        }).join().unwrap();
+        let queued_event = rx.try_recv().unwrap();
+        let work_event = rx.try_recv().unwrap();
+        assert!(caller.monotonic_ns > 0 && worker.monotonic_ns >= caller.monotonic_ns);
+        assert!(caller.tid > 0 && worker.tid > 0 && caller.tid != worker.tid);
+        assert_eq!(queued_event.start_stamp.tid, caller.tid);
+        assert_eq!(queued_event.end_stamp.tid, worker.tid);
+        assert_eq!(work_event.start_stamp.tid, worker.tid);
+        assert_eq!(work_event.end_stamp.tid, worker.tid);
+        assert!(work_event.end_stamp.monotonic_ns >= work_event.start_stamp.monotonic_ns);
+        // Outcome zero explicitly does not certify a committed operation.
+        assert_eq!(queued_event.outcome, 0);
+    }
     #[test]
     fn slow_client_minimum_preserves_budget_and_emits_count() {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -2138,7 +2378,8 @@ mod tests {
         let diagnostic = Box::leak(Box::new(SlowDiagnostics {
             sender, start: now - Duration::from_secs(10),
             threshold: Duration::from_millis(50),
-            attempted: AtomicU64::new(0), dropped: AtomicU64::new(0),
+            attempted: Arc::new(AtomicU64::new(0)), dropped: Arc::new(AtomicU64::new(0)),
+            capped: Arc::new(AtomicU64::new(0)), next_span: AtomicU64::new(1), correlation_key: None,
         }));
         let mut normal = SlowPhase::new("client_stage", "raft_client_write_wait")
             .with_minimum(Duration::from_secs(1)).with_count(1);
@@ -2165,14 +2406,15 @@ mod tests {
             sender,
             start: std::time::Instant::now(),
             threshold: std::time::Duration::ZERO,
-            attempted: AtomicU64::new(0),
-            dropped: AtomicU64::new(0),
+            attempted: Arc::new(AtomicU64::new(0)),
+            dropped: Arc::new(AtomicU64::new(0)),
+            capped: Arc::new(AtomicU64::new(0)), next_span: AtomicU64::new(1), correlation_key: None,
         }));
         for _ in 0..10_010 {
             drop(SlowPhase {
                 diagnostic: Some(diagnostic), operation: "test", phase: "bounded",
                 start: Some(std::time::Instant::now()),
-                minimum: std::time::Duration::ZERO, count: 0,
+                minimum: std::time::Duration::ZERO, count: 0, correlation: None, span: 0, start_stamp: DiagnosticStamp::default(), outcome: 0,
             });
         }
         assert_eq!(diagnostic.attempted.load(Relaxed), 10_000);
@@ -2182,9 +2424,10 @@ mod tests {
         drop(SlowPhase {
             diagnostic: Some(diagnostic), operation: "test", phase: "bounded",
             start: Some(std::time::Instant::now()),
-            minimum: std::time::Duration::ZERO, count: 0,
+            minimum: std::time::Duration::ZERO, count: 0, correlation: None, span: 0, start_stamp: DiagnosticStamp::default(), outcome: 0,
         });
         assert!(receiver.try_recv().is_err());
+        assert_eq!(diagnostic.capped.load(Relaxed), 11);
     }
     #[tokio::test(flavor = "current_thread")]
     async fn raft_storage_mutex_wait_keeps_single_thread_timer_responsive() {
