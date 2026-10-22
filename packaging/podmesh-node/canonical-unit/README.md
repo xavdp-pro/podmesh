@@ -69,10 +69,39 @@ package metadata are checked before creating work.
 The collector uses a fresh isolated APT_CONFIG, etc/state/cache/status/log/key/
 source/lock paths and sanitized environment. Host APT methods/binaries are
 read-only tools; host package status/config/hooks are never used or modified.
-APT acquisition uses the existing unprivileged _apt identity. A pre-existing
-setfacl helper and searchable protected work ancestors are explicit prerequisites.
-Named-user ACLs affect only the NEW work tree; no host parent or global APT path
-is modified. Work/output remain private to their designated identities.
+APT acquisition uses the existing unprivileged _apt identity. Pre-existing
+searchable protected work ancestors are an explicit prerequisite. Linux Python
+stdlib FD xattrs encode POSIX ACCESS ACLs directly; no setfacl/libacl, package
+installation, root acquisition fallback or parent ACL change is used. The caller
+must exclusively own the newly constructed tree. Before any mutation, held
+O_NOFOLLOW descriptors verify the exact 24-node layout, root ownership, private
+0700/0600 modes, inode/name/mount identity, single-linked files, absent ACCESS and
+default ACLs, and finite node/depth/byte bounds. Symlinks, foreign bind mounts,
+unexpected nodes and inherited ACLs refuse collection. Privileged concurrent
+writers are outside this exclusive-construction contract.
+
+Only _apt receives r-x on directories and r-- on files. GROUP_OBJ and OTHER are
+zero; the ACL MASK equals named-user rights (stat group bits reflect that mask,
+not group membership access). The two partial acquisition directories instead
+transfer to the existing _apt UID/GID at 0700 without ACLs. FD xattr bytes and
+metadata are read back before APT; unsupported/denied xattrs, identity changes or
+readback mismatches stop collection. XATTR_CREATE is not treated as an atomic
+absence guarantee; the checks rely on exclusive ownership of the new tree. Any
+partial setup is retained within the new tree, with no acquisition child started. No host parent or global APT path is
+modified. Work/output remain private to their designated identities.
+
+The fixed little-endian ACL ABI is version 2 with USER_OBJ, named USER, GROUP_OBJ,
+MASK, OTHER entries from the Linux UAPI
+[posix_acl_xattr.h](https://raw.githubusercontent.com/torvalds/linux/master/include/uapi/linux/posix_acl_xattr.h)
+and [posix_acl.h](https://raw.githubusercontent.com/torvalds/linux/master/include/uapi/linux/posix_acl.h).
+Targeted contract fixtures: `python3 -m unittest discover -s packaging/podmesh-node/canonical-unit -p test_python_closure.py -k NativePrivateAPTACL -v`.
+These mock xattrs and require authorized Linux root fixture execution; they do
+not prove kernel permissions. A separately authorized CT can opt into actual
+kernel ACL/access checks with `PODMESH_RUN_REAL_APT_ACL_TESTS=1` and the same
+command using `-k RealPrivateAPTACL`. That check drops supplementary groups and
+compares _apt access against same-group, root-group and unrelated identities,
+including denied file/unlink/outside writes and permitted private partial writes.
+
 Only official Ubuntu HTTPS noble/main, updates and security sources signed with
 the image's Ubuntu archive key are selected. Signature and expiry validation stay
 enabled; signed Release origin/suite/arch and package metadata are recorded.

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Collect a replayable signed Ubuntu Python closure without host installation."""
 import argparse
+import errno
+import fcntl
+import struct
+import sys
 import hashlib
 import json
 import os
@@ -627,6 +631,185 @@ class Commands:
         return output.read_text()
 
 
+# Linux UAPI: include/uapi/linux/{posix_acl,posix_acl_xattr}.h.
+# Narrow ACCESS ACL only: no parser, defaults, group grant, shell or libacl.
+_APT_ACL_ACCESS = 'system.posix_acl_access'
+_APT_ACL_DEFAULT = 'system.posix_acl_default'
+_APT_PARTIAL_DIRS = {'state/lists/partial', 'cache/archives/partial'}
+_APT_NEW_DIRS = ('etc/parts', 'etc/sources.d', 'etc/preferences.d', 'etc/trusted.d', 'etc/auth.d',
+                 'state/lists/partial', 'cache/archives/partial', 'log')
+_APT_NEW_FILES = ('etc/empty.conf', 'etc/sources.list', 'etc/empty.gpg', 'etc/auth.conf',
+                  'state/extended_states', 'state/status', 'etc/ubuntu-key.gpg', 'apt.conf',
+                  'etc/preferences', 'etc/sources.d/ubuntu.sources')
+
+
+def private_apt_acl_bytes(uid, directory):
+    need(type(uid) is int and 0 < uid < 0xffffffff, 'invalid/root sandbox UID')
+    owner, named = (7, 5) if directory else (6, 4)
+    undefined = 0xffffffff
+    entries = ((0x01, owner, undefined), (0x02, named, uid), (0x04, 0, undefined),
+               (0x10, named, undefined), (0x20, 0, undefined))
+    return struct.pack('<I', 2) + b''.join(struct.pack('<HHI', *entry) for entry in entries)
+
+
+def _acl_absent(fd, name):
+    try:
+        os.getxattr(fd, name)
+    except OSError as error:
+        need(error.errno == errno.ENODATA, 'POSIX ACL xattr unsupported or denied')
+        return
+    raise ValueError('pre-existing/inherited ACL refused on new collector tree')
+
+
+def _acl_mount_id(fd):
+    # Refuse foreign bind mounts even when they share a filesystem device number.
+    info = Path('/proc/self/fdinfo/'+str(fd)).read_text()
+    rows = [line.split(':', 1)[1].strip() for line in info.splitlines() if line.startswith('mnt_id:')]
+    need(len(rows) == 1 and rows[0].isdigit(), 'Linux FD mount identity unavailable')
+    return int(rows[0])
+
+
+def _acl_identity(metadata):
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid, metadata.st_gid,
+            metadata.st_nlink, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+
+def grant_private_apt_access(work, created_identity, uid, gid):
+    """Only freshly constructed, exclusively owned collector nodes may be granted.
+
+    Held FDs, exact new-tree membership and metadata readback detect replacement.
+    A privileged concurrent writer is outside this exclusive-construction contract;
+    no unprivileged identity can rename/write these root-owned paths before or after
+    the read/traverse grants. Partial acquisition roots alone transfer to _apt.
+    """
+    need(sys.platform == 'linux' and os.geteuid() == 0, 'native ACL setup requires Linux build root')
+    private_apt_acl_bytes(uid, False)  # Closed UID domain before any mutation.
+    need(type(gid) is int and 0 <= gid < 0xffffffff, 'invalid sandbox GID')
+    account = pwd.getpwnam('_apt')
+    need((uid, gid) == (account.pw_uid, account.pw_gid), 'sandbox UID/GID is not the existing _apt identity')
+    need(callable(getattr(os, 'getxattr', None)) and callable(getattr(os, 'setxattr', None)),
+         'Python FD xattr support unavailable')
+    expected_paths = {''}
+    for name in (*_APT_NEW_DIRS, *_APT_NEW_FILES):
+        parts = PurePosixPath(name).parts
+        expected_paths.update('/'.join(parts[:i]) for i in range(1, len(parts)+1))
+    held = []
+    records = []
+    seen = set()
+    total_bytes = 0
+    root_fd = os.open(work, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    held.append(root_fd)
+    try:
+        original_root = os.fstat(root_fd)
+        need((original_root.st_dev, original_root.st_ino) == tuple(created_identity), 'new work root inode differs')
+        fcntl.flock(root_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        mount = _acl_mount_id(root_fd)
+
+        def scan(fd, relative, parent=None, name=None):
+            nonlocal total_bytes
+            need(len(records) < 64 and len(PurePosixPath(relative).parts) <= 8, 'private ACL node/depth bound')
+            metadata = os.fstat(fd)
+            directory = stat.S_ISDIR(metadata.st_mode)
+            need(directory or stat.S_ISREG(metadata.st_mode), 'non-directory/non-regular ACL object')
+            need(metadata.st_uid == metadata.st_gid == 0 and metadata.st_dev == original_root.st_dev
+                 and _acl_mount_id(fd) == mount, 'foreign ACL owner/filesystem/mount')
+            need(stat.S_IMODE(metadata.st_mode) == (0o700 if directory else 0o600), 'new ACL object is not private')
+            need(metadata.st_nlink >= 2 if directory else metadata.st_nlink == 1, 'unlinked/hardlinked ACL object')
+            if not directory:
+                total_bytes += metadata.st_size
+                need(metadata.st_size <= 16*1024*1024 and total_bytes <= 32*1024*1024, 'private ACL byte bound')
+            _acl_absent(fd, _APT_ACL_ACCESS)
+            if directory:
+                _acl_absent(fd, _APT_ACL_DEFAULT)
+            record = {'fd': fd, 'relative': relative, 'parent': parent, 'name': name,
+                      'before': metadata, 'directory': directory}
+            records.append(record)
+            seen.add(relative)
+            if directory:
+                with os.scandir(fd) as entries:
+                    for entry in entries:
+                        child = (relative+'/' if relative else '')+entry.name
+                        need(child in expected_paths and child not in seen, 'unexpected/repeated node in new ACL tree')
+                        before = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
+                        need(stat.S_ISDIR(before.st_mode) or stat.S_ISREG(before.st_mode), 'symlink/special ACL child refused')
+                        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+                        if stat.S_ISDIR(before.st_mode):
+                            flags |= os.O_DIRECTORY
+                        child_fd = os.open(entry.name, flags, dir_fd=fd)
+                        held.append(child_fd)
+                        need(_acl_identity(before) == _acl_identity(os.fstat(child_fd)), 'ACL child changed during open')
+                        scan(child_fd, child, fd, entry.name)
+
+        def current(record, expected):
+            actual = os.fstat(record['fd'])
+            need(_acl_identity(actual) == _acl_identity(expected), 'ACL object changed before/after grant')
+            if record['parent'] is not None:
+                linked = os.stat(record['name'], dir_fd=record['parent'], follow_symlinks=False)
+                need(_acl_identity(linked) == _acl_identity(actual), 'ACL name/inode binding changed')
+            else:
+                linked = os.stat(work, follow_symlinks=False)
+                need((linked.st_dev, linked.st_ino) == tuple(created_identity), 'work root path replaced')
+            return actual
+
+        # Full preflight before the first write; all descriptors remain held.
+        scan(root_fd, '')
+        need(seen == expected_paths, 'missing node in new collector ACL tree')
+        for record in records:
+            current(record, record['before'])
+        proof = []
+        for record in records:
+            fd, before = record['fd'], current(record, record['before'])
+            _acl_absent(fd, _APT_ACL_ACCESS)
+            if record['relative'] in _APT_PARTIAL_DIRS:
+                need(record['directory'], 'partial acquisition root is not a directory')
+                os.fchown(fd, uid, gid)
+                after = os.fstat(fd)
+                need((after.st_dev, after.st_ino, after.st_uid, after.st_gid, stat.S_IMODE(after.st_mode)) ==
+                     (before.st_dev, before.st_ino, uid, gid, 0o700), 'partial ownership/mode differs')
+                _acl_absent(fd, _APT_ACL_ACCESS)
+                expected_acl = None
+            else:
+                expected_acl = private_apt_acl_bytes(uid, record['directory'])
+                # No atomic exclusion is assumed from this flag for POSIX ACLs;
+                # absence checks rely on exclusive ownership of the new tree.
+                os.setxattr(fd, _APT_ACL_ACCESS, expected_acl, os.XATTR_CREATE)
+                need(os.getxattr(fd, _APT_ACL_ACCESS) == expected_acl, 'kernel ACL readback differs')
+                after = os.fstat(fd)
+                expected_mode = 0o750 if record['directory'] else 0o640
+                need((after.st_uid, after.st_gid, stat.S_IMODE(after.st_mode)) == (0, 0, expected_mode),
+                     'ACL effective mask/owner mode differs')
+            need((before.st_dev, before.st_ino, before.st_nlink, before.st_size, before.st_mtime_ns) ==
+                 (after.st_dev, after.st_ino, after.st_nlink, after.st_size, after.st_mtime_ns),
+                 'ACL grant changed data/inode/link/mtime')
+            if record['directory']:
+                _acl_absent(fd, _APT_ACL_DEFAULT)
+            record['after'], record['acl'] = after, expected_acl
+            proof.append({'path':record['relative'], 'dev':after.st_dev, 'ino':after.st_ino,
+                          'uid':after.st_uid, 'gid':after.st_gid, 'mode':oct(stat.S_IMODE(after.st_mode)),
+                          'named_rights':'owner-only-rwx' if expected_acl is None else ('r-x' if record['directory'] else 'r--')})
+        # Re-read every grant and binding before any APT child can start.
+        unintended_rights = 0
+        for record in records:
+            current(record, record['after'])
+            if record['acl'] is None:
+                _acl_absent(record['fd'], _APT_ACL_ACCESS)
+                unintended_rights |= stat.S_IMODE(os.fstat(record['fd']).st_mode) & 0o077
+            else:
+                readback = os.getxattr(record['fd'], _APT_ACL_ACCESS)
+                need(readback == record['acl'], 'final ACL readback changed')
+                # Fixed GROUP_OBJ and OTHER permission fields in the verified ABI.
+                unintended_rights |= struct.unpack_from('<H', readback, 22)[0] | struct.unpack_from('<H', readback, 38)[0]
+        need(unintended_rights == 0, 'unexpected group/other access')
+        return {'schema':'podmesh.private-apt-access/v1','sandbox_uid':uid,'sandbox_gid':gid,
+                'nodes':proof,'bytes':total_bytes,'scope':'new-tree-only','default_ACL':False,
+                'unintended_group_other_rights':unintended_rights}
+    except OSError as error:
+        raise ValueError('native private ACL unsupported/denied or object changed; no APT start') from error
+    finally:
+        for fd in reversed(held):
+            os.close(fd)
+
+
 def collect(args):
     need(os.geteuid() == 0, 'collector requires an isolated root build authority, never host package installation')
     root = protected_absolute(args.base_root)
@@ -640,14 +823,14 @@ def collect(args):
     need(shutil.disk_usage(work.parent).free > 2*args.max_metadata_bytes + 2*args.max_download_bytes,
          'insufficient measured work filesystem free bytes')
     sandbox = pwd.getpwnam('_apt')
-    need(sandbox.pw_uid != 0 and shutil.which('setfacl') == '/usr/bin/setfacl', 'unprivileged APT sandbox/setfacl dependency missing')
+    need(sandbox.pw_uid != 0, 'unprivileged existing _apt identity required')
     need(all(parent.stat().st_mode & 0o001 for parent in [work.parent,*work.parent.parents]),
          'sandbox cannot traverse protected work ancestors; choose a private build root below searchable parents')
     work.mkdir(mode=0o700)
-    for name in ['etc/parts', 'etc/sources.d', 'etc/preferences.d', 'etc/trusted.d', 'etc/auth.d',
-                 'state/lists/partial', 'cache/archives/partial', 'log']:
+    created_work = work.stat()
+    for name in _APT_NEW_DIRS:
         (work/name).mkdir(mode=0o700, parents=True, exist_ok=True)
-    for name in ['etc/empty.conf', 'etc/sources.list', 'etc/empty.gpg', 'etc/auth.conf', 'state/extended_states']:
+    for name in ('etc/empty.conf', 'etc/sources.list', 'etc/empty.gpg', 'etc/auth.conf', 'state/extended_states'):
         (work/name).write_text('')
     (work/'state/status').write_bytes(data['dpkg_status'])
     (work/'etc/ubuntu-key.gpg').write_bytes(data['ubuntu_key'])
@@ -656,11 +839,10 @@ def collect(args):
     (work/'etc/preferences').write_text(prefs)
     sources = ''.join(f'Types: deb\nURIs: {uri}\nSuites: {suite}\nComponents: main\nTargets: Packages\nArchitectures: amd64\nSigned-By: {work}/etc/ubuntu-key.gpg\n\n' for uri, suite in SOURCES)
     (work/'etc/sources.d/ubuntu.sources').write_text(sources)
-    # Named-user ACLs change only NEW work files, never host ancestors/config.
-    subprocess.run(['/usr/bin/setfacl','-R','-m',f'u:{sandbox.pw_uid}:r-X',str(work)],
-                   env={'PATH':'/usr/bin:/bin','LC_ALL':'C'},check=True,timeout=10)
-    for partial in ('state/lists/partial','cache/archives/partial'):
-        os.chown(work/partial,sandbox.pw_uid,sandbox.pw_gid)
+    # Native FD ACL/readback completes (or refuses) before any APT network child.
+    acl_proof = grant_private_apt_access(work, (created_work.st_dev, created_work.st_ino),
+                                       sandbox.pw_uid, sandbox.pw_gid)
+    (work/'private-apt-access.json').write_text(json.dumps(acl_proof,sort_keys=True)+'\n')
     cmd = Commands(work, 2*args.max_metadata_bytes + 2*args.max_download_bytes)
     cmd.run(['/usr/bin/apt-get', 'update'], 180)
     target_text = cmd.run(['/usr/bin/apt-get', 'indextargets', 'Identifier: Packages', 'Architecture: amd64', 'Component: main'])

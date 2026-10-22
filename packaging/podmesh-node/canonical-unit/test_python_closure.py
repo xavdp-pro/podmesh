@@ -1,6 +1,14 @@
 """Dependency closure contract tests. No network, APT install or product execution."""
 import importlib.util
 import json
+import errno
+import pwd
+import grp
+import stat
+import struct
+import types
+import subprocess
+import sys
 import os
 from pathlib import Path
 import tempfile
@@ -293,6 +301,191 @@ class PythonClosure(unittest.TestCase):
         with self.assertRaises(ValueError):c.read_bounded(path,3)
         alias=self.root/'alias';alias.symlink_to(path)
         with self.assertRaises(ValueError):c.read_bounded(alias,100)
+
+
+@unittest.skipUnless(os.geteuid()==0 and sys.platform=='linux', 'private Linux root fixtures')
+class NativePrivateAPTACL(unittest.TestCase):
+    """Mocked xattr ABI tests, explicitly NOT kernel access qualification."""
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(prefix='private-apt-acl-test-',dir='/var/lib')
+        self.parent=Path(self.temp.name);self.parent.chmod(0o711)
+        self.work=self.parent/'new-work';self.work.mkdir(mode=0o700)
+        for name in c._APT_NEW_DIRS:(self.work/name).mkdir(mode=0o700,parents=True,exist_ok=True)
+        for node in self.work.rglob('*'):
+            if node.is_dir():node.chmod(0o700)
+        for name in c._APT_NEW_FILES:
+            p=self.work/name;p.write_text('public fixture');p.chmod(0o600)
+        m=self.work.stat();self.identity=(m.st_dev,m.st_ino)
+        self.attrs={};self.writes=[]
+        self.real_fstat=os.fstat
+        self.account=patch.object(c.pwd,'getpwnam',return_value=types.SimpleNamespace(pw_uid=42,pw_gid=65534))
+        self.account.start()
+
+    def tearDown(self):
+        self.account.stop();self.temp.cleanup()
+
+    def key(self,fd):
+        m=self.real_fstat(fd);return (m.st_dev,m.st_ino)
+
+    def get(self,fd,name):
+        if (self.key(fd),name) not in self.attrs:raise OSError(errno.ENODATA,'absent')
+        return self.attrs[(self.key(fd),name)]
+
+    def put(self,fd,name,data,flags=0):
+        self.writes.append((self.key(fd),name,data,flags))
+        self.attrs[(self.key(fd),name)]=data
+        metadata=self.real_fstat(fd)
+        # Simulate only kernel stat-mask reflection; named-user access is not real.
+        os.fchmod(fd,0o750 if stat.S_ISDIR(metadata.st_mode) else 0o640)
+
+    def apply(self):
+        return c.grant_private_apt_access(self.work,self.identity,42,65534)
+
+    def test_exact_directory_file_masks_and_zero_group_other_entries(self):
+        with patch.object(c.os,'getxattr',side_effect=self.get),patch.object(c.os,'setxattr',side_effect=self.put):
+            proof=self.apply()
+        self.assertEqual(len(proof['nodes']),24)
+        self.assertEqual(c.private_apt_acl_bytes(42,True),struct.pack('<I',2)+b''.join(struct.pack('<HHI',*r) for r in [(1,7,0xffffffff),(2,5,42),(4,0,0xffffffff),(16,5,0xffffffff),(32,0,0xffffffff)]))
+        self.assertEqual(c.private_apt_acl_bytes(42,False),struct.pack('<I',2)+b''.join(struct.pack('<HHI',*r) for r in [(1,6,0xffffffff),(2,4,42),(4,0,0xffffffff),(16,4,0xffffffff),(32,0,0xffffffff)]))
+        self.assertEqual(proof['unintended_group_other_rights'],0)
+        for _,name,data,flags in self.writes:
+            self.assertEqual(name,'system.posix_acl_access');self.assertEqual(flags,os.XATTR_CREATE)  # Caller flag, not kernel atomicity proof.
+            self.assertEqual(struct.unpack('<I',data[:4]),(2,))
+            rows=[struct.unpack('<HHI',data[i:i+8]) for i in range(4,len(data),8)]
+            self.assertEqual([r[0] for r in rows],[1,2,4,16,32])
+            self.assertEqual(rows[1][2],42);self.assertEqual(rows[2][1],0);self.assertEqual(rows[4][1],0)
+            self.assertEqual(rows[1][1],rows[3][1]);self.assertIn(rows[1][1],(4,5))
+        for name in c._APT_PARTIAL_DIRS:
+            m=(self.work/name).stat();self.assertEqual((m.st_uid,m.st_gid,stat.S_IMODE(m.st_mode)),(42,65534,0o700))
+            self.assertNotIn(((m.st_dev,m.st_ino),'system.posix_acl_access'),self.attrs)
+
+    def test_invalid_or_root_UID_and_wrong_existing_identity_refuse_without_writes(self):
+        with patch.object(c.os,'getxattr',side_effect=self.get),patch.object(c.os,'setxattr',side_effect=self.put):
+            for uid in [0,-1,True,0xffffffff,'42']:
+                with self.assertRaises(ValueError):c.grant_private_apt_access(self.work,self.identity,uid,65534)
+            with self.assertRaises(ValueError):c.grant_private_apt_access(self.work,self.identity,43,65534)
+        self.assertEqual(self.writes,[])
+
+    def test_wrong_root_inode_symlink_and_hardlink_refuse_no_outside_mutation(self):
+        outside=self.parent/'outside';outside.write_text('retain');outside.chmod(0o600)
+        with patch.object(c.os,'getxattr',side_effect=self.get),patch.object(c.os,'setxattr',side_effect=self.put):
+            with self.assertRaises(ValueError):c.grant_private_apt_access(self.work,(self.identity[0],self.identity[1]+1),42,65534)
+            original=self.work/'state/status';original.unlink();original.symlink_to(outside)
+            with self.assertRaises(ValueError):self.apply()
+            original.unlink();os.link(outside,original)
+            with self.assertRaises(ValueError):self.apply()
+        self.assertEqual(outside.read_text(),'retain');self.assertEqual(self.writes,[])
+
+    def test_foreign_owner_and_foreign_fd_inode_refuse_before_xattr_write(self):
+        path=self.work/'state/status';os.chown(path,42,65534)
+        with patch.object(c.os,'getxattr',side_effect=self.get),patch.object(c.os,'setxattr',side_effect=self.put):
+            with self.assertRaises(ValueError):self.apply()
+        os.chown(path,0,0)
+        outside=self.parent/'outside';outside.write_text('retain');outside.chmod(0o600)
+        real_open=os.open
+        def open_wrong(name,flags,*args,**kwargs):
+            if name=='status':return real_open(outside,flags)
+            return real_open(name,flags,*args,**kwargs)
+        with patch.object(c.os,'open',side_effect=open_wrong),patch.object(c.os,'getxattr',side_effect=self.get),patch.object(c.os,'setxattr',side_effect=self.put):
+            with self.assertRaises(ValueError):self.apply()
+        self.assertEqual(self.writes,[])
+
+    def test_changed_name_binding_and_unexpected_nodes_refuse(self):
+        extra=self.work/'foreign';extra.write_text('unknown');extra.chmod(0o600)
+        with patch.object(c.os,'getxattr',side_effect=self.get),patch.object(c.os,'setxattr',side_effect=self.put):
+            with self.assertRaises(ValueError):self.apply()
+        extra.unlink()
+        outside=self.parent/'outside';outside.write_text('retain');outside.chmod(0o600);wrong=outside.stat()
+        real_stat=os.stat;calls=0
+        def switched(name,*args,**kwargs):
+            nonlocal calls
+            if name=='status':
+                calls+=1
+                if calls>=2:return wrong
+            return real_stat(name,*args,**kwargs)
+        with patch.object(c.os,'stat',side_effect=switched),patch.object(c.os,'getxattr',side_effect=self.get),patch.object(c.os,'setxattr',side_effect=self.put):
+            with self.assertRaises(ValueError):self.apply()
+        self.assertEqual(self.writes,[])
+
+    def test_foreign_or_symlink_ancestor_refuses_without_outside_changes(self):
+        ancestor=self.parent/'foreign-parent';ancestor.mkdir(mode=0o777);ancestor.chmod(0o777)
+        alias=self.parent/'alias-parent';alias.symlink_to(self.work,target_is_directory=True)
+        for path in (ancestor/'absent',alias/'absent'):
+            with self.assertRaises(ValueError):c.protected_absolute(path,True)
+        self.assertEqual(self.writes,[])
+
+    def test_existing_or_default_ACL_and_foreign_mount_refuse(self):
+        rootkey=(self.identity,c._APT_ACL_DEFAULT);self.attrs[rootkey]=b'inherited'
+        with patch.object(c.os,'getxattr',side_effect=self.get),patch.object(c.os,'setxattr',side_effect=self.put):
+            with self.assertRaises(ValueError):self.apply()
+        self.attrs.clear()
+        with patch.object(c,'_acl_mount_id',side_effect=[1,2]),patch.object(c.os,'getxattr',side_effect=self.get),patch.object(c.os,'setxattr',side_effect=self.put):
+            with self.assertRaises(ValueError):self.apply()
+        self.assertEqual(self.writes,[])
+
+    def test_xattr_unsupported_denied_and_readback_mismatch_failclosed(self):
+        for code in (errno.EOPNOTSUPP,errno.EACCES):
+            with patch.object(c.os,'getxattr',side_effect=self.get),patch.object(c.os,'setxattr',side_effect=OSError(code,'denied')):
+                with self.assertRaises(ValueError):self.apply()
+        def mismatched(fd,name):
+            value=self.get(fd,name)
+            return value+b'bad'
+        with patch.object(c.os,'getxattr',side_effect=mismatched),patch.object(c.os,'setxattr',side_effect=self.put):
+            with self.assertRaises(ValueError):self.apply()
+
+    def test_ACL_failure_precedes_APT_command_constructor(self):
+        # Real collector setup path, fake already-verified base; no signature/crypto claim.
+        base=self.parent/'base';base.mkdir(mode=0o700)
+        binding=self.parent/'binding';binding.write_text('{}');binding.chmod(0o600)
+        args=types.SimpleNamespace(base_root=base,base_binding=binding,base_binding_sha256='a'*64,
+            work=self.parent/'collector',output=self.parent/'output',max_download_bytes=1024,max_metadata_bytes=1024)
+        with patch.object(c,'verify_base',return_value=({}, {'dpkg_status':b'fixture','ubuntu_key':b'public'},{})), \
+             patch.object(c.shutil,'disk_usage',return_value=types.SimpleNamespace(free=1024*1024)), \
+             patch.object(c.os,'getxattr',side_effect=self.get), \
+             patch.object(c.os,'setxattr',side_effect=OSError(errno.EOPNOTSUPP,'no ACL')), \
+             patch.object(c,'Commands') as apt:
+            old_umask=os.umask(0o077)
+            try:
+                with self.assertRaises(ValueError):c.collect(args)
+            finally:os.umask(old_umask)
+            apt.assert_not_called()
+
+
+@unittest.skipUnless(os.geteuid()==0 and sys.platform=='linux' and os.environ.get('PODMESH_RUN_REAL_APT_ACL_TESTS')=='1',
+                     'explicitly authorized Linux root kernel ACL proof only')
+class RealPrivateAPTACL(unittest.TestCase):
+    def test_kernel_named_APT_access_no_group_other_or_outside_writes(self):
+        apt=pwd.getpwnam('_apt');nobody=pwd.getpwnam('nobody');daemon=grp.getgrnam('daemon')
+        self.assertNotIn(nobody.pw_uid,(0,apt.pw_uid))
+        with tempfile.TemporaryDirectory(prefix='real-private-apt-acl-',dir='/var/lib') as outer:
+            parent=Path(outer);parent.chmod(0o711);work=parent/'work';work.mkdir(mode=0o700)
+            for name in c._APT_NEW_DIRS:(work/name).mkdir(mode=0o700,parents=True,exist_ok=True)
+            for node in work.rglob('*'):
+                if node.is_dir():node.chmod(0o700)
+            for name in c._APT_NEW_FILES:
+                p=work/name;p.write_text('public fixture');p.chmod(0o600)
+            outside=parent/'outside';outside.write_text('retain');outside.chmod(0o600)
+            m=work.stat();proof=c.grant_private_apt_access(work,(m.st_dev,m.st_ino),apt.pw_uid,apt.pw_gid)
+            self.assertEqual(proof['unintended_group_other_rights'],0)
+            script="""import os,json,sys,pathlib
+root=pathlib.Path(sys.argv[1]);outside=pathlib.Path(sys.argv[2]);result={}
+for name,fn in [('read',lambda:(root/'etc/ubuntu-key.gpg').read_bytes()),('write',lambda:os.close(os.open(root/'etc/ubuntu-key.gpg',os.O_WRONLY))),('unlink',lambda:os.unlink(root/'etc/ubuntu-key.gpg')),('outside',lambda:os.close(os.open(outside,os.O_WRONLY)))]:
+ try:fn();result[name]=True
+ except PermissionError:result[name]=False
+if sys.argv[3]=='apt':
+ p=root/'state/lists/partial/probe';p.write_text('owned');p.unlink();result['partial']=True
+print(json.dumps(result))
+"""
+            for uid,gid,role in [(apt.pw_uid,apt.pw_gid,'apt'),(nobody.pw_uid,apt.pw_gid,'shared-group'),
+                                 (nobody.pw_uid,0,'root-group'),(nobody.pw_uid,daemon.gr_gid,'other')]:
+                def drop():os.setgroups([]);os.setgid(gid);os.setuid(uid)
+                result=subprocess.run([sys.executable,'-I','-c',script,str(work),str(outside),role],
+                    env={'PATH':'/usr/bin:/bin','LC_ALL':'C'},capture_output=True,text=True,check=True,timeout=10,preexec_fn=drop)
+                observed=json.loads(result.stdout)
+                self.assertEqual(observed['read'],role=='apt')
+                self.assertFalse(observed['write']);self.assertFalse(observed['unlink']);self.assertFalse(observed['outside'])
+                if role=='apt':self.assertTrue(observed['partial'])
+            self.assertEqual(outside.read_text(),'retain')
 
 
 if __name__=='__main__':unittest.main()
