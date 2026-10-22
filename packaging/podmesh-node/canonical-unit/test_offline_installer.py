@@ -46,6 +46,21 @@ class OfflinePlanParser(unittest.TestCase):
         self.assertEqual(self.run_plan(self.good().replace('Inst ', ' \tInst\t').replace('Conf ', '\tConf  ')).returncode,0)
         self.assertEqual(self.run_plan(self.good().replace('local-deb','Ubuntu:24.04/noble-updates, Ubuntu:24.04/noble-security')).returncode,0)
 
+    def test_release_token_literal_hyphen_and_allowed_punctuation(self):
+        # Each punctuation is exercised through the actual extracted AWK parser.
+        for label in ['local-deb', 'Ubuntu:24.04/noble-updates,', 'A_z0.9:+~/,-']:
+            with self.subTest(label=label):
+                result=self.run_plan(self.good().replace('local-deb',label))
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(result.stderr,'')
+
+    def test_release_token_illegal_characters_report_release_shape(self):
+        for character in ['@','!','=',';','[',']','(',')','\\','%','?','"',"'",'é']:
+            with self.subTest(character=character):
+                result=self.rejected(self.good().replace('local-deb','local'+character+'deb'))
+                self.assertIn('stage=plan_validate guard=release-shape input_line=3 exit=65',result.stderr)
+                self.assertNotIn('Invalid range',result.stderr)
+
     def test_qualified_names_only_match_locked_architecture(self):
         plan=self.good().replace('python3 (','python3:amd64 (').replace('libpython3-stdlib (','libpython3-stdlib:all (')
         self.assertEqual(self.run_plan(plan).returncode,0)

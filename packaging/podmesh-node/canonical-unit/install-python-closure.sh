@@ -73,7 +73,7 @@ FILENAME==ARGV[1] {
  if (!(n in v) || count>2 || (count==2 && qualified[2]!=a[n])) die("package-architecture");
  # Current installed versions appear as [old] BEFORE the candidate: always refuse.
  if (t[3]!="(" v[n] || t[k]!="[" a[n] "])") die("candidate-version-architecture");
- for (i=4;i<k;i++) if (t[i]!~/^[A-Za-z0-9._:+~\055\/,]+$/) die("release-shape");
+ for (i=4;i<k;i++) if (t[i]!~/^[-A-Za-z0-9._:+~\/,]+$/) die("release-shape");
  if (t[1]=="Inst") {if (++found[n]!=1) die("duplicate-install")}
  else {if (found[n]!=1 || ++configured[n]!=1) die("unexpected-configure")}
 }
