@@ -1849,6 +1849,19 @@ pub(crate) fn volume_store_gates(
     db.owned(container, uuid, "universe")
 }
 
+/// Read-only migration gate: reuse all durable ownership/terminal/restore checks.
+/// No intent, attempt, observation, schema or reservation is written here.
+pub(crate) fn migration_store_readonly_gates(
+    store: &mut dyn DurableStore,
+    uuid: &str,
+    container: &Value,
+) -> Result<Option<String>, Error> {
+    let mut db = DurableLifecycleDb { store };
+    db.refuse_reserved(uuid, "migration_preflight")?;
+    db.owned(container, uuid, "Migration source")?;
+    db.reservation_state(uuid)
+}
+
 /// Read a verified result before any host observation or mutation. IDs bind the whole request.
 pub(crate) fn historical_store_result(
     store: &mut dyn DurableStore,

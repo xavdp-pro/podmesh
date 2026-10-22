@@ -854,6 +854,202 @@ pub(crate) fn preflight(db: &Connection, uuid: &str, b: &Binding, existing: Opti
     )
 }
 
+/// Private-MariaDB source preflight. Only the separately scoped provider reads
+/// host facts. Existing SQLite preflight/effect dispatch stays unchanged.
+/// In addition to the legacy explicit binding, private callers name provider_scope
+/// and creation_operation. The provider attests these against its pinned record;
+/// neither caller assertion is accepted as an observed host fact by itself.
+pub(crate) fn preflight_store(
+    store: &mut dyn crate::store::DurableStore,
+    request: &Value,
+) -> Result<Value, Error> {
+    if store.engine()!=crate::store::Engine::Mariadb {
+        return Err("private migration preflight requires the MariaDB durable store".into());
+    }
+    if !crate::host_adapter::configured() {
+        return Err("private migration preflight requires the typed host provider; no local fallback".into());
+    }
+    preflight_store_with(store, request, provider_readonly_call)
+}
+
+// The provider action is public protocol, but its generic transport is private
+// to host_adapter. Keep this client closed to these two read-only actions;
+// do not expose a generic caller-controlled command, path, PID or effect intent.
+fn provider_readonly_call(action: &Value) -> Result<Value, Error> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::{fd::AsRawFd, unix::net::UnixStream};
+    if !matches!(action["kind"].as_str(), Some("migration_observe" | "host_identity")) {
+        return Err("unsupported migration read-only provider action".into());
+    }
+    let path=std::env::var_os(crate::host_adapter::SOCKET_ENV).ok_or("typed host provider missing")?;
+    let mut stream=UnixStream::connect(path)?;
+    let mut peer:libc::ucred=unsafe {std::mem::zeroed()};
+    let mut size=std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    if unsafe {libc::getsockopt(stream.as_raw_fd(),libc::SOL_SOCKET,libc::SO_PEERCRED,
+        &mut peer as *mut _ as *mut libc::c_void,&mut size)}!=0
+        || size as usize!=std::mem::size_of::<libc::ucred>() || peer.uid!=0 {
+        return Err("migration observation provider peer is not verified root".into());
+    }
+    stream.set_read_timeout(Some(Duration::from_secs(20)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let bytes=serde_json::to_vec(&json!({"protocol":"podmesh-host-capability/1","action":action,"intent":null}))?;
+    if bytes.len()>65536 {return Err("migration provider request exceeds bound".into());}
+    stream.write_all(&bytes)?;stream.write_all(b"\n")?;
+    let mut bytes=Vec::new();
+    BufReader::new(stream).take(131073).read_until(b'\n',&mut bytes)?;
+    if bytes.len()>131072 || !bytes.ends_with(b"\n") {return Err("migration provider response incomplete or oversized".into());}
+    let response:Value=serde_json::from_slice(&bytes)?;
+    if response["ok"]!=true {return Err("typed host provider refused read-only migration observation".into());}
+    Ok(response["data"].clone())
+}
+
+fn readonly_binding<'a>(request: &'a Value) -> Result<(&'a str, &'a str, &'a str, Binding<'a>), Error> {
+    let fields=["operation","operation_id","authorization_ref","universe_uuid","container_id","image",
+        "source_host_uuid","destination_host_uuid","migration_profile","provider_scope","creation_operation"];
+    let obj=request.as_object().ok_or("preflight must be an object")?;
+    if obj.keys().any(|k|!fields.contains(&k.as_str())) {return Err("unknown private preflight field".into());}
+    if request["operation"]!="migration_preflight" {return Err("not a read-only preflight".into());}
+    lc::token(lc::text(request,"operation_id")?)?;
+    if lc::text(request,"authorization_ref")?.is_empty() {return Err("preflight authorization reference is empty".into());}
+    let uuid=lc::text(request,"universe_uuid")?;
+    let cid=lc::text(request,"container_id")?;
+    let image=lc::text(request,"image")?;
+    let source=lc::text(request,"source_host_uuid")?;
+    let dest=lc::text(request,"destination_host_uuid")?;
+    let scope=lc::text(request,"provider_scope")?;
+    let creation=lc::text(request,"creation_operation")?;
+    if !lc::is_uuid(uuid) || !lc::is_uuid(source) || !lc::is_uuid(dest) || source==dest {
+        return Err("invalid universe/source/destination identity or same-host destination".into());
+    }
+    if cid.len()!=64 || !cid.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)) {
+        return Err("preflight container ID must be full lowercase hex".into());
+    }
+    if image.len()!=71 || !image.starts_with("sha256:") || !image[7..].bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)) {
+        return Err("preflight requires full local image digest".into());
+    }
+    if scope.is_empty() || scope.len()>32 || !scope.bytes().all(|b|b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'-') {
+        return Err("invalid private provider scope".into());
+    }
+    lc::token(creation)?;
+    let profile=match request.get("migration_profile") {
+        None|Some(Value::Null)=>MigrationProfile::Flat,
+        Some(Value::String(v))=>MigrationProfile::parse(v)?,
+        _=>return Err("migration_profile must be flat or nested".into()),
+    };
+    Ok((uuid,scope,creation,Binding{container_id:cid,image,source_host:source,destination:dest,profile}))
+}
+
+fn journal_host(store: &mut dyn crate::store::DurableStore) -> Result<String, Error> {
+    let host=store.query_one("SELECT value FROM metadata WHERE `key` = ?",
+        &[crate::store::Value::from("host_uuid")])?.ok_or("journal host_uuid absent; preflight will not initialize it")?.text(0)?.to_string();
+    if !lc::is_uuid(&host) {return Err("journal host_uuid is invalid".into());}
+    Ok(host)
+}
+
+fn preflight_store_with(
+    store: &mut dyn crate::store::DurableStore,
+    request: &Value,
+    mut provider: impl FnMut(&Value)->Result<Value,Error>,
+) -> Result<Value, Error> {
+    let (uuid,scope,creation,b)=readonly_binding(request)?;
+    let host=journal_host(store)?;
+    if b.source_host!=host {return Err("source_host_uuid does not match this durable journal".into());}
+    // The provider will attest the SAME creation label and immutable CID below.
+    // This binding view is not an invented host observation: the complete durable
+    // ownership implementation validates it before AND after provider attestation.
+    let binding_view=json!({"Id":b.container_id,"Image":b.image,
+        "Config":{"Labels":{"io.podmesh.creation-operation":creation}}});
+    let reservation=lc::migration_store_readonly_gates(store,uuid,&binding_view)?;
+    let action=json!({"kind":"migration_observe","scope":scope,"uuid":uuid,
+        "container_id":b.container_id,"image":b.image,"creation_operation":creation});
+    let observed=provider(&action)?;
+    let identity=provider(&json!({"kind":"host_identity"}))?;
+    let facts=&observed["facts"];
+    let run=&facts["container_incarnation"];
+    let expected_cgroup=format!("/machine.slice/libpod-{}.scope",b.container_id);
+    if run["cgroup"].as_str()!=Some(expected_cgroup.as_str()) {return Err("provider cgroup does not bind the requested container".into());}
+    if observed["type"]!="podmesh-owned-migration-observation/1" || observed["scope"]!=scope
+        || observed["universe_uuid"]!=uuid || observed["creation_operation"]!=creation
+        || run["container_id"]!=b.container_id
+        || run["image"].as_str().map(|v|v.trim_start_matches("sha256:"))!=Some(b.image.trim_start_matches("sha256:"))
+        || run["boot_id"]!=identity["boot_id"] || identity["boot_id"].as_str().filter(|s|lc::is_uuid(s)).is_none()
+        || identity["machine_id"].as_str().filter(|s|s.len()==32&&s.bytes().all(|b|b.is_ascii_hexdigit())).is_none() {
+        return Err("provider observation identity does not bind this journal universe and host boot".into());
+    }
+    if journal_host(store)?!=host || lc::migration_store_readonly_gates(store,uuid,&binding_view)?!=reservation {
+        return Err("durable ownership/reservation changed during preflight".into());
+    }
+    let mut blockers=private_observation_blockers(facts,b.profile);
+    if let Some(state)=reservation {blockers.push(format!("universe already has migration reservation state {state}"));}
+    Ok(json!({"status":"verified","operation":"migration_preflight","store_engine":store.engine().as_str(),
+        "universe_uuid":uuid,"source_host_uuid":host,"destination_host_uuid":b.destination,
+        "migration_profile":b.profile.as_str(),"compatible":blockers.is_empty(),"blockers":blockers,
+        "facts":{"provider_observation":observed,"provider_host_identity":identity,"logical_journal_host_uuid":host},
+        "effects":"none: no journal write, intent, reservation, hostUUID initialization or artifact creation",
+        "scope":"private-MariaDB source assessment; no destination inspection or migration effect enabled"}))
+}
+
+fn private_observation_blockers(f: &Value, profile: MigrationProfile) -> Vec<String> {
+    let mut blockers=Vec::new();
+    let shape=&f["container_shape"];
+    let expected=profile==MigrationProfile::Nested;
+    if shape["privileged"].as_bool()!=Some(expected) {blockers.push("privilege mode unknown or differs from migration profile".into());}
+    if shape["network_mode"]!="none" {blockers.push("network mode is not observed none".into());}
+    if shape["mounts_present"]!=false {blockers.push("volumes/bind mounts present or unobserved".into());}
+    if shape["tty"]!=false {blockers.push("TTY present or unobserved".into());}
+    if f["frozen"]!=false {blockers.push("container cgroup frozen or unobserved".into());}
+    if f["memory_current_bytes"].as_u64().filter(|n|*n<=MAX_MEMORY_BYTES).is_none() {blockers.push("memory observation missing or above qualified bound".into());}
+    let run=&f["container_incarnation"];
+    if run["host_pid"].as_u64().filter(|p|*p>0).is_none()
+        || run["started_at"].as_str().filter(|v|!v.is_empty()).is_none()
+        || run["cgroup"].as_str().filter(|v|v.starts_with("/machine.slice/libpod-")).is_none() {
+        blockers.push("provider process incarnation identity is missing".into());
+    }
+    for ns in ["mnt","pid","net","user","cgroup"] {
+        if f["provider_namespaces"][ns].as_str().filter(|v|!v.is_empty()).is_none() {
+            blockers.push(format!("provider namespace {ns} is unobserved"));
+        }
+    }
+    let p=f["processes"].as_array();
+    if p.is_none() || p.is_some_and(|p|p.is_empty()||p.len()>MAX_PROCESSES) {blockers.push("process observation empty, missing or above qualified bound".into());}
+    if let Some(p)=p {
+        let ids=p.iter().filter_map(|v|v["identity"]["pid"].as_u64()).collect::<std::collections::BTreeSet<_>>();
+        if ids.len()!=p.len() || run["processes"].as_array().map(|v|v.len())!=Some(p.len())
+            || !run["host_pid"].as_u64().is_some_and(|pid|ids.contains(&pid)) {
+            blockers.push("process summaries do not cover the owned incarnation exactly".into());
+        }
+        for process in p {
+        let identity=&process["identity"];
+        let group=run["cgroup"].as_str().unwrap_or("");
+        if group.is_empty() || !identity["cgroup"].as_str().is_some_and(|g|g==group||g.starts_with(&format!("{group}/"))) {
+            blockers.push("process identity left the owned container cgroup".into());
+        }
+        if identity["pid"].as_u64().filter(|v|*v>0).is_none()
+            || identity["starttime_ticks"].as_u64().filter(|v|*v>0).is_none()
+            || !run["processes"].as_array().is_some_and(|rows|rows.contains(identity)) {
+            blockers.push("process summary is not bound to observed incarnation".into());
+        }
+        for ns in ["mnt","pid","net","user","cgroup"] {
+            if identity["namespaces"][ns].as_str().filter(|v|!v.is_empty()).is_none() {
+                blockers.push(format!("process namespace {ns} is unobserved"));
+            }
+        }
+        if process["libc"]!="musl" && !(process["libc"]=="glibc"&&process["glibc_rseq_zero_tunable_observed"]==true) {
+            blockers.push("unidentified or rseq-unqualified process".into());
+        }
+    }}
+    for (path,expected) in [(RUNTIME_REAL,RUNTIME_REAL_SHA256),(RUNTIME_WRAPPER,RUNTIME_WRAPPER_SHA256),(RUNTIME_SHIM,RUNTIME_SHIM_SHA256)] {
+        if f["runtime_files"][path]["sha256"]!=expected {blockers.push(format!("qualified runtime identity unavailable or different: {path}"));}
+    }
+    if f["storage"]["graphroot"]!=CONTAINER_STORAGE || f["storage"]["driver"]!="overlay" {blockers.push("provider graphroot/driver differs from qualified default overlay store".into());}
+    // These facts intentionally remain unknown in the first provider increment.
+    // Never substitute graphroot free space for the APP artifact volume.
+    blockers.push("CRIU capability check not observed by the read-only provider".into());
+    blockers.push("writable-layer size is unobserved; capture space cannot be bounded".into());
+    blockers.push("APP artifact-volume capacity/binding is unobserved".into());
+    blockers
+}
+
 fn scope_unit(id: &str) -> String {
     format!("podmesh-checkpoint-{id}.scope")
 }
@@ -3439,5 +3635,144 @@ mod tests {
             &inner,
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod durable_preflight_tests {
+    use super::*;
+    use crate::store::{self, DurableStore, Engine, Integrity, Row, Transaction, Value as Stored, SqliteStore};
+    const U:&str="00000000-0000-4000-8000-000000000001";
+    const H:&str="00000000-0000-4000-8000-000000000002";
+    const D:&str="00000000-0000-4000-8000-000000000003";
+    const B:&str="00000000-0000-4000-8000-000000000004";
+    struct ReadOnly(SqliteStore);
+    impl DurableStore for ReadOnly {
+        fn engine(&self)->Engine {Engine::Mariadb}
+        fn execute(&mut self,_:&str,_:&[Stored])->store::Result<u64> {panic!("readonly preflight attempted a write")}
+        fn execute_batch(&mut self,_:&str)->store::Result<()> {panic!("readonly preflight attempted DDL/write")}
+        fn query(&mut self,q:&str,p:&[Stored])->store::Result<Vec<Row>> {self.0.query(q,p)}
+        fn transaction(&mut self)->store::Result<Box<dyn Transaction+'_>> {panic!("readonly preflight attempted a transaction")}
+        fn integrity_check(&mut self)->store::Result<Integrity> {self.0.integrity_check()}
+        fn tables(&mut self)->store::Result<Vec<String>> {self.0.tables()}
+    }
+    fn fixture()->(ReadOnly,Value,Value) {
+        let mut db=SqliteStore::open_in_memory().unwrap();store::migrations::apply(&mut db).unwrap();
+        db.execute("INSERT INTO metadata(`key`,value) VALUES(?,?)",&[Stored::from("host_uuid"),Stored::from(H)]).unwrap();
+        let cid="a".repeat(64);let image=format!("sha256:{}","b".repeat(64));
+        let req=json!({"operation":"migration_preflight","operation_id":"preflight-owned","authorization_ref":"test",
+            "universe_uuid":U,"container_id":cid,"image":image,"source_host_uuid":H,"destination_host_uuid":D,
+            "provider_scope":"owned","creation_operation":"created-owned"});
+        let creation=json!({"operation":"create","universe_uuid":U});
+        let result=json!({"container_id":cid});
+        db.execute("INSERT INTO operations(id,request,status,result) VALUES(?,?,'verified',?)",
+            &[Stored::from("created-owned"),Stored::from(creation.to_string()),Stored::from(result.to_string())]).unwrap();
+        let proc=json!({"pid":42,"starttime_ticks":100,"cgroup":format!("/machine.slice/libpod-{cid}.scope"),
+            "namespaces":{"pid":"pid:[2]","mnt":"mnt:[2]","net":"net:[2]","user":"user:[1]","cgroup":"cgroup:[1]"}});
+        let mut runtime=json!({});
+        for (path,hash) in [(RUNTIME_REAL,RUNTIME_REAL_SHA256),(RUNTIME_WRAPPER,RUNTIME_WRAPPER_SHA256),(RUNTIME_SHIM,RUNTIME_SHIM_SHA256)] {
+            runtime[path]=json!({"sha256":hash});
+        }
+        let observation=json!({"type":"podmesh-owned-migration-observation/1","scope":"owned","universe_uuid":U,"creation_operation":"created-owned",
+            "facts":{"provider_namespaces":{"pid":"pid:[1]","mnt":"mnt:[1]","net":"net:[1]","user":"user:[1]","cgroup":"cgroup:[1]"},
+            "container_incarnation":{"container_id":cid,"image":image,"host_pid":42,"started_at":"observed-start","boot_id":B,
+                "cgroup":format!("/machine.slice/libpod-{cid}.scope"),"processes":[proc.clone()]},
+            "container_shape":{"privileged":false,"network_mode":"none","mounts_present":false,"tty":false},
+            "frozen":false,"memory_current_bytes":1048576,"processes":[{"identity":proc,"libc":"musl","glibc_rseq_zero_tunable_observed":false}],
+            "runtime_files":runtime,
+            "storage":{"graphroot":CONTAINER_STORAGE,"driver":"overlay","writable_layer_bytes":null,"app_artifact_volume":null}}});
+        (ReadOnly(db),req,observation)
+    }
+    fn fake_provider(a:&Value,obs:&Value)->Result<Value,Error> {
+        match a["kind"].as_str() {
+            Some("migration_observe")=>Ok(obs.clone()),
+            Some("host_identity")=>Ok(json!({"boot_id":B,"machine_id":"1".repeat(32)})),
+            _=>panic!("unexpected provider action"),
+        }
+    }
+    #[test]
+    fn durable_preflight_joins_owned_journal_and_real_provider_shape_without_writes() {
+        let (mut db,req,obs)=fixture();
+        let before=db.0.query("SELECT * FROM operations",&[]).unwrap();
+        let result=preflight_store_with(&mut db,&req,|a|fake_provider(a,&obs)).unwrap();
+        assert_eq!(result["status"],"verified");assert_eq!(result["compatible"],false);
+        assert_eq!(result["facts"]["logical_journal_host_uuid"],H);
+        assert_eq!(result["facts"]["provider_observation"]["facts"]["provider_namespaces"]["pid"],"pid:[1]");
+        let blockers=result["blockers"].to_string();
+        assert!(blockers.contains("APP artifact-volume"));assert!(blockers.contains("writable-layer"));assert!(blockers.contains("CRIU"));
+        assert_eq!(before.len(),db.0.query("SELECT * FROM operations",&[]).unwrap().len());
+        assert_eq!(db.0.query("SELECT * FROM operation_attempts",&[]).unwrap().len(),0);
+        assert_eq!(db.0.query("SELECT * FROM observations",&[]).unwrap().len(),0);
+        assert_eq!(db.0.query("SELECT * FROM migration_reservations",&[]).unwrap().len(),0);
+    }
+    #[test]
+    fn durable_preflight_wrong_host_destination_ownership_and_missing_identity_refuse_before_provider() {
+        for field in ["source_host_uuid","destination_host_uuid","container_id","creation_operation","image"] {
+            let (mut db,mut req,_)=fixture();
+            req[field]=match field {"source_host_uuid"=>json!(D),"destination_host_uuid"=>json!(H),"container_id"=>json!("c".repeat(64)),"image"=>json!(format!("sha256:{}","B".repeat(64))),_=>json!("unknown-creation")};
+            assert!(preflight_store_with(&mut db,&req,|_|panic!("must refuse before provider")).is_err());
+        }
+        let (mut db,req,_)=fixture();db.0.execute("DELETE FROM metadata WHERE `key`='host_uuid'",&[]).unwrap();
+        assert!(preflight_store_with(&mut db,&req,|_|panic!("must not initialize identity")).is_err());
+        assert!(db.0.query("SELECT * FROM metadata",&[]).unwrap().is_empty());
+    }
+    #[test]
+    fn durable_preflight_reservation_and_collected_or_transferred_history_remain_effective() {
+        for state in ["reserved","transferred","released"] {
+            let (mut db,req,obs)=fixture();let cid="a".repeat(64);
+            db.0.execute("INSERT INTO migration_reservations(universe_uuid,operation_id,container_id,image_id,source_host_uuid,destination_host_uuid,container_started_at,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,0,0)",
+                &[Stored::from(U),Stored::from("held"),Stored::from(cid.as_str()),Stored::from("b".repeat(64)),Stored::from(H),Stored::from(D),Stored::from("start"),Stored::from(state)]).unwrap();
+            let result=preflight_store_with(&mut db,&req,|a|fake_provider(a,&obs));
+            if state=="released" {let r=result.unwrap();assert_eq!(r["compatible"],false);assert!(r["blockers"].to_string().contains("reservation state released"));}
+            else {assert!(result.is_err());}
+        }
+        let (mut db,req,_)=fixture();
+        db.0.execute("UPDATE operations SET status='failed' WHERE id='created-owned'",&[]).unwrap();
+        assert!(preflight_store_with(&mut db,&req,|_|panic!("unverified creation must refuse")).is_err());
+    }
+    #[test]
+    fn durable_preflight_preserves_terminal_history_and_restored_ownership_semantics() {
+        let (mut db,req,_)=fixture();let cid="a".repeat(64);
+        db.0.execute("INSERT INTO migration_reservation_history(universe_uuid,operation_id,container_id,image_id,source_host_uuid,destination_host_uuid,container_started_at,state,created_at,updated_at,archived_at,archived_by_operation) VALUES(?,?,?,?,?,?,?,'transferred',0,0,0,'archived')",
+            &[Stored::from(U),Stored::from("old-transfer"),Stored::from(cid.as_str()),Stored::from("b".repeat(64)),Stored::from(H),Stored::from(D),Stored::from("start")]).unwrap();
+        assert!(preflight_store_with(&mut db,&req,|_|panic!("terminal transfer must gate host reads")).is_err());
+        let (mut db,req,_)=fixture();
+        db.0.execute("INSERT INTO migration_universe_tombstones(universe_uuid,class,class_number,container_id,container_absent_at_collection,checkpoint_operation_id,collected_by_operation,collected_at,proof) VALUES(?,'absent',1,?,1,'old-checkpoint','collector',0,'{}')",
+            &[Stored::from(U),Stored::from(cid.as_str())]).unwrap();
+        assert!(preflight_store_with(&mut db,&req,|_|panic!("collected absent identity must refuse")).is_err());
+        let (mut db,req,obs)=fixture();
+        db.0.execute("DELETE FROM operations",&[]).unwrap();
+        let restored=json!({"operation":"migration_restore_local","universe_uuid":U});
+        let result=json!({"container_id":cid});
+        db.0.execute("INSERT INTO operations(id,request,status,result) VALUES('restored-owned',?,'verified',?)",
+            &[Stored::from(restored.to_string()),Stored::from(result.to_string())]).unwrap();
+        assert!(preflight_store_with(&mut db,&req,|a|fake_provider(a,&obs)).is_ok(),"reuse restored ownership, not a creation-only SELECT");
+    }
+
+    #[test]
+    fn durable_preflight_provider_scope_boot_image_and_unknown_facts_fail_closed() {
+        for pointer in ["/scope","/universe_uuid","/creation_operation","/facts/container_incarnation/container_id","/facts/container_incarnation/image","/facts/container_incarnation/boot_id","/facts/container_incarnation/cgroup"] {
+            let (mut db,req,mut obs)=fixture();*obs.pointer_mut(pointer).unwrap()=json!("wrong");
+            assert!(preflight_store_with(&mut db,&req,|a|fake_provider(a,&obs)).is_err());
+        }
+        let (_,_,obs)=fixture();let mut facts=obs["facts"].clone();
+        facts["container_shape"]["privileged"]=Value::Null;facts["memory_current_bytes"]=Value::Null;
+        facts["storage"]["graphroot"]=json!("/private/vfs");facts["storage"]["driver"]=json!("vfs");
+        facts["provider_namespaces"]=Value::Null;facts["processes"][0]["identity"]["cgroup"]=json!("/foreign");
+        let blockers=private_observation_blockers(&facts,MigrationProfile::Flat).join(";");
+        assert!(blockers.contains("privilege"));assert!(blockers.contains("memory"));assert!(blockers.contains("overlay"));assert!(blockers.contains("namespace"));assert!(blockers.contains("cgroup"));
+    }
+    #[test]
+    fn durable_preflight_shape_stays_consistent_with_sqlite_flat_and_nested_rules() {
+        let (_,_,obs)=fixture();
+        for profile in [MigrationProfile::Flat,MigrationProfile::Nested] {
+            for privileged in [false,true] {
+                let c=json!({"HostConfig":{"Privileged":privileged,"NetworkMode":"none"},"Mounts":[],"Config":{"Tty":false}});
+                let mut f=obs["facts"].clone();f["container_shape"]["privileged"]=json!(privileged);
+                let local=migration_shape_blockers(&c,profile);
+                let durable=private_observation_blockers(&f,profile);
+                assert_eq!(!local.is_empty(),durable.iter().any(|s|s.contains("privilege")));
+            }
+        }
     }
 }

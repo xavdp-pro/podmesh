@@ -534,6 +534,18 @@ fn handle_durable(store: &mut dyn DurableStore, request: &Value) -> Value {
         .get("operation")
         .and_then(Value::as_str)
         .unwrap_or("");
+    // A source observation is served outside the effect journal. In particular,
+    // do not append observations/attempts or initialize a missing host identity.
+    if operation == "migration_preflight" && store.engine()==Engine::Mariadb {
+        return match migration::preflight_store(store, request) {
+            Ok(data) => json!({"ok":true,"observed_at":now(),"data":data}),
+            Err(error) => {
+                let mut refused=json!({"ok":false,"observed_at":now(),"error_code":"migration_preflight_refused","error":error.to_string()});
+                if let Some(failure)=error.downcast_ref::<lifecycle::Failure>() {refused["details"]=failure.details.clone();}
+                refused
+            },
+        };
+    }
     if host_adapter::configured() && matches!(operation, "secret_declare" | "secret_remove" | "secret_status" | "universe_stats") {
         return json!({"ok":false,"observed_at":now(),"error_code":"host_capability_unsupported","error":"operation is not ported to the private node host adapter","operation":operation});
     }
@@ -838,6 +850,36 @@ mod api_store_tests {
         fn tables(&mut self) -> StoreResult<Vec<String>> {
             self.0.tables()
         }
+    }
+
+    #[test]
+    fn durable_preflight_does_not_enable_migration_or_recovery_effects() {
+        let mut sqlite=SqliteStore::open_in_memory().unwrap();migrations::apply(&mut sqlite).unwrap();
+        let mut store=MariaDbAdapter(sqlite);
+        for op in ["migration_checkpoint","migration_authorize_transfer","migration_complete_transfer",
+            "migration_retire_source","migration_release","migration_abandon","migration_restore_local",
+            "migration_destination_preflight","migration_restore","migration_restore_abort",
+            "recovery_point_prepare","recovery_point_restore","recovery_point_promote","recovery_point_stage",
+            "recovery_point_resume","recovery_point_discard","activation_require","activation_acquire","activation_supersede",
+            "activation_renew","activation_release","activation_fence","activation_fence_preview"] {
+            let response=handle_durable(&mut store,&json!({"operation":op}));
+            assert_eq!(response["ok"],false,"{op}");assert_eq!(response["error_code"],"store_engine_unsupported","{op}");
+        }
+        assert!(store.0.query("SELECT * FROM observations",&[]).unwrap().is_empty());
+        assert!(store.0.query("SELECT * FROM operations",&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn durable_preflight_readonly_route_does_not_append_observations_on_refusal() {
+        let mut sqlite=SqliteStore::open_in_memory().unwrap();migrations::apply(&mut sqlite).unwrap();
+        let mut store=MariaDbAdapter(sqlite);
+        // Missing binding always refuses before any socket connection, regardless
+        // of whether a build environment happens to configure a provider socket.
+        let result=handle_durable(&mut store,&json!({"operation":"migration_preflight"}));
+        assert_eq!(result["ok"],false);assert_ne!(result["error_code"],"store_engine_unsupported");
+        assert!(store.0.query("SELECT * FROM observations",&[]).unwrap().is_empty());
+        assert!(store.0.query("SELECT * FROM operations",&[]).unwrap().is_empty());
+        assert!(store.0.query("SELECT * FROM metadata",&[]).unwrap().is_empty());
     }
 
     #[test]
