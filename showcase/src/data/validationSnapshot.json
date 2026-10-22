@@ -142,9 +142,9 @@
         "es": "Objetivo de producción con MariaDB privada"
       },
       "state": {
-        "fr": "Bloqué : portage incomplet",
-        "en": "Blocked: incomplete port",
-        "es": "Bloqueado: adaptación incompleta"
+        "fr": "Précontrôle source validé · déplacement encore bloqué",
+        "en": "Source preflight validated · move still blocked",
+        "es": "Comprobación de origen validada · traslado aún bloqueado"
       },
       "intro": {
         "fr": "Déplacer l’univers ou préparer sa reprise sur un autre hôte.",
@@ -152,20 +152,20 @@
         "es": "Trasladar un universo o preparar su recuperación en otro host."
       },
       "remaining": {
-        "fr": "Porter et qualifier le précontrôle hôte, le déplacement et les points de reprise avec MariaDB privée. Le candidat privé testé refuse encore ces opérations ; les réussites historiques SQLite ne couvrent pas ce nouveau moteur.",
-        "en": "Port and qualify host preflight, moving and recovery points with private MariaDB. The tested private candidate still refuses these operations; historical SQLite successes do not cover this backend.",
-        "es": "Adaptar y validar la comprobación del host, el traslado y los puntos de recuperación con MariaDB privada. El candidato privado probado aún rechaza estas operaciones; los éxitos históricos SQLite no cubren este motor."
+        "fr": "Le précontrôle source typé est démontré en lecture seule sur une vraie MariaDB privée. Il signale encore une incompatibilité : contrôle CRIU, mesure de la couche inscriptible, capacité du volume d’archives et configuration d’exécution restent à qualifier. Le déplacement, les points de reprise et la destination ne sont pas validés.",
+        "en": "Typed source preflight is demonstrated read-only against real private MariaDB. It still reports incompatibility: CRIU checks, writable-layer measurement, artifact-volume capacity and runtime configuration remain unqualified. Moving, recovery points and destination readiness are not validated.",
+        "es": "La comprobación tipada del origen se demostró de solo lectura con MariaDB privada real. Aún declara incompatibilidad: falta validar CRIU, medida de la capa escribible, capacidad del volumen de archivos y configuración de ejecución. El traslado, los puntos de recuperación y el destino no están validados."
       },
       "checks": [
         {
           "id": "preflight",
-          "status": "blocked",
+          "status": "validated",
           "label": {
-            "fr": "Précontrôle hôte typé, réellement en lecture seule",
-            "en": "Typed, genuinely read-only host preflight",
-            "es": "Comprobación tipada del host realmente de solo lectura"
+            "fr": "Précontrôle hôte source typé, réellement en lecture seule",
+            "en": "Typed, genuinely read-only source-host preflight",
+            "es": "Comprobación tipada del host de origen realmente de solo lectura"
           },
-          "proof": "move-gap"
+          "proof": "move-mariadb-readonly"
         },
         {
           "id": "planned-move",
@@ -204,18 +204,19 @@
         "es": "Validación MariaDB privada"
       },
       "labSummary": {
-        "fr": "Un déplacement d’univers imbriqué entre deux hôtes a été démontré, avec identité conservée et reprise des fichiers et journaux. La réplication et la bascule planifiée ont aussi réussi, avec captures à l’arrêt et à chaud. Ce sont des preuves historiques sur le parcours SQLite et les configurations de labo précisées.",
-        "en": "A nested-universe move between two hosts was demonstrated with preserved identity and recovered files and logs. Replication and planned switchover also passed with stopped and live captures. These are historical proofs on the SQLite path and the stated lab configurations.",
-        "es": "Se demostró el traslado de un universo anidado entre dos hosts, conservando identidad y recuperando archivos y registros. También funcionaron la replicación y el cambio planificado, con capturas en parada y en caliente. Son pruebas históricas del recorrido SQLite y las configuraciones de laboratorio indicadas."
+        "fr": "Nouveau : le précontrôle source a répondu avec une vraie MariaDB privée, sans modifier les 40 tables du journal ni le registre du fournisseur. Il refuse correctement de déclarer la configuration compatible. Un déplacement d’univers imbriqué entre deux hôtes a été démontré, avec identité conservée et reprise des fichiers et journaux. La réplication et la bascule planifiée ont aussi réussi, avec captures à l’arrêt et à chaud. Ce sont des preuves historiques sur le parcours SQLite et les configurations de labo précisées.",
+        "en": "New: source preflight ran against real private MariaDB without changing the 40 journal tables or provider registry. It correctly declines to declare the configuration compatible. A nested-universe move between two hosts was demonstrated with preserved identity and recovered files and logs. Replication and planned switchover also passed with stopped and live captures. These are historical proofs on the SQLite path and the stated lab configurations.",
+        "es": "Nuevo: la comprobación del origen se ejecutó con MariaDB privada real sin cambiar las 40 tablas del registro ni el registro del proveedor. Rechaza correctamente declarar compatible la configuración. Se demostró el traslado de un universo anidado entre dos hosts, conservando identidad y recuperando archivos y registros. También funcionaron la replicación y el cambio planificado, con capturas en parada y en caliente. Son pruebas históricas del recorrido SQLite y las configuraciones de laboratorio indicadas."
       },
       "labProofs": [
+        "move-mariadb-readonly",
         "move-lab",
         "replication-lab"
       ],
       "qualificationNote": {
-        "fr": "Le score ci-dessus concerne uniquement les critères MariaDB privée. Les déplacements et réplications déjà démontrés en labo restent acquis.",
-        "en": "The score above covers private MariaDB criteria only. Moves and replication already demonstrated in the lab remain established.",
-        "es": "El porcentaje anterior solo cubre los criterios MariaDB privada. Los traslados y replicaciones ya demostrados en laboratorio siguen siendo logros válidos."
+        "fr": "1 critère sur 4 concerne le précontrôle source en lecture seule, pas un déplacement réussi. Les déplacements et réplications historiques SQLite restent acquis dans leur périmètre.",
+        "en": "1 of 4 criteria covers read-only source preflight, not a successful move. Historical SQLite moves and replication remain established within their scope.",
+        "es": "1 de 4 criterios cubre la comprobación de origen de solo lectura, no un traslado exitoso. Los traslados y replicaciones históricos SQLite siguen probados en su ámbito."
       }
     },
     {
@@ -657,9 +658,9 @@
         "es": "Traslado con MariaDB: dependencia identificada"
       },
       "summary": {
-        "fr": "Les opérations de déplacement et de point de reprise refusent encore ce moteur. Il manque une capacité hôte typée réellement en lecture seule. Les anciennes preuves SQLite ne valident pas ce périmètre MariaDB.",
-        "en": "Move and recovery-point operations still refuse this backend. A genuinely read-only typed host capability is missing. Historical SQLite proofs do not qualify this MariaDB scope.",
-        "es": "Las operaciones de traslado y punto de recuperación aún rechazan este motor. Falta una capacidad tipada del host realmente de solo lectura. Las pruebas SQLite no validan este ámbito MariaDB."
+        "fr": "Le diagnostic initial avait identifié une capacité hôte typée manquante sur le moteur MariaDB. Le nouveau précontrôle source est maintenant démontré séparément ; les opérations de déplacement et de point de reprise restent refusées. Les anciennes preuves SQLite ne qualifient pas ces effets MariaDB.",
+        "en": "The initial diagnosis identified a missing typed host capability on the MariaDB backend. The new source preflight is now demonstrated separately; move and recovery-point effects remain refused. Historical SQLite proofs do not qualify these MariaDB effects.",
+        "es": "El diagnóstico inicial identificó una capacidad tipada del host ausente con MariaDB. La nueva comprobación del origen ya se demostró por separado; los efectos de traslado y recuperación siguen rechazados. Las pruebas SQLite no validan estos efectos con MariaDB."
       }
     },
     {
@@ -817,8 +818,23 @@
         "es": "Compruebe que su versión ofrece pmbs restore --help. Proporcione PMBS_API_TOKEN mediante su canal habitual de secretos. El directorio padre debe existir sin enlaces simbólicos; el destino no debe existir. Use el ID y tipo reales del snapshot. Solo HTTPS o HTTP loopback numérico. El comando restaura contenidos; iniciar la aplicación es otro paso."
       },
       "example": "pmbs restore /srv/recovery/restored-content \\\n  --datastore datastore-default \\\n  --snapshot universe-snapshot-001 \\\n  --backup-type podman \\\n  --remote https://backup.example.net \\\n  --max-bytes 10737418240"
+    },
+    {
+      "id": "move-mariadb-readonly",
+      "date": "2026-10-22",
+      "version": "NODE/provider 0aa3a7f · MariaDB 11.8.9",
+      "title": {
+        "fr": "Précontrôle source sans écriture sur MariaDB privée",
+        "en": "Write-free source preflight on private MariaDB",
+        "es": "Comprobación del origen sin escrituras con MariaDB privada"
+      },
+      "summary": {
+        "fr": "Après 15 tests ciblés et la construction du paquet exact, un vrai NODE avec son fournisseur hôte a évalué un conteneur Podman possédé. Le résultat est vérifié mais incompatible, sans déplacement. Une requête ne différant que par un scope incorrect a été refusée. Les empreintes canoniques des 40 tables du journal et du registre fournisseur sont identiques avant et après les deux appels. Les témoins sont calculés dans l’invité ; les lignes SQL brutes restent privées. Workload supprimé, arrêt propre et rollback natif terminés ; données conservées. Les services persistants, montages et anciens fichiers contrôlés sont préservés ; le gestionnaire de sessions SSH a changé de PID, écart conservé. Revues Opus 5.5 et muse-shaper. Aucun contrôle de destination, transfert, checkpoint, restauration ou preuve de continuité après déplacement.",
+        "en": "After 15 targeted tests and construction of the exact package, a real NODE and its host provider assessed an owned Podman container. The result is verified but incompatible, with no move. A request differing only by an incorrect scope was refused. Canonical digests of all 40 journal tables and the provider registry match before and after both calls. Witnesses are computed in the guest; raw SQL rows remain private. Workload removed, clean stop and native rollback completed; data retained. Checked persistent services, mounts and old files are preserved; the SSH session manager changed PID and this difference is retained. Reviewed by Opus 5.5 and muse-shaper. No destination check, transfer, checkpoint, restore or post-move continuity proof.",
+        "es": "Tras 15 pruebas específicas y construir el paquete exacto, un NODE real y su proveedor del host evaluaron un contenedor Podman propio. El resultado es verificado pero incompatible, sin traslado. Se rechazó una solicitud que solo cambiaba a un scope incorrecto. Las huellas canónicas de las 40 tablas y del registro del proveedor coinciden antes y después de ambas llamadas. Los testigos se calculan en el invitado; las filas SQL permanecen privadas. Carga eliminada, parada limpia y reversión nativa completas; datos conservados. Servicios persistentes, montajes y archivos anteriores comprobados conservados; el gestor de sesiones SSH cambió de PID y se registra la diferencia. Revisado por Opus 5.5 y muse-shaper. No demuestra destino, transferencia, checkpoint, restauración ni continuidad tras traslado."
+      }
     }
   ],
-  "updatedAtUTC": "2026-10-22T17:29:59.878356+00:00",
+  "updatedAtUTC": "2026-10-22T18:12:39.555273+00:00",
   "updatePolicy": "Publish only verified evidence changes; preserve historical lab achievements and version boundaries; never count in-progress code as validated."
 }
