@@ -8,6 +8,8 @@ import ShowcaseSidebar, { SIDEBAR_ITEMS } from '../components/showcase/ShowcaseS
 import GlossaryText from '../components/GlossaryText'
 import ComponentDiagram from '../components/showcase/ComponentDiagram'
 import { guideContent } from '../data/publicGuideContent'
+import ValidationPage from './ValidationPage'
+import { validationCopy } from '../data/validationCopy'
 
 const REPOSITORY = 'https://github.com/xavdp-pro/podmesh'
 const DOC_BASE = `${REPOSITORY}/tree/cursor/assembly-2026-10-07/`
@@ -23,12 +25,14 @@ const LEGACY_ANCHORS = {
 export default function TechnicalShowcasePage() {
   const { locale } = useI18n()
   const copy = guideContent[locale] || guideContent.fr
-  const { hash } = useLocation()
+  const { hash, pathname } = useLocation()
   const navigate = useNavigate()
   const targetId = LEGACY_ANCHORS[hash.slice(1)] || hash.slice(1)
-  const activeId = SIDEBAR_ITEMS.find((item) => item.key === targetId || item.anchors.some((anchor) => anchor.id === targetId))?.key || 'podmesh'
+  const isValidation = pathname === '/validation' || targetId.startsWith('validation')
+  const activeId = isValidation ? 'validation' : SIDEBAR_ITEMS.find((item) => item.key === targetId || item.anchors.some((anchor) => anchor.id === targetId))?.key || 'podmesh'
   const index = copy.sections.findIndex((section) => section.id === activeId)
-  const section = copy.sections[index]
+  const validationText = validationCopy[locale] || validationCopy.fr
+  const section = isValidation ? { name: validationText.nav } : copy.sections[index]
   const [mobileOpen, setMobileOpen] = useState(false)
   const [isDesktop, setIsDesktop] = useState(() => window.matchMedia('(min-width: 1024px)').matches)
   const [desktopExpanded, setDesktopExpanded] = useState(() => {
@@ -58,19 +62,20 @@ export default function TechnicalShowcasePage() {
 
   function selectSection(id, anchorId = id) {
     setMobileOpen(false)
-    if (targetId === anchorId) followTarget(anchorId)
-    else navigate({ hash: `#${anchorId}` })
+    const destination = id === 'validation' ? '/validation' : '/'
+    if (pathname === destination && targetId === anchorId) followTarget(anchorId)
+    else navigate({ pathname: destination, hash: `#${anchorId}` })
   }
 
   useLayoutEffect(() => {
-    if (!targetId) return
-    followTarget(targetId)
-  }, [targetId, activeId, locale])
+    if (targetId) followTarget(targetId)
+    else if (isValidation) window.scrollTo({ top: 0, behavior: 'instant' })
+  }, [targetId, activeId, locale, isValidation])
 
   useEffect(() => {
     document.title = `${section.name} · PodMesh`
-    document.querySelector('meta[name="description"]')?.setAttribute('content', copy.meta)
-  }, [section.name, copy.meta])
+    document.querySelector('meta[name="description"]')?.setAttribute('content', isValidation ? validationText.intro : copy.meta)
+  }, [section.name, copy.meta, isValidation, validationText.intro])
 
   useEffect(() => {
     if (!mobileOpen) return
@@ -110,7 +115,7 @@ export default function TechnicalShowcasePage() {
       <div className="mx-auto flex max-w-7xl items-start gap-6 px-4 py-6 sm:px-6 lg:gap-10 lg:px-8">
         <ShowcaseSidebar activeTab={activeId} activeAnchor={targetId} onSelectTab={selectSection} desktopExpanded={desktopExpanded} onCollapseDesktop={() => { setDesktopMenu(false); menuRef.current?.focus() }} mobileOpen={mobileOpen} onCloseMobile={() => { setMobileOpen(false); menuRef.current?.focus() }} locale={locale} />
         <main className="min-w-0 flex-1 pb-12">
-          <section className="mb-10 border-b border-line pb-8">
+          {!isValidation && <section className="mb-10 border-b border-line pb-8">
             <p className="mb-4 text-sm font-semibold text-accent">PodMesh · MeshFS · PMBS</p>
             <h1 className="site-display max-w-3xl text-4xl font-semibold leading-tight sm:text-5xl">{text(copy.title)}</h1>
             <p className="mt-5 max-w-3xl text-lg leading-8 text-fg-muted">{text(copy.intro)}</p>
@@ -119,9 +124,10 @@ export default function TechnicalShowcasePage() {
             <p className="mt-4 text-sm leading-6 text-fg-muted">{copy.direction}{' '}<a href={`${DOC_BASE}docs/IDEAL-SCENE.md`} target="_blank" rel="noreferrer" className="text-accent underline underline-offset-4">{copy.directionLink}</a></p>
             <p className="mt-5 border-l-2 border-warm pl-4 text-sm leading-6 text-fg-muted">{text(copy.vocabulary)}</p>
             <p className="mt-3 text-xs text-fg-faint">{locale === 'fr' ? 'Un mot souligné ? Survolez-le ou touchez-le pour l’expliquer.' : locale === 'es' ? '¿Una palabra subrayada? Pasa el cursor o tócala para ver su explicación.' : 'An underlined word? Hover or tap it for an explanation.'}</p>
-          </section>
+            <Link to="/validation" className="mt-5 inline-flex items-center gap-2 text-sm font-semibold text-accent underline underline-offset-4">{validationText.nav}<ArrowRight size={16} aria-hidden="true" /></Link>
+          </section>}
 
-          <article key={`${activeId}-${locale}`} id={activeId} tabIndex={-1} className="scroll-mt-24 space-y-7">
+          {isValidation ? <ValidationPage locale={locale} /> : <article key={`${activeId}-${locale}`} id={activeId} tabIndex={-1} className="scroll-mt-24 space-y-7">
             <div>
               <p className="mb-3 text-sm font-semibold text-accent">{section.name} · {section.short}</p>
               <h2 className="site-display text-3xl font-semibold leading-tight sm:text-4xl">{section.title}</h2>
@@ -162,7 +168,7 @@ export default function TechnicalShowcasePage() {
               {index > 0 ? <Link to={`#${copy.sections[index - 1].id}`} className="inline-flex items-center gap-2 text-sm font-semibold text-accent"><ArrowLeft size={16} />{copy.previous} {copy.sections[index - 1].name}</Link> : <span />}
               {index < copy.sections.length - 1 && <Link to={`#${copy.sections[index + 1].id}`} className="inline-flex items-center gap-2 text-sm font-semibold text-accent">{copy.next} {copy.sections[index + 1].name}<ArrowRight size={16} /></Link>}
             </nav>
-          </article>
+          </article>}
         </main>
       </div>
       <footer className="border-t border-line bg-surface px-4 py-6 text-sm text-fg-muted">

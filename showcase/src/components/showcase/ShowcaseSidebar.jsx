@@ -1,5 +1,6 @@
 import React, { useEffect, useRef } from 'react'
 import { guideContent } from '../../data/publicGuideContent'
+import { validationCopy } from '../../data/validationCopy'
 import {
   Layers,
   HardDrive,
@@ -9,6 +10,7 @@ import {
   X,
   ChevronRight,
   Bookmark,
+  ClipboardCheck,
 } from 'lucide-react'
 
 const NAV_ICONS = { podmesh: Layers, meshfs: HardDrive, pmbs: ShieldCheck, proxmox: Server, downloads: Terminal }
@@ -24,7 +26,17 @@ export const SIDEBAR_ITEMS = guideContent.fr.sections.map(({ id }, index) => ({
     id: `${id}-${part}`,
     label: translated((copy) => copy[part]),
   })),
-}))
+})).concat([{
+  key: 'validation',
+  icon: ClipboardCheck,
+  title: Object.fromEntries(LOCALES.map((locale) => [locale, validationCopy[locale].nav])),
+  desc: Object.fromEntries(LOCALES.map((locale) => [locale, validationCopy[locale].short])),
+  anchors: [
+    ['validation-criteria', 'navCriteria'],
+    ['validation-method', 'navMethod'],
+    ['validation-evidence', 'navProofs'],
+  ].map(([id, field]) => ({ id, label: Object.fromEntries(LOCALES.map((locale) => [locale, validationCopy[locale][field]])) })),
+}])
 
 const UI_TEXT = {
   fr: {
@@ -83,7 +95,7 @@ export default function ShowcaseSidebar({
         return (
           <div key={item.key} className="flex flex-col">
             <a
-              href={`#${item.key}`}
+              href={`${item.key === 'validation' ? '/validation' : '/'}#${item.key}`}
               aria-current={isActive ? 'page' : undefined}
               onClick={(event) => {
                 event.preventDefault()
@@ -138,7 +150,7 @@ export default function ShowcaseSidebar({
                 {item.anchors.map((anchor) => (
                   <a
                     key={anchor.id}
-                    href={`#${anchor.id}`}
+                    href={`${item.key === 'validation' ? '/validation' : '/'}#${anchor.id}`}
                     aria-current={activeAnchor === anchor.id ? 'location' : undefined}
                     onClick={(event) => {
                       event.preventDefault()

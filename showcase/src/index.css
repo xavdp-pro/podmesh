@@ -56,6 +56,26 @@ html.theme-dark,
 
 @custom-variant dark (&:where(.theme-dark, .theme-dark *));
 
+.validation-progress {
+  display: block;
+  appearance: none;
+  border: 0;
+  border-radius: 999px;
+  background: var(--color-line);
+}
+.validation-progress::-webkit-progress-bar {
+  border-radius: 999px;
+  background: var(--color-line);
+}
+.validation-progress::-webkit-progress-value {
+  border-radius: 999px;
+  background: currentColor;
+}
+.validation-progress::-moz-progress-bar {
+  border-radius: 999px;
+  background: currentColor;
+}
+
 html {
   -webkit-tap-highlight-color: transparent;
   overflow-x: clip;

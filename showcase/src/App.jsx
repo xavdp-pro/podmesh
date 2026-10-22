@@ -11,6 +11,7 @@ export default function App() {
           <Route path="/" element={<TechnicalShowcasePage />} />
           <Route path="/showcase" element={<TechnicalShowcasePage />} />
           <Route path="/technical-showcase" element={<TechnicalShowcasePage />} />
+          <Route path="/validation" element={<TechnicalShowcasePage />} />
           <Route path="*" element={<TechnicalShowcasePage />} />
         </Routes>
       </BrowserRouter>

@@ -1,0 +1,696 @@
+{
+  "schema": 1,
+  "updatedAt": "2026-10-22",
+  "metric": "validated_essential_criteria_coverage",
+  "formula": "round(100 * count(status == validated) / count(criteria))",
+  "productionQualified": false,
+  "features": [
+    {
+      "id": "lifecycle",
+      "name": {
+        "fr": "Cycle de vie PodMesh",
+        "en": "PodMesh lifecycle",
+        "es": "Ciclo de vida PodMesh"
+      },
+      "scope": {
+        "fr": "NODE et manager · MariaDB privée",
+        "en": "NODE and manager · private MariaDB",
+        "es": "NODE y manager · MariaDB privada"
+      },
+      "state": {
+        "fr": "Socle qualifié dans son périmètre",
+        "en": "Baseline qualified within scope",
+        "es": "Base validada en su ámbito"
+      },
+      "intro": {
+        "fr": "Créer, arrêter et retrouver une application avec son journal et ses données.",
+        "en": "Create, stop and recover an application with its journal and data.",
+        "es": "Crear, parar y recuperar una aplicación con su registro y datos."
+      },
+      "remaining": {
+        "fr": "Le retour après un véritable redémarrage de l’hôte reste à démontrer dans la version de livraison retenue.",
+        "en": "Return after a real host reboot remains to be demonstrated for the selected release.",
+        "es": "Falta demostrar la vuelta tras un reinicio real del host en la versión elegida."
+      },
+      "checks": [
+        {
+          "id": "private-db",
+          "status": "validated",
+          "label": {
+            "fr": "Unités isolées avec une vraie MariaDB privée",
+            "en": "Isolated units with real private MariaDB",
+            "es": "Unidades aisladas con MariaDB privada real"
+          },
+          "proof": "node-common"
+        },
+        {
+          "id": "operations",
+          "status": "validated",
+          "label": {
+            "fr": "Opérations, identité et rejeu sans double effet",
+            "en": "Operations, identity and replay without duplicate effects",
+            "es": "Operaciones, identidad y reejecución sin duplicar efectos"
+          },
+          "proof": "node-common"
+        },
+        {
+          "id": "stop-restart",
+          "status": "validated",
+          "label": {
+            "fr": "Arrêt propre et redémarrage avec état conservé",
+            "en": "Clean stop and restart with preserved state",
+            "es": "Parada y reinicio limpios con estado conservado"
+          },
+          "proof": "node-confirmation"
+        },
+        {
+          "id": "flat-restore",
+          "status": "validated",
+          "label": {
+            "fr": "Restauration complète du NODE simple et reprise utile",
+            "en": "Full flat NODE restore and useful recovery",
+            "es": "Restauración completa del NODE simple y recuperación útil"
+          },
+          "proof": "node-common"
+        },
+        {
+          "id": "nested-restore",
+          "status": "validated",
+          "label": {
+            "fr": "Restauration imbriquée : identités, fichiers et journaux",
+            "en": "Nested restore: identities, files and journals",
+            "es": "Restauración anidada: identidades, archivos y registros"
+          },
+          "proof": "node-common"
+        },
+        {
+          "id": "manager-restore",
+          "status": "validated",
+          "label": {
+            "fr": "Journal du manager et restauration native utiles",
+            "en": "Manager journal and useful native restore",
+            "es": "Registro del manager y restauración nativa útil"
+          },
+          "proof": "manager-native"
+        },
+        {
+          "id": "rollback",
+          "status": "validated",
+          "label": {
+            "fr": "Retour arrière et conservation des services d’origine",
+            "en": "Rollback and preservation of original services",
+            "es": "Reversión y conservación de servicios originales"
+          },
+          "proof": "node-common"
+        },
+        {
+          "id": "host-reboot",
+          "status": "unverified",
+          "label": {
+            "fr": "Retour des services après redémarrage réel de l’hôte",
+            "en": "Service recovery after a real host reboot",
+            "es": "Recuperación de servicios tras reinicio real del host"
+          },
+          "proof": null
+        }
+      ]
+    },
+    {
+      "id": "move",
+      "name": {
+        "fr": "Déplacement et réplication",
+        "en": "Move and replication",
+        "es": "Traslado y replicación"
+      },
+      "scope": {
+        "fr": "Périmètre de production avec MariaDB privée",
+        "en": "Production target with private MariaDB",
+        "es": "Objetivo de producción con MariaDB privada"
+      },
+      "state": {
+        "fr": "Bloqué : portage incomplet",
+        "en": "Blocked: incomplete port",
+        "es": "Bloqueado: adaptación incompleta"
+      },
+      "intro": {
+        "fr": "Déplacer l’univers ou préparer sa reprise sur un autre hôte.",
+        "en": "Move a universe or prepare its recovery on another host.",
+        "es": "Trasladar un universo o preparar su recuperación en otro host."
+      },
+      "remaining": {
+        "fr": "Le parcours SQLite historique existe. Il ne valide pas les opérations MariaDB encore refusées par le candidat privé.",
+        "en": "The historical SQLite path exists. It does not qualify MariaDB operations still refused by the private candidate.",
+        "es": "Existe el recorrido histórico SQLite. No valida las operaciones MariaDB aún rechazadas por el candidato privado."
+      },
+      "checks": [
+        {
+          "id": "preflight",
+          "status": "blocked",
+          "label": {
+            "fr": "Précontrôle hôte typé, réellement en lecture seule",
+            "en": "Typed, genuinely read-only host preflight",
+            "es": "Comprobación tipada del host realmente de solo lectura"
+          },
+          "proof": "move-gap"
+        },
+        {
+          "id": "planned-move",
+          "status": "blocked",
+          "label": {
+            "fr": "Déplacement planifié avec identité et données conservées",
+            "en": "Planned move preserving identity and data",
+            "es": "Traslado planificado conservando identidad y datos"
+          },
+          "proof": "move-gap"
+        },
+        {
+          "id": "recovery-point",
+          "status": "blocked",
+          "label": {
+            "fr": "Point de reprise et bascule planifiée sur MariaDB",
+            "en": "MariaDB recovery point and planned switchover",
+            "es": "Punto de recuperación y cambio planificado con MariaDB"
+          },
+          "proof": "move-gap"
+        },
+        {
+          "id": "nested-move",
+          "status": "unverified",
+          "label": {
+            "fr": "Continuité de l’univers imbriqué après déplacement MariaDB",
+            "en": "Nested-universe continuity after a MariaDB-backed move",
+            "es": "Continuidad del universo anidado tras traslado con MariaDB"
+          },
+          "proof": "move-gap"
+        }
+      ]
+    },
+    {
+      "id": "meshfs",
+      "name": {
+        "fr": "MeshFS",
+        "en": "MeshFS",
+        "es": "MeshFS"
+      },
+      "scope": {
+        "fr": "Système de fichiers distribué · preuves par version",
+        "en": "Distributed filesystem · version-specific proofs",
+        "es": "Sistema de archivos distribuido · pruebas por versión"
+      },
+      "state": {
+        "fr": "Blocage : délais d’écriture",
+        "en": "Blocker: write deadlines",
+        "es": "Bloqueo: plazos de escritura"
+      },
+      "intro": {
+        "fr": "Conserver des copies cohérentes et récupérer ce qu’un nœud a manqué.",
+        "en": "Keep consistent copies and recover changes missed by a node.",
+        "es": "Mantener copias coherentes y recuperar cambios perdidos por un nodo."
+      },
+      "remaining": {
+        "fr": "Les délais de trois secondes ne sont pas résolus. La consolidation du stockage de métadonnées vers MariaDB reste un chantier distinct.",
+        "en": "Three-second deadline failures remain unresolved. Consolidating metadata storage on MariaDB is a separate unfinished task.",
+        "es": "Los fallos del plazo de tres segundos siguen abiertos. Consolidar los metadatos en MariaDB es un trabajo pendiente separado."
+      },
+      "checks": [
+        {
+          "id": "replication",
+          "status": "validated",
+          "label": {
+            "fr": "Contenus cohérents contrôlés sur trois répliques",
+            "en": "Consistent payloads checked across three replicas",
+            "es": "Contenidos coherentes verificados en tres réplicas"
+          },
+          "proof": "mesh-recovery"
+        },
+        {
+          "id": "replay-bounds",
+          "status": "validated",
+          "label": {
+            "fr": "Anciens rejeux refusés et métadonnées bornées",
+            "en": "Stale replays refused and metadata bounded",
+            "es": "Reejecuciones antiguas rechazadas y metadatos acotados"
+          },
+          "proof": "mesh-replay"
+        },
+        {
+          "id": "empty-replica",
+          "status": "validated",
+          "label": {
+            "fr": "Rattrapage d’une réplique vide dans le périmètre testé",
+            "en": "Empty-replica catch-up within the tested scope",
+            "es": "Recuperación de una réplica vacía en el ámbito probado"
+          },
+          "proof": "mesh-empty"
+        },
+        {
+          "id": "abrupt-recovery",
+          "status": "validated",
+          "label": {
+            "fr": "Réouverture après arrêt brutal et nouvelle écriture",
+            "en": "Reopen after abrupt stop and a new write",
+            "es": "Reapertura tras parada abrupta y nueva escritura"
+          },
+          "proof": "mesh-recovery"
+        },
+        {
+          "id": "actual-ingestion",
+          "status": "validated",
+          "label": {
+            "fr": "262 144 blocs réellement ingérés sur le labo secondaire",
+            "en": "262,144 blocks actually ingested in the secondary lab",
+            "es": "262 144 bloques realmente ingeridos en el segundo laboratorio"
+          },
+          "proof": "mesh-ingestion"
+        },
+        {
+          "id": "write-deadlines",
+          "status": "blocked",
+          "label": {
+            "fr": "Écritures sous charge sans résultats incertains à trois secondes",
+            "en": "Loaded writes without uncertain three-second outcomes",
+            "es": "Escrituras bajo carga sin resultados inciertos a tres segundos"
+          },
+          "proof": "mesh-latency"
+        },
+        {
+          "id": "production-backend",
+          "status": "unverified",
+          "label": {
+            "fr": "Consolidation MariaDB et rétention pour la production",
+            "en": "Production MariaDB consolidation and retention",
+            "es": "Consolidación MariaDB y retención para producción"
+          },
+          "proof": null
+        }
+      ]
+    },
+    {
+      "id": "pmbs",
+      "name": {
+        "fr": "PMBS · sauvegarde et restauration",
+        "en": "PMBS · backup and restore",
+        "es": "PMBS · copia y restauración"
+      },
+      "scope": {
+        "fr": "Conteneur Podman · configuration bornée",
+        "en": "Podman container · bounded configuration",
+        "es": "Contenedor Podman · configuración acotada"
+      },
+      "state": {
+        "fr": "Reprise utile démontrée au labo",
+        "en": "Useful lab recovery demonstrated",
+        "es": "Recuperación útil demostrada en laboratorio"
+      },
+      "intro": {
+        "fr": "Retrouver l’image, la configuration et les données, puis refaire fonctionner l’application.",
+        "en": "Recover image, configuration and data, then run the application again.",
+        "es": "Recuperar imagen, configuración y datos, y volver a ejecutar la aplicación."
+      },
+      "remaining": {
+        "fr": "Le parcours reste orchestré par des scripts de recette. La fidélité des attributs et la restauration d’un univers complet avec ses bases privées restent ouvertes.",
+        "en": "The path still uses qualification scripts. File-attribute fidelity and recovery of a full universe with private databases remain open.",
+        "es": "El recorrido aún usa scripts de validación. Siguen pendientes la fidelidad de atributos y la recuperación de un universo completo con bases privadas."
+      },
+      "checks": [
+        {
+          "id": "api-policy",
+          "status": "validated",
+          "label": {
+            "fr": "Manifestes, chemins et accès API contrôlés",
+            "en": "Checked manifests, paths and API access",
+            "es": "Manifiestos, rutas y acceso API comprobados"
+          },
+          "proof": "pmbs-policy"
+        },
+        {
+          "id": "backup-persistence",
+          "status": "validated",
+          "label": {
+            "fr": "Sauvegarde authentifiée et manifeste conservé après redémarrage",
+            "en": "Authenticated backup and manifest surviving restart",
+            "es": "Copia autenticada y manifiesto conservado tras reiniciar"
+          },
+          "proof": "pmbs-data"
+        },
+        {
+          "id": "server-index",
+          "status": "validated",
+          "label": {
+            "fr": "Index et contenus récupérés depuis le serveur, sans manifeste client",
+            "en": "Index and payloads recovered from server without client manifest",
+            "es": "Índice y contenidos del servidor sin manifiesto cliente"
+          },
+          "proof": "pmbs-server"
+        },
+        {
+          "id": "empty-image-store",
+          "status": "validated",
+          "label": {
+            "fr": "Image et configuration récupérées dans un magasin Podman vide",
+            "en": "Image and configuration recovered into an empty Podman store",
+            "es": "Imagen y configuración recuperadas en almacén Podman vacío"
+          },
+          "proof": "pmbs-server"
+        },
+        {
+          "id": "useful-restored-app",
+          "status": "validated",
+          "label": {
+            "fr": "Application restaurée : lecture et nouvelle écriture synchronisée",
+            "en": "Restored application: reads and a new synced write",
+            "es": "Aplicación restaurada: lectura y nueva escritura sincronizada"
+          },
+          "proof": "pmbs-server"
+        },
+        {
+          "id": "file-attributes",
+          "status": "unverified",
+          "label": {
+            "fr": "Fidélité des permissions, propriétaires et attributs de fichiers",
+            "en": "File permissions, ownership and attribute fidelity",
+            "es": "Fidelidad de permisos, propietarios y atributos de archivos"
+          },
+          "proof": null
+        },
+        {
+          "id": "whole-universe",
+          "status": "unverified",
+          "label": {
+            "fr": "Univers complet avec volumes et bases MariaDB privées cohérentes",
+            "en": "Complete universe with volumes and consistent private MariaDB stores",
+            "es": "Universo completo con volúmenes y bases MariaDB privadas coherentes"
+          },
+          "proof": null
+        },
+        {
+          "id": "delivered-restore",
+          "status": "partial",
+          "label": {
+            "fr": "Parcours de restauration livré et documenté pour l’exploitation",
+            "en": "Delivered, documented operational restoration workflow",
+            "es": "Recorrido de restauración entregado y documentado para explotación"
+          },
+          "proof": null
+        }
+      ]
+    },
+    {
+      "id": "shaper",
+      "name": {
+        "fr": "Univers SHAPER intégré",
+        "en": "Integrated SHAPER universe",
+        "es": "Universo SHAPER integrado"
+      },
+      "scope": {
+        "fr": "SHAPER OS V1.15 · périmètres natifs conservés",
+        "en": "SHAPER OS V1.15 · retained native scopes",
+        "es": "SHAPER OS V1.15 · ámbitos nativos conservados"
+      },
+      "state": {
+        "fr": "Sous-ensemble utile qualifié",
+        "en": "Useful subset qualified",
+        "es": "Subconjunto útil validado"
+      },
+      "intro": {
+        "fr": "Faire travailler les unités ensemble et retrouver leur fonctionnement après restauration.",
+        "en": "Run the units together and recover useful operation after restoration.",
+        "es": "Hacer trabajar juntas las unidades y recuperar su funcionamiento tras restaurar."
+      },
+      "remaining": {
+        "fr": "Le fonctionnement utile restauré est acquis. Les pannes du parent, les réparations et les scénarios de sécurité restants demandent leur propre qualification.",
+        "en": "Useful restored operation is established. Remaining parent failures, repairs and security scenarios need their own qualification.",
+        "es": "El funcionamiento útil restaurado está demostrado. Los fallos del padre, reparaciones y escenarios de seguridad restantes necesitan su propia validación."
+      },
+      "checks": [
+        {
+          "id": "native-birth",
+          "status": "validated",
+          "label": {
+            "fr": "Création native et identités des unités",
+            "en": "Native creation and unit identities",
+            "es": "Creación nativa e identidades de unidades"
+          },
+          "proof": "shaper-useful"
+        },
+        {
+          "id": "restored-vault",
+          "status": "validated",
+          "label": {
+            "fr": "Restauration utile et lecture/écriture Vault",
+            "en": "Useful restoration and Vault read/write",
+            "es": "Restauración útil y lectura/escritura Vault"
+          },
+          "proof": "shaper-useful"
+        },
+        {
+          "id": "unit-chain",
+          "status": "validated",
+          "label": {
+            "fr": "Chaîne réelle Maestro → Queue → Bridge → témoin",
+            "en": "Actual Maestro → Queue → Bridge → witness chain",
+            "es": "Cadena real Maestro → Queue → Bridge → testigo"
+          },
+          "proof": "shaper-useful"
+        },
+        {
+          "id": "logger-events",
+          "status": "validated",
+          "label": {
+            "fr": "Événements Logger corrélés aux opérations utiles",
+            "en": "Logger events correlated with useful operations",
+            "es": "Eventos Logger correlacionados con operaciones útiles"
+          },
+          "proof": "shaper-useful"
+        },
+        {
+          "id": "parent-failure",
+          "status": "unverified",
+          "label": {
+            "fr": "Panne du parent et réconciliation après retour",
+            "en": "Parent failure and reconciliation after return",
+            "es": "Fallo del padre y reconciliación tras su vuelta"
+          },
+          "proof": null
+        },
+        {
+          "id": "repair-escalation",
+          "status": "unverified",
+          "label": {
+            "fr": "Réparation bornée, épuisement et remontée d’échec",
+            "en": "Bounded repair, exhaustion and failure escalation",
+            "es": "Reparación acotada, agotamiento y escalado del fallo"
+          },
+          "proof": null
+        },
+        {
+          "id": "fleet-security",
+          "status": "unverified",
+          "label": {
+            "fr": "Scénarios restants de sécurité et de reprise de flotte",
+            "en": "Remaining security and fleet-recovery scenarios",
+            "es": "Escenarios pendientes de seguridad y recuperación del conjunto"
+          },
+          "proof": null
+        }
+      ]
+    }
+  ],
+  "proofs": [
+    {
+      "id": "node-common",
+      "date": "2026-10-08",
+      "version": "NODE 64238f · recipe affe6a",
+      "title": {
+        "fr": "NODE : opérations et restauration",
+        "en": "NODE: operations and restoration",
+        "es": "NODE: operaciones y restauración"
+      },
+      "summary": {
+        "fr": "MariaDB privée, huit opérations et rejeux, arrêt propre, restauration en cible vide en mode simple et imbriqué, puis fonctionnement utile et retour arrière. Les conteneurs imbriqués retrouvent leurs données ; leur mémoire vive n’est pas certifiée.",
+        "en": "Private MariaDB, eight operations and replays, clean stop, empty-target flat and nested restore, useful operation and rollback. Nested containers recover data; inner memory continuity is not certified.",
+        "es": "MariaDB privada, ocho operaciones y reejecuciones, parada limpia, restauración simple y anidada en destino vacío, funcionamiento útil y reversión. No se certifica la continuidad de memoria interna."
+      }
+    },
+    {
+      "id": "manager-native",
+      "date": "2026-10-08",
+      "version": "Manager d0bcf079",
+      "title": {
+        "fr": "Manager : journal et restauration native",
+        "en": "Manager: journal and native restore",
+        "es": "Manager: registro y restauración nativa"
+      },
+      "summary": {
+        "fr": "Restauration native, identité conservée, ancien rejeu et nouvelle opération durable, comparaison de trois répliques et arrêt propre. Cette preuve n’active pas la haute disponibilité automatique.",
+        "en": "Native restore, preserved identity, historical replay and a new durable operation, three-replica comparison and clean stop. This does not enable automatic high availability.",
+        "es": "Restauración nativa, identidad conservada, reejecución y nueva operación duradera, comparación de tres réplicas y parada limpia. No activa la alta disponibilidad automática."
+      }
+    },
+    {
+      "id": "node-confirmation",
+      "date": "2026-10-22",
+      "version": "NODE 64238f · recipe affe6a",
+      "title": {
+        "fr": "Socle NODE confirmé dans un nouveau labo",
+        "en": "NODE baseline confirmed in a new lab",
+        "es": "Base NODE confirmada en otro laboratorio"
+      },
+      "summary": {
+        "fr": "Installation, création typée, correspondance API/SQL, arrêt et redémarrage propres, rejeu sans nouvel effet et nettoyage vérifiés sur les mêmes octets du paquet commun.",
+        "en": "Install, typed create, matching API/SQL state, clean stop/restart, replay without a new effect and cleanup verified on the same common-package bytes.",
+        "es": "Instalación, creación tipada, coincidencia API/SQL, parada y reinicio limpios, reejecución sin nuevo efecto y limpieza verificados con el mismo paquete."
+      }
+    },
+    {
+      "id": "move-gap",
+      "date": "2026-10-22",
+      "version": "Private MariaDB target",
+      "title": {
+        "fr": "Déplacement MariaDB : dépendance identifiée",
+        "en": "MariaDB move: identified dependency",
+        "es": "Traslado con MariaDB: dependencia identificada"
+      },
+      "summary": {
+        "fr": "Les opérations de déplacement et de point de reprise refusent encore ce moteur. Il manque une capacité hôte typée réellement en lecture seule. Les anciennes preuves SQLite ne valident pas ce périmètre MariaDB.",
+        "en": "Move and recovery-point operations still refuse this backend. A genuinely read-only typed host capability is missing. Historical SQLite proofs do not qualify this MariaDB scope.",
+        "es": "Las operaciones de traslado y punto de recuperación aún rechazan este motor. Falta una capacidad tipada del host realmente de solo lectura. Las pruebas SQLite no validan este ámbito MariaDB."
+      }
+    },
+    {
+      "id": "mesh-replay",
+      "date": "2026-10-21",
+      "version": "MeshFS 2f9e27e",
+      "title": {
+        "fr": "Anciens rejeux et métadonnées bornées",
+        "en": "Stale replays and bounded metadata",
+        "es": "Reejecuciones antiguas y metadatos acotados"
+      },
+      "summary": {
+        "fr": "Sur deux labos : anciens messages refusés après éviction, rejeu récent sans écrasement, état conservé après redémarrage et références de fichiers et snapshots préservées. Le stockage physique des blocs n’est pas purgé par cette preuve.",
+        "en": "Two labs: stale messages refused after eviction, recent retry without overwrite, restart persistence and file/snapshot references preserved. Physical block reclamation is not proved.",
+        "es": "En dos laboratorios: mensajes antiguos rechazados tras la expulsión, reintento reciente sin sobrescritura, persistencia tras reinicio y referencias conservadas. No demuestra liberación física de bloques."
+      }
+    },
+    {
+      "id": "mesh-empty",
+      "date": "2026-10-21",
+      "version": "MeshFS ac9e777",
+      "title": {
+        "fr": "Rattrapage d’une réplique vide",
+        "en": "Empty-replica catch-up",
+        "es": "Recuperación de una réplica vacía"
+      },
+      "summary": {
+        "fr": "Rattrapage d’une réplique vide avec le nouveau protocole, dans les scénarios conservés des deux labos. Cette preuve reste liée à cette version ; elle ne certifie pas toutes les mises à niveau ni une panne d’hôte physique.",
+        "en": "Empty-replica catch-up with the new protocol in the retained two-lab scenarios. Bound to that version; not a general upgrade or physical-host failure certificate.",
+        "es": "Recuperación de una réplica vacía con el nuevo protocolo en los escenarios de dos laboratorios. Prueba ligada a esa versión, no a toda actualización ni a fallos del host físico."
+      }
+    },
+    {
+      "id": "mesh-ingestion",
+      "date": "2026-10-21",
+      "version": "MeshFS 934c199",
+      "title": {
+        "fr": "Ingestion réelle : 262 144 blocs",
+        "en": "Actual ingestion: 262,144 blocks",
+        "es": "Ingesta real: 262 144 bloques"
+      },
+      "summary": {
+        "fr": "262 144 requêtes acquittées sans résultat incertain sur le labo secondaire, avec contrôle des contenus des trois répliques. Le labo principal a présenté des dépassements de délai : son blocage reste ouvert.",
+        "en": "262,144 acknowledged requests with no uncertain outcome in the secondary lab, with payload checks on all three replicas. Primary-lab deadline failures remain open.",
+        "es": "262 144 solicitudes confirmadas sin resultados inciertos en el laboratorio secundario, con comprobación de tres réplicas. Los fallos de plazo del laboratorio principal siguen abiertos."
+      }
+    },
+    {
+      "id": "mesh-recovery",
+      "date": "2026-10-22",
+      "version": "MeshFS c7a67c9",
+      "title": {
+        "fr": "Reprise après arrêt brutal",
+        "en": "Recovery after abrupt stop",
+        "es": "Recuperación tras parada abrupta"
+      },
+      "summary": {
+        "fr": "Les 96 contenus acquittés conservés ont été relus après réouverture réelle des trois répliques ; une nouvelle écriture porte le total contrôlé à 97. Aucun ancien jeu de données n’a été remplacé.",
+        "en": "All 96 retained acknowledged payloads were read after actual reopening of three replicas; a new write brought the checked total to 97. Previous datasets were preserved.",
+        "es": "Los 96 contenidos confirmados se leyeron tras reabrir las tres réplicas; una nueva escritura elevó el total comprobado a 97. Los datos anteriores se conservaron."
+      }
+    },
+    {
+      "id": "mesh-latency",
+      "date": "2026-10-21",
+      "version": "MeshFS c7a67c9",
+      "title": {
+        "fr": "Délais d’écriture : blocage ouvert",
+        "en": "Write latency: open blocker",
+        "es": "Latencia de escritura: bloqueo abierto"
+      },
+      "summary": {
+        "fr": "Des confirmations dépassent la limite de trois secondes. Un fsync du journal a duré 3,35 secondes dans une capture instrumentée. La cause exclusive n’est pas isolée et l’écriture peut être enregistrée malgré le timeout.",
+        "en": "Some confirmations exceed the three-second deadline. A journal fsync took 3.35 seconds in an instrumented capture. The sole cause is not isolated; a timed-out write may still be recorded.",
+        "es": "Algunas confirmaciones superan tres segundos. Un fsync del registro duró 3,35 segundos en una captura instrumentada. La causa única no está aislada y una escritura puede quedar registrada pese al timeout."
+      }
+    },
+    {
+      "id": "pmbs-policy",
+      "date": "2026-10-21",
+      "version": "PMBS 702ec62 → c932df3",
+      "title": {
+        "fr": "Manifestes, chemins et accès API",
+        "en": "Manifests, paths and API access",
+        "es": "Manifiestos, rutas y acceso API"
+      },
+      "summary": {
+        "fr": "Les contrôles ciblés des manifestes, chemins et accès API sont conservés avec leurs versions. L’intégrité d’un snapshot et le démarrage réel d’une application restent deux preuves distinctes.",
+        "en": "Targeted manifest, path and API-access checks are retained with their versions. Snapshot integrity and actual application operation remain distinct proofs.",
+        "es": "Se conservan controles de manifiestos, rutas y acceso API con sus versiones. La integridad de un snapshot y el funcionamiento de una aplicación son pruebas distintas."
+      }
+    },
+    {
+      "id": "pmbs-data",
+      "date": "2026-10-22",
+      "version": "PMBS c932df3",
+      "title": {
+        "fr": "Sauvegarde et reprise utile Podman",
+        "en": "Podman backup and useful recovery",
+        "es": "Copia y recuperación útil de Podman"
+      },
+      "summary": {
+        "fr": "Sauvegarde authentifiée, manifeste retrouvé après redémarrage du service, restauration de données dans une cible vide, puis lecture des cinq enregistrements et écriture de cinq nouveaux.",
+        "en": "Authenticated backup, manifest recovered after service restart, data restored to an empty target, then five records recovered and five new records written.",
+        "es": "Copia autenticada, manifiesto recuperado tras reiniciar el servicio, datos restaurados en destino vacío, cinco registros recuperados y cinco nuevos escritos."
+      }
+    },
+    {
+      "id": "pmbs-server",
+      "date": "2026-10-22",
+      "version": "PMBS c932df3",
+      "title": {
+        "fr": "Image, configuration et données depuis le serveur",
+        "en": "Image, configuration and data from the server",
+        "es": "Imagen, configuración y datos desde el servidor"
+      },
+      "summary": {
+        "fr": "Métadonnées et contenus récupérés par l’API PMBS authentifiée, sans ancien manifeste client. Magasin Podman initialement vide, image et configuration bornée reconstituées, cinq enregistrements retrouvés et sixième synchronisé. Revue Opus 5.5 et muse-shaper. Cinq fichiers simples ; orchestration externe, sans preuve de reprise complète d’un univers MariaDB.",
+        "en": "Metadata and payloads recovered through authenticated PMBS API, without a retained client index. Initially empty Podman store, recovered image and bounded config, five records recovered and a sixth synced. Reviewed by Opus 5.5 and muse-shaper. Five regular files; external orchestration, not a complete MariaDB-universe recovery proof.",
+        "es": "Metadatos y contenidos recuperados por la API PMBS autenticada, sin índice cliente previo. Almacén Podman vacío, imagen y configuración acotada recuperadas, cinco registros encontrados y un sexto sincronizado. Revisado por Opus 5.5 y muse-shaper. Cinco archivos normales; orquestación externa, no recuperación completa de un universo MariaDB."
+      }
+    },
+    {
+      "id": "shaper-useful",
+      "date": "2026-10-22",
+      "version": "Adopted V1.15 · qualified unit scopes",
+      "title": {
+        "fr": "Univers SHAPER : sous-ensemble utile restauré",
+        "en": "SHAPER universe: useful restored subset",
+        "es": "Universo SHAPER: subconjunto útil restaurado"
+      },
+      "summary": {
+        "fr": "Bilan du 22 octobre reprenant les preuves natives antérieures. Clone natif et restauration utiles conservés : Vault écrit et relit, Maestro déclenche Queue puis Bridge vers un témoin indépendant, Logger conserve cinq événements corrélés. Les scénarios restants du parent et de réparation ne sont pas clos.",
+        "en": "October 22 review of earlier native evidence. Retained native clone and useful restore: Vault write/read, Maestro triggers Queue and Bridge toward an independent witness, and Logger records five correlated events. Remaining parent and repair scenarios are not closed.",
+        "es": "Balance del 22 de octubre de pruebas nativas anteriores. Clon nativo y restauración útil conservados: Vault escribe y lee, Maestro activa Queue y Bridge hacia un testigo independiente, Logger registra cinco eventos correlacionados. Los escenarios pendientes del padre y reparación no están cerrados."
+      }
+    }
+  ]
+}
