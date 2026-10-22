@@ -45,6 +45,9 @@ pub enum Commands {
     /// Does not execute workloads or restore permissions, ACLs, xattrs or symlinks.
     Restore(RestoreArgs),
 
+    /// Capture regular contents of an explicitly quiesced directory; create-only snapshot.
+    Backup(BackupArgs),
+
     /// Trigger inter-site differential replication
     Sync(SyncArgs),
 }
@@ -165,4 +168,32 @@ pub struct RestoreArgs {
     /// Maximum logical restored bytes (default 10 GiB); checked before writing.
     #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024u64)]
     pub max_bytes: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct BackupArgs {
+    /// Trusted source directory; symlinks in any ancestor or entry are refused.
+    /// Only logical relative names/content are exported, never the absolute source path.
+    pub source: PathBuf,
+    /// Operator confirms input writers are stopped; this is not a live snapshot.
+    #[arg(long, required = true)]
+    pub quiesced_input: bool,
+    #[arg(long)]
+    pub snapshot: String,
+    #[arg(long)]
+    pub backup_type: String,
+    #[arg(long, default_value = "datastore-default")]
+    pub datastore: String,
+    /// HTTPS or numeric loopback HTTP, PMBS_API_TOKEN, no redirects or proxies.
+    #[arg(long, default_value = "http://127.0.0.1:8007")]
+    pub remote: String,
+    #[arg(long)]
+    pub max_bytes: u64,
+    #[arg(long)]
+    pub max_files: usize,
+    #[arg(long, default_value_t = 1024 * 1024 * 1024u64)]
+    pub max_file_bytes: u64,
+    /// Cooperative capture deadline; cannot interrupt a stalled kernel filesystem syscall.
+    #[arg(long, default_value_t = 300)]
+    pub max_seconds: u64,
 }

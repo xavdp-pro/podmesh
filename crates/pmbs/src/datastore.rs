@@ -49,8 +49,15 @@ fn secure_dir(path: &Path) -> io::Result<()> {
         Ok(m) if m.is_dir() && !m.file_type().is_symlink() => Ok(()),
         Ok(_) => Err(invalid("non-directory or symlink in storage path")),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(path)?;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            match fs::create_dir(path) {
+                Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    let m = fs::symlink_metadata(path)?;
+                    if m.is_dir() && !m.file_type().is_symlink() { Ok(()) }
+                    else { Err(invalid("non-directory or symlink in storage path")) }
+                }
+                Err(e) => Err(e),
+            }
         }
         Err(e) => Err(e),
     }
@@ -237,25 +244,42 @@ impl Datastore {
     }
     /// Publish immutable snapshots: exact retries succeed, conflicting contents never replace.
     pub fn save_snapshot(&self, manifest: &BackupManifest) -> io::Result<()> {
+        self.publish_snapshot(manifest, false)
+    }
+    /// Conditional create: even an exact existing retry is refused, atomically.
+    pub fn create_snapshot(&self, manifest: &BackupManifest) -> io::Result<()> {
+        self.publish_snapshot(manifest, true)
+    }
+    fn publish_snapshot(&self, manifest: &BackupManifest, create_only: bool) -> io::Result<()> {
         self.validate_manifest(manifest)?;
         let type_dir = self.snapshots_dir.join(&manifest.backup_type); secure_dir(&type_dir)?;
         let snap_dir = type_dir.join(&manifest.id); secure_dir(&snap_dir)?;
+        if create_only {
+            File::open(&self.snapshots_dir)?.sync_all()?;
+            File::open(&type_dir)?.sync_all()?;
+        }
         let target = snap_dir.join("manifest.json");
         let value = serde_json::to_value(manifest).map_err(|_| invalid("invalid manifest"))?;
+        if create_only && fs::symlink_metadata(&target).is_ok() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "snapshot identity already exists"));
+        }
         if target.exists() {
             let previous: serde_json::Value = serde_json::from_slice(&read_regular(&target)?).map_err(|_| invalid("invalid existing manifest"))?;
             return if previous == value { Ok(()) } else { Err(io::Error::new(io::ErrorKind::AlreadyExists, "snapshot identity conflict")) };
         }
         let seq = TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temp = snap_dir.join(format!("manifest.tmp.{}.{}", std::process::id(), seq));
+        let mut temp_owned = false;
         let result = (|| {
             let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp)?;
+            temp_owned = true;
             file.write_all(&serde_json::to_vec_pretty(&value).map_err(|_| invalid("invalid manifest"))?)?;
             file.sync_all()?;
             fs::hard_link(&temp, &target)?;
             File::open(&snap_dir)?.sync_all()
         })();
-        let _ = fs::remove_file(&temp); result
+        if temp_owned { let _ = fs::remove_file(&temp); }
+        result
     }
 
     /// Loads all snapshot manifests within this datastore.

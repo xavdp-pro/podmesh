@@ -8,7 +8,7 @@ use axum::{
     middleware::{self, Next},
     extract::Request,
     extract::{DefaultBodyLimit, Path as AxPath, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -202,6 +202,7 @@ async fn list_snapshots_handler(
 async fn save_snapshot_handler(
     State(state): State<AppState>,
     AxPath(datastore): AxPath<String>,
+    headers: HeaderMap,
     Json(manifest): Json<BackupManifest>,
 ) -> Response {
     let stores = state.datastores.read().await;
@@ -216,14 +217,24 @@ async fn save_snapshot_handler(
         }
     };
 
-    match ds.save_snapshot(&manifest) {
+    if headers.get_all(header::IF_NONE_MATCH).iter().count() > 1 {
+        return (StatusCode::BAD_REQUEST, "ambiguous If-None-Match").into_response();
+    }
+    let create_only = match headers.get(header::IF_NONE_MATCH) {
+        None => false,
+        Some(v) if v.as_bytes() == b"*" => true,
+        Some(_) => return (StatusCode::BAD_REQUEST, "only If-None-Match: * is supported").into_response(),
+    };
+    let publication = if create_only { ds.create_snapshot(&manifest) } else { ds.save_snapshot(&manifest) };
+    match publication {
         Ok(_) => (
             StatusCode::CREATED,
-            Json(serde_json::json!({ "ok": true, "snapshotId": manifest.id })),
+            Json(if create_only { serde_json::json!({ "ok": true, "snapshotId": manifest.id, "createdOnly": true }) }
+                 else { serde_json::json!({ "ok": true, "snapshotId": manifest.id }) }),
         )
             .into_response(),
         Err(e) => (
-            match e.kind() { std::io::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST, std::io::ErrorKind::AlreadyExists => StatusCode::CONFLICT, _ => StatusCode::INTERNAL_SERVER_ERROR },
+            match e.kind() { std::io::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST, std::io::ErrorKind::AlreadyExists => if create_only { StatusCode::PRECONDITION_FAILED } else { StatusCode::CONFLICT }, _ => StatusCode::INTERNAL_SERVER_ERROR },
             Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
         )
             .into_response(),

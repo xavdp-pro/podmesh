@@ -1,6 +1,7 @@
 //! PMBS — Main Entrypoint and Backup Daemon
 
 mod restore;
+mod backup;
 
 use clap::Parser;
 use pmbs::cli::{Cli, Commands, DatastoreSubcommand};
@@ -32,6 +33,16 @@ async fn main() -> ExitCode {
         .init();
 
     match args.command {
+        Commands::Backup(args) => {
+            match backup::run(&args).await {
+                Ok(report) => println!("{}", report),
+                Err(error) => {
+                    eprintln!("{}", serde_json::json!({"ok": false, "error": error,
+                        "snapshotPublication": "NOT_CONFIRMED", "unreferencedChunksMayRemain": true}));
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
         Commands::Restore(args) => {
             match restore::run(&args).await {
                 Ok(report) => println!("{}", report),
