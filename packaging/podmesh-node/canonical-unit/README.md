@@ -125,6 +125,29 @@ It also verifies the unmodified base status/os-release/key bytes. A fresh empty
 image-local APT configuration plus --no-download/--no-upgrade/--no-remove selects
 only exact local packages and preserves dependency/Pre-Depends ordering; service
 autostart is denied during construction and original image policy restored.
+The offline simulation is parsed separately from the tab-separated manifest.
+Only exact new-package Inst and Conf pairs are accepted, with locked versions
+(including epochs and distribution suffixes) and amd64/all architecture identity.
+Optional package qualifiers must match the locked architecture. Current-version
+brackets, extra/missing/duplicate actions, removals, purge, broken or ambiguous
+rows fail before installation. Native release descriptions are metadata only;
+artifact/base/signature checks remain the authority. Simulation input is bounded
+by 4 MiB, 8192 lines and 4096 bytes per line.
+
+Installer refusals emit fixed, bounded stderr fields: stage, guard, kind, source
+line and exit status; parser errors additionally identify their input line. They
+never dump commands, environment or lock contents. Original command status is
+retained. A specific parser or subshell error may be followed by a propagation
+diagnostic; preserve their order and use the first specific guard. Service-policy restoration runs on failure as well as success; removal
+or restoration failures are explicit, preserve the saved original and cannot
+produce a completion marker. Restoration failure cannot replace the original
+failure status. A partially written temporary policy is tracked for cleanup.
+
+Isolated parser and diagnostic fixtures extract the actual implementation
+functions without invoking the installer or APT. Run them on the authorized
+qualification host with `python3 -m unittest discover -s packaging/podmesh-node/canonical-unit -p test_offline_installer.py -v`.
+These fixtures do not qualify an image installation.
+
 Installed expected versions and actual hashlib/json/pathlib/secrets/socket/
 subprocess/tempfile/unittest imports plus Linux WNOWAIT are verified afterwards.
 No image success or runtime compatibility is inferred until that stage passes.

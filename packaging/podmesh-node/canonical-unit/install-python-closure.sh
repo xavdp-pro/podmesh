@@ -1,32 +1,122 @@
 #!/bin/bash
 # ONLY inside a new image build. No collector/host path invokes this installer.
-set -euo pipefail
+set -Eeuo pipefail
+# BEGIN OFFLINE_INSTALLER_SUPPORT
+# Fixed diagnostic fields only: never print commands, environment or lock contents.
+stage=bootstrap
+guard=initialization
+policy_created=0
+policy_saved=0
+cleanup_done=0
+cleanup_status=0
+failure_reported=0
+report_failure() {
+    failure_reported=1
+    printf 'offline-installer stage=%s guard=%s kind=%s line=%s exit=%s\n' \
+        "$stage" "$guard" "$1" "$2" "$3" >&2
+}
+refuse() {
+    report_failure guard "${BASH_LINENO[0]}" "$1"
+    exit "$1"
+}
+cleanup() {
+    if [[ $cleanup_done == 1 ]]; then return "$cleanup_status"; fi
+    cleanup_done=1
+    if [[ $policy_created == 1 ]]; then
+        if rm -f -- "$policy_path"; then policy_created=0
+        else
+            cleanup_status=$?
+            report_failure cleanup-remove "$LINENO" "$cleanup_status"
+            return "$cleanup_status" # Keep the saved original; never overwrite on removal failure.
+        fi
+    fi
+    if [[ $policy_saved == 1 ]]; then
+        if mv -- "$work/policy-rc.d.saved" "$policy_path"; then policy_saved=0
+        else
+            cleanup_status=$?
+            report_failure cleanup-restore "$LINENO" "$cleanup_status"
+            return "$cleanup_status" # Retain the only saved original and work directory.
+        fi
+    fi
+}
+on_exit() {
+    local line=$1 original=$2 restored=0
+    trap - ERR EXIT
+    set +e
+    if [[ $original != 0 && $failure_reported == 0 ]]; then report_failure exit "$line" "$original"; fi
+    cleanup || restored=$?
+    if [[ $original != 0 ]]; then exit "$original"; fi
+    exit "$restored"
+}
+# The parser is also extracted verbatim by isolated fixture tests; no installer bypass.
+validate_plan() {
+    awk '
+function die(reason) {
+ failed=1;
+ printf "offline-installer stage=plan_validate guard=%s input_line=%d exit=65\n",reason,FNR > "/dev/stderr";
+ exit 65
+}
+FILENAME==ARGV[1] {
+ if (length($0)>4096 || ++packages>64) die("manifest-bound");
+ k=split($0,row,"\t");
+ if (k!=6 || row[1]!~/^[a-z0-9][a-z0-9+.-]+$/ || row[2]!~/^[0-9][A-Za-z0-9.+:~\055]*$/ || (row[3]!="amd64" && row[3]!="all") || (row[1] in v)) die("manifest-identity");
+ v[row[1]]=row[2]; a[row[1]]=row[3]; next
+}
+{
+ if (++lines>8192 || length($0)>4096) die("plan-bound");
+ line=$0; sub(/^[ \t]+/,"",line); sub(/[ \t]+$/,"",line);
+ if (line!~/^(Inst|Conf|Remv|Purg)/) next;
+ k=split(line,t,/[ \t]+/);
+ if (t[1]=="Remv" || t[1]=="Purg") die("removal");
+ if ((t[1]!="Inst" && t[1]!="Conf") || k<4) die("action-shape");
+ count=split(t[2],qualified,":"); n=qualified[1];
+ if (!(n in v) || count>2 || (count==2 && qualified[2]!=a[n])) die("package-architecture");
+ # Current installed versions appear as [old] BEFORE the candidate: always refuse.
+ if (t[3]!="(" v[n] || t[k]!="[" a[n] "])") die("candidate-version-architecture");
+ for (i=4;i<k;i++) if (t[i]!~/^[A-Za-z0-9._:+~\055\/,]+$/) die("release-shape");
+ if (t[1]=="Inst") {if (++found[n]!=1) die("duplicate-install")}
+ else {if (found[n]!=1 || ++configured[n]!=1) die("unexpected-configure")}
+}
+END {
+ if (failed) exit 65;
+ if (packages<1) die("empty-manifest");
+ for (n in v) if (found[n]!=1 || configured[n]!=1) die("missing-action")
+}
+' "$1" "$2"
+}
+# END OFFLINE_INSTALLER_SUPPORT
+trap 'report_failure command "$LINENO" "$?"' ERR
+trap 'on_exit "$LINENO" "$?"' EXIT
+policy_path=/usr/sbin/policy-rc.d
 export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root
 unset APT_CONFIG LD_PRELOAD LD_LIBRARY_PATH PYTHONPATH PYTHONHOME MYSQL_PWD DPKG_ROOT DPKG_ADMINDIR BASH_ENV ENV CDPATH http_proxy https_proxy all_proxy ftp_proxy no_proxy
 root=/opt/podmesh-python-closure
-expected=${1:?mandatory trusted closure SHA256}
-[[ $expected =~ ^[0-9a-f]{64}$ ]] || exit 64
-[[ ${PODMESH_CANONICAL_IMAGE_BUILD:-} == 1 && $EUID == 0 ]] || exit 64
-[[ -f /.dockerenv || -f /run/.containerenv ]] || { echo 'image-build boundary missing' >&2; exit 64; }
+guard=trusted-lock-argument
+[[ $# == 1 ]] || refuse 64
+expected=$1
+stage=boundary guard=trusted-lock-shape
+[[ $expected =~ ^[0-9a-f]{64}$ ]] || refuse 64
+guard=image-build-authority
+[[ ${PODMESH_CANONICAL_IMAGE_BUILD:-} == 1 && $EUID == 0 ]] || refuse 64
+guard=image-build-marker
+[[ -f /.dockerenv || -f /run/.containerenv ]] || { echo 'image-build boundary missing' >&2; refuse 64; }
+stage=prerequisites guard=required-tool
 for helper in sha256sum awk cmp cp sort find stat dpkg-deb dpkg-query dpkg apt-get mktemp wc grep df; do
-    command -v "$helper" >/dev/null || { echo "missing offline installer helper: $helper" >&2; exit 65; }
+    command -v "$helper" >/dev/null || { echo "missing offline installer helper: $helper" >&2; refuse 65; }
 done
-[[ -d $root && ! -L $root && -f $root/closure.lock && ! -L $root/closure.lock ]] || exit 65
-[[ $(stat -c %s "$root/closure.lock") -le 131072 ]] || exit 65
+stage=lock_verify guard=lock-path
+[[ -d $root && ! -L $root && -f $root/closure.lock && ! -L $root/closure.lock ]] || refuse 65
+guard=lock-size
+[[ $(stat -c %s "$root/closure.lock") -le 131072 ]] || refuse 65
+guard=trusted-lock-checksum
 printf '%s  %s\n' "$expected" "$root/closure.lock" | sha256sum --check --strict - >/dev/null
 # The lock is data, never sourced/eval'd. Reject malformed lines, duplicates and unsafe fields.
+stage=work_prepare guard=private-work-create
 work=$(mktemp -d /tmp/podmesh-python-offline.XXXXXXXX)
 chmod 700 "$work"
-policy_created=0
-policy_saved=0
-cleanup() {
-    if [[ $policy_created == 1 ]]; then rm -f /usr/sbin/policy-rc.d; fi
-    if [[ $policy_saved == 1 ]]; then mv "$work/policy-rc.d.saved" /usr/sbin/policy-rc.d; fi
-    # On failure retain diagnostics; image build must fail rather than claim installation.
-}
-trap cleanup EXIT
+stage=lock_decode guard=lock-schema
 awk -F '\t' '
-function die() { exit 65 }
+function die() { failed=1; print "offline-installer stage=lock_decode guard=lock-schema input_line=" NR " exit=65" > "/dev/stderr"; exit 65 }
 NR==1 { if ($0!="PODMESH_PYTHON_CLOSURE_V1") die(); next }
 $1=="PACKAGE" {
  if (ended || NF!=8 || $2!~/^[a-z0-9][a-z0-9+.-]+$/ || $3!~/^[0-9][A-Za-z0-9.+:~\055]*$/ || ($4!="all" && $4!="amd64") || length($5)!=64 || $5!~/^[0-9a-f]+$/ || $6!~/^[1-9][0-9]*$/ || $7!=$5".deb" || $8!~/^[0-9]+$/ || names[$2]++ || hashes[$5]++) die();
@@ -43,30 +133,45 @@ $1=="END" { if (ended++ || NF!=3 || $2!=count || $3!=total || count<1 || count>6
  else if ($1=="STATUS" || $1=="OS_RELEASE" || $1=="KEY" || $1=="BINDING" || $1=="EVIDENCE") { if (length($2)!=64 || $2!~/^[0-9a-f]+$/) die() }
  else die()
 }
-END { if (!ended || count<1 || !names["python3"] || !names["libpython3-stdlib"]) die(); split("REGISTRY IMAGE ARCHIVE SUITE ARCH STATUS OS_RELEASE KEY BINDING EVIDENCE",required," "); for (i in required) if (!seen[required[i]]) die() }
+END { if (failed) exit 65; if (!ended || count<1 || !names["python3"] || !names["libpython3-stdlib"]) die(); split("REGISTRY IMAGE ARCHIVE SUITE ARCH STATUS OS_RELEASE KEY BINDING EVIDENCE",required," "); for (i in required) if (!seen[required[i]]) die() }
 ' "$root/closure.lock" > "$work/packages.tsv"
 field() { awk -F '\t' -v key="$1" '$1==key {print $2}' "$root/closure.lock"; }
+stage=base_verify guard=base-status-checksum
 printf '%s  %s\n' "$(field STATUS)" /var/lib/dpkg/status | sha256sum --check --strict - >/dev/null
+guard=base-os-checksum
 printf '%s  %s\n' "$(field OS_RELEASE)" /etc/os-release | sha256sum --check --strict - >/dev/null
+guard=base-key-checksum
 printf '%s  %s\n' "$(field KEY)" /usr/share/keyrings/ubuntu-archive-keyring.gpg | sha256sum --check --strict - >/dev/null
-[[ -f $root/evidence.json && ! -L $root/evidence.json && -d $root/debs && ! -L $root/debs ]] || exit 65
+stage=bundle_verify guard=evidence-path
+[[ -f $root/evidence.json && ! -L $root/evidence.json && -d $root/debs && ! -L $root/debs ]] || refuse 65
+guard=evidence-checksum
 printf '%s  %s\n' "$(field EVIDENCE)" "$root/evidence.json" | sha256sum --check --strict - >/dev/null
-[[ -z $(find "$root" -type l -print -quit) ]] || exit 65
-[[ $(find "$root" -name '*.deb' -printf '%P\n' | wc -l) -eq $(wc -l < "$work/packages.tsv") ]] || exit 65
-[[ $(find "$root/debs" -mindepth 1 -maxdepth 1 -printf '%f\n' | wc -l) == $(wc -l < "$work/packages.tsv") ]] || exit 65
+guard=bundle-no-symlinks
+[[ -z $(find "$root" -type l -print -quit) ]] || refuse 65
+guard=bundle-deb-count
+[[ $(find "$root" -name '*.deb' -printf '%P\n' | wc -l) -eq $(wc -l < "$work/packages.tsv") ]] || refuse 65
+guard=bundle-artifact-count
+[[ $(find "$root/debs" -mindepth 1 -maxdepth 1 -printf '%f\n' | wc -l) == $(wc -l < "$work/packages.tsv") ]] || refuse 65
 # Validate every byte/identity before any privileged installation, including unknown extra artifacts.
+stage=artifact_verify guard=artifact-identity
 debs=()
 while IFS=$'\t' read -r name version arch hash bytes filename; do
     artifact="$root/debs/$filename"
-    [[ -f $artifact && ! -L $artifact && $(stat -c %s "$artifact") == "$bytes" ]] || exit 65
+    guard=artifact-path-size
+    [[ -f $artifact && ! -L $artifact && $(stat -c %s "$artifact") == "$bytes" ]] || refuse 65
+    guard=artifact-checksum
     printf '%s  %s\n' "$hash" "$artifact" | sha256sum --check --strict - >/dev/null
-    [[ $(dpkg-deb --field "$artifact" Package) == "$name" && $(dpkg-deb --field "$artifact" Version) == "$version" && $(dpkg-deb --field "$artifact" Architecture) == "$arch" ]] || exit 65
+    guard=artifact-package-version-architecture
+    [[ $(dpkg-deb --field "$artifact" Package) == "$name" && $(dpkg-deb --field "$artifact" Version) == "$version" && $(dpkg-deb --field "$artifact" Architecture) == "$arch" ]] || refuse 65
     # New packages only; no image base reinstall or upgrade is authorized.
-    if dpkg-query --show --showformat='${Status}' "$name" 2>/dev/null | grep -qx 'install ok installed'; then exit 65; fi
+    guard=new-package-only
+    if dpkg-query --show --showformat='${Status}' "$name" 2>/dev/null | grep -qx 'install ok installed'; then refuse 65; fi
     debs+=("$artifact")
 done < "$work/packages.tsv"
-[[ $(dpkg --print-architecture) == amd64 ]] || exit 65
+guard=native-architecture
+[[ $(dpkg --print-architecture) == amd64 ]] || refuse 65
 # Empty APT sources/config/hooks; dpkg/status is this IMAGE, never the collector host.
+stage=apt_prepare guard=isolated-configuration
 mkdir -p "$work/etc/parts" "$work/etc/sources.d" "$work/state/lists/partial" "$work/cache/archives/partial" "$work/log"
 : > "$work/etc/empty.conf"
 : > "$work/etc/sources.list"
@@ -106,41 +211,57 @@ Acquire::https::Proxy "http://127.0.0.1:9";
 #clear DPkg::Pre-Install-Pkgs;
 EOF
 export APT_CONFIG="$work/apt.conf" DEBIAN_FRONTEND=noninteractive
+stage=plan_simulate guard=offline-native-resolver
 apt-get --simulate --no-download --no-upgrade --no-remove --no-install-recommends install "${debs[@]}" > "$work/plan.log"
 # Reject extra resolution, version changes and removals before invoking installation.
-awk -F '\t' 'NR==FNR {v[$1]=$2; next} /^Remv |^Purg / {exit 65} /^Inst / {n=$2; sub(/:amd64$/,"",n); if (!(n in v) || index($0,"[" v[n] "]")) exit 65; want="("v[n]" "; if (!index($0,want)) exit 65; found[n]++} END {for (n in v) if (found[n]!=1) exit 65}' "$work/packages.tsv" "$work/plan.log"
+stage=plan_validate guard=plan-byte-bound
+[[ $(stat -c %s "$work/plan.log") -le 4194304 ]] || refuse 65
+guard=exact-new-install-plan
+validate_plan "$work/packages.tsv" "$work/plan.log"
 # Bind base package versions before native configuration, then compare exact full set.
+stage=package_snapshot guard=full-package-set
 dpkg-query --show --showformat='${Package}\t${Version}\t${Architecture}\t${Status}\n' | sort > "$work/packages-before.tsv"
+stage=capacity guard=installed-space-bound
 installed_kib=$(awk -F '\t' '$1=="PACKAGE" {n+=$8} END {printf "%.0f",n}' "$root/closure.lock")
 free_kib=$(df -Pk / | awk 'NR==2 {print $4}')
-[[ $installed_kib =~ ^[0-9]+$ && $free_kib =~ ^[0-9]+$ && $installed_kib -lt $free_kib ]] || exit 65
+[[ $installed_kib =~ ^[0-9]+$ && $free_kib =~ ^[0-9]+$ && $installed_kib -lt $free_kib ]] || refuse 65
 # Native package resolver preserves Pre-Depends/configuration order; never force dependencies.
-if [[ -e /usr/sbin/policy-rc.d || -L /usr/sbin/policy-rc.d ]]; then
-    [[ -f /usr/sbin/policy-rc.d && ! -L /usr/sbin/policy-rc.d ]] || exit 65
-    mv /usr/sbin/policy-rc.d "$work/policy-rc.d.saved"
+stage=policy_prepare guard=service-policy-original
+if [[ -e "$policy_path" || -L "$policy_path" ]]; then
+    [[ -f "$policy_path" && ! -L "$policy_path" ]] || refuse 65
+    mv "$policy_path" "$work/policy-rc.d.saved"
     policy_saved=1
 fi
-printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
-chmod 755 /usr/sbin/policy-rc.d
-policy_created=1
+policy_created=1 # Track even a partially written replacement for EXIT restoration.
+printf '#!/bin/sh\nexit 101\n' > "$policy_path"
+chmod 755 "$policy_path"
+stage=install guard=offline-native-install
 apt-get --yes --no-download --no-upgrade --no-remove --no-install-recommends install "${debs[@]}"
+stage=installed_verify guard=installed-package-identity
 while IFS=$'\t' read -r name version arch _hash _bytes _filename; do
-    [[ $(dpkg-query --show --showformat='${Version}' "$name") == "$version" && $(dpkg-query --show --showformat='${Architecture}' "$name") == "$arch" && $(dpkg-query --show --showformat='${Status}' "$name") == 'install ok installed' ]] || exit 65
-    [[ -z $(dpkg --verify "$name") ]] || exit 65
+    guard=installed-package-identity
+    [[ $(dpkg-query --show --showformat='${Version}' "$name") == "$version" && $(dpkg-query --show --showformat='${Architecture}' "$name") == "$arch" && $(dpkg-query --show --showformat='${Status}' "$name") == 'install ok installed' ]] || refuse 65
+    guard=installed-package-bytes
+    [[ -z $(dpkg --verify "$name") ]] || refuse 65
 done < "$work/packages.tsv"
 cp "$work/packages-before.tsv" "$work/packages-expected.tsv"
+stage=installed_verify guard=installed-package-identity
 while IFS=$'\t' read -r name version arch _hash _bytes _filename; do
     printf '%s\t%s\t%s\tinstall ok installed\n' "$name" "$version" "$arch" >> "$work/packages-expected.tsv"
 done < "$work/packages.tsv"
 sort "$work/packages-expected.tsv" > "$work/packages-expected-sorted.tsv"
+stage=package_snapshot guard=full-package-set
 dpkg-query --show --showformat='${Package}\t${Version}\t${Architecture}\t${Status}\n' | sort > "$work/packages-after.tsv"
+stage=installed_verify guard=full-package-set-equality
 cmp "$work/packages-expected-sorted.tsv" "$work/packages-after.tsv"
+stage=runtime_helpers guard=python-imports-WNOWAIT
 /usr/bin/python3 -I -c 'import hashlib,json,pathlib,secrets,socket,subprocess,tempfile,unittest,os; assert hasattr(os,"WNOWAIT")'
 # Restore service policy successfully BEFORE recording any completed installation.
+stage=policy_restore guard=service-policy-restore
 cleanup
-policy_created=0
-policy_saved=0
 trap - EXIT
+stage=finalize guard=private-work-remove
 rm -rf -- "$work"
 # Retain lock, packages, signed evidence and this verification result in the image.
+guard=completion-marker
 printf '%s\n' "$expected" > "$root/installed.lock.sha256"
