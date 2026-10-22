@@ -19,16 +19,37 @@ MariaDB digest remains selected. No Alpine switch or arbitrary host Python tree.
 Build with `--network=none --pull=never`; image construction uses verified local
 Debian packages only. Dependency collection is an explicit separate build action.
 
-### Authenticated Python dependency closure — guarded incomplete source
+### Authenticated Python dependency closure — source implementation, unqualified
 
-The collector currently **hard-refuses after signed Release verification** at
-`UNIMPLEMENTED_AUTHENTICATED_PACKAGES_INDEX_BINDING`. It cannot yet download
-packages or publish a lock. The missing stage must normalize each actual APT
-Packages index, match it to the SHA256/size recorded in the verified Release,
-and prove selected package stanzas come from that signed index. No flag bypasses
-this guard. The installer and later collection path are unqualified source; the
-following describes their contract, not a successful closure or image build.
+Only uncompressed UTF-8 deb822 Packages indices are supported. The collector sets
+`Acquire::GzipIndexes=false` and `Acquire::IndexTargets::deb::Packages::KeepCompressed=false`
+and obtains actual filenames/URI/component/architecture from `apt-get indextargets`.
+The target must also report KeepCompressed=no and the exact configured Release;
+compressed sibling files are rejected. It does not guess Packages cache filenames or equate compressed bytes with a signed
+uncompressed hash. Unknown encoding, compressed retained targets, missing index
+or conflicting source/candidate metadata refuses without fallback.
 
+For each exact official source/suite, gpgv verified plaintext and externally bound
+archive primary signers authenticate Release; signing-subkey fingerprints are
+retained separately. Strict gpgv success is required: extra unknown, expired, revoked
+or bad signatures refuse, with no permissive multiple-signature fallback. Its SHA256/size entry for
+`main/binary-amd64/Packages` must match a private streamed snapshot of the actual
+index. Selected package fields and retained raw stanzas come from those matched
+bytes, never apt-cache self-report. Exact artifact matches mirrored across security
+and updates retain all identical-artifact provenance; conflicting identities or
+repeated selected rows inside one index refuse. Retained signed files, key, binding,
+index snapshots, signer/plaintext hashes and selected stanzas allow verify_bundle
+to replay signature verification and the complete index/artifact chain offline.
+Verification uses a separate private temporary scratch directory, never writes
+inside retained bundles, and checks input sizes before reading. Package/evidence
+ordering is canonical by name; actual download URIs must match authenticated
+Filename fields and source origins before download.
+Synthetic tests mock only the signature boundary and do not prove real OpenPGP.
+Real signed metadata collection and an offline image build remain required.
+
+APT's [index-target documentation](https://github.com/Debian/apt/blob/main/doc/acquire-additional-files.md)
+defines deb822 indextargets and KeepCompressed=false. The implementation intentionally
+supports that narrow uncompressed retention contract, not every APT cache encoding.
 
 `prepare-python-closure.py` is a build tool, not a runtime initializer. It takes
 explicit absolute `--base-root`, `--base-binding`, `--base-binding-sha256`, absent
@@ -36,7 +57,7 @@ explicit absolute `--base-root`, `--base-binding`, `--base-binding-sha256`, abse
 Never infer an image identity from a root directory name. The separate build
 acceptance supplies a hash-pinned `podmesh.base-root-binding/v1` JSON document:
 `base` has registry/image/archive IDs matching this recipe; ubuntu_archive_fingerprints
-has the externally verified archive key fingerprints; suite=noble,
+has the externally verified archive PRIMARY key fingerprints; suite=noble,
 arch=amd64, verification=oci-config-diffids-checked; `files` has SHA256s for
 os_release, dpkg_status, ubuntu_key and dpkg_elf. The authority issuing that
 binding must first verify the retained OCI config/rootfs chain. The collector
