@@ -33,6 +33,13 @@ export default function ValidationPage({ locale = 'fr' }) {
         <div><p className="font-semibold">{copy.productionTitle}</p><p className="mt-2 text-sm leading-6 text-fg-muted">{copy.productionBody}</p></div>
       </aside>
 
+      {snapshot.canonicalBoundary && <section className="rounded-xl border border-warm/30 p-5" aria-labelledby="canonical-title" data-canonical-boundary>
+        <h2 id="canonical-title" className="text-lg font-semibold">{snapshot.canonicalBoundary.title[lang]}</h2>
+        <p className="mt-3 text-sm leading-7 text-fg-muted">{snapshot.canonicalBoundary.summary[lang]}</p>
+        <ul className="mt-3 list-disc space-y-2 pl-5 text-sm leading-7 text-fg-muted">{snapshot.canonicalBoundary.gaps[lang].map((gap) => <li key={gap}>{gap}</li>)}</ul>
+        <Link to="/validation#proof-canonical-boundary" className="mt-4 inline-flex items-center gap-1 text-sm font-semibold text-accent underline underline-offset-4">{copy.proof}<ArrowUpRight size={14} aria-hidden="true" /></Link>
+      </section>}
+
       <section id="validation-criteria" tabIndex={-1} className="scroll-mt-24" aria-labelledby="coverage-title">
         <div className="mb-4 flex flex-wrap items-baseline justify-between gap-3">
           <h2 id="coverage-title" className="site-display text-2xl font-semibold">{copy.coverage}</h2>

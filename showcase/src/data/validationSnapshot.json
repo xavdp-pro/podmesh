@@ -115,9 +115,9 @@
         }
       ],
       "qualificationLabel": {
-        "fr": "Socle MariaDB testé",
-        "en": "Tested MariaDB baseline",
-        "es": "Base MariaDB probada"
+        "fr": "Socle MariaDB · laboratoire",
+        "en": "MariaDB baseline · laboratory",
+        "es": "Base MariaDB · laboratorio"
       },
       "labSummary": {
         "fr": "Le NODE simple et imbriqué du socle testé a retrouvé son journal MariaDB, son identité et ses données après restauration. Le manager a repris une opération utile avec ses trois répliques. Ces preuves restent attachées aux paquets indiqués.",
@@ -127,7 +127,12 @@
       "labProofs": [
         "node-common",
         "manager-native"
-      ]
+      ],
+      "qualificationNote": {
+        "fr": "7/8 couvre le socle testé avec MariaDB séparée. Ce score ne démontre pas la conformité au canon : conteneur unique, socket privé et qualification des tables restent ouverts.",
+        "en": "7/8 covers the tested baseline with separate MariaDB. This score does not establish canonical conformity: a single container, private socket and table qualification remain open.",
+        "es": "7/8 cubre la base probada con MariaDB separada. No demuestra conformidad con el canon: siguen pendientes contenedor único, socket privado y evaluación de tablas."
+      }
     },
     {
       "id": "move",
@@ -199,9 +204,9 @@
         }
       ],
       "qualificationLabel": {
-        "fr": "Qualification MariaDB privée",
-        "en": "Private MariaDB qualification",
-        "es": "Validación MariaDB privada"
+        "fr": "Précontrôle MariaDB · laboratoire",
+        "en": "MariaDB preflight · laboratory",
+        "es": "Precontrol MariaDB · laboratorio"
       },
       "labSummary": {
         "fr": "Nouveau : le précontrôle source a répondu avec une vraie MariaDB privée, sans modifier les 40 tables du journal ni le registre du fournisseur. Il refuse correctement de déclarer la configuration compatible. Un déplacement d’univers imbriqué entre deux hôtes a été démontré, avec identité conservée et reprise des fichiers et journaux. La réplication et la bascule planifiée ont aussi réussi, avec captures à l’arrêt et à chaud. Ce sont des preuves historiques sur le parcours SQLite et les configurations de labo précisées.",
@@ -214,9 +219,9 @@
         "replication-lab"
       ],
       "qualificationNote": {
-        "fr": "1 critère sur 4 concerne le précontrôle source en lecture seule, pas un déplacement réussi. Les déplacements et réplications historiques SQLite restent acquis dans leur périmètre.",
-        "en": "1 of 4 criteria covers read-only source preflight, not a successful move. Historical SQLite moves and replication remain established within their scope.",
-        "es": "1 de 4 criterios cubre la comprobación de origen de solo lectura, no un traslado exitoso. Los traslados y replicaciones históricos SQLite siguen probados en su ámbito."
+        "fr": "1 critère sur 4 concerne le précontrôle source en lecture seule, pas un déplacement réussi. Les déplacements et réplications historiques SQLite restent acquis dans leur périmètre. La MariaDB testée était dans un conteneur distinct ; la conformité de la recette reste ouverte.",
+        "en": "1 of 4 criteria covers read-only source preflight, not a successful move. Historical SQLite moves and replication remain established within their scope. Tested MariaDB was in a separate container; recipe conformity remains open.",
+        "es": "1 de 4 criterios cubre la comprobación de origen de solo lectura, no un traslado exitoso. Los traslados y replicaciones históricos SQLite siguen probados en su ámbito. MariaDB estaba en otro contenedor; sigue abierta la conformidad de la receta."
       }
     },
     {
@@ -855,8 +860,56 @@
         "es": "Compruebe que la versión ofrece pmbs backup --help y pmbs restore --help. Pare las escrituras antes de preparar los archivos normales. Proporcione el token mediante su canal habitual de secretos. Elija un ID nuevo y límites adecuados; no repita a ciegas una publicación no confirmada. Mantenga la entrada en reposo durante toda la captura. Los comandos no copian automáticamente una base activa."
       },
       "example": "pmbs backup /srv/backup/quiesced-input \\\n  --quiesced-input --snapshot app-snapshot-001 \\\n  --backup-type podman --datastore datastore-default \\\n  --remote https://backup.example.net \\\n  --max-bytes 10737418240 --max-files 1000\n\npmbs restore /srv/recovery/restored-content \\\n  --snapshot app-snapshot-001 --backup-type podman \\\n  --datastore datastore-default \\\n  --remote https://backup.example.net \\\n  --max-bytes 10737418240"
+    },
+    {
+      "id": "canonical-boundary",
+      "date": "2026-10-22",
+      "version": "SHAPER OS · unit topology and table qualification",
+      "kind": "scope-correction",
+      "runtimePass": false,
+      "title": {
+        "fr": "Limite des preuves MariaDB et conformité des unités",
+        "en": "MariaDB evidence boundary and unit conformity",
+        "es": "Límite de las pruebas MariaDB y conformidad de las unidades"
+      },
+      "summary": {
+        "fr": "Relecture des règles de l’unité fonctionnelle et des recettes effectivement testées : le précontrôle NODE utilisait une vraie MariaDB privée, mais dans un conteneur distinct avec accès TCP loopback. Il ne prouve donc pas le placement dans le même conteneur, le socket privé sans écoute TCP, ni les partitions SQL attendues. Les cinq unités du sous-ensemble SHAPER restauré disposent de leurs MariaDB internes privées ; ce résultat ne se transfère pas aux recettes NODE/manager. Les anciens acquis et tous les critères chiffrés sont conservés. Il s’agit d’une correction de périmètre, pas d’un nouveau test réussi.",
+        "en": "Checked functional-unit rules against the recipes actually tested: NODE preflight used real private MariaDB, but in a separate container over loopback TCP. It therefore does not prove same-container placement, private socket without TCP listening, or required SQL partitions. The five units in the useful restored SHAPER subset have their private in-container MariaDB servers; that result does not transfer to NODE/manager recipes. Earlier achievements and all scored criteria are retained. This is a scope correction, not a new passed runtime test.",
+        "es": "Reglas de la unidad contrastadas con las recetas realmente probadas: el precontrol NODE usó MariaDB privada real, pero en otro contenedor mediante TCP loopback. No demuestra ubicación en el mismo contenedor, socket privado sin escucha TCP ni las particiones SQL exigidas. Las cinco unidades del subconjunto SHAPER restaurado tienen MariaDB interna privada; ese resultado no se transfiere a NODE/manager. Se conservan los logros anteriores y todos los criterios puntuados. Es una corrección de ámbito, no una prueba de ejecución nueva."
+      }
     }
   ],
-  "updatedAtUTC": "2026-10-22T18:54:09.081585+00:00",
-  "updatePolicy": "Publish only verified evidence changes; preserve historical lab achievements and version boundaries; never count in-progress code as validated."
+  "updatedAtUTC": "2026-10-22T20:26:31.479004+00:00",
+  "updatePolicy": "Publish only verified evidence changes; preserve historical lab achievements and version boundaries; never count in-progress code as validated.",
+  "canonicalBoundary": {
+    "state": "not_qualified",
+    "title": {
+      "fr": "Conformité SHAPER OS : un écart de recette reste ouvert",
+      "en": "SHAPER OS conformity: a unit-recipe gap remains open",
+      "es": "Conformidad SHAPER OS: sigue abierta una diferencia en la receta"
+    },
+    "summary": {
+      "fr": "Les pourcentages ci-dessous couvrent les critères affichés et les configurations testées en laboratoire. Ils ne mesurent pas la conformité complète au canon. La cible exige une MariaDB privée dans le même conteneur que chaque unité fonctionnelle, accessible par socket privé sans écoute TCP, avec identités, droits, persistance et restauration vérifiés.",
+      "en": "The percentages below cover the displayed criteria and tested lab configurations. They do not measure full canonical conformity. The target requires private MariaDB in the same container as each functional unit, accessed through a private socket without a TCP listener, with verified identities, permissions, persistence and restoration.",
+      "es": "Los porcentajes siguientes cubren los criterios mostrados y las configuraciones probadas en laboratorio. No miden la conformidad completa con el canon. El objetivo exige MariaDB privada en el mismo contenedor de cada unidad funcional, mediante socket privado sin escucha TCP, con identidades, permisos, persistencia y restauración verificados."
+    },
+    "gaps": {
+      "fr": [
+        "NODE et manager : les recettes actuelles séparent application et MariaDB en deux conteneurs. Les preuves SQL restent acquises dans ce périmètre ; la recette conforme et sa restauration utile restent à qualifier.",
+        "MeshFS utilise encore SQLite pour les métadonnées expérimentales. Les résultats PMBS portent sur les contenus sauvegardés ; ils ne qualifient pas à eux seuls son état durable comme unité SHAPER autonome.",
+        "Les tables doivent être qualifiées selon leur usage, leur croissance et leur rétention sur plusieurs mois : partitions mensuelles UTC pour les historiques concernés, sans purger les protections contre les anciens rejeux. Un export SQL fidèle précède les changements de schéma."
+      ],
+      "en": [
+        "NODE and manager: current recipes place application and MariaDB in two separate containers. SQL evidence remains valid within that scope; the conforming recipe and useful restoration still need qualification.",
+        "MeshFS still uses SQLite for experimental metadata. PMBS results cover backed-up contents; they do not by themselves qualify its durable state as an autonomous SHAPER unit.",
+        "Tables need qualification by usage, growth and retention over months: monthly UTC partitions for applicable histories, without purging protections against old replays. A faithful SQL export precedes schema changes."
+      ],
+      "es": [
+        "NODE y manager: las recetas actuales separan aplicación y MariaDB en dos contenedores. Las pruebas SQL siguen siendo válidas en ese ámbito; falta validar la receta conforme y su restauración útil.",
+        "MeshFS aún usa SQLite para los metadatos experimentales. Los resultados PMBS cubren los contenidos copiados; por sí solos no validan su estado duradero como unidad SHAPER autónoma.",
+        "Hay que evaluar cada tabla por uso, crecimiento y retención durante meses: particiones mensuales UTC para los históricos correspondientes, sin eliminar protecciones contra repeticiones antiguas. Una exportación SQL fiel precede a los cambios de esquema."
+      ]
+    },
+    "proof": "canonical-boundary"
+  }
 }
