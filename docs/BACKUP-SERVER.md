@@ -59,6 +59,54 @@ upgrades or the full design below.
 The historical design status below applies to the full design, not the mere
 existence of a Rust crate.
 
+### Native regular-file backup
+
+The Rust CLI also provides `pmbs backup` for an **operator-quiesced directory of
+regular file contents**. Check `pmbs backup --help`; use a server version that
+supports conditional create-only publication. This command does not stop writers,
+snapshot a live filesystem, or make a running MariaDB database consistent. Stop
+the declared application's writers or prepare a consistent export before capture,
+and keep the selected input unchanged throughout the command.
+
+```sh
+pmbs backup /srv/backup/quiesced-input \
+  --quiesced-input --snapshot app-snapshot-001 --backup-type podman \
+  --datastore datastore-default --remote https://backup.example.net \
+  --max-bytes 10737418240 --max-files 1000
+```
+
+Supply `PMBS_API_TOKEN` through the same secret channel as restoration, never in
+argv. HTTPS verification, numeric-loopback-only HTTP, disabled proxies and no
+redirects apply. Every source ancestor/entry must be a real directory or regular
+file; symlinks and special files are refused. The command checks held file
+identities, length, modification/change metadata and a final tree inventory;
+these checks do not turn a changing directory into an atomic snapshot. Absolute
+source paths, runtime handles and credentials are not snapshot metadata.
+
+Total bytes and file count are explicit limits; at most10000files are accepted.
+The per-file default is1GiB (`--max-file-bytes`), the cooperative capture deadline
+is300seconds (`--max-seconds`), and HTTP requests are bounded to30seconds or the
+remaining capture time. A stalled kernel filesystem read is not forcibly
+preempted. Empty files are supported; empty-directory identity and original
+permissions/ownership/timestamps/ACLs/xattrs/links are not captured.
+
+Content is chunked into canonical4MiB SHA256 CAS blocks. All chunks must be
+acknowledged and the source rechecked before the complete manifest is sent with
+`If-None-Match: *`. The server atomically refuses every existing snapshot identity,
+even identical contents (HTTP412); ordinary API clients without this conditional
+header retain their existing exact-retry contract. Successful native backup
+requires the server's explicit `createdOnly:true` acknowledgement. No global GC
+or automatic retry removes other data. On failure, uploaded unreferenced chunks
+may remain. If publication is not confirmed, the snapshot may already exist:
+inspect the server before retrying rather than blindly reusing its identity.
+
+The completed small laboratory pipeline used the same exact binary for native
+capture and restoration from server metadata into an absent destination, then
+ran a separate trusted Podman fixture from the recovered image/config/data.
+It demonstrated three recovered records and a fourth synchronized write, within
+that regular-content scope. It does not establish remote disaster recovery,
+power-loss durability, automatic workload launch or full MariaDB-universe recovery.
+
 ### Native regular-file restoration
 
 The Rust CLI provides `pmbs restore` for regular file contents from an existing

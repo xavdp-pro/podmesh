@@ -347,9 +347,9 @@
         "es": "Contenedor Podman · contenidos normales · configuración acotada"
       },
       "state": {
-        "fr": "Restauration native démontrée dans ce périmètre",
-        "en": "Native restoration demonstrated within this scope",
-        "es": "Restauración nativa demostrada en este ámbito"
+        "fr": "Sauvegarde et restauration natives démontrées dans ce périmètre",
+        "en": "Native backup and restore demonstrated within this scope",
+        "es": "Copia y restauración nativas demostradas en este ámbito"
       },
       "intro": {
         "fr": "Retrouver l’image, la configuration et les données, puis refaire fonctionner l’application.",
@@ -357,9 +357,9 @@
         "es": "Recuperar imagen, configuración y datos, y volver a ejecutar la aplicación."
       },
       "remaining": {
-        "fr": "La restitution des attributs et la reprise cohérente d’un univers complet avec ses bases MariaDB privées restent à qualifier. La capture native des sauvegardes n’est pas couverte. Le test utilise une copie de sauvegarde transférée, puis un échange HTTP en loopback.",
-        "en": "File-attribute fidelity and consistent recovery of a complete universe with private MariaDB stores remain unqualified. Native backup capture is not covered. The test uses a transported backup copy followed by loopback HTTP.",
-        "es": "Falta validar la fidelidad de atributos y la recuperación coherente de un universo completo con MariaDB privada. No se cubre la captura nativa de copias. El ensayo usa una copia transportada seguida de HTTP en loopback."
+        "fr": "La capture native et la restauration des contenus réguliers sont démontrées sur une entrée mise au repos. La restitution des attributs et la reprise cohérente d’un univers complet avec ses bases MariaDB privées restent à qualifier. Le test utilise du HTTP en loopback ; il ne démontre pas une reprise distante ni la cohérence d’une base en activité.",
+        "en": "Native capture and regular-content restoration are demonstrated for quiesced input. File-attribute fidelity and consistent recovery of a complete universe with private MariaDB stores remain unqualified. This test uses loopback HTTP; it does not demonstrate remote recovery or consistency of a running database.",
+        "es": "La captura nativa y la restauración de contenidos normales se demostraron con una entrada en reposo. Falta validar atributos y recuperación coherente de un universo completo con MariaDB privada. El ensayo usa HTTP loopback; no demuestra recuperación remota ni coherencia de una base activa."
       },
       "checks": [
         {
@@ -449,11 +449,12 @@
         "es": "Criterios de restauración seguidos"
       },
       "labSummary": {
-        "fr": "Le vrai CLI pmbs restore a récupéré l’image, la configuration bornée et les données depuis le serveur PMBS, vers une cible absente et un magasin Podman isolé vide. Les cinq fichiers ont été contrôlés. Le conteneur, lancé séparément depuis l’image récupérée, a retrouvé les enregistrements 1–5 puis écrit et synchronisé le sixième.",
-        "en": "The actual pmbs restore CLI recovered the image, bounded configuration and data from the PMBS server into an absent destination and an empty isolated Podman store. All five files were checked. The container, launched separately from the recovered image, read records 1–5 then wrote and synced the sixth.",
-        "es": "El CLI real pmbs restore recuperó imagen, configuración acotada y datos del servidor PMBS en un destino inexistente y un almacén Podman aislado vacío. Se comprobaron cinco archivos. El contenedor, iniciado por separado desde la imagen recuperada, leyó los registros 1–5 y escribió y sincronizó el sexto."
+        "fr": "Le même binaire vérifié a sauvegardé puis restauré cinq nouveaux fichiers, dont l’image OCI, la configuration bornée, les données et un fichier vide. L’application était arrêtée avant capture. Dans un magasin Podman isolé initialement vide, l’application restaurée a relu ses trois enregistrements et synchronisé le quatrième. Le démarrage applicatif reste une étape séparée des commandes natives.",
+        "en": "The same verified binary backed up and restored five new files, including the OCI image, bounded configuration, data and an empty file. The application was stopped before capture. In an initially empty isolated Podman store, the restored application read its three records and synced a fourth. Application launch remains separate from the native commands.",
+        "es": "El mismo binario verificado guardó y restauró cinco archivos nuevos: imagen OCI, configuración acotada, datos y un archivo vacío. La aplicación estaba parada antes de capturar. En un almacén Podman aislado inicialmente vacío, la aplicación restaurada leyó sus tres registros y sincronizó un cuarto. Iniciar la aplicación sigue siendo un paso separado de los comandos nativos."
       },
       "labProofs": [
+        "pmbs-native-backup",
         "pmbs-native",
         "pmbs-server"
       ]
@@ -833,8 +834,29 @@
         "en": "After 15 targeted tests and construction of the exact package, a real NODE and its host provider assessed an owned Podman container. The result is verified but incompatible, with no move. A request differing only by an incorrect scope was refused. Canonical digests of all 40 journal tables and the provider registry match before and after both calls. Witnesses are computed in the guest; raw SQL rows remain private. Workload removed, clean stop and native rollback completed; data retained. Checked persistent services, mounts and old files are preserved; the SSH session manager changed PID and this difference is retained. Reviewed by Opus 5.5 and muse-shaper. No destination check, transfer, checkpoint, restore or post-move continuity proof.",
         "es": "Tras 15 pruebas específicas y construir el paquete exacto, un NODE real y su proveedor del host evaluaron un contenedor Podman propio. El resultado es verificado pero incompatible, sin traslado. Se rechazó una solicitud que solo cambiaba a un scope incorrecto. Las huellas canónicas de las 40 tablas y del registro del proveedor coinciden antes y después de ambas llamadas. Los testigos se calculan en el invitado; las filas SQL permanecen privadas. Carga eliminada, parada limpia y reversión nativa completas; datos conservados. Servicios persistentes, montajes y archivos anteriores comprobados conservados; el gestor de sesiones SSH cambió de PID y se registra la diferencia. Revisado por Opus 5.5 y muse-shaper. No demuestra destino, transferencia, checkpoint, restauración ni continuidad tras traslado."
       }
+    },
+    {
+      "id": "pmbs-native-backup",
+      "date": "2026-10-22",
+      "version": "PMBS 30c8d21 · ELF 82c88f7b",
+      "title": {
+        "fr": "Sauvegarde native, restauration et nouvelle écriture Podman",
+        "en": "Native backup, restore and a new Podman write",
+        "es": "Copia nativa, restauración y nueva escritura Podman"
+      },
+      "summary": {
+        "fr": "Quatre tests ciblés ont réussi, avec une vraie exécution du cas routeur dans un sous-processus, puis un build unique. Le nouveau binaire a capturé une entrée explicitement mise au repos : cinq fichiers, quatre blocs CAS, 3 915 007 octets. La publication est en création seule, sans écrasement. Le même binaire a restauré les métadonnées et contenus du serveur vers une cible absente ; les empreintes ont été comparées avant utilisation. Une reprise Podman séparée a relu les trois enregistrements puis synchronisé le quatrième. Traces HTTP du parcours conservées, nettoyage vérifié, services persistants et anciens jeux contrôlés préservés ; variations normales des sessions SSH consignées. Revues Opus 5.5 et muse-shaper. Périmètre : petit jeu de fichiers réguliers, entrée au repos et HTTP loopback. Pas de capture MariaDB à chaud, de restitution des attributs, de démarrage automatique par le CLI, de reprise après panne d’alimentation ou de PRA distant.",
+        "en": "Four targeted tests passed, including actual execution of the router case in a child process, followed by one build. The new binary captured explicitly quiesced input: five files, four CAS chunks, 3,915,007 bytes. Publication is create-only without overwrite. The same binary restored server metadata and contents into an absent destination; hashes were checked before use. A separate Podman launch read the three records and synced a fourth. HTTP traces retained, cleanup verified, checked persistent services and old datasets preserved; normal SSH-session changes recorded. Reviewed by Opus 5.5 and muse-shaper. Scope: small regular-file input, quiescent capture and loopback HTTP. No live MariaDB capture, attribute fidelity, automatic CLI workload launch, power-loss recovery or remote disaster recovery.",
+        "es": "Cuatro pruebas específicas superadas, incluida la ejecución real del caso del router en un proceso hijo, seguidas de una compilación. El nuevo binario capturó una entrada explícitamente en reposo: cinco archivos, cuatro bloques CAS y 3 915 007 bytes. La publicación solo crea, sin sobrescribir. El mismo binario restauró metadatos y contenidos del servidor en un destino inexistente; se compararon huellas antes de usarlo. Una ejecución Podman separada leyó tres registros y sincronizó un cuarto. Trazas HTTP conservadas, limpieza verificada, servicios persistentes y datos anteriores comprobados conservados; cambios normales de sesiones SSH registrados. Revisado por Opus 5.5 y muse-shaper. Ámbito: archivos normales pequeños, captura en reposo y HTTP loopback. No cubre MariaDB activa, atributos, inicio automático por CLI, pérdida de alimentación ni recuperación remota."
+      },
+      "instructions": {
+        "fr": "Vérifiez que la version expose pmbs backup --help et pmbs restore --help. Arrêtez les écritures de l’application avant de préparer le répertoire de fichiers réguliers. Fournissez le token par le canal de secrets habituel. Choisissez un nouvel identifiant de snapshot et des limites adaptées ; ne réessayez pas aveuglément après une publication non confirmée. Conservez l’entrée au repos pendant toute la capture. Les commandes ne sauvegardent pas automatiquement une base active.",
+        "en": "Check that the version exposes pmbs backup --help and pmbs restore --help. Stop application writes before preparing the regular-file directory. Supply the token through the usual secret channel. Choose a new snapshot ID and suitable limits; do not blindly retry an unconfirmed publication. Keep input quiescent throughout capture. These commands do not automatically back up a running database.",
+        "es": "Compruebe que la versión ofrece pmbs backup --help y pmbs restore --help. Pare las escrituras antes de preparar los archivos normales. Proporcione el token mediante su canal habitual de secretos. Elija un ID nuevo y límites adecuados; no repita a ciegas una publicación no confirmada. Mantenga la entrada en reposo durante toda la captura. Los comandos no copian automáticamente una base activa."
+      },
+      "example": "pmbs backup /srv/backup/quiesced-input \\\n  --quiesced-input --snapshot app-snapshot-001 \\\n  --backup-type podman --datastore datastore-default \\\n  --remote https://backup.example.net \\\n  --max-bytes 10737418240 --max-files 1000\n\npmbs restore /srv/recovery/restored-content \\\n  --snapshot app-snapshot-001 --backup-type podman \\\n  --datastore datastore-default \\\n  --remote https://backup.example.net \\\n  --max-bytes 10737418240"
     }
   ],
-  "updatedAtUTC": "2026-10-22T18:12:39.555273+00:00",
+  "updatedAtUTC": "2026-10-22T18:54:09.081585+00:00",
   "updatePolicy": "Publish only verified evidence changes; preserve historical lab achievements and version boundaries; never count in-progress code as validated."
 }
