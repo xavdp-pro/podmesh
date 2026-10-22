@@ -109,6 +109,11 @@ export default function ValidationPage({ locale = 'fr' }) {
             <details key={proof.id} id={`proof-${proof.id}`} tabIndex={-1} className="group scroll-mt-24 py-4">
               <summary className="flex cursor-pointer items-start gap-3 text-sm font-semibold"><BookOpen size={17} className="mt-0.5 shrink-0 text-accent" aria-hidden="true" /><span className="min-w-0 flex-1">{proof.title[lang]}<span className="mt-1 block text-xs font-normal text-fg-faint"><time dateTime={proof.date}>{proof.date}</time> · {proof.version}</span></span><ChevronDown size={16} className="mt-1 shrink-0 group-open:rotate-180" aria-hidden="true" /></summary>
               <p className="mt-4 pl-7 text-sm leading-7 text-fg-muted">{proof.summary[lang]}</p>
+              {proof.example && <div className="mt-4 ml-7 rounded-xl border border-line bg-surface p-4">
+                <p className="text-sm font-semibold">{copy.commandGuide}</p>
+                <p className="mt-2 text-sm leading-6 text-fg-muted">{proof.instructions[lang]}</p>
+                <pre className="mt-3 whitespace-pre-wrap break-words text-xs leading-6 [overflow-wrap:anywhere]"><code>{proof.example}</code></pre>
+              </div>}
             </details>
           ))}
         </div>

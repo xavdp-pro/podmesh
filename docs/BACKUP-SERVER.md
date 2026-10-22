@@ -59,6 +59,61 @@ upgrades or the full design below.
 The historical design status below applies to the full design, not the mere
 existence of a Rust crate.
 
+### Native regular-file restoration
+
+The Rust CLI provides `pmbs restore` for regular file contents from an existing
+server snapshot. Check `pmbs restore --help` on the installed binary: earlier
+packages do not provide this command. This command does not capture a backup,
+start an application, or restore a complete universe by itself.
+
+Prepare an existing, trusted parent directory with sufficient free space. The
+destination directory must be absent; existing directories and symlinks are
+refused. All ancestor directories must also be free of symlinks. Obtain the
+administrative bearer token through the operator's secret channel and supply it
+as `PMBS_API_TOKEN` in the process environment, never as a command argument.
+
+```sh
+pmbs restore /srv/recovery/restored-content \
+  --datastore datastore-default \
+  --snapshot universe-snapshot-001 \
+  --backup-type podman \
+  --remote https://backup.example.net \
+  --max-bytes 10737418240
+```
+
+Use the actual server snapshot ID and backup type; both select the snapshot.
+HTTPS uses normal certificate verification. Cleartext HTTP is accepted only on
+a numeric loopback address, for example `http://127.0.0.1:8007`. Ambient HTTP
+proxies and redirects are disabled for this restore client. A loopback restore
+from a separately transported datastore copy does not establish inter-host HTTP
+recovery or remote disaster recovery.
+
+The CLI obtains the manifest and chunks from the authenticated server, without
+a retained client manifest or local source-file fallback. It validates layout,
+lengths, chunk hashes and reconstructed file hashes. Metadata responses are
+bounded to32MiB, snapshots to10000files and restored logical contents to10GiB
+by default (`--max-bytes` changes the last bound). Each HTTP request/body has a
+30-second deadline. These limits are not a reservation of filesystem capacity.
+
+Files are created0600 and directories0700 in a new private sibling staging
+directory. After file and directory synchronization, Linux `renameat2` with
+`RENAME_NOREPLACE` publishes the destination without overwriting a concurrent
+target. There is no unsafe replacement fallback. On failure the command exits
+nonzero and reports its private staging location; it retains partial files.
+Inspect and conserve that owned staging tree before any explicit cleanup. A
+parent-sync failure after publication is reported as a failure with a published
+destination to preserve, not as a successful restore.
+
+Success JSON lists the snapshot, destination, restored files, byte counts and
+digests. `integrityVerified:true` covers file contents only;
+`bootReadiness:NOT_TESTED` and `op10SandboxBootProof:false` remain explicit.
+Original ownership, modes, timestamps, ACLs, extended attributes and symlinks
+are not reconstructed. Application/database consistency still depends on the
+backup's capture contract. Inspect recovered configuration under trusted policy
+and launch only a declared workload separately; never execute arbitrary commands
+from a received manifest. Full private-MariaDB universe restoration and automatic
+application recovery require their own supported workflow and evidence.
+
 Status: design direction, revised four times after independent counter-review; not
 implemented, not validated. Nothing here is qualified.
 
