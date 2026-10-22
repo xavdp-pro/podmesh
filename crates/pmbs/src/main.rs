@@ -1,5 +1,7 @@
 //! PMBS — Main Entrypoint and Backup Daemon
 
+mod restore;
+
 use clap::Parser;
 use pmbs::cli::{Cli, Commands, DatastoreSubcommand};
 use pmbs::control::{query_control_socket, start_control_socket, ControlRequest};
@@ -23,12 +25,22 @@ async fn main() -> ExitCode {
         .unwrap_or_else(|_| EnvFilter::new(format!("pmbs={},tower_http=info", default_level)));
 
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(env_filter)
         .with_target(false)
         .with_thread_ids(false)
         .init();
 
     match args.command {
+        Commands::Restore(args) => {
+            match restore::run(&args).await {
+                Ok(report) => println!("{}", report),
+                Err(error) => {
+                    eprintln!("{}", serde_json::json!({"ok": false, "error": error}));
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
         Commands::Daemon(d) => {
             if let Err(e) = configured_token() { eprintln!("{}", e); return ExitCode::FAILURE; }
             info!(

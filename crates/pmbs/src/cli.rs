@@ -41,6 +41,10 @@ pub enum Commands {
     /// Audit referenced backup chunks (does not restore or boot workloads)
     Verify(VerifyArgs),
 
+    /// Restore regular file contents from authenticated server snapshot metadata.
+    /// Does not execute workloads or restore permissions, ACLs, xattrs or symlinks.
+    Restore(RestoreArgs),
+
     /// Trigger inter-site differential replication
     Sync(SyncArgs),
 }
@@ -142,4 +146,23 @@ pub struct SyncArgs {
     /// Local PMBS HTTP address
     #[arg(short, long, default_value = "http://127.0.0.1:8007")]
     pub remote: String,
+}
+
+#[derive(Args, Debug)]
+pub struct RestoreArgs {
+    /// New destination directory; it and its symlink form must not exist.
+    pub destination: PathBuf,
+    #[arg(long, default_value = "datastore-default")]
+    pub datastore: String,
+    #[arg(long)]
+    pub snapshot: String,
+    /// Required along with snapshot ID to disambiguate server snapshot identity.
+    #[arg(long)]
+    pub backup_type: String,
+    /// HTTPS endpoint, or numeric loopback HTTP. Uses PMBS_API_TOKEN, no redirects.
+    #[arg(long, default_value = "http://127.0.0.1:8007")]
+    pub remote: String,
+    /// Maximum logical restored bytes (default 10 GiB); checked before writing.
+    #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024u64)]
+    pub max_bytes: u64,
 }
