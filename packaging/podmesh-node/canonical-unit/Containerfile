@@ -7,9 +7,18 @@ ARG GRANTS_SHA256
 ARG BINARY_SOURCE_REVISION
 ARG ADMIN_SOURCE_REVISION
 ARG RECIPE_REVISION
+ARG PYTHON_CLOSURE_SHA256
+ARG PYTHON_INSTALLER_SHA256
 USER root
+COPY python-closure/ /opt/podmesh-python-closure/
+COPY install-python-closure.sh /usr/lib/podmesh-node-canonical/install-python-closure.sh
+# Verify the exact reusable installer before it parses/installs the signed local closure.
+RUN test "${#PYTHON_INSTALLER_SHA256}" -eq 64 \
+ && case "$PYTHON_INSTALLER_SHA256" in *[!0-9a-f]*) exit 1;; esac \
+ && printf '%s  %s\n' "$PYTHON_INSTALLER_SHA256" /usr/lib/podmesh-node-canonical/install-python-closure.sh | sha256sum --check --strict - \
+ && /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C PODMESH_CANONICAL_IMAGE_BUILD=1 /bin/bash /usr/lib/podmesh-node-canonical/install-python-closure.sh "$PYTHON_CLOSURE_SHA256"
 COPY podmeshd podmesh-store-admin entrypoint.py grants.json /usr/lib/podmesh-node-canonical/
-# Missing pre-existing Python/helper is a named hard build blocker, never a network install.
+# Other helpers remain mandatory pre-existing base dependencies; Python is the verified local closure.
 RUN for dep in /usr/bin/python3 /usr/bin/setpriv /usr/bin/mariadb /usr/bin/mariadb-install-db /usr/sbin/mariadbd; do \
       test -x "$dep" || { echo "canonical NODE missing base dependency: $dep" >&2; exit 1; }; done \
  && command -v useradd && command -v groupadd && command -v getent && command -v cut \
@@ -23,7 +32,7 @@ RUN for dep in /usr/bin/python3 /usr/bin/setpriv /usr/bin/mariadb /usr/bin/maria
 RUN NODE_BINARY_SHA256="$NODE_BINARY_SHA256" ADMIN_BINARY_SHA256="$ADMIN_BINARY_SHA256" \
  SUPERVISOR_SHA256="$SUPERVISOR_SHA256" GRANTS_SHA256="$GRANTS_SHA256" \
  BINARY_SOURCE_REVISION="$BINARY_SOURCE_REVISION" ADMIN_SOURCE_REVISION="$ADMIN_SOURCE_REVISION" \
- RECIPE_REVISION="$RECIPE_REVISION" /usr/bin/python3 -I -c 'import os,re,json,hashlib,pathlib; assert hasattr(os,"WNOWAIT"); p=pathlib.Path("/usr/lib/podmesh-node-canonical"); pairs={"podmeshd":"NODE_BINARY_SHA256","podmesh-store-admin":"ADMIN_BINARY_SHA256","entrypoint.py":"SUPERVISOR_SHA256","grants.json":"GRANTS_SHA256"}; hashes={n:os.environ[k] for n,k in pairs.items()}; assert all(re.fullmatch("[0-9a-f]{64}",h) and hashlib.sha256((p/n).read_bytes()).hexdigest()==h for n,h in hashes.items()); pins={k:os.environ[k] for k in ("BINARY_SOURCE_REVISION","ADMIN_SOURCE_REVISION","RECIPE_REVISION")}; assert all(re.fullmatch("[0-9a-f]{40}",v) for v in pins.values()); f=p/"provenance.json"; f.write_text(json.dumps({"sha256":hashes,"source":pins,"minimum_engine_stop_timeout_seconds":60},sort_keys=True)); f.chmod(0o444)'
+ RECIPE_REVISION="$RECIPE_REVISION" PYTHON_CLOSURE_SHA256="$PYTHON_CLOSURE_SHA256" PYTHON_INSTALLER_SHA256="$PYTHON_INSTALLER_SHA256" /usr/bin/python3 -I -c 'import os,re,json,hashlib,pathlib,sys; assert hasattr(os,"WNOWAIT"); p=pathlib.Path("/usr/lib/podmesh-node-canonical"); pairs={"podmeshd":"NODE_BINARY_SHA256","podmesh-store-admin":"ADMIN_BINARY_SHA256","entrypoint.py":"SUPERVISOR_SHA256","grants.json":"GRANTS_SHA256"}; hashes={n:os.environ[k] for n,k in pairs.items()}; assert all(re.fullmatch("[0-9a-f]{64}",h) and hashlib.sha256((p/n).read_bytes()).hexdigest()==h for n,h in hashes.items()); assert (pathlib.Path("/opt/podmesh-python-closure/installed.lock.sha256").read_text().strip()==os.environ["PYTHON_CLOSURE_SHA256"]); pins={k:os.environ[k] for k in ("BINARY_SOURCE_REVISION","ADMIN_SOURCE_REVISION","RECIPE_REVISION")}; assert all(re.fullmatch("[0-9a-f]{40}",v) for v in pins.values()); f=p/"provenance.json"; f.write_text(json.dumps({"sha256":hashes,"source":pins,"minimum_engine_stop_timeout_seconds":60,"python_closure_sha256":os.environ["PYTHON_CLOSURE_SHA256"],"python_installer_sha256":os.environ["PYTHON_INSTALLER_SHA256"],"python_version":sys.version},sort_keys=True)); f.chmod(0o444)'
 RUN mkdir -p /apps/podmesh-node/app /apps/podmesh-node/etc /apps/podmesh-node/sav /apps/podmesh-node/log /apps/podmesh-node/nosav \
  && chmod 0755 /apps /apps/podmesh-node /apps/podmesh-node/app /apps/podmesh-node/etc /apps/podmesh-node/sav /apps/podmesh-node/log /apps/podmesh-node/nosav /usr/lib/podmesh-node-canonical
 # The inherited MariaDB /var/lib/mysql VOLUME is NEVER allowed to auto-materialize.

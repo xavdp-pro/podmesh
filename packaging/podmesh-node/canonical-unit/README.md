@@ -10,17 +10,78 @@ Turbinobash direction define the target, not a new conformity claim.
 
 ## Required immutable inputs and dependency gates
 
-Build context: this Containerfile, entrypoint.py, grants.json, plus the exact
-`podmeshd` and `podmesh-store-admin` binaries. Supply mandatory SHA256 values for
-all four payloads, full binary/admin source pins and recipe pin. The build writes
-provenance, and startup rechecks all payload bytes. Build on the declared build host,
-with `--network=none --pull=never`; use the exact already cached MariaDB digest
-in the Containerfile. No Alpine switch, downloads, apt or hidden package install.
+Build context: this Containerfile, entrypoint.py, grants.json, the exact
+`podmeshd` and `podmesh-store-admin` binaries, install-python-closure.sh and the
+collected bundle at `python-closure/`. Mandatory SHA256/source/recipe pins bind
+all existing payloads; PYTHON_CLOSURE_SHA256 and PYTHON_INSTALLER_SHA256 additionally
+bind the authenticated dependency lock and offline installer. The same immutable
+MariaDB digest remains selected. No Alpine switch or arbitrary host Python tree.
+Build with `--network=none --pull=never`; image construction uses verified local
+Debian packages only. Dependency collection is an explicit separate build action.
 
-The base must already provide Python3 with Linux waitid/WNOWAIT, setpriv, mariadb, mariadb-install-db,
-mariadbd, account helpers and mysql system identity. This has **not** been
-verified by this source recipe for the selected digest. Missing pre-existing Python or a
-helper is an explicit hard build blocker. No image/package success is claimed.
+### Authenticated Python dependency closure — guarded incomplete source
+
+The collector currently **hard-refuses after signed Release verification** at
+`UNIMPLEMENTED_AUTHENTICATED_PACKAGES_INDEX_BINDING`. It cannot yet download
+packages or publish a lock. The missing stage must normalize each actual APT
+Packages index, match it to the SHA256/size recorded in the verified Release,
+and prove selected package stanzas come from that signed index. No flag bypasses
+this guard. The installer and later collection path are unqualified source; the
+following describes their contract, not a successful closure or image build.
+
+
+`prepare-python-closure.py` is a build tool, not a runtime initializer. It takes
+explicit absolute `--base-root`, `--base-binding`, `--base-binding-sha256`, absent
+`--work` and `--output`. Parents must be private/protected and paths portable.
+Never infer an image identity from a root directory name. The separate build
+acceptance supplies a hash-pinned `podmesh.base-root-binding/v1` JSON document:
+`base` has registry/image/archive IDs matching this recipe; ubuntu_archive_fingerprints
+has the externally verified archive key fingerprints; suite=noble,
+arch=amd64, verification=oci-config-diffids-checked; `files` has SHA256s for
+os_release, dpkg_status, ubuntu_key and dpkg_elf. The authority issuing that
+binding must first verify the retained OCI config/rootfs chain. The collector
+only verifies consistency with that externally trusted binding; it does not
+self-certify the rootfs. Image absolute symlinks resolve inside the image root,
+never onto the build host. Actual Ubuntu24.04 noble, amd64 ELF and installed
+package metadata are checked before creating work.
+
+The collector uses a fresh isolated APT_CONFIG, etc/state/cache/status/log/key/
+source/lock paths and sanitized environment. Host APT methods/binaries are
+read-only tools; host package status/config/hooks are never used or modified.
+APT acquisition uses the existing unprivileged _apt identity. A pre-existing
+setfacl helper and searchable protected work ancestors are explicit prerequisites.
+Named-user ACLs affect only the NEW work tree; no host parent or global APT path
+is modified. Work/output remain private to their designated identities.
+Only official Ubuntu HTTPS noble/main, updates and security sources signed with
+the image's Ubuntu archive key are selected. Signature and expiry validation stay
+enabled; signed Release origin/suite/arch and package metadata are recorded.
+Installed base versions are pinned and any proposed upgrade/removal/reinstall is
+rejected. Resolution uses the full `python3` distribution and libpython3-stdlib,
+not python3-minimal alone; current versions come from signed metadata.
+
+Only update metadata, simulate, print-URIs, query metadata and fixed download-only
+commands run on the build host. No host install/unpack/configure. Finite time,
+metadata/output/download/package-count bounds and measured filesystem bytes gate
+work; failures retain work. Local .debs are matched to signed SHA256/size/name/
+version/arch before publication. The output retains closure.lock, exact artifacts,
+key/signed metadata and evidence.json. Its deterministic lock is data, not shell;
+it pins actual resolved versions, every artifact and the external base binding.
+Future collection can resolve different official versions; the lock/artifacts
+are the reproducible input to rebuild that exact selected closure.
+
+The offline image installer verifies the trusted lock hash, all listed bytes,
+package identities and absence of extra/symlink artifacts BEFORE installation.
+It also verifies the unmodified base status/os-release/key bytes. A fresh empty
+image-local APT configuration plus --no-download/--no-upgrade/--no-remove selects
+only exact local packages and preserves dependency/Pre-Depends ordering; service
+autostart is denied during construction and original image policy restored.
+Installed expected versions and actual hashlib/json/pathlib/secrets/socket/
+subprocess/tempfile/unittest imports plus Linux WNOWAIT are verified afterwards.
+No image success or runtime compatibility is inferred until that stage passes.
+
+Other setpriv/SQL/server/account helpers and mysql identity remain mandatory
+pre-existing base inputs. No missing helper triggers a network install. Root
+administrative paths, engine/authentication and existing supervisor remain unchanged.
 
 The required schema-administration interface is the explicit local-root CLI:
 
@@ -106,7 +167,8 @@ retains state; clean stop is explicitly **not** a coherent backup receipt.
 On the declared build host, after pinning the recipe and dependency: run the targeted
 `python3 -m unittest discover -s packaging/podmesh-node/canonical-unit -p test_entrypoint.py`
 (root for private-file/owned-child cases); validate Python syntax there; run the
-schema-authority Rust tests when their source changes; verify base command/dependency and payload
+schema-authority Rust tests when their source changes; run only the new
+`test_python_closure.py` cases for closure changes; retain unaffected supervisor proofs; verify base command/dependency and payload
 hash gates before building the exact image offline. Passing these checks does not establish functional-unit runtime qualification.
 
 Then, on a separately authorized disposable target, prove same-container app+DB
@@ -119,5 +181,5 @@ coordinate declared non-reproducible volumes/config/image lock/provider bindings
 restore an isolated empty private target and independently compare useful data and
 old replay plus a new operation. A blank DB beside file-authoritative state is not
 compliance. No SQL dump/import, restore, retention, pruning or partition DDL is
-implemented here; use inventory18 to select later table-specific UTC partitions
+implemented here; use the table-specific data contract to select later UTC partitions
 without weakening global operation IDs. No production or full-candidate claim.
