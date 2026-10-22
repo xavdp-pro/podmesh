@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "updatedAt": "2026-10-22",
   "metric": "validated_essential_criteria_coverage",
   "formula": "round(100 * count(status == validated) / count(criteria))",
@@ -28,9 +28,9 @@
         "es": "Crear, parar y recuperar una aplicación con su registro y datos."
       },
       "remaining": {
-        "fr": "Le retour après un véritable redémarrage de l’hôte reste à démontrer dans la version de livraison retenue.",
-        "en": "Return after a real host reboot remains to be demonstrated for the selected release.",
-        "es": "Falta demostrar la vuelta tras un reinicio real del host en la versión elegida."
+        "fr": "Conserver les acquis du socle testé et rattacher les preuves à chaque nouveau candidat. Sa restauration complète reste à qualifier si elle n’est pas couverte par les reçus existants. Le retour après redémarrage réel de l’hôte reste également ouvert.",
+        "en": "Preserve the tested baseline and bind evidence to each new candidate. Its full restoration still needs qualification if existing receipts do not cover it. Recovery after a real host reboot also remains open.",
+        "es": "Conservar la base probada y vincular las pruebas a cada nuevo candidato. Su restauración completa sigue pendiente si no la cubren los registros existentes. También falta la recuperación tras reinicio real del host."
       },
       "checks": [
         {
@@ -113,6 +113,20 @@
           },
           "proof": null
         }
+      ],
+      "qualificationLabel": {
+        "fr": "Socle MariaDB testé",
+        "en": "Tested MariaDB baseline",
+        "es": "Base MariaDB probada"
+      },
+      "labSummary": {
+        "fr": "Le NODE simple et imbriqué du socle testé a retrouvé son journal MariaDB, son identité et ses données après restauration. Le manager a repris une opération utile avec ses trois répliques. Ces preuves restent attachées aux paquets indiqués.",
+        "en": "The tested flat and nested NODE baseline recovered its MariaDB journal, identity and data after restoration. The manager resumed useful operation with three replicas. These proofs remain bound to the listed packages.",
+        "es": "El NODE simple y anidado probado recuperó su registro MariaDB, identidad y datos tras restaurar. El manager reanudó una operación útil con tres réplicas. Las pruebas siguen ligadas a los paquetes indicados."
+      },
+      "labProofs": [
+        "node-common",
+        "manager-native"
       ]
     },
     {
@@ -138,9 +152,9 @@
         "es": "Trasladar un universo o preparar su recuperación en otro host."
       },
       "remaining": {
-        "fr": "Le parcours SQLite historique existe. Il ne valide pas les opérations MariaDB encore refusées par le candidat privé.",
-        "en": "The historical SQLite path exists. It does not qualify MariaDB operations still refused by the private candidate.",
-        "es": "Existe el recorrido histórico SQLite. No valida las operaciones MariaDB aún rechazadas por el candidato privado."
+        "fr": "Porter et qualifier le précontrôle hôte, le déplacement et les points de reprise avec MariaDB privée. Le candidat privé testé refuse encore ces opérations ; les réussites historiques SQLite ne couvrent pas ce nouveau moteur.",
+        "en": "Port and qualify host preflight, moving and recovery points with private MariaDB. The tested private candidate still refuses these operations; historical SQLite successes do not cover this backend.",
+        "es": "Adaptar y validar la comprobación del host, el traslado y los puntos de recuperación con MariaDB privada. El candidato privado probado aún rechaza estas operaciones; los éxitos históricos SQLite no cubren este motor."
       },
       "checks": [
         {
@@ -183,7 +197,26 @@
           },
           "proof": "move-gap"
         }
-      ]
+      ],
+      "qualificationLabel": {
+        "fr": "Qualification MariaDB privée",
+        "en": "Private MariaDB qualification",
+        "es": "Validación MariaDB privada"
+      },
+      "labSummary": {
+        "fr": "Un déplacement d’univers imbriqué entre deux hôtes a été démontré, avec identité conservée et reprise des fichiers et journaux. La réplication et la bascule planifiée ont aussi réussi, avec captures à l’arrêt et à chaud. Ce sont des preuves historiques sur le parcours SQLite et les configurations de labo précisées.",
+        "en": "A nested-universe move between two hosts was demonstrated with preserved identity and recovered files and logs. Replication and planned switchover also passed with stopped and live captures. These are historical proofs on the SQLite path and the stated lab configurations.",
+        "es": "Se demostró el traslado de un universo anidado entre dos hosts, conservando identidad y recuperando archivos y registros. También funcionaron la replicación y el cambio planificado, con capturas en parada y en caliente. Son pruebas históricas del recorrido SQLite y las configuraciones de laboratorio indicadas."
+      },
+      "labProofs": [
+        "move-lab",
+        "replication-lab"
+      ],
+      "qualificationNote": {
+        "fr": "Le score ci-dessus concerne uniquement les critères MariaDB privée. Les déplacements et réplications déjà démontrés en labo restent acquis.",
+        "en": "The score above covers private MariaDB criteria only. Moves and replication already demonstrated in the lab remain established.",
+        "es": "El porcentaje anterior solo cubre los criterios MariaDB privada. Los traslados y replicaciones ya demostrados en laboratorio siguen siendo logros válidos."
+      }
     },
     {
       "id": "meshfs",
@@ -283,6 +316,21 @@
           },
           "proof": null
         }
+      ],
+      "qualificationLabel": {
+        "fr": "Critères suivis · versions testées",
+        "en": "Tracked criteria · tested versions",
+        "es": "Criterios seguidos · versiones probadas"
+      },
+      "labSummary": {
+        "fr": "Des contenus identiques sur trois répliques, le rattrapage d’une réplique vide et la reprise après arrêt brutal sont démontrés dans les versions indiquées. La protection contre les anciens rejeux et l’ingestion réelle de 262 144 blocs sont également acquises dans leur périmètre.",
+        "en": "Matching payloads across three replicas, empty-replica catch-up and recovery after abrupt stop are demonstrated for the stated versions. Stale-replay protection and actual ingestion of 262,144 blocks are also established within their scope.",
+        "es": "Se demostraron contenidos idénticos en tres réplicas, recuperación de una réplica vacía y vuelta tras una parada abrupta en las versiones indicadas. También se probaron la protección frente a reejecuciones antiguas y la ingesta real de 262 144 bloques en su ámbito."
+      },
+      "labProofs": [
+        "mesh-recovery",
+        "mesh-empty",
+        "mesh-ingestion"
       ]
     },
     {
@@ -393,6 +441,19 @@
           },
           "proof": null
         }
+      ],
+      "qualificationLabel": {
+        "fr": "Critères de restauration suivis",
+        "en": "Tracked recovery criteria",
+        "es": "Criterios de restauración seguidos"
+      },
+      "labSummary": {
+        "fr": "À partir des métadonnées et contenus du serveur PMBS, un conteneur a retrouvé son image, sa configuration bornée et ses données dans un magasin Podman vide. Les cinq enregistrements ont été relus, puis un sixième a été écrit et synchronisé. Le parcours testé utilise une orchestration externe.",
+        "en": "Using metadata and payloads from the PMBS server, a container recovered its image, bounded configuration and data into an empty Podman store. Five records were read, then a sixth was written and synced. The tested path uses external orchestration.",
+        "es": "Con metadatos y contenidos del servidor PMBS, un contenedor recuperó imagen, configuración acotada y datos en un almacén Podman vacío. Se leyeron cinco registros y se escribió y sincronizó un sexto. El recorrido probado usa orquestación externa."
+      },
+      "labProofs": [
+        "pmbs-server"
       ]
     },
     {
@@ -493,6 +554,19 @@
           },
           "proof": null
         }
+      ],
+      "qualificationLabel": {
+        "fr": "Critères d’intégration suivis",
+        "en": "Tracked integration criteria",
+        "es": "Criterios de integración seguidos"
+      },
+      "labSummary": {
+        "fr": "Le sous-ensemble restauré fonctionne : Vault écrit et relit, Maestro déclenche Queue puis Bridge vers un témoin indépendant, et Logger conserve les événements corrélés. Ces acquis ne ferment pas les scénarios de panne du parent et de réparation.",
+        "en": "The restored subset works: Vault writes and reads, Maestro triggers Queue then Bridge toward an independent witness, and Logger retains correlated events. These achievements do not close parent-failure and repair scenarios.",
+        "es": "El subconjunto restaurado funciona: Vault escribe y lee, Maestro activa Queue y Bridge hacia un testigo independiente, y Logger conserva eventos correlacionados. Estos logros no cierran los escenarios de fallo del padre y reparación."
+      },
+      "labProofs": [
+        "shaper-useful"
       ]
     }
   ],
@@ -540,6 +614,36 @@
         "fr": "Installation, création typée, correspondance API/SQL, arrêt et redémarrage propres, rejeu sans nouvel effet et nettoyage vérifiés sur les mêmes octets du paquet commun.",
         "en": "Install, typed create, matching API/SQL state, clean stop/restart, replay without a new effect and cleanup verified on the same common-package bytes.",
         "es": "Instalación, creación tipada, coincidencia API/SQL, parada y reinicio limpios, reejecución sin nuevo efecto y limpieza verificados con el mismo paquete."
+      }
+    },
+    {
+      "id": "replication-lab",
+      "date": "2026-10-07",
+      "version": "Historical G4 P5 · SQLite lab path",
+      "title": {
+        "fr": "Réplication et bascule planifiée déjà démontrées",
+        "en": "Replication and planned switchover already demonstrated",
+        "es": "Replicación y cambio planificado ya demostrados"
+      },
+      "summary": {
+        "fr": "Sur deux hôtes, configuration, réplication et bascule planifiée réussies avec captures à l’arrêt et à chaud. Identité d’univers et marqueur persistant conservés ; le scénario à chaud rapporte 2,25 secondes d’interruption. Cette preuve sur un conteneur simple ne couvre ni toutes les applications, ni la RAM imbriquée, ni la haute disponibilité automatique, ni le portage MariaDB privé.",
+        "en": "On two hosts, configuration, replication and planned switchover passed with stopped and live captures. Universe identity and a persistent marker were preserved; the live scenario reports 2.25 seconds of interruption. This flat-container proof does not cover all applications, nested RAM, automatic high availability or the private MariaDB port.",
+        "es": "En dos hosts funcionaron configuración, replicación y cambio planificado con capturas en parada y en caliente. Se conservaron identidad y marcador persistente; el escenario en caliente informa de 2,25 segundos de interrupción. La prueba en contenedor simple no cubre todas las aplicaciones, RAM anidada, alta disponibilidad automática ni adaptación a MariaDB privada."
+      }
+    },
+    {
+      "id": "move-lab",
+      "date": "2026-10-07",
+      "version": "Historical NODE 95daeca · SQLite lab path",
+      "title": {
+        "fr": "Déplacement imbriqué déjà démontré",
+        "en": "Nested move already demonstrated",
+        "es": "Traslado anidado ya demostrado"
+      },
+      "summary": {
+        "fr": "Déplacement vérifié entre deux hôtes : capture sur la source, transfert, restauration puis retrait de la source, avec UUID d’univers conservé. La reprise interne concerne les fichiers et journaux après mise au repos, pas la conservation de la RAM interne. Configuration expérimentale privilégiée, sans qualification générale du réseau ou des applications.",
+        "en": "Verified move between two hosts: source capture, transfer, restoration and source retirement with preserved universe UUID. Inner recovery covers quiesced files and logs, not preserved inner RAM. Experimental privileged configuration, without general network or application qualification.",
+        "es": "Traslado verificado entre dos hosts: captura, transferencia, restauración y retirada de la fuente con UUID conservado. La recuperación interna cubre archivos y registros en reposo, no la RAM interna. Configuración experimental privilegiada, sin validación general de red o aplicaciones."
       }
     },
     {
@@ -692,5 +796,7 @@
         "es": "Balance del 22 de octubre de pruebas nativas anteriores. Clon nativo y restauración útil conservados: Vault escribe y lee, Maestro activa Queue y Bridge hacia un testigo independiente, Logger registra cinco eventos correlacionados. Los escenarios pendientes del padre y reparación no están cerrados."
       }
     }
-  ]
+  ],
+  "updatedAtUTC": "2026-10-22T16:57:14Z",
+  "updatePolicy": "Publish only verified evidence changes; preserve historical lab achievements and version boundaries; never count in-progress code as validated."
 }

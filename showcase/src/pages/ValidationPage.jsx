@@ -12,7 +12,8 @@ export function coverage(feature) {
 export default function ValidationPage({ locale = 'fr' }) {
   const lang = validationCopy[locale] ? locale : 'fr'
   const copy = validationCopy[lang]
-  const date = new Intl.DateTimeFormat(lang, { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' }).format(new Date(`${snapshot.updatedAt}T12:00:00Z`))
+  const timestamp = snapshot.updatedAtUTC || `${snapshot.updatedAt}T12:00:00Z`
+  const date = new Intl.DateTimeFormat(lang, { day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Paris' }).format(new Date(timestamp))
 
   return (
     <article id="validation" tabIndex={-1} className="scroll-mt-24 space-y-9">
@@ -21,9 +22,10 @@ export default function ValidationPage({ locale = 'fr' }) {
         <h1 className="site-display mt-4 max-w-3xl text-4xl font-semibold leading-tight sm:text-5xl">{copy.title}</h1>
         <p className="mt-5 max-w-3xl text-base leading-7 text-fg-muted sm:text-lg sm:leading-8">{copy.intro}</p>
         <div className="mt-5 flex flex-wrap gap-x-5 gap-y-2 text-sm text-fg-faint">
-          <p>{copy.updated} <time dateTime={snapshot.updatedAt}>{date}</time></p>
+          <p>{copy.updated} <time dateTime={timestamp}>{date}</time> · {copy.timezone}</p>
           <p>{copy.manual}</p>
         </div>
+        <p className="mt-3 max-w-3xl text-sm leading-6 text-fg-muted">{copy.updatePolicy}</p>
       </header>
 
       <aside className="flex gap-3 rounded-xl border border-warm/30 bg-warm-soft p-5" aria-label={copy.productionTitle}>
@@ -49,10 +51,22 @@ export default function ValidationPage({ locale = 'fr' }) {
                     <p className="mt-3 text-sm leading-6 text-fg-muted">{feature.intro[lang]}</p>
                   </div>
                   <div className="shrink-0 text-right">
+                    <p className="mb-2 max-w-36 text-xs leading-5 text-fg-muted" data-coverage-scope>{feature.qualificationLabel[lang]}</p>
                     <p className={`text-3xl font-semibold tabular-nums ${blocking ? 'text-warm' : 'text-accent'}`} data-coverage-percent>{score.percentage}<span className="ml-0.5 text-lg">%</span></p>
                     <p className="mt-1 text-xs tabular-nums text-fg-faint">{score.validated} / {score.total}</p>
                   </div>
                 </div>
+                <div className="mt-5 rounded-xl border border-accent/20 bg-accent/5 p-4 sm:p-5" data-lab-acquired>
+                  <h4 className="flex items-center gap-2 text-sm font-semibold text-accent"><CheckCircle2 size={17} aria-hidden="true" />{copy.labAcquired}</h4>
+                  <p className="mt-2 text-sm leading-7 text-fg-muted">{feature.labSummary[lang]}</p>
+                  <div className="mt-3 flex flex-wrap gap-x-4 gap-y-2">
+                    {feature.labProofs.map((id) => {
+                      const proof = snapshot.proofs.find((item) => item.id === id)
+                      return <Link key={id} to={`/validation#proof-${id}`} className="inline-flex items-center gap-1 text-xs font-semibold text-accent underline underline-offset-4"><BookOpen size={13} aria-hidden="true" />{proof.title[lang]}</Link>
+                    })}
+                  </div>
+                </div>
+                {feature.qualificationNote && <p className="mt-4 text-sm font-medium leading-6 text-warm" data-qualification-note>{feature.qualificationNote[lang]}</p>}
                 <progress className={`validation-progress mt-4 h-2 w-full ${blocking ? 'text-warm' : 'text-accent'}`} value={score.validated} max={score.total} aria-label={`${feature.name[lang]} : ${score.validated} / ${score.total} ${copy.counted}`} />
                 <div className="mt-2 flex flex-wrap justify-between gap-2 text-xs">
                   <p className={blocking ? 'font-semibold text-warm' : 'font-medium text-accent'}>{feature.state[lang]}</p>
@@ -84,7 +98,7 @@ export default function ValidationPage({ locale = 'fr' }) {
       <section id="validation-method" tabIndex={-1} className="scroll-mt-24 rounded-2xl border border-line bg-surface p-5 sm:p-7">
         <h2 className="site-display text-2xl font-semibold">{copy.methodology}</h2>
         <ol className="mt-5 list-decimal space-y-3 pl-5 text-sm leading-7 text-fg-muted">{copy.method.map((item) => <li key={item}>{item}</li>)}</ol>
-        <a href={snapshotUrl} download="podmesh-validation-2026-10-22.json" className="mt-5 inline-flex items-start gap-2 text-sm font-semibold text-accent underline underline-offset-4"><Download size={17} className="mt-0.5 shrink-0" aria-hidden="true" />{copy.download}</a>
+        <a href={snapshotUrl} download={`podmesh-validation-${snapshot.updatedAt}.json`} className="mt-5 inline-flex items-start gap-2 text-sm font-semibold text-accent underline underline-offset-4"><Download size={17} className="mt-0.5 shrink-0" aria-hidden="true" />{copy.download}</a>
       </section>
 
       <section id="validation-evidence" tabIndex={-1} className="scroll-mt-24" aria-labelledby="proofs-title">

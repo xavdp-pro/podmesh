@@ -3,7 +3,9 @@ export const validationCopy = {
     nav: 'État des validations', short: 'Acquis, limites et prochaines étapes',
     eyebrow: 'Du concret, avec ses limites', title: 'Ce qui fonctionne. Ce qu’il reste à valider.',
     intro: 'Les essais ont déjà démontré des reprises utiles, des données retrouvées et de nouvelles écritures. Cette page montre précisément ce que ces résultats couvrent — et les points qui empêchent encore une qualification complète pour la production.',
-    updated: 'Bilan du', manual: 'Mise à jour manuelle · périmètre Podman',
+    updated: 'Dernier bilan vérifié :', manual: 'Mise à jour à chaque résultat vérifié · périmètre Podman', timezone: 'heure de Paris',
+    updatePolicy: 'Les acquis en laboratoire restent visibles, avec leurs versions et leurs limites. Les corrections en cours ne comptent pas comme des validations : les scores évoluent seulement après vérification des preuves.',
+    labAcquired: 'Acquis en laboratoire',
     productionTitle: 'La qualification globale pour la production reste ouverte.',
     productionBody: 'Le déplacement avec MariaDB privée et les délais d’écriture MeshFS restent bloquants. Les succès de restauration sont réels, dans les configurations indiquées.',
     coverage: 'Couverture des critères suivis', counted: 'critères validés', details: 'Voir les critères', remaining: 'Ce qu’il reste',
@@ -13,7 +15,8 @@ export const validationCopy = {
       'Un critère validé compte pour un. Le pourcentage est le nombre de critères validés divisé par le nombre de critères affichés, arrondi à l’entier le plus proche. Un résultat partiel ne reçoit pas de demi-point.',
       'Le calcul porte uniquement sur les critères essentiels explicités ici. Ce n’est ni une probabilité de fiabilité, ni un pourcentage de code terminé, ni une certification exhaustive.',
       'Un seul blocage essentiel peut empêcher la production, même avec un pourcentage élevé. Nous n’affichons donc pas de moyenne globale.',
-      'Les preuves proviennent de versions et de périmètres distincts. Elles ne certifient pas automatiquement un nouvel assemblage de versions. Leur réutilisation évite de refaire les tests déjà conclus.'
+      'Les preuves proviennent de versions et de périmètres distincts. Elles ne certifient pas automatiquement un nouvel assemblage de versions. Leur réutilisation évite de refaire les tests déjà conclus.',
+      'Les acquis historiques en laboratoire sont présentés séparément de la qualification visée. Pour le déplacement et la réplication, le score porte uniquement sur MariaDB privée : 0 % dans ce périmètre ne signifie pas qu’aucun déplacement ou aucune réplication n’a fonctionné.'
     ],
     download: 'Télécharger les critères et les résumés de preuve',
     priorities: 'La suite, dans l’ordre', next: ['Compléter le déplacement et la réplication avec MariaDB privée.', 'Résoudre les délais d’écriture MeshFS sans affaiblir la durabilité.', 'Livrer un parcours de restauration utilisable en exploitation.', 'Fermer les scénarios SHAPER restants, puis qualifier un ensemble cohérent de versions.'],
@@ -24,7 +27,9 @@ export const validationCopy = {
     nav: 'Validation status', short: 'Evidence, limits and next steps',
     eyebrow: 'Working results, with clear limits', title: 'What works. What remains to be validated.',
     intro: 'Tests have already demonstrated useful recovery, recovered data and new writes. This page states exactly what those results cover — and what still prevents full production qualification.',
-    updated: 'Snapshot dated', manual: 'Manually updated · Podman scope',
+    updated: 'Last verified update:', manual: 'Updated with each verified result · Podman scope', timezone: 'Paris time',
+    updatePolicy: 'Lab achievements remain visible with their versions and limits. Work in progress does not count as validation: scores change only after the evidence has been checked.',
+    labAcquired: 'Demonstrated in the lab',
     productionTitle: 'Overall production qualification remains open.',
     productionBody: 'Moving with private MariaDB and MeshFS write deadlines remain blockers. Restoration results are real, within the configurations described.',
     coverage: 'Coverage of tracked criteria', counted: 'validated criteria', details: 'See the criteria', remaining: 'What remains',
@@ -34,7 +39,8 @@ export const validationCopy = {
       'Each validated criterion counts as one. The percentage is validated criteria divided by displayed criteria, rounded to the nearest integer. Partial results receive no half points.',
       'The calculation covers only the essential criteria listed here. It is not a reliability probability, a percentage of code completed or an exhaustive certification.',
       'One essential blocker can prevent production use even with a high percentage. We therefore show no overall average.',
-      'Proofs come from different versions and scopes. They do not automatically qualify a new release combination. Reusing them avoids repeating concluded tests.'
+      'Proofs come from different versions and scopes. They do not automatically qualify a new release combination. Reusing them avoids repeating concluded tests.',
+      'Historical lab achievements are shown separately from the target qualification. For moving and replication, the score covers private MariaDB only: 0% in that scope does not mean that no move or replication has worked.'
     ],
     download: 'Download criteria and evidence summaries',
     priorities: 'Next, in order', next: ['Complete moving and replication with private MariaDB.', 'Resolve MeshFS write deadlines without weakening durability.', 'Deliver an operationally usable restoration workflow.', 'Close remaining SHAPER scenarios, then qualify a consistent version set.'],
@@ -45,7 +51,9 @@ export const validationCopy = {
     nav: 'Estado de validación', short: 'Logros, límites y próximos pasos',
     eyebrow: 'Resultados concretos, con límites claros', title: 'Lo que funciona. Lo que falta por validar.',
     intro: 'Los ensayos ya han demostrado recuperaciones útiles, datos recuperados y nuevas escrituras. Esta página muestra exactamente qué cubren esos resultados y qué impide aún una validación completa para producción.',
-    updated: 'Balance del', manual: 'Actualización manual · ámbito Podman',
+    updated: 'Último balance verificado:', manual: 'Actualización con cada resultado verificado · ámbito Podman', timezone: 'hora de París',
+    updatePolicy: 'Los logros de laboratorio siguen visibles con sus versiones y límites. El trabajo en curso no cuenta como validación: los porcentajes solo cambian después de comprobar las pruebas.',
+    labAcquired: 'Demostrado en laboratorio',
     productionTitle: 'La validación global para producción sigue abierta.',
     productionBody: 'El traslado con MariaDB privada y los plazos de escritura MeshFS siguen bloqueados. Las restauraciones son reales, dentro de las configuraciones indicadas.',
     coverage: 'Cobertura de los criterios seguidos', counted: 'criterios validados', details: 'Ver los criterios', remaining: 'Lo que falta',
@@ -55,7 +63,8 @@ export const validationCopy = {
       'Cada criterio validado cuenta como uno. El porcentaje divide los criterios validados por los mostrados y redondea al entero más cercano. Un resultado parcial no recibe medio punto.',
       'El cálculo solo cubre los criterios esenciales enumerados aquí. No es una probabilidad de fiabilidad, un porcentaje de código terminado ni una certificación exhaustiva.',
       'Un solo bloqueo esencial puede impedir la producción incluso con un porcentaje alto. Por eso no mostramos una media global.',
-      'Las pruebas proceden de versiones y ámbitos distintos. No validan automáticamente una nueva combinación de versiones. Reutilizarlas evita repetir ensayos ya concluidos.'
+      'Las pruebas proceden de versiones y ámbitos distintos. No validan automáticamente una nueva combinación de versiones. Reutilizarlas evita repetir ensayos ya concluidos.',
+      'Los logros históricos se muestran por separado de la validación buscada. Para traslado y replicación, el porcentaje solo cubre MariaDB privada: un 0 % en ese ámbito no significa que nunca hayan funcionado.'
     ],
     download: 'Descargar criterios y resúmenes de pruebas',
     priorities: 'Lo siguiente, por orden', next: ['Completar el traslado y la replicación con MariaDB privada.', 'Resolver los plazos de escritura MeshFS sin debilitar la durabilidad.', 'Entregar un recorrido de restauración utilizable en explotación.', 'Cerrar los escenarios SHAPER pendientes y validar un conjunto coherente de versiones.'],
