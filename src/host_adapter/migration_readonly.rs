@@ -315,6 +315,45 @@ fn host_command(args: &[&str], deadline: Instant) -> Result<Value, Error> {
     }
     Ok(serde_json::from_slice(&out.stdout)?)
 }
+// The closed command is bounded by the same observation deadline/output cap.
+// An inspect-size failure never becomes a reassuring measured zero.
+fn writable_layer_with(
+    c: &Value, run: &Value, deadline: Instant,
+    collect: impl FnOnce(&[&str], Instant) -> Result<Value, Error>,
+) -> Result<Value, Error> {
+    within(deadline)?;
+    if c["State"]["Running"].as_bool()!=Some(true) || c["State"]["Paused"].as_bool()!=Some(false) {
+        return Err("writable-layer observation requires a running unpaused container".into());
+    }
+    let id=text(c,"Id")?;digest(id)?;
+    let observed=collect(&["container","inspect","--size",id],deadline)?;
+    within(deadline)?;
+    let rows=observed.as_array().filter(|rows|rows.len()==1).ok_or("sized container observation absent or ambiguous")?;
+    let sized=&rows[0];
+    for key in ["Id","Image"] {
+        if sized[key]!=c[key] {return Err("sized observation container/image changed".into());}
+    }
+    for key in [SCOPE_LABEL,ACTION_LABEL,"io.podmesh.universe","io.podmesh.creation-operation"] {
+        if sized["Config"]["Labels"][key]!=c["Config"]["Labels"][key]
+            || c["Config"]["Labels"][key].as_str().filter(|v|!v.is_empty()).is_none() {
+            return Err("sized observation ownership binding changed".into());
+        }
+    }
+    for key in ["Pid","StartedAt","CgroupPath","Running","Paused"] {
+        if sized["State"][key]!=c["State"][key] {return Err("sized observation process incarnation changed".into());}
+    }
+    if sized["State"]["Pid"]!=run["host_pid"] || sized["State"]["StartedAt"]!=run["started_at"]
+        || sized["State"]["CgroupPath"]!=run["cgroup"] {
+        return Err("sized observation differs from sampled process incarnation".into());
+    }
+    let bytes=sized["SizeRw"].as_u64().ok_or("writable-layer SizeRw missing, negative or not a u64")?;
+    Ok(json!({"type":"podmesh-owned-writable-layer/1","status":"observed","source":"provider-podman-inspect-size",
+        "bytes":bytes,"container_id":id,"image":c["Image"],"scope":c["Config"]["Labels"][SCOPE_LABEL],
+        "universe_uuid":c["Config"]["Labels"]["io.podmesh.universe"],
+        "creation_operation":c["Config"]["Labels"]["io.podmesh.creation-operation"],
+        "incarnation":{"host_pid":run["host_pid"],"started_at":run["started_at"],"cgroup":run["cgroup"]},
+        "limit":"point-in-time running writable size; not a future hard bound or reservation; recheck after quiescence"}))
+}
 fn filesystem(path: &Path) -> Result<Value, Error> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -324,9 +363,11 @@ fn filesystem(path: &Path) -> Result<Value, Error> {
     if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    Ok(
-        json!({"path":canonical,"available_bytes":(stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64)}),
-    )
+    if stat.f_bavail>stat.f_bfree || stat.f_bfree>stat.f_blocks {return Err("graphroot free-block counts inconsistent".into());}
+    let block=u64::try_from(stat.f_frsize)?;
+    if block==0 {return Err("graphroot fragment size is zero".into());}
+    let available=u64::try_from(stat.f_bavail)?.checked_mul(block).ok_or("graphroot free-space overflow")?;
+    Ok(json!({"path":canonical,"available_bytes":available}))
 }
 // An environment hint is not proof of kernel rseq registration or restorability.
 fn classify_process(maps: &str, environ: &[u8]) -> Value {
@@ -379,6 +420,7 @@ fn facts(c: &Value, run: &Value, deadline: Instant) -> Result<Value, Error> {
     if !Path::new(graph).is_absolute() {
         return Err("actual host graphroot is not absolute".into());
     }
+    let writable=writable_layer_with(c,run,deadline,host_command)?;
     let mut runtime = json!({});
     for path in [
         "/usr/lib/podmesh-vzcriu/criu",
@@ -400,7 +442,8 @@ fn facts(c: &Value, run: &Value, deadline: Instant) -> Result<Value, Error> {
         "runtime_files":runtime,"runtime_check":"not executed: observation does not invoke CRIU",
         "podman_runtime":{"version":info["version"]["Version"],"oci_runtime":info["host"]["ociRuntime"]["name"],
             "oci_runtime_version":info["host"]["ociRuntime"]["version"]},
-        "storage":{"graphroot":graph,"driver":info["store"]["graphDriverName"],"writable_layer_bytes":null,"writable_layer_status":"not measured: no potentially long size walk",
+        "storage":{"graphroot":graph,"driver":info["store"]["graphDriverName"],"writable_layer_bytes":writable["bytes"],
+            "writable_layer":writable,"writable_layer_status":"observed point-in-time; bounded command; not a reservation",
             "graphroot_filesystem":filesystem(Path::new(graph))?,"app_artifact_volume":null,
             "app_artifact_volume_status":"not observable through this host capability; no APP free-space claim",
             "legacy_default_graphroot":graph=="/var/lib/containers/storage"},
@@ -743,4 +786,43 @@ mod tests {
             false
         );
     }
+    fn space_fixture()->(Value,Value) {
+        let (_,_,mut c)=fixture();
+        c["State"]=json!({"Pid":42,"StartedAt":"one-run","CgroupPath":format!("/machine.slice/libpod-{}.scope","a".repeat(64)),"Running":true,"Paused":false});
+        let run=json!({"host_pid":42,"started_at":"one-run","cgroup":c["State"]["CgroupPath"]});
+        (c,run)
+    }
+    #[test]
+    fn migration_space_size_zero_is_observed_but_invalid_or_missing_is_not_zero() {
+        let (c,run)=space_fixture();
+        for bytes in [0u64,1234] {
+            let mut sized=c.clone();sized["SizeRw"]=json!(bytes);
+            let result=writable_layer_with(&c,&run,Instant::now()+Duration::from_secs(5),|args,_|{
+                let id="a".repeat(64);assert_eq!(args,["container","inspect","--size",id.as_str()]);
+                Ok(json!([sized]))
+            }).unwrap();
+            assert_eq!(result["bytes"],bytes);assert_eq!(result["status"],"observed");
+        }
+        for value in [Value::Null,json!(-1),json!("0"),json!(1.5),serde_json::from_str("18446744073709551616").unwrap()] {
+            let mut sized=c.clone();sized["SizeRw"]=value;
+            assert!(writable_layer_with(&c,&run,Instant::now()+Duration::from_secs(5),|_,_|Ok(json!([sized]))).is_err());
+        }
+        assert!(writable_layer_with(&c,&run,Instant::now()+Duration::from_secs(5),|_,_|Ok(json!([c.clone()]))).is_err());
+    }
+    #[test]
+    fn migration_space_size_identity_replacement_and_timeout_fail_closed() {
+        let (c,run)=space_fixture();
+        for pointer in ["/Id","/Image","/Config/Labels/io.podmesh.adapter-scope","/Config/Labels/io.podmesh.creation-operation","/Config/Labels/io.podmesh.universe","/Config/Labels/io.podmesh.adapter-action",
+            "/State/Pid","/State/StartedAt","/State/CgroupPath","/State/Running","/State/Paused"] {
+            let mut sized=c.clone();sized["SizeRw"]=json!(0);*sized.pointer_mut(pointer).unwrap()=json!("replaced");
+            assert!(writable_layer_with(&c,&run,Instant::now()+Duration::from_secs(5),|_,_|Ok(json!([sized]))).is_err());
+        }
+        let mut mismatch=run.clone();mismatch["host_pid"]=json!(999);
+        let mut sized=c.clone();sized["SizeRw"]=json!(0);
+        assert!(writable_layer_with(&c,&mismatch,Instant::now()+Duration::from_secs(5),|_,_|Ok(json!([sized]))).is_err());
+        assert!(writable_layer_with(&c,&run,Instant::now()+Duration::from_secs(5),|_,_|Err("command timeout".into())).is_err());
+        assert!(writable_layer_with(&c,&run,Instant::now()-Duration::from_millis(1),|_,_|panic!("expired budget must not start tool")).is_err());
+        assert!(writable_layer_with(&c,&run,Instant::now()+Duration::from_secs(5),|_,_|Ok(json!([]))).is_err());
+    }
+
 }

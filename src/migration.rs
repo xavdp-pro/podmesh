@@ -869,7 +869,7 @@ pub(crate) fn preflight_store(
     if !crate::host_adapter::configured() {
         return Err("private migration preflight requires the typed host provider; no local fallback".into());
     }
-    preflight_store_with(store, request, provider_readonly_call)
+    preflight_store_observe(store, request, provider_readonly_call, observe_app_artifact_space)
 }
 
 // The provider action is public protocol, but its generic transport is private
@@ -946,10 +946,11 @@ fn journal_host(store: &mut dyn crate::store::DurableStore) -> Result<String, Er
     Ok(host)
 }
 
-fn preflight_store_with(
+fn preflight_store_observe(
     store: &mut dyn crate::store::DurableStore,
     request: &Value,
     mut provider: impl FnMut(&Value)->Result<Value,Error>,
+    app_observer: impl FnOnce()->(Option<PathBuf>,Value),
 ) -> Result<Value, Error> {
     let (uuid,scope,creation,b)=readonly_binding(request)?;
     let host=journal_host(store)?;
@@ -976,15 +977,20 @@ fn preflight_store_with(
         || identity["machine_id"].as_str().filter(|s|s.len()==32&&s.bytes().all(|b|b.is_ascii_hexdigit())).is_none() {
         return Err("provider observation identity does not bind this journal universe and host boot".into());
     }
+    let (configured_app_path,app_space)=app_observer();
     if journal_host(store)?!=host || lc::migration_store_readonly_gates(store,uuid,&binding_view)?!=reservation {
         return Err("durable ownership/reservation changed during preflight".into());
     }
+    let capture_space=capture_space_observation(facts,&app_space,configured_app_path.as_deref(),uuid,scope,creation,&b);
     let mut blockers=private_observation_blockers(facts,b.profile);
+    blockers.extend(capture_space["blockers"].as_array().ok_or("missing space assessment")?.iter()
+        .map(|v|v.as_str().unwrap_or("unknown space blocker").to_string()));
     if let Some(state)=reservation {blockers.push(format!("universe already has migration reservation state {state}"));}
     Ok(json!({"status":"verified","operation":"migration_preflight","store_engine":store.engine().as_str(),
         "universe_uuid":uuid,"source_host_uuid":host,"destination_host_uuid":b.destination,
         "migration_profile":b.profile.as_str(),"compatible":blockers.is_empty(),"blockers":blockers,
-        "facts":{"provider_observation":observed,"provider_host_identity":identity,"logical_journal_host_uuid":host},
+        "facts":{"provider_observation":observed,"provider_host_identity":identity,"logical_journal_host_uuid":host,
+            "capture_space":capture_space},
         "effects":"none: no journal write, intent, reservation, hostUUID initialization or artifact creation",
         "scope":"private-MariaDB source assessment; no destination inspection or migration effect enabled"}))
 }
@@ -1045,9 +1051,143 @@ fn private_observation_blockers(f: &Value, profile: MigrationProfile) -> Vec<Str
     // These facts intentionally remain unknown in the first provider increment.
     // Never substitute graphroot free space for the APP artifact volume.
     blockers.push("CRIU capability check not observed by the read-only provider".into());
-    blockers.push("writable-layer size is unobserved; capture space cannot be bounded".into());
-    blockers.push("APP artifact-volume capacity/binding is unobserved".into());
+
     blockers
+}
+
+// No global initializer is used by tests: their provider/APP observations are
+// explicit seams, never invented paths installed into process-global MIGRATIONS.
+#[cfg(test)]
+fn preflight_store_with(
+    store: &mut dyn crate::store::DurableStore, request: &Value,
+    provider: impl FnMut(&Value)->Result<Value,Error>,
+) -> Result<Value,Error> {
+    preflight_store_observe(store,request,provider,||(None,json!({"status":"unknown","reason":"test APP observer not supplied"})))
+}
+
+fn checked_available(blocks:u64,fragment:u64)->Result<u64,Error> {
+    if fragment==0 {return Err("filesystem fragment size is zero".into());}
+    blocks.checked_mul(fragment).ok_or_else(||"filesystem available-space overflow".into())
+}
+fn app_directory_fd(path:&Path)->Result<fs::File,Error> {
+    use std::os::fd::{AsRawFd,FromRawFd};
+    if !path.is_absolute() {return Err("configured migration base must be absolute".into());}
+    let mut current=fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_DIRECTORY|libc::O_NOFOLLOW|libc::O_CLOEXEC|libc::O_NONBLOCK).open("/")?;
+    for part in path.components() {
+        let name=match part {
+            std::path::Component::RootDir=>continue,
+            std::path::Component::Normal(name)=>name,
+            _=>return Err("configured migration base contains an unsafe component".into()),
+        };
+        use std::os::unix::ffi::OsStrExt;
+        let name=std::ffi::CString::new(name.as_bytes())?;
+        let fd=unsafe {libc::openat(current.as_raw_fd(),name.as_ptr(),libc::O_RDONLY|libc::O_DIRECTORY|libc::O_NOFOLLOW|libc::O_CLOEXEC|libc::O_NONBLOCK)};
+        if fd<0 {return Err("configured migration directory missing, symlinked or inaccessible".into());}
+        current=unsafe {fs::File::from_raw_fd(fd)};
+    }
+    Ok(current)
+}
+fn app_dir_identity(file:&fs::File)->Result<Value,Error> {
+    use std::os::{unix::fs::MetadataExt,fd::AsRawFd};
+    let m=file.metadata()?;
+    if !m.is_dir() || m.uid()!=unsafe{libc::geteuid()} || m.permissions().mode()&0o777!=0o700 {
+        return Err("APP migration directory is not owned private0700".into());
+    }
+    // dev/inode alone cannot detect a bind-mount replacement of the same inode.
+    // A missing mount-ID facility is unknown, never a weaker successful binding.
+    let mut x:libc::statx=unsafe{std::mem::zeroed()};
+    if unsafe{libc::statx(file.as_raw_fd(),b"\0".as_ptr() as *const libc::c_char,
+        libc::AT_EMPTY_PATH|libc::AT_STATX_DONT_SYNC,libc::STATX_MNT_ID,&mut x)}!=0
+        || x.stx_mask & libc::STATX_MNT_ID==0 {
+        return Err("APP directory mount identity unavailable".into());
+    }
+    Ok(json!({"device":m.dev(),"inode":m.ino(),"mount_id":x.stx_mnt_id,"uid":m.uid(),"gid":m.gid(),"mode":m.permissions().mode()&0o777}))
+}
+fn app_space_at(
+    path:&Path,
+    measure:impl FnOnce(&fs::File)->Result<Value,Error>,
+)->Result<Value,Error> {
+    let configured_path=path.to_str().ok_or("configured migration path cannot be represented as UTF-8")?;
+    let fd=app_directory_fd(path)?;
+    let identity=app_dir_identity(&fd)?;
+    let measurement=measure(&fd)?;
+    if identity!=app_dir_identity(&fd)? || identity!=app_dir_identity(&app_directory_fd(path)?)? {
+        return Err("APP migration directory replaced or ownership changed during observation".into());
+    }
+    Ok(json!({"type":"podmesh-app-artifact-space/1","status":"observed","source":"configured-migrations-base-fd",
+        "namespace":"application","configured_path":configured_path,"identity":identity,"binding_verified":true,
+        "binding_confidence":"held fd dev/inode/mount-ID equals configured nofollow path before and after; not a future reservation",
+        "filesystem":measurement}))
+}
+fn app_fd_space(file:&fs::File)->Result<Value,Error> {
+    use std::os::fd::AsRawFd;
+    let mut st:libc::statvfs=unsafe{std::mem::zeroed()};
+    if unsafe{libc::fstatvfs(file.as_raw_fd(),&mut st)}!=0 {return Err("APP fstatvfs failed".into());}
+    if st.f_bavail>st.f_bfree || st.f_bfree>st.f_blocks {return Err("APP filesystem free-block counts inconsistent".into());}
+    let blocks=u64::try_from(st.f_bavail)?;let fragment=u64::try_from(st.f_frsize)?;
+    Ok(json!({"available_bytes":checked_available(blocks,fragment)?,"available_blocks":blocks,
+        "fragment_bytes":fragment,"filesystem_id":st.f_fsid,
+        "read_only":st.f_flag & libc::ST_RDONLY != 0}))
+}
+fn observe_app_artifact_space()->(Option<PathBuf>,Value) {
+    // Getter only: never create a path or initialize the process-global OnceLock.
+    // Return the independently selected trusted configuration alongside the JSON,
+    // so the consumer cannot accept an absolute but unrelated APP directory.
+    match base() {
+        Err(_)=>(None,json!({"status":"unknown","reason":"APP migration base is unprepared"})),
+        Ok(path)=>{
+            let value=match app_space_at(path,app_fd_space) {
+                Ok(value)=>value,
+                Err(error)=>json!({"status":"unknown","source":"configured-migrations-base-fd","namespace":"application","reason":error.to_string()}),
+            };
+            (Some(path.clone()),value)
+        }
+    }
+}
+
+fn capture_space_observation(f:&Value,app:&Value,configured_app_path:Option<&Path>,uuid:&str,scope:&str,creation:&str,b:&Binding)->Value {
+    let mut blockers=Vec::<String>::new();let layer=&f["storage"]["writable_layer"];
+    let run=&f["container_incarnation"];
+    let bound=layer["type"]=="podmesh-owned-writable-layer/1" && layer["status"]=="observed"
+        && layer["source"]=="provider-podman-inspect-size" && layer["container_id"]==b.container_id
+        && layer["image"].as_str().map(|v|v.trim_start_matches("sha256:"))==Some(b.image.trim_start_matches("sha256:"))
+        && layer["scope"]==scope && layer["universe_uuid"]==uuid && layer["creation_operation"]==creation
+        && layer["incarnation"]["host_pid"]==run["host_pid"] && layer["incarnation"]["started_at"]==run["started_at"]
+        && layer["incarnation"]["cgroup"]==run["cgroup"];
+    let size=layer["bytes"].as_u64().filter(|_|bound);
+    if size.is_none() {blockers.push("writable-layer size unknown or not bound to this owned incarnation".into());}
+    let app_bound=app["type"]=="podmesh-app-artifact-space/1" && app["status"]=="observed"
+        && app["source"]=="configured-migrations-base-fd" && app["namespace"]=="application" && app["binding_verified"]==true
+        && configured_app_path.is_some()
+        && app["configured_path"].as_str().map(Path::new)==configured_app_path
+        && app["configured_path"].as_str().is_some_and(|p|Path::new(p).is_absolute())
+        && app["identity"]["device"].as_u64().is_some() && app["identity"]["inode"].as_u64().is_some_and(|n|n>0)
+        && app["identity"]["mount_id"].as_u64().is_some()
+        && app["identity"]["uid"].as_u64()==Some(unsafe{libc::geteuid()} as u64)
+        && app["identity"]["gid"].as_u64().is_some() && app["identity"]["mode"].as_u64()==Some(0o700);
+    let app_available=match (app["filesystem"]["available_blocks"].as_u64(),app["filesystem"]["fragment_bytes"].as_u64()) {
+        (Some(blocks),Some(fragment))=>checked_available(blocks,fragment).ok()
+            .filter(|n|Some(*n)==app["filesystem"]["available_bytes"].as_u64()&&app_bound&&app["filesystem"]["read_only"].as_bool()==Some(false)),
+        _=>None,
+    };
+    if app_available.is_none() {blockers.push("APP artifact-volume capacity/binding is unknown or read-only".into());}
+    let required=match (f["memory_current_bytes"].as_u64(),size) {
+        (Some(memory),Some(size))=>memory.checked_mul(2).and_then(|n|n.checked_add(size)).and_then(|n|n.checked_add(SPACE_MARGIN_BYTES)),
+        _=>None,
+    };
+    if required.is_none() {blockers.push("provisional capture space unknown or arithmetic overflow".into());}
+    let graph_path=f["storage"]["graphroot"].as_str();
+    let graph_bound=graph_path.is_some_and(|p|Path::new(p).is_absolute())
+        && f["storage"]["graphroot_filesystem"]["path"].as_str()==graph_path;
+    let graph_available=f["storage"]["graphroot_filesystem"]["available_bytes"].as_u64().filter(|_|graph_bound);
+    if let Some(required)=required {
+        if !graph_available.is_some_and(|n|n>=required) {blockers.push("provider graphroot capacity unknown or below provisional capture requirement".into());}
+        if !app_available.is_some_and(|n|n>=required) {blockers.push("APP artifact-volume capacity unknown or below provisional capture requirement".into());}
+    }
+    json!({"writable_layer":layer,"provider_graphroot_filesystem":f["storage"]["graphroot_filesystem"],
+        "app_artifact_space":app,"provisional_required_bytes":required,"blockers":blockers,
+        "limit":"point-in-time observations; not a space reservation or future hard bound; recheck after quiescence before any separately authorized capture"})
 }
 
 fn scope_unit(id: &str) -> String {
@@ -3775,4 +3915,93 @@ mod durable_preflight_tests {
             }
         }
     }
+    struct SpaceTemp(std::path::PathBuf);
+    impl SpaceTemp {
+        fn new()->Self {
+            let parent=std::env::temp_dir().canonicalize().unwrap().join(format!("podmesh-app-space-{}-{}",std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            fs::create_dir(&parent).unwrap();fs::set_permissions(&parent,fs::Permissions::from_mode(0o700)).unwrap();Self(parent)
+        }
+    }
+    impl Drop for SpaceTemp {fn drop(&mut self){let _=fs::remove_dir_all(&self.0);}}
+    #[test]
+    fn migration_space_actual_app_fd_is_readonly_and_does_not_initialize_global_base() {
+        let temp=SpaceTemp::new();let marker=temp.0.join("marker");fs::write(&marker,b"preserve-bytes").unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let before=fs::metadata(&temp.0).unwrap();let out=app_space_at(&temp.0,app_fd_space).unwrap();let after=fs::metadata(&temp.0).unwrap();
+        assert_eq!(out["status"],"observed");assert_eq!(out["namespace"],"application");assert_eq!(out["identity"]["inode"],before.ino());
+        assert!(out["filesystem"]["available_bytes"].as_u64().is_some());
+        assert_eq!((before.dev(),before.ino(),before.uid(),before.gid(),before.mode(),before.mtime(),before.mtime_nsec(),before.ctime(),before.ctime_nsec()),
+            (after.dev(),after.ino(),after.uid(),after.gid(),after.mode(),after.mtime(),after.mtime_nsec(),after.ctime(),after.ctime_nsec()));
+        assert_eq!(fs::read(&marker).unwrap(),b"preserve-bytes");assert_eq!(fs::read_dir(&temp.0).unwrap().count(),1);
+        // Deliberately never call prepare(), get_or_init(), or global setters.
+    }
+    #[test]
+    fn migration_space_app_missing_symlink_replaced_or_unowned_directory_refuses() {
+        use std::os::unix::fs::symlink;
+        let parent=SpaceTemp::new();let path=parent.0.join("migrations");
+        assert!(app_space_at(&path,app_fd_space).is_err());assert!(!path.exists());
+        fs::create_dir(&path).unwrap();fs::set_permissions(&path,fs::Permissions::from_mode(0o700)).unwrap();
+        let link=parent.0.join("link");symlink(&path,&link).unwrap();
+        assert!(app_space_at(&link,app_fd_space).is_err());assert!(app_space_at(&link.join(".."),app_fd_space).is_err());
+        fs::set_permissions(&path,fs::Permissions::from_mode(0o755)).unwrap();assert!(app_space_at(&path,app_fd_space).is_err());
+        fs::set_permissions(&path,fs::Permissions::from_mode(0o700)).unwrap();
+        let result=app_space_at(&path,|fd|{
+            fs::rename(&path,parent.0.join("old")).unwrap();fs::create_dir(&path).unwrap();
+            fs::set_permissions(&path,fs::Permissions::from_mode(0o700)).unwrap();app_fd_space(fd)
+        });assert!(result.is_err());
+        if unsafe{libc::geteuid()}==0 {
+            use std::os::unix::ffi::OsStrExt;
+            let c=std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe{libc::chown(c.as_ptr(),1102,1102)},0);
+            assert!(app_space_at(&path,app_fd_space).is_err());
+        }
+    }
+    fn space_values(req:&Value,obs:&Value)->(Value,Value) {
+        let mut f=obs["facts"].clone();let run=f["container_incarnation"].clone();
+        f["storage"]["writable_layer"]=json!({"type":"podmesh-owned-writable-layer/1","status":"observed","source":"provider-podman-inspect-size",
+            "bytes":0,"container_id":req["container_id"],"image":req["image"],"scope":req["provider_scope"],"universe_uuid":req["universe_uuid"],
+            "creation_operation":req["creation_operation"],"incarnation":{"host_pid":run["host_pid"],"started_at":run["started_at"],"cgroup":run["cgroup"]}});
+        f["storage"]["graphroot_filesystem"]=json!({"available_bytes":1u64<<34,"path":CONTAINER_STORAGE});
+        let app=json!({"type":"podmesh-app-artifact-space/1","status":"observed","source":"configured-migrations-base-fd","namespace":"application",
+            "binding_verified":true,"configured_path":"/configured/migrations","identity":{"device":1,"inode":2,"mount_id":3,"uid":unsafe{libc::geteuid()},"gid":0,"mode":0o700},
+            "filesystem":{"available_blocks":1u64<<22,"fragment_bytes":4096,"available_bytes":1u64<<34,"filesystem_id":1,"read_only":false}});
+        (f,app)
+    }
+    #[test]
+    fn migration_space_checked_math_and_graphroot_app_separation() {
+        assert_eq!(checked_available(0,4096).unwrap(),0);assert_eq!(checked_available(2,4096).unwrap(),8192);
+        assert!(checked_available(u64::MAX,2).is_err());assert!(checked_available(1,0).is_err());
+        let (_,req,obs)=fixture();let (mut f,mut app)=space_values(&req,&obs);let (uuid,scope,creation,b)=readonly_binding(&req).unwrap();
+        let good=capture_space_observation(&f,&app,Some(Path::new("/configured/migrations")),uuid,scope,creation,&b);assert!(good["blockers"].as_array().unwrap().is_empty());
+        assert_eq!(good["provisional_required_bytes"],2*1048576+SPACE_MARGIN_BYTES);
+        app["filesystem"]["available_bytes"]=json!(0);app["filesystem"]["available_blocks"]=json!(0);
+        let low=capture_space_observation(&f,&app,Some(Path::new("/configured/migrations")),uuid,scope,creation,&b);assert!(low["blockers"].to_string().contains("APP artifact-volume"));
+        f["storage"]["writable_layer"]["bytes"]=json!(u64::MAX);
+        assert!(capture_space_observation(&f,&app,Some(Path::new("/configured/migrations")),uuid,scope,creation,&b)["blockers"].to_string().contains("overflow"));
+    }
+    #[test]
+    fn migration_space_fields_clear_only_when_bound_and_independent_blockers_remain() {
+        let (mut db,req,obs)=fixture();let (f,app)=space_values(&req,&obs);let mut measured=obs.clone();measured["facts"]=f.clone();
+        let result=preflight_store_observe(&mut db,&req,|a|fake_provider(a,&measured),||(Some(PathBuf::from("/configured/migrations")),app.clone())).unwrap();
+        assert_eq!(result["compatible"],false);let blockers=result["blockers"].to_string();assert!(blockers.contains("CRIU"));
+        assert!(!blockers.contains("writable-layer"));assert!(!blockers.contains("APP artifact-volume"));
+        let (uuid,scope,creation,b)=readonly_binding(&req).unwrap();
+        for pointer in ["/storage/writable_layer/bytes","/storage/writable_layer/container_id","/storage/writable_layer/image","/storage/writable_layer/scope","/storage/writable_layer/creation_operation","/storage/writable_layer/incarnation/host_pid"] {
+            let mut bad=f.clone();*bad.pointer_mut(pointer).unwrap()=Value::Null;
+            assert!(capture_space_observation(&bad,&app,Some(Path::new("/configured/migrations")),uuid,scope,creation,&b)["blockers"].to_string().contains("writable-layer"));
+        }
+        for pointer in ["/binding_verified","/namespace","/identity/inode","/identity/mount_id","/filesystem/available_bytes"] {
+            let mut bad=app.clone();*bad.pointer_mut(pointer).unwrap()=Value::Null;
+            assert!(capture_space_observation(&f,&bad,Some(Path::new("/configured/migrations")),uuid,scope,creation,&b)["blockers"].to_string().contains("APP artifact-volume"));
+        }
+        let mut wrong_path=app.clone();wrong_path["configured_path"]=json!("/another/migrations");
+        assert!(capture_space_observation(&f,&wrong_path,Some(Path::new("/configured/migrations")),uuid,scope,creation,&b)["blockers"].to_string().contains("APP artifact-volume"));
+        let mut ro=app.clone();ro["filesystem"]["read_only"]=json!(true);
+        assert!(capture_space_observation(&f,&ro,Some(Path::new("/configured/migrations")),uuid,scope,creation,&b)["blockers"].to_string().contains("APP artifact-volume"));
+        let mut other=f.clone();other["storage"]["driver"]=json!("vfs");other["processes"][0]["libc"]=json!("glibc");
+        let independent=private_observation_blockers(&other,MigrationProfile::Flat).join(";");
+        assert!(independent.contains("rseq"));assert!(independent.contains("overlay"));assert!(independent.contains("CRIU"));
+    }
+
 }
