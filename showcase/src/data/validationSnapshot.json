@@ -1,6 +1,6 @@
 {
   "schema": 2,
-  "updatedAt": "2026-10-22",
+  "updatedAt": "2026-10-23",
   "metric": "validated_essential_criteria_coverage",
   "formula": "round(100 * count(status == validated) / count(criteria))",
   "productionQualified": false,
@@ -28,9 +28,9 @@
         "es": "Crear, parar y recuperar una aplicación con su registro y datos."
       },
       "remaining": {
-        "fr": "Conserver les acquis du socle testé et rattacher les preuves à chaque nouveau candidat. Sa restauration complète reste à qualifier si elle n’est pas couverte par les reçus existants. Le retour après redémarrage réel de l’hôte reste également ouvert.",
-        "en": "Preserve the tested baseline and bind evidence to each new candidate. Its full restoration still needs qualification if existing receipts do not cover it. Recovery after a real host reboot also remains open.",
-        "es": "Conservar la base probada y vincular las pruebas a cada nuevo candidato. Su restauración completa sigue pendiente si no la cubren los registros existentes. También falta la recuperación tras reinicio real del host."
+        "fr": "Terminer l’import du candidat canonique, puis démontrer le démarrage utile avec MariaDB dans le même conteneur, par socket privé sans TCP. Qualifier ensuite arrêt/reprise, copie SQL cohérente, volumes et restauration indépendante. Les acquis du socle historique restent distincts.",
+        "en": "Complete canonical candidate import, then demonstrate useful startup with same-container MariaDB over a private socket without TCP. Next qualify stop/recovery, coherent SQL copy, volumes and independent restoration. Historical baseline achievements remain separate.",
+        "es": "Completar la importación del candidato y demostrar su inicio útil con MariaDB en el mismo contenedor por socket privado sin TCP. Después validar parada/recuperación, copia SQL coherente, volúmenes y restauración independiente. Los logros históricos siguen separados."
       },
       "checks": [
         {
@@ -157,9 +157,9 @@
         "es": "Trasladar un universo o preparar su recuperación en otro host."
       },
       "remaining": {
-        "fr": "Le précontrôle source typé est démontré en lecture seule sur une vraie MariaDB privée. Il signale encore une incompatibilité : contrôle CRIU, mesure de la couche inscriptible, capacité du volume d’archives et configuration d’exécution restent à qualifier. Le déplacement, les points de reprise et la destination ne sont pas validés.",
-        "en": "Typed source preflight is demonstrated read-only against real private MariaDB. It still reports incompatibility: CRIU checks, writable-layer measurement, artifact-volume capacity and runtime configuration remain unqualified. Moving, recovery points and destination readiness are not validated.",
-        "es": "La comprobación tipada del origen se demostró de solo lectura con MariaDB privada real. Aún declara incompatibilidad: falta validar CRIU, medida de la capa escribible, capacidad del volumen de archivos y configuración de ejecución. El traslado, los puntos de recuperación y el destino no están validados."
+        "fr": "Le précontrôle MariaDB en lecture seule reste acquis, mais le déplacement et la réplication du candidat canonique ne sont pas validés. Son import est encore bloqué. Après démarrage et restauration utiles, il faudra qualifier la destination, le transfert, les points de reprise et la continuité sans rejouer d’anciens effets.",
+        "en": "Read-only MariaDB preflight remains demonstrated, but moving and replication of the canonical candidate are not validated. Its import is still blocked. After useful startup and restoration, destination readiness, transfer, recovery points and continuity without replaying old effects must be qualified.",
+        "es": "Se conserva la comprobación MariaDB de solo lectura, pero no están validados el traslado ni la replicación del candidato canónico. Su importación sigue bloqueada. Tras inicio y restauración útiles, habrá que validar destino, transferencia, puntos de recuperación y continuidad sin repetir efectos antiguos."
       },
       "checks": [
         {
@@ -877,9 +877,28 @@
         "en": "Checked functional-unit rules against the recipes actually tested: NODE preflight used real private MariaDB, but in a separate container over loopback TCP. It therefore does not prove same-container placement, private socket without TCP listening, or required SQL partitions. The five units in the useful restored SHAPER subset have their private in-container MariaDB servers; that result does not transfer to NODE/manager recipes. Earlier achievements and all scored criteria are retained. This is a scope correction, not a new passed runtime test.",
         "es": "Reglas de la unidad contrastadas con las recetas realmente probadas: el precontrol NODE usó MariaDB privada real, pero en otro contenedor mediante TCP loopback. No demuestra ubicación en el mismo contenedor, socket privado sin escucha TCP ni las particiones SQL exigidas. Las cinco unidades del subconjunto SHAPER restaurado tienen MariaDB interna privada; ese resultado no se transfiere a NODE/manager. Se conservan los logros anteriores y todos los criterios puntuados. Es una corrección de ámbito, no una prueba de ejecución nueva."
       }
+    },
+    {
+      "id": "canonical-import-preparation",
+      "date": "2026-10-23",
+      "version": "Canonical candidate · isolated import preparation",
+      "kind": "preparatory-boundary",
+      "runtimePass": false,
+      "importPass": false,
+      "productionQualified": false,
+      "title": {
+        "fr": "Préparation isolée vérifiée ; import toujours non validé",
+        "en": "Isolated preparation verified; import still unvalidated",
+        "es": "Preparación aislada verificada; importación aún sin validar"
+      },
+      "summary": {
+        "fr": "Les contrôles ont vérifié les namespaces privés, les correspondances utilisateur/groupe, les refus d’écriture sur les données d’origine et la liaison indépendante au processus testé. Les verrous ont ensuite été créés dans l’espace privé. L’import réel a rencontré une limite de création de threads ; la tentative suivante, à concurrence réduite, s’est arrêtée plus tôt sur un répertoire temporaire manquant. Cette dernière tentative ne démontre donc pas la résolution de la limite de threads. Aucune inspection d’image, création de conteneur applicatif ni opération SQL n’a été validée. Après nettoyage, les services, clés, montages et stockage d’origine contrôlés sont préservés ; aucun acteur jetable ne subsiste. Ces acquis préparatoires ne valident ni le cycle de vie canonique, ni le déplacement/réplication MariaDB, ni la production.",
+        "en": "Checks verified private namespaces, user/group mappings, denied writes to original data and independent binding to the tested process. Locks were then created in private storage. Actual import encountered a thread-creation limit; the next reduced-concurrency attempt stopped earlier on a missing temporary directory. That attempt therefore does not establish resolution of the thread limit. No image inspection, application-container creation or SQL operation was validated. After cleanup, checked original services, keys, mounts and storage are preserved, with no disposable actor left. These preparatory achievements do not qualify canonical lifecycle, MariaDB move/replication or production.",
+        "es": "Los controles verificaron namespaces privados, correspondencias de usuario/grupo, denegación de escrituras en datos originales y vinculación independiente al proceso probado. Los bloqueos se crearon en almacenamiento privado. La importación encontró un límite de creación de hilos; el siguiente intento con menor concurrencia paró antes por un directorio temporal ausente. Por tanto, no demuestra que el límite esté resuelto. No se validaron inspección de imagen, creación de contenedor de aplicación ni operación SQL. Tras limpiar, se conservan servicios, claves, montajes y almacenamiento originales comprobados, sin actores desechables. Estos avances preparatorios no validan ciclo de vida canónico, traslado/replicación MariaDB ni producción."
+      }
     }
   ],
-  "updatedAtUTC": "2026-10-22T20:26:31.479004+00:00",
+  "updatedAtUTC": "2026-10-23T20:00:42.007420Z",
   "updatePolicy": "Publish only verified evidence changes; preserve historical lab achievements and version boundaries; never count in-progress code as validated.",
   "canonicalBoundary": {
     "state": "not_qualified",
@@ -895,21 +914,40 @@
     },
     "gaps": {
       "fr": [
-        "NODE et manager : les recettes actuelles séparent application et MariaDB en deux conteneurs. Les preuves SQL restent acquises dans ce périmètre ; la recette conforme et sa restauration utile restent à qualifier.",
+        "NODE et manager : les preuves historiques utilisent application et MariaDB séparées. Un candidat réunissant application et base dans le même conteneur a été préparé, mais son import, son démarrage par socket privé et sa restauration ne sont pas validés.",
         "MeshFS utilise encore SQLite pour les métadonnées expérimentales. Les résultats PMBS portent sur les contenus sauvegardés ; ils ne qualifient pas à eux seuls son état durable comme unité SHAPER autonome.",
         "Les tables doivent être qualifiées selon leur usage, leur croissance et leur rétention sur plusieurs mois : partitions mensuelles UTC pour les historiques concernés, sans purger les protections contre les anciens rejeux. Un export SQL fidèle précède les changements de schéma."
       ],
       "en": [
-        "NODE and manager: current recipes place application and MariaDB in two separate containers. SQL evidence remains valid within that scope; the conforming recipe and useful restoration still need qualification.",
+        "NODE and manager: historical evidence uses separate application and MariaDB containers. A same-container application/database candidate has been prepared, but its import, private-socket startup and restoration are not validated.",
         "MeshFS still uses SQLite for experimental metadata. PMBS results cover backed-up contents; they do not by themselves qualify its durable state as an autonomous SHAPER unit.",
         "Tables need qualification by usage, growth and retention over months: monthly UTC partitions for applicable histories, without purging protections against old replays. A faithful SQL export precedes schema changes."
       ],
       "es": [
-        "NODE y manager: las recetas actuales separan aplicación y MariaDB en dos contenedores. Las pruebas SQL siguen siendo válidas en ese ámbito; falta validar la receta conforme y su restauración útil.",
+        "NODE y manager: las pruebas históricas usan contenedores separados. Se preparó un candidato con aplicación y base en el mismo contenedor, pero su importación, inicio por socket privado y restauración no están validados.",
         "MeshFS aún usa SQLite para los metadatos experimentales. Los resultados PMBS cubren los contenidos copiados; por sí solos no validan su estado duradero como unidad SHAPER autónoma.",
         "Hay que evaluar cada tabla por uso, crecimiento y retención durante meses: particiones mensuales UTC para los históricos correspondientes, sin eliminar protecciones contra repeticiones antiguas. Una exportación SQL fiel precede a los cambios de esquema."
       ]
     },
     "proof": "canonical-boundary"
+  },
+  "currentMilestone": {
+    "state": "blocked",
+    "proof": "canonical-import-preparation",
+    "title": {
+      "fr": "Point actuel : import du candidat canonique encore bloqué",
+      "en": "Current milestone: canonical candidate import still blocked",
+      "es": "Estado actual: importación del candidato canónico aún bloqueada"
+    },
+    "summary": {
+      "fr": "La préparation isolée de l’import a passé ses contrôles de protection. Les tentatives réelles n’ont toutefois pas abouti : aucune image n’a été acceptée par inspection et aucun NODE canonique n’a démarré. La mise en production reste non validée.",
+      "en": "Isolated import preparation passed its protection checks. Actual attempts have not completed: no image has been accepted by inspection and no canonical NODE has started. Production qualification remains open.",
+      "es": "La preparación aislada superó los controles de protección. Los intentos reales no se completaron: ninguna imagen fue aceptada mediante inspección ni se inició un NODE canónico. La validación para producción sigue abierta."
+    },
+    "next": {
+      "fr": "Prochaine étape : corriger le répertoire temporaire d’exécution, puis terminer l’import et vérifier l’image exacte. La limite de threads rencontrée auparavant reste à résoudre ou à exclure sous une charge comparable. Ensuite : démarrage utile du NODE avec MariaDB privée, conservation de l’état et restauration indépendante.",
+      "en": "Next: correct the temporary runtime directory, then complete import and inspect the exact image. The earlier thread-limit failure still needs resolution or exclusion under a comparable load. Then: useful NODE startup with private MariaDB, state persistence and independent restoration.",
+      "es": "Siguiente paso: corregir el directorio temporal de ejecución, completar la importación e inspeccionar la imagen exacta. El fallo anterior del límite de hilos debe resolverse o descartarse con carga comparable. Después: inicio útil del NODE con MariaDB privada, persistencia y restauración independiente."
+    }
   }
 }

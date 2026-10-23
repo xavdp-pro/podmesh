@@ -33,6 +33,13 @@ export default function ValidationPage({ locale = 'fr' }) {
         <div><p className="font-semibold">{copy.productionTitle}</p><p className="mt-2 text-sm leading-6 text-fg-muted">{copy.productionBody}</p></div>
       </aside>
 
+      {snapshot.currentMilestone && <section className="rounded-xl border border-warm/30 bg-warm-soft p-5" aria-labelledby="current-milestone-title" data-current-milestone>
+        <h2 id="current-milestone-title" className="text-lg font-semibold">{snapshot.currentMilestone.title[lang]}</h2>
+        <p className="mt-3 text-sm leading-7 text-fg-muted">{snapshot.currentMilestone.summary[lang]}</p>
+        <p className="mt-3 text-sm leading-7 text-fg-muted">{snapshot.currentMilestone.next[lang]}</p>
+        <Link to={`/validation#proof-${snapshot.currentMilestone.proof}`} className="mt-4 inline-flex items-center gap-1 text-sm font-semibold text-accent underline underline-offset-4">{copy.proof}<ArrowUpRight size={14} aria-hidden="true" /></Link>
+      </section>}
+
       {snapshot.canonicalBoundary && <section className="rounded-xl border border-warm/30 p-5" aria-labelledby="canonical-title" data-canonical-boundary>
         <h2 id="canonical-title" className="text-lg font-semibold">{snapshot.canonicalBoundary.title[lang]}</h2>
         <p className="mt-3 text-sm leading-7 text-fg-muted">{snapshot.canonicalBoundary.summary[lang]}</p>

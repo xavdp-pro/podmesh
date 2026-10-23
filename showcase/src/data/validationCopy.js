@@ -17,7 +17,7 @@ export const validationCopy = {
       'Le calcul porte uniquement sur les critères essentiels explicités ici. Ce n’est ni une probabilité de fiabilité, ni un pourcentage de code terminé, ni une certification exhaustive.',
       'Un seul blocage essentiel peut empêcher la production, même avec un pourcentage élevé. Nous n’affichons donc pas de moyenne globale.',
       'Les preuves proviennent de versions et de périmètres distincts. Elles ne certifient pas automatiquement un nouvel assemblage de versions. Leur réutilisation évite de refaire les tests déjà conclus.',
-      'Les acquis historiques en laboratoire sont présentés séparément de la qualification visée. Pour le déplacement et la réplication, le score porte uniquement sur MariaDB privée : 0 % dans ce périmètre ne signifie pas qu’aucun déplacement ou aucune réplication n’a fonctionné.'
+      'Les acquis historiques en laboratoire sont présentés séparément de la qualification visée. Pour le déplacement et la réplication, le score porte uniquement sur MariaDB privée : ce score ne mesure pas les succès historiques obtenus avec SQLite.'
     ],
     download: 'Télécharger les critères et les résumés de preuve',
     priorities: 'La suite, dans l’ordre', next: ['Aligner la recette des unités et qualifier les tables MariaDB, puis prouver la restauration utile.', 'Compléter le déplacement et la réplication avec MariaDB privée.', 'Résoudre les délais d’écriture MeshFS sans affaiblir la durabilité.', 'Livrer un parcours de restauration utilisable en exploitation.', 'Fermer les scénarios SHAPER restants, puis qualifier un ensemble cohérent de versions.'],
@@ -42,7 +42,7 @@ export const validationCopy = {
       'The calculation covers only the essential criteria listed here. It is not a reliability probability, a percentage of code completed or an exhaustive certification.',
       'One essential blocker can prevent production use even with a high percentage. We therefore show no overall average.',
       'Proofs come from different versions and scopes. They do not automatically qualify a new release combination. Reusing them avoids repeating concluded tests.',
-      'Historical lab achievements are shown separately from the target qualification. For moving and replication, the score covers private MariaDB only: 0% in that scope does not mean that no move or replication has worked.'
+      'Historical lab achievements are shown separately from the target qualification. For moving and replication, the score covers private MariaDB only: this score does not measure historical SQLite achievements.'
     ],
     download: 'Download criteria and evidence summaries',
     priorities: 'Next, in order', next: ['Align unit recipes and qualify MariaDB tables, then prove useful restoration.', 'Complete moving and replication with private MariaDB.', 'Resolve MeshFS write deadlines without weakening durability.', 'Deliver an operationally usable restoration workflow.', 'Close remaining SHAPER scenarios, then qualify a consistent version set.'],
@@ -67,7 +67,7 @@ export const validationCopy = {
       'El cálculo solo cubre los criterios esenciales enumerados aquí. No es una probabilidad de fiabilidad, un porcentaje de código terminado ni una certificación exhaustiva.',
       'Un solo bloqueo esencial puede impedir la producción incluso con un porcentaje alto. Por eso no mostramos una media global.',
       'Las pruebas proceden de versiones y ámbitos distintos. No validan automáticamente una nueva combinación de versiones. Reutilizarlas evita repetir ensayos ya concluidos.',
-      'Los logros históricos se muestran por separado de la validación buscada. Para traslado y replicación, el porcentaje solo cubre MariaDB privada: un 0 % en ese ámbito no significa que nunca hayan funcionado.'
+      'Los logros históricos se muestran por separado de la validación buscada. Para traslado y replicación, el porcentaje solo cubre MariaDB privada: esta puntuación no mide los logros históricos con SQLite.'
     ],
     download: 'Descargar criterios y resúmenes de pruebas',
     priorities: 'Lo siguiente, por orden', next: ['Alinear las recetas y evaluar las tablas MariaDB, después probar la restauración útil.', 'Completar el traslado y la replicación con MariaDB privada.', 'Resolver los plazos de escritura MeshFS sin debilitar la durabilidad.', 'Entregar un recorrido de restauración utilizable en explotación.', 'Cerrar los escenarios SHAPER pendientes y validar un conjunto coherente de versiones.'],
