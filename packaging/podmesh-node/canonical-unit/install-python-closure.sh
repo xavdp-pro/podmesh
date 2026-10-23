@@ -159,6 +159,63 @@ stage_verified_archives() {
         verify_staged_archive "${targets[i]}" "${names[i]}" "${versions[i]}" "${arches[i]}" "${hashes[i]}" "${sizes[i]}"
     done
 }
+# Emit only recognized verification paths, never arbitrary diagnostic text.
+installed_verify_summary() {
+    awk -v stream="$1" '
+NR<=8 {
+ line=$0; flags="unparsed"; path="";
+ if ($1=="missing" || (length($1)==9 && $1~/^[?.M5]+$/)) {
+  flags=$1; sub(/^[^ \t]+[ \t]+/,"",line); sub(/^c[ \t]+/,"",line);
+  if (line~/^\//) {path=line; if (flags=="missing") sub(/[ \t]+\([^)]*\)$/, "", path)}
+ }
+ if (path!="") {
+  gsub(/[^-A-Za-z0-9_.\/:+~,%@=]/,"?",path);
+  printf "offline-installer verify-detail stream=%s flags=%s path=%s\n",stream,flags,substr(path,1,256)
+ } else printf "offline-installer verify-detail stream=%s detail=private-unparsed-line\n",stream;
+}
+END {if (NR>8) printf "offline-installer verify-detail stream=%s summary_truncated=yes lines=%d\n",stream,NR}
+' "$2" >&2
+}
+verify_installed_package_bytes() {
+    stage=installed_verify guard=installed-package-bytes
+    local name=$1 caller=${BASH_LINENO[0]} report status out_bytes err_bytes out_lines err_lines bounded=no effective capture_failed=no
+    [[ $name =~ ^[a-z0-9][a-z0-9+.-]+$ && ${#name} -le 255 ]] || refuse 65
+    [[ -d $work && ! -L $work && $(stat -c %d:%i -- "$work") == "$work_identity" && $(stat -c %a -- "$work") == 700 ]] || refuse 65
+    archive_owned_path "$work"
+    report=$(mktemp -d "$work/installed-verify.XXXXXXXX")
+    (umask 077; : > "$report/stdout"; : > "$report/stderr")
+    # Linux Bash -f units are KiB (POSIX mode may lower them to512-byte blocks).
+    # Each raw stream is capped at16KiB, core dumps disabled, and runtime bounded.
+    # The outer stderr sink suppresses shell signal/command descriptions only.
+    if { (
+        umask 077
+        ulimit -c 0 && ulimit -f 16 || exit "$?"
+        exec timeout --kill-after=1s 15s dpkg --verify --verify-format=rpm "$name" > "$report/stdout" 2> "$report/stderr"
+    ); } 2>/dev/null; then status=0; else status=$?; fi
+    if out_bytes=$(stat -c %s -- "$report/stdout") && err_bytes=$(stat -c %s -- "$report/stderr") &&
+       out_lines=$(awk 'END {print NR+0}' "$report/stdout") && err_lines=$(awk 'END {print NR+0}' "$report/stderr"); then :
+    else
+        failure_reported=1
+        effective=$status; if [[ $effective == 0 ]]; then effective=65; fi
+        printf 'offline-installer stage=installed_verify guard=installed-package-bytes package=%s status=%s exit=%s line=%s capture_failed=measurement\n' "$name" "$status" "$effective" "$caller" >&2 || :
+        exit "$effective"
+    fi
+    if [[ $out_bytes -ge 16384 || $err_bytes -ge 16384 || $out_lines -gt 64 || $err_lines -gt 64 ]]; then bounded=yes; fi
+    effective=$status
+    if [[ $effective == 0 && ( $out_bytes != 0 || $err_bytes != 0 || $bounded == yes ) ]]; then effective=65; fi
+    if (umask 077; printf 'package=%s\nstatus=%s\neffective_exit=%s\nstdout_bytes=%s\nstderr_bytes=%s\nstdout_lines=%s\nstderr_lines=%s\nreport_bound=%s\n' \
+        "$name" "$status" "$effective" "$out_bytes" "$err_bytes" "$out_lines" "$err_lines" "$bounded" > "$report/status"); then :
+    else capture_failed=yes; if [[ $effective == 0 ]]; then effective=65; fi
+    fi
+    if [[ $effective != 0 ]]; then
+        failure_reported=1
+        printf 'offline-installer stage=installed_verify guard=installed-package-bytes package=%s status=%s exit=%s line=%s stdout_bytes=%s stderr_bytes=%s report_bound=%s capture_failed=%s\n' \
+            "$name" "$status" "$effective" "$caller" "$out_bytes" "$err_bytes" "$bounded" "$capture_failed" >&2 || :
+        installed_verify_summary stdout "$report/stdout" || printf 'offline-installer verify-detail stream=stdout summary_failed=yes\n' >&2 || :
+        installed_verify_summary stderr "$report/stderr" || printf 'offline-installer verify-detail stream=stderr summary_failed=yes\n' >&2 || :
+        exit "$effective" # Existing EXIT policy restoration retains this failure.
+    fi
+}
 # END OFFLINE_INSTALLER_SUPPORT
 trap 'report_failure command "$LINENO" "$?"' ERR
 trap 'on_exit "$LINENO" "$?"' EXIT
@@ -176,7 +233,7 @@ guard=image-build-authority
 guard=image-build-marker
 [[ -f /.dockerenv || -f /run/.containerenv ]] || { echo 'image-build boundary missing' >&2; refuse 64; }
 stage=prerequisites guard=required-tool
-for helper in sha256sum awk cmp cp sort find stat dpkg-deb dpkg-query dpkg apt-get mktemp wc grep df readlink cat; do
+for helper in sha256sum awk cmp cp sort find stat dpkg-deb dpkg-query dpkg apt-get mktemp wc grep df readlink cat timeout; do
     command -v "$helper" >/dev/null || { echo "missing offline installer helper: $helper" >&2; refuse 65; }
 done
 stage=lock_verify guard=lock-path
@@ -320,7 +377,7 @@ while IFS=$'\t' read -r name version arch _hash _bytes _filename; do
     guard=installed-package-identity
     [[ $(dpkg-query --show --showformat='${Version}' "$name") == "$version" && $(dpkg-query --show --showformat='${Architecture}' "$name") == "$arch" && $(dpkg-query --show --showformat='${Status}' "$name") == 'install ok installed' ]] || refuse 65
     guard=installed-package-bytes
-    [[ -z $(dpkg --verify "$name") ]] || refuse 65
+    verify_installed_package_bytes "$name"
 done < "$work/packages.tsv"
 cp "$work/packages-before.tsv" "$work/packages-expected.tsv"
 stage=installed_verify guard=installed-package-identity

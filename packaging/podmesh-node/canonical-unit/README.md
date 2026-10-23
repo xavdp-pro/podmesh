@@ -154,6 +154,31 @@ They create local fixture debs and mock only the APT argv capture; they never
 invoke APT installation. Native APT compatibility requires an actual authorized
 image construction.
 
+Installed package byte verification captures explicit rpm-format dpkg output
+and its status into a new private image-work report directory per package.
+Success requires status0 and both stdout/stderr empty. A mismatch with status0
+refuses with65; a nonzero command status is preserved even with empty stdout.
+No missing-file, documentation or path-exclusion exception is applied.
+
+Each raw stream is file-size limited to at most16KiB, core dumps are disabled,
+and verification is limited to15seconds plus a1second forced-stop grace. Reports
+with more than64 lines or reaching the byte cap fail closed. Raw bounded stdout,
+stderr and status records stay private; stderr diagnostics identify package,
+command status, effective exit, source line and sizes. Only recognized rpm-format
+mismatch paths are emitted: at most8rows per stream and256 sanitized path bytes
+per row. Unknown text is identified without printing it, so command text,
+environment and arbitrary diagnostic payloads are not dumped. Policy restoration
+still runs and preserves the original failure. No successful lock marker can be
+written after a report or command failure.
+
+Verification reports add at most32KiB raw data plus a status record and directory
+per package. The build capacity gate must account for filesystem/COW metadata
+and constructor overlap; no physical-capacity result follows from this limit.
+New isolated fixtures use a temporary mock dpkg executable with the extracted
+actual helper and existing EXIT cleanup; they never verify host packages.
+Run them on the authorized qualification host using `python3 -m unittest discover -s packaging/podmesh-node/canonical-unit -p test_offline_installer.py -k OfflineInstalledVerification -v`.
+Actual native mismatch diagnosis still requires an authorized image construction.
+
 The offline simulation is parsed separately from the tab-separated manifest.
 Only exact new-package Inst and Conf pairs are accepted, with locked versions
 (including epochs and distribution suffixes) and amd64/all architecture identity.

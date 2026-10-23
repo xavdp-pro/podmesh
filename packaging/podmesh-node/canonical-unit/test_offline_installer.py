@@ -293,4 +293,142 @@ class OfflineArchiveStaging(unittest.TestCase):
         self.assertEqual(result.stdout.decode().split('\0')[:-1],['--yes','--no-download','--no-upgrade','--no-remove','--no-install-recommends','install',*paths])
 
 
+@unittest.skipUnless(os.geteuid()==0, 'owned root verification-report fixtures')
+class OfflineInstalledVerification(unittest.TestCase):
+    def run_verify(self, mock_body='pass', *, name='fixture-pkg', policy=False, restore_failure=False, foreign=False, shell_extra=''):
+        import sys
+        with tempfile.TemporaryDirectory(prefix='installed-verify-fixture-') as directory:
+            parent=Path(directory);work=parent/'work';work.mkdir(mode=0o700)
+            m=work.stat();identity=str(m.st_dev)+':'+str(m.st_ino)
+            outside=parent/'outside';outside.write_text('preserve')
+            destination=parent/'policy-rc.d'
+            if policy:
+                destination.write_text('temporary deny');(work/'policy-rc.d.saved').write_text('original policy\n')
+            bindir=parent/'bin';bindir.mkdir()
+            executable=bindir/'dpkg'
+            executable.write_text('#!'+sys.executable+'\nimport os,sys\nif sys.argv[1:]!=["--verify","--verify-format=rpm","fixture-pkg"]:sys.exit(91)\n'+mock_body+'\n')
+            executable.chmod(0o700)
+            script=support_source()+'\nwork=$1\nwork_identity=$2\npolicy_path=$3\n'
+            if policy:script+='policy_created=1\npolicy_saved=1\n'
+            if restore_failure:script+='mv() { return 74; }\n'
+            selected=work
+            if foreign:
+                selected=parent/'foreign';selected.mkdir(mode=0o700)
+            script+=shell_extra+'\nverify_installed_package_bytes "$4"\n'
+            result=subprocess.run(['/bin/bash','-c',script,'fixture',str(selected),identity,str(destination),name],
+                env={'PATH':str(bindir)+':/usr/bin:/bin','LC_ALL':'C','SECRET_FIXTURE':'do-not-print-secret-value'},
+                capture_output=True,text=True,timeout=20)
+            reports=[]
+            for report in work.glob('installed-verify.*'):
+                reports.append({p.name:{'data':p.read_bytes(),'mode':p.stat().st_mode & 0o777} for p in report.iterdir()})
+            preserved=outside.read_text()
+            policy_after=destination.read_text() if destination.exists() else None
+            saved_after=(work/'policy-rc.d.saved').read_text() if (work/'policy-rc.d.saved').exists() else None
+            self.assertEqual(preserved,'preserve')
+            self.assertLessEqual(len(result.stderr.encode()),8192)
+            return result,reports,policy_after,saved_after
+
+    def test_clean_status_zero_empty_reports_pass_and_private_capture(self):
+        result,reports,_,_=self.run_verify()
+        self.assertEqual(result.returncode,0,result.stderr);self.assertEqual(result.stderr,'')
+        self.assertEqual(len(reports),1)
+        self.assertEqual(reports[0]['stdout']['data'],b'');self.assertEqual(reports[0]['stderr']['data'],b'')
+        self.assertIn(b'status=0\neffective_exit=0\n',reports[0]['status']['data'])
+        for entry in reports[0].values():self.assertEqual(entry['mode'],0o600)
+
+    def test_mismatch_stdout_status_zero_reports_package_path_and_refuses(self):
+        result,reports,_,_=self.run_verify('print("missing     /usr/share/doc/fixture-pkg/readme (No such file or directory)")')
+        self.assertEqual(result.returncode,65)
+        self.assertIn('package=fixture-pkg status=0 exit=65',result.stderr)
+        self.assertIn('flags=missing path=/usr/share/doc/fixture-pkg/readme',result.stderr)
+        self.assertIn(b'missing',reports[0]['stdout']['data'])
+
+    def test_digest_conffile_report_emits_flags_and_path(self):
+        result,reports,_,_=self.run_verify('print("??5?????? c /etc/fixture-pkg.conf")')
+        self.assertEqual(result.returncode,65)
+        self.assertIn('flags=??5?????? path=/etc/fixture-pkg.conf',result.stderr)
+        self.assertIn(b'??5?????? c /etc/fixture-pkg.conf',reports[0]['stdout']['data'])
+
+    def test_nonzero_status_with_empty_stdout_is_not_concealed(self):
+        result,reports,_,_=self.run_verify('sys.exit(2)')
+        self.assertEqual(result.returncode,2)
+        self.assertIn('package=fixture-pkg status=2 exit=2',result.stderr)
+        self.assertEqual(reports[0]['stdout']['data'],b'')
+
+    def test_stderr_command_failure_preserves_status_and_private_report(self):
+        result,reports,_,_=self.run_verify('print("dpkg: error: fixture failure",file=sys.stderr)\nsys.exit(37)')
+        self.assertEqual(result.returncode,37)
+        self.assertIn('status=37 exit=37',result.stderr)
+        self.assertIn(b'dpkg: error: fixture failure',reports[0]['stderr']['data'])
+        self.assertIn('stream=stderr detail=private-unparsed-line',result.stderr)
+
+    def test_stderr_on_status_zero_still_refuses(self):
+        result,_,_,_=self.run_verify('print("fixture warning",file=sys.stderr)')
+        self.assertEqual(result.returncode,65);self.assertIn('status=0 exit=65',result.stderr)
+
+    def test_oversized_output_is_capped_and_fails_closed(self):
+        for descriptor in (1,2):
+            with self.subTest(descriptor=descriptor):
+                result,reports,_,_=self.run_verify('os.write('+str(descriptor)+',b"x"*100000)')
+                self.assertNotEqual(result.returncode,0)
+                self.assertEqual(len(reports),1)
+                self.assertLessEqual(len(reports[0]['stdout']['data']),16384)
+                self.assertLessEqual(len(reports[0]['stderr']['data']),16384)
+                self.assertIn('report_bound=yes',result.stderr)
+                self.assertIn(('effective_exit='+str(result.returncode)).encode(),reports[0]['status']['data'])
+
+    def test_file_size_signal_status_is_preserved(self):
+        import signal
+        result,reports,_,_=self.run_verify('import signal\nsignal.signal(signal.SIGXFSZ,signal.SIG_DFL)\nos.write(1,b"x"*16384)\nos.write(1,b"x")')
+        self.assertEqual(result.returncode,128+signal.SIGXFSZ,result.stderr)
+        self.assertLessEqual(len(reports[0]['stdout']['data']),16384)
+        self.assertIn('report_bound=yes',result.stderr)
+
+    def test_timeout_force_kill_restores_policy_and_preserves_status(self):
+        result,reports,policy,saved=self.run_verify('import signal,time\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\ntime.sleep(60)',policy=True)
+        self.assertEqual(result.returncode,137,result.stderr)
+        self.assertIn('status=137 exit=137',result.stderr)
+        self.assertEqual(policy,'original policy\n');self.assertIsNone(saved)
+        self.assertEqual(len(reports),1)
+
+    def test_auxiliary_report_failures_do_not_replace_primary_status(self):
+        cases=[('stat() { if [[ ${!#} == */stdout ]]; then return 73; fi; command stat "$@"; }','capture_failed=measurement'),
+               ('printf() { if [[ $1 == package=* ]]; then return 73; fi; builtin printf "$@"; }','capture_failed=yes'),
+               ('awk() { if [[ $1 == -v ]]; then return 73; fi; command awk "$@"; }','summary_failed=yes')]
+        for extra,diagnostic in cases:
+            with self.subTest(diagnostic=diagnostic):
+                result,_,_,_=self.run_verify('sys.exit(2)',shell_extra=extra)
+                self.assertEqual(result.returncode,2,result.stderr)
+                self.assertIn(diagnostic,result.stderr)
+
+    def test_many_report_lines_refuse_with_bounded_path_summary(self):
+        result,reports,_,_=self.run_verify('print("missing     /usr/share/doc/fixture-pkg/file\\n"*100,end="")')
+        self.assertEqual(result.returncode,65);self.assertIn('report_bound=yes',result.stderr)
+        self.assertIn('summary_truncated=yes',result.stderr)
+        self.assertEqual(result.stderr.count('flags=missing path='),8)
+        self.assertLessEqual(len(reports[0]['stdout']['data']),16384)
+
+    def test_verification_failure_restores_original_policy_and_status(self):
+        result,_,policy,saved=self.run_verify('sys.exit(23)',policy=True)
+        self.assertEqual(result.returncode,23);self.assertEqual(policy,'original policy\n');self.assertIsNone(saved)
+
+    def test_policy_restore_failure_does_not_mask_verification_failure(self):
+        result,_,policy,saved=self.run_verify('sys.exit(2)',policy=True,restore_failure=True)
+        self.assertEqual(result.returncode,2);self.assertIn('kind=cleanup-restore',result.stderr)
+        self.assertIn('exit=74',result.stderr);self.assertIsNone(policy);self.assertEqual(saved,'original policy\n')
+
+    def test_invalid_package_and_foreign_work_refuse_without_outside_writes(self):
+        result,reports,_,_=self.run_verify(name='../outside')
+        self.assertEqual(result.returncode,65);self.assertEqual(reports,[])
+        result,reports,_,_=self.run_verify(foreign=True)
+        self.assertEqual(result.returncode,65);self.assertEqual(reports,[])
+
+    def test_unknown_text_never_dumps_secret_environment_or_commands(self):
+        result,reports,_,_=self.run_verify('print(os.environ["SECRET_FIXTURE"])\nprint("SECRETXYZ /bin/private-command")\nprint("echo $SECRET_FIXTURE; /bin/private-command",file=sys.stderr)')
+        self.assertEqual(result.returncode,65)
+        self.assertNotIn('do-not-print-secret-value',result.stderr)
+        self.assertNotIn('$SECRET_FIXTURE',result.stderr);self.assertNotIn('/bin/private-command',result.stderr)
+        self.assertIn(b'do-not-print-secret-value',reports[0]['stdout']['data'])
+
+
 if __name__=='__main__':unittest.main()
