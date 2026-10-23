@@ -431,4 +431,102 @@ class OfflineInstalledVerification(unittest.TestCase):
         self.assertIn(b'do-not-print-secret-value',reports[0]['stdout']['data'])
 
 
+@unittest.skipUnless(os.geteuid()==0, 'private native APT configuration fixtures')
+class OfflineCompletePayload(unittest.TestCase):
+    """Actual config generation/parser plus documented filter model, no installation."""
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(prefix='complete-payload-fixture-')
+        self.parent=Path(self.temp.name);self.work=self.parent/'work';self.work.mkdir(mode=0o700)
+        for name in ['etc/parts','etc/sources.d','etc/preferences.d','etc/auth.d']:
+            (self.work/name).mkdir(parents=True,exist_ok=True)
+        for name in ['empty.conf','sources.list','trusted.gpg','preferences','auth.conf']:
+            (self.work/'etc'/name).write_text('')
+        self.policy=self.parent/'base-excludes'
+        self.policy.write_text('path-exclude=/usr/share/man/*\npath-exclude=/usr/share/locale/*/LC_MESSAGES/*.mo\npath-exclude=/usr/share/doc/*\npath-include=/usr/share/doc/*/copyright\npath-include=/usr/share/doc/*/changelog.*\n')
+        self.policy_before=(self.policy.read_bytes(),self.policy.stat().st_mode,self.policy.stat().st_mtime_ns)
+
+    def tearDown(self):
+        try:self.assertEqual((self.policy.read_bytes(),self.policy.stat().st_mode,self.policy.stat().st_mtime_ns),self.policy_before)
+        finally:self.temp.cleanup()
+
+    def actual_options(self,prefix=''):
+        import re
+        text=INSTALLER.read_text();start=text.index('cat > "$work/apt.conf" <<EOF')
+        heredoc=text[start:text.index('\nEOF',start)+4]
+        exported=next(line for line in text.splitlines() if line.startswith('export APT_CONFIG='))
+        script='set -euo pipefail\nwork=$1\n'+heredoc+'\n'+exported+'\nprintf "%s\\n" "$APT_CONFIG"\n'
+        rendered=subprocess.run(['/bin/bash','-c',script,'fixture',str(self.work)],
+            env={'PATH':'/usr/bin:/bin','LC_ALL':'C','HOME':str(self.parent)},cwd=self.parent,
+            capture_output=True,text=True,timeout=5,check=True)
+        config=Path(rendered.stdout.strip());self.assertEqual(config,self.work/'apt.conf')
+        original=config.read_text()
+        if prefix:config.write_text(prefix+original)
+        result=subprocess.run(['/usr/bin/apt-config','dump'],
+            env={'PATH':'/usr/bin:/bin','LC_ALL':'C','HOME':str(self.parent),'APT_CONFIG':str(config)},
+            capture_output=True,text=True,timeout=5)
+        self.assertEqual(result.returncode,0,result.stderr)
+        options=re.findall(r'^DPkg::Options:: "([^"]*)";$',result.stdout,re.M|re.I)
+        return options,result.stdout,original
+
+    def documented_selection(self,options,paths):
+        # Model only dpkg's documented fnmatch(flags=0), append order and last match.
+        import fnmatch
+        rules=[]
+        for row in self.policy.read_text().splitlines():
+            key,pattern=row.split('=',1);rules.append((key=='path-include',pattern))
+        for option in options:
+            self.assertTrue(option.startswith('--path-include='))
+            rules.append((True,option.split('=',1)[1]))
+        result={}
+        for path in paths:
+            selected=True
+            for include,pattern in rules:
+                if fnmatch.fnmatchcase(path,pattern):selected=include
+            result[path]=selected
+        return result
+
+    def test_actual_private_APT_parser_preserves_one_literal_full_include(self):
+        (self.parent/'glob-marker').write_text('must not expand')
+        options,_,_=self.actual_options()
+        self.assertEqual(options,['--path-include=/*'])
+        self.assertEqual((self.parent/'glob-marker').read_text(),'must not expand')
+
+    def test_final_include_overrides_inherited_doc_man_locale_exclusions(self):
+        options,_,_=self.actual_options()
+        paths=['/usr/share/doc/libexpat1/AUTHORS','/usr/share/man/man1/fixture.1.gz',
+               '/usr/share/locale/fr/LC_MESSAGES/fixture.mo','/usr/share/doc/fixture/copyright',
+               '/usr/share/doc/fixture/changelog.gz','/usr/bin/fixture']
+        before=self.documented_selection([],paths);after=self.documented_selection(options,paths)
+        self.assertFalse(before[paths[0]]);self.assertFalse(before[paths[1]]);self.assertFalse(before[paths[2]])
+        self.assertTrue(all(after.values()))
+
+    def test_full_include_keeps_directory_paths_and_nested_entries(self):
+        options,_,_=self.actual_options()
+        paths=['/','/usr','/usr/share/doc','/usr/share/doc/fixture','/usr/share/doc/fixture/subdir/',
+               '/usr/share/man/man1/','/usr/share/locale/fr/LC_MESSAGES/']
+        self.assertTrue(all(self.documented_selection(options,paths).values()))
+
+    def test_inherited_APT_option_injection_is_cleared_without_policy_edits(self):
+        seed='DPkg::Options:: "--force-depends";\nDPkg::Options:: "--path-exclude=/*";\n'
+        options,_,_=self.actual_options(seed)
+        self.assertEqual(options,['--path-include=/*'])
+
+    def test_private_parts_redirect_prevents_foreign_option_loading(self):
+        parts=self.parent/'foreign-parts';parts.mkdir()
+        foreign=parts/'90foreign';foreign.write_text('DPkg::Options:: "--force-all";\nDPkg::Options:: "--path-exclude=/*";\n')
+        saved=foreign.read_bytes()
+        options,dump,_=self.actual_options('Dir::Etc::parts "'+str(parts)+'";\n')
+        self.assertEqual(options,['--path-include=/*'])
+        self.assertNotIn('"--force-all"',dump);self.assertEqual(foreign.read_bytes(),saved)
+
+    def test_full_include_does_not_turn_missing_file_verification_into_success(self):
+        options,_,_=self.actual_options();self.assertEqual(options,['--path-include=/*'])
+        fixture=OfflineInstalledVerification('test_mismatch_stdout_status_zero_reports_package_path_and_refuses')
+        fixture.setUp();self.addCleanup(fixture.tearDown)
+        result,reports,_,_=fixture.run_verify('print("missing     /usr/share/doc/fixture-pkg/AUTHORS")')
+        self.assertEqual(result.returncode,65)
+        self.assertIn('flags=missing path=/usr/share/doc/fixture-pkg/AUTHORS',result.stderr)
+        self.assertIn(b'status=0\neffective_exit=65\n',reports[0]['status']['data'])
+
+
 if __name__=='__main__':unittest.main()

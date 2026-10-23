@@ -154,6 +154,24 @@ They create local fixture debs and mock only the APT argv capture; they never
 invoke APT installation. Native APT compatibility requires an actual authorized
 image construction.
 
+The private APT configuration clears inherited DPkg::Options and passes one
+literal `--path-include=/*` option to native dpkg for the new image installation.
+Dpkg loads its inherited configuration first and evaluates path filters in order;
+the final matching inclusion restores all authenticated package files and
+directories, including documentation, manpages and locale messages. Original
+base and host dpkg policy files are never rewritten. The override exists only in
+the private APT invocation; direct whole-package verification stays unchanged,
+with status0 and empty stdout/stderr required. Missing files remain failures.
+
+Full payload data was already part of the package-size bound. Additional paths,
+inodes, block rounding, native temporary files and constructor overlap still need
+an updated capacity gate; this option alone proves no capacity or native result.
+New config fixtures generate the actual private config and query its effective
+options with apt-config, without invoking APT installation or dpkg unpack. Their
+filter-order examples model the documented contract; actual complete native
+installation still needs a separately authorized image proof. Run new fixtures
+with `python3 -m unittest discover -s packaging/podmesh-node/canonical-unit -p test_offline_installer.py -k OfflineCompletePayload -v`.
+
 Installed package byte verification captures explicit rpm-format dpkg output
 and its status into a new private image-work report directory per package.
 Success requires status0 and both stdout/stderr empty. A mismatch with status0

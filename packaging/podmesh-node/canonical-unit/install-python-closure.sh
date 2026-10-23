@@ -342,6 +342,9 @@ Acquire::https::Proxy "http://127.0.0.1:9";
 #clear DPkg::Pre-Invoke;
 #clear DPkg::Post-Invoke;
 #clear DPkg::Pre-Install-Pkgs;
+// Install the complete authenticated payload only in this new image.
+#clear DPkg::Options;
+DPkg::Options:: "--path-include=/*";
 EOF
 export APT_CONFIG="$work/apt.conf" DEBIAN_FRONTEND=noninteractive
 stage=plan_simulate guard=offline-native-resolver
