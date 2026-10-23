@@ -611,7 +611,7 @@ class Supervisor:
         accounts = {tuple(line.split('\t')) for line in self.sql('SELECT User,Host FROM mysql.global_priv;').splitlines()}
         expected_accounts = {tuple(pair) for pair in self.record['system_accounts']} | {('podmesh-node', 'localhost')}
         require(accounts == expected_accounts, 'unexpected database account or missing identity')
-        for view in ('USER_PRIVILEGES', 'SCHEMA_PRIVILEGES', 'TABLE_PRIVILEGES', 'COLUMN_PRIVILEGES', 'ROUTINE_PRIVILEGES'):
+        for view in ('USER_PRIVILEGES', 'SCHEMA_PRIVILEGES', 'TABLE_PRIVILEGES', 'COLUMN_PRIVILEGES'):
             public = self.sql('SELECT PRIVILEGE_TYPE,IS_GRANTABLE FROM information_schema.' + view + " WHERE UPPER(GRANTEE) LIKE '%PUBLIC%';")
             require(not public.strip() or (view == 'USER_PRIVILEGES' and all(row == 'USAGE\tNO' for row in public.splitlines())),
                     'PUBLIC privileges widen functional authority')
@@ -626,9 +626,11 @@ class Supervisor:
         actual = {tuple(line.split('\t')) for line in rows.splitlines()}
         expected = {('podmesh-node', t, privilege, 'NO') for t, privileges in self.grants.items() for privilege in privileges}
         require(actual == expected, 'functional table grants differ; no automatic repair on restart')
-        for view in ('COLUMN_PRIVILEGES', 'ROUTINE_PRIVILEGES'):
+        for view in ('COLUMN_PRIVILEGES',):
             require(not self.sql('SELECT PRIVILEGE_TYPE FROM information_schema.' + view + ' WHERE GRANTEE=' + who + ';').strip(),
                     'functional column/routine privileges refused')
+        require(not self.sql("SELECT Routine_name FROM mysql.procs_priv WHERE User='podmesh-node';").strip(),
+                'functional routine privileges refused')
         require(not self.sql("SELECT Role FROM mysql.roles_mapping WHERE User='podmesh-node' AND Host='localhost';").strip(),
                 'functional inherited roles refused')
 
