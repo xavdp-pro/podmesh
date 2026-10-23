@@ -469,20 +469,21 @@ impl Policy {
             }
         }
         let operations = tokens(&value["allowed_operations"])?;
-        if operations.is_empty()
-            || operations.iter().any(|v| {
-                ![
-                    "create",
-                    "delete",
-                    "clone",
-                    "start",
-                    "stop",
-                    "pause",
-                    "resume",
-                    "resources",
-                ]
-                .contains(&v.as_str())
-            })
+        // An explicit empty array grants no lifecycle operation. Missing/non-array
+        // values still fail in tokens; no implicit default or fact token exists.
+        if operations.iter().any(|v| {
+            ![
+                "create",
+                "delete",
+                "clone",
+                "start",
+                "stop",
+                "pause",
+                "resume",
+                "resources",
+            ]
+            .contains(&v.as_str())
+        })
         {
             return Err("host operation policy must name bounded lifecycle operations".into());
         }
@@ -739,6 +740,10 @@ impl Policy {
     }
 }
 fn command(seconds: u64, args: &[String]) -> Result<Output, Error> {
+    #[cfg(test)]
+    tests::DENY_ALL_NO_ENGINE.with(|forbidden| {
+        assert!(!forbidden.get(), "deny-all request reached the engine command seam");
+    });
     let mut child = Command::new("/usr/bin/timeout")
         .env_remove("INVOCATION_ID")
         .args([
@@ -930,6 +935,16 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
         _ => return Err("unknown host capability".into()),
     };
     fields(a, allowed)?;
+    // Some legacy observations call owned(), which may pin container_id in the
+    // ownership record; inspect with a stop intent may also bind an intent.
+    // A zero-operation policy must refuse these and every effect before either
+    // engine dispatch or ledger access. Existing nonempty policies are unchanged.
+    if policy.operations.is_empty()
+        && !matches!(kind, "host_identity" | "host_capacity" | "storage_status"
+            | "host_status" | "universe_stats" | "images" | "migration_observe")
+    {
+        return Err("operation outside host-owned policy".into());
+    }
     match kind {
         // Observation only: no operation intent is bound and no ownership record
         // is repaired. This does not enable any migration or recovery-point API.
@@ -1576,6 +1591,107 @@ pub fn serve(policy_path: &Path, socket: &Path) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    thread_local! {
+        pub(super) static DENY_ALL_NO_ENGINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    struct DenyAllFixture { dir: PathBuf }
+    impl DenyAllFixture {
+        fn new() -> Self {
+            assert_eq!(unsafe { libc::geteuid() }, 0, "deny-all parser fixture requires root on the leased CT test host");
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!("podmesh-deny-all-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            fs::create_dir(&dir).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            let state = dir.join("state");fs::create_dir(&state).unwrap();
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+            Self { dir }
+        }
+        fn document(&self) -> Value {
+            json!({"scope":"deny-all-fixture", "application_uid":1102, "application_gid":1102,
+                "allowed_images":["a".repeat(64)], "allowed_operations":[],
+                "max_memory_bytes":33554432, "max_cpus":0.1, "max_universes":1,
+                "state_dir":self.dir.join("state")})
+        }
+        fn load(&self, value: &Value) -> Result<Policy, Error> {
+            let path=self.dir.join("policy.json");
+            fs::write(&path, serde_json::to_vec(value)? )?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            Policy::load(&path)
+        }
+    }
+    impl Drop for DenyAllFixture {
+        fn drop(&mut self) {
+            if let Err(error)=fs::remove_dir_all(&self.dir) {
+                if !std::thread::panicking() { panic!("deny-all fixture cleanup failed: {error}"); }
+                eprintln!("deny-all fixture cleanup also failed: {error}");
+            }
+        }
+    }
+    #[test]
+    fn deny_all_policy_explicit_empty_is_valid_and_nonempty_keeps_exact_grants() {
+        let fixture=DenyAllFixture::new();let mut document=fixture.document();
+        assert!(fixture.load(&document).unwrap().operations.is_empty());
+        let grants=json!(["create","delete","clone","start","stop","pause","resume","resources"]);
+        document["allowed_operations"]=grants.clone();
+        assert_eq!(json!(fixture.load(&document).unwrap().operations),grants);
+        document["allowed_operations"]=json!(["start"]);
+        assert_eq!(fixture.load(&document).unwrap().operations,vec!["start"]);
+    }
+    #[test]
+    fn deny_all_policy_nonempty_dispatch_keeps_typed_intent_validation() {
+        let fixture=DenyAllFixture::new();let mut document=fixture.document();
+        document["allowed_operations"]=json!(["start"]);
+        let policy=fixture.load(&document).unwrap();
+        DENY_ALL_NO_ENGINE.with(|v|v.set(true));
+        let result=execute(&policy,&json!({"protocol":PROTOCOL,"action":{"kind":"start","uuid":U},"intent":intent("delete")}));
+        DENY_ALL_NO_ENGINE.with(|v|v.set(false));
+        assert_eq!(result.unwrap_err().to_string(),"typed effect does not belong to the committed operation");
+        assert_eq!(fs::read_dir(&policy.state).unwrap().count(),0);
+    }
+    #[test]
+    fn deny_all_policy_absent_malformed_and_unknown_never_default_to_authority() {
+        let fixture=DenyAllFixture::new();let valid=fixture.document();
+        assert!(fixture.load(&valid).is_ok(), "baseline must load before malformed-input assertions");
+        let mut absent=valid.clone();absent.as_object_mut().unwrap().remove("allowed_operations");
+        assert!(fixture.load(&absent).is_err());
+        for value in [Value::Null,json!(false),json!("start"),json!({}),json!([1]),json!([""]),json!(["host_identity"]),json!(["start","unknown"])] {
+            let mut bad=valid.clone();bad["allowed_operations"]=value;
+            assert!(fixture.load(&bad).is_err());
+        }
+    }
+    #[test]
+    fn deny_all_policy_every_effect_and_record_repair_refuses_before_engine_or_ledger() {
+        let fixture=DenyAllFixture::new();let policy=fixture.load(&fixture.document()).unwrap();
+        let sentinel=policy.state.join("preserved.json");fs::write(&sentinel,b"unchanged\n").unwrap();
+        struct NoEngine;
+        impl Drop for NoEngine { fn drop(&mut self) { DENY_ALL_NO_ENGINE.with(|v|v.set(false)); } }
+        DENY_ALL_NO_ENGINE.with(|v|v.set(true));let _guard=NoEngine;
+        for (kind,operation) in [("create","create"),("create","clone"),("start","start"),("stop","stop"),("signal","stop"),("pause","pause"),("unpause","resume"),("rm","delete"),("rm","clone"),("resources","resources"),("snapshot","clone"),("remove_snapshots","delete"),("remove_snapshots","clone"),
+            ("inventory","start"),("inspect","start"),("inspect","stop"),("cgroup_limits","start"),("recovery_bindings","start")] {
+            // Exercise all create envelopes without provisioning any grant or runtime.
+            let envelopes: &[(bool,&str)] = if kind=="create" {
+                &[(false,"flat"),(true,"legacy-host-root"),(true,contained::PROFILE)]
+            } else { &[(false,"not-applicable")] };
+            for &(nested,containment) in envelopes {
+                let action=if kind=="create" {json!({"kind":kind,"uuid":U,"nested":nested,"containment":containment})}
+                    else {json!({"kind":kind})};
+                let error=execute(&policy,&json!({"protocol":PROTOCOL,"action":action,"intent":intent(operation)})).unwrap_err();
+                assert_eq!(error.to_string(),"operation outside host-owned policy","{kind}/{operation}/{containment}");
+                assert_eq!(fs::read(&sentinel).unwrap(),b"unchanged\n");
+                assert_eq!(fs::read_dir(&policy.state).unwrap().count(),1);
+            }
+        }
+    }
+    #[test]
+    fn deny_all_policy_migration_fact_cannot_carry_an_effect_intent() {
+        let fixture=DenyAllFixture::new();let policy=fixture.load(&fixture.document()).unwrap();
+        DENY_ALL_NO_ENGINE.with(|v|v.set(true));
+        let result=execute(&policy,&json!({"protocol":PROTOCOL,
+            "action":{"kind":"migration_observe"},"intent":intent("create")}));
+        DENY_ALL_NO_ENGINE.with(|v|v.set(false));
+        assert_eq!(result.unwrap_err().to_string(),"read-only migration observation refuses an effect intent");
+        assert_eq!(fs::read_dir(&policy.state).unwrap().count(),0);
+    }
     #[test]
     fn stop_observation_is_bound_to_successful_dispatch_and_exact_run() {
         let intent = json!({"operation":"stop", "operation_id":"stop-current", "universe_uuid":"owned",

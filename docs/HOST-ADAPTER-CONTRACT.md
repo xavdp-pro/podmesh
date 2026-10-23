@@ -20,6 +20,22 @@ caller-supplied `authorization_ref`, majority or UID alone grants no governance
 power. The human/parent standing mandate grants the provider its capability scope;
 the application checks the operation mandate and journal ownership within it.
 
+`allowed_operations` is required and must be an array of known lifecycle names.
+An explicit `allowed_operations: []` grants zero lifecycle operations; omission,
+null, non-array values, non-text entries and unknown names still refuse. Other
+policy requirements, including protected policy/state paths, peer identity,
+images, grants and resource ceilings, remain mandatory. No dummy operation or
+`host_identity` operation token is needed to obtain the existing host fact.
+
+With an empty list every effect (including clone, legacy/contained nested create
+and snapshot cleanup) refuses before engine dispatch or intent/ownership writes.
+Legacy `inventory`, `inspect`, `cgroup_limits` and `recovery_bindings` requests
+also refuse: their ownership observation can pin a container identity, and a
+stop-bound inspect can persist an intent. They are not read-only authority.
+Existing non-repairing fact paths retain their original validation and scope;
+no new fact, lifecycle capability or recovery/migration effect is granted.
+Nonempty policies keep their existing operation gates and semantics.
+
 Before each effect the application commits canonical request/operation/attempt
 intent in its own store. The request carries that operation identity, request
 binding and mandate reference. The adapter validates the typed effect against
