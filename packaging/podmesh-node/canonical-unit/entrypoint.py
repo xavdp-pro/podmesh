@@ -13,7 +13,6 @@ import stat
 import struct
 import subprocess
 import time
-import tempfile
 
 HOME = Path('/apps/podmesh-node')
 ETC = HOME / 'etc'
@@ -32,6 +31,8 @@ LIB = Path('/usr/lib/podmesh-node-canonical')
 APP_UID = 1102
 STOP_APP = 10
 STOP_DB = 20
+OUTPUT_LIMIT = 65536  # Existing administrative metadata contract, in bytes.
+OUTPUT_CHUNK = 4096
 
 
 class Refusal(Exception):
@@ -164,23 +165,159 @@ class Supervisor:
         self.failed = False
         self.record = None
         self.diagnostic = None
+        self.output_pipes = {}
+        self.diagnostic_bytes = 0
+        self.diagnostic_prefix = bytearray()
+        self.output_failure = None
+        self.failure_prefix = b''
+        self.failure_prefix_saved = False
+        self.cleanup_failures = []
+
+    def output_error(self, name, stream, reason, child=None, prefix=b''):
+        self.failed = True
+        if self.output_failure is None:
+            self.output_failure = {'child': name, 'stream': stream, 'reason': reason,
+                                   'limit_bytes': OUTPUT_LIMIT}
+            if child is not None:
+                self.failure_prefix = (bytes(child.capture_data) if stream == 'stdout' and child.capture
+                                       else bytes(self.diagnostic_prefix)) or bytes(prefix[:OUTPUT_LIMIT])
+
+    def close_input(self, child):
+        if child.stdin is not None:
+            try:
+                child.stdin.close()
+            except OSError:
+                self.output_error(child.output_name, 'stdin', 'pipe-close', child)
+            child.stdin = None
+        child.pending_input = b''
+
+    def close_output(self, child):
+        for fd, (owner, _name, _stream, pipe) in list(self.output_pipes.items()):
+            if owner is child:
+                try:
+                    pipe.close()
+                except OSError:
+                    self.output_error(child.output_name, 'output', 'pipe-close', child)
+                del self.output_pipes[fd]
+        self.close_input(child)
+
+    def close_pipe(self, fd):
+        child, name, stream, pipe = self.output_pipes.pop(fd)
+        try:
+            pipe.close()
+        except OSError:
+            self.output_error(name, stream, 'pipe-close', child)
+
+    def has_output(self, child):
+        return any(owner is child for owner, *_ in self.output_pipes.values())
+
+    def pump(self, check=True):
+        # No reader threads. Every wait loop services every pipe, including DB
+        # diagnostics while SQL/readiness helpers run and while APP stops.
+        for child in list(self.children.values()):
+            if not getattr(child, 'pending_input', b''):
+                continue
+            if not check or self.stop_requested:
+                self.close_input(child)
+                continue
+            try:
+                count = os.write(child.stdin.fileno(), child.pending_input[:OUTPUT_CHUNK])
+                child.pending_input = child.pending_input[count:]
+                if not child.pending_input:
+                    self.close_input(child)
+            except BlockingIOError:
+                pass
+            except BrokenPipeError:
+                self.close_input(child)
+            except OSError:
+                self.output_error(child.output_name, 'stdin', 'pipe-write', child)
+                self.close_input(child)
+        for fd, (child, name, stream, pipe) in list(self.output_pipes.items()):
+            # Bounded work per pipe/pump; overflow is drained without retention
+            # during owned cleanup so a full pipe cannot block TERM handling.
+            for _ in range(17):
+                try:
+                    data = os.read(fd, OUTPUT_CHUNK)
+                except BlockingIOError:
+                    break
+                except OSError:
+                    self.output_error(name, stream, 'pipe-read', child)
+                    self.close_pipe(fd)
+                    break
+                if not data:
+                    self.close_pipe(fd)
+                    break
+                if self.output_failure is not None:
+                    continue
+                if child.capture:
+                    remaining = OUTPUT_LIMIT - child.output_bytes
+                    kept = data[:remaining]
+                    child.output_bytes += len(kept)
+                    if stream == 'stdout':
+                        child.capture_data.extend(kept)
+                    if len(data) > remaining:
+                        self.output_error(name, stream, 'helper-output-overflow', child, data)
+                else:
+                    kept = data
+                if stream != 'stdout' or not child.capture:
+                    remaining = OUTPUT_LIMIT - self.diagnostic_bytes
+                    prefix = kept[:remaining]
+                    try:
+                        if prefix:
+                            self.diagnostic_prefix.extend(prefix[:OUTPUT_LIMIT-len(self.diagnostic_prefix)])
+                            require(self.diagnostic is not None, 'private diagnostic unavailable')
+                            written = 0
+                            while written < len(prefix):
+                                count = self.diagnostic.write(prefix[written:])
+                                require(count is not None and count > 0, 'private diagnostic short write')
+                                written += count
+                                self.diagnostic_bytes += count
+                    except Exception:
+                        self.output_error(name, stream, 'diagnostic-write', child, prefix)
+                    if len(kept) > remaining:
+                        self.output_error(name, stream, 'diagnostic-overflow', child)
+        if check and self.output_failure is not None:
+            raise Refusal('owned child output failed; bounded private prefix retained')
 
     def spawn(self, name, args, env=None, stdin=None, capture=False):
         require(not self.stop_requested, 'startup interrupted before child launch')
         require(name not in self.children, 'child name already owned')
-        capture_file = tempfile.TemporaryFile(dir=STATE) if capture else None
-        child = subprocess.Popen(args, env=env or clean_env(), start_new_session=True,
-                                 stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-                                 stdout=capture_file if capture else self.diagnostic,
-                                 stderr=subprocess.DEVNULL if capture else self.diagnostic)
-        child.capture_file = capture_file
+        try:
+            child = subprocess.Popen(args, env=env or clean_env(), start_new_session=True,
+                                     stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE if capture else subprocess.STDOUT)
+        except Exception:
+            self.output_error(name, 'setup', 'spawn')
+            raise
+        child.capture = capture
+        child.capture_data = bytearray()
+        child.output_bytes = 0
+        child.output_name = name
+        child.pending_input = b''
         self.children[name] = child
-        if stdin is not None:
-            try:
-                child.stdin.write(stdin.encode())
-                child.stdin.close()
-            except BrokenPipeError:
-                pass
+        try:
+            require(child.stdout is not None and (not capture or child.stderr is not None),
+                    'owned output pipes unavailable')
+            for stream in ('stdout', 'stderr'):
+                pipe = getattr(child, stream)
+                if pipe is not None:
+                    self.output_pipes[pipe.fileno()] = (child, name, stream, pipe)
+                    os.set_blocking(pipe.fileno(), False)
+            if stdin is not None:
+                os.set_blocking(child.stdin.fileno(), False)
+                child.pending_input = stdin.encode()
+                if not child.pending_input:
+                    self.close_input(child)
+        except Exception:
+            self.output_error(name, 'setup', 'pipe-setup', child)
+            self.close_output(child)
+            self.stop_child(name, 2)
+            # Include streams that failed before registration.
+            for pipe in (child.stdout, child.stderr, child.stdin):
+                if pipe is not None:
+                    pipe.close()
+            raise
         return child
 
     def peek(self, child):
@@ -193,24 +330,28 @@ class Supervisor:
     def run(self, name, args, timeout, stdin=None, env=None):
         child = self.spawn(name, args, stdin=stdin, env=env, capture=True)
         deadline = time.monotonic() + timeout
-        while self.peek(child) is None:
+        while True:
+            self.pump()
+            if self.peek(child) is not None and not self.has_output(child):
+                if self.stop_requested:
+                    self.stop_child(name, 2)
+                    raise Refusal('administrative child interrupted or timed out')
+                break
             if self.stop_requested or time.monotonic() >= deadline:
                 self.stop_child(name, 2)
                 raise Refusal('administrative child interrupted or timed out')
-            # Do not buffer arbitrarily large output: commands here emit bounded metadata.
-            time.sleep(0.05)
+            time.sleep(0.01)
         if any(pid != child.pid for pid, _ in self.group_members(child.pid)):
             self.failed = True
             self.stop_child(name, 2)
             raise Refusal('administrative child left descendants')
-        # No further group signals after this reap: the session has drained.
+        # Pipes drained and session checked before reaping the pinned leader.
         child.wait(timeout=2)
-        child.capture_file.seek(0)
-        output = child.capture_file.read(65537)
-        child.capture_file.close()
+        output = bytes(child.capture_data)
+        self.close_output(child)
         del self.children[name]
-        require(len(output) <= 65536 and child.returncode == 0,
-                'administrative child refused; private diagnostic retained')
+        require(child.returncode == 0,
+                'administrative child refused; bounded private diagnostic retained')
         return output.decode()
 
     def group_members(self, group):
@@ -248,27 +389,33 @@ class Supervisor:
                 os.killpg(child.pid, sig)
             except ProcessLookupError:
                 pass
+        self.close_input(child)
+        self.pump(check=False)
         running = self.peek(child) is None
         if running or descendants():
             signal_group(signal.SIGTERM)
         deadline = time.monotonic() + seconds
         forced = False
-        while self.peek(child) is None or descendants():
+        while self.peek(child) is None or descendants() or self.has_output(child):
+            self.pump(check=False)
             if time.monotonic() >= deadline:
                 forced = True
                 self.failed = True
                 signal_group(signal.SIGKILL)
                 kill_deadline = time.monotonic() + 2
-                while (self.peek(child) is None or descendants()) and time.monotonic() < kill_deadline:
+                while (self.peek(child) is None or descendants() or self.has_output(child)) and time.monotonic() < kill_deadline:
+                    self.pump(check=False)
                     time.sleep(0.02)
                 break
             time.sleep(0.02)
         drained = self.peek(child) is not None and not descendants()
+        pipes_drained = not self.has_output(child)
+        if not pipes_drained:
+            self.output_error(name, 'output', 'pipe-not-drained', child)
         if drained:
-            child.wait(timeout=2)  # No killpg is permitted after this point.
-        if getattr(child, 'capture_file', None) is not None:
-            child.capture_file.close()
-        good = drained and not forced and child.returncode == 0
+            child.wait(timeout=2)  # Session drained: no more killpg, even on pipe failure.
+        self.close_output(child)
+        good = drained and pipes_drained and not forced and child.returncode == 0
         self.failed |= not good
         if drained:
             del self.children[name]
@@ -276,12 +423,40 @@ class Supervisor:
 
     def stop(self):
         # Application always stops before its private database; helpers cannot outlive DB.
-        self.stop_child('app', STOP_APP)
-        for name in list(self.children):
-            if name != 'db':
-                self.stop_child(name, 2)
-        self.stop_child('db', STOP_DB)
+        order = ['app'] + [name for name in self.children if name not in ('app', 'db')] + ['db']
+        for name in order:
+            try:
+                self.stop_child(name, STOP_APP if name == 'app' else STOP_DB if name == 'db' else 2)
+            except Exception:
+                self.failed = True
+                if name not in self.cleanup_failures:
+                    self.cleanup_failures.append(name)
+        for child in list(self.children.values()):
+            self.close_output(child)
+        if self.output_failure is not None and self.record is not None:
+            self.record['output_failure'] = self.output_failure
+            if self.failure_prefix and not self.failure_prefix_saved:
+                self.failure_prefix_saved = True  # Never retry an uncertain prefix write.
+                try:
+                    path = STATE / ('output-prefix-' + secrets.token_hex(8))
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                    try:
+                        view = memoryview(self.failure_prefix)
+                        while view:
+                            count = os.write(fd, view)
+                            require(count > 0, 'private prefix short write')
+                            view = view[count:]
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                    self.output_failure['prefix_file'] = path.name
+                    self.output_failure['prefix_bytes'] = len(self.failure_prefix)
+                except Exception:
+                    self.failed = True
+                    self.output_failure['prefix_error'] = 'prefix-write'
         if self.record is not None:
+            if self.cleanup_failures:
+                self.record['cleanup_failure'] = self.cleanup_failures
             self.record['phase'] = 'failed' if self.failed else 'stopped-clean'
             self.record['coherent_backup'] = False  # A stop is never a backup receipt.
             durable_state(self.record)
@@ -384,6 +559,7 @@ class Supervisor:
                    env=dict(clean_env(), TMPDIR=str(RUN / 'db-tmp')))
         deadline = time.monotonic() + 30
         while True:
+            self.pump()
             require(not self.stop_requested and self.peek(self.children['db']) is None, 'database died or startup interrupted')
             try:
                 require(self.sql('SELECT 1;\n').strip() == '1', 'database readiness response differs')
@@ -469,6 +645,7 @@ s.sendall(b'{"operation":"capabilities"}\\n');r=json.loads(s.makefile('rb').read
 print('ready')
 """
         while True:
+            self.pump()
             require(not self.stop_requested and all(self.peek(self.children[x]) is None for x in ('app', 'db')),
                     'owned app/database died before readiness')
             try:
@@ -496,6 +673,7 @@ print('ready')
 
     def supervise(self):
         while not self.stop_requested:
+            self.pump()
             self.reap_owned_orphans()
             no_tcp_listeners()
             require(all(self.peek(self.children[x]) is None for x in ('app', 'db')),
@@ -523,6 +701,9 @@ def main():
             supervisor.stop()
         except Exception:
             supervisor.failed = True
+        finally:
+            if supervisor.diagnostic is not None:
+                supervisor.diagnostic.close()
     return 1 if supervisor.failed else 0
 
 

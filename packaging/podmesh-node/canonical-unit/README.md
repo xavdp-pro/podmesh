@@ -287,8 +287,9 @@ or query logging. Same-container SQL readiness and socket peer/inode checks prec
 schema preparation; observed TCP listeners refuse. Root authentication is local
 Unix socket plus a separately generated native password, confined to root files.
 Passwords enter SQL through private stdin/defaults files, never app env/argv or
-public diagnostics. Administrative helper stderr is discarded (SQL errors may echo query fragments);
-server/application diagnostics remain root-private, with server query logging disabled.
+public diagnostics. Administrative helper stderr and server/application diagnostics remain in the
+bounded root-private diagnostic prefix (SQL errors may contain query fragments);
+no raw diagnostic is exported, and server query logging remains disabled.
 
 The root CLI runs before the app. Fresh grants are exact per-table DML, never
 GRANT ALL: all40 tables SELECT; metadata/observations INSERT; operations and
@@ -306,6 +307,65 @@ owned children using non-reaping waitid/WNOWAIT until owned session cleanup ends
 bounded10s/20s waits and KILL only for owned sessions if necessary. Init/schema/
 SQL/readiness waits are finite. Forced stop or child failure exits nonzero and
 retains state; clean stop is explicitly **not** a coherent backup receipt.
+
+## Bounded native output contract
+
+Administrative helpers use nonblocking stdout/stderr pipes. Their combined
+output limit is 65536 bytes per helper, preserving the existing 64 KiB metadata
+contract. Only stdout is accumulated in memory for the caller; stderr joins the
+private diagnostic stream. DB and application stdout/stderr share a combined
+65536-byte diagnostic budget across the complete supervisor lifetime, including
+initialization, readiness and clean stop. These are byte limits, not character,
+line, output-rate or memory-limit estimates. Reaching the limit is allowed; the
+first byte beyond it is an explicit failure. No rotation conceals overflow.
+Readiness/SQL retry stderr counts toward that lifetime budget. Repeated failed
+probes may therefore refuse a slow birth even before its existing deadline;
+noise is neither filtered nor discarded to obtain a successful readiness result.
+
+One small synchronous pump services every owned pipe in helper, readiness,
+supervision and stop loops; there are no reader threads. Nonblocking stdin is
+also advanced there, so an SQL helper cannot deadlock by writing output before
+reading its input. Each pipe read is at most4096 bytes with at most17reads per
+pump pass. The pipes provide backpressure between passes. Original command and
+10sAPP/20sDB stop deadlines are unchanged; no new unbounded join/grace is added.
+WNOWAIT pins owned session leaders until descendant/group cleanup ends.
+
+On overflow, read failure or diagnostic-write failure, the first fixed-field
+failure is retained and the birth cannot be marked clean. The main finally path
+stops APP, then helpers, then DB, and reaps only owned groups. During that cleanup
+remaining bytes are drained without retention; this does not turn failure into
+success. At most65536 diagnostic bytes and one additional private helper/failure
+prefix of at most65536 bytes are saved, root0600, using a new exclusive path.
+Failure metadata contains only internal child/stream/reason, limit and prefix
+basename/size; raw SQL, credentials, environment and argv never enter public
+errors. A disk write failure may also prevent prefix/receipt persistence and
+still exits failed; no retry or repaired file is substituted.
+
+Administrative captures create no durable temporary files. The single sequential
+helper's stdout bytearray and lifetime diagnostic-prefix bytearray are each at
+most65536 bytes; the first failure-prefix copy is at most
+65536 bytes. Successful bytes/UTF-8 result conversion can transiently retain the
+bytearray plus one65536-byte bytes copy and a Python string of up to4bytes per
+input byte, excluding interpreter object overhead. The pump uses bounded4096-byte
+scratch slices. Queued stdin additionally holds the fixed internally generated
+SQL payload; it is not an output buffer. There are at most four output pipes
+(DB, APP and two helper streams), plus one helper stdin pipe in the current
+sequence. Kernel pipe capacity is a separate native-host input, not inferred
+from PIPE_BUF or these user-space limits. No full memory/storage admission is
+claimed from this output contract.
+
+For filesystem allocation planning add ceil(65536/B)*B for each of the two
+possible saved prefix files, directory/inode metadata, and the existing atomic
+birth.json/pending overlap including the small failure fields. Do not substitute
+logical bytes for allocated/COW blocks. InnoDB system/temporary spaces, VFS and
+thin-pool accounting remain separate. Existing images do not gain this contract
+until an immutable changed recipe is tested and rebuilt offline.
+
+New source tests use actual small owned subprocesses and private files. Execute
+only `BoundedNativeOutput` and the specifically affected existing readiness,
+unexpected-death/order and pinned-zombie supervisor fixtures on the separately
+leased native test host. The prior supervisor suite is retained evidence, not
+an automatic rerun request. Source/test authoring alone is not native proof.
 
 ## Required affected proof
 

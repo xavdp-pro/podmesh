@@ -44,11 +44,13 @@ class Contracts(unittest.TestCase):
         child = Mock()
         child.poll.return_value = 1
         child.returncode = 1
-        child.capture_file = io.BytesIO(b'not-ready')
+        child.capture_data = bytearray(b'not-ready')
+        child.stdin = None
+        child.pending_input = b''
         def launch(name, *_args, **_kw):
             s.children[name] = child
             return child
-        with patch.object(s, 'spawn', side_effect=launch), patch.object(s, 'peek', return_value=1), patch.object(s, 'group_members', return_value=[]):
+        with patch.object(s, 'spawn', side_effect=launch), patch.object(s, 'peek', return_value=1), patch.object(s, 'group_members', return_value=[]), patch.object(s, 'pump'):
             with self.assertRaises(u.Refusal):
                 s.run('readiness', ['/exact/helper'], 1)
         self.assertNotIn('readiness', s.children)
@@ -71,7 +73,7 @@ class Contracts(unittest.TestCase):
             if len(attempts) == 1:
                 raise u.Refusal('socket not ready')
             return 'ready\n'
-        with patch.object(s, 'spawn', side_effect=launch), patch.object(s, 'run', side_effect=probe), patch.object(s, 'peek', return_value=None), \
+        with patch.object(s, 'spawn', side_effect=launch), patch.object(s, 'run', side_effect=probe), patch.object(s, 'peek', return_value=None), patch.object(s, 'pump'), \
              patch.object(u, 'no_tcp_listeners'), patch.object(u, 'durable_state') as marker, \
              patch.object(u.time, 'sleep'):
             s.start_application()
@@ -84,7 +86,7 @@ class Contracts(unittest.TestCase):
         s.children = {'app': Mock(), 'db': Mock()}
         s.children['app'].poll.return_value = None
         s.children['db'].poll.return_value = 0
-        with patch.object(s, 'peek', side_effect=[None, 0]), patch.object(s, 'reap_owned_orphans'), patch.object(u, 'no_tcp_listeners'):
+        with patch.object(s, 'peek', side_effect=[None, 0]), patch.object(s, 'reap_owned_orphans'), patch.object(u, 'no_tcp_listeners'), patch.object(s, 'pump'):
             with self.assertRaises(u.Refusal):
                 s.supervise()
         order = []
@@ -137,14 +139,14 @@ class Contracts(unittest.TestCase):
 
     def test_owned_zombie_is_reaped_after_group_signaling_not_before(self):
         s = u.Supervisor()
-        child = Mock(pid=12345, returncode=0, capture_file=None)
+        child = Mock(pid=12345, returncode=0, stdin=None, pending_input=b'')
         s.children['app'] = child
         sequence = []
         child.wait.side_effect = lambda **_: sequence.append('reap')
         # A dead leader still owns a live session descendant for the first check.
         groups = [[(12345, 1), (12346, 1)], [(12345, 1), (12346, 1)],
                   [(12345, 1)], [(12345, 1)], []]
-        with patch.object(s, 'peek', return_value=0), \
+        with patch.object(s, 'peek', return_value=0), patch.object(s, 'pump'), \
              patch.object(s, 'group_members', side_effect=lambda *_: groups.pop(0) if groups else []), \
              patch.object(u.os, 'killpg', side_effect=lambda *_: sequence.append('signal')), \
              patch.object(u.os, 'waitpid'):
@@ -254,6 +256,238 @@ class PrivateFilesAndOwnedChildren(unittest.TestCase):
             self.assertTrue(ready.exists())
             self.assertEqual(s.stop_child('app', 0.1), not ignore)
             self.assertEqual(s.failed, ignore)
+
+
+class BoundedNativeOutput(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='bounded-output-')
+        self.root = Path(self.temp.name)
+        self.supervisor = u.Supervisor()
+        path = self.root / 'diagnostic'
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        self.supervisor.diagnostic = os.fdopen(fd, 'wb', buffering=0)
+        self.path = path
+
+    def tearDown(self):
+        self.supervisor.stop()
+        self.supervisor.diagnostic.close()
+        self.assertFalse(self.supervisor.children)
+        self.assertFalse(self.supervisor.output_pipes)
+        self.temp.cleanup()
+
+    def fixture(self, fd, count, name='app', capture=False):
+        ready = self.root / ('ready-' + name)
+        code = ('import os,signal,sys,time,pathlib;'
+                'signal.signal(signal.SIGTERM,lambda *_:sys.exit(0));'
+                'data=b"x"*int(sys.argv[2]);'
+                'fd=int(sys.argv[1]);'
+                r'exec("while data:\n n=os.write(fd,data);data=data[n:]");'
+                'pathlib.Path(sys.argv[3]).touch();time.sleep(30)')
+        child = self.supervisor.spawn(name, [sys.executable, '-I', '-c', code, str(fd), str(count), str(ready)], capture=capture)
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            self.supervisor.pump(check=False)
+            time.sleep(0.005)
+        self.assertTrue(ready.exists(), 'fixture must finish writing while its process stays alive')
+        for _ in range(20):
+            self.supervisor.pump(check=False)
+            time.sleep(0.002)
+        self.assertIsNone(self.supervisor.peek(child))
+        return child
+
+    def test_native_stdout_and_stderr_under_exact_over_limit_while_alive(self):
+        for fd in (1, 2):
+            for count in (u.OUTPUT_LIMIT-1, u.OUTPUT_LIMIT, u.OUTPUT_LIMIT+1):
+                with self.subTest(fd=fd, count=count):
+                    self.supervisor.diagnostic.seek(0)
+                    self.supervisor.diagnostic.truncate()
+                    self.supervisor.diagnostic_bytes = 0
+                    self.supervisor.diagnostic_prefix.clear()
+                    self.supervisor.failed = False
+                    self.supervisor.output_failure = None
+                    self.supervisor.failure_prefix = b''
+                    self.supervisor.failure_prefix_saved = False
+                    self.fixture(fd, count)
+                    self.assertEqual(self.path.stat().st_size, min(count, u.OUTPUT_LIMIT))
+                    self.assertEqual(self.path.read_bytes(), b'x'*min(count, u.OUTPUT_LIMIT))
+                    self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
+                    self.assertEqual(self.supervisor.failed, count > u.OUTPUT_LIMIT)
+                    if count > u.OUTPUT_LIMIT:
+                        with self.assertRaises(u.Refusal):self.supervisor.pump()
+                    self.supervisor.stop_child('app', 1)
+
+    def test_admin_combined_stream_limit_and_bounded_memory_while_alive(self):
+        for fd in (1, 2):
+            for count in (u.OUTPUT_LIMIT-1, u.OUTPUT_LIMIT, u.OUTPUT_LIMIT+1):
+                with self.subTest(fd=fd,count=count):
+                    self.supervisor.output_failure = None
+                    self.supervisor.failed = False
+                    self.supervisor.diagnostic_bytes = 0
+                    self.supervisor.diagnostic_prefix.clear()
+                    self.supervisor.diagnostic.seek(0);self.supervisor.diagnostic.truncate()
+                    child=self.fixture(fd,count,'sql',True)
+                    self.assertLessEqual(len(child.capture_data),u.OUTPUT_LIMIT)
+                    self.assertEqual(child.output_bytes,min(count,u.OUTPUT_LIMIT))
+                    self.assertEqual(self.supervisor.failed,count>u.OUTPUT_LIMIT)
+                    self.supervisor.stop_child('sql',1)
+
+    def test_combined_admin_stdout_stderr_overflow_shares_one_budget(self):
+        code='import os,time;os.write(1,b"o"*32768);os.write(2,b"e"*32769);time.sleep(30)'
+        with self.assertRaises(u.Refusal):
+            self.supervisor.run('sql',[sys.executable,'-I','-c',code],5)
+        self.assertTrue(self.supervisor.failed)
+        self.assertEqual(self.supervisor.children['sql'].output_bytes,u.OUTPUT_LIMIT)
+        self.assertLessEqual(self.path.stat().st_size,32769)
+        self.assertTrue(self.path.read_bytes().startswith(b'e'))
+        self.assertLessEqual(len(self.supervisor.failure_prefix),u.OUTPUT_LIMIT)
+
+    def test_run_drains_full_pipes_and_child_exit_before_reap(self):
+        # More than a small kernel pipe can hold, but within the metadata cap.
+        code=r'import os;data=b"z"*65536;exec("while data:\n n=os.write(1,data);data=data[n:]")'
+        self.assertEqual(self.supervisor.run('schema',[sys.executable,'-I','-c',code],5),'z'*65536)
+        self.assertFalse(self.supervisor.output_pipes)
+        self.assertFalse(self.supervisor.children)
+
+    def test_helper_stderr_overflow_after_full_stdout_retains_private_prefix(self):
+        code = (r'import os,time;data=b"o"*65536;'
+                r'exec("while data:\n n=os.write(1,data);data=data[n:]");'
+                r'os.write(2,b"e");time.sleep(30)')
+        with self.assertRaises(u.Refusal):
+            self.supervisor.run('sql', [sys.executable, '-I', '-c', code], 5)
+        self.assertEqual(self.supervisor.output_failure['reason'], 'helper-output-overflow')
+        self.assertEqual(self.supervisor.output_failure['stream'], 'stderr')
+        self.assertEqual(self.supervisor.failure_prefix, b'e')
+        self.assertEqual(self.supervisor.children['sql'].output_bytes, u.OUTPUT_LIMIT)
+        self.assertEqual(self.path.stat().st_size, 0)
+
+    def test_overflow_never_waits_for_child_exit_and_owned_cleanup_keeps_foreign_alive(self):
+        foreign=u.subprocess.Popen([sys.executable,'-I','-c','import time;time.sleep(30)'],start_new_session=True)
+        try:
+            code='import os,time;os.write(1,b"q"*262144);time.sleep(30)'
+            with self.assertRaises(u.Refusal):
+                self.supervisor.run('schema',[sys.executable,'-I','-c',code],5)
+            self.assertTrue(self.supervisor.failed)
+            self.assertEqual(len(self.supervisor.failure_prefix),u.OUTPUT_LIMIT)
+            self.supervisor.stop()
+            self.assertIsNone(foreign.poll())
+            self.assertFalse(self.supervisor.output_pipes)
+        finally:
+            foreign.terminate();foreign.wait(timeout=3)
+
+    def test_short_reads_are_not_eof_and_pipe_read_error_fails_closed(self):
+        child=self.fixture(1,2,'sql',True)
+        self.assertEqual(bytes(child.capture_data),b'xx')
+        original=u.os.read
+        def broken(fd,size):
+            if fd in self.supervisor.output_pipes:raise OSError('owned read fixture')
+            return original(fd,size)
+        with patch.object(u.os,'read',side_effect=broken):
+            with self.assertRaises(u.Refusal):self.supervisor.pump()
+        self.assertEqual(self.supervisor.output_failure['reason'],'pipe-read')
+
+    def test_diagnostic_write_error_is_failure_and_cannot_escape_private_prefix_cap(self):
+        child=self.supervisor.spawn('app',[sys.executable,'-I','-c','import os,time;os.write(2,b"failure");time.sleep(30)'])
+        sink=self.supervisor.diagnostic
+        self.supervisor.diagnostic=Mock()
+        self.supervisor.diagnostic.write.side_effect=OSError('private sink failed')
+        try:
+            deadline=time.monotonic()+5
+            while not self.supervisor.failed and time.monotonic()<deadline:
+                self.supervisor.pump(check=False);time.sleep(.005)
+            self.assertEqual(self.supervisor.output_failure['reason'],'diagnostic-write')
+            self.assertEqual(self.path.stat().st_size,0)
+            self.assertEqual(self.supervisor.diagnostic_bytes,0)
+        finally:self.supervisor.diagnostic=sink
+
+    @unittest.skipUnless(os.geteuid() == 0, 'private output receipt requires CT root')
+    def test_overflow_prefix_and_metadata_saved_once_with_failed_marker(self):
+        with tempfile.TemporaryDirectory(prefix='bounded-private-',dir='/root') as root:
+            state=Path(root)
+            self.supervisor.record={'phase':'starting'}
+            self.supervisor.failure_prefix=b'p'*u.OUTPUT_LIMIT
+            self.supervisor.output_error('schema','stdout','helper-output-overflow')
+            with patch.object(u,'STATE',state):
+                self.supervisor.stop();self.supervisor.stop()
+            prefixes=list(state.glob('output-prefix-*'))
+            self.assertEqual(len(prefixes),1)
+            self.assertEqual(prefixes[0].read_bytes(),b'p'*u.OUTPUT_LIMIT)
+            self.assertEqual(stat.S_IMODE(prefixes[0].stat().st_mode),0o600)
+            marker=json.loads((state/'birth.json').read_text())
+            self.assertEqual(marker['phase'],'failed')
+            self.assertEqual(marker['output_failure']['prefix_bytes'],u.OUTPUT_LIMIT)
+            self.supervisor.record=None
+
+    @unittest.skipUnless(os.geteuid() == 0, 'private failure marker requires CT root')
+    def test_prefix_write_failure_still_persists_failed_metadata(self):
+        with tempfile.TemporaryDirectory(prefix='bounded-prefix-failure-',dir='/root') as root:
+            state=Path(root);self.supervisor.record={'phase':'starting'}
+            self.supervisor.failure_prefix=b'private prefix'
+            self.supervisor.output_error('sql','stdout','helper-output-overflow')
+            original=u.os.write
+            def fail_prefix(fd,data):
+                # Only this test's new prefix fd is unlinked from Popen's pipe set.
+                if data==b'private prefix':raise OSError('owned prefix fixture')
+                return original(fd,data)
+            with patch.object(u,'STATE',state),patch.object(u.os,'write',side_effect=fail_prefix):
+                self.supervisor.stop()
+            marker=json.loads((state/'birth.json').read_text())
+            self.assertEqual(marker['phase'],'failed')
+            self.assertEqual(marker['output_failure']['prefix_error'],'prefix-write')
+            self.supervisor.record=None
+
+    def test_repeated_readiness_stderr_counts_toward_lifetime_budget(self):
+        code='import os,sys;os.write(2,b"n"*8192);sys.exit(1)'
+        for _ in range(8):
+            with self.assertRaises(u.Refusal):
+                self.supervisor.run('readiness',[sys.executable,'-I','-c',code],5)
+            self.assertIsNone(self.supervisor.output_failure)
+        self.assertEqual(self.path.stat().st_size,u.OUTPUT_LIMIT)
+        with self.assertRaises(u.Refusal):
+            self.supervisor.run('readiness',[sys.executable,'-I','-c',code],5)
+        self.assertEqual(self.supervisor.output_failure['reason'],'diagnostic-overflow')
+        self.assertTrue(self.supervisor.failed)
+        self.assertEqual(self.path.stat().st_size,u.OUTPUT_LIMIT)
+
+    def test_failed_spawn_and_pipe_setup_leave_no_readers_or_child(self):
+        with self.assertRaises(OSError):self.supervisor.spawn('sql',['/missing-owned-output-fixture'])
+        self.assertFalse(self.supervisor.children);self.assertFalse(self.supervisor.output_pipes)
+        self.assertTrue(self.supervisor.failed)
+        self.assertEqual(self.supervisor.output_failure['reason'],'spawn')
+        self.supervisor.output_failure=None
+        with patch.object(u.os,'set_blocking',side_effect=OSError('owned setup fixture')):
+            with self.assertRaises(OSError):
+                self.supervisor.spawn('sql',[sys.executable,'-I','-c','import time;time.sleep(30)'],capture=True)
+        self.assertFalse(self.supervisor.children);self.assertFalse(self.supervisor.output_pipes)
+        self.assertTrue(self.supervisor.failed)
+        self.assertEqual(self.supervisor.output_failure['reason'],'pipe-setup')
+
+    def test_missing_output_pipe_refuses_and_reaps_real_owned_child(self):
+        popen=u.subprocess.Popen
+        def missing(*args,**kwargs):
+            kwargs['stdout']=u.subprocess.DEVNULL
+            kwargs['stderr']=u.subprocess.DEVNULL
+            return popen(*args,**kwargs)
+        with patch.object(u.subprocess,'Popen',side_effect=missing):
+            with self.assertRaises(u.Refusal):
+                self.supervisor.spawn('sql',[sys.executable,'-I','-c','import time;time.sleep(30)'],capture=True)
+        self.assertTrue(self.supervisor.failed)
+        self.assertFalse(self.supervisor.children)
+        self.assertFalse(self.supervisor.output_pipes)
+
+    def test_SIGTERM_during_SQL_stops_owned_groups_app_before_database(self):
+        for name in ('db','app'):
+            self.supervisor.spawn(name,[sys.executable,'-I','-c','import time;time.sleep(30)'])
+        original=self.supervisor.pump
+        def interrupt(check=True):
+            original(check=check)
+            self.supervisor.stop_requested=True
+        with patch.object(self.supervisor,'pump',side_effect=interrupt):
+            with self.assertRaises(u.Refusal):
+                self.supervisor.run('sql',[sys.executable,'-I','-c','import time;time.sleep(30)'],5,stdin='SELECT 1;')
+        order=[];stop=self.supervisor.stop_child
+        def observed(name,seconds):order.append(name);return stop(name,seconds)
+        with patch.object(self.supervisor,'stop_child',side_effect=observed):self.supervisor.stop()
+        self.assertEqual(order[0],'app');self.assertEqual(order[-1],'db')
 
 
 if __name__ == '__main__':
