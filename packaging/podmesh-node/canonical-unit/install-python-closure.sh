@@ -84,6 +84,81 @@ END {
 }
 ' "$1" "$2"
 }
+# APT pkgAcqArchive: QuoteString(name,"_:")_QuoteString(version,"_:")_arch.deb.
+# The already restricted metadata alphabet only requires colon -> lowercase %3a.
+native_archive_name() {
+    guard=archive-name
+    [[ $# == 3 && $1 =~ ^[a-z0-9][a-z0-9+.-]+$ && $2 =~ ^[0-9][A-Za-z0-9.+:~-]*$ && ( $3 == amd64 || $3 == all ) ]] || refuse 65
+    local encoded=${2//:/%3a} result
+    result="${1}_${encoded}_${3}.deb"
+    [[ ${#result} -le 255 ]] || refuse 65
+    printf '%s\n' "$result"
+}
+archive_owned_path() {
+    local path=$1 mode
+    [[ $path == /* && ! -L $path && $(readlink -f -- "$path") == "$path" ]] || refuse 65
+    [[ $(stat -c %u:%g -- "$path") == 0:0 ]] || refuse 65
+    mode=$(stat -c %a -- "$path")
+    (( (8#$mode & 022) == 0 )) || refuse 65
+}
+verify_staged_archive() {
+    local path=$1 name=$2 version=$3 arch=$4 hash=$5 bytes=$6
+    guard=archive-file-path
+    [[ -f $path && ! -L $path && $(stat -c %h -- "$path") == 1 ]] || refuse 65
+    archive_owned_path "$path"
+    guard=archive-file-size
+    [[ $(stat -c %s -- "$path") == "$bytes" ]] || refuse 65
+    guard=archive-file-checksum
+    printf '%s  %s\n' "$hash" "$path" | sha256sum --check --strict - >/dev/null
+    guard=archive-file-identity
+    [[ $(dpkg-deb --field "$path" Package) == "$name" && $(dpkg-deb --field "$path" Version) == "$version" && $(dpkg-deb --field "$path" Architecture) == "$arch" ]] || refuse 65
+}
+stage_verified_archives() {
+    stage=archive_stage guard=archive-tree
+    local cache="$work/cache/archives" source="$root/debs" manifest="$work/packages.tsv"
+    local name version arch hash bytes filename extra native target i count=0 total=0 free
+    local -a sources=() targets=() names=() versions=() arches=() hashes=() sizes=()
+    local -A unique=()
+    [[ -d $root && -d $work && $root != "$work" && $root != "$work/"* && $work != "$root/"* ]] || refuse 65
+    archive_owned_path "$root"; archive_owned_path "$work"
+    [[ $(stat -c %d:%i -- "$work") == "$work_identity" && $(stat -c %a -- "$work") == 700 ]] || refuse 65
+    for target in "$source" "$work/cache" "$cache" "$cache/partial"; do
+        [[ -d $target ]] || refuse 65
+        archive_owned_path "$target"
+    done
+    [[ -f $manifest && ! -L $manifest && $(stat -c %h -- "$manifest") == 1 ]] || refuse 65
+    archive_owned_path "$manifest"
+    # Never merge into an existing archive set, follow a link or overwrite a destination.
+    [[ $(find "$cache" -mindepth 1 -maxdepth 1 -printf '%f\n') == partial && -z $(find "$cache/partial" -mindepth 1 -print -quit) ]] || refuse 65
+    while IFS=$'\t' read -r name version arch hash bytes filename extra; do
+        guard=archive-manifest
+        [[ -z $extra && $hash =~ ^[0-9a-f]{64}$ && $bytes =~ ^[1-9][0-9]{0,8}$ && $filename == "$hash.deb" ]] || refuse 65
+        native=$(native_archive_name "$name" "$version" "$arch")
+        [[ -z ${unique[$native]+present} ]] || refuse 65
+        unique[$native]=1
+        ((count+=1)); ((total+=bytes))
+        [[ $count -le 64 && $total -le 268435456 ]] || refuse 65
+        target="$cache/$native"
+        [[ ! -e $target && ! -L $target ]] || refuse 65
+        verify_staged_archive "$source/$filename" "$name" "$version" "$arch" "$hash" "$bytes"
+        sources+=("$source/$filename"); targets+=("$target"); names+=("$name"); versions+=("$version")
+        arches+=("$arch"); hashes+=("$hash"); sizes+=("$bytes")
+    done < "$manifest"
+    guard=archive-source-count
+    [[ $count -gt 0 && $(find "$source" -mindepth 1 -maxdepth 1 -printf '%f\n' | wc -l) == "$count" ]] || refuse 65
+    # Extra physical allocation must also be included in the external image peak gate.
+    archive_stage_bound=$((total + count*65536 + 1048576))
+    free=$(df -Pk "$cache" | awk 'NR==2 {print $4}')
+    guard=archive-stage-space
+    [[ $free =~ ^[0-9]+$ && $((free*1024)) -gt $archive_stage_bound ]] || refuse 65
+    for ((i=0;i<count;i++)); do
+        guard=archive-copy-new-only
+        # Exclusive new root-owned tree; preflight excludes all existing nodes.
+        # Noclobber additionally refuses regular-file collisions; no hostile root writer is allowed.
+        (set -o noclobber; umask 077; cat -- "${sources[i]}" > "${targets[i]}")
+        verify_staged_archive "${targets[i]}" "${names[i]}" "${versions[i]}" "${arches[i]}" "${hashes[i]}" "${sizes[i]}"
+    done
+}
 # END OFFLINE_INSTALLER_SUPPORT
 trap 'report_failure command "$LINENO" "$?"' ERR
 trap 'on_exit "$LINENO" "$?"' EXIT
@@ -101,7 +176,7 @@ guard=image-build-authority
 guard=image-build-marker
 [[ -f /.dockerenv || -f /run/.containerenv ]] || { echo 'image-build boundary missing' >&2; refuse 64; }
 stage=prerequisites guard=required-tool
-for helper in sha256sum awk cmp cp sort find stat dpkg-deb dpkg-query dpkg apt-get mktemp wc grep df; do
+for helper in sha256sum awk cmp cp sort find stat dpkg-deb dpkg-query dpkg apt-get mktemp wc grep df readlink cat; do
     command -v "$helper" >/dev/null || { echo "missing offline installer helper: $helper" >&2; refuse 65; }
 done
 stage=lock_verify guard=lock-path
@@ -114,6 +189,7 @@ printf '%s  %s\n' "$expected" "$root/closure.lock" | sha256sum --check --strict 
 stage=work_prepare guard=private-work-create
 work=$(mktemp -d /tmp/podmesh-python-offline.XXXXXXXX)
 chmod 700 "$work"
+work_identity=$(stat -c %d:%i -- "$work")
 stage=lock_decode guard=lock-schema
 awk -F '\t' '
 function die() { failed=1; print "offline-installer stage=lock_decode guard=lock-schema input_line=" NR " exit=65" > "/dev/stderr"; exit 65 }
@@ -218,6 +294,8 @@ stage=plan_validate guard=plan-byte-bound
 [[ $(stat -c %s "$work/plan.log") -le 4194304 ]] || refuse 65
 guard=exact-new-install-plan
 validate_plan "$work/packages.tsv" "$work/plan.log"
+# Cache hits bind native absolute archive paths even when acquisition is disabled.
+stage_verified_archives
 # Bind base package versions before native configuration, then compare exact full set.
 stage=package_snapshot guard=full-package-set
 dpkg-query --show --showformat='${Package}\t${Version}\t${Architecture}\t${Status}\n' | sort > "$work/packages-before.tsv"

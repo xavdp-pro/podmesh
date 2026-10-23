@@ -125,6 +125,35 @@ It also verifies the unmodified base status/os-release/key bytes. A fresh empty
 image-local APT configuration plus --no-download/--no-upgrade/--no-remove selects
 only exact local packages and preserves dependency/Pre-Depends ordering; service
 autostart is denied during construction and original image policy restored.
+For native offline APT, the new image work cache is populated only after the
+exact simulated plan passes. Verified bundle archives are copied without links
+to native cache basenames: package, full version and architecture separated by
+underscores, ending in .deb. APT QuoteString rules encode version colons as `%3a`
+under the restricted metadata alphabet; epochs are retained. Cache hits let APT
+supply absolute archive paths while `--no-download` remains enforced. The signed
+bundle, its hash filenames and the absolute local-file install arguments remain
+unchanged. No source, download, sandbox fallback or host cache is introduced.
+
+Staging requires the original private work inode and canonical root-owned paths,
+a fresh empty cache apart from its empty partial directory, safe unique metadata
+components, and regular single-link source files. All source size/hash/identity
+checks complete before copies; new-only private copies are checked again for
+size, SHA256 and dpkg metadata. Existing destinations, symlinks, foreign/writable
+paths and unexpected artifacts refuse staging. Failed setup is retained within
+new image work and cannot reach native installation. Policy restoration remains
+unchanged.
+
+The staging payload adds one full copy of the closure bytes while installation
+runs. Its local free-space gate reserves payload bytes plus 64KiB per archive
+and 1MiB of staging overhead. This is a planning reserve, not a measured physical
+allocation or complete image peak: the build authority must include filesystem
+and constructor overhead in its separate capacity gate. Work-cache copies are
+removed with successful installer cleanup before the final image marker.
+Isolated new staging fixtures run with `python3 -m unittest discover -s packaging/podmesh-node/canonical-unit -p test_offline_installer.py -k OfflineArchiveStaging -v`.
+They create local fixture debs and mock only the APT argv capture; they never
+invoke APT installation. Native APT compatibility requires an actual authorized
+image construction.
+
 The offline simulation is parsed separately from the tab-separated manifest.
 Only exact new-package Inst and Conf pairs are accepted, with locked versions
 (including epochs and distribution suffixes) and amd64/all architecture identity.
