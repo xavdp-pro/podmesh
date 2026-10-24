@@ -120,9 +120,9 @@
         "es": "Base MariaDB · laboratorio"
       },
       "labSummary": {
-        "fr": "Un export SQL cohérent est restauré dans une base privée indépendante et vide sur le même hôte. Les 5 tables, leurs 10 lignes et les 8 déclencheurs sont comparés intégralement avant utilisation ; aucune routine ni aucun événement présents. Après recréation, les 4 faits d’origine sont identiques, puis un cinquième est écrit et relu. UUID et configuration conservés ; identifiants SQL propres à la cible régénérés. Aucun fichier applicatif durable présent dans ce jeu. Source et cible arrêtées proprement, existant contrôlé préservé. Petit essai local : pas de déplacement interhôtes du manager, réplication, volumes arbitraires ou production qualifiés. Deux managers sur le même hôte ont aussi répliqué deux faits dans les deux sens, sans doublon.",
-        "en": "A coherent SQL export is restored into an independent empty private database on the same host. All 5 tables, their 10 rows and 8 triggers match before use; no routines or events were present. After recreation, the 4 original facts remain identical, then a fifth is written and read. UUID and configuration retained; target-specific SQL credentials regenerated. No durable application payload file was present in this fixture. Source and target stopped cleanly, checked originals preserved. Small local test: no qualified cross-host manager move, replication, arbitrary volumes or production. Two managers on the same host also replicated two facts in both directions without duplicates.",
-        "es": "Una exportación SQL coherente se restaura en una base privada independiente y vacía del mismo host. Las 5 tablas, sus 10 filas y 8 disparadores coinciden íntegramente antes del uso; no había rutinas ni eventos. Tras recreación, los 4 hechos originales permanecen idénticos y se escribe y lee un quinto. UUID y configuración conservados; credenciales SQL propias del destino regeneradas. Sin archivos aplicativos duraderos en este ensayo. Fuente y destino parados limpiamente, originales comprobados preservados. Pequeño ensayo local: sin validar traslado del manager entre hosts, replicación, volúmenes arbitrarios ni producción. Dos managers en el mismo host también replicaron dos hechos en ambos sentidos sin duplicados."
+        "fr": "Un export SQL cohérent est restauré dans une base privée indépendante et vide sur le même hôte. Les 5 tables, leurs 10 lignes et les 8 déclencheurs sont comparés intégralement avant utilisation ; aucune routine ni aucun événement présents. Après recréation, les 4 faits d’origine sont identiques, puis un cinquième est écrit et relu. UUID et configuration conservés ; identifiants SQL propres à la cible régénérés. Aucun fichier applicatif durable présent dans ce jeu. Source et cible arrêtées proprement, existant contrôlé préservé. Petit essai local : pas de déplacement interhôtes du manager, réplication, volumes arbitraires ou production qualifiés. Deux managers sur le même hôte ont aussi répliqué deux faits dans les deux sens, sans doublon. La réplication entre deux VM et la recréation propre d’un pair sont aussi vérifiées sur trois faits.",
+        "en": "A coherent SQL export is restored into an independent empty private database on the same host. All 5 tables, their 10 rows and 8 triggers match before use; no routines or events were present. After recreation, the 4 original facts remain identical, then a fifth is written and read. UUID and configuration retained; target-specific SQL credentials regenerated. No durable application payload file was present in this fixture. Source and target stopped cleanly, checked originals preserved. Small local test: no qualified cross-host manager move, replication, arbitrary volumes or production. Two managers on the same host also replicated two facts in both directions without duplicates. Two-VM replication and clean peer recreation are also verified with three facts.",
+        "es": "Una exportación SQL coherente se restaura en una base privada independiente y vacía del mismo host. Las 5 tablas, sus 10 filas y 8 disparadores coinciden íntegramente antes del uso; no había rutinas ni eventos. Tras recreación, los 4 hechos originales permanecen idénticos y se escribe y lee un quinto. UUID y configuración conservados; credenciales SQL propias del destino regeneradas. Sin archivos aplicativos duraderos en este ensayo. Fuente y destino parados limpiamente, originales comprobados preservados. Pequeño ensayo local: sin validar traslado del manager entre hosts, replicación, volúmenes arbitrarios ni producción. Dos managers en el mismo host también replicaron dos hechos en ambos sentidos sin duplicados. También se verifican la replicación entre dos VM y la recreación limpia de un par con tres hechos."
       },
       "labProofs": [
         "node-common",
@@ -132,7 +132,8 @@
         "canonical-manager-persistence",
         "canonical-manager-process-recovery",
         "canonical-manager-logical-restore",
-        "canonical-manager-peer-replication"
+        "canonical-manager-peer-replication",
+        "canonical-manager-crossvm-rejoin"
       ],
       "qualificationNote": {
         "fr": "7/8 conserve le dénominateur du socle historique. Les nouveaux essais NODE canonique sont des preuves distinctes : une recréation propre et une reprise explicite après crash, pas une qualification globale, un redémarrage d’hôte ou des mois d’endurance.",
@@ -1126,9 +1127,27 @@
         "en": "Two fresh managers, each with private MariaDB and no SQL TCP listener, exchange two facts through the native authenticated protocol. Each write is acknowledged; complete histories match without duplicates, preserving origins and sequences. Network evidence links to commit receipts. An incorrect collector assertion then stops the lot; the error is retained without rerunning. Both units stop cleanly and original-state preservation checks pass. Two replicas in the same VM with logical laboratory host identities: no distinct physical failure domains, three-node quorum, HA or production qualification. Post-replication recreation was not executed.",
         "es": "Dos managers nuevos, cada uno con MariaDB privada sin escucha SQL TCP, intercambian dos hechos mediante el protocolo nativo autenticado. Cada escritura se confirma; los historiales completos coinciden sin duplicados, conservando orígenes y secuencias. Las pruebas de red enlazan con los recibos de commit. Una aserción incorrecta del recolector detiene después el lote; el error se conserva sin repetirlo. Ambas unidades se paran correctamente y pasan los controles de preservación de los originales. Dos réplicas en la misma VM con identidades lógicas de laboratorio: sin dominios físicos distintos, quorum de tres, HA ni validación de producción. No se ejecutó la recreación posterior a la replicación."
       }
+    },
+    {
+      "id": "canonical-manager-crossvm-rejoin",
+      "date": "2026-10-24",
+      "version": "canonical-manager 01d603fa · two-VM native facts",
+      "kind": "scoped-native-runtime",
+      "runtimePass": true,
+      "productionQualified": false,
+      "title": {
+        "fr": "Managers : réplication entre deux VM et reprise d’un pair",
+        "en": "Managers: two-VM replication and clean peer rejoin",
+        "es": "Managers: replicación entre dos VM y reincorporación de un par"
+      },
+      "summary": {
+        "fr": "Deux managers neufs, chacun avec MariaDB privée accessible par socket sans écoute SQL TCP, répliquent leurs faits par le protocole natif authentifié entre deux VM. Les deux premiers faits convergent sans doublon. Le second manager est arrêté et recréé avec les mêmes données, identité, configuration et identifiants ; ses deux faits sont conservés. Après reconnexion, un troisième fait est transmis avec origine et séquence intactes. Les historiques complets et les liens entre événements réseau et reçus de commit sont vérifiés. Les trois incarnations des conteneurs sont arrêtées proprement ; réseaux et écoutes du lot supprimés, originaux suivis préservés. Les deux VM partagent un hyperviseur : pas de domaine physique indépendant, quorum à trois, reprise après panne électrique, bascule automatique ou qualification production. Ce jalon porte sur les faits du manager, pas la réplication d’un univers NODE.",
+        "en": "Two fresh managers, each with private socket-only MariaDB and no SQL TCP listener, replicate facts through the native authenticated protocol across two VMs. The first two facts converge without duplicates. The second manager is stopped and recreated with the same data, identity, configuration and credentials; both facts survive. After rejoining, a third fact arrives with its origin and sequence intact. Complete histories and network-event/commit-receipt links are verified. All three container incarnations stop cleanly; owned networks/listeners are removed and tracked originals preserved. Both VMs share one hypervisor: no independent physical failure domain, three-node quorum, power-loss recovery, automatic failover or production qualification. This milestone covers manager facts, not NODE universe replication.",
+        "es": "Dos managers nuevos, cada uno con MariaDB privada por socket y sin escucha SQL TCP, replican hechos mediante el protocolo nativo autenticado entre dos VM. Los dos primeros hechos convergen sin duplicados. El segundo manager se para y recrea con los mismos datos, identidad, configuración y credenciales; conserva ambos hechos. Tras reconectarse recibe un tercer hecho con origen y secuencia intactos. Se verifican historiales completos y vínculos entre eventos de red y recibos de commit. Las tres instancias se paran correctamente; redes y escuchas propias eliminadas, originales seguidos preservados. Las dos VM comparten hipervisor: sin dominio físico independiente, quorum de tres, recuperación de corte eléctrico, conmutación automática ni validación de producción. El hito cubre hechos del manager, no replicación de universos NODE."
+      }
     }
   ],
-  "updatedAtUTC": "2026-10-24T09:24:05.399138Z",
+  "updatedAtUTC": "2026-10-24T09:48:44.150041Z",
   "updatePolicy": "Publish only verified evidence changes; preserve historical lab achievements and version boundaries; never count in-progress code as validated.",
   "canonicalBoundary": {
     "state": "not_qualified",
@@ -1163,21 +1182,21 @@
   },
   "currentMilestone": {
     "state": "partial",
-    "proof": "canonical-manager-peer-replication",
+    "proof": "canonical-manager-crossvm-rejoin",
     "title": {
-      "fr": "Managers : réplication native de deux faits dans les deux sens",
-      "en": "Managers: native two-way replication of two facts",
-      "es": "Managers: replicación nativa de dos hechos en ambos sentidos"
+      "fr": "Managers : réplication entre deux VM et reprise d’un pair",
+      "en": "Managers: two-VM replication and clean peer rejoin",
+      "es": "Managers: replicación entre dos VM y reincorporación de un par"
     },
     "summary": {
-      "fr": "La réplication native entre deux managers à MariaDB privée est observée dans les deux sens sur le même hôte. La restauration des cinq cellules Alpine par PMBS reste acquise. Les périmètres restent distincts et ne constituent pas une qualification globale de production.",
-      "en": "Native replication between two private-MariaDB managers is observed in both directions on the same host. Five-cell Alpine restoration through PMBS remains acquired. These distinct scopes do not constitute overall production qualification.",
-      "es": "Se observa replicación nativa en ambos sentidos entre dos managers con MariaDB privada en el mismo host. Se mantiene la restauración PMBS de las cinco células Alpine. Son ámbitos distintos, sin validación global de producción."
+      "fr": "Les managers ont répliqué trois faits entre deux VM, y compris après la recréation propre du second pair. Leurs identités et données sont conservées. La restauration PMBS des cinq cellules Alpine reste acquise. Ces preuves restent limitées au laboratoire, sans qualification globale de production.",
+      "en": "Managers replicated three facts across two VMs, including after clean recreation of the second peer. Identity and data are retained. PMBS restoration of five Alpine cells remains acquired. These remain laboratory scopes without overall production qualification.",
+      "es": "Los managers replicaron tres hechos entre dos VM, incluso tras recrear limpiamente el segundo par. Identidad y datos conservados. Sigue adquirida la restauración PMBS de cinco células Alpine. Son ámbitos de laboratorio, sin validación global de producción."
     },
     "next": {
-      "fr": "La commande complète de transfert NODE reste à valider. Réplication entre hôtes, reprise après réplication, partitionnement délibéré et moteur réel du Bridge restent ouverts.",
-      "en": "The complete NODE transfer command remains to be validated. Cross-host replication, post-replication recovery, deliberate partitioning and a real Bridge engine remain open.",
-      "es": "El comando completo de traslado NODE sigue pendiente de validación. Siguen pendientes replicación entre hosts, recuperación tras replicación, particionado deliberado y motor real del Bridge."
+      "fr": "La commande de transfert NODE reste à valider après son échec d’export. Partitionnement délibéré, réplication des univers, moteur réel du Bridge et exploitation de production restent ouverts.",
+      "en": "The NODE transfer command remains to be validated after its export failure. Deliberate partitioning, universe replication, a real Bridge engine and production operations remain open.",
+      "es": "El comando de traslado NODE sigue pendiente tras el fallo de exportación. Siguen abiertos particionado deliberado, replicación de universos, motor real del Bridge y operación en producción."
     }
   }
 }
