@@ -120,9 +120,9 @@
         "es": "Base MariaDB · laboratorio"
       },
       "labSummary": {
-        "fr": "Un export SQL cohérent est restauré dans une base privée indépendante et vide sur le même hôte. Les 5 tables, leurs 10 lignes et les 8 déclencheurs sont comparés intégralement avant utilisation ; aucune routine ni aucun événement présents. Après recréation, les 4 faits d’origine sont identiques, puis un cinquième est écrit et relu. UUID et configuration conservés ; identifiants SQL propres à la cible régénérés. Aucun fichier applicatif durable présent dans ce jeu. Source et cible arrêtées proprement, existant contrôlé préservé. Petit essai local : pas de déplacement interhôtes du manager, réplication, volumes arbitraires ou production qualifiés.",
-        "en": "A coherent SQL export is restored into an independent empty private database on the same host. All 5 tables, their 10 rows and 8 triggers match before use; no routines or events were present. After recreation, the 4 original facts remain identical, then a fifth is written and read. UUID and configuration retained; target-specific SQL credentials regenerated. No durable application payload file was present in this fixture. Source and target stopped cleanly, checked originals preserved. Small local test: no qualified cross-host manager move, replication, arbitrary volumes or production.",
-        "es": "Una exportación SQL coherente se restaura en una base privada independiente y vacía del mismo host. Las 5 tablas, sus 10 filas y 8 disparadores coinciden íntegramente antes del uso; no había rutinas ni eventos. Tras recreación, los 4 hechos originales permanecen idénticos y se escribe y lee un quinto. UUID y configuración conservados; credenciales SQL propias del destino regeneradas. Sin archivos aplicativos duraderos en este ensayo. Fuente y destino parados limpiamente, originales comprobados preservados. Pequeño ensayo local: sin validar traslado del manager entre hosts, replicación, volúmenes arbitrarios ni producción."
+        "fr": "Un export SQL cohérent est restauré dans une base privée indépendante et vide sur le même hôte. Les 5 tables, leurs 10 lignes et les 8 déclencheurs sont comparés intégralement avant utilisation ; aucune routine ni aucun événement présents. Après recréation, les 4 faits d’origine sont identiques, puis un cinquième est écrit et relu. UUID et configuration conservés ; identifiants SQL propres à la cible régénérés. Aucun fichier applicatif durable présent dans ce jeu. Source et cible arrêtées proprement, existant contrôlé préservé. Petit essai local : pas de déplacement interhôtes du manager, réplication, volumes arbitraires ou production qualifiés. Deux managers sur le même hôte ont aussi répliqué deux faits dans les deux sens, sans doublon.",
+        "en": "A coherent SQL export is restored into an independent empty private database on the same host. All 5 tables, their 10 rows and 8 triggers match before use; no routines or events were present. After recreation, the 4 original facts remain identical, then a fifth is written and read. UUID and configuration retained; target-specific SQL credentials regenerated. No durable application payload file was present in this fixture. Source and target stopped cleanly, checked originals preserved. Small local test: no qualified cross-host manager move, replication, arbitrary volumes or production. Two managers on the same host also replicated two facts in both directions without duplicates.",
+        "es": "Una exportación SQL coherente se restaura en una base privada independiente y vacía del mismo host. Las 5 tablas, sus 10 filas y 8 disparadores coinciden íntegramente antes del uso; no había rutinas ni eventos. Tras recreación, los 4 hechos originales permanecen idénticos y se escribe y lee un quinto. UUID y configuración conservados; credenciales SQL propias del destino regeneradas. Sin archivos aplicativos duraderos en este ensayo. Fuente y destino parados limpiamente, originales comprobados preservados. Pequeño ensayo local: sin validar traslado del manager entre hosts, replicación, volúmenes arbitrarios ni producción. Dos managers en el mismo host también replicaron dos hechos en ambos sentidos sin duplicados."
       },
       "labProofs": [
         "node-common",
@@ -131,7 +131,8 @@
         "canonical-process-recovery",
         "canonical-manager-persistence",
         "canonical-manager-process-recovery",
-        "canonical-manager-logical-restore"
+        "canonical-manager-logical-restore",
+        "canonical-manager-peer-replication"
       ],
       "qualificationNote": {
         "fr": "7/8 conserve le dénominateur du socle historique. Les nouveaux essais NODE canonique sont des preuves distinctes : une recréation propre et une reprise explicite après crash, pas une qualification globale, un redémarrage d’hôte ou des mois d’endurance.",
@@ -1107,9 +1108,27 @@
         "en": "A native backup of 8 files, 13 chunks and 29,180,049 bytes is restored from the authenticated PMBS server into an absent destination. The STATE adapter verifies all five roots, selected contents and declared metadata before starting five targets. The 2 completed Queue tasks, Vault values, 152-byte result, Logger prefix and Maestro files are retained. A new target Vault write/read and Logger event succeed. All 17 independent checks pass; targets and server stopped, checked originals unchanged. Same host, cached images and stopped state: no qualified cold-host recovery, remote disaster recovery, arbitrary volumes or general attributes. Vault remains plaintext, Queue uses SQLite and Bridge is health-only with no AI call.",
         "es": "Una copia nativa de 8 archivos, 13 chunks y 29 180 049 bytes se restaura desde el servidor PMBS autenticado en un destino inexistente. El adaptador de estado verifica las cinco raíces, todos los contenidos seleccionados y metadatos declarados antes de iniciar cinco destinos. Se conservan las 2 tareas Queue terminadas, valores Vault, resultado de 152 bytes, prefijo Logger y archivos Maestro. Funcionan una nueva escritura/lectura Vault y un evento Logger. Pasan los 17 controles independientes; destinos y servidor parados, originales comprobados sin cambios. Mismo host, imágenes en caché y estado parado: sin validar recuperación en host vacío, recuperación remota, volúmenes arbitrarios ni atributos generales. Vault sigue sin cifrar, Queue usa SQLite y Bridge solo ofrece salud, sin llamada IA."
       }
+    },
+    {
+      "id": "canonical-manager-peer-replication",
+      "date": "2026-10-24",
+      "version": "canonical-manager 01d603fa · native private SQL peers",
+      "kind": "scoped-native-runtime",
+      "runtimePass": true,
+      "productionQualified": false,
+      "title": {
+        "fr": "Managers : réplication native de deux faits dans les deux sens",
+        "en": "Managers: native two-way replication of two facts",
+        "es": "Managers: replicación nativa de dos hechos en ambos sentidos"
+      },
+      "summary": {
+        "fr": "Deux managers neufs, chacun avec sa MariaDB privée sans écoute TCP, échangent deux faits par le protocole natif authentifié. Chaque écriture est acquittée ; les historiques complets sont identiques, sans doublon, avec origines et séquences conservées. Les preuves réseau et reçus de commit se correspondent. Une assertion incorrecte du collecteur arrête ensuite le lot ; elle reste consignée, sans relance. Les deux unités sont arrêtées proprement et les contrôles de préservation des originaux passent. Deux répliques dans la même VM avec identités logiques de laboratoire : pas de domaines physiques distincts, de quorum à trois, de HA ni de qualification production. La recréation après réplication n’a pas été exécutée.",
+        "en": "Two fresh managers, each with private MariaDB and no SQL TCP listener, exchange two facts through the native authenticated protocol. Each write is acknowledged; complete histories match without duplicates, preserving origins and sequences. Network evidence links to commit receipts. An incorrect collector assertion then stops the lot; the error is retained without rerunning. Both units stop cleanly and original-state preservation checks pass. Two replicas in the same VM with logical laboratory host identities: no distinct physical failure domains, three-node quorum, HA or production qualification. Post-replication recreation was not executed.",
+        "es": "Dos managers nuevos, cada uno con MariaDB privada sin escucha SQL TCP, intercambian dos hechos mediante el protocolo nativo autenticado. Cada escritura se confirma; los historiales completos coinciden sin duplicados, conservando orígenes y secuencias. Las pruebas de red enlazan con los recibos de commit. Una aserción incorrecta del recolector detiene después el lote; el error se conserva sin repetirlo. Ambas unidades se paran correctamente y pasan los controles de preservación de los originales. Dos réplicas en la misma VM con identidades lógicas de laboratorio: sin dominios físicos distintos, quorum de tres, HA ni validación de producción. No se ejecutó la recreación posterior a la replicación."
+      }
     }
   ],
-  "updatedAtUTC": "2026-10-24T08:59:10.639290Z",
+  "updatedAtUTC": "2026-10-24T09:24:05.399138Z",
   "updatePolicy": "Publish only verified evidence changes; preserve historical lab achievements and version boundaries; never count in-progress code as validated.",
   "canonicalBoundary": {
     "state": "not_qualified",
@@ -1144,21 +1163,21 @@
   },
   "currentMilestone": {
     "state": "partial",
-    "proof": "pmbs-five-cell-state-restore",
+    "proof": "canonical-manager-peer-replication",
     "title": {
-      "fr": "Les cinq cellules Alpine restaurées par PMBS",
-      "en": "Five Alpine cells restored through PMBS",
-      "es": "Cinco células Alpine restauradas por PMBS"
+      "fr": "Managers : réplication native de deux faits dans les deux sens",
+      "en": "Managers: native two-way replication of two facts",
+      "es": "Managers: replicación nativa de dos hechos en ambos sentidos"
     },
     "summary": {
-      "fr": "Après sauvegarde et restauration authentifiées, les cinq cellules démarrent avec leur état conservé. Le coffre et le journal restaurés acceptent de nouvelles opérations. Le manager dispose aussi de sa preuve de restauration SQL. Ces résultats restent des périmètres de laboratoire distincts, sans qualification globale de production.",
-      "en": "After authenticated backup and restore, all five cells start with retained state. The restored vault and logger accept new operations. The manager also has SQL restore evidence. These remain distinct laboratory scopes without overall production qualification.",
-      "es": "Tras copia y restauración autenticadas, las cinco células arrancan con su estado conservado. El almacén y registro restaurados aceptan nuevas operaciones. El manager también tiene pruebas de restauración SQL. Son ámbitos distintos de laboratorio, sin validación global de producción."
+      "fr": "La réplication native entre deux managers à MariaDB privée est observée dans les deux sens sur le même hôte. La restauration des cinq cellules Alpine par PMBS reste acquise. Les périmètres restent distincts et ne constituent pas une qualification globale de production.",
+      "en": "Native replication between two private-MariaDB managers is observed in both directions on the same host. Five-cell Alpine restoration through PMBS remains acquired. These distinct scopes do not constitute overall production qualification.",
+      "es": "Se observa replicación nativa en ambos sentidos entre dos managers con MariaDB privada en el mismo host. Se mantiene la restauración PMBS de las cinco células Alpine. Son ámbitos distintos, sin validación global de producción."
     },
     "next": {
-      "fr": "Prochaines preuves : commande de transfert NODE utilisable et réplication MariaDB. Partitionnement délibéré, moteur réel du Bridge et exploitation de production restent ouverts.",
-      "en": "Next evidence: usable NODE transfer command and MariaDB replication. Deliberate partitioning, a real Bridge engine and production operations remain open.",
-      "es": "Próximas pruebas: comando utilizable de traslado NODE y replicación MariaDB. Siguen pendientes particionado deliberado, motor real del Bridge y operación en producción."
+      "fr": "La commande complète de transfert NODE reste à valider. Réplication entre hôtes, reprise après réplication, partitionnement délibéré et moteur réel du Bridge restent ouverts.",
+      "en": "The complete NODE transfer command remains to be validated. Cross-host replication, post-replication recovery, deliberate partitioning and a real Bridge engine remain open.",
+      "es": "El comando completo de traslado NODE sigue pendiente de validación. Siguen pendientes replicación entre hosts, recuperación tras replicación, particionado deliberado y motor real del Bridge."
     }
   }
 }
