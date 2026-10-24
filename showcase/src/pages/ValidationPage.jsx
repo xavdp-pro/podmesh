@@ -23,82 +23,131 @@ export default function ValidationPage({ locale = 'fr' }) {
   const heroLabels = {
     fr: {
       eyebrow: "Synthèse d'avancement",
-      title: 'Grandes fonctionnalités',
-      global: 'Couverture globale',
-      counted: 'critères validés'
+      title: "Grandes fonctionnalités",
+      global: "Couverture globale",
+      globalCardTitle: "Couverture globale vérifiée",
+      globalCardDesc: "Synthèse des 5 chantiers fonctionnels qualifiés sur le fer.",
+      viewAll: "Tous les critères"
     },
     en: {
-      eyebrow: 'Roadmap Progress',
-      title: 'Major Features',
-      global: 'Overall coverage',
-      counted: 'validated criteria'
+      eyebrow: "Roadmap Progress",
+      title: "Major Features",
+      global: "Overall coverage",
+      globalCardTitle: "Verified overall coverage",
+      globalCardDesc: "Summary of all 5 functional milestones qualified on iron.",
+      viewAll: "All criteria"
     },
     es: {
-      eyebrow: 'Resumen de avance',
-      title: 'Grandes funcionalidades',
-      global: 'Cobertura global',
-      counted: 'criterios validados'
+      eyebrow: "Resumen de avance",
+      title: "Grandes funcionalidades",
+      global: "Cobertura global",
+      globalCardTitle: "Cobertura global verificada",
+      globalCardDesc: "Resumen de las 5 metas funcionales calificadas en hierro real.",
+      viewAll: "Todos los criterios"
     }
   }[lang] || {
     eyebrow: "Synthèse d'avancement",
-    title: 'Grandes fonctionnalités',
-    global: 'Couverture globale',
-    counted: 'critères validés'
+    title: "Grandes fonctionnalités",
+    global: "Couverture globale",
+    globalCardTitle: "Couverture globale vérifiée",
+    globalCardDesc: "Synthèse des 5 chantiers fonctionnels qualifiés sur le fer.",
+    viewAll: "Tous les critères"
   }
 
   return (
     <article id="validation" tabIndex={-1} className="scroll-mt-24 space-y-9">
       {/* Barre de progression synthétique en début de page */}
       <section
-        className="rounded-2xl border border-line bg-surface p-5 sm:p-6 shadow-sm"
+        className="rounded-2xl border border-line bg-surface p-5 sm:p-7"
         aria-label={heroLabels.title}
         data-hero-progress
       >
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line pb-4 mb-4">
+        <div className="flex flex-wrap items-baseline justify-between gap-3 border-b border-line pb-5 mb-6">
           <div>
             <p className="text-xs font-semibold uppercase tracking-wider text-accent">{heroLabels.eyebrow}</p>
-            <h2 className="site-display mt-0.5 text-xl font-bold sm:text-2xl">{heroLabels.title}</h2>
+            <h2 className="site-display mt-1 text-2xl font-bold sm:text-3xl">{heroLabels.title}</h2>
           </div>
-          <div className="flex items-center gap-2.5 rounded-xl border border-accent/20 bg-accent/5 px-3.5 py-1.5 text-sm font-semibold text-accent">
+          <div className="flex items-center gap-2 rounded-xl border border-accent/20 bg-accent/5 px-4 py-2 text-sm font-semibold text-accent">
             <span>{heroLabels.global} :</span>
             <span className="text-lg font-bold tabular-nums">{overallPercentage}%</span>
             <span className="text-xs font-normal text-fg-muted">({totalValidated}/{totalChecks})</span>
           </div>
         </div>
 
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {snapshot.features.map((feature) => {
             const score = coverage(feature)
-            const blocking = feature.checks.some((criterion) => criterion.status === 'blocked')
+            const blocking = feature.checks.some((criterion) => criterion.status === "blocked")
             return (
               <a
                 key={feature.id}
                 href={`#validation-${feature.id}`}
-                className="group flex flex-col justify-between rounded-xl border border-line/70 bg-surface p-3.5 transition-all hover:border-accent hover:shadow-sm"
+                className="group flex flex-col justify-between rounded-xl border border-line bg-surface p-5 transition-all hover:border-accent hover:bg-surface-2/40"
               >
-                <div className="flex items-start justify-between gap-2">
-                  <span className="text-xs font-semibold text-fg transition-colors group-hover:text-accent line-clamp-1">
-                    {feature.name[lang]}
-                  </span>
-                  <span className={`text-sm font-bold tabular-nums ${blocking ? 'text-warm' : 'text-accent'}`}>
-                    {score.percentage}%
-                  </span>
+                <div>
+                  <div className="flex items-start justify-between gap-3">
+                    <h3 className="text-sm font-semibold text-fg transition-colors group-hover:text-accent">
+                      {feature.name[lang]}
+                    </h3>
+                    <span className={`text-base font-bold tabular-nums shrink-0 ${blocking ? "text-warm" : "text-accent"}`}>
+                      {score.percentage}%
+                    </span>
+                  </div>
+                  <p className="mt-1.5 text-xs leading-5 text-fg-muted">
+                    {feature.state[lang]}
+                  </p>
                 </div>
-                <div className="mt-3">
+                <div className="mt-4">
                   <progress
-                    className={`validation-progress h-2 w-full ${blocking ? 'text-warm' : 'text-accent'}`}
+                    className={`validation-progress h-2 w-full ${blocking ? "text-warm" : "text-accent"}`}
                     value={score.validated}
                     max={score.total}
                     aria-label={`${feature.name[lang]} : ${score.percentage}%`}
                   />
-                  <div className="mt-1.5 flex justify-between text-[11px] text-fg-faint">
-                    <span className="line-clamp-1">{feature.state[lang]}</span>
-                    <span className="shrink-0">{score.validated}/{score.total}</span>
+                  <div className="mt-2.5 flex items-center justify-between text-xs text-fg-faint">
+                    <span>{score.validated} / {score.total} {copy.counted}</span>
+                    <span className="font-semibold text-accent underline underline-offset-4 group-hover:text-accent-hover transition-colors">
+                      {copy.details} →
+                    </span>
                   </div>
                 </div>
               </a>
             )
           })}
+
+          {/* 6e carte : Synthèse globale */}
+          <a
+            href="#validation-criteria"
+            className="group flex flex-col justify-between rounded-xl border border-accent/30 bg-accent/5 p-5 transition-all hover:border-accent hover:bg-accent/10"
+          >
+            <div>
+              <div className="flex items-start justify-between gap-3">
+                <h3 className="text-sm font-semibold text-accent transition-colors">
+                  {heroLabels.globalCardTitle}
+                </h3>
+                <span className="text-base font-bold tabular-nums shrink-0 text-accent">
+                  {overallPercentage}%
+                </span>
+              </div>
+              <p className="mt-1.5 text-xs leading-5 text-fg-muted">
+                {heroLabels.globalCardDesc}
+              </p>
+            </div>
+            <div className="mt-4">
+              <progress
+                className="validation-progress h-2 w-full text-accent"
+                value={totalValidated}
+                max={totalChecks}
+                aria-label={`${heroLabels.global} : ${overallPercentage}%`}
+              />
+              <div className="mt-2.5 flex items-center justify-between text-xs text-fg-faint">
+                <span>{totalValidated} / {totalChecks} {copy.counted}</span>
+                <span className="font-semibold text-accent underline underline-offset-4 group-hover:text-accent-hover transition-colors">
+                  {heroLabels.viewAll} →
+                </span>
+              </div>
+            </div>
+          </a>
         </div>
       </section>
 
