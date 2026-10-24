@@ -405,3 +405,12 @@ This opt-in mode does not provide cross-host fencing, replication or automatic
 promotion. A changed provenance or relocated database needs its own explicit
 restore/upgrade procedure. The policy test alone does not establish native
 crash recovery or production support.
+
+## Planned manual logical restore helper — source only
+
+See [LOGICAL-TRANSFER.md](LOGICAL-TRANSFER.md) for the explicit root-only export
+and absent-target restore commands, bounded SQL/regular-file contract, credential
+rotation, existing host-adoption integration, failure retention and qualification
+limits. Capture requires an operator-established idle SQL/file checkpoint;
+cleanup evidence binds the current started container lifecycle. This candidate
+does not change ordinary startup or the NODE API.
