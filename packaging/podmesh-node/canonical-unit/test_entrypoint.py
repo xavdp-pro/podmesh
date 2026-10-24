@@ -137,6 +137,20 @@ class Contracts(unittest.TestCase):
             with self.assertRaises(u.Refusal):
                 s.verify_grants()
 
+    def test_routine_privilege_is_refused_via_procs_priv(self):
+        s = u.Supervisor()
+        s.record = {'system_accounts': [['root', 'localhost']]}
+        s.grants = {}
+        def response(statement):
+            if 'FROM mysql.global_priv' in statement:
+                return 'root\tlocalhost\npodmesh-node\tlocalhost\n'
+            if 'FROM mysql.procs_priv' in statement:
+                return 'malicious_procedure\n'
+            return ''
+        with patch.object(s, 'sql', side_effect=response):
+            with self.assertRaises(u.Refusal):
+                s.verify_grants()
+
     def test_owned_zombie_is_reaped_after_group_signaling_not_before(self):
         s = u.Supervisor()
         child = Mock(pid=12345, returncode=0, stdin=None, pending_input=b'')
