@@ -1,0 +1,24 @@
+{
+  "role": "manager",
+  "tables": {
+    "store_schema": [
+      "SELECT"
+    ],
+    "identity": [
+      "SELECT",
+      "INSERT"
+    ],
+    "facts": [
+      "SELECT",
+      "INSERT"
+    ],
+    "receipts": [
+      "SELECT",
+      "INSERT"
+    ],
+    "exchange_audit_events": [
+      "SELECT",
+      "INSERT"
+    ]
+  }
+}

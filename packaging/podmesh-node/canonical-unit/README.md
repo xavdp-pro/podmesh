@@ -388,3 +388,20 @@ old replay plus a new operation. A blank DB beside file-authoritative state is n
 compliance. No SQL dump/import, restore, retention, pruning or partition DDL is
 implemented here; use the table-specific data contract to select later UTC partitions
 without weakening global operation IDs. No production or full-candidate claim.
+
+
+## Explicit process recovery
+
+`entrypoint.py --recover-known-running` permits an operator to resume a recorded
+`running` birth after the previous exact container has stopped unexpectedly.
+The operator must first establish exclusive ownership of the durable directories
+and that the former actor is stopped. Keep the same artifact provenance, datadir
+identity and credential/profile files. Fresh, initializing, starting and failed
+births are refused. The record preserves its recovery origin; it is never
+relabeled as a clean shutdown. MariaDB starts normally against its existing data
+and performs its native recovery; no initialization or forced-recovery mode runs.
+
+This opt-in mode does not provide cross-host fencing, replication or automatic
+promotion. A changed provenance or relocated database needs its own explicit
+restore/upgrade procedure. The policy test alone does not establish native
+crash recovery or production support.

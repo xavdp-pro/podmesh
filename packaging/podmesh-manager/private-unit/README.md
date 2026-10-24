@@ -1,5 +1,10 @@
 # Private manager unit application wrapper
 
+For a new application + socket-only MariaDB **single-container** candidate, see
+[canonical-unit](../canonical-unit/README.md). This older application-only wrapper
+and its two-container delivery remain separate; their artifact manifests do not
+qualify the canonical recipe.
+
 This is a bounded candidate recipe, not an installer or a SHAPER integration
 claim. It reuses the exact CT-built `podmesh-managerd` binary, without compilation
 or downloads in the recipe. The base and the separate database container both use

@@ -1,0 +1,45 @@
+# NEW canonical-unit candidate only. Build offline on the declared build host; never pull/apt.
+FROM docker.io/library/mariadb@sha256:93fc3fe333b6cdfb061425869c2c3a5bb2851c0c74dbebc2c940f024e7482d76
+ARG MANAGER_BINARY_SHA256
+ARG ADMIN_BINARY_SHA256
+ARG SUPERVISOR_SHA256
+ARG GRANTS_SHA256
+ARG LIFECYCLE_SHA256
+ARG BINARY_SOURCE_REVISION
+ARG ADMIN_SOURCE_REVISION
+ARG RECIPE_REVISION
+ARG PYTHON_CLOSURE_SHA256
+ARG PYTHON_INSTALLER_SHA256
+USER root
+COPY python-closure/ /opt/podmesh-python-closure/
+COPY packaging/podmesh-node/canonical-unit/install-python-closure.sh /usr/lib/podmesh-manager-canonical/install-python-closure.sh
+# Verify the exact reusable installer before it parses/installs the signed local closure.
+RUN test "${#PYTHON_INSTALLER_SHA256}" -eq 64 \
+ && case "$PYTHON_INSTALLER_SHA256" in *[!0-9a-f]*) exit 1;; esac \
+ && printf '%s  %s\n' "$PYTHON_INSTALLER_SHA256" /usr/lib/podmesh-manager-canonical/install-python-closure.sh | sha256sum --check --strict - \
+ && /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C PODMESH_CANONICAL_IMAGE_BUILD=1 /bin/bash /usr/lib/podmesh-manager-canonical/install-python-closure.sh "$PYTHON_CLOSURE_SHA256"
+COPY podmesh-managerd podmesh-store-admin /usr/lib/podmesh-manager-canonical/
+COPY packaging/podmesh-manager/canonical-unit/entrypoint.py packaging/podmesh-manager/canonical-unit/grants.json /usr/lib/podmesh-manager-canonical/
+COPY packaging/podmesh-node/canonical-unit/entrypoint.py /usr/lib/podmesh-manager-canonical/lifecycle.py
+# Other helpers remain mandatory pre-existing base dependencies; Python is the verified local closure.
+RUN for dep in /usr/bin/python3 /usr/bin/setpriv /usr/bin/mariadb /usr/bin/mariadb-install-db /usr/sbin/mariadbd; do \
+      test -x "$dep" || { echo "canonical MANAGER missing base dependency: $dep" >&2; exit 1; }; done \
+ && command -v useradd && command -v groupadd && command -v getent && command -v cut \
+ && test "$(getent passwd mysql | cut -d: -f3)" -gt 0 \
+ && ! getent passwd 1103 && ! getent group 1103 \
+ && groupadd --gid 1103 podmesh-manager \
+ && useradd --uid 1103 --gid 1103 --home-dir /apps/podmesh-manager --no-create-home --shell /usr/sbin/nologin podmesh-manager \
+ && chmod 0555 /usr/lib/podmesh-manager-canonical/podmesh-managerd /usr/lib/podmesh-manager-canonical/podmesh-store-admin /usr/lib/podmesh-manager-canonical/entrypoint.py /usr/lib/podmesh-manager-canonical/lifecycle.py \
+ && chmod 0444 /usr/lib/podmesh-manager-canonical/grants.json
+# Never import/execute product binaries while constructing provenance.
+RUN MANAGER_BINARY_SHA256="$MANAGER_BINARY_SHA256" ADMIN_BINARY_SHA256="$ADMIN_BINARY_SHA256" \
+ SUPERVISOR_SHA256="$SUPERVISOR_SHA256" GRANTS_SHA256="$GRANTS_SHA256" LIFECYCLE_SHA256="$LIFECYCLE_SHA256" \
+ BINARY_SOURCE_REVISION="$BINARY_SOURCE_REVISION" ADMIN_SOURCE_REVISION="$ADMIN_SOURCE_REVISION" \
+ RECIPE_REVISION="$RECIPE_REVISION" PYTHON_CLOSURE_SHA256="$PYTHON_CLOSURE_SHA256" PYTHON_INSTALLER_SHA256="$PYTHON_INSTALLER_SHA256" /usr/bin/python3 -I -c 'import os,re,json,hashlib,pathlib,sys; assert hasattr(os,"WNOWAIT"); p=pathlib.Path("/usr/lib/podmesh-manager-canonical"); pairs={"podmesh-managerd":"MANAGER_BINARY_SHA256","podmesh-store-admin":"ADMIN_BINARY_SHA256","entrypoint.py":"SUPERVISOR_SHA256","grants.json":"GRANTS_SHA256","lifecycle.py":"LIFECYCLE_SHA256"}; hashes={n:os.environ[k] for n,k in pairs.items()}; assert all(re.fullmatch("[0-9a-f]{64}",h) and hashlib.sha256((p/n).read_bytes()).hexdigest()==h for n,h in hashes.items()); assert (pathlib.Path("/opt/podmesh-python-closure/installed.lock.sha256").read_text().strip()==os.environ["PYTHON_CLOSURE_SHA256"]); pins={k:os.environ[k] for k in ("BINARY_SOURCE_REVISION","ADMIN_SOURCE_REVISION","RECIPE_REVISION")}; assert all(re.fullmatch("[0-9a-f]{40}",v) for v in pins.values()); f=p/"provenance.json"; f.write_text(json.dumps({"sha256":hashes,"source":pins,"minimum_engine_stop_timeout_seconds":60,"python_closure_sha256":os.environ["PYTHON_CLOSURE_SHA256"],"python_installer_sha256":os.environ["PYTHON_INSTALLER_SHA256"],"python_version":sys.version},sort_keys=True)); f.chmod(0o444)'
+RUN mkdir -p /apps/podmesh-manager/app /apps/podmesh-manager/etc /apps/podmesh-manager/sav /apps/podmesh-manager/log /apps/podmesh-manager/nosav \
+ && chmod 0755 /apps /apps/podmesh-manager /apps/podmesh-manager/app /apps/podmesh-manager/etc /apps/podmesh-manager/sav /apps/podmesh-manager/log /apps/podmesh-manager/nosav /usr/lib/podmesh-manager-canonical
+# The inherited MariaDB /var/lib/mysql VOLUME is NEVER allowed to auto-materialize.
+# Native delivery MUST use --image-volume=ignore, explicit etc/sav mounts and fresh /run.
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/bin/python3", "-I", "/usr/lib/podmesh-manager-canonical/entrypoint.py"]
+CMD []
