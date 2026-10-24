@@ -461,15 +461,16 @@
         "es": "Criterios de restauración seguidos"
       },
       "labSummary": {
-        "fr": "Une sauvegarde native de 7 fichiers, puis une restauration depuis le serveur PMBS authentifié vers une destination absente, récupèrent l’export SQL cohérent et le fichier témoin. Le NODE restauré retrouve 40 tables/7 lignes, son UUID logique et le fichier ; une nouvelle écriture réussit après recréation propre. Les identifiants SQL de la cible sont régénérés explicitement. Même hôte, image déjà en cache, petit jeu de données : pas de copie de base active, de volumes arbitraires, d’attributs généraux, de reprise sur hôte vierge ni de secours distant qualifiés.",
-        "en": "Native backup of 7 files followed by restore from the authenticated PMBS server into an absent destination recovers the coherent SQL export and marker file. The restored NODE retains 40 tables/7 rows, logical UUID and file; a new write succeeds after clean recreation. Target SQL credentials are explicitly regenerated. Same host, cached image and small fixture: no qualified live database copy, arbitrary volumes, general attributes, cold-host recovery or remote disaster recovery.",
-        "es": "Una copia nativa de 7 archivos seguida de restauración desde el servidor PMBS autenticado hacia un destino inexistente recupera la exportación SQL coherente y el archivo testigo. El NODE conserva 40 tablas/7 filas, UUID lógico y archivo; una nueva escritura funciona tras recreación limpia. Las credenciales SQL destino se regeneran explícitamente. Mismo host, imagen en caché y datos pequeños: sin validar copia de base activa, volúmenes arbitrarios, atributos generales, recuperación en host vacío ni recuperación remota."
+        "fr": "Une sauvegarde native de 8 fichiers, 13 chunks et 29 180 049 octets est restaurée depuis le serveur PMBS authentifié vers une destination absente. L’adaptateur d’état vérifie les cinq racines, tous les contenus sélectionnés et les métadonnées déclarées avant de démarrer les cinq cibles. Les 2 tâches Queue terminées, les valeurs Vault, le résultat de 152 octets, le préfixe Logger et les fichiers Maestro sont conservés. Une nouvelle écriture/lecture Vault et un nouvel événement Logger réussissent sur la cible. Les 17 contrôles indépendants passent ; cibles et serveur arrêtés, originaux contrôlés inchangés. Même hôte, images déjà en cache et état arrêté : pas de reprise sur hôte vierge, secours distant, volumes arbitraires ou attributs généraux qualifiés. Vault reste en clair, Queue sous SQLite et Bridge limité à sa santé, sans appel IA.",
+        "en": "A native backup of 8 files, 13 chunks and 29,180,049 bytes is restored from the authenticated PMBS server into an absent destination. The STATE adapter verifies all five roots, selected contents and declared metadata before starting five targets. The 2 completed Queue tasks, Vault values, 152-byte result, Logger prefix and Maestro files are retained. A new target Vault write/read and Logger event succeed. All 17 independent checks pass; targets and server stopped, checked originals unchanged. Same host, cached images and stopped state: no qualified cold-host recovery, remote disaster recovery, arbitrary volumes or general attributes. Vault remains plaintext, Queue uses SQLite and Bridge is health-only with no AI call.",
+        "es": "Una copia nativa de 8 archivos, 13 chunks y 29 180 049 bytes se restaura desde el servidor PMBS autenticado en un destino inexistente. El adaptador de estado verifica las cinco raíces, todos los contenidos seleccionados y metadatos declarados antes de iniciar cinco destinos. Se conservan las 2 tareas Queue terminadas, valores Vault, resultado de 152 bytes, prefijo Logger y archivos Maestro. Funcionan una nueva escritura/lectura Vault y un evento Logger. Pasan los 17 controles independientes; destinos y servidor parados, originales comprobados sin cambios. Mismo host, imágenes en caché y estado parado: sin validar recuperación en host vacío, recuperación remota, volúmenes arbitrarios ni atributos generales. Vault sigue sin cifrar, Queue usa SQLite y Bridge solo ofrece salud, sin llamada IA."
       },
       "labProofs": [
         "pmbs-native-backup",
         "pmbs-native",
         "pmbs-server",
-        "pmbs-canonical-node-restore"
+        "pmbs-canonical-node-restore",
+        "pmbs-five-cell-state-restore"
       ]
     },
     {
@@ -584,7 +585,8 @@
       "labProofs": [
         "shaper-useful",
         "alpine-stem-cell-core",
-        "alpine-stem-cell-restart"
+        "alpine-stem-cell-restart",
+        "pmbs-five-cell-state-restore"
       ]
     }
   ],
@@ -1087,9 +1089,27 @@
         "en": "The five existing cells restart on their retained state with only one changed Maestro image. TERM during actual IPC waiting and INT during timed waiting both exit0. Within the cell, normal Podman stop of Maestro takes about 0.087 seconds without SIGKILL. The 2 completed Queue tasks, Vault contents, 152-byte result, schedule markers and Logger prefix are retained without replaying producers. All actors stopped and checked originals preserved. Queue remains SQLite WAL, Vault remains plaintext JSON and Bridge still does not invoke a real engine: no qualified inference, vault encryption, complete PMBS restore, HA or production.",
         "es": "Las cinco células existentes reinician con su estado conservado y una sola imagen Maestro corregida. TERM durante espera IPC real e INT durante espera temporizada terminan con código0. En la célula, la parada Podman normal de Maestro tarda unos 0,087 segundos, sin SIGKILL. Se conservan las 2 tareas Queue terminadas, contenido Vault, resultado de 152 bytes, marcadores de planificación y prefijo Logger, sin repetir productores. Actores parados y originales comprobados preservados. Queue sigue en SQLite WAL, Vault en JSON sin cifrar y Bridge aún no llama a un motor real: sin validar inferencia, cifrado, restauración PMBS completa, HA ni producción."
       }
+    },
+    {
+      "id": "pmbs-five-cell-state-restore",
+      "date": "2026-10-24",
+      "version": "PMBS30c8d21 · five-cell STATE adapter",
+      "kind": "scoped-native-runtime",
+      "runtimePass": true,
+      "productionQualified": false,
+      "title": {
+        "fr": "PMBS : restauration des cinq cellules Alpine et opérations utiles",
+        "en": "PMBS: five Alpine cells restored and useful operations",
+        "es": "PMBS: restauración de cinco células Alpine y operaciones útiles"
+      },
+      "summary": {
+        "fr": "Une sauvegarde native de 8 fichiers, 13 chunks et 29 180 049 octets est restaurée depuis le serveur PMBS authentifié vers une destination absente. L’adaptateur d’état vérifie les cinq racines, tous les contenus sélectionnés et les métadonnées déclarées avant de démarrer les cinq cibles. Les 2 tâches Queue terminées, les valeurs Vault, le résultat de 152 octets, le préfixe Logger et les fichiers Maestro sont conservés. Une nouvelle écriture/lecture Vault et un nouvel événement Logger réussissent sur la cible. Les 17 contrôles indépendants passent ; cibles et serveur arrêtés, originaux contrôlés inchangés. Même hôte, images déjà en cache et état arrêté : pas de reprise sur hôte vierge, secours distant, volumes arbitraires ou attributs généraux qualifiés. Vault reste en clair, Queue sous SQLite et Bridge limité à sa santé, sans appel IA.",
+        "en": "A native backup of 8 files, 13 chunks and 29,180,049 bytes is restored from the authenticated PMBS server into an absent destination. The STATE adapter verifies all five roots, selected contents and declared metadata before starting five targets. The 2 completed Queue tasks, Vault values, 152-byte result, Logger prefix and Maestro files are retained. A new target Vault write/read and Logger event succeed. All 17 independent checks pass; targets and server stopped, checked originals unchanged. Same host, cached images and stopped state: no qualified cold-host recovery, remote disaster recovery, arbitrary volumes or general attributes. Vault remains plaintext, Queue uses SQLite and Bridge is health-only with no AI call.",
+        "es": "Una copia nativa de 8 archivos, 13 chunks y 29 180 049 bytes se restaura desde el servidor PMBS autenticado en un destino inexistente. El adaptador de estado verifica las cinco raíces, todos los contenidos seleccionados y metadatos declarados antes de iniciar cinco destinos. Se conservan las 2 tareas Queue terminadas, valores Vault, resultado de 152 bytes, prefijo Logger y archivos Maestro. Funcionan una nueva escritura/lectura Vault y un evento Logger. Pasan los 17 controles independientes; destinos y servidor parados, originales comprobados sin cambios. Mismo host, imágenes en caché y estado parado: sin validar recuperación en host vacío, recuperación remota, volúmenes arbitrarios ni atributos generales. Vault sigue sin cifrar, Queue usa SQLite y Bridge solo ofrece salud, sin llamada IA."
+      }
     }
   ],
-  "updatedAtUTC": "2026-10-24T08:36:16.155393Z",
+  "updatedAtUTC": "2026-10-24T08:59:10.639290Z",
   "updatePolicy": "Publish only verified evidence changes; preserve historical lab achievements and version boundaries; never count in-progress code as validated.",
   "canonicalBoundary": {
     "state": "not_qualified",
@@ -1124,21 +1144,21 @@
   },
   "currentMilestone": {
     "state": "partial",
-    "proof": "canonical-manager-logical-restore",
+    "proof": "pmbs-five-cell-state-restore",
     "title": {
-      "fr": "Manager restauré ; cellules Alpine redémarrées sur leur état",
-      "en": "Manager restored; Alpine cells restarted on retained state",
-      "es": "Manager restaurado; células Alpine reiniciadas con su estado"
+      "fr": "Les cinq cellules Alpine restaurées par PMBS",
+      "en": "Five Alpine cells restored through PMBS",
+      "es": "Cinco células Alpine restauradas por PMBS"
     },
     "summary": {
-      "fr": "Le manager retrouve son historique après restauration SQL et recréation, puis accepte une nouvelle écriture. Les cinq cellules Alpine redémarrent sans perdre leur état et Maestro s’arrête normalement. Ce sont des preuves de laboratoire délimitées, pas une qualification de production.",
-      "en": "The manager retains its history after SQL restore and recreation, then accepts a new write. The five Alpine cells restart without losing their state and Maestro stops normally. These are scoped laboratory results, not production qualification.",
-      "es": "El manager conserva su historial tras restauración SQL y recreación, y acepta una nueva escritura. Las cinco células Alpine reinician conservando su estado y Maestro para normalmente. Resultados limitados de laboratorio, sin validar producción."
+      "fr": "Après sauvegarde et restauration authentifiées, les cinq cellules démarrent avec leur état conservé. Le coffre et le journal restaurés acceptent de nouvelles opérations. Le manager dispose aussi de sa preuve de restauration SQL. Ces résultats restent des périmètres de laboratoire distincts, sans qualification globale de production.",
+      "en": "After authenticated backup and restore, all five cells start with retained state. The restored vault and logger accept new operations. The manager also has SQL restore evidence. These remain distinct laboratory scopes without overall production qualification.",
+      "es": "Tras copia y restauración autenticadas, las cinco células arrancan con su estado conservado. El almacén y registro restaurados aceptan nuevas operaciones. El manager también tiene pruebas de restauración SQL. Son ámbitos distintos de laboratorio, sin validación global de producción."
     },
     "next": {
-      "fr": "En cours : restauration PMBS des cinq cellules et commande de transfert NODE utilisable. Réplication MariaDB continue, partitionnement délibéré et moteur réel du Bridge restent à qualifier.",
-      "en": "In progress: five-cell PMBS restore and a usable NODE transfer command. Continuous MariaDB replication, deliberate partitioning and a real Bridge engine remain to qualify.",
-      "es": "En curso: restauración PMBS de cinco células y comando utilizable de traslado NODE. Siguen por validar replicación MariaDB continua, particionado deliberado y motor real del Bridge."
+      "fr": "Prochaines preuves : commande de transfert NODE utilisable et réplication MariaDB. Partitionnement délibéré, moteur réel du Bridge et exploitation de production restent ouverts.",
+      "en": "Next evidence: usable NODE transfer command and MariaDB replication. Deliberate partitioning, a real Bridge engine and production operations remain open.",
+      "es": "Próximas pruebas: comando utilizable de traslado NODE y replicación MariaDB. Siguen pendientes particionado deliberado, motor real del Bridge y operación en producción."
     }
   }
 }
