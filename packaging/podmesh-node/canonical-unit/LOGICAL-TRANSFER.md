@@ -1,9 +1,10 @@
 # Planned manual canonical NODE logical restore — unqualified source candidate
 
-This root administrative helper exposes two finite commands, `export` and
-`restore`. It uses the canonical NODE image, its actual store profile and private
+This root administrative helper exposes finite `export`, `restore`, and
+`seal-source` commands. It uses the canonical NODE image, its actual store profile and private
 MariaDB, and the external real host provider. It changes no NODE API, daemon,
-entrypoint, MANAGER interface or private-unit delivery controller. The old
+MANAGER interface or private-unit delivery controller. The seal-capable canonical
+entrypoint adds an early local startup refusal. The old
 `delivery/instance.py` controls a different private-unit layout and cannot restore
 this canonical single-container layout; it is deliberately not reused as an engine.
 
@@ -56,6 +57,11 @@ its import and temporary target lifecycles, and throughout any later target use.
 Export resumes the source APP; the operator must perform and verify the separate
 source stop under its lifecycle authority before a duplicate target is restored.
 The helper does not establish or remotely verify exclusive live ownership.
+For a seal-capable source artifact, the separate root `seal-source` command can
+persistently block its local canonical entrypoint after export and clean stop.
+See [SOURCE-SEAL.md](SOURCE-SEAL.md) for exact source/incarnation binding, the
+fail-closed commit and separate recovery conditions. This local stop guard does
+not prove remote fencing or turn logical copy/restore into a completed move.
 
 ## Required idle checkpoint contract
 
@@ -90,8 +96,10 @@ container's Python through local `podman exec`; it need not be built into the
 image. Use an exact locally cached canonical image containing the adopted
 entrypoint and matching immutable provenance, with no code overlays or anonymous
 image volumes. The image is never pulled, rebuilt or imported by this command.
-This candidate requires embedded entrypoint SHA256
-`2490cd272725d53dc341c7056cbf0a1817449f83119e0a42119f3c9d5ca22f22`.
+Export/restore retain the exact accepted adoption and monthly entrypoint pins
+and additionally accept the seal-capable entrypoint SHA256
+`9cd57eaa579201d6a9f4d3d4a10a4b59781c1d07db8c258b23ce2a5e5b479ac8`.
+Only this new pin can authorize `seal-source`; see SOURCE-SEAL.md.
 An older base image ID alone is insufficient, even if it was used successfully
 with a temporary entrypoint mount in a separate procedure. Build/freeze the exact
 derived artifact separately and use its resulting image ID for both source and

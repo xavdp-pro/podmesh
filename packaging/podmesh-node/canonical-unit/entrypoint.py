@@ -62,6 +62,25 @@ def protected(path, uid=0, mode=None, kind='dir'):
     return m
 
 
+def refuse_source_seal():
+    """Presence is authoritative, including a partial or malformed exclusive commit.
+
+    Read before layout, diagnostics or birth loading. Never rewrite the existing ledger.
+    Only root may separately recover a sealed source; no entrypoint mode bypasses this.
+    """
+    protected(SAV, 0, 0o755)
+    try:
+        STATE.lstat()
+    except FileNotFoundError:
+        return  # A fresh unsealed unit has no admin state yet.
+    protected(STATE, 0, 0o700)
+    try:
+        (STATE / 'source-seal.json').lstat()
+    except FileNotFoundError:
+        return
+    raise Refusal('source sealed for planned cold handoff; explicit separate recovery required')
+
+
 def owned_directory(path, uid, gid, mode):
     path = Path(path)
     if not path.exists() and not path.is_symlink():
@@ -582,6 +601,7 @@ class Supervisor:
                 self.record['process_recovery'] = {'from_phase': 'running',
                                                    'mode': 'explicit-native-mariadb-redo'}
         self.record['configuration'] = fingerprint
+        self.record['lifecycle_id'] = secrets.token_hex(32)
         self.record['phase'] = 'starting'
         durable_state(self.record)
         exclusive_file(ADMIN / 'client.cnf', '[client]\nprotocol=socket\nuser=root\nsocket=' + str(DBSOCK)
@@ -817,6 +837,7 @@ def main():
     signal.signal(signal.SIGTERM, signal_stop)
     signal.signal(signal.SIGINT, signal_stop)
     try:
+        refuse_source_seal()
         supervisor.layout()
         supervisor.birth()
         supervisor.supervise()

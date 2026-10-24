@@ -21,6 +21,7 @@ FORMAT = 'podmesh.canonical-logical-export/v1'
 BOOTSTRAP_DIRS = ('inbox', 'outbox', 'migrations', 'podman-tmp')
 ADOPTION_ENTRYPOINT_SHA256 = '2490cd272725d53dc341c7056cbf0a1817449f83119e0a42119f3c9d5ca22f22'
 MONTHLY_ENTRYPOINT_SHA256 = '0c32bca847f039334c62c5f2f8e3bce491db51b2fe142b56226744b3bd635299'
+FENCED_ENTRYPOINT_SHA256 = '9cd57eaa579201d6a9f4d3d4a10a4b59781c1d07db8c258b23ce2a5e5b479ac8'
 ARTIFACT_DEST = '/usr/lib/podmesh-node-canonical'
 LIMIT = 16 * 1024 * 1024
 ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8'}
@@ -421,6 +422,134 @@ def load_bundle(path):
     return m, data, saved
 
 
+def document_sha256(value):
+    return sha(json.dumps(value, sort_keys=True, separators=(',', ':')).encode())
+
+
+def seal_read(path, uid=0, mode=0o600):
+    """Bounded private read, including the one app-owned credential leaf."""
+    path = Path(path)
+    protected(path.parent, True)
+    before = path.lstat()
+    need(stat.S_ISREG(before.st_mode) and before.st_uid == uid
+         and stat.S_IMODE(before.st_mode) == mode and before.st_nlink == 1,
+         'source private file type/owner/mode differs')
+    def identity(m):
+        return (m.st_dev, m.st_ino, m.st_size, m.st_mtime_ns, m.st_ctime_ns)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        need(identity(before) == identity(os.fstat(stream.fileno())), 'source private file replaced')
+        data = stream.read(LIMIT + 1)
+        need(len(data) <= LIMIT and identity(before) == identity(os.fstat(stream.fileno()))
+             and identity(before) == identity(path.lstat()), 'source private file changed/oversized')
+    return data
+
+
+def source_configuration(config):
+    etc = Path(config['etc_root'])
+    return {'/apps/podmesh-node/etc/' + name: sha(seal_read(etc / name, uid, mode))
+            for name, uid, mode in [('mysql/localhost/passwd', 1102, 0o600),
+                                    ('admin/passwd', 0, 0o600), ('store.json', 0, 0o440)]}
+
+
+def stopped_source(node, source, manifest):
+    i = node.validate()  # Reuses the closed explicit mount/image/entrypoint contract.
+    state = i['State']
+    need(i['Id'] == source['container_id']
+         and i.get('Name', '').lstrip('/') == node.c['container'], 'source container identity differs')
+    need(state['Running'] is False and state['Pid'] == 0 and state['ExitCode'] == 0
+         and state.get('Status') == 'exited' and not state.get('Paused')
+         and not state.get('Restarting') and not state.get('OOMKilled') and not state.get('Error')
+         and state.get('StartedAt') == source['started_at']
+         and isinstance(state.get('FinishedAt'), str) and state['FinishedAt']
+         and not state['FinishedAt'].startswith('0001-'),
+         'source is not the exported incarnation cleanly stopped')
+    sav = Path(node.c['sav_root'])
+    protected(sav, True)
+    admin = protected(sav / 'admin', True)
+    need(stat.S_IMODE(admin.stat().st_mode) == 0o700, 'source admin directory must be root0700')
+    data = seal_read(admin / 'birth.json')
+    birth = json.loads(data)
+    need(birth.get('phase') == 'stopped-clean' and birth.get('lifecycle_id') == source['lifecycle_id']
+         and birth.get('datadir') == source['datadir'], 'clean stopped birth/incarnation differs')
+    need(birth.get('provenance') == manifest['provenance']
+         and birth.get('configuration') == manifest['configuration_sha256'],
+         'source stopped artifact/configuration differs from export')
+    need(birth['provenance']['sha256']['entrypoint.py'] == FENCED_ENTRYPOINT_SHA256,
+         'source artifact cannot enforce persistent seal; no hash bypass')
+    datadir = (sav / 'mariadb').lstat()
+    need(stat.S_ISDIR(datadir.st_mode) and [datadir.st_dev, datadir.st_ino] == source['datadir'],
+         'source datadir identity differs')
+    need(source_configuration(node.c) == manifest['configuration_sha256'],
+         'source credential/profile bytes differ from export')
+    return {'birth_sha256': sha(data), 'engine': {k: state.get(k) for k in
+            ('Status', 'Running', 'Pid', 'ExitCode', 'StartedAt', 'FinishedAt', 'OOMKilled')}}
+
+
+def seal_source(node, bundle, receipt_path):
+    """Local planned cold handoff only. Never stops, resumes, restores or unseals anything."""
+    _stage('seal.prepare')
+    need(os.getuid() == 0 and os.geteuid() == 0, 'source seal requires real/effective root')
+    manifest, _sql, _files = load_bundle(bundle)
+    source = manifest.get('source')
+    need(isinstance(source, dict) and set(source) == {'config', 'container_id', 'started_at',
+         'datadir', 'lifecycle_id', 'running_birth_sha256'}, 'export lacks exact source-incarnation binding')
+    need(source['config'] == node.c and manifest['image'] == node.c['image'],
+         'bundle belongs to another source configuration/image')
+    need(re.fullmatch(r'[0-9a-f]{64}', source['container_id'])
+         and re.fullmatch(r'[0-9a-f]{64}', source['lifecycle_id'])
+         and re.fullmatch(r'[0-9a-f]{64}', source['running_birth_sha256'])
+         and isinstance(source['started_at'], str) and source['started_at']
+         and not source['started_at'].startswith('0001-'),
+         'invalid exported source incarnation')
+    need(manifest['provenance']['sha256']['entrypoint.py'] == FENCED_ENTRYPOINT_SHA256
+         and manifest['native_worker_sha256'] == sha(node.worker.encode()),
+         'source export must use exact seal-capable artifact/helper')
+    identity = manifest['inventory']['identity']
+    need(set(identity) == {'host_uuid', 'machine_id_sha256'}
+         and re.fullmatch(r'[0-9a-f]{64}', identity['machine_id_sha256'])
+         and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', identity['host_uuid']),
+         'source export identity is invalid')
+    bundle = protected(bundle, True)
+    manifest_bytes = seal_read(bundle / 'manifest.json')
+    need(json.loads(manifest_bytes) == manifest, 'bundle manifest changed during validation')
+    receipt_path = absent(receipt_path)
+    for root in [bundle, *(Path(node.c[k]) for k in ('etc_root', 'sav_root', 'provider_dir')),
+                 *([Path(node.c['artifact_root'])] if 'artifact_root' in node.c else [])]:
+        need(root != receipt_path and root not in receipt_path.parents, 'receipt must be outside source/bundle roots')
+    node.cid = source['container_id']
+    admin = protected(Path(node.c['sav_root']) / 'admin', True)
+    seal = absent(admin / 'source-seal.json')
+    # Existing export lock, never a new replacement. Operator excludes lifecycle/root competitors.
+    lock_path = protected(admin / 'logical-transfer.lock')
+    need(stat.S_IMODE(lock_path.stat().st_mode) == 0o600, 'source transfer lock mode differs')
+    fd = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'a+b') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _stage('seal.validate-stopped')
+        stopped = stopped_source(node, source, manifest)
+        record = {'format': 'podmesh.canonical-source-seal/v1', 'status': 'source-sealed',
+                  'source': source, 'source_identity': identity,
+                  'bundle_manifest_sha256': sha(manifest_bytes), 'sql': manifest['sql'],
+                  'configuration_sha256': manifest['configuration_sha256'],
+                  'provenance': manifest['provenance'], 'stopped': stopped,
+                  'sealed_at': int(time.time())}
+        need(stopped_source(node, source, manifest) == stopped, 'source changed before seal commit')
+        need(seal_read(bundle / 'manifest.json') == manifest_bytes, 'bundle changed before seal commit')
+        need(len((json.dumps(record, sort_keys=True, indent=2) + '\n').encode()) <= LIMIT,
+             'source seal exceeds explicit administrative payload bound')
+        _stage('seal.commit')
+        # O_EXCL + file fsync + parent fsync. Partial files remain authoritative refusal markers.
+        json_new(seal, record)
+    _stage('seal.receipt')
+    receipt = {'status': 'SOURCE_SEALED_LOCAL_COLD_HANDOFF', 'seal': str(seal),
+               'seal_sha256': sha(seal_read(seal)), 'bundle_manifest_sha256': sha(manifest_bytes),
+               'source_identity': identity, 'container_id': source['container_id']}
+    json_new(receipt_path, receipt)
+    return receipt
+
+
+
 def adoption_delta(before, after, target, request):
     need(after['identity'] == {'host_uuid': before['identity']['host_uuid'],
                               'machine_id_sha256': target}, 'restored identity differs')
@@ -440,7 +569,7 @@ def adoption_delta(before, after, target, request):
 def restore_artifact(manifest, image):
     need(manifest['image'] == image, 'restore requires the same exact cached image')
     need(manifest['provenance']['sha256']['entrypoint.py'] in
-         (ADOPTION_ENTRYPOINT_SHA256, MONTHLY_ENTRYPOINT_SHA256),
+         (ADOPTION_ENTRYPOINT_SHA256, MONTHLY_ENTRYPOINT_SHA256, FENCED_ENTRYPOINT_SHA256),
          'image must embed the pinned adoption entrypoint; an old base ID is insufficient')
 
 
@@ -487,6 +616,16 @@ def export(node, output, names):
                 'provenance': value['birth']['provenance'],
                 'configuration_sha256': value['birth']['configuration'],
                 'native_worker_sha256': sha(node.worker.encode()), 'created_at': int(time.time())}
+    if value['birth']['provenance']['sha256']['entrypoint.py'] == FENCED_ENTRYPOINT_SHA256:
+        current = node.validate()
+        need(current['Id'] == node.cid and current['State']['Running']
+             and current['State']['StartedAt'] == i['State']['StartedAt'], 'source incarnation changed during export')
+        lifecycle = value['birth'].get('lifecycle_id')
+        need(isinstance(lifecycle, str) and re.fullmatch(r'[0-9a-f]{64}', lifecycle),
+             'seal-capable source must record its current incarnation')
+        manifest['source'] = {'config': dict(node.c), 'container_id': node.cid,
+                              'started_at': i['State']['StartedAt'], 'datadir': value['birth']['datadir'],
+                              'lifecycle_id': lifecycle, 'running_birth_sha256': document_sha256(value['birth'])}
     # Completion is published last; partial directories are retained and not restorable.
     _stage('export.publish-manifest')
     json_new(output / 'manifest.json', manifest)
@@ -605,6 +744,9 @@ def main():
     res.add_argument('--bundle', required=True, type=Path)
     res.add_argument('--receipt', required=True, type=Path)
     res.add_argument('--adopt-restored-host-identity', action='store_true')
+    seal = sub.add_parser('seal-source')
+    seal.add_argument('--bundle', required=True, type=Path)
+    seal.add_argument('--receipt', required=True, type=Path)
     args = parser.parse_args()
     need(os.getuid() == 0 and os.getgid() == 0, 'root administration only')
     need(args.max_payload_bytes > 0, 'positive explicit payload limit required')
@@ -616,6 +758,8 @@ def main():
     node = Node(config)
     if args.command == 'export':
         result = export(node, args.output, args.saved_file)
+    elif args.command == 'seal-source':
+        result = seal_source(node, args.bundle, args.receipt)
     else:
         result = restore(node, args.bundle, args.receipt, args.adopt_restored_host_identity)
     print(json.dumps(result))
