@@ -20,6 +20,8 @@ LABEL = 'io.podmesh.logical-restore'
 FORMAT = 'podmesh.canonical-logical-export/v1'
 BOOTSTRAP_DIRS = ('inbox', 'outbox', 'migrations', 'podman-tmp')
 ADOPTION_ENTRYPOINT_SHA256 = '2490cd272725d53dc341c7056cbf0a1817449f83119e0a42119f3c9d5ca22f22'
+MONTHLY_ENTRYPOINT_SHA256 = '0c32bca847f039334c62c5f2f8e3bce491db51b2fe142b56226744b3bd635299'
+ARTIFACT_DEST = '/usr/lib/podmesh-node-canonical'
 LIMIT = 16 * 1024 * 1024
 ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8'}
 
@@ -135,19 +137,23 @@ def configuration(path):
     path = protected(path)
     need(stat.S_IMODE(path.stat().st_mode) == 0o600, 'configuration must be root0600')
     c = json.loads(path.read_text())
-    need(set(c) == {'container', 'image', 'etc_root', 'sav_root', 'provider_dir'},
+    required = {'container', 'image', 'etc_root', 'sav_root', 'provider_dir'}
+    need(set(c) in (required, required | {'artifact_root'}),
          'configuration fields differ')
     need(re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}', c['container']), 'invalid container name')
     c['image'] = c['image'].removeprefix('sha256:')
     need(re.fullmatch(r'[0-9a-f]{64}', c['image']), 'exact cached image ID required')
-    for key in ('etc_root', 'sav_root', 'provider_dir'):
+    keys = ('etc_root', 'sav_root', 'provider_dir') + (('artifact_root',) if 'artifact_root' in c else ())
+    for key in keys:
         need(isinstance(c[key], str) and Path(c[key]).is_absolute()
              and str(Path(c[key])) == c[key] and '..' not in Path(c[key]).parts
              and ':' not in c[key] and ',' not in c[key], 'unsafe explicit path')
-    roots = [Path(c[k]) for k in ('etc_root', 'sav_root', 'provider_dir')]
+    roots = [Path(c[k]) for k in keys]
     need(all(a != b and a not in b.parents and b not in a.parents
              for i, a in enumerate(roots) for b in roots[i + 1:]), 'owned/provider roots overlap')
     protected(c['provider_dir'], True)
+    if 'artifact_root' in c:
+        protected(c['artifact_root'], True)
     return c
 
 
@@ -216,9 +222,15 @@ class Node:
              and h.get('PidMode', '') in ('', 'private') and h.get('IpcMode', '') != 'host',
              'private container boundary differs')
         mounts = {m['Destination']: m for m in i['Mounts']}
+        expected_mounts = {'/apps/podmesh-node/etc', '/apps/podmesh-node/sav', '/run/podmesh-host'}
+        if 'artifact_root' in self.c:
+            expected_mounts.add(ARTIFACT_DEST)
+            artifact = mounts.get(ARTIFACT_DEST, {})
+            need(artifact.get('Type') == 'bind' and artifact.get('Source') == self.c['artifact_root']
+                 and artifact.get('RW') is False, 'exact read-only canonical artifacts required')
+            protected(self.c['artifact_root'], True)
         # Native Podman reports --tmpfs in HostConfig.Tmpfs, separately from bind Mounts.
-        need(set(mounts) == {'/apps/podmesh-node/etc', '/apps/podmesh-node/sav',
-                             '/run/podmesh-host'}, 'undeclared mount or inherited image volume')
+        need(set(mounts) == expected_mounts, 'undeclared mount or inherited image volume')
         for key, dest, rw in [('etc_root', '/apps/podmesh-node/etc', True),
                               ('sav_root', '/apps/podmesh-node/sav', True),
                               ('provider_dir', '/run/podmesh-host', False)]:
@@ -256,6 +268,8 @@ class Node:
                                   ('sav_root', '/apps/podmesh-node/sav', 'rw'),
                                   ('provider_dir', '/run/podmesh-host', 'ro')]:
             args += ['--volume', self.c[key] + ':' + dest + ':' + access]
+        if 'artifact_root' in self.c:
+            args += ['--volume', self.c['artifact_root'] + ':' + ARTIFACT_DEST + ':ro']
         args += [self.c['image']]
         if adopt:
             args += ['--adopt-restored-host-identity']
@@ -425,7 +439,8 @@ def adoption_delta(before, after, target, request):
 
 def restore_artifact(manifest, image):
     need(manifest['image'] == image, 'restore requires the same exact cached image')
-    need(manifest['provenance']['sha256']['entrypoint.py'] == ADOPTION_ENTRYPOINT_SHA256,
+    need(manifest['provenance']['sha256']['entrypoint.py'] in
+         (ADOPTION_ENTRYPOINT_SHA256, MONTHLY_ENTRYPOINT_SHA256),
          'image must embed the pinned adoption entrypoint; an old base ID is insufficient')
 
 

@@ -22,6 +22,7 @@ ADMIN = HOME / 'sav/admin'
 RUNTIME = Path('/run/podmesh-node/admin')
 LIB = Path('/usr/lib/podmesh-node-canonical')
 ADOPTION_ENTRYPOINT_SHA256 = '2490cd272725d53dc341c7056cbf0a1817449f83119e0a42119f3c9d5ca22f22'
+MONTHLY_ENTRYPOINT_SHA256 = '0c32bca847f039334c62c5f2f8e3bce491db51b2fe142b56226744b3bd635299'
 LIMIT = 16 * 1024 * 1024
 BOOTSTRAP_DIRS = ('inbox', 'outbox', 'migrations', 'podman-tmp')
 FLAGS = ['--single-transaction', '--quick', '--routines', '--events', '--triggers',
@@ -350,7 +351,8 @@ def main(request):
     _stage('native.birth')
     birth = json.loads(regular(ADMIN / 'birth.json', 0, 0o600))
     need(birth['phase'] == 'running', 'truthful running canonical birth required')
-    need(birth['provenance']['sha256']['entrypoint.py'] == ADOPTION_ENTRYPOINT_SHA256,
+    need(birth['provenance']['sha256']['entrypoint.py'] in
+         (ADOPTION_ENTRYPOINT_SHA256, MONTHLY_ENTRYPOINT_SHA256),
          'image must embed the pinned adoption entrypoint')
     _stage('native.artifacts')
     for name, expected in birth['provenance']['sha256'].items():

@@ -177,10 +177,13 @@ def restored_identity_sql(previous, machine, host_uuid, receipt):
 
 
 class Supervisor:
-    def __init__(self, recover_running=False, adopt_restored_identity=False):
+    def __init__(self, recover_running=False, adopt_restored_identity=False, prepare_observations_months=False):
         # Explicit operator recovery of a stopped owned actor, never auto-adoption.
         self.recover_running = recover_running
         self.adopt_restored_identity = adopt_restored_identity
+        self.prepare_observations_months = prepare_observations_months
+        require(not prepare_observations_months or not (recover_running or adopt_restored_identity),
+                'monthly construction is a separate fresh-only mode')
         require(not (recover_running and adopt_restored_identity),
                 'process recovery and restored-host adoption are separate modes')
         self.children = {}
@@ -537,6 +540,8 @@ class Supervisor:
         require(not self.stop_requested, 'startup interrupted')
         marker = STATE / 'birth.json'
         fresh = not marker.exists()
+        require(not self.prepare_observations_months or fresh,
+                'monthly construction requires a new birth; no existing schema conversion')
         require(not self.recover_running or not fresh, 'process recovery requires an existing recorded birth')
         require(not self.adopt_restored_identity or not fresh,
                 'host adoption requires a completed restore into an existing clean birth')
@@ -624,11 +629,7 @@ class Supervisor:
             self.sql("ALTER USER 'root'@'localhost' IDENTIFIED VIA unix_socket OR mysql_native_password USING PASSWORD('"
                      + root_password + "');\nCREATE DATABASE `podmesh-node` CHARACTER SET utf8mb4;\n"
                      + "CREATE USER 'podmesh-node'@'localhost' IDENTIFIED BY '" + app_password + "';\n")
-        result = json.loads(self.run('schema', [str(LIB / 'podmesh-store-admin'), 'prepare', '--role', 'node',
-                                      '--profile', str(PROFILE), '--admin-socket', str(ALIAS),
-                                      '--admin-password-file', str(ROOTPASS)], 30))
-        require(result.get('status') == ('prepared_empty_schema' if fresh else 'already_current_no_ddl'),
-                'schema-admin result is not the selected fresh/restart contract')
+        self.prepare_schema(fresh)
         if fresh:
             statements = []
             for table, privileges in self.grants.items():
@@ -643,6 +644,24 @@ class Supervisor:
         protected(ADMIN / 'client.cnf', 0, 0o600, 'file')
         (ADMIN / 'client.cnf').unlink()  # Boot-only duplicate credential, not original root password.
         self.start_application()
+
+    def prepare_schema(self, fresh):
+        require(not self.prepare_observations_months or fresh,
+                'monthly construction requires a new birth')
+        args = [str(LIB / 'podmesh-store-admin'), 'prepare', '--role', 'node',
+                '--profile', str(PROFILE), '--admin-socket', str(ALIAS),
+                '--admin-password-file', str(ROOTPASS)]
+        expected = 'prepared_empty_schema' if fresh else 'already_current_no_ddl'
+        if self.prepare_observations_months:
+            # Explicit immutable root input, never an app profile or ambient env switch.
+            plan = LIB / 'observations-months.json'
+            protected(plan, 0, 0o444, 'file')
+            require(plan.stat().st_size <= OUTPUT_LIMIT, 'monthly plan exceeds bound')
+            args += ['--observations-months', str(plan)]
+            expected = 'prepared_empty_schema_monthly_observations'
+        result = json.loads(self.run('schema', args, 30))
+        require(result.get('status') == expected,
+                'schema-admin result is not the selected fresh/restart contract')
 
     def verify_grants(self):
         accounts = {tuple(line.split('\t')) for line in self.sql('SELECT User,Host FROM mysql.global_priv;').splitlines()}
@@ -787,10 +806,12 @@ print('ready')
 
 def main():
     os.umask(0o077)
-    require(sys.argv[1:] in ([], ['--recover-known-running'], ['--adopt-restored-host-identity']),
+    require(sys.argv[1:] in ([], ['--recover-known-running'], ['--adopt-restored-host-identity'],
+                            ['--prepare-observations-months']),
             'unknown entrypoint mode')
     supervisor = Supervisor(recover_running=sys.argv[1:] == ['--recover-known-running'],
-                            adopt_restored_identity=sys.argv[1:] == ['--adopt-restored-host-identity'])
+                            adopt_restored_identity=sys.argv[1:] == ['--adopt-restored-host-identity'],
+                            prepare_observations_months=sys.argv[1:] == ['--prepare-observations-months'])
     def signal_stop(_number, _frame):
         supervisor.stop_requested = True
     signal.signal(signal.SIGTERM, signal_stop)
