@@ -120,9 +120,9 @@
         "es": "Base MariaDB · laboratorio"
       },
       "labSummary": {
-        "fr": "NODE et manager ont chacun démontré leurs écritures persistantes, la recréation propre et la reprise explicite après panne de processus, avec MariaDB privée dans le même conteneur. Les preuves restent délimitées à de petits essais : elles ne qualifient pas la production.",
-        "en": "NODE and manager each demonstrated persistent writes, clean recreation and explicit process-failure recovery with private MariaDB in the same container. Evidence remains limited to small tests and does not qualify production.",
-        "es": "NODE y manager demostraron escrituras persistentes, recreación limpia y recuperación explícita tras fallo de proceso, con MariaDB privada en el mismo contenedor. Pruebas limitadas a ensayos pequeños, sin validar producción."
+        "fr": "Un export SQL cohérent est restauré dans une base privée indépendante et vide sur le même hôte. Les 5 tables, leurs 10 lignes et les 8 déclencheurs sont comparés intégralement avant utilisation ; aucune routine ni aucun événement présents. Après recréation, les 4 faits d’origine sont identiques, puis un cinquième est écrit et relu. UUID et configuration conservés ; identifiants SQL propres à la cible régénérés. Aucun fichier applicatif durable présent dans ce jeu. Source et cible arrêtées proprement, existant contrôlé préservé. Petit essai local : pas de déplacement interhôtes du manager, réplication, volumes arbitraires ou production qualifiés.",
+        "en": "A coherent SQL export is restored into an independent empty private database on the same host. All 5 tables, their 10 rows and 8 triggers match before use; no routines or events were present. After recreation, the 4 original facts remain identical, then a fifth is written and read. UUID and configuration retained; target-specific SQL credentials regenerated. No durable application payload file was present in this fixture. Source and target stopped cleanly, checked originals preserved. Small local test: no qualified cross-host manager move, replication, arbitrary volumes or production.",
+        "es": "Una exportación SQL coherente se restaura en una base privada independiente y vacía del mismo host. Las 5 tablas, sus 10 filas y 8 disparadores coinciden íntegramente antes del uso; no había rutinas ni eventos. Tras recreación, los 4 hechos originales permanecen idénticos y se escribe y lee un quinto. UUID y configuración conservados; credenciales SQL propias del destino regeneradas. Sin archivos aplicativos duraderos en este ensayo. Fuente y destino parados limpiamente, originales comprobados preservados. Pequeño ensayo local: sin validar traslado del manager entre hosts, replicación, volúmenes arbitrarios ni producción."
       },
       "labProofs": [
         "node-common",
@@ -130,7 +130,8 @@
         "canonical-node-persistence",
         "canonical-process-recovery",
         "canonical-manager-persistence",
-        "canonical-manager-process-recovery"
+        "canonical-manager-process-recovery",
+        "canonical-manager-logical-restore"
       ],
       "qualificationNote": {
         "fr": "7/8 conserve le dénominateur du socle historique. Les nouveaux essais NODE canonique sont des preuves distinctes : une recréation propre et une reprise explicite après crash, pas une qualification globale, un redémarrage d’hôte ou des mois d’endurance.",
@@ -576,13 +577,14 @@
         "es": "Criterios de integración seguidos"
       },
       "labSummary": {
-        "fr": "Les cinq images existantes démarrent : Vault écrit et relit, Queue termine deux tâches dont une déclenchée par Maestro, Logger conserve 10 événements et Bridge répond à sa santé. Leur état est conservé après arrêt. Maestro a toutefois nécessité un arrêt forcé et le redémarrage reste non vérifié. Cette version utilise SQLite WAL pour Queue et du JSON en clair pour Vault. Le Bridge synthétise un texte sans appel réel de moteur : aucune inférence IA ni chiffrement du coffre démontrés. Résultat partiel distinct des anciens essais SHAPER ; tous les acteurs sont arrêtés et l’existant contrôlé est préservé.",
-        "en": "The five existing images start: Vault writes and reads, Queue completes two tasks including one triggered by Maestro, Logger retains 10 events and Bridge answers health checks. State is retained after stop. Maestro required forced termination and restart remains unverified. This version uses SQLite WAL for Queue and plaintext JSON for Vault. Bridge synthesizes text without a real engine call: no AI inference or vault encryption demonstrated. Partial result distinct from older SHAPER tests; all actors stopped and checked originals preserved.",
-        "es": "Las cinco imágenes existentes arrancan: Vault escribe y lee, Queue termina dos tareas, una activada por Maestro, Logger conserva 10 eventos y Bridge responde a salud. El estado se conserva tras parar. Maestro necesitó terminación forzada y el reinicio sigue sin verificar. Esta versión usa SQLite WAL para Queue y JSON sin cifrar para Vault. Bridge sintetiza texto sin llamar a un motor real: no se demuestran inferencia IA ni cifrado del almacén. Resultado parcial distinto de los ensayos SHAPER anteriores; actores parados y originales comprobados conservados."
+        "fr": "Les cinq cellules existantes redémarrent sur leur état conservé, avec une seule image Maestro corrigée. TERM pendant une attente IPC réelle et INT pendant une attente temporisée se terminent avec code0. Dans la cellule, l’arrêt Podman normal de Maestro prend environ 0,087 seconde, sans SIGKILL. Les 2 tâches Queue terminées, le contenu Vault, le résultat de 152 octets, les marqueurs de planification et le préfixe Logger restent conservés, sans rejouer les producteurs. Tous les acteurs sont arrêtés et l’existant contrôlé préservé. Queue reste SQLite WAL, Vault reste en JSON clair et Bridge ne lance pas encore de vrai moteur : aucune inférence, chiffrement du coffre, restauration complète PMBS, HA ou production qualifiés.",
+        "en": "The five existing cells restart on their retained state with only one changed Maestro image. TERM during actual IPC waiting and INT during timed waiting both exit0. Within the cell, normal Podman stop of Maestro takes about 0.087 seconds without SIGKILL. The 2 completed Queue tasks, Vault contents, 152-byte result, schedule markers and Logger prefix are retained without replaying producers. All actors stopped and checked originals preserved. Queue remains SQLite WAL, Vault remains plaintext JSON and Bridge still does not invoke a real engine: no qualified inference, vault encryption, complete PMBS restore, HA or production.",
+        "es": "Las cinco células existentes reinician con su estado conservado y una sola imagen Maestro corregida. TERM durante espera IPC real e INT durante espera temporizada terminan con código0. En la célula, la parada Podman normal de Maestro tarda unos 0,087 segundos, sin SIGKILL. Se conservan las 2 tareas Queue terminadas, contenido Vault, resultado de 152 bytes, marcadores de planificación y prefijo Logger, sin repetir productores. Actores parados y originales comprobados preservados. Queue sigue en SQLite WAL, Vault en JSON sin cifrar y Bridge aún no llama a un motor real: sin validar inferencia, cifrado, restauración PMBS completa, HA ni producción."
       },
       "labProofs": [
         "shaper-useful",
-        "alpine-stem-cell-core"
+        "alpine-stem-cell-core",
+        "alpine-stem-cell-restart"
       ]
     }
   ],
@@ -1049,9 +1051,45 @@
         "en": "After a third fact is committed, only the new test container receives SIGKILL. The old actor and children are verified absent before explicit recovery on the same state, without a forged clean stop. InnoDB recovers 6 pages; all three facts are retained in full, then a fourth is written and read. Identities, configuration, SQL credentials and datadir are preserved; clean stop and checked-original preservation verified. One same-VM test: no qualified automatic HA, quorum, physical failure, promotion or production.",
         "es": "Tras confirmar un tercer hecho, solo el nuevo contenedor de prueba recibe SIGKILL. Se comprueba ausencia del actor y sus hijos antes de recuperar explícitamente el mismo estado, sin fingir parada limpia. InnoDB recupera 6 páginas; los tres hechos se conservan íntegros y se escribe y lee un cuarto. Identidades, configuración, credenciales SQL y datadir conservados; parada limpia y preservación de originales comprobadas. Un ensayo en la misma VM: sin validar HA automática, quórum, fallo físico, promoción ni producción."
       }
+    },
+    {
+      "id": "canonical-manager-logical-restore",
+      "date": "2026-10-24",
+      "version": "Canonical MANAGER · logical SQL restore01d603f",
+      "kind": "scoped-native-runtime",
+      "runtimePass": true,
+      "productionQualified": false,
+      "title": {
+        "fr": "Manager : restauration SQL vers une cible vide et reprise utile",
+        "en": "Manager: SQL restore into an empty target and useful restart",
+        "es": "Manager: restauración SQL en destino vacío y reinicio útil"
+      },
+      "summary": {
+        "fr": "Un export SQL cohérent est restauré dans une base privée indépendante et vide sur le même hôte. Les 5 tables, leurs 10 lignes et les 8 déclencheurs sont comparés intégralement avant utilisation ; aucune routine ni aucun événement présents. Après recréation, les 4 faits d’origine sont identiques, puis un cinquième est écrit et relu. UUID et configuration conservés ; identifiants SQL propres à la cible régénérés. Aucun fichier applicatif durable présent dans ce jeu. Source et cible arrêtées proprement, existant contrôlé préservé. Petit essai local : pas de déplacement interhôtes du manager, réplication, volumes arbitraires ou production qualifiés.",
+        "en": "A coherent SQL export is restored into an independent empty private database on the same host. All 5 tables, their 10 rows and 8 triggers match before use; no routines or events were present. After recreation, the 4 original facts remain identical, then a fifth is written and read. UUID and configuration retained; target-specific SQL credentials regenerated. No durable application payload file was present in this fixture. Source and target stopped cleanly, checked originals preserved. Small local test: no qualified cross-host manager move, replication, arbitrary volumes or production.",
+        "es": "Una exportación SQL coherente se restaura en una base privada independiente y vacía del mismo host. Las 5 tablas, sus 10 filas y 8 disparadores coinciden íntegramente antes del uso; no había rutinas ni eventos. Tras recreación, los 4 hechos originales permanecen idénticos y se escribe y lee un quinto. UUID y configuración conservados; credenciales SQL propias del destino regeneradas. Sin archivos aplicativos duraderos en este ensayo. Fuente y destino parados limpiamente, originales comprobados preservados. Pequeño ensayo local: sin validar traslado del manager entre hosts, replicación, volúmenes arbitrarios ni producción."
+      }
+    },
+    {
+      "id": "alpine-stem-cell-restart",
+      "date": "2026-10-24",
+      "version": "Existing Alpine stem cells · changed Maestro entrypoint",
+      "kind": "scoped-native-runtime",
+      "runtimePass": true,
+      "productionQualified": false,
+      "title": {
+        "fr": "Cellules Alpine : redémarrage sur le même état et arrêt normal de Maestro",
+        "en": "Alpine cells: same-state restart and normal Maestro stop",
+        "es": "Células Alpine: reinicio del mismo estado y parada normal de Maestro"
+      },
+      "summary": {
+        "fr": "Les cinq cellules existantes redémarrent sur leur état conservé, avec une seule image Maestro corrigée. TERM pendant une attente IPC réelle et INT pendant une attente temporisée se terminent avec code0. Dans la cellule, l’arrêt Podman normal de Maestro prend environ 0,087 seconde, sans SIGKILL. Les 2 tâches Queue terminées, le contenu Vault, le résultat de 152 octets, les marqueurs de planification et le préfixe Logger restent conservés, sans rejouer les producteurs. Tous les acteurs sont arrêtés et l’existant contrôlé préservé. Queue reste SQLite WAL, Vault reste en JSON clair et Bridge ne lance pas encore de vrai moteur : aucune inférence, chiffrement du coffre, restauration complète PMBS, HA ou production qualifiés.",
+        "en": "The five existing cells restart on their retained state with only one changed Maestro image. TERM during actual IPC waiting and INT during timed waiting both exit0. Within the cell, normal Podman stop of Maestro takes about 0.087 seconds without SIGKILL. The 2 completed Queue tasks, Vault contents, 152-byte result, schedule markers and Logger prefix are retained without replaying producers. All actors stopped and checked originals preserved. Queue remains SQLite WAL, Vault remains plaintext JSON and Bridge still does not invoke a real engine: no qualified inference, vault encryption, complete PMBS restore, HA or production.",
+        "es": "Las cinco células existentes reinician con su estado conservado y una sola imagen Maestro corregida. TERM durante espera IPC real e INT durante espera temporizada terminan con código0. En la célula, la parada Podman normal de Maestro tarda unos 0,087 segundos, sin SIGKILL. Se conservan las 2 tareas Queue terminadas, contenido Vault, resultado de 152 bytes, marcadores de planificación y prefijo Logger, sin repetir productores. Actores parados y originales comprobados preservados. Queue sigue en SQLite WAL, Vault en JSON sin cifrar y Bridge aún no llama a un motor real: sin validar inferencia, cifrado, restauración PMBS completa, HA ni producción."
+      }
     }
   ],
-  "updatedAtUTC": "2026-10-24T08:12:55.633292Z",
+  "updatedAtUTC": "2026-10-24T08:36:16.155393Z",
   "updatePolicy": "Publish only verified evidence changes; preserve historical lab achievements and version boundaries; never count in-progress code as validated.",
   "canonicalBoundary": {
     "state": "not_qualified",
@@ -1086,21 +1124,21 @@
   },
   "currentMilestone": {
     "state": "partial",
-    "proof": "canonical-manager-process-recovery",
+    "proof": "canonical-manager-logical-restore",
     "title": {
-      "fr": "NODE et manager : persistance et reprise après panne démontrées",
-      "en": "NODE and manager: persistence and process recovery demonstrated",
-      "es": "NODE y manager: persistencia y recuperación tras fallo demostradas"
+      "fr": "Manager restauré ; cellules Alpine redémarrées sur leur état",
+      "en": "Manager restored; Alpine cells restarted on retained state",
+      "es": "Manager restaurado; células Alpine reiniciadas con su estado"
     },
     "summary": {
-      "fr": "NODE et manager ont chacun démontré leurs écritures persistantes, la recréation propre et la reprise explicite après panne de processus, avec MariaDB privée dans le même conteneur. Les preuves restent délimitées à de petits essais : elles ne qualifient pas la production.",
-      "en": "NODE and manager each demonstrated persistent writes, clean recreation and explicit process-failure recovery with private MariaDB in the same container. Evidence remains limited to small tests and does not qualify production.",
-      "es": "NODE y manager demostraron escrituras persistentes, recreación limpia y recuperación explícita tras fallo de proceso, con MariaDB privada en el mismo contenedor. Pruebas limitadas a ensayos pequeños, sin validar producción."
+      "fr": "Le manager retrouve son historique après restauration SQL et recréation, puis accepte une nouvelle écriture. Les cinq cellules Alpine redémarrent sans perdre leur état et Maestro s’arrête normalement. Ce sont des preuves de laboratoire délimitées, pas une qualification de production.",
+      "en": "The manager retains its history after SQL restore and recreation, then accepts a new write. The five Alpine cells restart without losing their state and Maestro stops normally. These are scoped laboratory results, not production qualification.",
+      "es": "El manager conserva su historial tras restauración SQL y recreación, y acepta una nueva escritura. Las cinco células Alpine reinician conservando su estado y Maestro para normalmente. Resultados limitados de laboratorio, sin validar producción."
     },
     "next": {
-      "fr": "Prochaines preuves : copie/restauration SQL du manager, commandes de transfert et de restauration des cellules utilisables, arrêt propre et reprise des cellules Alpine. Réplication continue, partitionnement délibéré et exploitation de production restent à qualifier.",
-      "en": "Next evidence: manager SQL copy/restore, usable cell transfer/restore commands, and Alpine-cell clean stop and restart. Continuous replication, deliberate partitioning and production operations remain to qualify.",
-      "es": "Próximas pruebas: copia/restauración SQL del manager, comandos utilizables de traslado/restauración de células y parada limpia/reinicio de células Alpine. Siguen por validar replicación continua, particionado deliberado y explotación en producción."
+      "fr": "En cours : restauration PMBS des cinq cellules et commande de transfert NODE utilisable. Réplication MariaDB continue, partitionnement délibéré et moteur réel du Bridge restent à qualifier.",
+      "en": "In progress: five-cell PMBS restore and a usable NODE transfer command. Continuous MariaDB replication, deliberate partitioning and a real Bridge engine remain to qualify.",
+      "es": "En curso: restauración PMBS de cinco células y comando utilizable de traslado NODE. Siguen por validar replicación MariaDB continua, particionado deliberado y motor real del Bridge."
     }
   }
 }
