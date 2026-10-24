@@ -159,10 +159,30 @@ def adapter_precondition():
                 'host adapter is not root')
 
 
+def restored_identity_sql(previous, machine, host_uuid, receipt):
+    """One connection/transaction: compare both identity rows, update one, audit once."""
+    def text_literal(value):
+        return 'CONVERT(0x' + value.encode('utf-8').hex() + ' USING utf8mb4)'
+    payload = json.dumps(receipt, sort_keys=True)
+    return (
+        'START TRANSACTION; UPDATE `podmesh-node`.metadata AS m '
+        "JOIN `podmesh-node`.metadata AS u ON u.`key`='host_uuid' "
+        'SET m.value=' + text_literal(machine)
+        + " WHERE m.`key`='machine_id' AND BINARY m.value=" + text_literal(previous)
+        + ' AND BINARY u.value=' + text_literal(host_uuid)
+        + '; SET @adopted=ROW_COUNT(); '
+        'INSERT INTO `podmesh-node`.observations(observed_at,operation,result) SELECT '
+        + str(receipt['observed_at']) + ",'host_identity_adopt'," + text_literal(payload)
+        + ' FROM DUAL WHERE @adopted=1; SELECT @adopted; COMMIT;')
+
+
 class Supervisor:
-    def __init__(self, recover_running=False):
+    def __init__(self, recover_running=False, adopt_restored_identity=False):
         # Explicit operator recovery of a stopped owned actor, never auto-adoption.
         self.recover_running = recover_running
+        self.adopt_restored_identity = adopt_restored_identity
+        require(not (recover_running and adopt_restored_identity),
+                'process recovery and restored-host adoption are separate modes')
         self.children = {}
         self.stop_requested = False
         self.failed = False
@@ -518,6 +538,8 @@ class Supervisor:
         marker = STATE / 'birth.json'
         fresh = not marker.exists()
         require(not self.recover_running or not fresh, 'process recovery requires an existing recorded birth')
+        require(not self.adopt_restored_identity or not fresh,
+                'host adoption requires a completed restore into an existing clean birth')
         if fresh:
             require(not marker.is_symlink() and not any(DATA.iterdir()) and not any((SAV / 'app').iterdir()),
                     'unrecorded existing database/application state; no automatic adoption')
@@ -535,6 +557,8 @@ class Supervisor:
             protected(marker, 0, 0o600, 'file')
             self.record = json.loads(marker.read_text())
             phase = self.record.get('phase')
+            require(not self.adopt_restored_identity or phase == 'stopped-clean',
+                    'host adoption requires a truthful stopped-clean birth')
             require(phase == 'stopped-clean' or (self.recover_running and phase == 'running'),
                     'partial/unclean birth requires separate recovery authority')
             require(self.record.get('provenance') == self.provenance, 'new artifact needs explicit recovery/upgrade procedure')
@@ -614,6 +638,8 @@ class Supervisor:
                                   + "` TO 'podmesh-node'@'localhost';")
             self.sql('\n'.join(statements))
         self.verify_grants()
+        if self.adopt_restored_identity:
+            self.adopt_restored_host_identity()
         protected(ADMIN / 'client.cnf', 0, 0o600, 'file')
         (ADMIN / 'client.cnf').unlink()  # Boot-only duplicate credential, not original root password.
         self.start_application()
@@ -644,6 +670,71 @@ class Supervisor:
                 'functional routine privileges refused')
         require(not self.sql("SELECT Role FROM mysql.roles_mapping WHERE User='podmesh-node' AND Host='localhost';").strip(),
                 'functional inherited roles refused')
+
+    def restored_target_machine(self):
+        # APP1102 is the provider's authorized reader. Its peer must remain root;
+        # neither a request field nor the container's machine-id supplies this fact.
+        probe = """import json,socket,struct
+with socket.socket(socket.AF_UNIX) as peer:
+ peer.settimeout(8);peer.connect('/run/podmesh-host/capability.sock')
+ assert struct.unpack('3i',peer.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))[1]==0
+ peer.sendall(b'{"protocol":"podmesh-host-capability/1","action":{"kind":"host_identity"},"intent":null}\\n')
+ response=json.loads(peer.makefile('rb').readline(65537));assert response['ok']
+ print(response['data']['machine_id'])
+"""
+        machine = self.run('restore-host-fact', drop_command(APP_UID, APP_UID,
+                           ['/usr/bin/python3', '-I', '-c', probe]), 10).strip()
+        require(len(machine) == 32 and all(c in '0123456789abcdefABCDEF' for c in machine),
+                'native target identity invalid')
+        return machine
+
+    def adopt_restored_host_identity(self):
+        require(os.geteuid() == 0 and self.adopt_restored_identity,
+                'explicit root restored-host administration required')
+        path = ETC / 'admin' / 'restore-complete.json'
+        protected(path, 0, 0o600, 'file')
+        with path.open('rb') as stream:
+            raw = stream.read(4097)
+        require(len(raw) <= 4096, 'restore completion request oversized')
+        request = json.loads(raw)
+        require(isinstance(request, dict) and set(request) == {
+            'status', 'source_machine_sha256', 'target_machine_sha256', 'host_uuid', 'export_sha256'},
+            'restore completion request fields differ')
+        require(request['status'] == 'restored-and-compared', 'logical restore not declared complete')
+        for key in ('source_machine_sha256', 'target_machine_sha256', 'export_sha256'):
+            value = request[key]
+            require(isinstance(value, str) and len(value) == 64
+                    and all(c in '0123456789abcdef' for c in value), 'restore digest invalid')
+        require(isinstance(request['host_uuid'], str), 'restore NODE UUID invalid')
+        require('host_identity_adoption' not in self.record,
+                'adoption already recorded; use ordinary startup')
+        export = STATE / 'restore.sql'
+        protected(export, 0, 0o600, 'file')
+        digest = hashlib.sha256()
+        with export.open('rb') as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(block)
+        require(digest.hexdigest() == request['export_sha256'], 'completed restore export differs')
+        machine = self.restored_target_machine()
+        require(hashlib.sha256(machine.encode()).hexdigest() == request['target_machine_sha256'],
+                'real provider differs from explicit restore destination')
+        rows = dict(line.split('\t', 1) for line in self.sql(
+            "SELECT `key`,HEX(value) FROM `podmesh-node`.metadata "
+            "WHERE `key` IN ('machine_id','host_uuid');").splitlines())
+        require(set(rows) == {'machine_id', 'host_uuid'}, 'restored identity rows missing')
+        previous = bytes.fromhex(rows['machine_id']).decode('ascii')
+        host_uuid = bytes.fromhex(rows['host_uuid']).decode('ascii')
+        require(host_uuid == request['host_uuid'], 'restored NODE UUID differs')
+        require(hashlib.sha256(previous.encode()).hexdigest() == request['source_machine_sha256']
+                and previous != machine, 'restored source identity differs')
+        receipt = dict(request, operation='explicit-restored-host-identity-adoption',
+                       observed_at=int(time.time()))
+        # sql() is a non-force batch client. An audit error aborts the connection,
+        # rolling back the InnoDB UPDATE; a failed CAS commits no update or audit.
+        require(self.sql(restored_identity_sql(previous, machine, host_uuid, receipt)).strip() == '1',
+                'source identity or NODE UUID changed during adoption')
+        self.record['host_identity_adoption'] = receipt
+        durable_state(self.record)
 
     def start_application(self):
         self.spawn('app', drop_command(APP_UID, APP_UID, [str(LIB / 'podmeshd')]), env=app_env())
@@ -696,8 +787,10 @@ print('ready')
 
 def main():
     os.umask(0o077)
-    require(sys.argv[1:] in ([], ['--recover-known-running']), 'unknown entrypoint mode')
-    supervisor = Supervisor(recover_running=sys.argv[1:] == ['--recover-known-running'])
+    require(sys.argv[1:] in ([], ['--recover-known-running'], ['--adopt-restored-host-identity']),
+            'unknown entrypoint mode')
+    supervisor = Supervisor(recover_running=sys.argv[1:] == ['--recover-known-running'],
+                            adopt_restored_identity=sys.argv[1:] == ['--adopt-restored-host-identity'])
     def signal_stop(_number, _frame):
         supervisor.stop_requested = True
     signal.signal(signal.SIGTERM, signal_stop)

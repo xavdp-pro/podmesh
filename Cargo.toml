@@ -1,4 +1,6 @@
 [workspace]
+# Manager experiments retain their independent lockfiles and build profiles.
+exclude = ["experiments/manager-resident", "experiments/manager-ha", "experiments/manager-network"]
 members = [
     "crates/meshfs",
     "crates/pmbs",
