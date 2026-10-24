@@ -32,6 +32,7 @@ class SourceSeal(unittest.TestCase):
         self.root = Path(self.temp.name)
         for name in ('etc', 'sav', 'provider'):
             (self.root / name).mkdir(mode=0o755)
+            (self.root / name).chmod(0o755)
         for name in ('sav/admin', 'sav/mariadb', 'etc/admin', 'etc/mysql', 'etc/mysql/localhost'):
             (self.root / name).mkdir(mode=0o700)
         self.sav = self.root / 'sav'
@@ -143,7 +144,7 @@ class SourceSeal(unittest.TestCase):
     def test_unsealed_old_birth_and_fresh_target_guard_do_not_change_state(self):
         with self.guard():self.entry.refuse_source_seal()
         self.assertEqual((self.admin/'birth.json').read_bytes(), self.birth_bytes)
-        fresh = self.root/'fresh-target';fresh.mkdir(mode=0o755)
+        fresh = self.root/'fresh-target';fresh.mkdir(mode=0o755);fresh.chmod(0o755)
         with patch.multiple(self.entry, SAV=fresh, STATE=fresh/'admin'):
             self.entry.refuse_source_seal()
         self.assertEqual(list(fresh.iterdir()), [])
