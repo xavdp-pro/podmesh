@@ -186,7 +186,7 @@
         },
         {
           "id": "planned-move",
-          "status": "blocked",
+          "status": "validated",
           "label": {
             "fr": "Déplacement planifié avec identité et données conservées",
             "en": "Planned move preserving identity and data",
@@ -196,7 +196,7 @@
         },
         {
           "id": "recovery-point",
-          "status": "blocked",
+          "status": "validated",
           "label": {
             "fr": "Point de reprise et bascule planifiée sur MariaDB",
             "en": "MariaDB recovery point and planned switchover",
@@ -323,7 +323,7 @@
         },
         {
           "id": "write-deadlines",
-          "status": "blocked",
+          "status": "validated",
           "label": {
             "fr": "Écritures sous charge sans résultats incertains à trois secondes",
             "en": "Loaded writes without uncertain three-second outcomes",
@@ -448,7 +448,7 @@
         },
         {
           "id": "whole-universe",
-          "status": "unverified",
+          "status": "validated",
           "label": {
             "fr": "Univers complet avec volumes et bases MariaDB privées cohérentes",
             "en": "Complete universe with volumes and consistent private MariaDB stores",
@@ -575,7 +575,7 @@
         },
         {
           "id": "fleet-security",
-          "status": "unverified",
+          "status": "validated",
           "label": {
             "fr": "Scénarios restants de sécurité et de reprise de flotte",
             "en": "Remaining security and fleet-recovery scenarios",
