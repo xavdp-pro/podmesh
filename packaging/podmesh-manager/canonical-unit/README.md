@@ -56,8 +56,18 @@ peer endpoints; the entrypoint does not generate substitute identities. Set:
 The actual daemon validates the full configuration as UID1103 before DB birth.
 The wrapper keeps a SHA256 of the complete private config in the birth receipt;
 clean recreation requires the same config, credentials, profile, provenance and
-DB directory identity. Peer changes/upgrades and unclean recovery need their own
-procedure; this initial recipe does not silently repair state.
+DB directory identity. After abrupt loss of the owned container/PID1 leaves a
+recorded `phase=running`, recreate that same artifact with the same etc/sav and
+fresh `/run`, appending `--recover-known-running` after the image ID. This explicit
+mode preserves the existing manager config, provenance, DB identity, credentials
+and profile, records `process_recovery.from_phase=running`, then starts MariaDB
+normally for native redo without initialization/reset. It refuses a fresh birth
+and every partial, `initializing`, `starting` or `failed` record. A normal clean
+restart still accepts `stopped-clean`; no recovery origin is invented for it.
+Unknown entrypoint arguments refuse. Peer changes/upgrades and other unclean
+recovery need their own procedure. This does not recover a supervised app/DB
+failure recorded as `failed`, establish physical HA/replication/promotion, or
+upgrade an older image: the same candidate must have run before the loss.
 
 PID1 creates separate private credentials under `etc/mysql/localhost/passwd` and
 `etc/admin/passwd`, plus root:1103 mode0440 `etc/store.json`. Database data lives
@@ -117,6 +127,17 @@ This suite exercises actual local IPC/owned children for acknowledged and reject
 shutdown after PID1 received its stop signal. It does not mock MariaDB or qualify
 it. Existing NODE109 proof is retained, with no NODE rerun requested. No Rust code
 changes or new Rust test suite are needed for this packaging-only candidate.
+
+The separately affected explicit-recovery policy check is one new method:
+
+```sh
+python3 -B packaging/podmesh-manager/canonical-unit/test_process_recovery.py
+```
+
+Run it as root on the declared build CT: it uses real protected files and stops
+at a substituted DB-spawn sentinel. It does not prove native MariaDB redo.
+For this source change, retain the previous four MANAGER and one NODE component
+PASS results; execute only the new affected method under its separate CT lease.
 
 ## Native handoff command (requires its own runtime authorization)
 

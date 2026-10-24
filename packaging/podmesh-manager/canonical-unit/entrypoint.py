@@ -13,6 +13,7 @@ import signal
 import socket
 import stat
 import struct
+import sys
 import time
 
 # Reuse the existing owned-process supervision, output draining and stop ordering.
@@ -125,6 +126,7 @@ class Supervisor(u.Supervisor):
         require(not self.stop_requested, 'startup interrupted')
         marker = STATE / 'birth.json'
         fresh = not marker.exists()
+        require(not self.recover_running or not fresh, 'process recovery requires an existing recorded birth')
         if fresh:
             require(not marker.is_symlink() and not any(DATA.iterdir()) and not any((SAV / 'app').iterdir()),
                     'unrecorded existing database/application state; no automatic adoption')
@@ -141,7 +143,9 @@ class Supervisor(u.Supervisor):
         else:
             protected(marker, 0, 0o600, 'file')
             self.record = json.loads(marker.read_text())
-            require(self.record.get('phase') == 'stopped-clean', 'partial/unclean birth requires separate recovery authority')
+            phase = self.record.get('phase')
+            require(phase == 'stopped-clean' or (self.recover_running and phase == 'running'),
+                    'partial/unclean birth requires separate recovery authority')
             require(self.record.get('provenance') == self.provenance, 'new artifact needs explicit recovery/upgrade procedure')
             require(self.record.get('datadir') == [DATA.stat().st_dev, DATA.stat().st_ino]
                     and (DATA / 'mysql').is_dir(), 'database identity or initialization differs')
@@ -152,6 +156,11 @@ class Supervisor(u.Supervisor):
         fingerprint = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in (PASS, ROOTPASS, PROFILE)}
         if not fresh:
             require(self.record.get('configuration') == fingerprint, 'existing credential/profile changed')
+            if self.recover_running and self.record.get('phase') == 'running':
+                # Existing identity/config/provenance checks precede this transition.
+                # Native mariadbd performs redo; never initialize or reset this store.
+                self.record['process_recovery'] = {'from_phase': 'running',
+                                                   'mode': 'explicit-native-mariadb-redo'}
         self.record['configuration'] = fingerprint
         self.record['phase'] = 'starting'
         durable_state(self.record)
@@ -317,7 +326,8 @@ class Supervisor(u.Supervisor):
 
 def main():
     os.umask(0o077)
-    supervisor = Supervisor()
+    require(sys.argv[1:] in ([], ['--recover-known-running']), 'unknown entrypoint mode')
+    supervisor = Supervisor(recover_running=sys.argv[1:] == ['--recover-known-running'])
     def stop(_number, _frame):
         supervisor.stop_requested = True
     signal.signal(signal.SIGTERM, stop)
