@@ -28,6 +28,66 @@ FLAGS = ['--single-transaction', '--quick', '--routines', '--events', '--trigger
          '--order-by-primary', '--databases', 'podmesh-node']
 
 
+_SOURCE = 'logical-transfer-native.py'
+_COMPONENT = 'native'
+
+# Public failure evidence contains only fixed stages, class names and own code locations.
+_DIAGNOSTIC_PREFIX = 'logical-transfer-diagnostic '
+_CODE_FILENAME = sys._getframe().f_code.co_filename
+_STAGE = 'entrypoint'
+_EXCEPTION_NAMES = frozenset(('Exception RuntimeError ValueError TypeError KeyError IndexError '
+    'AssertionError OSError FileNotFoundError PermissionError FileExistsError IsADirectoryError '
+    'NotADirectoryError BlockingIOError TimeoutError BrokenPipeError ProcessLookupError '
+    'JSONDecodeError TimeoutExpired CalledProcessError Error OverflowError UnicodeDecodeError '
+    'UnicodeEncodeError RecursionError MemoryError InterruptedError').split())
+
+
+def _stage(name):
+    global _STAGE
+    _STAGE = name
+
+
+def _failure_record(error, stage=None, secondary=False):
+    frames = []
+    trace = error.__traceback__
+    while trace is not None:
+        frame = trace.tb_frame
+        if frame.f_globals is globals() and frame.f_code.co_filename == _CODE_FILENAME:
+            name = frame.f_code.co_name
+            if not (re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,63}', name)
+                    or name in ('<module>', '<listcomp>', '<dictcomp>', '<setcomp>', '<genexpr>', '<lambda>')):
+                name = 'code'
+            frames.append({'source': _SOURCE, 'function': name, 'line': trace.tb_lineno})
+        trace = trace.tb_next
+    name = type(error).__name__
+    return {'component': _COMPONENT, 'stage': stage or _STAGE,
+            'exception': name if name in _EXCEPTION_NAMES else 'Exception',
+            'secondary': secondary, 'frames': frames[-8:]}
+
+
+def _emit_failure(error, stage=None, secondary=False):
+    try:
+        print(_DIAGNOSTIC_PREFIX + json.dumps(_failure_record(error, stage, secondary),
+              separators=(',', ':')), file=sys.stderr)
+    except Exception:
+        pass  # A diagnostic write must never replace the operational failure.
+
+
+def _cleanup(operation, stage):
+    primary = sys.exc_info()[1]
+    failed_stage = _STAGE
+    try:
+        operation()
+    except Exception as error:
+        if primary is None:
+            _stage(stage)
+            raise
+        _emit_failure(error, stage=stage, secondary=True)
+    finally:
+        if primary is not None:
+            _stage(failed_stage)
+
+
 def need(ok, reason):
     if not ok:
         raise RuntimeError(reason)
@@ -111,7 +171,7 @@ def client(app=False):
                          + b'\nsocket=/run/podmesh-node/mysql/mysql.sock\npassword=' + password + b'\n')
         yield name
     finally:
-        os.unlink(name)
+        _cleanup(lambda: os.unlink(name), 'cleanup.client')
 
 
 def sql(query, app=False):
@@ -169,7 +229,7 @@ def quiesced(token):
             raise RuntimeError('APP quiescence not observed')
         yield
     finally:
-        resume(token)
+        _cleanup(lambda: resume(token), 'cleanup.resume')
 
 
 def file_names(names):
@@ -266,42 +326,56 @@ def main(request):
     need(os.getuid() == 0 and os.getgid() == 0, 'root administration only')
     mode = request['mode']
     if mode == 'resume':
+        _stage('native.resume')
         resume(request['token'])
         return {'resumed': True}
+    _stage('native.birth')
     birth = json.loads(regular(ADMIN / 'birth.json', 0, 0o600))
     need(birth['phase'] == 'running', 'truthful running canonical birth required')
     need(birth['provenance']['sha256']['entrypoint.py'] == ADOPTION_ENTRYPOINT_SHA256,
          'image must embed the pinned adoption entrypoint')
+    _stage('native.artifacts')
     for name, expected in birth['provenance']['sha256'].items():
         need(name in ('podmeshd', 'podmesh-store-admin', 'entrypoint.py', 'grants.json')
              and digest((LIB / name).read_bytes()) == expected, 'actual immutable artifact differs')
     if mode == 'binding':
+        _stage('native.binding')
         observed = identity()
         actual = provider_machine_sha256()
         need(observed['machine_id_sha256'] == actual, 'NODE binding differs from real host provider')
         return {'birth': birth, 'identity': observed, 'provider_machine_sha256': actual, 'api': api()}
+    _stage('native.quiesce')
     with quiesced(request['token']):
         names = file_names(request['files'])
         if mode == 'export':
+            _stage('export.inventory.before')
             before = inventory()
+            _stage('export.provider')
             need(before['identity']['machine_id_sha256'] == provider_machine_sha256(),
                  'source binding differs from real host provider')
+            _stage('export.dump')
             payload = dump()
             need(payload.strip(), 'native SQL dump is empty')
+            _stage('export.files')
             saved = files(names)
+            _stage('export.inventory.after')
             need(inventory() == before, 'source changed during export')
             return {'inventory': before, 'sql': encoded(payload), 'files': saved, 'birth': birth}
         if mode == 'readback':
+            _stage('readback.inventory')
             return {'inventory': inventory(), 'files': files(names)}
         need(mode == 'restore', 'unknown native operation')
+        _stage('restore.empty-target')
         need(not any((HOME / 'sav/app').iterdir()), 'target application directory is not empty')
         need(identity() == request['fresh_identity'], 'fresh target identity changed')
         payload = decoded(request['sql'])
         # The owning host command has created this target in this invocation only.
+        _stage('restore.import')
         sql('DROP DATABASE `podmesh-node`;')
         need(sql("SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='podmesh-node';").strip() == '0', 'application database must be absent before import')
         with client() as cnf:
             run(['/usr/bin/mariadb', '--defaults-file=' + cnf, '--default-character-set=utf8mb4'], payload)
+        _stage('restore.files')
         need(set(request['saved']) == set(names), 'saved file inventory differs')
         for name in names:
             item = request['saved'][name]
@@ -310,6 +384,7 @@ def main(request):
                  and type(item['mode']) is int and 0 <= item['mode'] <= 0o777,
                  'plain regular file ownership/mode required')
             write_new(HOME / 'sav/app' / name, decoded(item['data']), item['uid'], item['gid'], item['mode'])
+        _stage('restore.inventory')
         observed = inventory()
         need(observed == request['inventory'] and files(names) == request['saved'], 'restored SQL/files differ')
         write_new(ADMIN / 'restore.sql', payload)
@@ -324,12 +399,15 @@ if __name__ == '__main__':
     signal.signal(signal.SIGALRM, interrupted)
     signal.alarm(360)
     try:
+        _stage('entrypoint.limit')
         need(len(sys.argv) == 2 and sys.argv[1].isdigit(), 'explicit payload limit required')
         LIMIT = int(sys.argv[1])
         need(LIMIT > 0, 'positive explicit payload limit required')
+        _stage('entrypoint.request')
         raw = sys.stdin.buffer.read(4 * LIMIT + 1)
         need(len(raw) <= 4 * LIMIT, 'request exceeds bound')
         print(json.dumps(main(json.loads(raw)), separators=(',', ':')))
-    except Exception:
+    except Exception as error:
         print('logical transfer native step failed; retained private diagnostics', file=sys.stderr)
+        _emit_failure(error)
         raise SystemExit(1)

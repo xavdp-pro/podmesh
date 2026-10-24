@@ -23,6 +23,66 @@ LIMIT = 16 * 1024 * 1024
 ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8'}
 
 
+_SOURCE = 'logical-transfer.py'
+_COMPONENT = 'host'
+
+# Public failure evidence contains only fixed stages, class names and own code locations.
+_DIAGNOSTIC_PREFIX = 'logical-transfer-diagnostic '
+_CODE_FILENAME = sys._getframe().f_code.co_filename
+_STAGE = 'entrypoint'
+_EXCEPTION_NAMES = frozenset(('Exception RuntimeError ValueError TypeError KeyError IndexError '
+    'AssertionError OSError FileNotFoundError PermissionError FileExistsError IsADirectoryError '
+    'NotADirectoryError BlockingIOError TimeoutError BrokenPipeError ProcessLookupError '
+    'JSONDecodeError TimeoutExpired CalledProcessError Error OverflowError UnicodeDecodeError '
+    'UnicodeEncodeError RecursionError MemoryError InterruptedError').split())
+
+
+def _stage(name):
+    global _STAGE
+    _STAGE = name
+
+
+def _failure_record(error, stage=None, secondary=False):
+    frames = []
+    trace = error.__traceback__
+    while trace is not None:
+        frame = trace.tb_frame
+        if frame.f_globals is globals() and frame.f_code.co_filename == _CODE_FILENAME:
+            name = frame.f_code.co_name
+            if not (re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,63}', name)
+                    or name in ('<module>', '<listcomp>', '<dictcomp>', '<setcomp>', '<genexpr>', '<lambda>')):
+                name = 'code'
+            frames.append({'source': _SOURCE, 'function': name, 'line': trace.tb_lineno})
+        trace = trace.tb_next
+    name = type(error).__name__
+    return {'component': _COMPONENT, 'stage': stage or _STAGE,
+            'exception': name if name in _EXCEPTION_NAMES else 'Exception',
+            'secondary': secondary, 'frames': frames[-8:]}
+
+
+def _emit_failure(error, stage=None, secondary=False):
+    try:
+        print(_DIAGNOSTIC_PREFIX + json.dumps(_failure_record(error, stage, secondary),
+              separators=(',', ':')), file=sys.stderr)
+    except Exception:
+        pass  # A diagnostic write must never replace the operational failure.
+
+
+def _cleanup(operation, stage):
+    primary = sys.exc_info()[1]
+    failed_stage = _STAGE
+    try:
+        operation()
+    except Exception as error:
+        if primary is None:
+            _stage(stage)
+            raise
+        _emit_failure(error, stage=stage, secondary=True)
+    finally:
+        if primary is not None:
+            _stage(failed_stage)
+
+
 def need(ok, reason):
     if not ok:
         raise RuntimeError(reason)
@@ -90,6 +150,40 @@ def configuration(path):
     return c
 
 
+def _forward_native_failure(stderr):
+    # Never relay Podman/native arbitrary stderr. Only the fixed diagnostic schema.
+    stages = {'entrypoint', 'entrypoint.limit', 'entrypoint.request', 'native.birth',
+              'native.artifacts', 'native.binding', 'native.resume', 'native.quiesce',
+              'export.inventory.before', 'export.provider', 'export.dump', 'export.files',
+              'export.inventory.after', 'readback.inventory', 'restore.empty-target',
+              'restore.import', 'restore.files', 'restore.inventory', 'cleanup.resume', 'cleanup.client'}
+    functions = set(('need digest encoded decoded write_new regular run bounds client sql dump '
+        'app_process resume quiesced file_names files identity inventory contents '
+        'provider_machine_sha256 api main interrupted _cleanup code <module> '
+        '<listcomp> <dictcomp> <setcomp> <genexpr> <lambda>').split())
+    # A failed native entrypoint writes its structured line last. Parse no SQL log.
+    line = stderr[-8192:].splitlines()[-1:]
+    if not line or not line[0].startswith(_DIAGNOSTIC_PREFIX.encode()):
+        return
+    try:
+        record = json.loads(line[0][len(_DIAGNOSTIC_PREFIX):])
+        if (set(record) != {'component', 'stage', 'exception', 'secondary', 'frames'}
+                or record['component'] != 'native' or record['stage'] not in stages
+                or record['exception'] not in _EXCEPTION_NAMES
+                or type(record['secondary']) is not bool or type(record['frames']) is not list
+                or len(record['frames']) > 8):
+            return
+        for frame in record['frames']:
+            if (set(frame) != {'source', 'function', 'line'}
+                    or frame['source'] != 'logical-transfer-native.py'
+                    or frame['function'] not in functions or type(frame['line']) is not int
+                    or not 0 < frame['line'] < 1000000):
+                return
+        print(_DIAGNOSTIC_PREFIX + json.dumps(record, separators=(',', ':')), file=sys.stderr)
+    except Exception:
+        pass  # Preserve the generic boundary even if failure evidence is unavailable.
+
+
 class Node:
     def __init__(self, config):
         self.c = config
@@ -101,9 +195,11 @@ class Node:
         protected(HERE / 'logical-transfer-native.py')
         self.worker = (HERE / 'logical-transfer-native.py').read_text()
 
-    def podman(self, *args, data=None, okay=(0,), timeout=120):
+    def podman(self, *args, data=None, okay=(0,), timeout=120, native_diagnostic=False):
         r = subprocess.run(['/usr/bin/podman', '--remote=false', *map(str, args)], input=data,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env, timeout=timeout)
+        if native_diagnostic and r.returncode not in okay:
+            _forward_native_failure(r.stderr)
         need(r.returncode in okay, 'Podman operation failed; owned state and native logs retained')
         need(len(r.stdout) <= 4 * LIMIT, 'response exceeds bound')
         return r
@@ -134,9 +230,11 @@ class Node:
         return i
 
     def native(self, mode, **fields):
+        _stage({'export': 'native.export', 'restore': 'native.restore', 'readback': 'native.readback',
+                'binding': 'native.binding', 'resume': 'native.resume'}.get(mode, 'native.operation'))
         request = dict(mode=mode, token=self.token, **fields)
         r = self.podman('exec', '--user', '0:0', '-i', self.cid, '/usr/bin/python3', '-I',
-                        '-c', self.worker, str(LIMIT), data=json.dumps(request).encode(), timeout=480)
+                        '-c', self.worker, str(LIMIT), data=json.dumps(request).encode(), timeout=480, native_diagnostic=True)
         return json.loads(r.stdout)
 
     def resume(self):
@@ -315,15 +413,18 @@ def restore_artifact(manifest, image):
 
 
 def export(node, output, names):
+    _stage('export.prepare')
     output = absent(output)
     output.mkdir(mode=0o700)
     (output / 'files').mkdir(mode=0o700)
     protected(node.c['etc_root'], True)
     protected(node.c['sav_root'], True)
+    _stage('export.validate-source')
     i = node.validate()
     need(i['State']['Running'], 'source must already be running under its own authority')
     node.cid = i['Id']
     # The caller owns this cooperative lock, not the source lifecycle.
+    _stage('export.lock')
     lock_path = Path(node.c['sav_root']) / 'admin/logical-transfer.lock'
     protected(lock_path.parent, True)
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -334,12 +435,15 @@ def export(node, output, names):
         try:
             value = node.native('export', files=names)
         finally:
-            node.resume()
+            _cleanup(node.resume, 'cleanup.resume')
+    _stage('export.decode')
     data = base64.b64decode(value['sql'], validate=True)
     need(len(data) <= LIMIT, 'SQL exceeds fixture bound')
     saved = value['files']
     fm = files_manifest(saved)
+    _stage('export.publish-sql')
     write_new(output / 'logical.sql', data)
+    _stage('export.publish-files')
     for name, item in saved.items():
         write_new(output / 'files' / name, base64.b64decode(item['data'], validate=True))
     manifest = {'format': FORMAT, 'status': 'completed-coherent-export',
@@ -349,12 +453,15 @@ def export(node, output, names):
                 'configuration_sha256': value['birth']['configuration'],
                 'native_worker_sha256': sha(node.worker.encode()), 'created_at': int(time.time())}
     # Completion is published last; partial directories are retained and not restorable.
+    _stage('export.publish-manifest')
     json_new(output / 'manifest.json', manifest)
     return {'status': 'COMPLETED_COHERENT_EXPORT', 'output': str(output)}
 
 
 def restore(node, bundle, receipt_path, allow_adoption):
+    _stage('restore.load-bundle')
     m, data, saved = load_bundle(bundle)  # Reuse this completed bundle; never re-export a source.
+    _stage('restore.preflight')
     restore_artifact(m, node.c['image'])
     receipt_path = absent(receipt_path)
     for key in ('etc_root', 'sav_root'):
@@ -368,6 +475,7 @@ def restore(node, bundle, receipt_path, allow_adoption):
     receipt = {'status': 'FAILED_OR_INCOMPLETE', 'bundle_sql': m['sql'],
                'configuration': node.c, 'stage': 'new-target-construction', 'events': []}
     try:
+        _stage('restore.new-target')
         for key in ('etc_root', 'sav_root'):
             Path(node.c[key]).mkdir(mode=0o755)
             Path(node.c[key]).chmod(0o755)
@@ -417,9 +525,12 @@ def restore(node, bundle, receipt_path, allow_adoption):
                        adoption=request, inventory=final['inventory'], files=m['files'],
                        ordinary_api=actual['api'], binding=binding)
     finally:
+        primary = sys.exc_info()[1]
+        failed_stage = _STAGE
         try:
             cleanup = node.stop()
-        except Exception:
+        except Exception as error:
+            _emit_failure(error, stage='cleanup.target-stop', secondary=primary is not None)
             cleanup = {'status': 'UNSTABLE_OR_UNVERIFIED_TARGET', 'container_stopped': False,
                        'clean_lifecycle': False, 'errors': ['unexpected-cleanup-error']}
         receipt['cleanup'] = cleanup
@@ -435,7 +546,11 @@ def restore(node, bundle, receipt_path, allow_adoption):
                 if receipt['never_started_cleanup'] else
                 'Cleanup incomplete or unverified; do not assume retained SQL state is stable.')
         receipt['target_container'] = node.cid
-        json_new(receipt_path, receipt)
+        _stage('restore.publish-receipt')
+        _cleanup(lambda: json_new(receipt_path, receipt), 'cleanup.receipt')
+        if primary is not None:
+            _stage(failed_stage)
+    _stage('restore.cleanup-result')
     need(receipt['owned_target_stopped_cleanly'], 'target cleanup incomplete; retain ledger/logs')
     return {'status': receipt['status'], 'receipt': str(receipt_path)}
 
@@ -459,7 +574,10 @@ def main():
     need(args.max_payload_bytes > 0, 'positive explicit payload limit required')
     LIMIT = args.max_payload_bytes
     os.umask(0o077)
-    node = Node(configuration(args.config))
+    _stage('config.read')
+    config = configuration(args.config)
+    _stage('node.prepare')
+    node = Node(config)
     if args.command == 'export':
         result = export(node, args.output, args.saved_file)
     else:
@@ -474,6 +592,7 @@ if __name__ == '__main__':
     signal.signal(signal.SIGINT, interrupted)
     try:
         main()
-    except Exception:
+    except Exception as error:
         print('logical transfer incomplete; preserve bundle, target ledger and private diagnostics', file=sys.stderr)
+        _emit_failure(error)
         raise SystemExit(1)
