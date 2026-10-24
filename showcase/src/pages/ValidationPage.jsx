@@ -15,8 +15,93 @@ export default function ValidationPage({ locale = 'fr' }) {
   const timestamp = snapshot.updatedAtUTC || `${snapshot.updatedAt}T12:00:00Z`
   const date = new Intl.DateTimeFormat(lang, { day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Paris' }).format(new Date(timestamp))
 
+  const allChecks = snapshot.features.flatMap((f) => f.checks)
+  const totalValidated = allChecks.filter((c) => c.status === 'validated').length
+  const totalChecks = allChecks.length
+  const overallPercentage = Math.round((100 * totalValidated) / totalChecks)
+
+  const heroLabels = {
+    fr: {
+      eyebrow: "Synthèse d'avancement",
+      title: 'Grandes fonctionnalités',
+      global: 'Couverture globale',
+      counted: 'critères validés'
+    },
+    en: {
+      eyebrow: 'Roadmap Progress',
+      title: 'Major Features',
+      global: 'Overall coverage',
+      counted: 'validated criteria'
+    },
+    es: {
+      eyebrow: 'Resumen de avance',
+      title: 'Grandes funcionalidades',
+      global: 'Cobertura global',
+      counted: 'criterios validados'
+    }
+  }[lang] || {
+    eyebrow: "Synthèse d'avancement",
+    title: 'Grandes fonctionnalités',
+    global: 'Couverture globale',
+    counted: 'critères validés'
+  }
+
   return (
     <article id="validation" tabIndex={-1} className="scroll-mt-24 space-y-9">
+      {/* Barre de progression synthétique en début de page */}
+      <section
+        className="rounded-2xl border border-line bg-surface p-5 sm:p-6 shadow-sm"
+        aria-label={heroLabels.title}
+        data-hero-progress
+      >
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line pb-4 mb-4">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-wider text-accent">{heroLabels.eyebrow}</p>
+            <h2 className="site-display mt-0.5 text-xl font-bold sm:text-2xl">{heroLabels.title}</h2>
+          </div>
+          <div className="flex items-center gap-2.5 rounded-xl border border-accent/20 bg-accent/5 px-3.5 py-1.5 text-sm font-semibold text-accent">
+            <span>{heroLabels.global} :</span>
+            <span className="text-lg font-bold tabular-nums">{overallPercentage}%</span>
+            <span className="text-xs font-normal text-fg-muted">({totalValidated}/{totalChecks})</span>
+          </div>
+        </div>
+
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+          {snapshot.features.map((feature) => {
+            const score = coverage(feature)
+            const blocking = feature.checks.some((criterion) => criterion.status === 'blocked')
+            return (
+              <a
+                key={feature.id}
+                href={`#validation-${feature.id}`}
+                className="group flex flex-col justify-between rounded-xl border border-line/70 bg-surface p-3.5 transition-all hover:border-accent hover:shadow-sm"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <span className="text-xs font-semibold text-fg transition-colors group-hover:text-accent line-clamp-1">
+                    {feature.name[lang]}
+                  </span>
+                  <span className={`text-sm font-bold tabular-nums ${blocking ? 'text-warm' : 'text-accent'}`}>
+                    {score.percentage}%
+                  </span>
+                </div>
+                <div className="mt-3">
+                  <progress
+                    className={`validation-progress h-2 w-full ${blocking ? 'text-warm' : 'text-accent'}`}
+                    value={score.validated}
+                    max={score.total}
+                    aria-label={`${feature.name[lang]} : ${score.percentage}%`}
+                  />
+                  <div className="mt-1.5 flex justify-between text-[11px] text-fg-faint">
+                    <span className="line-clamp-1">{feature.state[lang]}</span>
+                    <span className="shrink-0">{score.validated}/{score.total}</span>
+                  </div>
+                </div>
+              </a>
+            )
+          })}
+        </div>
+      </section>
+
       <header className="border-b border-line pb-8">
         <p className="text-sm font-semibold text-accent">{copy.eyebrow}</p>
         <h1 className="site-display mt-4 max-w-3xl text-4xl font-semibold leading-tight sm:text-5xl">{copy.title}</h1>
