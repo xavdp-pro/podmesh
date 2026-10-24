@@ -18,6 +18,7 @@ import time
 HERE = Path(__file__).resolve().parent
 LABEL = 'io.podmesh.logical-restore'
 FORMAT = 'podmesh.canonical-logical-export/v1'
+BOOTSTRAP_DIRS = ('inbox', 'outbox', 'migrations', 'podman-tmp')
 ADOPTION_ENTRYPOINT_SHA256 = '2490cd272725d53dc341c7056cbf0a1817449f83119e0a42119f3c9d5ca22f22'
 LIMIT = 16 * 1024 * 1024
 ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8'}
@@ -158,7 +159,7 @@ def _forward_native_failure(stderr):
               'export.inventory.after', 'readback.inventory', 'restore.empty-target',
               'restore.import', 'restore.files', 'restore.inventory', 'cleanup.resume', 'cleanup.client'}
     functions = set(('need digest encoded decoded write_new regular run bounds client sql dump '
-        'app_process resume quiesced file_names files identity inventory contents '
+        'app_process resume quiesced file_names bootstrap_directories files identity inventory contents '
         'provider_machine_sha256 api main interrupted _cleanup code <module> '
         '<listcomp> <dictcomp> <setcomp> <genexpr> <lambda>').split())
     # A failed native entrypoint writes its structured line last. Parse no SQL log.
@@ -361,6 +362,20 @@ def files_manifest(saved):
     return result
 
 
+def directories_manifest(value):
+    # Empty canonical bootstrap directories have metadata, not file payloads.
+    need(isinstance(value, dict) and set(value) == set(BOOTSTRAP_DIRS),
+         'explicit canonical bootstrap directory manifest required')
+    for item in value.values():
+        need(isinstance(item, dict) and set(item) == {'type', 'uid', 'gid', 'mode', 'empty'}
+             and item['type'] == 'directory' and item['empty'] is True,
+             'empty plain directory metadata required')
+        need(all(type(item[k]) is int and 0 <= item[k] < 4294967295 for k in ('uid', 'gid'))
+             and type(item['mode']) is int and 0 <= item['mode'] <= 0o777,
+             'plain directory ownership/mode required')
+    return value
+
+
 def load_bundle(path):
     path = protected(path, True)
     need(stat.S_IMODE(path.stat().st_mode) == 0o700, 'bundle must be root0700')
@@ -369,6 +384,8 @@ def load_bundle(path):
     need((path / 'manifest.json').stat().st_size <= LIMIT, 'manifest exceeds bound')
     m = json.loads((path / 'manifest.json').read_text())
     need(m['format'] == FORMAT and m['status'] == 'completed-coherent-export', 'completed export required')
+    directories_manifest(m.get('directories'))
+    need(not set(m['files']) & set(BOOTSTRAP_DIRS), 'file/directory names overlap')
     protected(path / 'logical.sql')
     need((path / 'logical.sql').stat().st_size <= LIMIT, 'SQL exceeds fixture bound')
     data = (path / 'logical.sql').read_bytes()
@@ -441,6 +458,8 @@ def export(node, output, names):
     need(len(data) <= LIMIT, 'SQL exceeds fixture bound')
     saved = value['files']
     fm = files_manifest(saved)
+    directories = directories_manifest(value['directories'])
+    need(not set(saved) & set(directories), 'file/directory names overlap')
     _stage('export.publish-sql')
     write_new(output / 'logical.sql', data)
     _stage('export.publish-files')
@@ -448,6 +467,7 @@ def export(node, output, names):
         write_new(output / 'files' / name, base64.b64decode(item['data'], validate=True))
     manifest = {'format': FORMAT, 'status': 'completed-coherent-export',
                 'sql': {'bytes': len(data), 'sha256': sha(data)}, 'files': fm,
+                'directories': directories,
                 'inventory': value['inventory'], 'image': node.c['image'],
                 'provenance': value['birth']['provenance'],
                 'configuration_sha256': value['birth']['configuration'],
@@ -490,7 +510,7 @@ def restore(node, bundle, receipt_path, allow_adoption):
         different = target != m['inventory']['identity']['machine_id_sha256']
         need(not different or allow_adoption, 'different physical host requires --adopt-restored-host-identity')
         receipt['stage'] = 'absent-application-database-import-and-compare'
-        result = node.native('restore', files=sorted(saved), saved=saved,
+        result = node.native('restore', files=sorted(saved), saved=saved, directories=m['directories'],
                              sql=base64.b64encode(data).decode(), inventory=m['inventory'],
                              fresh_identity=fresh['identity'])
         need(result['compared'], 'restore comparison incomplete')
@@ -511,7 +531,8 @@ def restore(node, bundle, receipt_path, allow_adoption):
             need(node.birth()['host_identity_adoption'] == restored['inventory']['audits'][-1], 'birth/audit mismatch')
         else:
             need(restored['inventory'] == m['inventory'], 'same-host restored inventory differs')
-        need(restored['files'] == saved, 'restored saved files differ')
+        need(restored['files'] == saved and restored['directories'] == m['directories'],
+             'restored saved files/directories differ')
         # A separate ordinary lifecycle must preserve the post-adoption result exactly.
         receipt['stage'] = 'ordinary-recreation-and-readback'
         node.recreate()
@@ -522,7 +543,7 @@ def restore(node, bundle, receipt_path, allow_adoption):
         need(actual['api']['identity']['host_uuid'] == m['inventory']['identity']['host_uuid']
              and actual['api']['capabilities']['store_engine'] == 'mariadb', 'ordinary NODE API readback failed')
         receipt.update(status='READBACK_PASSED_FINAL_STOP_PENDING', stage='final-owned-stop', target_container=node.cid,
-                       adoption=request, inventory=final['inventory'], files=m['files'],
+                       adoption=request, inventory=final['inventory'], files=m['files'], directories=m['directories'],
                        ordinary_api=actual['api'], binding=binding)
     finally:
         primary = sys.exc_info()[1]

@@ -23,6 +23,7 @@ RUNTIME = Path('/run/podmesh-node/admin')
 LIB = Path('/usr/lib/podmesh-node-canonical')
 ADOPTION_ENTRYPOINT_SHA256 = '2490cd272725d53dc341c7056cbf0a1817449f83119e0a42119f3c9d5ca22f22'
 LIMIT = 16 * 1024 * 1024
+BOOTSTRAP_DIRS = ('inbox', 'outbox', 'migrations', 'podman-tmp')
 FLAGS = ['--single-transaction', '--quick', '--routines', '--events', '--triggers',
          '--hex-blob', '--skip-comments', '--skip-dump-date', '--skip-lock-tables',
          '--order-by-primary', '--databases', 'podmesh-node']
@@ -239,10 +240,27 @@ def file_names(names):
     return sorted(names)
 
 
+def bootstrap_directories():
+    result = {}
+    for name in BOOTSTRAP_DIRS:
+        path = HOME / 'sav/app' / name
+        m = path.lstat()
+        mode = stat.S_IMODE(m.st_mode)
+        need(stat.S_ISDIR(m.st_mode) and mode <= 0o777,
+             'plain native bootstrap directory required; no symlink')
+        need(not any(path.iterdir()), 'nonempty bootstrap directory outside flat-file contract')
+        result[name] = {'type': 'directory', 'uid': m.st_uid, 'gid': m.st_gid,
+                        'mode': mode, 'empty': True}
+    return result
+
+
 def files(names):
     names = file_names(names)
     folder = HOME / 'sav/app'
-    need(sorted(p.name for p in folder.iterdir()) == names, 'undeclared saved application state')
+    need(not set(names) & set(BOOTSTRAP_DIRS), 'file/directory names overlap')
+    need(sorted(p.name for p in folder.iterdir()) == sorted(names + list(BOOTSTRAP_DIRS)),
+         'undeclared saved application state')
+    bootstrap_directories()  # Check all four actual types, ordinary modes and empty contents.
     result = {}
     total = 0
     for n in names:
@@ -360,13 +378,15 @@ def main(request):
             saved = files(names)
             _stage('export.inventory.after')
             need(inventory() == before, 'source changed during export')
-            return {'inventory': before, 'sql': encoded(payload), 'files': saved, 'birth': birth}
+            return {'inventory': before, 'sql': encoded(payload), 'files': saved,
+                    'directories': bootstrap_directories(), 'birth': birth}
         if mode == 'readback':
             _stage('readback.inventory')
-            return {'inventory': inventory(), 'files': files(names)}
+            return {'inventory': inventory(), 'files': files(names), 'directories': bootstrap_directories()}
         need(mode == 'restore', 'unknown native operation')
         _stage('restore.empty-target')
-        need(not any((HOME / 'sav/app').iterdir()), 'target application directory is not empty')
+        need(files([]) == {} and bootstrap_directories() == request['directories'],
+             'fresh target bootstrap directory metadata differs or saved files already exist')
         need(identity() == request['fresh_identity'], 'fresh target identity changed')
         payload = decoded(request['sql'])
         # The owning host command has created this target in this invocation only.
@@ -386,7 +406,8 @@ def main(request):
             write_new(HOME / 'sav/app' / name, decoded(item['data']), item['uid'], item['gid'], item['mode'])
         _stage('restore.inventory')
         observed = inventory()
-        need(observed == request['inventory'] and files(names) == request['saved'], 'restored SQL/files differ')
+        need(observed == request['inventory'] and files(names) == request['saved']
+             and bootstrap_directories() == request['directories'], 'restored SQL/files/directories differ')
         write_new(ADMIN / 'restore.sql', payload)
         return {'compared': True, 'inventory': observed}
 

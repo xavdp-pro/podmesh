@@ -17,6 +17,12 @@ manual procedure passing is not qualification of these new command bytes.
   per table. Output/file buffers use the explicit operator byte limit below.
   Views, routines, events and triggers
   must be absent; their presence refuses rather than discarding them silently.
+- Exactly four empty native bootstrap directories under `sav/app`: `inbox`,
+  `outbox`, `migrations`, and `podman-tmp`. The manifest records type, UID, GID,
+  ordinary mode and emptiness. Fresh targets create their own directories; their
+  metadata must match before import and through subsequent readbacks/recreation.
+  Nonempty directories, symlinks and extra entries remain outside this scope.
+  Bundles without this explicit directory map are refused; no old bundle is rewritten.
 - A complete explicit list of at most16 flat regular files directly under
   `sav/app`. Each must be single-linked. Actual UID, GID and ordinary permission
   mode are recorded and restored, including a mode0644 marker. Special mode bits
