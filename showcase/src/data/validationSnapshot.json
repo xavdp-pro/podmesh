@@ -120,15 +120,17 @@
         "es": "Base MariaDB · laboratorio"
       },
       "labSummary": {
-        "fr": "Application et MariaDB ont fonctionné dans le même conteneur par socket privé. Les données ont survécu à une recréation propre puis, dans un autre essai, à un SIGKILL avec récupération InnoDB et nouvelle écriture. Une copie SQL cohérente de 40 tables et 7 lignes a aussi réussi. Ce sont de petits essais de laboratoire, sans qualification de production.",
-        "en": "Application and MariaDB operated in the same container over a private socket. Data survived clean recreation and, in another test, SIGKILL with InnoDB recovery and a new write. A coherent SQL copy of 40 tables and 7 rows also passed. These are small laboratory tests, without production qualification.",
-        "es": "Aplicación y MariaDB funcionaron en el mismo contenedor mediante socket privado. Los datos sobrevivieron a una recreación limpia y, en otro ensayo, a SIGKILL con recuperación InnoDB y nueva escritura. También funcionó una copia SQL coherente de 40 tablas y 7 filas. Son pequeños ensayos de laboratorio, sin validación para producción."
+        "fr": "NODE et manager ont chacun démontré leurs écritures persistantes, la recréation propre et la reprise explicite après panne de processus, avec MariaDB privée dans le même conteneur. Les preuves restent délimitées à de petits essais : elles ne qualifient pas la production.",
+        "en": "NODE and manager each demonstrated persistent writes, clean recreation and explicit process-failure recovery with private MariaDB in the same container. Evidence remains limited to small tests and does not qualify production.",
+        "es": "NODE y manager demostraron escrituras persistentes, recreación limpia y recuperación explícita tras fallo de proceso, con MariaDB privada en el mismo contenedor. Pruebas limitadas a ensayos pequeños, sin validar producción."
       },
       "labProofs": [
         "node-common",
         "manager-native",
         "canonical-node-persistence",
-        "canonical-process-recovery"
+        "canonical-process-recovery",
+        "canonical-manager-persistence",
+        "canonical-manager-process-recovery"
       ],
       "qualificationNote": {
         "fr": "7/8 conserve le dénominateur du socle historique. Les nouveaux essais NODE canonique sont des preuves distinctes : une recréation propre et une reprise explicite après crash, pas une qualification globale, un redémarrage d’hôte ou des mois d’endurance.",
@@ -1011,16 +1013,52 @@
         "en": "The five existing images start: Vault writes and reads, Queue completes two tasks including one triggered by Maestro, Logger retains 10 events and Bridge answers health checks. State is retained after stop. Maestro required forced termination and restart remains unverified. This version uses SQLite WAL for Queue and plaintext JSON for Vault. Bridge synthesizes text without a real engine call: no AI inference or vault encryption demonstrated. Partial result distinct from older SHAPER tests; all actors stopped and checked originals preserved.",
         "es": "Las cinco imágenes existentes arrancan: Vault escribe y lee, Queue termina dos tareas, una activada por Maestro, Logger conserva 10 eventos y Bridge responde a salud. El estado se conserva tras parar. Maestro necesitó terminación forzada y el reinicio sigue sin verificar. Esta versión usa SQLite WAL para Queue y JSON sin cifrar para Vault. Bridge sintetiza texto sin llamar a un motor real: no se demuestran inferencia IA ni cifrado del almacén. Resultado parcial distinto de los ensayos SHAPER anteriores; actores parados y originales comprobados conservados."
       }
+    },
+    {
+      "id": "canonical-manager-persistence",
+      "date": "2026-10-24",
+      "version": "Canonical MANAGER · image01d603f",
+      "kind": "scoped-native-runtime",
+      "runtimePass": true,
+      "productionQualified": false,
+      "title": {
+        "fr": "Manager canonique : écritures conservées après recréation",
+        "en": "Canonical manager: writes retained after recreation",
+        "es": "Manager canónico: escrituras conservadas tras recreación"
+      },
+      "summary": {
+        "fr": "Le vrai manager et MariaDB fonctionnent dans le même conteneur : application UID1103, SQL privé par socket sans port3306. Deux observations sont ajoutées et relues par les interfaces natives ; la première est retrouvée intégralement après arrêt propre et recréation. UUID, configuration, identifiants SQL, provenance et datadir restent identiques. Une seule réplique locale sans pair ni autorité d’activation ; acteurs arrêtés, existant contrôlé préservé. Ce résultat ne prouve ni réplication ni disponibilité de production.",
+        "en": "The actual manager and MariaDB run in one container: application UID1103, private SQL socket without port3306. Two observations are appended and read through native interfaces; the first survives clean stop and recreation in full. UUID, configuration, SQL credentials, provenance and datadir remain identical. One local replica without peers or activation authority; actors stopped and checked originals preserved. This does not prove replication or production availability.",
+        "es": "El manager real y MariaDB funcionan en un contenedor: aplicación UID1103, socket SQL privado sin puerto3306. Dos observaciones añadidas y leídas por interfaces nativas; la primera se conserva íntegra tras parada limpia y recreación. UUID, configuración, credenciales SQL, procedencia y datadir idénticos. Una réplica local sin pares ni autoridad de activación; actores parados y originales comprobados preservados. No demuestra replicación ni disponibilidad en producción."
+      }
+    },
+    {
+      "id": "canonical-manager-process-recovery",
+      "date": "2026-10-24",
+      "version": "Canonical MANAGER · explicit process recovery01d603f",
+      "kind": "scoped-native-runtime",
+      "runtimePass": true,
+      "productionQualified": false,
+      "title": {
+        "fr": "Manager : reprise explicite après SIGKILL et redo InnoDB",
+        "en": "Manager: explicit SIGKILL recovery and InnoDB redo",
+        "es": "Manager: recuperación explícita tras SIGKILL y redo InnoDB"
+      },
+      "summary": {
+        "fr": "Après validation d’un troisième fait, seul le nouveau conteneur de test reçoit SIGKILL. L’ancien acteur et ses enfants sont vérifiés absents avant la reprise explicite sur le même état, sans faux arrêt propre. InnoDB récupère 6 pages ; les trois faits sont retrouvés intégralement, puis un quatrième est écrit et relu. Identités, configuration, identifiants SQL et datadir sont conservés ; arrêt propre et préservation de l’existant contrôlés. Un seul essai sur la même VM : pas de HA automatique, quorum, panne physique, promotion ou production qualifiés.",
+        "en": "After a third fact is committed, only the new test container receives SIGKILL. The old actor and children are verified absent before explicit recovery on the same state, without a forged clean stop. InnoDB recovers 6 pages; all three facts are retained in full, then a fourth is written and read. Identities, configuration, SQL credentials and datadir are preserved; clean stop and checked-original preservation verified. One same-VM test: no qualified automatic HA, quorum, physical failure, promotion or production.",
+        "es": "Tras confirmar un tercer hecho, solo el nuevo contenedor de prueba recibe SIGKILL. Se comprueba ausencia del actor y sus hijos antes de recuperar explícitamente el mismo estado, sin fingir parada limpia. InnoDB recupera 6 páginas; los tres hechos se conservan íntegros y se escribe y lee un cuarto. Identidades, configuración, credenciales SQL y datadir conservados; parada limpia y preservación de originales comprobadas. Un ensayo en la misma VM: sin validar HA automática, quórum, fallo físico, promoción ni producción."
+      }
     }
   ],
-  "updatedAtUTC": "2026-10-24T07:48:38.846247Z",
+  "updatedAtUTC": "2026-10-24T08:12:55.633292Z",
   "updatePolicy": "Publish only verified evidence changes; preserve historical lab achievements and version boundaries; never count in-progress code as validated.",
   "canonicalBoundary": {
     "state": "not_qualified",
     "title": {
-      "fr": "Canon : NODE natif démontré, qualification globale encore ouverte",
-      "en": "Canonical boundary: native NODE demonstrated, overall qualification open",
-      "es": "Canon: NODE nativo demostrado, validación global aún abierta"
+      "fr": "Canon : NODE et manager natifs démontrés, qualification globale ouverte",
+      "en": "Canonical boundary: native NODE and manager demonstrated, overall qualification open",
+      "es": "Canon: NODE y manager nativos demostrados, validación global abierta"
     },
     "summary": {
       "fr": "Les pourcentages ci-dessous couvrent les critères affichés et les configurations testées en laboratoire. Ils ne mesurent pas la conformité complète au canon. La cible exige une MariaDB privée dans le même conteneur que chaque unité fonctionnelle, accessible par socket privé sans écoute TCP, avec identités, droits, persistance et restauration vérifiés.",
@@ -1029,17 +1067,17 @@
     },
     "gaps": {
       "fr": [
-        "Le NODE combine application et MariaDB privée ; persistance, reprise explicite, restauration PMBS et adoption après transfert sont démontrées sur petit jeu de données. Manager et restauration de tous les états restent ouverts.",
+        "NODE et manager réunissent application et MariaDB privée : persistance propre et reprise explicite après crash sont observées. Le NODE a aussi une restauration PMBS et une adoption après transfert. Restauration complète de tous les états, partitionnement et exploitation globale restent ouverts.",
         "MeshFS utilise encore SQLite pour les métadonnées expérimentales. Les résultats PMBS portent sur les contenus sauvegardés ; ils ne qualifient pas à eux seuls son état durable comme unité SHAPER autonome.",
         "Les tables doivent être qualifiées selon leur usage, leur croissance et leur rétention sur plusieurs mois : partitions mensuelles UTC pour les historiques concernés, sans purger les protections contre les anciens rejeux. Un export SQL fidèle précède les changements de schéma."
       ],
       "en": [
-        "NODE combines application and private MariaDB; persistence, explicit recovery, PMBS restore and post-transfer adoption are demonstrated on a small fixture. Manager and full declared-state restoration remain open.",
+        "NODE and manager combine application and private MariaDB: clean persistence and explicit crash recovery are observed. NODE also has PMBS restore and post-transfer adoption evidence. Full declared-state restoration, partitioning and overall operations remain open.",
         "MeshFS still uses SQLite for experimental metadata. PMBS results cover backed-up contents; they do not by themselves qualify its durable state as an autonomous SHAPER unit.",
         "Tables need qualification by usage, growth and retention over months: monthly UTC partitions for applicable histories, without purging protections against old replays. A faithful SQL export precedes schema changes."
       ],
       "es": [
-        "NODE combina aplicación y MariaDB privada; persistencia, recuperación explícita, restauración PMBS y adopción tras transferencia demostradas con pocos datos. Siguen pendientes manager y restauración de todo estado declarado.",
+        "NODE y manager reúnen aplicación y MariaDB privada: persistencia limpia y recuperación explícita tras fallo observadas. NODE también tiene pruebas de restauración PMBS y adopción tras traslado. Siguen pendientes restauración de todo estado declarado, particionado y operación global.",
         "MeshFS aún usa SQLite para los metadatos experimentales. Los resultados PMBS cubren los contenidos copiados; por sí solos no validan su estado duradero como unidad SHAPER autónoma.",
         "Hay que evaluar cada tabla por uso, crecimiento y retención durante meses: particiones mensuales UTC para los históricos correspondientes, sin eliminar protecciones contra repeticiones antiguas. Una exportación SQL fiel precede a los cambios de esquema."
       ]
@@ -1048,21 +1086,21 @@
   },
   "currentMilestone": {
     "state": "partial",
-    "proof": "canonical-crosshost-adoption",
+    "proof": "canonical-manager-process-recovery",
     "title": {
-      "fr": "NODE : restauration entre hôtes et restauration PMBS démontrées",
-      "en": "NODE: cross-host restore and PMBS restore demonstrated",
-      "es": "NODE: restauración entre hosts y con PMBS demostradas"
+      "fr": "NODE et manager : persistance et reprise après panne démontrées",
+      "en": "NODE and manager: persistence and process recovery demonstrated",
+      "es": "NODE y manager: persistencia y recuperación tras fallo demostradas"
     },
     "summary": {
-      "fr": "Le transfert manuel conserve données et UUID sur une nouvelle machine après adoption explicite. Une restauration native PMBS sur le même hôte retrouve aussi le NODE utile. Les essais portent sur 40 tables, 7 lignes initiales et un fichier témoin ; les nouvelles écritures sont vérifiées. Les anciens acquis de persistance et de reprise après crash sont conservés.",
-      "en": "Manual transfer preserves data and UUID on a new machine after explicit adoption. Native same-host PMBS restore also recovers a useful NODE. Tests cover 40 tables, 7 initial rows and one marker file; new writes are verified. Earlier persistence and crash-recovery proofs are retained.",
-      "es": "La transferencia manual conserva datos y UUID en otra máquina tras adopción explícita. La restauración nativa PMBS en el mismo host también recupera un NODE útil. Ensayos sobre 40 tablas, 7 filas iniciales y un archivo testigo; nuevas escrituras verificadas. Se conservan pruebas anteriores de persistencia y recuperación tras fallo."
+      "fr": "NODE et manager ont chacun démontré leurs écritures persistantes, la recréation propre et la reprise explicite après panne de processus, avec MariaDB privée dans le même conteneur. Les preuves restent délimitées à de petits essais : elles ne qualifient pas la production.",
+      "en": "NODE and manager each demonstrated persistent writes, clean recreation and explicit process-failure recovery with private MariaDB in the same container. Evidence remains limited to small tests and does not qualify production.",
+      "es": "NODE y manager demostraron escrituras persistentes, recreación limpia y recuperación explícita tras fallo de proceso, con MariaDB privada en el mismo contenedor. Pruebas limitadas a ensayos pequeños, sin validar producción."
     },
     "next": {
-      "fr": "Restent : manager canonique avec écriture durable/recréation, commande de transfert exploitable, réplication continue, restauration de tous les états déclarés et cycle de vie complet des cellules Alpine. Leurs lacunes réelles de Bridge, Vault et arrêt Maestro sont explicites. Production non qualifiée.",
-      "en": "Remaining: canonical manager durable write/recreation, usable transfer command, continuous replication, restore of all declared state and complete Alpine-cell lifecycle. Actual Bridge, Vault and Maestro-stop gaps are explicit. Production unqualified.",
-      "es": "Pendientes: escritura durable/recreación del manager canónico, comando de transferencia utilizable, replicación continua, restauración de todo estado declarado y ciclo completo de células Alpine. Se explicitan carencias reales de Bridge, Vault y parada Maestro. Producción no validada."
+      "fr": "Prochaines preuves : copie/restauration SQL du manager, commandes de transfert et de restauration des cellules utilisables, arrêt propre et reprise des cellules Alpine. Réplication continue, partitionnement délibéré et exploitation de production restent à qualifier.",
+      "en": "Next evidence: manager SQL copy/restore, usable cell transfer/restore commands, and Alpine-cell clean stop and restart. Continuous replication, deliberate partitioning and production operations remain to qualify.",
+      "es": "Próximas pruebas: copia/restauración SQL del manager, comandos utilizables de traslado/restauración de células y parada limpia/reinicio de células Alpine. Siguen por validar replicación continua, particionado deliberado y explotación en producción."
     }
   }
 }
