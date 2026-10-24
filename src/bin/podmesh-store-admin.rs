@@ -3,7 +3,9 @@ use podmesh::store::{self, migrations, DurableStore, Engine, StoreConfig};
 use serde_json::{json,Value};
 use std::{fs,io::Read,path::{Path,PathBuf},os::unix::fs::{MetadataExt,PermissionsExt,OpenOptionsExt,FileTypeExt}};
 type Error=Box<dyn std::error::Error>;
-const USAGE:&str="Usage: podmesh-store-admin prepare --role node|manager --profile ROOT_PROFILE --admin-socket PRIVATE_UNIX_SOCKET --admin-password-file ROOT0600_FILE\nRequires real uid0 and euid0, an existing empty role database or an exact-current schema, and no other non-daemon server connections. No TCP/DSN, arbitrary SQL, grants, copy, drop, reset, force or old/partial-schema repair. Functional and private admin socket paths must identify the same local socket.";
+#[path = "store_admin/observations_monthly.rs"]
+mod observations_monthly;
+const USAGE:&str="Usage: podmesh-store-admin prepare --role node|manager --profile ROOT_PROFILE --admin-socket PRIVATE_UNIX_SOCKET --admin-password-file ROOT0600_FILE\nOptional NODE-only --observations-months ROOT_PLAN_JSON constructs monthly observations on an EMPTY database. advance-observations with the same credentials and plan extends its future partition; no purge.\nRequires real uid0 and euid0, an existing empty role database or an exact-current schema, and no other non-daemon server connections. No TCP/DSN, arbitrary SQL, grants, copy, drop, reset, force or old/partial-schema repair. Functional and private admin socket paths must identify the same local socket.";
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 enum Role {Node,Manager}
 impl Role {
@@ -12,21 +14,24 @@ impl Role {
     fn verify(self,db:&mut dyn DurableStore)->store::Result<()>{match self{Self::Node=>migrations::verify_current_node(db),Self::Manager=>migrations::verify_current_manager(db)}}
     fn apply(self,db:&mut dyn DurableStore)->store::Result<migrations::Applied>{match self{Self::Node=>migrations::apply(db),Self::Manager=>migrations::apply_manager(db)}}
 }
-struct Args {role:Role,profile:PathBuf,socket:PathBuf,password:PathBuf}
+struct Args {role:Role,profile:PathBuf,socket:PathBuf,password:PathBuf,advance:bool,months:Option<PathBuf>}
 fn parse(args:Vec<String>)->Result<Args,Error>{
-    if args.first().map(String::as_str)!=Some("prepare") {return Err(USAGE.into());}
-    let mut role=None;let mut profile=None;let mut socket=None;let mut password=None;
+    let advance=match args.first().map(String::as_str){Some("prepare")=>false,Some("advance-observations")=>true,_=>return Err(USAGE.into())};
+    let mut role=None;let mut profile=None;let mut socket=None;let mut password=None;let mut months=None;
     let mut i=1;while i<args.len(){
         let value=args.get(i+1).filter(|v|!v.starts_with("--")).ok_or("missing schema-admin option value")?;
         match args[i].as_str(){
             "--role" if role.is_none()=>role=Some(Role::parse(value)?),
+            "--observations-months" if months.is_none()=>months=Some(PathBuf::from(value)),
             "--profile" if profile.is_none()=>profile=Some(PathBuf::from(value)),
             "--admin-socket" if socket.is_none()=>socket=Some(PathBuf::from(value)),
             "--admin-password-file" if password.is_none()=>password=Some(PathBuf::from(value)),
             _=>return Err("unknown or duplicate schema-admin option".into()),
         } i+=2;
     }
-    Ok(Args{role:role.ok_or("role is required")?,profile:profile.ok_or("profile is required")?,socket:socket.ok_or("admin socket is required")?,password:password.ok_or("separate private admin password file is required")?})
+    let role=role.ok_or("role is required")?;
+    if (advance && months.is_none()) || (months.is_some() && role!=Role::Node) {return Err("monthly observations require NODE and an explicit root plan".into());}
+    Ok(Args{role,advance,months,profile:profile.ok_or("profile is required")?,socket:socket.ok_or("admin socket is required")?,password:password.ok_or("separate private admin password file is required")?})
 }
 fn require_root(uid:u32)->Result<(),Error>{if uid!=0{Err("private schema administration requires real uid0 and euid0".into())}else{Ok(())}}
 fn absolute(path:&Path)->Result<(),Error>{
@@ -78,7 +83,7 @@ fn profile(document:&Value,role:Role)->Result<StoreConfig,Error>{
     absolute(config.mariadb.socket.as_deref().unwrap())?;absolute(config.mariadb.password_file.as_deref().unwrap())?;
     Ok(config)
 }
-fn administer(role:Role,db:&mut dyn DurableStore)->Result<&'static str,Error>{
+fn offline(db:&mut dyn DurableStore)->Result<(),Error>{
     // Offline is a deployment precondition: refuse every other non-daemon connection,
     // including sessions that could use qualified names without selecting this DB.
     // Functional startup cannot become current until the final immutable migration
@@ -86,6 +91,10 @@ fn administer(role:Role,db:&mut dyn DurableStore)->Result<&'static str,Error>{
     let peers=db.query_one("SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE `ID`<>CONNECTION_ID() AND `COMMAND`<>'Daemon'",&[])?
         .ok_or("offline connection inventory unreadable")?.integer(0)?;
     if peers!=0{return Err("database is not offline: other connections are present".into());}
+    Ok(())
+}
+fn administer(role:Role,db:&mut dyn DurableStore)->Result<&'static str,Error>{
+    offline(db)?;
     if db.tables()?.is_empty(){role.apply(db)?;role.verify(db)?;Ok("prepared_empty_schema")}
     else{role.verify(db)?;Ok("already_current_no_ddl")}
 }
@@ -97,6 +106,10 @@ fn run()->Result<(),Error>{
     if !cfg!(feature="mariadb"){return Err("schema-admin requires a build with the mariadb feature".into());}
     let document:Value=serde_json::from_slice(&root_file(&args.profile,false,65536)?).map_err(|_|"root profile JSON is malformed")?;
     let mut config=profile(&document,args.role)?;
+    let months=args.months.as_ref().map(|path| -> Result<_,Error> {
+        let value:Value=serde_json::from_slice(&root_file(path,false,65536)?)?;
+        observations_monthly::Plan::parse(&value)
+    }).transpose()?;
     root_parents(&args.socket)?;
     let parent=fs::symlink_metadata(args.socket.parent().ok_or("admin socket parent missing")?)?;
     if parent.permissions().mode()&0o777!=0o700 {return Err("admin socket must have a private root0700 parent".into());}
@@ -120,7 +133,11 @@ fn run()->Result<(),Error>{
     let target=db.query_one("SELECT DATABASE(), CURRENT_USER()",&[]).map_err(|_|"administrator identity query failed")?
         .ok_or("administrator identity unavailable")?;
     if target.text(0)?!=args.role.slug()||!target.text(1)?.starts_with("root@") {return Err("connected database/administrator identity differs from declared role".into());}
-    let status=administer(args.role,db.as_mut())?;
+    let status=if let Some(plan)=months.as_ref(){
+        offline(db.as_mut())?;
+        if args.advance {observations_monthly::advance(db.as_mut(),plan)?;"observations_months_advanced"}
+        else {observations_monthly::prepare_empty(db.as_mut(),plan)?;"prepared_empty_schema_monthly_observations"}
+    }else{administer(args.role,db.as_mut())?};
     println!("{}",json!({"status":status,"role":match args.role{Role::Node=>"node",Role::Manager=>"manager"},"database":args.role.slug(),"transport":"explicit-local-unix-socket","data_copy":false}));
     Ok(())
 }
@@ -161,6 +178,15 @@ mod tests {
         let mut duplicate=args();duplicate.extend(["--role".into(),"manager".into()]);assert!(parse(duplicate).is_err());
         let mut wrong=args();wrong[2]="other-role".into();assert!(parse(wrong).is_err());
         assert!(absolute(Path::new("relative.sock")).is_err());assert!(absolute(Path::new("/root/../socket")).is_err());
+    }
+    #[test]
+    fn monthly_observations_parser_requires_explicit_node_plan_and_preserves_default(){
+        let default=parse(args()).unwrap();assert!(!default.advance);assert!(default.months.is_none());
+        let mut selected=args();selected.extend(["--observations-months".into(),"/root/months.json".into()]);
+        assert!(parse(selected.clone()).is_ok());selected[0]="advance-observations".into();assert!(parse(selected.clone()).unwrap().advance);
+        selected[2]="manager".into();assert!(parse(selected).is_err());
+        let mut missing=args();missing[0]="advance-observations".into();assert!(parse(missing).is_err());
+        let mut duplicate=args();duplicate.extend(["--observations-months".into(),"/root/a".into(),"--observations-months".into(),"/root/b".into()]);assert!(parse(duplicate).is_err());
     }
     #[test]
     fn private_schema_authority_admin_profile_preserves_role_and_requires_unix_socket(){
