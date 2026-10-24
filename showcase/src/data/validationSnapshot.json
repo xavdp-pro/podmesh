@@ -18,9 +18,9 @@
         "es": "NODE y manager · MariaDB privada"
       },
       "state": {
-        "fr": "NODE canonique : essais natifs réussis",
-        "en": "Canonical NODE: native tests passed",
-        "es": "NODE canónico: ensayos nativos superados"
+        "fr": "Transfert logique et adoption vérifiés en laboratoire",
+        "en": "Logical transfer and adoption verified in laboratory",
+        "es": "Traslado lógico y adopción verificados en laboratorio"
       },
       "intro": {
         "fr": "Créer, arrêter et retrouver une application avec son journal et ses données.",
@@ -28,9 +28,9 @@
         "es": "Crear, parar y recuperar una aplicación con su registro y datos."
       },
       "remaining": {
-        "fr": "Restent à qualifier : manager canonique, restauration PMBS intégrée, adoption explicite de l’identité après transfert vers un autre hôte, puis déplacement et réplication. Le transfert SQL entre hôtes est conforme, mais le NODE cible refuse encore l’ancienne identité d’hôte.",
-        "en": "Still to qualify: canonical manager, integrated PMBS restore, explicit identity adoption after transfer to another host, then move and replication. Cross-host SQL transfer matches, but the target NODE still refuses the former host identity.",
-        "es": "Quedan por validar: manager canónico, restauración PMBS integrada, adopción explícita de identidad tras transferir a otro host y después traslado y replicación. La transferencia SQL entre hosts coincide, pero el NODE de destino aún rechaza la identidad del host anterior."
+        "fr": "Restent la maintenance des partitions sur copie restaurée, la réplication complète des univers et leur reprise interrompue, le retour après redémarrage réel de l’hôte et l’exploitation de production. Les acquis NODE, manager et PMBS restent distincts ; aucun transfert de mémoire vive ni bascule automatique n’est qualifié.",
+        "en": "Remaining work includes partition maintenance on a restored copy, full universe replication and interrupted recovery, actual host-reboot recovery and production operations. NODE, manager and PMBS achievements remain distinct; no RAM transfer or automatic failover is qualified.",
+        "es": "Quedan mantenimiento de particiones sobre copia restaurada, replicación completa de universos y recuperación interrumpida, recuperación tras reinicio real del host y operación en producción. Los logros NODE, manager y PMBS siguen separados; sin validar traslado de RAM ni conmutación automática."
       },
       "checks": [
         {
@@ -120,9 +120,9 @@
         "es": "Base MariaDB · laboratorio"
       },
       "labSummary": {
-        "fr": "Un export SQL cohérent est restauré dans une base privée indépendante et vide sur le même hôte. Les 5 tables, leurs 10 lignes et les 8 déclencheurs sont comparés intégralement avant utilisation ; aucune routine ni aucun événement présents. Après recréation, les 4 faits d’origine sont identiques, puis un cinquième est écrit et relu. UUID et configuration conservés ; identifiants SQL propres à la cible régénérés. Aucun fichier applicatif durable présent dans ce jeu. Source et cible arrêtées proprement, existant contrôlé préservé. Petit essai local : pas de déplacement interhôtes du manager, réplication, volumes arbitraires ou production qualifiés. Deux managers sur le même hôte ont aussi répliqué deux faits dans les deux sens, sans doublon. La réplication entre deux VM et la recréation propre d’un pair sont aussi vérifiées sur trois faits. La commande native NODE est aussi vérifiée avec 40 tables, un témoin, les quatre répertoires vides et une nouvelle écriture conservée après recréation.",
-        "en": "A coherent SQL export is restored into an independent empty private database on the same host. All 5 tables, their 10 rows and 8 triggers match before use; no routines or events were present. After recreation, the 4 original facts remain identical, then a fifth is written and read. UUID and configuration retained; target-specific SQL credentials regenerated. No durable application payload file was present in this fixture. Source and target stopped cleanly, checked originals preserved. Small local test: no qualified cross-host manager move, replication, arbitrary volumes or production. Two managers on the same host also replicated two facts in both directions without duplicates. Two-VM replication and clean peer recreation are also verified with three facts. The native NODE command is also verified with 40 tables, a marker, four empty directories and a new write retained after recreation.",
-        "es": "Una exportación SQL coherente se restaura en una base privada independiente y vacía del mismo host. Las 5 tablas, sus 10 filas y 8 disparadores coinciden íntegramente antes del uso; no había rutinas ni eventos. Tras recreación, los 4 hechos originales permanecen idénticos y se escribe y lee un quinto. UUID y configuración conservados; credenciales SQL propias del destino regeneradas. Sin archivos aplicativos duraderos en este ensayo. Fuente y destino parados limpiamente, originales comprobados preservados. Pequeño ensayo local: sin validar traslado del manager entre hosts, replicación, volúmenes arbitrarios ni producción. Dos managers en el mismo host también replicaron dos hechos en ambos sentidos sin duplicados. También se verifican la replicación entre dos VM y la recreación limpia de un par con tres hechos. También se verifica el comando NODE nativo con 40 tablas, un testigo, cuatro directorios vacíos y una nueva escritura conservada tras recreación."
+        "fr": "Un export SQL cohérent est restauré dans une base privée indépendante et vide sur le même hôte. Les 5 tables, leurs 10 lignes et les 8 déclencheurs sont comparés intégralement avant utilisation ; aucune routine ni aucun événement présents. Après recréation, les 4 faits d’origine sont identiques, puis un cinquième est écrit et relu. UUID et configuration conservés ; identifiants SQL propres à la cible régénérés. Aucun fichier applicatif durable présent dans ce jeu. Source et cible arrêtées proprement, existant contrôlé préservé. Petit essai local : pas de déplacement interhôtes du manager, réplication, volumes arbitraires ou production qualifiés. Deux managers sur le même hôte ont aussi répliqué deux faits dans les deux sens, sans doublon. La réplication entre deux VM et la recréation propre d’un pair sont aussi vérifiées sur trois faits. La commande native NODE est aussi vérifiée avec 40 tables, un témoin, les quatre répertoires vides et une nouvelle écriture conservée après recréation. Le transfert du NODE avec partitions mensuelles du journal est également vérifié après recréation.",
+        "en": "A coherent SQL export is restored into an independent empty private database on the same host. All 5 tables, their 10 rows and 8 triggers match before use; no routines or events were present. After recreation, the 4 original facts remain identical, then a fifth is written and read. UUID and configuration retained; target-specific SQL credentials regenerated. No durable application payload file was present in this fixture. Source and target stopped cleanly, checked originals preserved. Small local test: no qualified cross-host manager move, replication, arbitrary volumes or production. Two managers on the same host also replicated two facts in both directions without duplicates. Two-VM replication and clean peer recreation are also verified with three facts. The native NODE command is also verified with 40 tables, a marker, four empty directories and a new write retained after recreation. NODE transfer with monthly journal partitions is also verified after recreation.",
+        "es": "Una exportación SQL coherente se restaura en una base privada independiente y vacía del mismo host. Las 5 tablas, sus 10 filas y 8 disparadores coinciden íntegramente antes del uso; no había rutinas ni eventos. Tras recreación, los 4 hechos originales permanecen idénticos y se escribe y lee un quinto. UUID y configuración conservados; credenciales SQL propias del destino regeneradas. Sin archivos aplicativos duraderos en este ensayo. Fuente y destino parados limpiamente, originales comprobados preservados. Pequeño ensayo local: sin validar traslado del manager entre hosts, replicación, volúmenes arbitrarios ni producción. Dos managers en el mismo host también replicaron dos hechos en ambos sentidos sin duplicados. También se verifican la replicación entre dos VM y la recreación limpia de un par con tres hechos. También se verifica el comando NODE nativo con 40 tablas, un testigo, cuatro directorios vacíos y una nueva escritura conservada tras recreación. También se verifica tras recreación el traslado NODE con particiones mensuales del diario."
       },
       "labProofs": [
         "node-common",
@@ -134,7 +134,8 @@
         "canonical-manager-logical-restore",
         "canonical-manager-peer-replication",
         "canonical-manager-crossvm-rejoin",
-        "canonical-node-transfer-command"
+        "canonical-node-transfer-command",
+        "canonical-monthly-node-transfer"
       ],
       "qualificationNote": {
         "fr": "7/8 conserve le dénominateur du socle historique. Les nouveaux essais NODE canonique sont des preuves distinctes : une recréation propre et une reprise explicite après crash, pas une qualification globale, un redémarrage d’hôte ou des mois d’endurance.",
@@ -155,9 +156,9 @@
         "es": "Objetivo de producción con MariaDB privada"
       },
       "state": {
-        "fr": "Copie SQL démontrée · identité interhôtes à traiter",
-        "en": "SQL copy demonstrated · cross-host identity pending",
-        "es": "Copia SQL demostrada · identidad entre hosts pendiente"
+        "fr": "Transfert logique et adoption vérifiés en laboratoire",
+        "en": "Logical transfer and adoption verified in laboratory",
+        "es": "Traslado lógico y adopción verificados en laboratorio"
       },
       "intro": {
         "fr": "Déplacer l’univers ou préparer sa reprise sur un autre hôte.",
@@ -165,9 +166,9 @@
         "es": "Trasladar un universo o preparar su recuperación en otro host."
       },
       "remaining": {
-        "fr": "Restent à qualifier : manager canonique, restauration PMBS intégrée, adoption explicite de l’identité après transfert vers un autre hôte, puis déplacement et réplication. Le transfert SQL entre hôtes est conforme, mais le NODE cible refuse encore l’ancienne identité d’hôte.",
-        "en": "Still to qualify: canonical manager, integrated PMBS restore, explicit identity adoption after transfer to another host, then move and replication. Cross-host SQL transfer matches, but the target NODE still refuses the former host identity.",
-        "es": "Quedan por validar: manager canónico, restauración PMBS integrada, adopción explícita de identidad tras transferir a otro host y después traslado y replicación. La transferencia SQL entre hosts coincide, pero el NODE de destino aún rechaza la identidad del host anterior."
+        "fr": "Restent la maintenance des partitions sur copie restaurée, la réplication complète des univers et leur reprise interrompue, le retour après redémarrage réel de l’hôte et l’exploitation de production. Les acquis NODE, manager et PMBS restent distincts ; aucun transfert de mémoire vive ni bascule automatique n’est qualifié.",
+        "en": "Remaining work includes partition maintenance on a restored copy, full universe replication and interrupted recovery, actual host-reboot recovery and production operations. NODE, manager and PMBS achievements remain distinct; no RAM transfer or automatic failover is qualified.",
+        "es": "Quedan mantenimiento de particiones sobre copia restaurada, replicación completa de universos y recuperación interrumpida, recuperación tras reinicio real del host y operación en producción. Los logros NODE, manager y PMBS siguen separados; sin validar traslado de RAM ni conmutación automática."
       },
       "checks": [
         {
@@ -217,9 +218,9 @@
         "es": "Precontrol MariaDB · laboratorio"
       },
       "labSummary": {
-        "fr": "La commande native exporte 40 tables et 5 lignes, un fichier témoin et les quatre répertoires de démarrage vides, puis restaure une cible neuve dans une autre VM. Schéma, données et métadonnées des répertoires sont comparés. L’adoption conserve le UUID logique, change la liaison machine et ajoute une ligne d’audit (6 lignes). Une nouvelle écriture applicative survit à une recréation ordinaire. Un export et une restauration, sans reprise manuelle ; 3 tests ciblés réussis et contre-regard Opus sans blocage. Acteurs du lot arrêtés, périmètre préexistant contrôlé préservé. Deux VM sur un même hyperviseur : pas de réplication continue, RAM, volumes arbitraires, HA ou qualification production.",
-        "en": "The native command exports 40 tables and 5 rows, one marker file and four empty bootstrap directories, then restores a fresh target in another VM. Schema, data and directory metadata are compared. Adoption retains the logical UUID, changes machine binding and adds one audit row (6 rows). A new application write survives ordinary recreation. One export and one restore, without manual substitution; 3 affected tests pass and Opus reports no blocker. Owned actors stopped and checked originals preserved. Two VMs share one hypervisor: no continuous replication, RAM, arbitrary volumes, HA or production qualification.",
-        "es": "El comando nativo exporta 40 tablas y 5 filas, un archivo testigo y cuatro directorios de arranque vacíos, y restaura un destino nuevo en otra VM. Se comparan esquema, datos y metadatos de directorios. La adopción conserva el UUID lógico, cambia la vinculación de máquina y añade una fila de auditoría (6 filas). Una nueva escritura aplicativa sobrevive a la recreación normal. Una exportación y una restauración, sin sustitución manual; 3 pruebas dirigidas pasan y Opus no encuentra bloqueos. Actores propios parados y originales comprobados preservados. Dos VM en un mismo hipervisor: sin replicación continua, RAM, volúmenes arbitrarios, HA ni validación de producción."
+        "fr": "Un NODE neuf construit son seul journal observations en partitions mensuelles UTC. Un export cohérent de 40 tables et 9 lignes, un témoin et quatre répertoires vides est restauré dans une autre VM ; catalogue des partitions, clé et schéma sont conservés après recréation ordinaire. L’adoption ajoute une ligne d’audit (10 lignes). Une requête applicative vers une identité de qualification absente est rejouée sans nouvel effet métier ; une seconde requête sur la cible survit à une nouvelle recréation. Six conteneurs arrêtés proprement, périmètre préexistant suivi préservé. Même hyperviseur : pas de déplacement de charge réelle, réorganisation de partitions peuplées, réplication continue, HA ou qualification production.",
+        "en": "A fresh NODE constructs only its observations journal in monthly UTC partitions. A coherent export of 40 tables and 9 rows, a marker and four empty directories is restored into another VM; partition catalog, key and schema survive ordinary recreation. Adoption adds one audit row (10 rows). An application request targeting an absent qualification identity replays without a new business effect; a second target request survives another recreation. Six containers stopped cleanly and tracked originals preserved. Same hypervisor: no real workload move, populated-partition reorganization, continuous replication, HA or production qualification.",
+        "es": "Un NODE nuevo crea únicamente su diario observations en particiones mensuales UTC. Una exportación coherente de 40 tablas y 9 filas, un testigo y cuatro directorios vacíos se restaura en otra VM; catálogo, clave y esquema de particiones sobreviven a la recreación normal. La adopción añade una fila de auditoría (10 filas). Una petición aplicativa a una identidad de ensayo ausente se repite sin nuevo efecto de negocio; una segunda petición en destino sobrevive a otra recreación. Seis contenedores parados limpiamente, originales seguidos preservados. Mismo hipervisor: sin traslado de carga real, reorganización de particiones pobladas, replicación continua, HA ni validación de producción."
       },
       "labProofs": [
         "move-mariadb-readonly",
@@ -227,7 +228,8 @@
         "replication-lab",
         "canonical-sql-transfer",
         "canonical-crosshost-adoption",
-        "canonical-node-transfer-command"
+        "canonical-node-transfer-command",
+        "canonical-monthly-node-transfer"
       ],
       "qualificationNote": {
         "fr": "1/4 reste le précontrôle du parcours de déplacement ; la copie SQL seule ne valide pas le déplacement complet ni la réplication. Les acquis SQLite restent acquis dans leur périmètre.",
@@ -1165,9 +1167,27 @@
         "en": "The native command exports 40 tables and 5 rows, one marker file and four empty bootstrap directories, then restores a fresh target in another VM. Schema, data and directory metadata are compared. Adoption retains the logical UUID, changes machine binding and adds one audit row (6 rows). A new application write survives ordinary recreation. One export and one restore, without manual substitution; 3 affected tests pass and Opus reports no blocker. Owned actors stopped and checked originals preserved. Two VMs share one hypervisor: no continuous replication, RAM, arbitrary volumes, HA or production qualification.",
         "es": "El comando nativo exporta 40 tablas y 5 filas, un archivo testigo y cuatro directorios de arranque vacíos, y restaura un destino nuevo en otra VM. Se comparan esquema, datos y metadatos de directorios. La adopción conserva el UUID lógico, cambia la vinculación de máquina y añade una fila de auditoría (6 filas). Una nueva escritura aplicativa sobrevive a la recreación normal. Una exportación y una restauración, sin sustitución manual; 3 pruebas dirigidas pasan y Opus no encuentra bloqueos. Actores propios parados y originales comprobados preservados. Dos VM en un mismo hipervisor: sin replicación continua, RAM, volúmenes arbitrarios, HA ni validación de producción."
       }
+    },
+    {
+      "id": "canonical-monthly-node-transfer",
+      "date": "2026-10-24",
+      "version": "monthly admin 05361fb · native integration dffb492",
+      "kind": "scoped-native-runtime",
+      "runtimePass": true,
+      "productionQualified": false,
+      "title": {
+        "fr": "NODE : partitions mensuelles conservées après transfert",
+        "en": "NODE: monthly partitions retained after transfer",
+        "es": "NODE: particiones mensuales conservadas tras traslado"
+      },
+      "summary": {
+        "fr": "Un NODE neuf construit son seul journal observations en partitions mensuelles UTC. Un export cohérent de 40 tables et 9 lignes, un témoin et quatre répertoires vides est restauré dans une autre VM ; catalogue des partitions, clé et schéma sont conservés après recréation ordinaire. L’adoption ajoute une ligne d’audit (10 lignes). Une requête applicative vers une identité de qualification absente est rejouée sans nouvel effet métier ; une seconde requête sur la cible survit à une nouvelle recréation. Six conteneurs arrêtés proprement, périmètre préexistant suivi préservé. Même hyperviseur : pas de déplacement de charge réelle, réorganisation de partitions peuplées, réplication continue, HA ou qualification production.",
+        "en": "A fresh NODE constructs only its observations journal in monthly UTC partitions. A coherent export of 40 tables and 9 rows, a marker and four empty directories is restored into another VM; partition catalog, key and schema survive ordinary recreation. Adoption adds one audit row (10 rows). An application request targeting an absent qualification identity replays without a new business effect; a second target request survives another recreation. Six containers stopped cleanly and tracked originals preserved. Same hypervisor: no real workload move, populated-partition reorganization, continuous replication, HA or production qualification.",
+        "es": "Un NODE nuevo crea únicamente su diario observations en particiones mensuales UTC. Una exportación coherente de 40 tablas y 9 filas, un testigo y cuatro directorios vacíos se restaura en otra VM; catálogo, clave y esquema de particiones sobreviven a la recreación normal. La adopción añade una fila de auditoría (10 filas). Una petición aplicativa a una identidad de ensayo ausente se repite sin nuevo efecto de negocio; una segunda petición en destino sobrevive a otra recreación. Seis contenedores parados limpiamente, originales seguidos preservados. Mismo hipervisor: sin traslado de carga real, reorganización de particiones pobladas, replicación continua, HA ni validación de producción."
+      }
     }
   ],
-  "updatedAtUTC": "2026-10-24T10:47:01.120259+00:00",
+  "updatedAtUTC": "2026-10-24T11:43:14.525989+00:00",
   "updatePolicy": "Publish only verified evidence changes; preserve historical lab achievements and version boundaries; never count in-progress code as validated.",
   "canonicalBoundary": {
     "state": "not_qualified",
@@ -1202,21 +1222,21 @@
   },
   "currentMilestone": {
     "state": "partial",
-    "proof": "canonical-node-transfer-command",
+    "proof": "canonical-monthly-node-transfer",
     "title": {
-      "fr": "NODE : export et restauration natifs avec les quatre répertoires",
-      "en": "NODE: native export and restore with four bootstrap directories",
-      "es": "NODE: exportación y restauración nativas con cuatro directorios"
+      "fr": "NODE : partitions mensuelles conservées après transfert",
+      "en": "NODE: monthly partitions retained after transfer",
+      "es": "NODE: particiones mensuales conservadas tras traslado"
     },
     "summary": {
-      "fr": "La commande native exporte 40 tables et 5 lignes, un fichier témoin et les quatre répertoires de démarrage vides, puis restaure une cible neuve dans une autre VM. Schéma, données et métadonnées des répertoires sont comparés. L’adoption conserve le UUID logique, change la liaison machine et ajoute une ligne d’audit (6 lignes). Une nouvelle écriture applicative survit à une recréation ordinaire. Un export et une restauration, sans reprise manuelle ; 3 tests ciblés réussis et contre-regard Opus sans blocage. Acteurs du lot arrêtés, périmètre préexistant contrôlé préservé. Deux VM sur un même hyperviseur : pas de réplication continue, RAM, volumes arbitraires, HA ou qualification production.",
-      "en": "The native command exports 40 tables and 5 rows, one marker file and four empty bootstrap directories, then restores a fresh target in another VM. Schema, data and directory metadata are compared. Adoption retains the logical UUID, changes machine binding and adds one audit row (6 rows). A new application write survives ordinary recreation. One export and one restore, without manual substitution; 3 affected tests pass and Opus reports no blocker. Owned actors stopped and checked originals preserved. Two VMs share one hypervisor: no continuous replication, RAM, arbitrary volumes, HA or production qualification.",
-      "es": "El comando nativo exporta 40 tablas y 5 filas, un archivo testigo y cuatro directorios de arranque vacíos, y restaura un destino nuevo en otra VM. Se comparan esquema, datos y metadatos de directorios. La adopción conserva el UUID lógico, cambia la vinculación de máquina y añade una fila de auditoría (6 filas). Una nueva escritura aplicativa sobrevive a la recreación normal. Una exportación y una restauración, sin sustitución manual; 3 pruebas dirigidas pasan y Opus no encuentra bloqueos. Actores propios parados y originales comprobados preservados. Dos VM en un mismo hipervisor: sin replicación continua, RAM, volúmenes arbitrarios, HA ni validación de producción."
+      "fr": "Un NODE neuf construit son seul journal observations en partitions mensuelles UTC. Un export cohérent de 40 tables et 9 lignes, un témoin et quatre répertoires vides est restauré dans une autre VM ; catalogue des partitions, clé et schéma sont conservés après recréation ordinaire. L’adoption ajoute une ligne d’audit (10 lignes). Une requête applicative vers une identité de qualification absente est rejouée sans nouvel effet métier ; une seconde requête sur la cible survit à une nouvelle recréation. Six conteneurs arrêtés proprement, périmètre préexistant suivi préservé. Même hyperviseur : pas de déplacement de charge réelle, réorganisation de partitions peuplées, réplication continue, HA ou qualification production.",
+      "en": "A fresh NODE constructs only its observations journal in monthly UTC partitions. A coherent export of 40 tables and 9 rows, a marker and four empty directories is restored into another VM; partition catalog, key and schema survive ordinary recreation. Adoption adds one audit row (10 rows). An application request targeting an absent qualification identity replays without a new business effect; a second target request survives another recreation. Six containers stopped cleanly and tracked originals preserved. Same hypervisor: no real workload move, populated-partition reorganization, continuous replication, HA or production qualification.",
+      "es": "Un NODE nuevo crea únicamente su diario observations en particiones mensuales UTC. Una exportación coherente de 40 tablas y 9 filas, un testigo y cuatro directorios vacíos se restaura en otra VM; catálogo, clave y esquema de particiones sobreviven a la recreación normal. La adopción añade una fila de auditoría (10 filas). Una petición aplicativa a una identidad de ensayo ausente se repite sin nuevo efecto de negocio; una segunda petición en destino sobrevive a otra recreación. Seis contenedores parados limpiamente, originales seguidos preservados. Mismo hipervisor: sin traslado de carga real, reorganización de particiones pobladas, replicación continua, HA ni validación de producción."
     },
     "next": {
-      "fr": "Partitionnement délibéré, réplication des univers, moteur réel du Bridge et exploitation de production restent ouverts. La réplication de trois faits du manager entre deux VM reste acquise dans son périmètre.",
-      "en": "Deliberate partitioning, universe replication, a real Bridge engine and production operations remain open. Two-VM replication of three manager facts remains established within its scope.",
-      "es": "Siguen abiertos particionado deliberado, replicación de universos, motor real del Bridge y operación en producción. La replicación de tres hechos del manager entre dos VM sigue adquirida en su ámbito."
+      "fr": "Restent la maintenance mensuelle sur copie restaurée, la réplication complète des univers, le moteur réel du Bridge et la qualification de production. Les essais de réplication du manager et de restauration PMBS conservent leurs périmètres distincts.",
+      "en": "Remaining work includes monthly maintenance on a restored copy, full universe replication, a real Bridge engine and production qualification. Manager replication and PMBS restoration retain their distinct scopes.",
+      "es": "Quedan mantenimiento mensual sobre copia restaurada, replicación completa de universos, motor real del Bridge y validación de producción. La replicación del manager y la restauración PMBS mantienen ámbitos distintos."
     }
   }
 }
