@@ -142,7 +142,7 @@ class ManualLogicalTransfer(unittest.TestCase):
         self.assertFalse((self.root / 'absent-sav').exists())
         self.assertFalse((self.root / 'receipt.json').exists())
         # A failed final owned-container stop never asserts retained SQL stability.
-        failed = mock.Mock(c={'image': 'a' * 64, 'etc_root': str(self.root / 'new-etc'),
+        failed = mock.Mock(c={'container': 'new-target', 'image': 'a' * 64, 'etc_root': str(self.root / 'new-etc'),
                               'sav_root': str(self.root / 'new-sav')}, cid='incomplete', lifecycle=None)
         def engine(*args, **kwargs):
             if args[:2] == ('container', 'exists'):
@@ -185,6 +185,39 @@ class ManualLogicalTransfer(unittest.TestCase):
                 mock.patch.object(native.subprocess, 'run', side_effect=child):
             with self.assertRaisesRegex(RuntimeError, 'native result exceeds fixture bound'):
                 native.run(['/controlled/unit-boundary'])
+
+    def test_native_tmpfs_inspect_representation(self):
+        provider = self.root / 'provider'
+        provider.mkdir()
+        config = {'container': 'new-target', 'image': 'a' * 64,
+                  'etc_root': str(self.root / 'etc'), 'sav_root': str(self.root / 'sav'),
+                  'provider_dir': str(provider)}
+        node = host.Node(config)
+        # Supported native inspect shape: bind mounts and --tmpfs are separate fields.
+        observed = {'Image': 'sha256:' + 'a' * 64,
+                    'HostConfig': {'Privileged': False, 'NetworkMode': 'none',
+                                   'Tmpfs': {'/run': 'rw,nosuid,nodev,mode=755,rprivate,tmpcopyup'}},
+                    'Mounts': [
+                        {'Destination': dest, 'Type': 'bind', 'Source': config[key], 'RW': rw}
+                        for key, dest, rw in [('etc_root', '/apps/podmesh-node/etc', True),
+                                              ('sav_root', '/apps/podmesh-node/sav', True),
+                                              ('provider_dir', '/run/podmesh-host', False)]],
+                    'Config': {'Entrypoint': ['/usr/bin/python3', '-I',
+                                             '/usr/lib/podmesh-node-canonical/entrypoint.py']}}
+        with mock.patch.object(node, 'inspect', return_value=observed):
+            self.assertEqual(node.validate(), observed)
+            observed['HostConfig']['Tmpfs'] = {}
+            with self.assertRaisesRegex(RuntimeError, 'fresh runtime tmpfs required'):
+                node.validate()
+            observed['HostConfig']['Tmpfs'] = {'/run': 'rw,nosuid,nodev,mode=755'}
+            observed['Mounts'][-1]['RW'] = True
+            with self.assertRaisesRegex(RuntimeError, 'persistent/provider binding differs'):
+                node.validate()
+            observed['Mounts'][-1]['RW'] = False
+            observed['Mounts'].append({'Destination': '/undeclared', 'Type': 'bind',
+                                       'Source': str(self.root), 'RW': False})
+            with self.assertRaisesRegex(RuntimeError, 'undeclared mount'):
+                node.validate()
 
     def test_only_machine_binding_and_one_audit_may_differ_after_adoption(self):
         artifact = {'image': 'a' * 64,

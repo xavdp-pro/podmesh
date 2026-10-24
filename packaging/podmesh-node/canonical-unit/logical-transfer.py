@@ -119,15 +119,16 @@ class Node:
              and h.get('PidMode', '') in ('', 'private') and h.get('IpcMode', '') != 'host',
              'private container boundary differs')
         mounts = {m['Destination']: m for m in i['Mounts']}
+        # Native Podman reports --tmpfs in HostConfig.Tmpfs, separately from bind Mounts.
         need(set(mounts) == {'/apps/podmesh-node/etc', '/apps/podmesh-node/sav',
-                             '/run/podmesh-host', '/run'}, 'undeclared mount or inherited image volume')
+                             '/run/podmesh-host'}, 'undeclared mount or inherited image volume')
         for key, dest, rw in [('etc_root', '/apps/podmesh-node/etc', True),
                               ('sav_root', '/apps/podmesh-node/sav', True),
                               ('provider_dir', '/run/podmesh-host', False)]:
             m = mounts[dest]
             need(m['Type'] == 'bind' and m['Source'] == self.c[key] and bool(m['RW']) == rw,
                  'persistent/provider binding differs')
-        need(mounts['/run']['Type'] == 'tmpfs', 'fresh runtime tmpfs required')
+        need(set(h.get('Tmpfs') or {}) == {'/run'}, 'fresh runtime tmpfs required')
         need(i['Config']['Entrypoint'] == ['/usr/bin/python3', '-I',
              '/usr/lib/podmesh-node-canonical/entrypoint.py'], 'canonical entrypoint required')
         return i
