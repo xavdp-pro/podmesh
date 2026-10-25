@@ -26,7 +26,7 @@ Dans un cluster de virtualisation Proxmox VE, le stockage distribué partagé es
 
 Le plugin Proxmox VE se compose de :
 - **`/usr/share/perl5/PVE/Storage/Custom/MeshFSPlugin.pm`** : Le module Perl chargé dynamiquement par le moteur Proxmox (`PVE::Storage`).
-- **`/home/zaza/Bureau/NOW7/PODMESH/podmesh-packages/meshfs/proxmox/install-pve-plugin.sh`** : Le script d'installation automatisé 1-clic.
+- **`packaging/proxmox/install-pve-plugin.sh`** : Le script d'installation automatisé 1-clic.
 
 ### Diagramme d'Intégration Proxmox VE
 
@@ -108,7 +108,7 @@ Le stockage MeshFS supporte l'intégralité des flux de travail Proxmox VE :
 Le script d'installation s'occupe de toutes les étapes (vérification des dépendances Perl, copie du module, création des répertoires, déclaration `/etc/pve/storage.cfg` et rechargement des services) :
 
 ```bash
-cd /home/zaza/Bureau/NOW7/PODMESH/podmesh-packages/meshfs/proxmox
+cd /path/to/podmesh/packaging/proxmox
 sudo ./install-pve-plugin.sh --storage-id meshfs --server 127.0.0.1 --port 7443 --shared 1
 ```
 

@@ -1,5 +1,7 @@
 # PodMesh — Sovereign Infrastructure, Distributed Storage & Backup Suite
 
+[Human–AI tandem, composition and state ownership](docs/ECOSYSTEM-AND-COMPONENT-OWNERSHIP.md)
+
 > **100% Pure Rust Architecture • Zero Python Runtime on Storage Nodes • Sub-8MB Footprint**  
 > Portable Podman operations for human-agent tandems, high-performance distributed storage (**MeshFS**), deduplicated backup server (**PMBS**), and unified orchestration CLI (**`podmesh-ctl`**).
 

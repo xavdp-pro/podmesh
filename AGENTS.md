@@ -19,6 +19,16 @@ Rules:
    name or workstation path is ever a default.
 4. Nothing durable is kept only in a temporary directory.
 
+## Current cross-project documentary route
+
+Resolve the tandem's task through [ecosystem/component ownership](docs/ECOSYSTEM-AND-COMPONENT-OWNERSHIP.md),
+the [glossary](https://github.com/xavdp-pro/shaper-glossary), required interfaces
+and exact implementation owner. Use component in current concepts while retaining
+runtime/storage/API IDs. Durable application state follows private MariaDB
+ownership and partitions chosen for actual workload/retention need. The existing
+adoption record below retains its exact scope/version; source alignment does not
+silently re-adopt a framework or activate a running system.
+
 ## Adopted development standard
 
 The human–agent tandem has explicitly adopted SHAPER OS as the governing
