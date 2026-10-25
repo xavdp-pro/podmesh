@@ -25,7 +25,7 @@ PodMesh unifie l'orchestration de conteneurs, le stockage distribué souverain e
 │   (crates/meshfs)     │       │       (src/ - Core Engine)    │       │     (crates/pmbs)     │
 ├───────────────────────┤       ├───────────────────────────────┤       ├───────────────────────┤
 │ • CAS SHA-256 4MB     │       │ • Rootful Podman Lifecycle    │       │ • CAS SHA-256 Dedup   │
-│ • Merkle DAG Inodes   │       │ • MariaDB & SQLite Stores     │       │ • Op 10 Boot Proof    │
+│ • Merkle DAG Inodes   │       │ • Private MariaDB Stores     │       │ • Op 10 Boot Proof    │
 │ • ioctl FICLONE CoW   │       │ • Reconcile & State Machine   │       │ • Cross-Site Sync     │
 │ • Proxmox VE Plugin   │       │ • Ed25519 Takeover Proofs     │       │ • Single-File Restore │
 │ • Port 7443 + IPC Sock│       │ • Port 8080 + IPC Socket      │       │ • Port 8007 + IPC Sock│

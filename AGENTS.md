@@ -43,14 +43,7 @@ obligations as binding requirements, not optional background context.
 - Production path: `docs/SIMPLE-PRODUCTION-PATH.md` — **A** container life, then **B** move + replicate, **C** later. Commit source before building; carry that immutable pin, artifact manifest and hashes through runtime qualification. Build/test hosts are explicit deployment inputs, never an operator workstation prerequisite.
 - Candidate source interfaces: `packaging/podmesh-node/private-unit`, `src/host_adapter.rs`, `docs/HOST-ADAPTER-CONTRACT.md` and `packaging/podmesh-manager/private-unit`. Recipes/provider do not establish a complete installer or runtime qualification. Private app launches suppress inherited image volumes; only declared owned app/DB volumes are permitted. Node product proof driver/scenario: `packaging/podmesh-node/qualification`; host/VM/recovery execution belongs to its separately authorized runtime owner.
 - Application identity and private store stay inside each declared unit boundary. A privileged host adapter is a separate, scoped capability provider; it does not become the application account, own its database, or acquire Governor/Maker authority. See `docs/FUNCTIONAL-UNITS.md`.
-- Existing conformity gaps (do not expand into campaigns from this list):
-  - Supervision adapter not qualified (`docs/SHAPER-SUPERVISION.md`).
-  - Published package ≠ qualified package (`ACCEPTANCE-TEST-PLAN.md` note 2026-09-18).
-  - Nested move: verify under PodMesh (outer Podman moves; nested follows); then align site and wiki.
-  - `INTENT.md`: still missing Rule 0B / Rule 7 headers — add on next edit of that file.
-  - Epoch gate and guardian still on a workstation (ideal-scene departure 2 / A5) — separate mandate.
-  - Gate 4 HELD; no vote keys from this assembly.
-  - Node MariaDB serves the ported lifecycle slice; bounded volume declarations and isolated ungated boot return also use DurableStore; exact-artifact runtime and restoration proofs remain required. Manager journal engineering proofs do not establish a replicated deployment or authenticated functional restore. One private server instance per unit; qualification belongs to the exact candidate.
+- Current qualification and conformity observations are maintained in the distinct private `podmesh-lab/status/` source. Product intentions, operating contracts and acceptance criteria remain here; current campaign results retain their exact source/artifact scope in that companion.
 - Outside this mandate: arming vote keys, closing laboratory gates, production HA promotion, reference universe, editing the pinned SHAPER corpus.
 
 Follow the corpus's AGENTS.md, LAW.md, governing map and reading contract.
