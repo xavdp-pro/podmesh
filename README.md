@@ -203,3 +203,7 @@ podmesh-ctl admin status
 
 ## Licence
 Sous licence Apache-2.0. Créé par Xavier de Poorter et l'équipe d'ingénieurs PodMesh.
+
+## Dedication
+
+[Personal dedication by Xavier de Poorter](DEDICATION.md).
