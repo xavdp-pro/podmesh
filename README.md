@@ -1,5 +1,7 @@
 # PodMesh — Sovereign Infrastructure, Distributed Storage & Backup Suite
 
+[Human–AI tandem, composition and state ownership](docs/ECOSYSTEM-AND-COMPONENT-OWNERSHIP.md)
+
 > **100% Pure Rust Architecture • Zero Python Runtime on Storage Nodes • Sub-8MB Footprint**  
 > Portable Podman operations for human-agent tandems, high-performance distributed storage (**MeshFS**), deduplicated backup server (**PMBS**), and unified orchestration CLI (**`podmesh-ctl`**).
 
@@ -23,7 +25,7 @@ PodMesh unifie l'orchestration de conteneurs, le stockage distribué souverain e
 │   (crates/meshfs)     │       │       (src/ - Core Engine)    │       │     (crates/pmbs)     │
 ├───────────────────────┤       ├───────────────────────────────┤       ├───────────────────────┤
 │ • CAS SHA-256 4MB     │       │ • Rootful Podman Lifecycle    │       │ • CAS SHA-256 Dedup   │
-│ • Merkle DAG Inodes   │       │ • MariaDB & SQLite Stores     │       │ • Op 10 Boot Proof    │
+│ • Merkle DAG Inodes   │       │ • Private MariaDB Stores     │       │ • Op 10 Boot Proof    │
 │ • ioctl FICLONE CoW   │       │ • Reconcile & State Machine   │       │ • Cross-Site Sync     │
 │ • Proxmox VE Plugin   │       │ • Ed25519 Takeover Proofs     │       │ • Single-File Restore │
 │ • Port 7443 + IPC Sock│       │ • Port 8080 + IPC Socket      │       │ • Port 8007 + IPC Sock│
@@ -167,17 +169,18 @@ Le paquet `podmesh-meshfs` installe automatiquement `MeshFSPlugin.pm` dans `/usr
 Le binaire `podmesh-ctl` (100% Rust) remplace les anciens scripts Python et shell :
 
 ```bash
+# Replace example hostnames with the explicitly selected deployment inputs.
 # Déclaration de politique HA pour un univers
 podmesh-ctl ha declare my-universe --authority authority-quorum-1 --lease 30
 
 # Rotation d'époque et génération de preuve Ed25519 de reprise
-podmesh-ctl ha rotate my-universe --host gbs-p4
+podmesh-ctl ha rotate my-universe --host node-a.example
 
 # Configuration de la réplication inter-nœuds
-podmesh-ctl replicate configure my-universe --active gbs-p4 --standbys med-pmox --interval 300
+podmesh-ctl replicate configure my-universe --active node-a.example --standbys node-b.example --interval 300
 
 # Déplacement à chaud d'un univers
-podmesh-ctl move my-universe gbs-p4 med-pmox
+podmesh-ctl move my-universe node-a.example node-b.example
 
 # Statut du manager de cluster
 podmesh-ctl admin status
@@ -188,7 +191,7 @@ podmesh-ctl admin status
 ## 📖 Documentation & Specifications (English / AI & Humans)
 
 - **[Architecture & Machine-Readable Spec](docs/ARCHITECTURE-PURE-RUST-AND-STORAGE.md)**: Exhaustive architectural breakdown for AI agents and human operators detailing component roles, fail-closed mandate contracts, IPC protocols, and Proxmox storage hooks.
-- **[Laboratory Qualification Record (2026-10-19)](https://github.com/xavdp-pro/podmesh-lab/tree/main/records/pure-rust-qualification-2026-10-19)**: Complete test matrix evidence on hypervisor `gbs-p4`, lab nodes, and nested Proxmox VE.
+- **[Production path and qualification boundaries](docs/SIMPLE-PRODUCTION-PATH.md)**: Public operating route and source/artifact requirements. Maintainers retain dated campaign results in the distinct private project laboratory; authorized readers resolve that evidence through their workspace.
 
 ---
 
@@ -201,3 +204,7 @@ podmesh-ctl admin status
 
 ## Licence
 Sous licence Apache-2.0. Créé par Xavier de Poorter et l'équipe d'ingénieurs PodMesh.
+
+## Dedication
+
+[Personal dedication by Xavier de Poorter](DEDICATION.md).

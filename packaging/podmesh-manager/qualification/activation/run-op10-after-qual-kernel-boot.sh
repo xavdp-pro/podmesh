@@ -63,15 +63,15 @@ fi
 cat <<'EOF'
 
 Next (operator only, disposable reboot window; gate OP10-REBOOT-APPROVED on record):
-  export PODMESH_REBOOT_SSH=zaza@localhost
+  export PODMESH_REBOOT_SSH="${PODMESH_REBOOT_SSH:?set the authorized disposable target}"
   export PODMESH_REBOOT_MANDATE=mandate:lab-standing-2026-09-17
   export PODMESH_SOCKET=/run/podmesh-dev-ha/api.sock
   export PODMESH_STATE_DIR=/var/lib/podmesh-dev-ha
   export PODMESH_UNIT=podmesh-dev-ha.service
   export PODMESH_RESTORE_UNIT=podmesh-dev-ha-restore.service
-  cd /home/zaza/Bureau/NOW7/PODMESH/podmesh
-  python3 -B tests/check-boot-restore.py | tee /home/zaza/Bureau/NOW7/PODMESH/podmesh-lab/records/slice-a-campaign-2026-10-07/op10-boot-restore.log
-  echo $? > /home/zaza/Bureau/NOW7/PODMESH/podmesh-lab/records/slice-a-campaign-2026-10-07/op10-boot-restore.exit
+  cd "${PODMESH_SOURCE:?set the selected product source checkout}"
+  python3 -B tests/check-boot-restore.py | tee "${PODMESH_OP10_RECORD_DIR:?set the private qualification record directory}/op10-boot-restore.log"
+  echo $? > "${PODMESH_OP10_RECORD_DIR:?set the private qualification record directory}/op10-boot-restore.exit"
 
 Full copy-paste block: podmesh-lab records/slice-a-campaign-2026-10-07/op10-operator-grub-reboot-window.md §8.
 EOF

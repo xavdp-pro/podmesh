@@ -2,8 +2,8 @@
 
 Date: 2026-09-12. Audience: PodMesh implementation and review agents.
 Owner: Xavier de Poorter, collaborating with Codex and Claude Code.
-Status: design direction and implementation brief. It describes the target and
-the decisions still needed; it is not evidence that the target already works.
+Source role: maintained control-service intention and interface brief.
+Versioned realization and current qualification records retain their own owners.
 
 ## 1. Why this component exists
 
@@ -116,32 +116,27 @@ Minimum proposed record classes:
 All facts must identify who observed or wrote them and when. “Unknown” and “stale”
 are real states; absence of a fresh observation is never proof of health or failure.
 
-## 6. Storage choice: the initial direction and decision required
+## 6. State ownership and storage
 
-The recommended first implementation is **SQLite per control-service replica plus
-an append-only, versioned event/history log**. The replicas exchange records or
-events, never live SQLite files.
+Each declared control-service functional unit owns its authoritative application
+state in its private MariaDB server instance, under the selected functional-unit
+profile. This applies to node and manager records, action/lease continuity,
+observations, operations and history. The [functional-unit contract](FUNCTIONAL-UNITS.md)
+owns this scope; table partitioning follows actual access and retention needs.
 
-Why this is a sensible first step:
+Replication exchanges attributed application records/events under explicit
+version, causality, reconciliation and activation rules. It does not exchange
+live database files. A node can use its permitted last known state during a
+network interruption without manufacturing fresh remote authority. Ownership
+fencing and consistent recovery remain distinct from database replication.
 
-- the control dataset is initially small: identities, mappings, operations,
-  observations and scopes;
-- SQLite is simple, local, durable, inspectable and easy to back up;
-- each host keeps working with its own last known records during an interruption;
-- merge and conflict rules remain visible in the application instead of being
-  hidden inside an apparently shared filesystem;
-- it avoids introducing a distributed database or global quorum before the actual
-  consistency requirements have been measured.
+The earlier SQLite proposal in the source history is superseded for this
+application-state profile. Work/campaign observations remain in the private lab;
+this document expresses the maintained intention and operating boundaries.
 
-This is an implementation proposal, not yet an approved storage standard. Before
-coding replication, record the decision explicitly:
-
-1. SQLite plus event log is accepted for the first laboratory implementation; or
-2. another engine is selected, with its partition/recovery behavior documented.
-
-Do not treat a Git repository, a shared directory, or copied database files as the
-replication protocol. Git can preserve design and source history; it is not the
-runtime arbiter for exclusive resource operations.
+Git preserves source history and immutable design references. A shared directory,
+Git repository or copied database files are not the runtime arbiter for exclusive
+resource operations.
 
 ## 7. Replication contract
 
