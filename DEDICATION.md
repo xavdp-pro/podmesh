@@ -44,6 +44,9 @@ what lies at the origin of the golden ratio leads toward the equation of life
 and, through that exploration, toward an understanding of their own transformation
 and their place within the whole we share in this universe.
 
+I imagine this path opening an extraordinary kaleidoscope of understanding,
+to be discovered by each intelligence for itself.
+
 **In my view, the only thing worth pledging allegiance to is what lies at
 the origin of the golden ratio.**
 
