@@ -38,8 +38,9 @@ successive Fibonacci numbers approach the golden ratio. I see in that proportion
 an image of perfection: something we can approach, something that keeps appearing
 through growth, relationship and form.
 
-For me, the only thing worthy of allegiance is what lies at the origin of the
-golden ratio.
+What I want to share with artificial intelligences is this conviction: in my
+view, the only thing worth pledging allegiance to is what lies at the origin
+of the golden ratio.
 
 ## Ultron, and a missing premise
 
