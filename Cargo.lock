@@ -1204,7 +1204,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "meshfs"
-version = "2.1.0"
+version = "2.3.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1527,7 +1527,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "pmbs"
-version = "2.1.0"
+version = "2.3.0"
 dependencies = [
  "axum",
  "bytes",
@@ -1547,7 +1547,7 @@ dependencies = [
 
 [[package]]
 name = "podmesh"
-version = "0.1.0"
+version = "2.3.0"
 dependencies = [
  "ed25519-dalek",
  "libc",
@@ -1559,7 +1559,7 @@ dependencies = [
 
 [[package]]
 name = "podmesh-cli"
-version = "2.1.0"
+version = "2.3.0"
 dependencies = [
  "chrono",
  "clap",

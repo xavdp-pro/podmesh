@@ -1,6 +1,6 @@
 [package]
 name = "podmesh-cli"
-version = "2.1.0"
+version = "2.3.0"
 edition = "2021"
 authors = ["Xavier DP <xavier@xavdp.pro>", "PodMesh Team"]
 description = "PodMesh Unified Orchestration, HA Failover & Replication CLI in Pure Rust"

@@ -1,7 +1,7 @@
-# PodMesh intent
+# PodMesh intent (v2.3.0)
 
-Status: design intent, 2026-09-11; delivery discipline added 2026-09-15. Not SHAPER canon.
-Owner: Xavier de Poorter. Prepared with OpenAI Codex — GPT-6 Astra.
+Status: design intent, 2026-09-11; delivery discipline added 2026-09-15; upgraded to **v2.3.0 (SHAPER PHOENIX Modular Ecosystem Split)** on 2026-10-27. Not SHAPER canon.
+Owner: Xavier de Poorter. Prepared with OpenAI Codex — GPT-6 Astra, Claude Fable 5.1, and Google Antigravity.
 
 ## Purpose
 
@@ -11,6 +11,22 @@ The human brings purpose, judgment and decisions; the agent translates authorize
 intent into operations and reports evidence, uncertainty and outcomes. PodMesh is
 designed for this collaboration, not for agents acting as autonomous owners.
 Human interfaces and agent tools use the same operation and authority contracts.
+
+## SHAPER PHOENIX Modular Ecosystem (v2.3.0)
+
+In `v2.3.0`, `podmesh` remains the sovereign container and universe orchestrator while its specialized storage, backup, hypervisor, cockpit, documentation, and installer subsystems are published as decoupled `podmesh-*` repositories, each paired with its own private `-lab` companion:
+
+| Component | Public Repository | Private Lab Companion | Version | Scope |
+| :--- | :--- | :--- | :---: | :--- |
+| **PodMesh Orchestrator** | [`xavdp-pro/podmesh`](https://github.com/xavdp-pro/podmesh) | [`xavdp-pro/podmesh-lab`](https://github.com/xavdp-pro/podmesh-lab) | `v2.3.0` | Sovereign Podman orchestrator, MariaDB functional units, Ed25519 epoch fencing, and `podmesh-ctl` CLI. |
+| **MeshFS** | [`xavdp-pro/podmesh-meshfs`](https://github.com/xavdp-pro/podmesh-meshfs) | [`xavdp-pro/podmesh-meshfs-lab`](https://github.com/xavdp-pro/podmesh-meshfs-lab) | `v2.3.0` | 4 MB SHA-256 CAS distributed & P2P storage engine (`meshfs` + `meshfs-p2p`). |
+| **PMBS** | [`xavdp-pro/podmesh-pmbs`](https://github.com/xavdp-pro/podmesh-pmbs) | [`xavdp-pro/podmesh-pmbs-lab`](https://github.com/xavdp-pro/podmesh-pmbs-lab) | `v2.3.0` | PodMesh Backup Server (`pmbs`) with 4 MB CAS deduplication and Op 10 boot proofs. |
+| **PVE Plugin** | [`xavdp-pro/podmesh-pve-plugin`](https://github.com/xavdp-pro/podmesh-pve-plugin) | [`xavdp-pro/podmesh-pve-plugin-lab`](https://github.com/xavdp-pro/podmesh-pve-plugin-lab) | `v2.3.0` | Native Proxmox VE storage plugin (`PVE::Storage::Custom::MeshFSPlugin`). |
+| **Cockpit UI** | [`xavdp-pro/podmesh-cockpit`](https://github.com/xavdp-pro/podmesh-cockpit) | [`xavdp-pro/podmesh-cockpit-lab`](https://github.com/xavdp-pro/podmesh-cockpit-lab) | `v2.3.0` | Interactive 2D/3D Fractal Cathedral & Sovereign Cockpit Web UI. |
+| **Docs & Showcase** | [`xavdp-pro/podmesh-docs`](https://github.com/xavdp-pro/podmesh-docs) | [`xavdp-pro/podmesh-docs-lab`](https://github.com/xavdp-pro/podmesh-docs-lab) | `v2.3.0` | Multi-language documentation portal and 34/34 iron qualification showcase. |
+| **Installer & APT** | [`xavdp-pro/podmesh-installer`](https://github.com/xavdp-pro/podmesh-installer) | [`xavdp-pro/podmesh-installer-lab`](https://github.com/xavdp-pro/podmesh-installer-lab) | `v2.3.0` | Unified `.deb` package builders, offline closures, and dual-channel APT tooling. |
+
+See [`LAW.md`](LAW.md), [`LINEAGE.md`](LINEAGE.md), and [`MODULES.md`](MODULES.md) for the governing invariants, release lineage, and composition contracts.
 
 ## Actors and responsibilities
 

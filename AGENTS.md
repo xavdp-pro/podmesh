@@ -1,13 +1,17 @@
-# Agents: what goes where
+# Agents: what goes where (v2.3.0)
 
-PodMesh lives in two repositories and one vault. Every agent working on PodMesh (Claude Code, Codex, Cursor,
-Antigravity or any other) follows this split. Dialogue with the operator is French; everything written into either
-repository is English.
+In **v2.3.0** (**SHAPER PHOENIX Modular Ecosystem Split**), PodMesh lives across the sovereign orchestrator pair (`podmesh` / `podmesh-lab`), six specialized `podmesh-*` modular repository pairs, and one vault. Every agent working on PodMesh (Claude Code, Codex, Cursor, Antigravity or any other) follows this split. Dialogue with the operator is French; everything written into any repository is English (`en-US`).
 
 | Where | What belongs there | What never goes there |
 | --- | --- | --- |
-| **`xavdp-pro/podmesh`** (this repository, public) | The product: code, tests, tools, packaging; the documentation needed to understand, build, qualify and operate PodMesh; the ideal scene, its program and its certification criteria (the ideal scene is common to both repositories and lives here only) | Laboratory status and campaign narratives, reviews, decisions and coordination notes, laboratory addresses and host names as defaults, anything private |
-| **`xavdp-pro/podmesh-lab`** (private) | The maintainers' workshop: the current state and handoff, the status of every certification item with its evidence, campaign scripts and records, reviews, decisions, mandates, research notes, agent handoffs, laboratory configuration without secrets; it pins this repository as a submodule to read the ideal scene without copying it | Secrets and private kits, large binary evidence |
+| **`xavdp-pro/podmesh`** (this repository, public, `v2.3.0`) | The sovereign orchestrator product: code, tests, tools, packaging; the documentation needed to understand, build, qualify and operate PodMesh; the ideal scene, its program and its certification criteria (the ideal scene is common to both repositories and lives here only); [`LAW.md`](LAW.md), [`LINEAGE.md`](LINEAGE.md), [`MODULES.md`](MODULES.md) | Laboratory status and campaign narratives, reviews, decisions and coordination notes, laboratory addresses and host names as defaults, anything private |
+| **`xavdp-pro/podmesh-lab`** (private, `v2.3.0`) | The maintainers' master workshop: the current state and handoff, the status of every certification item with its evidence, campaign scripts and records, reviews, decisions, mandates, research notes, agent handoffs, laboratory configuration without secrets; it pins this repository as a submodule to read the ideal scene without copying it | Secrets and private kits, large binary evidence |
+| **`xavdp-pro/podmesh-meshfs`** & **`podmesh-meshfs-lab`** | Standalone 4 MB CAS distributed & P2P storage engine (`v2.3.0`) and its private qualification workshop | Private host keys, secrets, unverified lab dumps in the public repo |
+| **`xavdp-pro/podmesh-pmbs`** & **`podmesh-pmbs-lab`** | Standalone PodMesh Backup Server (`v2.3.0`) with Op 10 boot proofs and its private qualification workshop | Private host keys, secrets, unverified lab dumps in the public repo |
+| **`xavdp-pro/podmesh-pve-plugin`** & **`podmesh-pve-plugin-lab`** | Standalone Proxmox VE Perl storage plugin (`MeshFSPlugin.pm`, `v2.3.0`) and its private qualification workshop | Private host keys, secrets, unverified lab dumps in the public repo |
+| **`xavdp-pro/podmesh-cockpit`** & **`podmesh-cockpit-lab`** | Standalone 2D/3D Fractal Cathedral & Sovereign Cockpit UI (`v2.3.0`) and its private design/qualification workshop | Private host keys, secrets, unverified lab dumps in the public repo |
+| **`xavdp-pro/podmesh-docs`** & **`podmesh-docs-lab`** | Standalone multi-language documentation portal and 34/34 iron qualification showcase (`v2.3.0`) and its private workshop | Private host keys, secrets, unverified lab dumps in the public repo |
+| **`xavdp-pro/podmesh-installer`** & **`podmesh-installer-lab`** | Standalone `.deb` package builders, offline closures, and dual-channel APT repository tooling (`v2.3.0`) and its private workshop | Private signing keys, secrets, unverified lab dumps in the public repo |
 | **The vault** (or an encrypted backup the operator names) | Signing keys, tokens, credentials, private replica kits | — |
 
 Rules:
