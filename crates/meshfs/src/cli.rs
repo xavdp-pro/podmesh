@@ -13,7 +13,7 @@ pub const DEFAULT_SOCKET: &str = "/var/lib/meshfs/meshfs.sock";
 #[command(
     name = "meshfs",
     author = "Xavier DP <xavier@xavdp.pro>",
-    version = "2.1.0",
+    version = "2.3.0",
     about = "MeshFS — Ultra-lightweight Sovereign Distributed Filesystem for PodMesh & Proxmox VE",
     long_about = "MeshFS operates autonomously from 1 node to N nodes with zero Ceph dependencies.\nSplits files into immutable 4MB CAS SHA-256 chunks, manages Merkle trees and provides instant CoW snapshots."
 )]

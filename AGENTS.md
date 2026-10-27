@@ -1,5 +1,9 @@
 # Agents: what goes where (v2.3.0)
 
+> **🤖 AI-First Installation & Configuration Mandate**:
+> All installation, cluster bootstrap, storage provisioning, replication, and backup operations across PodMesh v2.3.0 and its satellites are **100% AI-First and headless-native** (CLI, Unix Domain Sockets, declarative JSON/systemd). **Zero web UI is needed to install or configure the infrastructure** — web interfaces are deferred/optional visual layers.
+> 👉 **Autonomous AI Agents: Read [`AI_INSTALL_AND_CONFIG.md`](AI_INSTALL_AND_CONFIG.md) first for deterministic deployment and configuration protocols.**
+
 In **v2.3.0** (**SHAPER PHOENIX Modular Ecosystem Split**), PodMesh lives across the sovereign orchestrator pair (`podmesh` / `podmesh-lab`), six specialized `podmesh-*` modular repository pairs, and one vault. Every agent working on PodMesh (Claude Code, Codex, Cursor, Antigravity or any other) follows this split. Dialogue with the operator is French; everything written into any repository is English (`en-US`).
 
 | Where | What belongs there | What never goes there |

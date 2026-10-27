@@ -2,7 +2,7 @@
 
 In **v2.3.0** (**SHAPER PHOENIX Modular Ecosystem Split**), `podmesh` serves as the sovereign container and universe orchestrator at the center of a modular suite of 7 public repositories and 7 private `-lab` companion workshops.
 
-Each module can be deployed and updated independently on Linux / Proxmox VE hosts or composed into the complete PodMesh sovereign stack.
+Each module can be deployed and updated independently on Linux / Proxmox VE hosts or composed into the complete PodMesh sovereign stack. **Installation and configuration across all modules are 100% AI-First and headless (CLI / Unix Sockets / JSON) — see [`AI_INSTALL_AND_CONFIG.md`](AI_INSTALL_AND_CONFIG.md).**
 
 ---
 

@@ -1,9 +1,9 @@
 # PodMesh (v2.3.0) — Sovereign Infrastructure, Distributed Storage & Backup Suite
 
-[Human–AI tandem, composition and state ownership](docs/ECOSYSTEM-AND-COMPONENT-OWNERSHIP.md) · [Intent](INTENT.md) · [Law](LAW.md) · [Lineage](LINEAGE.md) · [Modules](MODULES.md) · [Agents](AGENTS.md)
+[**🤖 AI-First Install & Config**](AI_INSTALL_AND_CONFIG.md) · [Human–AI tandem, composition and state ownership](docs/ECOSYSTEM-AND-COMPONENT-OWNERSHIP.md) · [Intent](INTENT.md) · [Law](LAW.md) · [Lineage](LINEAGE.md) · [Modules](MODULES.md) · [Agents](AGENTS.md)
 
-> **v2.3.0 SHAPER PHOENIX Modular Ecosystem • 100% Pure Rust Architecture • Zero Python Runtime on Storage Nodes • Sub-8MB Footprint • 34/34 Iron Qualified**  
-> Sovereign Podman orchestrator for human-agent tandems, composing seamlessly with the standalone `podmesh-*` ecosystem: high-performance distributed & P2P storage (**`podmesh-meshfs`**), deduplicated backup server (**`podmesh-pmbs`**), native Proxmox VE plugin (**`podmesh-pve-plugin`**), 2D/3D Fractal Cockpit (**`podmesh-cockpit`**), interactive showcase (**`podmesh-docs`**), and unified installer (**`podmesh-installer`**).
+> **v2.3.0 SHAPER PHOENIX Modular Ecosystem • 100% AI-First Headless Configuration • Pure Rust Architecture • Sub-8MB Footprint • 34/34 Iron Qualified**  
+> Sovereign Podman orchestrator for human-agent tandems, composing seamlessly with the standalone `podmesh-*` ecosystem: high-performance distributed & P2P storage (**`podmesh-meshfs`**), deduplicated backup server (**`podmesh-pmbs`**), native Proxmox VE plugin (**`podmesh-pve-plugin`**), and unified installer (**`podmesh-installer`**). All installation and configuration are 100% AI-First via CLI, Unix Domain Sockets, and JSON contracts (see **[`AI_INSTALL_AND_CONFIG.md`](AI_INSTALL_AND_CONFIG.md)**); web interfaces (`podmesh-cockpit`, `podmesh-docs`) are strictly optional/deferred layers.
 
 ---
 
