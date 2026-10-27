@@ -1,0 +1,20 @@
+[submodule "modules/podmesh-meshfs"]
+	path = modules/podmesh-meshfs
+	url = https://github.com/xavdp-pro/podmesh-meshfs.git
+	branch = main
+[submodule "modules/podmesh-pmbs"]
+	path = modules/podmesh-pmbs
+	url = https://github.com/xavdp-pro/podmesh-pmbs.git
+	branch = main
+[submodule "modules/podmesh-pve-plugin"]
+	path = modules/podmesh-pve-plugin
+	url = https://github.com/xavdp-pro/podmesh-pve-plugin.git
+	branch = main
+[submodule "modules/podmesh-installer"]
+	path = modules/podmesh-installer
+	url = https://github.com/xavdp-pro/podmesh-installer.git
+	branch = main
+[submodule "modules/podmesh-docs"]
+	path = modules/podmesh-docs
+	url = https://github.com/xavdp-pro/podmesh-docs.git
+	branch = main
