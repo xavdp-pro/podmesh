@@ -20,7 +20,7 @@ RUST_BIN="${ROOT_DIR}/target/release/pmbs"
 
 echo "=== [PMBS] Packaging Debian 13 (Trixie): ${PKG_NAME}_${PKG_VERSION}_${PKG_ARCH}.deb ==="
 
-if [ ! -f "${RUST_BIN}" ]; then
+if true; then
     echo "Compiling release binary for PMBS v${PKG_VERSION}..."
     cargo build --release -p pmbs --manifest-path "${ROOT_DIR}/Cargo.toml"
 fi

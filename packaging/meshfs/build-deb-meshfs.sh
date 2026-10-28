@@ -21,7 +21,7 @@ RUST_BIN="${ROOT_DIR}/target/release/meshfs"
 
 echo "=== [MeshFS] Packaging Debian 13 (Trixie): ${PKG_NAME}_${PKG_VERSION}_${PKG_ARCH}.deb ==="
 
-if [ ! -f "${RUST_BIN}" ]; then
+if true; then
     echo "Compiling release binary for MeshFS v${PKG_VERSION}..."
     cargo build --release -p meshfs --manifest-path "${ROOT_DIR}/Cargo.toml"
 fi
