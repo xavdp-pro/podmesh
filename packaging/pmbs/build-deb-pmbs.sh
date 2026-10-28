@@ -13,7 +13,7 @@ set -euo pipefail
 PKG_NAME="podmesh-backup-server"
 PKG_VERSION="2.3.0"
 PKG_ARCH="amd64"
-ROOT_DIR="$(cd "$(dirname "$0")/../.." ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)" pwd)"
+ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 BUILD_DIR="$(mktemp -d /tmp/build-${PKG_NAME}.XXXXXX)"
 DIST_DIR="${ROOT_DIR}/dist"
 RUST_BIN="${ROOT_DIR}/target/release/pmbs"
@@ -22,7 +22,7 @@ echo "=== [PMBS] Packaging Debian 13 (Trixie): ${PKG_NAME}_${PKG_VERSION}_${PKG_
 
 if [ ! -f "${RUST_BIN}" ]; then
     echo "Compiling release binary for PMBS v${PKG_VERSION}..."
-    cargo build --release --locked -p pmbs --manifest-path "${ROOT_DIR}/Cargo.toml"
+    cargo build --release -p pmbs --manifest-path "${ROOT_DIR}/Cargo.toml"
 fi
 
 trap 'rm -rf "${BUILD_DIR}"' EXIT

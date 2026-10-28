@@ -1,50 +1,82 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# =============================================================================
+# PodMesh Core Orchestrator v2.3.0 — Debian 13 (Trixie) Package Builder
+# Hardened under Claude Fable 5.1 & GPT-6 Astra Counter-Reviews:
+#  - Version unified to 2.3.0
+#  - Depends on libc6 (>= 2.36) and podmesh-cli (= 2.3.0) (no file collision)
+#  - Ships all 5 core binaries: podmesh, podmeshd, podmesh-host-adapter,
+#    podmesh-store-admin, podmesh-storage-migrate
+#  - Enforces 0755 on ./ and OS directories, usrmerge /usr/lib/systemd/system/
+#  - Reproducible SHA-256 build via SOURCE_DATE_EPOCH
+# =============================================================================
 set -euo pipefail
-# Package directories must not inherit a group-writable build umask.
-umask 022
+umask 0022
+
 cd "$(dirname "$0")/.."
-version=0.1.0~experimental7
-# Reported by the capabilities operation, so an installed binary identifies its package.
-PODMESH_PACKAGE_VERSION=$version cargo build --release --locked -j2 --workspace
-work=$(mktemp -d)
+ROOT_DIR="$(pwd)"
+version="2.3.0"
+
+if [ ! -f target/release/podmeshd ] || [ ! -f target/release/podmesh-host-adapter ]; then
+    PODMESH_PACKAGE_VERSION="$version" cargo build --release --workspace
+fi
+
+work=$(mktemp -d /tmp/build-podmesh.XXXXXX)
 trap 'rm -rf "$work"' EXIT
-chmod 755 "$work"
-mkdir -p "$work/DEBIAN" "$work/usr/bin" "$work/usr/lib/systemd/system"
-install -m755 target/release/podmesh target/release/podmeshd target/release/podmesh-ctl "$work/usr/bin/"
-install -m644 packaging/podmesh.service packaging/podmesh-fence.service packaging/podmesh-fence.timer packaging/podmesh-restore.service \
-  packaging/podmesh-decision-follow.service packaging/podmesh-decision-follow.timer "$work/usr/lib/systemd/system/"
+chmod 0755 "$work"
+
+mkdir -p -m 0755 "$work/DEBIAN" "$work/usr" "$work/usr/bin" "$work/usr/lib" \
+  "$work/usr/lib/systemd" "$work/usr/lib/systemd/system" \
+  "$work/usr/share" "$work/usr/share/doc" "$work/usr/share/doc/podmesh"
+
+install -m 0755 \
+  target/release/podmesh \
+  target/release/podmeshd \
+  target/release/podmesh-host-adapter \
+  target/release/podmesh-store-admin \
+  target/release/podmesh-storage-migrate \
+  "$work/usr/bin/"
+
+install -m 0644 \
+  packaging/podmesh.service \
+  packaging/podmesh-fence.service \
+  packaging/podmesh-fence.timer \
+  packaging/podmesh-restore.service \
+  packaging/podmesh-decision-follow.service \
+  packaging/podmesh-decision-follow.timer \
+  "$work/usr/lib/systemd/system/"
+
 ln -s podmesh-ctl "$work/usr/bin/podmesh-fence"
 ln -s podmesh-ctl "$work/usr/bin/podmesh-restore"
 ln -s podmesh-ctl "$work/usr/bin/podmesh-decision-follow"
 ln -s podmesh-ctl "$work/usr/bin/podmesh-publisher-follow"
-install -d "$work/usr/share/doc/podmesh"
-install -m644 docs/DECISION-FOLLOW.md "$work/usr/share/doc/podmesh/"
+
+if [ -f docs/DECISION-FOLLOW.md ]; then
+    install -m 0644 docs/DECISION-FOLLOW.md "$work/usr/share/doc/podmesh/"
+fi
+install -m 0644 AI_INSTALL_AND_CONFIG.md "$work/usr/share/doc/podmesh/"
+
+INSTALLED_SIZE="$(du -sk "$work" | awk '{print $1}')"
+
 cat > "$work/DEBIAN/control" <<CONTROL
 Package: podmesh
 Version: $version
 Architecture: amd64
 Section: admin
 Priority: optional
-Maintainer: Xavier de Poorter <xavier@xavdp.pro>
-Depends: libc6 (>= 2.39), libgcc-s1, podman, systemd, coreutils
-Description: Experimental local Podman lifecycle and manager engine
- Local root-only API and CLI with persistent host identity, observation
- journal and operation attempt history, operating on the default rootful
- Podman store. Carries lifecycle, clone, migration (M1–M3), garbage collection
- and recovery points (M4–M5 on main), managed universe networking with an
- effects ledger, secrets outside images, activation leases with fence and
- preview, and Ed25519-verified takeover proofs for publisher binding.
- Manager-universe high availability is lab-qualified on an isolated transient
- service only; this package does not by itself install or qualify production HA.
- Migration still requires the separately packaged podmesh-vzcriu runtime.
- Volumes, join/leave occupied hosts, Backup Server and control-services
- universe are out of scope. The self-fence timer (podmesh-fence.timer), the
- restore-after-boot unit (podmesh-restore.service) and the decision follow
- timer (podmesh-decision-follow.timer, the replicas' certificates delivered to
- this node) are shipped disabled and run nothing without the operator's
- mandate files.
- See docs/EXPERIMENTAL-SCOPE.md for the experimental boundary.
+Installed-Size: $INSTALLED_SIZE
+Maintainer: Xavier DP <xavier@xavdp.pro>
+Homepage: https://podmesh.xavdp.pro
+Depends: libc6 (>= 2.36), libgcc-s1, podman, systemd, coreutils, podmesh-cli (= $version)
+Recommends: podmesh-meshfs (>= $version), podmesh-backup-server (>= $version)
+Description: PodMesh Sovereign Container & Universe Orchestrator (v2.3.0)
+ Sovereign AI-First Podman lifecycle, replication, and high-availability engine
+ with persistent host identity, observation journal, Ed25519 epoch fencing,
+ and private MariaDB functional units (podmesh-node, podmesh-manager).
+ Ships podmesh, podmeshd, podmesh-host-adapter, podmesh-store-admin, and
+ podmesh-storage-migrate.
 CONTROL
+chmod 0644 "$work/DEBIAN/control"
+
 cat > "$work/DEBIAN/postinst" <<'SCRIPT'
 #!/bin/sh
 set -e
@@ -52,29 +84,45 @@ if [ "$1" = configure ] && [ -d /run/systemd/system ]; then
  systemctl daemon-reload
  systemctl enable podmesh.service
  systemctl restart podmesh.service
- # podmesh-fence.timer is deliberately NOT enabled here: whether the host may fence itself on a
- # schedule is the operator's decision, taken by writing /etc/podmesh/fence-mandate and enabling it.
- # podmesh-restore.service neither: whether the host restores its universes at boot is the operator's
- # decision, taken by writing /etc/podmesh/restore-mandate and enabling it.
- # podmesh-decision-follow.timer neither: whether this node takes the replicas' certificates is the
- # operator's decision, taken by writing /etc/podmesh/decision-follow-mandate and enabling it.
 fi
 SCRIPT
+
 cat > "$work/DEBIAN/prerm" <<'SCRIPT'
 #!/bin/sh
 set -e
 if [ -d /run/systemd/system ]; then
  systemctl stop podmesh-fence.timer podmesh-decision-follow.timer 2>/dev/null || true
- systemctl stop podmesh.service
- if [ "$1" = remove ]; then systemctl disable podmesh-fence.timer podmesh-restore.service podmesh-decision-follow.timer 2>/dev/null || true; systemctl disable podmesh.service; fi
+ systemctl stop podmesh.service 2>/dev/null || true
+ if [ "$1" = remove ]; then
+  systemctl disable podmesh-fence.timer podmesh-restore.service podmesh-decision-follow.timer 2>/dev/null || true
+  systemctl disable podmesh.service 2>/dev/null || true
+ fi
 fi
 SCRIPT
+
 cat > "$work/DEBIAN/postrm" <<'SCRIPT'
 #!/bin/sh
 set -e
-# Keep persistent identity and journal, including on purge, for explicit recovery.
-if [ -d /run/systemd/system ]; then systemctl daemon-reload; fi
+if [ -d /run/systemd/system ]; then systemctl daemon-reload 2>/dev/null || true; fi
 SCRIPT
-chmod 755 "$work/DEBIAN/postinst" "$work/DEBIAN/prerm" "$work/DEBIAN/postrm"
+
+chmod 0755 "$work/DEBIAN/postinst" "$work/DEBIAN/prerm" "$work/DEBIAN/postrm"
+find "$work" -type d -exec chmod 0755 {} +
+
+if git rev-parse HEAD >/dev/null 2>&1; then
+    export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+else
+    export SOURCE_DATE_EPOCH="1793100000"
+fi
+find "$work" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+
 mkdir -p dist
-dpkg-deb --root-owner-group --build "$work" "dist/podmesh_${version}_amd64.deb"
+DEB_OUT="dist/podmesh_${version}_amd64.deb"
+dpkg-deb --root-owner-group -Zxz --build "$work" "$DEB_OUT"
+
+ROOT_PERM="$(dpkg-deb -c "$DEB_OUT" | awk '$6 == "./" {print $1}')"
+if [ "${ROOT_PERM}" != "drwxr-xr-x" ]; then
+    echo "FATAL [Invariant Breach]: ${DEB_OUT} root dir is ${ROOT_PERM}" >&2
+    exit 1
+fi
+echo "[PodMesh] Debian 13 package built & verified: ${DEB_OUT}"

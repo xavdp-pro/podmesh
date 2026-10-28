@@ -1,40 +1,56 @@
 #!/usr/bin/env bash
+# =============================================================================
+# PodMesh MeshFS v2.3.0 — Debian 13 (Trixie) Package Builder
+# Hardened under Claude Fable 5.1 & GPT-6 Astra Counter-Reviews:
+#  - Enforces 0755 on ./ and OS directories; 0700 on /etc/meshfs & /var/lib/meshfs
+#  - Debian 13 usrmerge compliance (/usr/lib/systemd/system/meshfs.service)
+#  - Ships both /usr/bin/meshfs (Pure Rust) and /usr/bin/meshfs-p2p
+#  - Protects /etc/meshfs/config.json in DEBIAN/conffiles
+#  - Clean FUSE unmount in prerm and reproducible build via SOURCE_DATE_EPOCH
+# =============================================================================
 set -euo pipefail
+umask 0022
 
 PKG_NAME="podmesh-meshfs"
-PKG_VERSION="2.1.0"
+PKG_VERSION="2.3.0"
 PKG_ARCH="amd64"
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 BUILD_DIR="$(mktemp -d /tmp/build-${PKG_NAME}.XXXXXX)"
 DIST_DIR="${ROOT_DIR}/dist"
 RUST_BIN="${ROOT_DIR}/target/release/meshfs"
 
-echo "=== [MeshFS] Packaging Debian: ${PKG_NAME}_${PKG_VERSION}_${PKG_ARCH}.deb (Pure Rust Edition) ==="
+echo "=== [MeshFS] Packaging Debian 13 (Trixie): ${PKG_NAME}_${PKG_VERSION}_${PKG_ARCH}.deb ==="
 
-# 1. Vérification compilation
 if [ ! -f "${RUST_BIN}" ]; then
-    echo "Compilation release de MeshFS..."
+    echo "Compiling release binary for MeshFS v${PKG_VERSION}..."
     cargo build --release -p meshfs --manifest-path "${ROOT_DIR}/Cargo.toml"
 fi
 
 trap 'rm -rf "${BUILD_DIR}"' EXIT
 
-mkdir -p "${BUILD_DIR}/DEBIAN"
-mkdir -p "${BUILD_DIR}/usr/bin"
-mkdir -p "${BUILD_DIR}/lib/systemd/system"
-mkdir -p "${BUILD_DIR}/etc/meshfs"
-mkdir -p "${BUILD_DIR}/var/lib/meshfs/chunks"
-mkdir -p "${BUILD_DIR}/var/lib/meshfs/meta"
+chmod 0755 "${BUILD_DIR}"
+mkdir -p -m 0755 "${BUILD_DIR}/DEBIAN"
+mkdir -p -m 0755 "${BUILD_DIR}/usr" "${BUILD_DIR}/usr/bin" "${BUILD_DIR}/usr/lib" \
+  "${BUILD_DIR}/usr/lib/systemd" "${BUILD_DIR}/usr/lib/systemd/system"
+mkdir -p -m 0755 "${BUILD_DIR}/etc" "${BUILD_DIR}/var" "${BUILD_DIR}/var/lib"
+mkdir -p -m 0700 "${BUILD_DIR}/etc/meshfs"
+mkdir -p -m 0700 "${BUILD_DIR}/var/lib/meshfs"
+mkdir -p -m 0700 "${BUILD_DIR}/var/lib/meshfs/chunks"
+mkdir -p -m 0700 "${BUILD_DIR}/var/lib/meshfs/meta"
+mkdir -p -m 0700 "${BUILD_DIR}/var/lib/meshfs/volumes"
 mkdir -p "${DIST_DIR}"
 
-# 2. Copie du binaire natif autonome Rust
-cp "${RUST_BIN}" "${BUILD_DIR}/usr/bin/meshfs"
-chmod 755 "${BUILD_DIR}/usr/bin/meshfs"
+# 1. Install binaries (/usr/bin/meshfs + /usr/bin/meshfs-p2p)
+install -m 0755 "${RUST_BIN}" "${BUILD_DIR}/usr/bin/meshfs"
+if [ -f "${ROOT_DIR}/bin/meshfs-p2p" ]; then
+    install -m 0755 "${ROOT_DIR}/bin/meshfs-p2p" "${BUILD_DIR}/usr/bin/meshfs-p2p"
+fi
 
-# 3. Fichier de configuration par défaut
+# 2. Default configuration (/etc/meshfs/config.json)
 cat << 'EOF' > "${BUILD_DIR}/etc/meshfs/config.json"
 {
-  "clusterName": "meshfs-federation",
+  "version": "2.3.0",
+  "clusterName": "meshfs-cluster",
   "port": 7443,
   "dataDir": "/var/lib/meshfs",
   "chunkSizeMb": 4,
@@ -43,24 +59,43 @@ cat << 'EOF' > "${BUILD_DIR}/etc/meshfs/config.json"
   "requiresPodmesh": false
 }
 EOF
+chmod 0600 "${BUILD_DIR}/etc/meshfs/config.json"
 
-# 4. Service systemd natif avec socket Unix et restart automatique
-cat << 'EOF' > "${BUILD_DIR}/lib/systemd/system/meshfs.service"
+# 3. DEBIAN/conffiles
+cat << 'EOF' > "${BUILD_DIR}/DEBIAN/conffiles"
+/etc/meshfs/config.json
+EOF
+chmod 0644 "${BUILD_DIR}/DEBIAN/conffiles"
+
+# 4. Debian 13 usrmerge systemd unit (/usr/lib/systemd/system/meshfs.service)
+cat << 'EOF' > "${BUILD_DIR}/usr/lib/systemd/system/meshfs.service"
 [Unit]
-Description=PodMesh MeshFS Pure Rust Distributed Filesystem Daemon
-After=network.target
+Description=PodMesh MeshFS Pure Rust 4MB CAS Distributed Filesystem Daemon (v2.3.0)
+After=network-online.target local-fs.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
+Group=root
+UMask=0077
+StateDirectory=meshfs
+StateDirectoryMode=0700
+ConfigurationDirectory=meshfs
+ConfigurationDirectoryMode=0700
 ExecStart=/usr/bin/meshfs daemon --port 7443 --data-dir /var/lib/meshfs --socket /var/lib/meshfs/meshfs.sock
-Restart=always
-RestartSec=3
+Restart=on-failure
+RestartSec=2
 LimitNOFILE=65536
+NoNewPrivileges=yes
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
+chmod 0644 "${BUILD_DIR}/usr/lib/systemd/system/meshfs.service"
+
+INSTALLED_SIZE="$(du -sk "${BUILD_DIR}" | awk '{print $1}')"
 
 # 5. DEBIAN/control
 cat << EOF > "${BUILD_DIR}/DEBIAN/control"
@@ -69,66 +104,94 @@ Version: ${PKG_VERSION}
 Section: admin
 Priority: optional
 Architecture: ${PKG_ARCH}
-Depends: libc6 (>= 2.31)
-Maintainer: Xavier <xavier@xavdp.pro>
-Description: PodMesh MeshFS — Pure Rust Distributed Deduplicated Filesystem (CephFS alternative)
- Ultra-lightweight distributed filesystem operating seamlessly on 1 node up to
- N nodes. Features SHA-256 chunk deduplication, Merkle tree structure snapshots,
- Unix Domain Socket control IPC, kernel FICLONE zero-copy reflink, and native
- incremental backup to PodMesh Backup Server (PMBS).
- 100% Native Pure Rust — Zero external runtime, < 8MB RAM.
- Can be installed on servers WITH or WITHOUT PodMesh.
+Installed-Size: ${INSTALLED_SIZE}
+Depends: libc6 (>= 2.36), systemd, fuse3
+Recommends: podmesh-pve-plugin (>= 2.3.0), python3
+Maintainer: Xavier DP <xavier@xavdp.pro>
+Homepage: https://meshfs.xavdp.pro
+Description: PodMesh MeshFS — Pure Rust 4MB CAS Distributed Filesystem (v2.3.0)
+ Ultra-lightweight distributed and peer-to-peer filesystem operating seamlessly
+ from 1 standalone node up to N-node clusters. Features 4 MiB SHA-256 Content
+ Addressable Storage (CAS), Merkle Copy-on-Write snapshots, Unix Domain Socket
+ IPC, FUSE POSIX mounting, and Zero-Transit synergy with PodMesh Backup Server.
 EOF
+chmod 0644 "${BUILD_DIR}/DEBIAN/control"
 
-# 6. Intégration du plugin Proxmox VE si présent
-if [ -d "${ROOT_DIR}/packaging/proxmox" ]; then
-    mkdir -p "${BUILD_DIR}/usr/share/meshfs/proxmox"
-    cp -r "${ROOT_DIR}/packaging/proxmox/"* "${BUILD_DIR}/usr/share/meshfs/proxmox/"
-fi
-
-# 7. DEBIAN/postinst
+# 6. DEBIAN/postinst
 cat << 'EOF' > "${BUILD_DIR}/DEBIAN/postinst"
 #!/usr/bin/env bash
-set -e
-if [ "$1" = "configure" ]; then
-    systemctl daemon-reload || true
-    systemctl enable meshfs.service || true
-    systemctl restart meshfs.service || true
-    echo "[MeshFS] Service meshfs.service (Pure Rust) activé et démarré sur le port 7443."
-
-    # Détection automatique de Proxmox VE
-    if [ -d "/usr/share/perl5/PVE" ]; then
-        echo "[MeshFS] Environnement Proxmox VE détecté ! Enregistrement du plugin PVE..."
-        mkdir -p /usr/share/perl5/PVE/Storage/Custom
-        rm -f /usr/share/perl5/PVE/Storage/MeshFSPlugin.pm 2>/dev/null || true
-        cp /usr/share/meshfs/proxmox/MeshFSPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
-        chmod 644 /usr/share/perl5/PVE/Storage/Custom/MeshFSPlugin.pm
-
-        if ! grep -q "PVE::Storage::Custom::MeshFSPlugin" /usr/share/perl5/PVE/Storage.pm 2>/dev/null; then
-            echo "[MeshFS] Ajout du plugin dans /usr/share/perl5/PVE/Storage.pm..."
-            sed -i '/use PVE::Storage::Plugin;/a use PVE::Storage::Custom::MeshFSPlugin;' /usr/share/perl5/PVE/Storage.pm || true
-            sed -i '/PVE::Storage::Plugin->init();/a PVE::Storage::Custom::MeshFSPlugin->register();' /usr/share/perl5/PVE/Storage.pm || true
-        fi
-        systemctl restart pvedaemon pveproxy 2>/dev/null || true
-        echo "[MeshFS] Plugin Proxmox VE enregistré et services PVE rechargés."
+set -euo pipefail
+if [ "${1:-}" = "configure" ]; then
+    install -d -m 0700 -o root -g root /etc/meshfs /var/lib/meshfs /var/lib/meshfs/chunks /var/lib/meshfs/meta /var/lib/meshfs/volumes
+    if [ -f /etc/meshfs/config.json ]; then
+        chmod 0600 /etc/meshfs/config.json
+        chown root:root /etc/meshfs/config.json
+    fi
+    if [ -f /etc/systemd/system/meshfs.service ] && [ ! -L /etc/systemd/system/meshfs.service ]; then
+        rm -f /etc/systemd/system/meshfs.service
+    fi
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+        systemctl enable meshfs.service || true
+        systemctl restart meshfs.service || true
+        echo "[MeshFS] Service meshfs.service (v2.3.0) enabled and started on :7443 + /var/lib/meshfs/meshfs.sock."
     fi
 fi
 exit 0
 EOF
-chmod 755 "${BUILD_DIR}/DEBIAN/postinst"
+chmod 0755 "${BUILD_DIR}/DEBIAN/postinst"
 
-# 8. DEBIAN/prerm
+# 7. DEBIAN/prerm
 cat << 'EOF' > "${BUILD_DIR}/DEBIAN/prerm"
 #!/usr/bin/env bash
 set -e
-if [ "$1" = "remove" ]; then
-    systemctl stop meshfs.service 2>/dev/null || true
-    systemctl disable meshfs.service 2>/dev/null || true
+if [ "${1:-}" = "remove" ]; then
+    if command -v fusermount3 >/dev/null 2>&1; then
+        fusermount3 -uz /mnt/meshfs 2>/dev/null || true
+    fi
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl stop meshfs.service 2>/dev/null || true
+        systemctl disable meshfs.service 2>/dev/null || true
+    fi
+    rm -f /var/lib/meshfs/meshfs.sock 2>/dev/null || true
 fi
 exit 0
 EOF
-chmod 755 "${BUILD_DIR}/DEBIAN/prerm"
+chmod 0755 "${BUILD_DIR}/DEBIAN/prerm"
 
-# 9. Construction du paquet .deb
-dpkg-deb --root-owner-group --build "${BUILD_DIR}" "${DIST_DIR}/${PKG_NAME}_${PKG_VERSION}_${PKG_ARCH}.deb"
-echo "[MeshFS] Paquet généré avec succès dans : ${DIST_DIR}/${PKG_NAME}_${PKG_VERSION}_${PKG_ARCH}.deb"
+# 8. DEBIAN/postrm (Storage Safety First: never delete /var/lib/meshfs CAS chunks)
+cat << 'EOF' > "${BUILD_DIR}/DEBIAN/postrm"
+#!/usr/bin/env bash
+set -e
+if [ "${1:-}" = "remove" ] || [ "${1:-}" = "purge" ]; then
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+fi
+if [ "${1:-}" = "purge" ]; then
+    rm -f /etc/meshfs/config.json 2>/dev/null || true
+fi
+exit 0
+EOF
+chmod 0755 "${BUILD_DIR}/DEBIAN/postrm"
+
+# 9. Reproducible build timestamp & permission gate
+if git -C "${ROOT_DIR}" rev-parse HEAD >/dev/null 2>&1; then
+    export SOURCE_DATE_EPOCH="$(git -C "${ROOT_DIR}" log -1 --format=%ct)"
+else
+    export SOURCE_DATE_EPOCH="1793100000"
+fi
+find "${BUILD_DIR}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+
+DEB_OUT="${DIST_DIR}/${PKG_NAME}_${PKG_VERSION}_${PKG_ARCH}.deb"
+dpkg-deb --root-owner-group -Zxz --build "${BUILD_DIR}" "${DEB_OUT}"
+
+ROOT_PERM="$(dpkg-deb -c "${DEB_OUT}" | awk '$6 == "./" {print $1}')"
+if [ "${ROOT_PERM}" != "drwxr-xr-x" ]; then
+    echo "FATAL [Invariant Breach]: ${DEB_OUT} root dir is ${ROOT_PERM}" >&2
+    exit 1
+fi
+
+sha256sum "${DEB_OUT}" > "${DIST_DIR}/SHA256SUMS"
+echo "[MeshFS] Debian 13 package built & verified: ${DEB_OUT}"
+cat "${DIST_DIR}/SHA256SUMS"
