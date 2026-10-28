@@ -1,6 +1,6 @@
 [package]
 name = "meshfs"
-version = "2.3.0"
+version = "2.4.0"
 edition = "2021"
 authors = ["Xavier DP <xavier@xavdp.pro>", "PodMesh Team"]
 description = "High-performance distributed CAS filesystem and storage engine for PodMesh & Proxmox VE"

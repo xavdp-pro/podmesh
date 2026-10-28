@@ -1,9 +1,9 @@
 # Lineage — podmesh
 
-## Sovereign Orchestrator & SHAPER PHOENIX Modular Split — v2.3.0 (2026-10-27)
+## Sovereign Universal Multi-Storage & Orchestration Suite — v2.4.0 (2026-10-28)
 
-- **Current Version**: `2.3.0`
-- **Release Date**: `2026-10-27`
+- **Current Version**: `2.4.0`
+- **Release Date**: `2026-10-28`
 - **Canonical Repository**: [`xavdp-pro/podmesh`](https://github.com/xavdp-pro/podmesh)
 - **Private Workshop Companion**: [`xavdp-pro/podmesh-lab`](https://github.com/xavdp-pro/podmesh-lab)
 - **Governing Standard**: [`xavdp-pro/SHAPER-OS-V1.15`](https://github.com/xavdp-pro/SHAPER-OS-V1.15) (`SEP22-CONTAINER-MARIADB`, Rules 4, 11, 26, 38, GEM-001)
@@ -40,3 +40,9 @@
   - [`xavdp-pro/podmesh-docs`](https://github.com/xavdp-pro/podmesh-docs) — Bilingual documentation portal and interactive validation showcase.
   - [`xavdp-pro/podmesh-installer`](https://github.com/xavdp-pro/podmesh-installer) — Unified `.deb` packaging, offline closures, and dual-channel APT repository tooling.
 - `xavdp-pro/podmesh` (`v2.3.0`) remains the **full-power sovereign orchestrator** (retaining the complete workspace build for integrated local/CI verification while composing cleanly with the standalone `podmesh-*` modules). See [`MODULES.md`](MODULES.md).
+
+### 6. `v2.4.0` — Universal Multi-Storage & Multi-Platform Architecture
+- **Sortie du démonstrateur expérimental v2.3.0** : passage à l'architecture de production multi-plateformes universelle.
+- **Entrée dans l'ère multi-plateformes universelle** : support et qualification multi-cibles harmonisés pour Proxmox VE, TrueNAS, Synology, Windows et Podman.
+- **Moteur de stockage haute performance** : réception atomique des chunks, découpage FastCDC (Content-Defined Chunking) et empreinte cryptographique BLAKE3 ultra-rapide en complément de SHA-256.
+- **Réseau maillé souverain** : architecture WireGuard Dual-Hub résiliente sans point unique de défaillance (SPOF) avec bascule dynamique inter-liaisons.
