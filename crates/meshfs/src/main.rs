@@ -47,7 +47,7 @@ async fn main() -> ExitCode {
                 data_dir = %d.data_dir.display(),
                 socket = %d.socket.display(),
                 port = d.port,
-                "Démarrage du démon MeshFS Pure Rust v2.1.0"
+                "Démarrage du démon MeshFS Pure Rust v2.3.0"
             );
 
             let engine = match MeshFSEngine::new(&d.data_dir, &d.cluster, d.port).await {
