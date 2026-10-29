@@ -224,7 +224,6 @@ async fn cas_chunk_handler(
                 [
                     ("content-type", "application/octet-stream"),
                     ("x-podmesh-cas-blake3", clean.as_str()),
-                    ("x-podmesh-cas-sha256", clean.as_str()),
                 ],
                 bytes,
             )
@@ -450,7 +449,7 @@ async fn download_file_handler(
                 .into_response()
         }
     };
-    if inode.digest.starts_with("merkle-blake3:") || inode.digest.starts_with("merkle-sha256:") {
+    if inode.digest.starts_with("merkle-blake3:") {
         return (
             StatusCode::CONFLICT,
             "live files require the range interface or mount; digest is a manifest hash",

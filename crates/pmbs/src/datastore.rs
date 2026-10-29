@@ -1,9 +1,8 @@
 //! PMBS Datastore Management
-//! Manages deduplicated Content-Addressable Storage (CAS 4MB SHA-256),
+//! Manages deduplicated Content-Addressable Storage (CAS 4MB BLAKE3),
 //! backup snapshot manifests, and disk metrics.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -15,21 +14,14 @@ pub const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB canonical chunks
 
 static TMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-/// Computes BLAKE3 lower hex digest (primary CAS chunk & file digest for PMBS v2.4+).
+/// Computes BLAKE3 lower hex digest (canonical CAS chunk & file digest for PMBS v2.4+).
 pub fn blake3_digest(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
 }
 
-/// Computes SHA-256 lower hex digest (legacy v2.3 compatibility).
-pub fn sha256_digest(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
-}
-
-/// Verifies chunk/file integrity against BLAKE3 (primary) or SHA-256 (legacy).
+/// Verifies chunk/file integrity against BLAKE3.
 pub fn verify_cas_digest(data: &[u8], expected_clean: &str) -> bool {
-    blake3_digest(data) == expected_clean || sha256_digest(data) == expected_clean
+    blake3_digest(data) == expected_clean
 }
 
 pub fn invalid(message: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidInput, message) }
@@ -48,9 +40,9 @@ pub fn validate_file_path(path: &str) -> io::Result<()> {
     Ok(())
 }
 pub fn validate_chunk_id(id: &str) -> io::Result<()> {
-    let id = id.strip_prefix("blake3:").or_else(|| id.strip_prefix("sha256:")).unwrap_or(id);
+    let id = id.strip_prefix("blake3:").unwrap_or(id);
     if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-        return Err(invalid("invalid BLAKE3/SHA256 chunk id"));
+        return Err(invalid("invalid BLAKE3 chunk id"));
     }
     Ok(())
 }
@@ -147,11 +139,9 @@ impl Datastore {
         })
     }
 
-    /// Normalizes chunk ID string by stripping any "blake3:" or "sha256:" prefix.
+    /// Normalizes chunk ID string by stripping any "blake3:" prefix.
     pub fn normalize_id(id: &str) -> &str {
-        id.strip_prefix("blake3:")
-            .or_else(|| id.strip_prefix("sha256:"))
-            .unwrap_or(id)
+        id.strip_prefix("blake3:").unwrap_or(id)
     }
 
     /// Computes path for chunk storage: `<chunks_dir>/<prefix>/<hash>`
@@ -235,11 +225,10 @@ impl Datastore {
         for (key, f) in &m.files {
             validate_file_path(key)?;
             if key != &f.path || f.chunks_count != f.chunks.len() { return Err(invalid("file identity or chunk count mismatch")); }
-            if !f.digest.starts_with("blake3:") && !f.digest.starts_with("sha256:") { return Err(invalid("file digest must be BLAKE3 or SHA256")); }
+            if !f.digest.starts_with("blake3:") { return Err(invalid("file digest must be BLAKE3")); }
             validate_chunk_id(&f.digest)?;
             let mut offset = 0u64;
             let mut b3_hash = blake3::Hasher::new();
-            let mut sha_hash = Sha256::new();
             for (idx, c) in f.chunks.iter().enumerate() {
                 validate_chunk_id(&c.id)?;
                 if c.offset != offset || c.size == 0 || c.size > CHUNK_SIZE
@@ -248,12 +237,8 @@ impl Datastore {
                 let bytes = self.read_chunk(&c.id).map_err(|_| invalid("missing or corrupt referenced chunk"))?;
                 if bytes.len() != c.size { return Err(invalid("chunk size mismatch")); }
                 b3_hash.update(&bytes);
-                sha_hash.update(&bytes);
             }
-            let expected_clean = Self::normalize_id(&f.digest);
-            let b3_hex = b3_hash.finalize().to_hex().to_string();
-            let sha_hex = hex::encode(sha_hash.finalize());
-            if offset != f.size || (b3_hex != expected_clean && sha_hex != expected_clean) { return Err(invalid("file size or digest mismatch")); }
+            if offset != f.size || format!("blake3:{}", b3_hash.finalize().to_hex()) != f.digest { return Err(invalid("file size or digest mismatch")); }
             total = total.checked_add(f.size).ok_or_else(|| invalid("total size overflow"))?;
             count = count.checked_add(f.chunks.len()).ok_or_else(|| invalid("chunk count overflow"))?;
         }

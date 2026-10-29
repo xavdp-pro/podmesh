@@ -1,7 +1,6 @@
 //! CAS (Content-Addressable Storage) Chunk Store for MeshFS
-//! Splits data into immutable 4MB chunks indexed by their BLAKE3 digests (with SHA-256 backward compatibility).
+//! Splits data into immutable 4MB chunks indexed by their BLAKE3 digests.
 
-use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,21 +11,14 @@ use std::sync::{
 
 pub const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB canonical chunks
 
-/// Computes BLAKE3 digest string in lower hex (primary CAS chunk digest for MeshFS v2.4+).
+/// Computes BLAKE3 digest string in lower hex (canonical CAS chunk digest for MeshFS v2.4+).
 pub fn blake3_digest(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
 }
 
-/// Computes SHA-256 digest string in lower hex (legacy v2.3 compatibility & metadata).
-pub fn sha256_digest(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
-}
-
-/// Verifies chunk integrity against BLAKE3 (primary v2.4+) or SHA-256 (backward-compatible v2.3).
+/// Verifies chunk integrity against BLAKE3.
 pub fn verify_cas_digest(data: &[u8], expected_clean: &str) -> bool {
-    blake3_digest(data) == expected_clean || sha256_digest(data) == expected_clean
+    blake3_digest(data) == expected_clean
 }
 
 /// Metadata describing a chunk slice within a file.
@@ -81,11 +73,9 @@ impl ChunkStore {
         })
     }
 
-    /// Strips any "blake3:" or "sha256:" prefix and ensures clean lowercase hash.
+    /// Strips any "blake3:" prefix and ensures clean lowercase hash.
     pub fn normalize_id(id: &str) -> &str {
-        id.strip_prefix("blake3:")
-            .or_else(|| id.strip_prefix("sha256:"))
-            .unwrap_or(id)
+        id.strip_prefix("blake3:").unwrap_or(id)
     }
 
     /// Resolves disk path for a given chunk hash: <chunks_dir>/<prefix>/<hash>

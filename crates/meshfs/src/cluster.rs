@@ -907,11 +907,7 @@ impl Machine {
                 if s.volumes
                     .get(volume)
                     .and_then(|v| v.files.get(&inode.path))
-                    .is_some_and(|i| {
-                        i.revision > 0
-                            || i.digest.starts_with("merkle-blake3:")
-                            || i.digest.starts_with("merkle-sha256:")
-                    })
+                    .is_some_and(|i| i.revision > 0 || i.digest.starts_with("merkle-blake3:"))
                 {
                     return Ok(json!({"error":"live file requires precondition"}));
                 }
@@ -935,11 +931,7 @@ impl Machine {
                 if s.volumes
                     .get(volume)
                     .and_then(|v| v.files.get(path))
-                    .is_some_and(|i| {
-                        i.revision > 0
-                            || i.digest.starts_with("merkle-blake3:")
-                            || i.digest.starts_with("merkle-sha256:")
-                    })
+                    .is_some_and(|i| i.revision > 0 || i.digest.starts_with("merkle-blake3:"))
                 {
                     return Ok(json!({"error":"live file requires precondition"}));
                 }
@@ -2588,13 +2580,12 @@ fn validate_layout(inode: &Inode, sizes: &BTreeMap<String, usize>) -> SResult<()
     if inode.chunks_count != inode.chunks.len() {
         return Err(se("chunk count mismatch"));
     }
-    if inode.digest.starts_with("merkle-blake3:") || inode.digest.starts_with("merkle-sha256:") {
+    if inode.digest.starts_with("merkle-blake3:") {
         return crate::live::validate(inode, sizes).map_err(se);
     }
     let digest = inode
         .digest
         .strip_prefix("blake3:")
-        .or_else(|| inode.digest.strip_prefix("sha256:"))
         .ok_or_else(|| se("invalid file digest"))?;
 
     if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {

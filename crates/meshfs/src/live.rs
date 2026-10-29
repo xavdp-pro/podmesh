@@ -266,7 +266,7 @@ impl MeshFSEngine {
         .map_err(io::Error::other)
     }
     async fn live_resize_blocks(&self, i: &mut Inode, size: u64) -> io::Result<()> {
-        if !i.digest.starts_with("merkle-blake3:") && !i.digest.starts_with("merkle-sha256:") {
+        if !i.digest.starts_with("merkle-blake3:") {
             return Err(io::Error::other(
                 "import the file through the live interface first",
             ));

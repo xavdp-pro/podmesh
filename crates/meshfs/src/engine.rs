@@ -80,7 +80,6 @@ fn collect_cas_hashes_from_value(
             for (k, v) in map {
                 if let serde_json::Value::String(s) = v {
                     if s.starts_with("blake3:")
-                        || s.starts_with("sha256:")
                         || k == "id"
                         || k == "chunk"
                         || k == "hash"

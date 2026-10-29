@@ -8,7 +8,6 @@ use pmbs::server::configured_token;
 use pmbs::{BackupManifest, CHUNK_SIZE};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
@@ -141,7 +140,7 @@ fn validate_manifest(m: &BackupManifest, max_bytes: u64) -> Result<(), String> {
         validate_file_path(key).map_err(io_error)?;
         for (idx, _) in key.match_indices('/') { if paths.contains(&key[..idx]) { return Err(invalid("file/directory prefix collision")); } }
         if key != &f.path || f.chunks_count != f.chunks.len() { return Err(invalid("file identity/chunk count mismatch")); }
-        if !f.digest.starts_with("blake3:") && !f.digest.starts_with("sha256:") { return Err(invalid("file digest must be BLAKE3 or SHA256")); }
+        if !f.digest.starts_with("blake3:") { return Err(invalid("file digest must be BLAKE3")); }
         validate_chunk_id(&f.digest).map_err(io_error)?;
         let mut offset = 0u64;
         for (idx, c) in f.chunks.iter().enumerate() {
@@ -208,7 +207,6 @@ async fn restore(args: &RestoreArgs, client: &reqwest::Client) -> Result<Value, 
             let f = &manifest.files[path];
             let (mut output, dir) = stage.new_file(path).map_err(io_error)?;
             let mut b3_hash = blake3::Hasher::new();
-            let mut sha_hash = Sha256::new();
             for chunk in &f.chunks {
                 let url = base.join(&format!("{}chunks/{}", ds_path, chunk.id)).map_err(|e| e.to_string())?;
                 let payload = get_limited(client, url, chunk.size).await?;
@@ -216,13 +214,9 @@ async fn restore(args: &RestoreArgs, client: &reqwest::Client) -> Result<Value, 
                 if payload.len() != chunk.size || !pmbs::datastore::verify_cas_digest(&payload, clean_chunk) { return Err(invalid("referenced chunk length/digest mismatch")); }
                 output.write_all(&payload).map_err(io_error)?;
                 b3_hash.update(&payload);
-                sha_hash.update(&payload);
             }
-            let expected_clean = pmbs::datastore::Datastore::normalize_id(&f.digest);
-            let b3_hex = b3_hash.finalize().to_hex().to_string();
-            let sha_hex = hex::encode(sha_hash.finalize());
-            if output.metadata().map_err(io_error)?.len() != f.size || (b3_hex != expected_clean && sha_hex != expected_clean) { return Err(invalid("restored file length/digest mismatch")); }
-            let digest = format!("blake3:{}", b3_hex);
+            let digest = format!("blake3:{}", b3_hash.finalize().to_hex());
+            if output.metadata().map_err(io_error)?.len() != f.size || digest != f.digest { return Err(invalid("restored file length/digest mismatch")); }
             output.sync_all().map_err(io_error)?;
             dir.sync_all().map_err(io_error)?;
             files.push(json!({"path": path, "bytes": f.size, "digest": digest}));
