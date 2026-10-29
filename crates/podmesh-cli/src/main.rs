@@ -15,7 +15,7 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "podmesh-ctl",
     author = "Xavier DP <xavier@xavdp.pro>",
-    version = "2.3.0",
+    version = "2.4.1",
     about = "PodMesh Unified Orchestration, Replication & HA Failover CLI in Pure Rust",
     long_about = "Replaces legacy Python tools (ha-standby, replicate-universe, move-universe) with native, ultra-fast Rust binaries."
 )]

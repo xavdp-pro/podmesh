@@ -24,7 +24,7 @@ pub fn get_cluster_status() -> ClusterStatusReport {
     ClusterStatusReport {
         ok: true,
         service: "podmesh-manager".to_string(),
-        version: "2.3.0".to_string(),
+        version: "2.4.1".to_string(),
         active_manager: "mgr-leader".to_string(),
         quorum: true,
         replicas_count: 3,

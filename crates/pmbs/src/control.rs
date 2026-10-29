@@ -82,7 +82,7 @@ pub async fn start_control_socket(state: AppState, socket_path: PathBuf) -> std:
                                     serde_json::json!({
                                         "ok": true,
                                         "service": "podmesh-backup-server",
-                                        "version": "2.4.0",
+                                        "version": "2.4.1",
                                         "datastores": names,
                                         "dedupEngine": "SHA-256 CAS 4MB (Pure Rust)",
                                         "op10VerifierReady": false,
