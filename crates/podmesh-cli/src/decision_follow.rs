@@ -3,7 +3,6 @@
 //! 100% Native Pure Rust — Replaces packaging/podmesh-decision-follow Python script.
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -290,9 +289,7 @@ pub fn digest_of_certificate(cert: &Value) -> Result<String, String> {
 
     // Canonical serialization: keys sorted, compact separators
     let canonical = serde_json::to_string(&Value::Object(payload)).map_err(|e| e.to_string())?;
-    let mut hasher = Sha256::new();
-    hasher.update(canonical.as_bytes());
-    Ok(hex::encode(hasher.finalize()))
+    Ok(blake3::hash(canonical.as_bytes()).to_hex().to_string())
 }
 
 /// Follows a single resource. Returns the JSON report to print on stdout.

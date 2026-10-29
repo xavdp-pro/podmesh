@@ -4,7 +4,6 @@
 
 use crate::decision_follow::{call_node, is_token, is_uuid, NODE_TIMEOUT, PUBLISH_TIMEOUT};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -308,9 +307,7 @@ pub fn installed_proof(proof_path: &Path, epoch: i64, state: &mut TickState) -> 
     let proof: Value = match serde_json::from_slice::<Value>(&raw) {
         Ok(v) if v.is_object() => v,
         Ok(_) | Err(_) => {
-            let mut hasher = Sha256::new();
-            hasher.update(&raw);
-            let digest = hex::encode(hasher.finalize());
+            let digest = blake3::hash(&raw).to_hex().to_string();
             if state.mine.get("proof_warned").and_then(|v| v.as_str()) != Some(&digest) {
                 eprintln!(
                     "podmesh-publisher-follow: the installed proof at {} cannot be used; starting without it",

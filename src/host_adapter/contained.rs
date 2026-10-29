@@ -232,7 +232,6 @@ fn directory(path: &str) -> Result<(), Error> {
 }
 
 fn observed_oci_spec(container: &Value) -> Result<(Value, Value), Error> {
-    use sha2::{Digest, Sha256};
     let id = digest(text(container, "Id")?)?;
     let info = super::command(30, &["info".into(), "--format=json".into()])?;
     if !info.status.success() {
@@ -290,7 +289,7 @@ fn observed_oci_spec(container: &Value) -> Result<(Value, Value), Error> {
     }
     let custody = json!({"type":"podmesh-owned-oci-spec-observation/1", "path":path,
         "container_id":id,"device":before.dev(),"inode":before.ino(),"bytes":bytes.len(),
-        "sha256":format!("{:x}",Sha256::digest(&bytes))});
+        "sha256":blake3::hash(&bytes).to_hex().to_string()});
     Ok((serde_json::from_slice(&bytes)?, custody))
 }
 impl Grant {

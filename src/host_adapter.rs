@@ -579,13 +579,12 @@ impl Policy {
         Ok(())
     }
     fn bind_intent(&self, intent: &Value) -> Result<(), Error> {
-        use sha2::{Digest, Sha256};
         let id = text(intent, "operation_id")?;
         if id.is_empty() {
             return Err("operation ID must not be empty".into());
         }
         crate::lifecycle::token(id)?;
-        let binding = format!("{:x}", Sha256::digest(serde_json::to_vec(intent)?));
+        let binding = blake3::hash(&serde_json::to_vec(intent)?).to_hex().to_string();
         let path = self.state.join(format!("intent-{id}.json"));
         if path.exists() {
             let saved: Value = serde_json::from_slice(&fs::read(path)?)?;
@@ -1167,7 +1166,6 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
                     policy.require_nested(target, base)?;
                 }
             }
-            use sha2::{Digest, Sha256};
             let envelope = policy
                 .contained_grant(target)
                 .map(contained::Grant::binding);
@@ -1181,7 +1179,7 @@ fn execute(policy: &Policy, request: &Value) -> Result<Value, Error> {
             } else {
                 legacy_action
             };
-            let action_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&binding)?));
+            let action_hash = blake3::hash(&serde_json::to_vec(&binding)?).to_hex().to_string();
             let record_path = policy.record_path(target)?;
             if record_path.exists() {
                 let previous: Value = serde_json::from_slice(&fs::read(&record_path)?)?;
@@ -2467,11 +2465,9 @@ mod real_effect_tests {
         invalid_intent["command"] = json!(["true"]);
         invalid_intent["network_profile"] = json!("isolated");
         let invalid_action = json!({"kind":"create","uuid":invalid_uuid,"image":digest(&image).unwrap(),"command":["true"],"labels":{"io.podmesh.universe":invalid_uuid,"io.podmesh.creation-operation":invalid_id,"io.podmesh.network-profile":"isolated","io.podmesh.universe-profile":"flat"}});
-        use sha2::{Digest, Sha256};
-        let hash = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&invalid_action).unwrap())
-        );
+        let hash = blake3::hash(&serde_json::to_vec(&invalid_action).unwrap())
+            .to_hex()
+            .to_string();
         policy.write_record(&invalid_uuid, &json!({"operation_id":invalid_id,"action_sha256":hash,"container_id":null,"base_image":digest(&image).unwrap()})).unwrap();
         let malformed = command(
             30,

@@ -517,7 +517,6 @@ pub(super) fn observe(policy: &Policy, action: &Value) -> Result<Value, Error> {
 }
 
 fn hash_runtime(path: &Path, deadline: Instant) -> Result<String, Error> {
-    use sha2::{Digest, Sha256};
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -525,7 +524,7 @@ fn hash_runtime(path: &Path, deadline: Instant) -> Result<String, Error> {
     if !file.metadata()?.is_file() {
         return Err("runtime hash requires a regular file".into());
     }
-    let mut hash = Sha256::new();
+    let mut hash = blake3::Hasher::new();
     let mut total = 0;
     let mut bytes = [0u8; 65536];
     loop {
@@ -540,7 +539,7 @@ fn hash_runtime(path: &Path, deadline: Instant) -> Result<String, Error> {
         }
         hash.update(&bytes[..n]);
     }
-    Ok(format!("{:x}", hash.finalize()))
+    Ok(hash.finalize().to_hex().to_string())
 }
 
 #[cfg(test)]

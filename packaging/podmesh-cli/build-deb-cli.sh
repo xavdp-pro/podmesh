@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # =============================================================================
-# PodMesh Unified CLI (podmesh-ctl) v2.3.0 — Debian 13 (Trixie) Package Builder
+# PodMesh Unified CLI (podmesh-ctl) v2.4.1 — Debian 13 (Trixie) Package Builder
 # Hardened under Claude Fable 5.1 & GPT-6 Astra Counter-Reviews:
 #  - Enforces 0755 on ./ and OS directories
-#  - Replaces: podmesh (<< 2.3.0) to prevent /usr/bin/podmesh-ctl collision
+#  - Replaces: podmesh (<< 2.4.1) to prevent /usr/bin/podmesh-ctl collision
 #  - Reproducible SHA-256 build via SOURCE_DATE_EPOCH
 # =============================================================================
 set -euo pipefail
 umask 0022
 
 PKG_NAME="podmesh-cli"
-PKG_VERSION="2.3.0"
+PKG_VERSION="2.4.1"
 PKG_ARCH="amd64"
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 BUILD_DIR="$(mktemp -d /tmp/build-${PKG_NAME}.XXXXXX)"
@@ -43,12 +43,12 @@ Priority: optional
 Architecture: ${PKG_ARCH}
 Installed-Size: ${INSTALLED_SIZE}
 Depends: libc6 (>= 2.36)
-Recommends: podmesh (>= 2.3.0) | podmesh-meshfs (>= 2.3.0)
-Replaces: podmesh (<< 2.3.0)
-Breaks: podmesh (<< 2.3.0)
+Recommends: podmesh (>= 2.4.1) | podmesh-meshfs (>= 2.4.1)
+Replaces: podmesh (<< 2.4.1)
+Breaks: podmesh (<< 2.4.1)
 Maintainer: Xavier DP <xavier@xavdp.pro>
 Homepage: https://podmesh.xavdp.pro
-Description: PodMesh Unified CLI (podmesh-ctl) — AI-First Orchestration, HA & Replication (v2.3.0)
+Description: PodMesh Unified CLI (podmesh-ctl) — AI-First Orchestration, HA & Replication (v2.4.1)
  Native command line control tool for PodMesh nodes, warm standby failover,
  Ed25519 cryptographic takeover proof generation, universe replication,
  and cross-host disaster recovery. Outputs deterministic JSON for AI agents.

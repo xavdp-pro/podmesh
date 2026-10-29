@@ -500,29 +500,17 @@ fn history_view(db: &Connection, uuid: &str) -> Result<Vec<Value>, Error> {
 pub(crate) fn host_uuid(db: &Connection) -> Result<String, Error> {
     Ok(db.query_row("SELECT value FROM metadata WHERE key='host_uuid'", [], |r| r.get(0))?)
 }
-/// SHA-256 of a service-controlled path, computed by coreutils with fixed arguments.
+/// Pure BLAKE3 (256-bit) digest of a service-controlled path.
 pub(crate) fn sha256(path: &Path) -> Result<String, Error> {
-    let out = Command::new("/usr/bin/sha256sum").arg("--").arg(path).output()?;
-    if !out.status.success() {
-        return Err(format!("sha256sum failed for {}", path.display()).into());
-    }
-    let text = String::from_utf8(out.stdout)?;
-    Ok(text.split_whitespace().next().ok_or("Empty sha256sum output")?.to_string())
+    let mut file = fs::File::open(path)
+        .map_err(|e| format!("blake3 hash failed for {}: {}", path.display(), e))?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(hasher.finalize().to_hex().to_string())
 }
-/// SHA-256 of bytes held in memory, computed by coreutils from standard input.
+/// Pure BLAKE3 (256-bit) digest of bytes held in memory.
 pub(crate) fn sha256_bytes(bytes: &[u8]) -> Result<String, Error> {
-    let mut child = Command::new("/usr/bin/sha256sum")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    child.stdin.take().ok_or("sha256sum input unavailable")?.write_all(bytes)?;
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        return Err("sha256sum failed".into());
-    }
-    let text = String::from_utf8(out.stdout)?;
-    Ok(text.split_whitespace().next().ok_or("Empty sha256sum output")?.to_string())
+    Ok(blake3::hash(bytes).to_hex().to_string())
 }
 /// Copies a file into a service-owned path through a temporary name, private and synced; callers re-hash the copy.
 pub(crate) fn copy_private(from: &Path, to: &Path) -> Result<u64, Error> {

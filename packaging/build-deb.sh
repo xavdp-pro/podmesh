@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-# PodMesh Core Orchestrator v2.3.0 — Debian 13 (Trixie) Package Builder
+# PodMesh Core Orchestrator v2.4.1 — Debian 13 (Trixie) Package Builder
 # Hardened under Claude Fable 5.1 & GPT-6 Astra Counter-Reviews:
-#  - Version unified to 2.3.0
-#  - Depends on libc6 (>= 2.36) and podmesh-cli (= 2.3.0) (no file collision)
+#  - Version unified to 2.4.1
+#  - Depends on libc6 (>= 2.36) and podmesh-cli (= 2.4.1) (no file collision)
 #  - Ships all 5 core binaries: podmesh, podmeshd, podmesh-host-adapter,
 #    podmesh-store-admin, podmesh-storage-migrate
 #  - Enforces 0755 on ./ and OS directories, usrmerge /usr/lib/systemd/system/
@@ -14,7 +14,7 @@ umask 0022
 
 cd "$(dirname "$0")/.."
 ROOT_DIR="$(pwd)"
-version="2.3.0"
+version="2.4.1"
 
 if [ ! -f target/release/podmeshd ] || [ ! -f target/release/podmesh-host-adapter ]; then
     PODMESH_PACKAGE_VERSION="$version" cargo build --release --workspace
@@ -68,7 +68,7 @@ Maintainer: Xavier DP <xavier@xavdp.pro>
 Homepage: https://podmesh.xavdp.pro
 Depends: libc6 (>= 2.36), libgcc-s1, podman, systemd, coreutils, podmesh-cli (= $version)
 Recommends: podmesh-meshfs (>= $version), podmesh-backup-server (>= $version)
-Description: PodMesh Sovereign Container & Universe Orchestrator (v2.3.0)
+Description: PodMesh Sovereign Container & Universe Orchestrator (v2.4.1)
  Sovereign AI-First Podman lifecycle, replication, and high-availability engine
  with persistent host identity, observation journal, Ed25519 epoch fencing,
  and private MariaDB functional units (podmesh-node, podmesh-manager).

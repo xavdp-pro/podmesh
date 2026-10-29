@@ -13,8 +13,6 @@ use podmesh::store::{
 };
 #[cfg(feature = "mariadb")]
 use rusqlite::types::ValueRef;
-#[cfg(feature = "mariadb")]
-use sha2::{Digest, Sha256};
 
 const USAGE: &str = "\
 Usage: podmesh-storage-migrate --from-sqlite PATH --to-dsn URL [--role node|manager] [--dry-run] [--force]
@@ -405,25 +403,27 @@ fn quoted_sqlite_literal(value: &str) -> String {
 }
 
 #[cfg(feature = "mariadb")]
-fn update_value_digest(digest: &mut Sha256, value: &Value) {
+fn update_value_digest(digest: &mut blake3::Hasher, value: &Value) {
     match value {
-        Value::Null => digest.update([0]),
+        Value::Null => {
+            digest.update(&[0]);
+        }
         Value::Integer(value) => {
-            digest.update([1]);
-            digest.update(value.to_be_bytes());
+            digest.update(&[1]);
+            digest.update(&value.to_be_bytes());
         }
         Value::Real(value) => {
-            digest.update([2]);
-            digest.update(value.to_bits().to_be_bytes());
+            digest.update(&[2]);
+            digest.update(&value.to_bits().to_be_bytes());
         }
         Value::Text(value) => {
-            digest.update([3]);
-            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(&[3]);
+            digest.update(&(value.len() as u64).to_be_bytes());
             digest.update(value.as_bytes());
         }
         Value::Blob(value) => {
-            digest.update([4]);
-            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(&[4]);
+            digest.update(&(value.len() as u64).to_be_bytes());
             digest.update(value);
         }
     }
@@ -434,25 +434,21 @@ fn logical_checksum(rows: &[Vec<Value>]) -> String {
     let mut row_digests = rows
         .iter()
         .map(|row| {
-            let mut digest = Sha256::new();
-            digest.update((row.len() as u64).to_be_bytes());
+            let mut digest = blake3::Hasher::new();
+            digest.update(&(row.len() as u64).to_be_bytes());
             for value in row {
                 update_value_digest(&mut digest, value);
             }
-            digest.finalize().to_vec()
+            digest.finalize().as_bytes().to_vec()
         })
         .collect::<Vec<_>>();
     row_digests.sort();
-    let mut digest = Sha256::new();
-    digest.update((row_digests.len() as u64).to_be_bytes());
+    let mut digest = blake3::Hasher::new();
+    digest.update(&(row_digests.len() as u64).to_be_bytes());
     for row in row_digests {
-        digest.update(row);
+        digest.update(&row);
     }
-    digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    digest.finalize().to_hex().to_string()
 }
 
 #[cfg(feature = "mariadb")]
