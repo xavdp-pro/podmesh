@@ -136,6 +136,11 @@ pub fn create_router(engine: MeshFSEngine) -> Router {
         // Diagnostics & Integrity audit routes
         .route("/diagnostics", get(diagnostics_handler))
         .route("/api/v1/meshfs/diagnostics", get(diagnostics_handler))
+        .route("/metrics", get(metrics_handler))
+        .route("/cas/chunk/:hash", get(cas_chunk_handler))
+        .route("/api/v1/meshfs/cas/chunk/:hash", get(cas_chunk_handler))
+        .route("/api/v1/meshfs/gc", post(gc_handler))
+        .route("/api/v1/meshfs/volumes/quota", post(volume_quota_handler))
         .layer(DefaultBodyLimit::max(128 * 1024 * 1024))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(cors)
@@ -147,6 +152,126 @@ pub fn create_router(engine: MeshFSEngine) -> Router {
 async fn status_handler(State(engine): State<MeshFSEngine>) -> impl IntoResponse {
     let report = engine.get_status().await;
     Json(report)
+}
+
+async fn metrics_handler(State(engine): State<MeshFSEngine>) -> impl IntoResponse {
+    let st = engine.get_status().await;
+    let body = format!(
+        "# HELP meshfs_volumes_total Number of logical MeshFS volumes\n\
+         # TYPE meshfs_volumes_total gauge\n\
+         meshfs_volumes_total {}\n\
+         # HELP meshfs_snapshots_total Number of CoW Merkle snapshots\n\
+         # TYPE meshfs_snapshots_total gauge\n\
+         meshfs_snapshots_total {}\n\
+         # HELP meshfs_files_total Total files across all volumes\n\
+         # TYPE meshfs_files_total gauge\n\
+         meshfs_files_total {}\n\
+         # HELP meshfs_logical_bytes_total Total logical bytes stored across volumes\n\
+         # TYPE meshfs_logical_bytes_total gauge\n\
+         meshfs_logical_bytes_total {}\n\
+         # HELP meshfs_physical_cas_chunks_total Total physical 4 MiB CAS chunks on disk\n\
+         # TYPE meshfs_physical_cas_chunks_total gauge\n\
+         meshfs_physical_cas_chunks_total {}\n\
+         # HELP meshfs_physical_cas_bytes_total Total physical CAS bytes on disk\n\
+         # TYPE meshfs_physical_cas_bytes_total gauge\n\
+         meshfs_physical_cas_bytes_total {}\n\
+         # HELP meshfs_dedup_saved_bytes_total Bytes saved by CAS deduplication\n\
+         # TYPE meshfs_dedup_saved_bytes_total gauge\n\
+         meshfs_dedup_saved_bytes_total {}\n\
+         # HELP meshfs_dedup_ratio Deduplication ratio (logical / physical)\n\
+         # TYPE meshfs_dedup_ratio gauge\n\
+         meshfs_dedup_ratio {:.4}\n\
+         # HELP meshfs_self_healed_chunks_total Total CAS chunks automatically repaired via P2P self-healing\n\
+         # TYPE meshfs_self_healed_chunks_total counter\n\
+         meshfs_self_healed_chunks_total {}\n",
+        st.volumes_count,
+        st.snapshots_count,
+        st.total_files,
+        st.total_logical_bytes,
+        st.physical_cas_chunks,
+        st.physical_cas_bytes,
+        st.dedup_saved_bytes,
+        st.dedup_ratio,
+        st.self_healed_chunks,
+    );
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+}
+
+async fn cas_chunk_handler(
+    State(engine): State<MeshFSEngine>,
+    axum::extract::Path(hash): axum::extract::Path<String>,
+) -> Response {
+    let clean = crate::chunk::ChunkStore::normalize_id(&hash).to_string();
+    if clean.len() != 64
+        || !clean
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return (StatusCode::BAD_REQUEST, "Invalid chunk hash").into_response();
+    }
+    let target = engine.chunk_store.chunk_path(&clean);
+    match std::fs::read(&target) {
+        Ok(bytes)
+            if bytes.len() <= crate::chunk::CHUNK_SIZE
+                && crate::chunk::verify_cas_digest(&bytes, &clean) =>
+        {
+            (
+                StatusCode::OK,
+                [
+                    ("content-type", "application/octet-stream"),
+                    ("x-podmesh-cas-blake3", clean.as_str()),
+                    ("x-podmesh-cas-sha256", clean.as_str()),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        _ => (StatusCode::NOT_FOUND, "Chunk not found or corrupted").into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GcHttpRequest {
+    #[serde(default)]
+    grace_seconds: u64,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+async fn gc_handler(
+    State(engine): State<MeshFSEngine>,
+    Json(req): Json<GcHttpRequest>,
+) -> impl IntoResponse {
+    let rep = engine
+        .run_universal_cas_gc(req.grace_seconds, req.dry_run)
+        .await;
+    Json(rep)
+}
+
+#[derive(Debug, Deserialize)]
+struct QuotaHttpRequest {
+    volume: String,
+    max_bytes: Option<u64>,
+}
+
+async fn volume_quota_handler(
+    State(engine): State<MeshFSEngine>,
+    Json(req): Json<QuotaHttpRequest>,
+) -> Response {
+    match engine.set_volume_quota(&req.volume, req.max_bytes).await {
+        Ok(v) => Json(serde_json::json!({
+            "status": "ok",
+            "volume": v.name,
+            "logical_used_bytes": v.total_bytes(),
+            "max_bytes": v.max_bytes.unwrap_or(0),
+        }))
+        .into_response(),
+        Err(e) => unavailable(e),
+    }
 }
 
 async fn nodes_handler(State(engine): State<MeshFSEngine>) -> impl IntoResponse {
@@ -325,7 +450,7 @@ async fn download_file_handler(
                 .into_response()
         }
     };
-    if inode.digest.starts_with("merkle-sha256:") {
+    if inode.digest.starts_with("merkle-blake3:") || inode.digest.starts_with("merkle-sha256:") {
         return (
             StatusCode::CONFLICT,
             "live files require the range interface or mount; digest is a manifest hash",
@@ -334,13 +459,12 @@ async fn download_file_handler(
     }
     let size = inode.size;
     let digest = inode.digest.clone();
-    use sha2::{Digest, Sha256};
     let stream = futures_util::stream::try_unfold(
-        (engine, inode, 0usize, 0u64, Sha256::new()),
+        (engine, inode, 0usize, 0u64, blake3::Hasher::new()),
         |(engine, inode, index, offset, mut hash)| async move {
             if index == inode.chunks.len() {
                 if offset != inode.size
-                    || format!("sha256:{}", hex::encode(hash.finalize())) != inode.digest
+                    || format!("blake3:{}", hash.finalize().to_hex()) != inode.digest
                 {
                     return Err(std::io::Error::other("file digest mismatch"));
                 }
@@ -355,7 +479,7 @@ async fn download_file_handler(
             let offset = offset + bytes.len() as u64;
             if index + 1 == inode.chunks.len()
                 && (offset != inode.size
-                    || format!("sha256:{}", hex::encode(hash.clone().finalize())) != inode.digest)
+                    || format!("blake3:{}", hash.clone().finalize().to_hex()) != inode.digest)
             {
                 return Err(std::io::Error::other("file digest mismatch"));
             }

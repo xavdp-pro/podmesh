@@ -2,7 +2,7 @@
 //! Coordinates storage drivers, 4MB CAS chunking, Merkle DAG tracking,
 //! volume isolation, and peer node synchronization.
 
-use crate::chunk::{sha256_digest, ChunkRef, ChunkStore, CHUNK_SIZE};
+use crate::chunk::{blake3_digest, verify_cas_digest, ChunkRef, ChunkStore, CHUNK_SIZE};
 use crate::cluster::{Action, Cluster, MAX_INLINE_BYTES};
 use crate::merkle::Inode;
 use crate::storage::{StorageDriver, StorageMetrics};
@@ -44,6 +44,81 @@ pub struct EngineState {
     pub snapshots: Vec<Snapshot>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcReport {
+    pub status: String,
+    pub dry_run: bool,
+    pub grace_seconds: u64,
+    pub referenced_chunks: usize,
+    pub scanned_chunks: usize,
+    pub deleted_chunks: usize,
+    pub reclaimed_bytes: u64,
+    pub retained_physical_bytes: u64,
+}
+
+fn collect_cas_hashes_from_value(
+    val: &serde_json::Value,
+    referenced: &mut std::collections::HashSet<String>,
+) {
+    match val {
+        serde_json::Value::String(s) => {
+            let clean = ChunkStore::normalize_id(s.as_str());
+            if clean.len() == 64
+                && clean
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                referenced.insert(clean.to_string());
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                collect_cas_hashes_from_value(item, referenced);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                if let serde_json::Value::String(s) = v {
+                    if s.starts_with("blake3:")
+                        || s.starts_with("sha256:")
+                        || k == "id"
+                        || k == "chunk"
+                        || k == "hash"
+                    {
+                        collect_cas_hashes_from_value(v, referenced);
+                    }
+                } else {
+                    collect_cas_hashes_from_value(v, referenced);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_cas_hashes_from_dir(dir: &Path, referenced: &mut std::collections::HashSet<String>) {
+    if !dir.exists() {
+        return;
+    }
+    if let Ok(entries) = fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if p.file_name().and_then(|n| n.to_str()) == Some("chunks") {
+                    continue;
+                }
+                collect_cas_hashes_from_dir(&p, referenced);
+            } else if p.extension().and_then(|s| s.to_str()) == Some("json") {
+                if let Ok(bytes) = fs::read(&p) {
+                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        collect_cas_hashes_from_value(&val, referenced);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// MeshFS overall status report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusReport {
@@ -63,6 +138,16 @@ pub struct StatusReport {
     pub total_files: usize,
     #[serde(rename = "totalLogicalBytes")]
     pub total_logical_bytes: u64,
+    #[serde(rename = "physicalCasChunks")]
+    pub physical_cas_chunks: usize,
+    #[serde(rename = "physicalCasBytes")]
+    pub physical_cas_bytes: u64,
+    #[serde(rename = "dedupSavedBytes")]
+    pub dedup_saved_bytes: u64,
+    #[serde(rename = "dedupRatio")]
+    pub dedup_ratio: f64,
+    #[serde(rename = "selfHealedChunks")]
+    pub self_healed_chunks: u64,
     #[serde(rename = "diskTotal")]
     pub disk_total: u64,
     #[serde(rename = "diskUsed")]
@@ -230,6 +315,17 @@ impl MeshFSEngine {
 
         let total_files: usize = state.volumes.values().map(|v| v.files.len()).sum();
         let total_logical_bytes: u64 = state.volumes.values().map(|v| v.total_bytes()).sum();
+        let (physical_cas_chunks, physical_cas_bytes) = self.chunk_store.count_chunks_and_bytes();
+        let dedup_saved_bytes = total_logical_bytes.saturating_sub(physical_cas_bytes);
+        let dedup_ratio = if physical_cas_bytes > 0 && total_logical_bytes > 0 {
+            (total_logical_bytes as f64) / (physical_cas_bytes as f64)
+        } else {
+            1.0
+        };
+        let self_healed_chunks = self
+            .chunk_store
+            .self_healed_chunks
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         StatusReport {
             ok: ready,
@@ -242,6 +338,11 @@ impl MeshFSEngine {
             snapshots_count: state.snapshots.len(),
             total_files,
             total_logical_bytes,
+            physical_cas_chunks,
+            physical_cas_bytes,
+            dedup_saved_bytes,
+            dedup_ratio,
+            self_healed_chunks,
             disk_total: metrics.total_bytes,
             disk_used: metrics.used_bytes,
             disk_free: metrics.free_bytes,
@@ -260,6 +361,212 @@ impl MeshFSEngine {
             }
             .to_string(),
         }
+    }
+
+    pub async fn set_volume_quota(&self, volume_name: &str, max_bytes: Option<u64>) -> io::Result<Volume> {
+        let vol = {
+            let mut state = self.state.write().await;
+            let v = state
+                .volumes
+                .entry(volume_name.to_string())
+                .or_insert_with(|| Volume::new(volume_name));
+            v.max_bytes = max_bytes.filter(|&b| b > 0);
+            v.clone()
+        };
+        self.persist_state().await?;
+        Ok(vol)
+    }
+
+    pub async fn ensure_volume_quota(
+        &self,
+        volume_name: &str,
+        file_path: &str,
+        new_size: u64,
+    ) -> io::Result<()> {
+        let state = self.state.read().await;
+        if let Some(vol) = state.volumes.get(volume_name) {
+            if let Some(max_b) = vol.max_bytes {
+                if max_b > 0 {
+                    let existing_file_size = vol.files.get(file_path).map(|i| i.size).unwrap_or(0);
+                    let current_other = vol.total_bytes().saturating_sub(existing_file_size);
+                    let projected = current_other.saturating_add(new_size);
+                    if projected > max_b {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!(
+                                "QuotaExceeded: volume '{}' quota is {} bytes, projected usage is {} bytes",
+                                volume_name, max_b, projected
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn run_universal_cas_gc(&self, grace_seconds: u64, dry_run: bool) -> GcReport {
+        let mut referenced = std::collections::HashSet::new();
+        {
+            let state = self.state.read().await;
+            for vol in state.volumes.values() {
+                for inode in vol.files.values() {
+                    for c in &inode.chunks {
+                        referenced.insert(ChunkStore::normalize_id(&c.id).to_string());
+                    }
+                }
+            }
+            for snap in &state.snapshots {
+                for inode in snap.files_tree.values() {
+                    for c in &inode.chunks {
+                        referenced.insert(ChunkStore::normalize_id(&c.id).to_string());
+                    }
+                }
+            }
+        }
+        collect_cas_hashes_from_dir(&self.meta_dir, &mut referenced);
+        collect_cas_hashes_from_dir(&self.data_dir.join("s3").join("buckets"), &mut referenced);
+        collect_cas_hashes_from_dir(&self.data_dir.join("s3").join("multipart"), &mut referenced);
+        collect_cas_hashes_from_dir(Path::new("/var/lib/pmbs"), &mut referenced);
+
+        let now = std::time::SystemTime::now();
+        let mut scanned_chunks = 0usize;
+        let mut deleted_chunks = 0usize;
+        let mut reclaimed_bytes = 0u64;
+        let mut retained_physical_bytes = 0u64;
+
+        if let Ok(entries) = fs::read_dir(&self.chunk_store.chunks_dir) {
+            for e in entries.flatten() {
+                if e.path().is_dir() {
+                    if let Ok(sub) = fs::read_dir(e.path()) {
+                        for f in sub.flatten() {
+                            let p = f.path();
+                            if !p.is_file() {
+                                continue;
+                            }
+                            let fname = f.file_name().to_string_lossy().to_string();
+                            let meta = match f.metadata() {
+                                Ok(m) => m,
+                                Err(_) => continue,
+                            };
+                            let file_len = meta.len();
+                            let age_secs = meta
+                                .modified()
+                                .ok()
+                                .and_then(|m| now.duration_since(m).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(u64::MAX);
+
+                            if fname.contains(".tmp.") {
+                                if age_secs >= grace_seconds.max(60) && !dry_run {
+                                    let _ = fs::remove_file(&p);
+                                }
+                                continue;
+                            }
+
+                            scanned_chunks += 1;
+                            if referenced.contains(&fname) || age_secs < grace_seconds {
+                                retained_physical_bytes =
+                                    retained_physical_bytes.saturating_add(file_len);
+                            } else if !dry_run {
+                                if fs::remove_file(&p).is_ok() {
+                                    deleted_chunks += 1;
+                                    reclaimed_bytes = reclaimed_bytes.saturating_add(file_len);
+                                } else {
+                                    retained_physical_bytes =
+                                        retained_physical_bytes.saturating_add(file_len);
+                                }
+                            } else {
+                                deleted_chunks += 1;
+                                reclaimed_bytes = reclaimed_bytes.saturating_add(file_len);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        GcReport {
+            status: "ok".to_string(),
+            dry_run,
+            grace_seconds,
+            referenced_chunks: referenced.len(),
+            scanned_chunks,
+            deleted_chunks,
+            reclaimed_bytes,
+            retained_physical_bytes,
+        }
+    }
+
+    pub async fn materialize_volume_to_dir(&self, volume_name: &str, mount_dir: &Path) -> io::Result<()> {
+        fs::create_dir_all(mount_dir)?;
+        let files: Vec<String> = {
+            let mut state = self.state.write().await;
+            let vol = state
+                .volumes
+                .entry(volume_name.to_string())
+                .or_insert_with(|| Volume::new(volume_name));
+            vol.files.keys().cloned().collect()
+        };
+        for rel_path in files {
+            let clean = rel_path.trim_start_matches('/');
+            if clean.is_empty() || clean.contains("..") {
+                continue;
+            }
+            if let Ok(bytes) = self.get_file(volume_name, &rel_path).await {
+                let dest = mount_dir.join(clean);
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(dest, bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn sync_dir_to_volume(&self, volume_name: &str, mount_dir: &Path) -> io::Result<usize> {
+        if !mount_dir.exists() {
+            return Ok(0);
+        }
+        let mut discovered = Vec::new();
+        fn walk_dir(root: &Path, cur: &Path, out: &mut Vec<(String, PathBuf)>) {
+            if let Ok(entries) = fs::read_dir(cur) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        walk_dir(root, &p, out);
+                    } else if p.is_file() {
+                        if let Ok(rel) = p.strip_prefix(root) {
+                            let rel_str = rel.to_string_lossy().replace('\\', "/");
+                            if !rel_str.is_empty() {
+                                out.push((rel_str, p));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        walk_dir(mount_dir, mount_dir, &mut discovered);
+
+        let mut synced = 0usize;
+        let mut active_paths = std::collections::HashSet::new();
+        for (rel_path, full_path) in discovered {
+            active_paths.insert(rel_path.clone());
+            let bytes = fs::read(&full_path)?;
+            self.put_file(volume_name, &rel_path, &bytes).await?;
+            synced += 1;
+        }
+
+        // Remove deleted files from volume metadata
+        {
+            let mut state = self.state.write().await;
+            if let Some(vol) = state.volumes.get_mut(volume_name) {
+                vol.files.retain(|k, _| active_paths.contains(k));
+                vol.recompute_merkle();
+            }
+        }
+        self.persist_state().await?;
+        Ok(synced)
     }
 
     /// Stores a file into a volume, splitting it into 4MB CAS chunks.
@@ -288,7 +595,8 @@ impl MeshFSEngine {
             .map_err(io::Error::other);
         }
         let size = content.len() as u64;
-        let file_digest = format!("sha256:{}", sha256_digest(content));
+        self.ensure_volume_quota(volume_name, file_path, size).await?;
+        let file_digest = format!("blake3:{}", blake3_digest(content));
         let mut chunks = Vec::new();
 
         let mut offset = 0usize;
@@ -337,11 +645,10 @@ impl MeshFSEngine {
         path: &str,
         mut reader: R,
     ) -> io::Result<Inode> {
-        use sha2::{Digest, Sha256};
         use tokio::io::AsyncReadExt;
         let mut buffer = vec![0; CHUNK_SIZE];
         let mut size = 0u64;
-        let mut hash = Sha256::new();
+        let mut hash = blake3::Hasher::new();
         let mut chunks = Vec::new();
         let mut staged = std::collections::HashSet::new();
         loop {
@@ -358,7 +665,7 @@ impl MeshFSEngine {
             }
             let bytes = &buffer[..used];
             hash.update(bytes);
-            let digest = format!("sha256:{}", sha256_digest(bytes));
+            let digest = format!("blake3:{}", blake3_digest(bytes));
             let id = if let Some(c) = self.cluster.get() {
                 if staged.contains(&digest) {
                     digest.clone()
@@ -387,12 +694,13 @@ impl MeshFSEngine {
             size = size
                 .checked_add(used as u64)
                 .ok_or_else(|| io::Error::other("file size overflow"))?;
+            self.ensure_volume_quota(volume, path, size).await?;
         }
         let inode = Inode {
             revision: 0,
             path: path.into(),
             size,
-            digest: format!("sha256:{}", hex::encode(hash.finalize())),
+            digest: format!("blake3:{}", hash.finalize().to_hex()),
             chunks_count: chunks.len(),
             chunks,
             updated_at: Utc::now().to_rfc3339(),
@@ -476,7 +784,7 @@ impl MeshFSEngine {
         }
 
         if buffer.len() as u64 != inode.size
-            || format!("sha256:{}", sha256_digest(&buffer)) != inode.digest
+            || !verify_cas_digest(&buffer, ChunkStore::normalize_id(&inode.digest))
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

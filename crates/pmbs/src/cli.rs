@@ -11,7 +11,7 @@ pub const DEFAULT_SOCKET: &str = "/var/lib/pmbs/pmbs.sock";
 #[command(
     name = "pmbs",
     author = "Xavier DP <xavier@xavdp.pro>",
-    version = "2.3.0",
+    version = "2.4.0",
     about = "PodMesh Backup Server (PMBS) — Enterprise Deduplicated Backup Server in Pure Rust",
     long_about = "High-performance PBS-alternative backup server for PodMesh and sovereign servers.\nFeatures 4MB SHA-256 CAS chunk deduplication, referenced-chunk integrity verification (no boot proof), and inter-site sync."
 )]

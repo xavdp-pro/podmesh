@@ -2,7 +2,7 @@
 //! votes, logs and applied state. A returning peer catches up through log replay
 //! or a snapshot containing both metadata and immutable CAS content.
 use crate::{
-    chunk::{sha256_digest, ChunkRef, CHUNK_SIZE},
+    chunk::{blake3_digest, ChunkRef, CHUNK_SIZE},
     engine::MeshFSEngine,
     merkle::Inode,
     volume::{Snapshot as FileSnapshot, Volume},
@@ -120,14 +120,13 @@ fn diagnostic_stamp() -> DiagnosticStamp {
 }
 fn opaque_command(key: &[u8; 32], command: &Command) -> Option<[u8; 32]> {
     if command.id.is_empty() || command.id.len() > 256 { return None; }
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
+    let mut h = blake3::Hasher::new();
     h.update(b"meshfs-diagnostic-command-v1\0");
     h.update(key);
-    h.update(command.epoch.to_be_bytes());
-    h.update((command.id.len() as u64).to_be_bytes());
+    h.update(&command.epoch.to_be_bytes());
+    h.update(&(command.id.len() as u64).to_be_bytes());
     h.update(command.id.as_bytes());
-    Some(h.finalize().into())
+    Some(*h.finalize().as_bytes())
 }
 fn diagnostic_log_id(id: LogId<u64>) -> [u64; 3] {
     [id.leader_id.term, id.leader_id.node_id, id.index]
@@ -207,7 +206,6 @@ fn slow_diagnostics() -> Option<&'static SlowDiagnostics> {
     static DIAG: std::sync::OnceLock<Option<SlowDiagnostics>> = std::sync::OnceLock::new();
     DIAG.get_or_init(|| {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-        use sha2::{Digest, Sha256};
         let millis = std::env::var("MESHFS_SLOW_PHASE_MS").ok()?.parse::<u64>().ok()?;
         if !(1..=60_000).contains(&millis) { return None; }
         // Same cluster token yields the same opaque command key on each peer.
@@ -215,7 +213,7 @@ fn slow_diagnostics() -> Option<&'static SlowDiagnostics> {
         let correlation_requested = std::env::var("MESHFS_CORRELATION").as_deref() == Ok("1");
         let correlation_key = if correlation_requested {
             std::env::var("MESHFS_CLUSTER_TOKEN").ok().filter(|v| !v.is_empty())
-                .map(|v| Sha256::digest([b"meshfs-diagnostic-key-v1\0".as_slice(), v.as_bytes()].concat()).into())
+                .map(|v| *blake3::hash(&[b"meshfs-diagnostic-key-v1\0".as_slice(), v.as_bytes()].concat()).as_bytes())
         } else { None };
         let (sender, receiver) = std::sync::mpsc::sync_channel::<SlowEvent>(256);
         let attempted = Arc::new(AtomicU64::new(0));
@@ -331,7 +329,7 @@ impl ClusterConfig {
         Ok(c)
     }
     fn fingerprint(&self) -> String {
-        sha256_digest(
+        blake3_digest(
             &serde_json::to_vec(&("meshfs-live-v3-epochs", &self.cluster, &self.peers))
                 .expect("serializable topology"),
         )
@@ -769,7 +767,7 @@ impl Machine {
             }
             return Ok(result);
         }
-        let digest = sha256_digest(&serde_json::to_vec(&c.action).map_err(se)?);
+        let digest = blake3_digest(&serde_json::to_vec(&c.action).map_err(se)?);
         if let Some((previous, result)) = s.seen.get(&c.id) {
             return Ok(if previous == &digest {
                 result.clone()
@@ -814,7 +812,7 @@ impl Machine {
         s.blobs.retain(|id, _| retained.contains(id));
     }
     fn execute_action(&self, s: &mut MachineData, c: &Command) -> SResult<Value> {
-        let digest = sha256_digest(&serde_json::to_vec(&c.action).map_err(se)?);
+        let digest = blake3_digest(&serde_json::to_vec(&c.action).map_err(se)?);
         if !matches!(&c.action, Action::StageChunk { .. }) {
             if let Some((previous, result)) = s.seen.get(&c.id) {
                 return Ok(if previous == &digest {
@@ -909,7 +907,11 @@ impl Machine {
                 if s.volumes
                     .get(volume)
                     .and_then(|v| v.files.get(&inode.path))
-                    .is_some_and(|i| i.revision > 0 || i.digest.starts_with("merkle-sha256:"))
+                    .is_some_and(|i| {
+                        i.revision > 0
+                            || i.digest.starts_with("merkle-blake3:")
+                            || i.digest.starts_with("merkle-sha256:")
+                    })
                 {
                     return Ok(json!({"error":"live file requires precondition"}));
                 }
@@ -933,7 +935,11 @@ impl Machine {
                 if s.volumes
                     .get(volume)
                     .and_then(|v| v.files.get(path))
-                    .is_some_and(|i| i.revision > 0 || i.digest.starts_with("merkle-sha256:"))
+                    .is_some_and(|i| {
+                        i.revision > 0
+                            || i.digest.starts_with("merkle-blake3:")
+                            || i.digest.starts_with("merkle-sha256:")
+                    })
                 {
                     return Ok(json!({"error":"live file requires precondition"}));
                 }
@@ -954,7 +960,7 @@ impl Machine {
                     revision: 0,
                     path: path.clone(),
                     size: bytes.len() as u64,
-                    digest: format!("sha256:{}", sha256_digest(&bytes)),
+                    digest: format!("blake3:{}", blake3_digest(&bytes)),
                     chunks_count: chunks.len(),
                     chunks,
                     updated_at: at.clone(),
@@ -1119,7 +1125,7 @@ impl RaftStateMachine<Types> for Arc<Machine> {
         let mut checksum = [0u8; 32];
         reader.read_exact(&mut checksum).map_err(se)?;
         let metadata = read_frame(&mut reader, 128 * 1024 * 1024)?;
-        if hex::encode(checksum) != sha256_digest(&metadata) {
+        if hex::encode(checksum) != blake3_digest(&metadata) {
             return Err(se("snapshot metadata checksum mismatch"));
         }
         let state: MachineData = serde_json::from_slice(&metadata).map_err(se)?;
@@ -1184,7 +1190,7 @@ impl RaftSnapshotBuilder<Types> for Arc<Machine> {
             drop(checkpoint);
             let _stream = SlowPhase::new("snapshot", "stream_and_sync");
             let metadata = serde_json::to_vec(&state).map_err(se)?;
-            file.write_all(&hex::decode(sha256_digest(&metadata)).map_err(se)?)
+            file.write_all(&hex::decode(blake3_digest(&metadata)).map_err(se)?)
                 .map_err(se)?;
             write_frame(&mut file, &metadata)?;
             for id in Machine::chunk_ids(&state) {
@@ -2017,7 +2023,7 @@ mod tests {
             revision: 0,
             path: "aged".into(),
             size: 4,
-            digest: format!("sha256:{}", sha256_digest(b"aged")),
+            digest: format!("blake3:{}", blake3_digest(b"aged")),
             chunks_count: 1,
             chunks: vec![ChunkRef {
                 id: aged,
@@ -2083,7 +2089,7 @@ mod tests {
         assert_eq!(results[1]["name"], "kept");
         assert_eq!(
             results[255]["digest"],
-            format!("sha256:{}", sha256_digest(b"after-253"))
+            format!("blake3:{}", blake3_digest(b"after-253"))
         );
         // A fresh SQLite connection must observe the full final applied batch,
         // including replay rotation and the chunks referenced by the snapshot.
@@ -2582,12 +2588,13 @@ fn validate_layout(inode: &Inode, sizes: &BTreeMap<String, usize>) -> SResult<()
     if inode.chunks_count != inode.chunks.len() {
         return Err(se("chunk count mismatch"));
     }
-    if inode.digest.starts_with("merkle-sha256:") {
+    if inode.digest.starts_with("merkle-blake3:") || inode.digest.starts_with("merkle-sha256:") {
         return crate::live::validate(inode, sizes).map_err(se);
     }
     let digest = inode
         .digest
-        .strip_prefix("sha256:")
+        .strip_prefix("blake3:")
+        .or_else(|| inode.digest.strip_prefix("sha256:"))
         .ok_or_else(|| se("invalid file digest"))?;
 
     if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {

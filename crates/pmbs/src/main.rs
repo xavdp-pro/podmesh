@@ -58,7 +58,7 @@ async fn main() -> ExitCode {
                 port = d.port,
                 data_dir = %d.data_dir.display(),
                 socket = %d.socket.display(),
-                "Démarrage du démon PMBS Pure Rust v2.3.0"
+                "Démarrage du démon PMBS Pure Rust v2.4.0"
             );
 
             let _ = fs::create_dir_all(&d.data_dir);

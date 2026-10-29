@@ -2,14 +2,13 @@
 //! Mutations publish a CAS-guarded inode only after block replication. A semantic
 //! operation ID is persisted with the result so failover retries cannot reapply it.
 use crate::{
-    chunk::{sha256_digest, ChunkRef},
+    chunk::{blake3_digest, ChunkRef},
     cluster::Action,
     engine::MeshFSEngine,
     merkle::Inode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, io};
 pub const BLOCK: usize = 64 * 1024;
 pub const MAX_IO: usize = 256 * 1024;
@@ -59,14 +58,14 @@ pub fn version(i: &Inode) -> String {
     format!("{}:{}@{}", i.revision, i.digest, i.updated_at)
 }
 pub fn digest(size: u64, chunks: &[ChunkRef]) -> String {
-    let mut h = Sha256::new();
-    h.update(size.to_be_bytes());
+    let mut h = blake3::Hasher::new();
+    h.update(&size.to_be_bytes());
     for c in chunks {
         h.update(c.id.as_bytes());
-        h.update((c.size as u64).to_be_bytes());
-        h.update(c.offset.to_be_bytes());
+        h.update(&(c.size as u64).to_be_bytes());
+        h.update(&c.offset.to_be_bytes());
     }
-    format!("merkle-sha256:{}", hex::encode(h.finalize()))
+    format!("merkle-blake3:{}", h.finalize().to_hex())
 }
 pub fn validate(i: &Inode, sizes: &BTreeMap<String, usize>) -> io::Result<()> {
     let mut offset = 0;
@@ -148,7 +147,7 @@ impl MeshFSEngine {
         if epoch > current || current - epoch > 1 {
             return Err(io::Error::other("live replay epoch expired"));
         }
-        let hash = sha256_digest(&serde_json::to_vec(&r).map_err(io::Error::other)?);
+        let hash = blake3_digest(&serde_json::to_vec(&r).map_err(io::Error::other)?);
         let expected = r
             .base
             .as_ref()
@@ -267,7 +266,7 @@ impl MeshFSEngine {
         .map_err(io::Error::other)
     }
     async fn live_resize_blocks(&self, i: &mut Inode, size: u64) -> io::Result<()> {
-        if !i.digest.starts_with("merkle-sha256:") {
+        if !i.digest.starts_with("merkle-blake3:") && !i.digest.starts_with("merkle-sha256:") {
             return Err(io::Error::other(
                 "import the file through the live interface first",
             ));
@@ -317,7 +316,7 @@ mod tests {
     use super::*;
     #[test]
     fn manifest_rejects_reordered_missing_and_corrupt_blocks() {
-        let id = "sha256:example".to_string();
+        let id = "blake3:example".to_string();
         let chunks = vec![
             ChunkRef {
                 id: id.clone(),

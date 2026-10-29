@@ -17,7 +17,7 @@ pub mod server;
 pub mod storage;
 pub mod volume;
 
-pub use chunk::{sha256_digest, ChunkRef, ChunkStore, CHUNK_SIZE};
+pub use chunk::{blake3_digest, sha256_digest, verify_cas_digest, ChunkRef, ChunkStore, CHUNK_SIZE};
 pub use control::{query_control_socket, start_control_socket, ControlRequest, IntegrityReport};
 pub use engine::{MeshFSEngine, NodeInfo, StatusReport};
 pub use merkle::{compute_merkle_root, diff_trees, Inode, MerkleDiff};
@@ -26,3 +26,4 @@ pub use volume::{Snapshot, Volume};
 
 pub mod live;
 pub mod fuse;
+pub mod docker_plugin;

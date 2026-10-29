@@ -1,6 +1,6 @@
 [package]
 name = "pmbs"
-version = "2.4.0"
+version = "2.4.1"
 edition = "2021"
 authors = ["Xavier DP <xavier@xavdp.pro>", "PodMesh Team"]
 description = "PodMesh Backup Server (PMBS) — High-Performance Deduplicated Backup Server in Pure Rust"
@@ -12,6 +12,7 @@ axum = { version = "0.7", features = ["multipart"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+blake3 = "1.5"
 sha2 = "0.10"
 hex = "0.4"
 clap = { version = "4.4", features = ["derive"] }

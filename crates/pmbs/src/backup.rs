@@ -7,7 +7,6 @@ use pmbs::server::configured_token;
 use pmbs::{BackupFile, BackupManifest, ChunkRef, CHUNK_SIZE};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::{CString, CStr, OsStr};
 use std::fs::{File, Metadata, OpenOptions};
@@ -140,13 +139,13 @@ async fn capture(a:&BackupArgs,c:&reqwest::Client) -> Result<Value,String> {
     let mut manifest=BackupManifest { id:a.snapshot.clone(),backup_type:a.backup_type.clone(),backup_time:chrono::Utc::now().to_rfc3339(),files:HashMap::new(),total_logical_bytes:0,chunks_count:0,verified:false,verified_at:None };
     let mut metadata_budget=512usize;
     for e in entries.iter().filter(|e|!e.directory) {
-        b.check()?;let mut input=open_input(&root,e)?;let mut offset=0u64;let mut hash=Sha256::new();let mut chunks=Vec::new();
+        b.check()?;let mut input=open_input(&root,e)?;let mut offset=0u64;let mut hash=blake3::Hasher::new();let mut chunks=Vec::new();
         metadata_budget=metadata_budget.checked_add(e.path.len()*2+512).ok_or_else(||err("manifest budget exceeded"))?;
         if metadata_budget>MANIFEST_LIMIT { return Err(err("manifest budget exceeded")); }
         while offset<e.stamp.len {
             b.check()?;let size=(e.stamp.len-offset).min(CHUNK_SIZE as u64) as usize;let mut data=vec![0;size];
             input.read_exact(&mut data).map_err(|_|err("input changed/truncated or read failed"))?;b.check()?;
-            let id=format!("sha256:{}",hex::encode(Sha256::digest(&data)));hash.update(&data);
+            let id=format!("blake3:{}",blake3::hash(&data).to_hex());hash.update(&data);
             metadata_budget=metadata_budget.checked_add(192).ok_or_else(||err("manifest budget exceeded"))?;if metadata_budget>MANIFEST_LIMIT { return Err(err("manifest budget exceeded")); }
             let r=c.post(base.join(&(ds.clone()+"chunks")).map_err(|_|err("invalid request path"))?).timeout(b.timeout()?).header(reqwest::header::CONTENT_TYPE,"application/octet-stream").body(data).send().await.map_err(|_|err("PMBS chunk upload failed"))?;
             let ack:Value=serde_json::from_slice(&response(r,ACK_LIMIT).await?).map_err(|_|err("invalid chunk acknowledgement"))?;
@@ -155,7 +154,7 @@ async fn capture(a:&BackupArgs,c:&reqwest::Client) -> Result<Value,String> {
         }
         let mut extra=[0];if input.read(&mut extra).map_err(|_|err("input read failed"))?!=0 || Stamp::of(&input.metadata().map_err(|_|err("input metadata unavailable"))?)!=e.stamp { return Err(err("input changed during capture")); }b.check()?;
         manifest.total_logical_bytes+=offset;manifest.chunks_count+=chunks.len();
-        manifest.files.insert(e.path.clone(),BackupFile { path:e.path.clone(),size:offset,digest:format!("sha256:{}",hex::encode(hash.finalize())),chunks_count:chunks.len(),chunks });
+        manifest.files.insert(e.path.clone(),BackupFile { path:e.path.clone(),size:offset,digest:format!("blake3:{}",hash.finalize().to_hex()),chunks_count:chunks.len(),chunks });
     }
     if inventory(&root,a,b.end)?!=entries || Stamp::of(&root.metadata().map_err(|_|err("source metadata unavailable"))?)!=root_stamp || Stamp::of(&open_root(&a.source)?.metadata().map_err(|_|err("source metadata unavailable"))?)!=root_stamp { return Err(err("source tree changed during capture")); }
     let body=serde_json::to_vec(&manifest).map_err(|_|err("manifest encoding failed"))?;if body.len()>MANIFEST_LIMIT { return Err(err("manifest size limit exceeded")); }
@@ -262,7 +261,7 @@ mod tests {
             let outcomes=threads.into_iter().map(|t|t.join().unwrap()).collect::<Vec<_>>();
             assert_eq!(outcomes.iter().filter(|r|r.is_ok()).count(),1);
             assert_eq!(outcomes.iter().filter(|r|matches!(r,Err(std::io::ErrorKind::AlreadyExists))).count(),1);
-            let mut missing=original.clone();missing.id="missing".into();missing.files.get_mut("multi").unwrap().chunks[0].id=format!("sha256:{}","0".repeat(64));
+            let mut missing=original.clone();missing.id="missing".into();missing.files.get_mut("multi").unwrap().chunks[0].id=format!("blake3:{}","0".repeat(64));
             assert_eq!(c.post(&url).header("If-None-Match","*").json(&missing).send().await.unwrap().status(),StatusCode::BAD_REQUEST);
             let restore=pmbs::cli::RestoreArgs {destination:t.0.join("restored"),datastore:"store".into(),snapshot:a.snapshot.clone(),backup_type:a.backup_type.clone(),remote:a.remote.clone(),max_bytes:a.max_bytes};
             crate::restore::run(&restore).await.unwrap();assert_eq!(fs::read(restore.destination.join("multi")).unwrap(),bytes);assert_eq!(fs::metadata(restore.destination.join("empty")).unwrap().len(),0);
@@ -277,7 +276,7 @@ mod tests {
             if s.mode==1 {return StatusCode::INTERNAL_SERVER_ERROR.into_response()}
             if s.mode==2 {fs::write(&s.input,b"mutated and grew").unwrap();}
             if s.mode==3 {fs::write(&s.input,[]).unwrap();}
-            let id=if s.mode==0 {format!("sha256:{}","0".repeat(64))} else {format!("sha256:{}",hex::encode(Sha256::digest(&body)))};
+            let id=if s.mode==0 {format!("blake3:{}","0".repeat(64))} else {format!("blake3:{}",blake3::hash(&body).to_hex())};
             return axum::Json(json!({"ok":true,"chunkId":id})).into_response();
         }
         s.published.fetch_add(1,Ordering::Relaxed);StatusCode::INTERNAL_SERVER_ERROR.into_response()

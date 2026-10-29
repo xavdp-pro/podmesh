@@ -15,11 +15,21 @@ pub const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB canonical chunks
 
 static TMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-/// Computes SHA-256 lower hex digest.
+/// Computes BLAKE3 lower hex digest (primary CAS chunk & file digest for PMBS v2.4+).
+pub fn blake3_digest(data: &[u8]) -> String {
+    blake3::hash(data).to_hex().to_string()
+}
+
+/// Computes SHA-256 lower hex digest (legacy v2.3 compatibility).
 pub fn sha256_digest(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hex::encode(hasher.finalize())
+}
+
+/// Verifies chunk/file integrity against BLAKE3 (primary) or SHA-256 (legacy).
+pub fn verify_cas_digest(data: &[u8], expected_clean: &str) -> bool {
+    blake3_digest(data) == expected_clean || sha256_digest(data) == expected_clean
 }
 
 pub fn invalid(message: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidInput, message) }
@@ -38,9 +48,9 @@ pub fn validate_file_path(path: &str) -> io::Result<()> {
     Ok(())
 }
 pub fn validate_chunk_id(id: &str) -> io::Result<()> {
-    let id = id.strip_prefix("sha256:").unwrap_or(id);
+    let id = id.strip_prefix("blake3:").or_else(|| id.strip_prefix("sha256:")).unwrap_or(id);
     if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-        return Err(invalid("invalid SHA256 chunk id"));
+        return Err(invalid("invalid BLAKE3/SHA256 chunk id"));
     }
     Ok(())
 }
@@ -137,9 +147,11 @@ impl Datastore {
         })
     }
 
-    /// Normalizes chunk ID string by stripping any "sha256:" prefix.
+    /// Normalizes chunk ID string by stripping any "blake3:" or "sha256:" prefix.
     pub fn normalize_id(id: &str) -> &str {
-        id.strip_prefix("sha256:").unwrap_or(id)
+        id.strip_prefix("blake3:")
+            .or_else(|| id.strip_prefix("sha256:"))
+            .unwrap_or(id)
     }
 
     /// Computes path for chunk storage: `<chunks_dir>/<prefix>/<hash>`
@@ -155,15 +167,15 @@ impl Datastore {
         self.chunk_path(chunk_id).map(|p| p.is_file()).unwrap_or(false)
     }
 
-    /// Stores a 4MB chunk. If already present, skips write (deduplication).
+    /// Stores a 4MB chunk using BLAKE3 CAS addressing. If already present, skips write (deduplication).
     pub fn write_chunk(&self, data: &[u8]) -> io::Result<String> {
         if data.is_empty() || data.len() > CHUNK_SIZE { return Err(invalid("invalid chunk size")); }
-        let digest = sha256_digest(data);
+        let digest = blake3_digest(data);
         let target_file = self.chunk_path(&digest)?;
 
         if target_file.exists() {
             self.read_chunk(&digest)?;
-            return Ok(format!("sha256:{}", digest));
+            return Ok(format!("blake3:{}", digest));
         }
 
         if let Some(parent) = target_file.parent() {
@@ -184,10 +196,10 @@ impl Datastore {
         }
 
         fs::rename(tmp_file, &target_file)?;
-        Ok(format!("sha256:{}", digest))
+        Ok(format!("blake3:{}", digest))
     }
 
-    /// Reads a chunk and verifies cryptographic hash (anti-bit-rot).
+    /// Reads a chunk and verifies cryptographic hash (BLAKE3 primary, SHA-256 legacy anti-bit-rot).
     pub fn read_chunk(&self, chunk_id: &str) -> io::Result<Vec<u8>> {
         let target_file = self.chunk_path(chunk_id)?;
         if !target_file.exists() {
@@ -202,8 +214,8 @@ impl Datastore {
         if buffer.is_empty() || buffer.len() > CHUNK_SIZE { return Err(invalid("invalid stored chunk size")); }
 
         let expected = Self::normalize_id(chunk_id);
-        let actual = sha256_digest(&buffer);
-        if actual != expected {
+        if !verify_cas_digest(&buffer, expected) {
+            let actual = blake3_digest(&buffer);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Bit-rot détecté sur {}: attendu={}, réel={}", chunk_id, expected, actual),
@@ -223,9 +235,11 @@ impl Datastore {
         for (key, f) in &m.files {
             validate_file_path(key)?;
             if key != &f.path || f.chunks_count != f.chunks.len() { return Err(invalid("file identity or chunk count mismatch")); }
-            if !f.digest.starts_with("sha256:") { return Err(invalid("file digest must be SHA256")); }
+            if !f.digest.starts_with("blake3:") && !f.digest.starts_with("sha256:") { return Err(invalid("file digest must be BLAKE3 or SHA256")); }
             validate_chunk_id(&f.digest)?;
-            let mut offset = 0u64; let mut hash = Sha256::new();
+            let mut offset = 0u64;
+            let mut b3_hash = blake3::Hasher::new();
+            let mut sha_hash = Sha256::new();
             for (idx, c) in f.chunks.iter().enumerate() {
                 validate_chunk_id(&c.id)?;
                 if c.offset != offset || c.size == 0 || c.size > CHUNK_SIZE
@@ -233,9 +247,13 @@ impl Datastore {
                 offset = offset.checked_add(c.size as u64).ok_or_else(|| invalid("file size overflow"))?;
                 let bytes = self.read_chunk(&c.id).map_err(|_| invalid("missing or corrupt referenced chunk"))?;
                 if bytes.len() != c.size { return Err(invalid("chunk size mismatch")); }
-                hash.update(&bytes);
+                b3_hash.update(&bytes);
+                sha_hash.update(&bytes);
             }
-            if offset != f.size || format!("sha256:{}", hex::encode(hash.finalize())) != f.digest { return Err(invalid("file size or digest mismatch")); }
+            let expected_clean = Self::normalize_id(&f.digest);
+            let b3_hex = b3_hash.finalize().to_hex().to_string();
+            let sha_hex = hex::encode(sha_hash.finalize());
+            if offset != f.size || (b3_hex != expected_clean && sha_hex != expected_clean) { return Err(invalid("file size or digest mismatch")); }
             total = total.checked_add(f.size).ok_or_else(|| invalid("total size overflow"))?;
             count = count.checked_add(f.chunks.len()).ok_or_else(|| invalid("chunk count overflow"))?;
         }
@@ -326,7 +344,7 @@ mod tests {
 
         let data = b"PMBS Pure Rust Enterprise Backup 2026";
         let chunk_id = ds.write_chunk(data).unwrap();
-        assert!(chunk_id.starts_with("sha256:"));
+        assert!(chunk_id.starts_with("blake3:"));
 
         // Deduplication test: re-writing the same data returns same ID without duplicate storage
         let chunk_id_dup = ds.write_chunk(data).unwrap();

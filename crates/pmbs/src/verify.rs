@@ -103,7 +103,7 @@ mod tests {
             crate::datastore::BackupFile {
                 path: "drive-scsi0.img".to_string(),
                 size: raw.len() as u64,
-                digest: format!("sha256:{}", crate::datastore::sha256_digest(raw)),
+                digest: format!("blake3:{}", crate::datastore::blake3_digest(raw)),
                 chunks_count: 1,
                 chunks: vec![crate::datastore::ChunkRef {
                     id: chunk_id.clone(),

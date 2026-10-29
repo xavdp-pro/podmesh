@@ -141,7 +141,7 @@ fn validate_manifest(m: &BackupManifest, max_bytes: u64) -> Result<(), String> {
         validate_file_path(key).map_err(io_error)?;
         for (idx, _) in key.match_indices('/') { if paths.contains(&key[..idx]) { return Err(invalid("file/directory prefix collision")); } }
         if key != &f.path || f.chunks_count != f.chunks.len() { return Err(invalid("file identity/chunk count mismatch")); }
-        if !f.digest.starts_with("sha256:") { return Err(invalid("file digest must be SHA256")); }
+        if !f.digest.starts_with("blake3:") && !f.digest.starts_with("sha256:") { return Err(invalid("file digest must be BLAKE3 or SHA256")); }
         validate_chunk_id(&f.digest).map_err(io_error)?;
         let mut offset = 0u64;
         for (idx, c) in f.chunks.iter().enumerate() {
@@ -207,16 +207,22 @@ async fn restore(args: &RestoreArgs, client: &reqwest::Client) -> Result<Value, 
         for path in names {
             let f = &manifest.files[path];
             let (mut output, dir) = stage.new_file(path).map_err(io_error)?;
-            let mut hash = Sha256::new();
+            let mut b3_hash = blake3::Hasher::new();
+            let mut sha_hash = Sha256::new();
             for chunk in &f.chunks {
                 let url = base.join(&format!("{}chunks/{}", ds_path, chunk.id)).map_err(|e| e.to_string())?;
                 let payload = get_limited(client, url, chunk.size).await?;
-                if payload.len() != chunk.size || hex::encode(Sha256::digest(&payload)) != chunk.id.strip_prefix("sha256:").unwrap_or(&chunk.id) { return Err(invalid("referenced chunk length/digest mismatch")); }
+                let clean_chunk = pmbs::datastore::Datastore::normalize_id(&chunk.id);
+                if payload.len() != chunk.size || !pmbs::datastore::verify_cas_digest(&payload, clean_chunk) { return Err(invalid("referenced chunk length/digest mismatch")); }
                 output.write_all(&payload).map_err(io_error)?;
-                hash.update(&payload);
+                b3_hash.update(&payload);
+                sha_hash.update(&payload);
             }
-            let digest = format!("sha256:{}", hex::encode(hash.finalize()));
-            if output.metadata().map_err(io_error)?.len() != f.size || digest != f.digest { return Err(invalid("restored file length/digest mismatch")); }
+            let expected_clean = pmbs::datastore::Datastore::normalize_id(&f.digest);
+            let b3_hex = b3_hash.finalize().to_hex().to_string();
+            let sha_hex = hex::encode(sha_hash.finalize());
+            if output.metadata().map_err(io_error)?.len() != f.size || (b3_hex != expected_clean && sha_hex != expected_clean) { return Err(invalid("restored file length/digest mismatch")); }
+            let digest = format!("blake3:{}", b3_hex);
             output.sync_all().map_err(io_error)?;
             dir.sync_all().map_err(io_error)?;
             files.push(json!({"path": path, "bytes": f.size, "digest": digest}));
@@ -254,10 +260,10 @@ mod tests {
     fn manifest(payloads: &[Vec<u8>]) -> BackupManifest {
         let mut full = Vec::new(); let mut chunks = Vec::new();
         for bytes in payloads {
-            chunks.push(ChunkRef { id: format!("sha256:{}", hex::encode(Sha256::digest(bytes))), offset: full.len() as u64, size: bytes.len() });
+            chunks.push(ChunkRef { id: format!("blake3:{}", blake3::hash(bytes).to_hex()), offset: full.len() as u64, size: bytes.len() });
             full.extend(bytes);
         }
-        let f = BackupFile { path: "nested/file".into(), size: full.len() as u64, digest: format!("sha256:{}", hex::encode(Sha256::digest(&full))), chunks_count: chunks.len(), chunks };
+        let f = BackupFile { path: "nested/file".into(), size: full.len() as u64, digest: format!("blake3:{}", blake3::hash(&full).to_hex()), chunks_count: chunks.len(), chunks };
         BackupManifest { id: "snapshot".into(), backup_type: "podman".into(), backup_time: "2026-10-22T00:00:00Z".into(), files: HashMap::from([(f.path.clone(), f)]), total_logical_bytes: full.len() as u64, chunks_count: payloads.len(), verified: false, verified_at: None }
     }
     #[test]
@@ -336,9 +342,9 @@ mod tests {
     async fn start_mock() -> (MockServer, Mock, String) {
         let payloads = vec![vec![7; CHUNK_SIZE], b"tail".to_vec()];
         let mut m = manifest(&payloads);
-        let empty = BackupFile { path: "empty".into(), size: 0, digest: format!("sha256:{}", hex::encode(Sha256::digest(b""))), chunks_count: 0, chunks: Vec::new() };
+        let empty = BackupFile { path: "empty".into(), size: 0, digest: format!("blake3:{}", blake3::hash(b"").to_hex()), chunks_count: 0, chunks: Vec::new() };
         m.files.insert("empty".into(), empty);
-        let state = Mock { manifest: m, payloads: Arc::new(payloads.into_iter().map(|b| (format!("sha256:{}", hex::encode(Sha256::digest(&b))), b)).collect()), mode: Arc::new(AtomicUsize::new(0)), calls: Arc::new(AtomicUsize::new(0)) };
+        let state = Mock { manifest: m, payloads: Arc::new(payloads.into_iter().map(|b| (format!("blake3:{}", blake3::hash(&b).to_hex()), b)).collect()), mode: Arc::new(AtomicUsize::new(0)), calls: Arc::new(AtomicUsize::new(0)) };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = Router::new().fallback(get(serve)).with_state(state.clone());
@@ -389,7 +395,7 @@ mod tests {
     #[tokio::test]
     async fn whole_file_digest_is_checked_independently_of_valid_chunks() {
         let (_server, mut state, _remote) = start_mock().await;
-        state.manifest.files.get_mut("nested/file").unwrap().digest = format!("sha256:{}", "0".repeat(64));
+        state.manifest.files.get_mut("nested/file").unwrap().digest = format!("blake3:{}", "0".repeat(64));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let remote = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move { axum::serve(listener, Router::new().fallback(get(serve)).with_state(state)).await.unwrap(); });

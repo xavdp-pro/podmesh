@@ -14,6 +14,8 @@ pub struct Volume {
     pub files: HashMap<String, Inode>,
     #[serde(rename = "merkleRoot")]
     pub merkle_root: String,
+    #[serde(default, rename = "maxBytes")]
+    pub max_bytes: Option<u64>,
 }
 
 impl Volume {
@@ -23,6 +25,7 @@ impl Volume {
             created_at: Utc::now().to_rfc3339(),
             files: HashMap::new(),
             merkle_root: String::new(),
+            max_bytes: None,
         };
         vol.recompute_merkle();
         vol
@@ -101,7 +104,7 @@ mod tests {
     #[test]
     fn test_volume_snapshot_cow() {
         let mut vol = Volume::new("tank");
-        assert!(vol.merkle_root.starts_with("sha256:"));
+        assert!(vol.merkle_root.starts_with("blake3:"));
 
         vol.insert_file(Inode {
             revision: 0,

@@ -13,7 +13,7 @@ pub const DEFAULT_SOCKET: &str = "/var/lib/meshfs/meshfs.sock";
 #[command(
     name = "meshfs",
     author = "Xavier DP <xavier@xavdp.pro>",
-    version = "2.3.0",
+    version = "2.4.0",
     about = "MeshFS — Ultra-lightweight Sovereign Distributed Filesystem for PodMesh & Proxmox VE",
     long_about = "MeshFS operates autonomously from 1 node to N nodes with zero Ceph dependencies.\nSplits files into immutable 4MB CAS SHA-256 chunks, manages Merkle trees and provides instant CoW snapshots."
 )]
@@ -56,6 +56,50 @@ pub enum Commands {
     Get(GetArgs),
     /// Mount an experimental flat-file volume (one writer per file).
     Mount(MountArgs),
+    /// Universal CAS Mark-and-Sweep Garbage Collector across MeshFS, MeshFS-S3, and PMBS
+    Gc(GcArgs),
+    /// Manage logical volume quotas
+    Quota(QuotaCommand),
+}
+
+#[derive(Args, Debug)]
+pub struct GcArgs {
+    /// Grace window in seconds (chunks modified more recently than this are never deleted)
+    #[arg(long, default_value_t = 3600)]
+    pub grace_seconds: u64,
+    /// Only report unreferenced chunks without deleting them
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Unix Domain Socket path to query directly
+    #[arg(short, long)]
+    pub socket: Option<PathBuf>,
+    /// MeshFS HTTP daemon address
+    #[arg(short, long, default_value = "http://127.0.0.1:7443")]
+    pub remote: String,
+}
+
+#[derive(Args, Debug)]
+pub struct QuotaCommand {
+    #[command(subcommand)]
+    pub action: QuotaSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum QuotaSubcommand {
+    /// Set maximum logical bytes allowed for a volume (0 = unlimited)
+    Set {
+        volume: String,
+        #[arg(long)]
+        max_bytes: u64,
+        #[arg(short, long)]
+        socket: Option<PathBuf>,
+    },
+    /// Get current logical usage and quota for a volume
+    Get {
+        volume: String,
+        #[arg(short, long)]
+        socket: Option<PathBuf>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -81,6 +125,10 @@ pub struct DaemonArgs {
     /// Path to Unix Domain Socket for low-latency local IPC control
     #[arg(short, long, default_value = DEFAULT_SOCKET)]
     pub socket: PathBuf,
+
+    /// Path to Podman/Docker Volume Plugin Unix Domain Socket
+    #[arg(long, default_value = "/run/docker/plugins/meshfs.sock")]
+    pub plugin_socket: PathBuf,
 }
 
 #[derive(Args, Debug)]

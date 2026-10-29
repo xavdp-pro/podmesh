@@ -1,7 +1,7 @@
 //! Merkle Tree DAG and Inode structures for MeshFS
 //! Provides cryptographic verification of volume hierarchy and instant delta diffing.
 
-use crate::chunk::{sha256_digest, ChunkRef};
+use crate::chunk::{blake3_digest, ChunkRef};
 use std::collections::{BTreeMap, HashMap};
 
 /// Represents an immutable or mutable file Inode on MeshFS.
@@ -29,11 +29,10 @@ pub struct MerkleDiff {
     pub new_chunks_needed: Vec<String>,
 }
 
-/// Computes the canonical Merkle root hash for a set of file Inodes.
+/// Computes the canonical Merkle root hash for a set of file Inodes using BLAKE3.
 pub fn compute_merkle_root(files: &HashMap<String, Inode>) -> String {
     if files.is_empty() {
-        return "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-            .to_string(); // Empty string sha256
+        return format!("blake3:{}", blake3_digest(b""));
     }
 
     // Sort files deterministically in a BTreeMap
@@ -45,8 +44,8 @@ pub fn compute_merkle_root(files: &HashMap<String, Inode>) -> String {
     }
 
     let payload = lines.join("\n");
-    let root = sha256_digest(payload.as_bytes());
-    format!("sha256:{}", root)
+    let root = blake3_digest(payload.as_bytes());
+    format!("blake3:{}", root)
 }
 
 /// Calculates diff between two file trees (e.g. for differential snapshot sync or backup).
@@ -144,7 +143,7 @@ mod tests {
         let root1 = compute_merkle_root(&files);
         let root2 = compute_merkle_root(&files);
         assert_eq!(root1, root2);
-        assert!(root1.starts_with("sha256:"));
+        assert!(root1.starts_with("blake3:"));
     }
 
     #[test]
