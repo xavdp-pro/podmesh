@@ -128,7 +128,7 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
         service: "podmesh-backup-server".to_string(),
         version: "2.4.1".to_string(),
         datastores: names,
-        dedup_engine: "SHA-256 CAS 4MB (Pure Rust)".to_string(),
+        dedup_engine: "BLAKE3 CAS 4MB (Pure Rust)".to_string(),
         op10_verifier_ready: false,
         remote_sync_enabled: false,
     })

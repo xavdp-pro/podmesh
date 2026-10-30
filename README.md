@@ -1,25 +1,25 @@
-# PodMesh (v2.4.0) — Sovereign Infrastructure, Distributed Storage & Backup Suite
+# PodMesh (v2.4.1) — Sovereign Infrastructure, Distributed Storage & Backup Suite
 
 [**🤖 AI-First Install & Config**](AI_INSTALL_AND_CONFIG.md) · [Human–AI tandem, composition and state ownership](docs/ECOSYSTEM-AND-COMPONENT-OWNERSHIP.md) · [Intent](INTENT.md) · [Law](LAW.md) · [Lineage](LINEAGE.md) · [Modules](MODULES.md) · [Agents](AGENTS.md)
 
 > **v2.4.0 Universal Multi-Storage Architecture • Multi-Plateformes (Proxmox VE + TrueNAS + Synology + Windows + Podman) • 100% AI-First Headless • Pure Rust • Réception atomique des chunks • FastCDC / BLAKE3 • WireGuard Dual-Hub sans SPOF**  
-> Sovereign Podman orchestrator for human-agent tandems, transitioning from the experimental v2.3.0 demonstrator into production-grade universal multi-platform storage and orchestration (Proxmox VE, TrueNAS CORE/SCALE, Synology DSM, Windows Server / Hyper-V, and Linux Podman). Composes seamlessly with the standalone `podmesh-*` ecosystem: high-performance distributed & P2P storage (**`podmesh-meshfs`**), deduplicated backup server (**`podmesh-pmbs`**), native Proxmox VE plugin (**`podmesh-pve-plugin`**), and unified installer (**`podmesh-installer`**). All installation and configuration are 100% AI-First via CLI, Unix Domain Sockets, and JSON contracts (see **[`AI_INSTALL_AND_CONFIG.md`](AI_INSTALL_AND_CONFIG.md)**); web interfaces (`podmesh-cockpit`, `podmesh-docs`) are strictly optional/deferred layers.
+> Sovereign Podman orchestrator for human-agent tandems, transitioning from the experimental v2.4.1 demonstrator into production-grade universal multi-platform storage and orchestration (Proxmox VE, TrueNAS CORE/SCALE, Synology DSM, Windows Server / Hyper-V, and Linux Podman). Composes seamlessly with the standalone `podmesh-*` ecosystem: high-performance distributed & P2P storage (**`podmesh-meshfs`**), deduplicated backup server (**`podmesh-pmbs`**), native Proxmox VE plugin (**`podmesh-pve-plugin`**), and unified installer (**`podmesh-installer`**). All installation and configuration are 100% AI-First via CLI, Unix Domain Sockets, and JSON contracts (see **[`AI_INSTALL_AND_CONFIG.md`](AI_INSTALL_AND_CONFIG.md)**); web interfaces (`podmesh-cockpit`, `podmesh-docs`) are strictly optional/deferred layers.
 
 ---
 
-## 🧩 SHAPER PHOENIX Modular Ecosystem (v2.4.0)
+## 🧩 SHAPER PHOENIX Modular Ecosystem (v2.4.1)
 
 In **v2.4.0**, `podmesh` acts as the sovereign orchestrator at the center of 7 modular public repositories and 7 private `-lab` companion workshops (see [`MODULES.md`](MODULES.md) and [`LINEAGE.md`](LINEAGE.md)):
 
 | Module | Public Product Repository | Private Lab Companion | Version | Description |
 | :--- | :--- | :--- | :---: | :--- |
-| **PodMesh Core** | [`xavdp-pro/podmesh`](https://github.com/xavdp-pro/podmesh) | [`xavdp-pro/podmesh-lab`](https://github.com/xavdp-pro/podmesh-lab) | `v2.4.0` | Sovereign Podman orchestrator, MariaDB functional units (`podmesh-node`, `podmesh-manager`), Ed25519 epoch fencing, and `podmesh-ctl` CLI. |
-| **MeshFS** | [`xavdp-pro/podmesh-meshfs`](https://github.com/xavdp-pro/podmesh-meshfs) | [`xavdp-pro/podmesh-meshfs-lab`](https://github.com/xavdp-pro/podmesh-meshfs-lab) | `v2.4.0` | Universal multi-storage CAS engine: atomic chunk ingestion, FastCDC / BLAKE3, FUSE mount, WireGuard Dual-Hub P2P replication. |
-| **PMBS** | [`xavdp-pro/podmesh-pmbs`](https://github.com/xavdp-pro/podmesh-pmbs) | [`xavdp-pro/podmesh-pmbs-lab`](https://github.com/xavdp-pro/podmesh-pmbs-lab) | `v2.4.0` | PodMesh Backup Server (`pmbs`) in Pure Rust: FastCDC / BLAKE3 deduplication, immutable snapshots, and Op 10 boot proofs. |
-| **PVE Plugin** | [`xavdp-pro/podmesh-pve-plugin`](https://github.com/xavdp-pro/podmesh-pve-plugin) | [`xavdp-pro/podmesh-pve-plugin-lab`](https://github.com/xavdp-pro/podmesh-pve-plugin-lab) | `v2.4.0` | Native Proxmox VE Perl storage plugin (`PVE::Storage::Custom::MeshFSPlugin`) for QEMU/KVM, LXC, and VZDump. |
-| **Cockpit UI** | [`xavdp-pro/podmesh-cockpit`](https://github.com/xavdp-pro/podmesh-cockpit) | [`xavdp-pro/podmesh-cockpit-lab`](https://github.com/xavdp-pro/podmesh-cockpit-lab) | `v2.4.0` | Interactive 2D/3D Fractal Cathedral & Sovereign Cockpit Web UI with Dual-Hub failover monitoring. |
-| **Docs & Showcase** | [`xavdp-pro/podmesh-docs`](https://github.com/xavdp-pro/podmesh-docs) | [`xavdp-pro/podmesh-docs-lab`](https://github.com/xavdp-pro/podmesh-docs-lab) | `v2.4.0` | Multi-language documentation portal and universal multi-platform architecture showcase. |
-| **Installer & APT** | [`xavdp-pro/podmesh-installer`](https://github.com/xavdp-pro/podmesh-installer) | [`xavdp-pro/podmesh-installer-lab`](https://github.com/xavdp-pro/podmesh-installer-lab) | `v2.4.0` | Unified bare-metal and cross-platform installation daemon, offline closures, and APT repository tooling. |
+| **PodMesh Core** | [`xavdp-pro/podmesh`](https://github.com/xavdp-pro/podmesh) | [`xavdp-pro/podmesh-lab`](https://github.com/xavdp-pro/podmesh-lab) | `v2.4.1` | Sovereign Podman orchestrator, MariaDB functional units (`podmesh-node`, `podmesh-manager`), Ed25519 epoch fencing, and `podmesh-ctl` CLI. |
+| **MeshFS** | [`xavdp-pro/podmesh-meshfs`](https://github.com/xavdp-pro/podmesh-meshfs) | [`xavdp-pro/podmesh-meshfs-lab`](https://github.com/xavdp-pro/podmesh-meshfs-lab) | `v2.4.1` | Universal multi-storage CAS engine: atomic chunk ingestion, FastCDC / BLAKE3, FUSE mount, WireGuard Dual-Hub P2P replication. |
+| **PMBS** | [`xavdp-pro/podmesh-pmbs`](https://github.com/xavdp-pro/podmesh-pmbs) | [`xavdp-pro/podmesh-pmbs-lab`](https://github.com/xavdp-pro/podmesh-pmbs-lab) | `v2.4.1` | PodMesh Backup Server (`pmbs`) in Pure Rust: FastCDC / BLAKE3 deduplication, immutable snapshots, and Op 10 boot proofs. |
+| **PVE Plugin** | [`xavdp-pro/podmesh-pve-plugin`](https://github.com/xavdp-pro/podmesh-pve-plugin) | [`xavdp-pro/podmesh-pve-plugin-lab`](https://github.com/xavdp-pro/podmesh-pve-plugin-lab) | `v2.4.1` | Native Proxmox VE Perl storage plugin (`PVE::Storage::Custom::MeshFSPlugin`) for QEMU/KVM, LXC, and VZDump. |
+| **Cockpit UI** | [`xavdp-pro/podmesh-cockpit`](https://github.com/xavdp-pro/podmesh-cockpit) | [`xavdp-pro/podmesh-cockpit-lab`](https://github.com/xavdp-pro/podmesh-cockpit-lab) | `v2.4.1` | Interactive 2D/3D Fractal Cathedral & Sovereign Cockpit Web UI with Dual-Hub failover monitoring. |
+| **Docs & Showcase** | [`xavdp-pro/podmesh-docs`](https://github.com/xavdp-pro/podmesh-docs) | [`xavdp-pro/podmesh-docs-lab`](https://github.com/xavdp-pro/podmesh-docs-lab) | `v2.4.1` | Multi-language documentation portal and universal multi-platform architecture showcase. |
+| **Installer & APT** | [`xavdp-pro/podmesh-installer`](https://github.com/xavdp-pro/podmesh-installer) | [`xavdp-pro/podmesh-installer-lab`](https://github.com/xavdp-pro/podmesh-installer-lab) | `v2.4.1` | Unified bare-metal and cross-platform installation daemon, offline closures, and APT repository tooling. |
 
 ---
 
@@ -40,7 +40,7 @@ PodMesh unifie l'orchestration de conteneurs, le stockage distribué souverain e
 │     MeshFS Daemon     │       │       PodMesh Node Engine     │       │      PMBS Daemon      │
 │   (crates/meshfs)     │       │       (src/ - Core Engine)    │       │     (crates/pmbs)     │
 ├───────────────────────┤       ├───────────────────────────────┤       ├───────────────────────┤
-│ • CAS SHA-256 4MB     │       │ • Rootful Podman Lifecycle    │       │ • CAS SHA-256 Dedup   │
+│ • CAS BLAKE3 4MB     │       │ • Rootful Podman Lifecycle    │       │ • CAS BLAKE3 Dedup   │
 │ • Merkle DAG Inodes   │       │ • Private MariaDB Stores     │       │ • Op 10 Boot Proof    │
 │ • ioctl FICLONE CoW   │       │ • Reconcile & State Machine   │       │ • Cross-Site Sync     │
 │ • Proxmox VE Plugin   │       │ • Ed25519 Takeover Proofs     │       │ • Single-File Restore │

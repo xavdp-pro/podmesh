@@ -1,6 +1,6 @@
-# Law — podmesh (v2.3.0)
+# Law — podmesh (v2.4.1)
 
-The following architectural and operational invariants govern the sovereign `podmesh` orchestrator (`v2.3.0`) across its core Rust node engine, manager control plane, `podmesh-ctl` CLI, and SHAPER OS integration boundaries. Every code change, packaging recipe, and deployment profile must preserve these laws without exception.
+The following architectural and operational invariants govern the sovereign `podmesh` orchestrator (`v2.4.1`) across its core Rust node engine, manager control plane, `podmesh-ctl` CLI, and SHAPER OS integration boundaries. Every code change, packaging recipe, and deployment profile must preserve these laws without exception.
 
 ---
 

@@ -48,7 +48,7 @@ async fn main() -> ExitCode {
                 data_dir = %d.data_dir.display(),
                 socket = %d.socket.display(),
                 port = d.port,
-                "Démarrage du démon MeshFS Pure Rust v2.4.0"
+                "Démarrage du démon MeshFS Pure Rust v2.4.1"
             );
 
             let engine = match MeshFSEngine::new(&d.data_dir, &d.cluster, d.port).await {
@@ -530,9 +530,11 @@ fn resolve_socket(custom: Option<&Path>) -> Option<std::path::PathBuf> {
     if let Some(p) = custom {
         return Some(p.to_path_buf());
     }
-    let default_path = Path::new("/var/lib/meshfs/meshfs.sock");
-    if default_path.exists() {
-        return Some(default_path.to_path_buf());
+    for candidate in ["/run/shaper/meshfs.sock", "/var/lib/meshfs/meshfs.sock"] {
+        let p = Path::new(candidate);
+        if p.exists() {
+            return Some(p.to_path_buf());
+        }
     }
     None
 }

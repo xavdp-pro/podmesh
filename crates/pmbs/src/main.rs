@@ -58,7 +58,7 @@ async fn main() -> ExitCode {
                 port = d.port,
                 data_dir = %d.data_dir.display(),
                 socket = %d.socket.display(),
-                "Démarrage du démon PMBS Pure Rust v2.4.0"
+                "Démarrage du démon PMBS Pure Rust v2.4.1"
             );
 
             let _ = fs::create_dir_all(&d.data_dir);
@@ -286,9 +286,11 @@ fn resolve_socket(custom: Option<&Path>) -> Option<std::path::PathBuf> {
     if let Some(p) = custom {
         return Some(p.to_path_buf());
     }
-    let default_path = Path::new("/var/lib/pmbs/pmbs.sock");
-    if default_path.exists() {
-        return Some(default_path.to_path_buf());
+    for candidate in ["/run/shaper/pmbs.sock", "/var/lib/pmbs/pmbs.sock"] {
+        let p = Path::new(candidate);
+        if p.exists() {
+            return Some(p.to_path_buf());
+        }
     }
     None
 }

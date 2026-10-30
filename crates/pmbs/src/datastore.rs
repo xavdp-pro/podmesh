@@ -118,13 +118,70 @@ pub struct Datastore {
 
 impl Datastore {
     /// Opens or initializes a Datastore in `<base_dir>/datastores/<name>`.
+    /// If `PMBS_SHARED_CHUNKS_DIR` is set, or if `<base_dir>` is `/var/lib/pmbs` and
+    /// `/var/lib/meshfs/chunks` exists as a non-symlink directory, shares the unified
+    /// MeshFS CAS chunk pool (`<chunks_dir>/<prefix>/<blake3>`) for Zero-Transit deduplication.
     pub fn new(base_dir: &Path, name: &str) -> io::Result<Self> {
+        let shared = std::env::var_os("PMBS_SHARED_CHUNKS_DIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                let meshfs_chunks = Path::new("/var/lib/meshfs/chunks");
+                if base_dir == Path::new("/var/lib/pmbs")
+                    && fs::symlink_metadata(meshfs_chunks)
+                        .map(|m| m.is_dir() && !m.file_type().is_symlink())
+                        .unwrap_or(false)
+                {
+                    Some(meshfs_chunks.to_path_buf())
+                } else {
+                    None
+                }
+            });
+        Self::new_internal(base_dir, name, shared.as_deref())
+    }
+
+    /// Opens or initializes a Datastore explicitly sharing an external CAS chunk pool directory
+    /// (e.g. `/var/lib/meshfs/chunks`) for Zero-Transit deduplication with MeshFS and MeshFS-S3.
+    pub fn with_shared_chunks(
+        base_dir: &Path,
+        name: &str,
+        shared_chunks_dir: &Path,
+    ) -> io::Result<Self> {
+        Self::new_internal(base_dir, name, Some(shared_chunks_dir))
+    }
+
+    fn new_internal(
+        base_dir: &Path,
+        name: &str,
+        shared_chunks_dir: Option<&Path>,
+    ) -> io::Result<Self> {
         validate_name(name)?;
-        if fs::symlink_metadata(base_dir).map(|m| m.file_type().is_symlink()).unwrap_or(false) { return Err(invalid("symlink base directory")); }
+        if fs::symlink_metadata(base_dir)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(invalid("symlink base directory"));
+        }
         fs::create_dir_all(base_dir)?;
         secure_dir(&base_dir.join("datastores"))?;
         let root_dir = base_dir.join("datastores").join(name);
-        let chunks_dir = root_dir.join("chunks");
+        let chunks_dir = match shared_chunks_dir {
+            Some(shared) => {
+                if fs::symlink_metadata(shared)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false)
+                {
+                    return Err(invalid("symlink shared chunks directory"));
+                }
+                if let Some(parent) = shared.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        fs::create_dir_all(parent)?;
+                    }
+                }
+                shared.to_path_buf()
+            }
+            None => root_dir.join("chunks"),
+        };
         let snapshots_dir = root_dir.join("snapshots");
 
         secure_dir(&root_dir)?;
@@ -338,6 +395,38 @@ mod tests {
         // Verification of read data
         let read_back = ds.read_chunk(&chunk_id).unwrap();
         assert_eq!(read_back, data);
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_zero_transit_shared_cas_pool_with_meshfs() {
+        let tmp_dir = std::env::temp_dir().join(format!("pmbs-shared-cas-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let meshfs_chunks = tmp_dir.join("meshfs").join("chunks");
+        let pmbs_base = tmp_dir.join("pmbs");
+
+        // Simulate MeshFS writing a 4MB-style BLAKE3 chunk directly into `<meshfs_chunks>/<prefix>/<blake3>`
+        let payload = b"Zero-Transit Unified CAS Payload between MeshFS, MeshFS-S3, and PMBS v2.4.1";
+        let digest = blake3_digest(payload);
+        let prefix = &digest[..2];
+        let meshfs_chunk_file = meshfs_chunks.join(prefix).join(&digest);
+        fs::create_dir_all(meshfs_chunk_file.parent().unwrap()).unwrap();
+        fs::set_permissions(&meshfs_chunks, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(meshfs_chunk_file.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&meshfs_chunk_file, payload).unwrap();
+
+        // Open PMBS datastore pointing to the shared MeshFS CAS chunk pool
+        let ds = Datastore::with_shared_chunks(&pmbs_base, "datastore-default", &meshfs_chunks).unwrap();
+        assert_eq!(ds.chunks_dir, meshfs_chunks);
+
+        // PMBS immediately sees and verifies the chunk written by MeshFS without duplicating bytes!
+        assert!(ds.has_chunk(&digest));
+        assert_eq!(ds.read_chunk(&digest).unwrap(), payload);
+
+        // Writing the same payload via PMBS deduplicates against the existing MeshFS chunk
+        let chunk_id = ds.write_chunk(payload).unwrap();
+        assert_eq!(chunk_id, format!("blake3:{}", digest));
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

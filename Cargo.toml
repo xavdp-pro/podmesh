@@ -15,8 +15,8 @@ license = "Apache-2.0"
 description = "Local Podman operations for human-agent tandems"
 
 [features]
-# The MariaDB backend of the durable store (docs/STORE-CONFIGURATION.md). Off by default: the
-# packaged node still opens SQLite, and a default build keeps the dependency set it has today.
+# Enabled by default per SHAPER OS / FUNITS Full MariaDB constitutional law (docs/STORE-CONFIGURATION.md).
+default = ["mariadb"]
 mariadb = ["dep:mysql"]
 
 [dependencies]
@@ -28,7 +28,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 mysql = { version = "28", default-features = false, features = ["minimal-rust"], optional = true }
 # Verification of the authority's Ed25519-signed takeover documents; no key is ever held here.
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
-# Pure BLAKE3 digest for quorum policy, handoffs, and storage integrity (v2.4.1).
+# Quorum policy & certificate digest (protocol/memory SHA-256) + Pure BLAKE3 for disk/storage operations (v2.4.1).
+sha2 = { version = "0.10", default-features = false }
 blake3 = "1.5"
 
 [dev-dependencies]

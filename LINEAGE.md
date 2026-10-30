@@ -1,6 +1,6 @@
 # Lineage — podmesh
 
-## Sovereign Universal Multi-Storage & Orchestration Suite — v2.4.0 (2026-10-28)
+## Sovereign Universal Multi-Storage & Orchestration Suite — v2.4.1 (2026-10-28)
 
 - **Current Version**: `2.4.0`
 - **Release Date**: `2026-10-28`
@@ -31,7 +31,7 @@
 - Completed full-coverage laboratory and physical iron qualification (**34/34 Ideal Scene criteria**, including `lifecycle:host-reboot`, Proof 39 MeshFS SLA, Proof 40 Universe Stream, Proof 41 HA Fencing, and monthly observations partition administration).
 - Consolidated the bilingual interactive documentation and validation showcase (`showcase/`).
 
-### 5. `v2.3.0` — SHAPER PHOENIX Modular Ecosystem Split
+### 5. `v2.4.1` — SHAPER PHOENIX Modular Ecosystem Split
 - Under the **SHAPER PHOENIX** canonical architecture, the specialized subsystems developed and qualified inside `podmesh` are published as autonomous, composable `podmesh-*` repositories, each paired with its own dedicated private `-lab` workshop:
   - [`xavdp-pro/podmesh-meshfs`](https://github.com/xavdp-pro/podmesh-meshfs) — Distributed & P2P 4 MB CAS storage engine (`meshfs` + `meshfs-p2p`).
   - [`xavdp-pro/podmesh-pmbs`](https://github.com/xavdp-pro/podmesh-pmbs) — PodMesh Backup Server (`pmbs`) with 4 MB CAS deduplication and Op 10 boot proofs.
@@ -39,10 +39,10 @@
   - [`xavdp-pro/podmesh-cockpit`](https://github.com/xavdp-pro/podmesh-cockpit) — Interactive 2D/3D Fractal Cathedral & Cockpit Web UI.
   - [`xavdp-pro/podmesh-docs`](https://github.com/xavdp-pro/podmesh-docs) — Bilingual documentation portal and interactive validation showcase.
   - [`xavdp-pro/podmesh-installer`](https://github.com/xavdp-pro/podmesh-installer) — Unified `.deb` packaging, offline closures, and dual-channel APT repository tooling.
-- `xavdp-pro/podmesh` (`v2.3.0`) remains the **full-power sovereign orchestrator** (retaining the complete workspace build for integrated local/CI verification while composing cleanly with the standalone `podmesh-*` modules). See [`MODULES.md`](MODULES.md).
+- `xavdp-pro/podmesh` (`v2.4.1`) remains the **full-power sovereign orchestrator** (retaining the complete workspace build for integrated local/CI verification while composing cleanly with the standalone `podmesh-*` modules). See [`MODULES.md`](MODULES.md).
 
-### 6. `v2.4.0` — Universal Multi-Storage & Multi-Platform Architecture
-- **Sortie du démonstrateur expérimental v2.3.0** : passage à l'architecture de production multi-plateformes universelle.
+### 6. `v2.4.1` — Universal Multi-Storage & Multi-Platform Architecture
+- **Sortie du démonstrateur expérimental v2.4.1** : passage à l'architecture de production multi-plateformes universelle.
 - **Entrée dans l'ère multi-plateformes universelle** : support et qualification multi-cibles harmonisés pour Proxmox VE, TrueNAS, Synology, Windows et Podman.
 - **Moteur de stockage haute performance** : réception atomique des chunks, découpage FastCDC (Content-Defined Chunking) et empreinte cryptographique BLAKE3 ultra-rapide en complément de SHA-256.
 - **Réseau maillé souverain** : architecture WireGuard Dual-Hub résiliente sans point unique de défaillance (SPOF) avec bascule dynamique inter-liaisons.

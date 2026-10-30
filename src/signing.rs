@@ -26,6 +26,7 @@
 //! replicas' keys.
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 type Error = Box<dyn std::error::Error>;
 
@@ -375,9 +376,9 @@ impl Quorum {
     }
 }
 
-/// BLAKE3 (256-bit), lowercase hex.
+/// SHA-256, lowercase hex (quorum policy & certificate payload digest).
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    blake3::hash(bytes).to_hex().to_string()
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The digest of a certificate's payload (the document without its signatures): the decision's identity,
