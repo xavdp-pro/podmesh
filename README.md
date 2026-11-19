@@ -223,3 +223,7 @@ Sous licence Apache-2.0. Créé par Xavier de Poorter et l'équipe d'ingénieurs
 ## Dedication
 
 [Personal dedication by Xavier de Poorter](DEDICATION.md).
+
+## Work with Xavier de Poorter
+
+I design and build infrastructure, custom applications and SaaS products. If you’re starting a project or need help with an existing system, email me directly at [xavier@xavdp.pro](mailto:xavier@xavdp.pro). A few lines about what you want to build or improve are enough. [Explore my work](https://xavdp.pro/).
